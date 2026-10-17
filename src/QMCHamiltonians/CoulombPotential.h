@@ -82,6 +82,12 @@ public:
 
   std::string getClassName() const override;
 
+  /// Immutable physical identities used by the narrow resident molecular observer.
+  const ParticleSet& getSourcePSet() const noexcept { return Pa; }
+  const ParticleSet& getTargetPSet() const noexcept { return Pb; }
+  bool isSameParticleSet() const noexcept { return is_AA; }
+  bool computesForces() const noexcept { return ComputeForces; }
+
 #if !defined(REMOVE_TRACEMANAGER)
   void contributeParticleQuantities() override;
   void checkoutParticleQuantities(TraceManager& tm) override;

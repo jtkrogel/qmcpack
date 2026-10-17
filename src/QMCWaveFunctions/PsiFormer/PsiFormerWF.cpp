@@ -12699,6 +12699,129 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
 #endif
 }
 
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+namespace
+{
+/// Own the borrowed session/backend and immutable image receipts, not native caches.
+struct ResidentOpenBatch final : PsiFormerWF::ResidentOpenObservationBatch
+{
+  std::shared_ptr<PsiFormerSharedState> state;
+  std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+  std::shared_ptr<const pf::DirectBatchTileBackend> backend;
+  std::vector<psiformer::device::PreparedDeviceProductSession::ResidentOpenEnergyObservation> observations;
+  std::size_t version = 0;
+  std::size_t sourceVersion() const noexcept override { return version; }
+  std::size_t sampleCount() const noexcept override { return observations.size(); }
+  const std::array<double, 5>& energy(std::size_t sample) const override
+  { return observations.at(sample).energy; }
+};
+}
+#endif
+
+PsiFormerWF::ResidentOpenObservationRequirements PsiFormerWF::residentOpenObservationRequirements(
+    std::size_t samples) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  PsiFormerReadTransaction read(*model_state_, model_state_->resident_device_authority_enabled);
+  const auto& shape = read.state().execution_plan.modelShape();
+  if (samples != 2 || system_kind_ != "all_electron")
+    throw std::invalid_argument("Resident open observation requires the admitted sole AE W2 profile");
+  const auto cost = psiformer::device::PreparedDeviceProductSession::estimateResidentOpenEnergyCost(
+      shape.electrons(), shape.nuclei);
+  const auto receipts = checkedBatchMemoryAdd(sizeof(ResidentOpenBatch), checkedBatchMemoryMultiply(samples,
+      sizeof(psiformer::device::PreparedDeviceProductSession::ResidentOpenEnergyObservation),
+      "Resident observation receipts"), "Resident observation owner");
+  return {cost.device_bytes, cost.host_bytes, receipts};
+#else
+  throw std::invalid_argument("Resident open observation requires a real GPU build");
+#endif
+}
+
+void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons,
+    std::size_t device_cap, std::size_t host_cap) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto scratch = model_state_->resident_energy_scratch;
+  if (!scratch || system_kind_ != "all_electron" || !deviceSamplingEnabled())
+    throw std::invalid_argument("Resident open observation requires prepared sole AE sampling/C3");
+  PsiFormerDerivativeLease lease(*scratch);
+  PsiFormerReadTransaction read(*model_state_, model_state_->resident_device_authority_enabled);
+  const auto ne = read.state().execution_plan.modelShape().electrons();
+  if (electrons.getTotalNum() != ne || electrons.isSpinor() || electrons.getActivePtcl() != -1)
+    throw std::invalid_argument("Resident open observation particle shape is incompatible");
+  std::vector<double> inverse_masses(ne);
+  for (std::size_t e = 0; e < ne; ++e)
+    inverse_masses[e] = 1.0 / electrons.get_mass_by_group()[electrons.getGroupID(e)];
+  scratch->device_products->prepareResidentOpenEnergy(inverse_masses,
+      read.state().model.cfg.charges.x, device_cap, host_cap);
+#else
+  throw std::invalid_argument("Resident open observation requires a real GPU build");
+#endif
+}
+
+std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> PsiFormerWF::observeResidentOpenAccepted(
+    const RefVectorWithLeader<WaveFunctionComponent>& components) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto scratch = model_state_->resident_energy_scratch;
+  if (!scratch || !model_state_->resident_device_authority_enabled || components.empty() ||
+      system_kind_ != "all_electron")
+    throw std::invalid_argument("Resident observation requires active sole AE DEVICE authority");
+  auto& resource = requireMultiWalkerResource(components);
+  PsiFormerDerivativeLease lease(*scratch);
+  PsiFormerReadTransaction read(*model_state_, true);
+  auto result = std::make_unique<ResidentOpenBatch>();
+  result->state = model_state_;
+  result->scratch = scratch;
+  result->backend = model_state_->numerical_tile_backend;
+  result->version = read.parameterVersion();
+  const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(*result->backend);
+  result->observations.reserve(components.size());
+  for (std::size_t sample = 0; sample < components.size(); ++sample)
+  {
+    const auto& component = components.getCastedElement<PsiFormerWF>(sample);
+    component.requireNoSelectedParticleProposal("resident open observation");
+    if (component.model_state_ != model_state_ || component.system_kind_ != "all_electron")
+      throw std::invalid_argument("Resident observation contains a foreign component");
+    const auto coordinates = backend.residentAcceptedCoordinates(
+        resource.batch_workspace->numericalSamplingWorkspace(), sample, result->version);
+    result->observations.push_back(scratch->device_products->observeResidentOpenEnergy(coordinates, result->version));
+  }
+  return result;
+#else
+  throw std::invalid_argument("Resident open observation requires a real GPU build");
+#endif
+}
+
+void PsiFormerWF::materializeResidentOpenAccepted(
+    const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& particles) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  if (!model_state_->resident_device_authority_enabled || components.empty() || components.size() != particles.size())
+    throw std::invalid_argument("Resident cold fence requires the admitted nonempty crowd");
+  auto& resource = requireMultiWalkerResource(components);
+  PsiFormerReadTransaction read(*model_state_, true);
+  const auto ne = read.state().execution_plan.modelShape().electrons();
+  for (std::size_t sample = 0; sample < components.size(); ++sample)
+    if (components.getCastedElement<PsiFormerWF>(sample).model_state_ != model_state_ ||
+        particles[sample].getTotalNum() != ne || particles[sample].getActivePtcl() != -1)
+      throw std::invalid_argument("Resident cold fence contains foreign particles/components");
+  std::vector<double> positions(checkedBatchMemoryMultiply(components.size(), 3 * ne, "Resident cold coordinates"));
+  const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(
+      *model_state_->numerical_tile_backend);
+  backend.materializeResidentAccepted(resource.batch_workspace->numericalSamplingWorkspace(), positions,
+      read.parameterVersion());
+  // This publishes ONLY coordinates. Native tables, FULL, walkers and H must be refreshed by the caller.
+  for (std::size_t sample = 0; sample < particles.size(); ++sample)
+    for (std::size_t e = 0; e < ne; ++e)
+      for (std::size_t d = 0; d < 3; ++d)
+        particles[sample].R[e][d] = positions[(sample * ne + e) * 3 + d];
+#else
+  throw std::invalid_argument("Resident cold fence requires a real GPU build");
+#endif
+}
+
 /// Keep the concrete source and both read leases scoped through Adam completion.
 double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivativeOperator& derivative,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
@@ -12911,6 +13034,57 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeRes
   return proposal;
 #else
   throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
+/// Preserve finite-sample mean(dK): SCORE-only covariance is not this estimator.
+std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeResidentOpenAdamDevice(
+    const ResidentOpenObservationBatch& opaque,
+    const std::shared_ptr<psiformer::device::PreparedDeviceAdam>& adam,
+    double beta1, double beta2, double correction1, double correction2, double epsilon,
+    std::size_t snapshot_device_cap) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* batch = dynamic_cast<const ResidentOpenBatch*>(&opaque);
+  if (!batch || batch->state != model_state_ || batch->scratch != model_state_->resident_energy_scratch ||
+      !model_state_->resident_device_authority_enabled || system_kind_ != "all_electron" || !adam ||
+      batch->sampleCount() != 2)
+    throw std::invalid_argument("Resident open Adam requires this provider's admitted equal-weight W2 observations");
+  PsiFormerDerivativeLease lease(*batch->scratch);
+  PsiFormerReadTransaction read(*model_state_, true);
+  if (read.parameterVersion() != batch->version || batch->backend != model_state_->numerical_tile_backend)
+    throw std::invalid_argument("Resident open Adam observations are stale");
+  auto proposal = std::make_unique<ResidentAuthorityProposal>();
+  proposal->state = model_state_;
+  proposal->adam = adam;
+  auto& session = *batch->scratch->device_products;
+  const auto generation = session.beginScoreContraction(3, batch->version,
+      psiformer::device::ScoreContractionRole::ENERGY_T_EO_O);
+  double energy = 0;
+  try
+  {
+    for (const auto& observation : batch->observations)
+    {
+      const double local_energy = observation.energy[4];
+      if (!wftrain::isFiniteTrainingReal(local_energy))
+        throw std::invalid_argument("Resident open Adam energy is nonfinite");
+      const std::array<std::complex<double>, 3> score{{0.0, local_energy, 1.0}};
+      const std::array<std::complex<double>, 3> kinetic{{1.0, 0.0, 0.0}};
+      session.accumulateResidentKineticContraction(observation, score.data(), kinetic.data(), 3, batch->version);
+      energy += local_energy;
+    }
+    session.finishScoreContraction(batch->version);
+    proposal->candidate = session.consumeEnergyAdamDeviceCandidate(*adam, batch->version, generation,
+        2.0, energy / 2.0, beta1, beta2, correction1, correction2, epsilon, snapshot_device_cap, true);
+  }
+  catch (...)
+  {
+    session.abortScoreContraction();
+    throw;
+  }
+  return proposal;
+#else
+  throw std::invalid_argument("Resident open Adam requires a real GPU build");
 #endif
 }
 
@@ -13299,7 +13473,8 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
     const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
     const std::function<void(std::vector<double>&)>& gaussian_draw,
     const std::function<double()>& uniform_draw, bool use_drift,
-    const std::function<void(double, const double*, double*)>& drift) const
+    const std::function<void(double, const double*, double*)>& drift,
+    bool retain_device_coordinates) const
 {
 #ifdef ENABLE_CUDA
   if (!deviceSamplingEnabled() || wfc_list.size() != p_list.size() || wfc_list.empty() ||
@@ -13307,6 +13482,9 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
     throw std::invalid_argument("Device sampling needs an enabled, nonempty homogeneous crowd");
   auto& resource = requireMultiWalkerResource(wfc_list);
   PsiFormerReadTransaction transaction(*model_state_, model_state_->resident_device_authority_enabled);
+  if (retain_device_coordinates && (!model_state_->resident_device_authority_enabled ||
+      !model_state_->resident_energy_scratch || system_kind_ != "all_electron" || use_drift))
+    throw std::invalid_argument("Resident coordinates require admitted sole real/open AE DEVICE authority without drift");
   const auto ne = transaction.state().execution_plan.modelShape().electrons();
   const auto extent = psiformer::spatial_detail::checkedProduct(wfc_list.size(),
       psiformer::spatial_detail::checkedProduct(3, ne, "Sampling physical stride overflow"),
@@ -13334,10 +13512,11 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
   const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(
       *transaction.state().numerical_tile_backend);
   const auto counts = backend.advanceMetropolis(batch.numericalSamplingWorkspace(), positions, masses, tau,
-      substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted, {}, use_drift, drift);
+      substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted, {}, use_drift, drift,
+      retain_device_coordinates);
   // All device work succeeded. Derived host caches remain intentionally stale
   // until the driver's immediate ParticleSet update and full TWF evaluateLog.
-  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  for (std::size_t walker = 0; !retain_device_coordinates && walker < wfc_list.size(); ++walker)
     for (std::size_t electron = 0; electron < ne; ++electron)
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
         p_list[walker].R[electron][dimension] = accepted[(walker * ne + electron) * 3 + dimension];

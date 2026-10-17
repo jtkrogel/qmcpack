@@ -208,6 +208,32 @@ public:
   /// Report the independent explicit per-optimizer/rank real Adam limit.
   std::size_t adamBudget() const noexcept { return preparation_.adam_workspace_budget_bytes; }
 
+  /// Borrow only under the caller's retained crowd resource and model read lease.
+  PackedDeviceCoordinatesView residentAcceptedCoordinates(pf::DirectBatchTileBackendWorkspace& workspace,
+      std::size_t sample, std::size_t version) const
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (!context || context->owner != this || !context->sampler || !context->resident_coordinates ||
+        context->sampler_version != version || version != image_->version())
+      throw std::logic_error("Resident accepted coordinates are absent, foreign or stale");
+    return context->sampler->acceptedView(sample, 1);
+  }
+
+  /// The sole explicit DEVICE-to-HOST coordinate boundary; FULL/H remain dirty.
+  void materializeResidentAccepted(pf::DirectBatchTileBackendWorkspace& workspace,
+      std::vector<double>& positions, std::size_t version) const
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (!context || context->owner != this || !context->sampler || !context->resident_coordinates ||
+        context->sampler_version > version || version != image_->version())
+      throw std::logic_error("Resident coordinate fence requires its current sampler");
+    context->sampler->exportAccepted(positions);
+    std::copy(positions.begin(), positions.end(), context->sampler_positions.begin());
+    context->resident_coordinates = false;
+  }
+
   /** Borrow the existing VALUE graph for native-engine whole-system substeps.
    * The caller holds its native model read transaction and acquired host crowd.
    * Draw callbacks must not reenter the backend. Returned coordinates are only
@@ -219,7 +245,7 @@ public:
       const std::function<void(std::vector<double>&)>& gaussian_draw,
       const std::function<double()>& uniform_draw, std::vector<double>& accepted_positions,
       const std::function<void(const std::vector<std::uint32_t>&)>& validation_mask_observer = {},
-      bool use_drift = false, NativeDriftCallback drift = {}) const
+      bool use_drift = false, NativeDriftCallback drift = {}, bool retain_device_coordinates = false) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
@@ -231,6 +257,11 @@ public:
       throw std::invalid_argument("Device sampling requires its explicit real/open FP64 crowd profile and current image");
     if (use_drift != bool(metropolisDriftBudget()) || (use_drift && !drift))
       throw std::invalid_argument("Device sampling usedrift must match its explicit additions cap and native policy");
+    if ((retain_device_coordinates && use_drift) ||
+        (context->resident_coordinates && !retain_device_coordinates))
+      throw std::invalid_argument("Resident sampling requires no drift and an explicit cold coordinate fence before HOST reuse");
+    if (context->resident_coordinates && context->sampler_masses != inverse_mass)
+      throw std::invalid_argument("Resident sampling cannot reseed changed masses from stale HOST coordinates");
     const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne);
     if (cost.device_bytes > metropolisBudget())
       throw std::length_error("Device sampling exceeds its explicit standalone per-crowd budget before draws");
@@ -256,7 +287,7 @@ public:
       context->sampler.reset(); // Revoke every borrower before deleting the ordinary VALUE graph.
       context->hooks.retainValueTape();
     }
-    const bool reseed = !context->sampler || context->sampler_positions != positions ||
+    const bool reseed = !context->sampler || (!context->resident_coordinates && context->sampler_positions != positions) ||
         context->sampler_masses != inverse_mass;
     context->sampler_gaussian.resize(positions.size());
     context->sampler_uniforms.resize(cost.population);
@@ -303,14 +334,19 @@ public:
         if (validation_mask_observer)
           validation_mask_observer(mask);
       }
-      context->sampler->exportAccepted(accepted_positions);
-      std::copy(accepted_positions.begin(), accepted_positions.end(), context->sampler_positions.begin());
+      if (!retain_device_coordinates)
+      {
+        context->sampler->exportAccepted(accepted_positions);
+        std::copy(accepted_positions.begin(), accepted_positions.end(), context->sampler_positions.begin());
+      }
+      context->resident_coordinates = retain_device_coordinates;
       context->executor.release(owner_, context->crowd, context->hooks);
     }
     catch (...)
     {
       // Earlier substeps/RNG draws are not rolled back; the caller must abort.
       context->sampler.reset();
+      context->resident_coordinates = false;
       if (context->crowd.poisoned())
       {
         context->executor.recover(owner_, context->crowd, context->hooks);
@@ -322,6 +358,7 @@ public:
       throw;
     }
     std::clog << "PsiFormer device sampling completed: B=" << cost.population << ", Ne=" << ne
+              << ", accepted_coordinate_authority=" << (retain_device_coordinates ? "DEVICE" : "HOST")
               << ", usedrift=" << (use_drift ? "yes" : "no")
               << ", drift_additions_device_bytes=" << drift_cost.device_workspace_bytes
               << ", drift_additions_host_bytes=" << drift_cost.host_workspace_bytes
@@ -538,6 +575,7 @@ private:
     std::unique_ptr<PreparedDeviceMetropolis> sampler;
     std::vector<double> sampler_positions, sampler_gaussian, sampler_uniforms, sampler_masses;
     std::size_t sampler_version = 0;
+    bool resident_coordinates = false;
     std::vector<double> positions;
     std::size_t coordinate_generation = 0;
     bool parallel_batch_reported = false;

@@ -585,6 +585,44 @@ public:
   /// Retain one shared lane and admit C3; return separately charged norm bytes.
   std::size_t prepareResidentEnergyAdam(std::size_t budget) const;
 
+  /// Scalar-only accepted DEVICE observations; the owner pins the derivative session.
+  class ResidentOpenObservationBatch
+  {
+  public:
+    virtual ~ResidentOpenObservationBatch() = default;
+    virtual std::size_t sourceVersion() const noexcept = 0;
+    virtual std::size_t sampleCount() const noexcept = 0;
+    /// K, ee, ei, ii, total; does not imply that native ParticleSet G/L/H are current.
+    virtual const std::array<double, 5>& energy(std::size_t sample) const = 0;
+  };
+
+  struct ResidentOpenObservationRequirements
+  {
+    std::size_t device_bytes, host_bytes, receipt_host_bytes;
+  };
+
+  /// Cold numerical constants plus requested receipt elements; no allocation/device work.
+  ResidentOpenObservationRequirements residentOpenObservationRequirements(std::size_t samples) const;
+
+  /// Cold constants only; requires the already admitted sole real/open AE C3 lane.
+  void prepareResidentOpenObservation(const ParticleSet& electrons,
+      std::size_t device_cap, std::size_t host_cap) const;
+
+  /// Borrow each accepted sampler row under its actual crowd resource, never HOST R/G/L.
+  std::unique_ptr<ResidentOpenObservationBatch> observeResidentOpenAccepted(
+      const RefVectorWithLeader<WaveFunctionComponent>& components) const;
+
+  /// Complete equal-weight T/EO/O directly from the versioned resident observations.
+  std::unique_ptr<ResidentDeviceAdamProposal> consumeResidentOpenAdamDevice(
+      const ResidentOpenObservationBatch& observations,
+      const std::shared_ptr<psiformer::device::PreparedDeviceAdam>& adam,
+      double beta1, double beta2, double correction1, double correction2, double epsilon,
+      std::size_t snapshot_device_cap) const;
+
+  /// Explicit cold coordinate fence; caller must update particles and refresh FULL/H afterward.
+  void materializeResidentOpenAccepted(const RefVectorWithLeader<WaveFunctionComponent>& components,
+      const RefVectorWithLeader<ParticleSet>& particles) const;
+
   /// Consume one bound physical batch synchronously; no device views escape.
   double consumeResidentEnergyAdam(const wftrain::StreamingDerivativeOperator& derivative,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
@@ -598,7 +636,8 @@ public:
       const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
       const std::function<void(std::vector<double>&)>& gaussian_draw,
       const std::function<double()>& uniform_draw, bool use_drift,
-      const std::function<void(double, const double*, double*)>& drift) const;
+      const std::function<void(double, const double*, double*)>& drift,
+      bool retain_device_coordinates = false) const;
 
   /// Evaluate complete VGL data through one direct crowd batch boundary.
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
