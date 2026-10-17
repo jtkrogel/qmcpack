@@ -1496,6 +1496,17 @@ TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejec
   sibling_particles.update();
   private_particles.update();
   sibling->evaluateLog(sibling_particles);
+  // Independently evaluated clones can differ by an initial reduction-roundoff
+  // bit. Isolation must preserve each object's OWN pre-reset physical baseline.
+  const auto sibling_log = sibling->getLogPsi();
+  const auto sibling_kinetic = kineticEnergy(sibling_particles);
+  CAPTURE(source_log, sibling_log);
+  source->evaluateLog(particles);
+  sibling->evaluateLog(sibling_particles);
+  CHECK(source->getLogPsi() == source_log);
+  CHECK(sibling->getLogPsi() == sibling_log);
+  CHECK(kineticEnergy(particles) == source_kinetic);
+  CHECK(kineticEnergy(sibling_particles) == sibling_kinetic);
   const auto banks = [](TrialWaveFunction& wf) {
     std::vector<const void*> result;
     for (OptimizableObject& object : wf.extractOptimizableObjectRefs())
@@ -1526,9 +1537,9 @@ TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejec
     source->evaluateLog(particles);
     sibling->evaluateLog(sibling_particles);
     CHECK(source->getLogPsi() == source_log);
-    CHECK(sibling->getLogPsi() == source_log);
+    CHECK(sibling->getLogPsi() == sibling_log);
     CHECK(kineticEnergy(particles) == source_kinetic);
-    CHECK(kineticEnergy(sibling_particles) == source_kinetic);
+    CHECK(kineticEnergy(sibling_particles) == sibling_kinetic);
     CHECK(binding.snapshotParameters().values == snapshot.values);
     CHECK(binding.snapshotParameters().version == snapshot.version);
   };
