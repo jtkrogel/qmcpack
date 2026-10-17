@@ -35,6 +35,36 @@ protected:
 private:
   std::vector<DerivativeValue>& values_;
 };
+
+/// Contract raw Jv into its statistical mean without retaining rows or a mean P-vector.
+class LinearScoreMeanSink final : public SampleProductSink
+{
+public:
+  explicit LinearScoreMeanSink(const ScoreCovarianceBatch& batch) : batch_(batch) {}
+  double weighted = 0, absolute = 0, weight = 0;
+
+protected:
+  void consume(const SampleProductTileConstView& tile) override
+  {
+    const auto offset = tile.descriptor().sample_offset - batch_.derivative_operator->sampleOffset();
+    if (offset > batch_.weights.size() || tile.values().size() > batch_.weights.size() - offset)
+      throw std::invalid_argument("Linear CI score-mean tile extent mismatch");
+    for (std::size_t i = 0; i < tile.values().size(); ++i)
+    {
+      const auto value = tile.values()[i];
+      const auto w = batch_.weights[offset + i];
+      if (!isFiniteTrainingReal(value.real()) || !isFiniteTrainingReal(value.imag()) || value.imag() != 0 ||
+          !isFiniteTrainingReal(w) || w < 0)
+        throw std::invalid_argument("Linear CI retraction requires finite real scores and nonnegative weights");
+      weighted += w * value.real();
+      absolute += w * std::abs(value.real());
+      weight += w;
+    }
+  }
+
+private:
+  const ScoreCovarianceBatch& batch_;
+};
 }
 
 SampledLinearMethodOperator::SampledLinearMethodOperator(const ScoreCovarianceFactor& factor,
@@ -187,8 +217,10 @@ void SampledLinearMethodOperator::evaluate(DerivativeArrayView<const DerivativeV
 }
 
 LinearMethodUpdateRule::LinearMethodUpdateRule(const ScoreCovarianceFactor& factor,
-    MatrixFreeLinearMethodResult result, double learning_rate, double normalization_xi)
-    : factor_(factor), result_(std::move(result)), learning_rate_(learning_rate), xi_(normalization_xi)
+    MatrixFreeLinearMethodResult result, double learning_rate, double normalization_xi,
+    LinearMethodNormalization normalization, DerivativeArrayView<const ScoreCovarianceBatch> linear_batches)
+    : factor_(factor), result_(std::move(result)), learning_rate_(learning_rate), xi_(normalization_xi),
+      normalization_(normalization), linear_batches_(linear_batches.begin(), linear_batches.end())
 {
   if (!result_.converged || !isFiniteTrainingReal(learning_rate_) || learning_rate_ <= 0.0 ||
       !isFiniteTrainingReal(xi_) || xi_ < 0.0 || xi_ > 1.0)
@@ -198,9 +230,73 @@ LinearMethodUpdateRule::LinearMethodUpdateRule(const ScoreCovarianceFactor& fact
 StructuredParameterSnapshot LinearMethodUpdateRule::propose(const StructuredParameterSchema& schema,
     const StructuredParameterSnapshot& parameters, ParameterGradientView objective)
 {
-  if (parameters.version != result_.parameter_version || objective.parameter_version != parameters.version ||
-      objective.schema_fingerprint != schema.fingerprint())
+  const bool stale = parameters.version != result_.parameter_version || objective.parameter_version != parameters.version ||
+      objective.schema_fingerprint != schema.fingerprint();
+  if (stale && normalization_ != LinearMethodNormalization::FIXED_REFERENCE_LINEAR)
     throw std::invalid_argument("Live LM update has a stale parameter binding");
+  if (normalization_ == LinearMethodNormalization::FIXED_REFERENCE_LINEAR)
+  {
+    double weighted = 0, absolute = 0, weight = 0;
+    std::exception_ptr failure;
+    try
+    {
+      if (stale || factor_.sampleDomain() != ScoreSampleDomain::REAL ||
+          result_.stop_reason != LinearMethodStopReason::CONVERGED || result_.provider_id != schema.providerId() ||
+          result_.schema_fingerprint != schema.fingerprint() || parameters.schema_fingerprint != schema.fingerprint() ||
+          parameters.values.size() != schema.parameterCount() || result_.eigenvector.size() != schema.parameterCount() + 1 ||
+          factor_.parameterVersion() != parameters.version || factor_.parameterSchema().fingerprint() != schema.fingerprint())
+        throw std::invalid_argument("Linear CI retraction has an incompatible solved state");
+      for (const auto value : result_.eigenvector)
+        if (!isFiniteTrainingReal(value.real()) || !isFiniteTrainingReal(value.imag()) || value.imag() != 0)
+          throw std::invalid_argument("Linear CI Ritz coefficients must be finite and real");
+      for (const auto value : parameters.values)
+        if (!isFiniteTrainingReal(value))
+          throw std::invalid_argument("Linear CI accepted parameters must be finite");
+      for (const auto& block : schema.blocks())
+        if (!block.trainable)
+          for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+            if (result_.eigenvector[i + 1] != DerivativeValue{})
+              throw std::invalid_argument("Linear CI retraction cannot update frozen coordinates");
+      const StructuredParameterVectorConstView tangent(schema, parameters.version,
+          {result_.eigenvector.data() + 1, schema.parameterCount()});
+      std::size_t local_samples = 0;
+      for (const auto& batch : linear_batches_)
+      {
+        if (!batch.derivative_operator || batch.weights.size() != batch.derivative_operator->sampleCount())
+          throw std::invalid_argument("Linear CI retraction has incompatible samples");
+        LinearScoreMeanSink sink(batch);
+        batch.derivative_operator->applyScoreJVP(tangent, sink);
+        weighted += sink.weighted;
+        absolute += sink.absolute;
+        weight += sink.weight;
+        local_samples += batch.weights.size();
+      }
+      if (local_samples != factor_.localSampleVectorSize())
+        throw std::invalid_argument("Linear CI retraction samples do not match its centered factor");
+      if (!isFiniteTrainingReal(weighted) || !isFiniteTrainingReal(absolute) || !isFiniteTrainingReal(weight))
+        throw std::overflow_error("Linear CI score mean overflow");
+    }
+    catch (...) { failure = std::current_exception(); }
+    // Agree all fallible local work before subsequent reductions, including empty ranks.
+    const double total_weight = factor_.reduceSampleScalar({weight, 0}, failure).real();
+    const double mean = factor_.reduceSampleScalar({weighted, 0}).real() / total_weight;
+    const double absolute_mean = factor_.reduceSampleScalar({absolute, 0}).real() / total_weight;
+    const double reference = result_.eigenvector[0].real();
+    const double gauge = reference - mean;
+    if (!(total_weight > 0) || !isFiniteTrainingReal(total_weight) || !isFiniteTrainingReal(mean) || !isFiniteTrainingReal(absolute_mean) ||
+        !isFiniteTrainingReal(gauge) || std::abs(gauge) <= 1e-10 * (std::abs(reference) + absolute_mean))
+      throw std::invalid_argument("Linear CI fixed-reference projective denominator is unusable");
+    auto candidate = parameters;
+    for (const auto& block : schema.blocks())
+      for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+      {
+        if (block.trainable)
+          candidate.values[i] += learning_rate_ * (result_.eigenvector[i + 1].real() / gauge);
+        if (!isFiniteTrainingReal(candidate.values[i]))
+          throw std::overflow_error("Linear CI retracted parameter is nonfinite");
+      }
+    return candidate; // xi is deliberately nonlinear-only; shifts belong to the solved H/S actions.
+  }
   const auto update = formLinearMethodUpdateCandidate(schema, result_);
   std::vector<DerivativeValue> sample(factor_.localSampleVectorSize());
   factor_.apply({schema, parameters.version, {update.direction.data(), update.direction.size()}},

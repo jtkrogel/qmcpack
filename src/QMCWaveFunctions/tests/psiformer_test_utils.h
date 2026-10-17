@@ -121,8 +121,8 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
 /// Fill every parameter region with deterministic values appropriate to its role.
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
-  const std::size_t electron_count = system == "lih" ? 4 :
-      (system == "lih_pair" ? 8 : (system == "oh" ? 7 : (system == "unequal" ? 3 : 2)));
+  const std::size_t electron_count = system == "hydrogen50" ? 50 : (system == "hydrogen100" ? 100 : (system == "lih" ? 4 :
+      (system == "lih_pair" ? 8 : (system == "oh" ? 7 : (system == "unequal" ? 3 : 2)))));
   SplitMix64 random(PARAMETER_RECIPE_SEED + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
@@ -198,6 +198,19 @@ inline Geometry makeGeometry(const std::string& system)
     geometry.charges = {2, 1};
     centers          = {0, 1, 0};
     geometry.nup     = 2;
+  }
+  else if (system == "hydrogen50" || system == "hydrogen100")
+  {
+    // Neutral open hydrogen clusters for shape smoke tests, not trained models.
+    const std::size_t count = system == "hydrogen50" ? 50 : 100;
+    geometry.nup = count / 2;
+    for (std::size_t nucleus = 0; nucleus < count; ++nucleus)
+    {
+      geometry.nuclei.insert(geometry.nuclei.end(),
+          {3.0 * (nucleus % 5), 3.0 * ((nucleus / 5) % 5), 3.0 * (nucleus / 25)});
+      geometry.charges.push_back(1.0);
+      centers.push_back(nucleus);
+    }
   }
   else
     throw std::invalid_argument("Unknown generated PsiFormer test system: " + system);

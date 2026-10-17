@@ -17,6 +17,12 @@
 
 #include <stdexcept>
 
+// Resolve the component's testing helper before the fixture's nested psiformer
+// namespace is declared. Native-only builds do not include this header.
+#ifdef PSIFORMER_MEMORY_COMPONENT
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#endif
+
 // Reuse the deterministic fixture recipe without linking a Catch2 runner.  The
 // prefix option leaves the utility's REQUIRE spelling available for this small
 // throwing replacement, so HDF5 writes are still checked.
@@ -54,6 +60,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <complex>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -142,6 +151,10 @@ struct Options
   std::string output_path;
   std::size_t walkers = 4;
   int warm_calls      = 1;
+  std::size_t configuration_tile = 1;
+  std::size_t target_tile = 0; // zero selects FULL, never an active-only request
+  std::size_t owner_budget = 10ULL * 1024 * 1024 * 1024;
+  bool open_coulomb = false;
 };
 
 /** One phase boundary with process counters and explicitly accounted storage. */
@@ -164,6 +177,8 @@ struct Phase
       << executable
       << " --scenario NAME --parameters FILE --configuration FILE [--walkers N]"
          " [--warm-calls N] [--output FILE]\n"
+         " complete requests: --scenario batch_value|complete_vgl [--configuration-tile B]"
+         " [--target-tile K (0=FULL)] [--owner-budget BYTES] [--open-coulomb 0|1]\n"
          "scenarios: model_load, clone_population, value, full_vgl, active_gradient,"
          " crowd_value, crowd_full_vgl, crowd_active_gradient, score, score_and_kinetic\n";
   std::exit(EXIT_FAILURE);
@@ -193,6 +208,17 @@ Options parseOptions(int argc, char** argv)
         options.warm_calls = std::stoi(value);
       else if (key == "--output")
         options.output_path = value;
+      else if (key == "--configuration-tile")
+        options.configuration_tile = std::stoull(value);
+      else if (key == "--target-tile")
+        options.target_tile = std::stoull(value);
+      else if (key == "--owner-budget")
+        options.owner_budget = std::stoull(value);
+      else if (key == "--open-coulomb")
+      {
+        if (value != "0" && value != "1") throw std::invalid_argument("open Coulomb boolean");
+        options.open_coulomb = value == "1";
+      }
       else
         usage(argv[0], "unknown option " + key);
     }
@@ -204,8 +230,14 @@ Options parseOptions(int argc, char** argv)
 
   if (options.scenario.empty() || options.parameter_path.empty() || options.configuration_path.empty())
     usage(argv[0], "scenario, parameter file, and configuration file are required");
-  if (options.walkers == 0 || options.warm_calls < 0)
+  if (options.walkers == 0 || options.warm_calls < 0 || !options.configuration_tile || !options.owner_budget)
     usage(argv[0], "walker count must be positive and warm-call count nonnegative");
+  if ((options.scenario == "complete_vgl" || options.scenario == "batch_value") && options.warm_calls != 0)
+    usage(argv[0], "complete-request profiling requires --warm-calls 0 (one whole request)");
+  if (options.scenario == "complete_vgl" && options.configuration_tile != 1)
+    usage(argv[0], "target/FULL comparison traverses configurations serially; B must be 1");
+  if (options.scenario == "batch_value" && (options.target_tile || options.open_coulomb))
+    usage(argv[0], "VALUE batching has no target or energy request");
   return options;
 }
 
@@ -351,9 +383,14 @@ public:
       : options_(std::move(options)), metadata_(metadata)
   {}
 
+  /// Record actual loaded model dimensions, not manifest guesses.
+  void realizedShape(std::size_t determinants, std::size_t width, std::size_t heads, std::size_t blocks)
+  { realized_shape_ = {determinants, width, heads, blocks}; }
+
   /// Record RSS and peak RSS at one explicit lifetime boundary.
   void snapshot(std::string name, std::map<std::string, std::uint64_t> categories = {})
   {
+    std::cerr << "phase: " << name << std::endl;
     std::uint64_t accounted = 0;
     for (const auto& [category, bytes] : categories)
       accounted += bytes;
@@ -395,8 +432,12 @@ private:
 #ifdef PSIFORMER_MEMORY_COMPONENT
            << "  \"workload_walkers\":" << (options_.scenario == "model_load" ? 0 : options_.walkers) << ",\n"
 #else
-           << "  \"workload_walkers\":1,\n"
+           << "  \"workload_walkers\":"
+           << ((options_.scenario == "complete_vgl" || options_.scenario == "batch_value") ? options_.walkers : 1) << ",\n"
 #endif
+           << "  \"configuration_tile\":" << options_.configuration_tile << ",\n"
+           << "  \"target_tile\":" << options_.target_tile << ",\n"
+           << "  \"open_coulomb_energy\":" << (options_.open_coulomb ? "true" : "false") << ",\n"
            << "  \"warm_calls\":" << options_.warm_calls << ",\n"
            << "  \"model\":{\"parameters\":" << metadata_.parameters
            << ",\"configurations\":" << metadata_.configurations
@@ -404,6 +445,9 @@ private:
            << ",\"nuclei\":" << metadata_.nuclei
            << ",\"spin_up\":" << metadata_.spin_up
            << ",\"spin_down\":" << metadata_.spin_down << "},\n"
+           << "  \"realized_shape\":{\"determinants\":" << realized_shape_[0]
+           << ",\"width\":" << realized_shape_[1] << ",\"heads\":" << realized_shape_[2]
+           << ",\"blocks\":" << realized_shape_[3] << "},\n"
            << "  \"provenance\":{\n"
            << "    \"qmcpack_version\":"
            << jsonString(std::to_string(QMCPACK_VERSION_MAJOR) + "." +
@@ -485,6 +529,7 @@ private:
   Options options_;
   ModelMetadata metadata_;
   std::vector<Phase> phases_;
+  std::array<std::size_t, 4> realized_shape_{};
 };
 
 /** Write the standard generated export to a persistent caller-owned directory. */
@@ -507,7 +552,7 @@ qmcplusplus::psiformer::PsiFormerExecutionPlan makePlan(const pf::PsiFormer& mod
 {
   return qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
       model.p, ModelShape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
-                          model.ndet, model.dim, model.heads, 4});
+                          model.ndet, model.dim, model.heads, model.blocks});
 }
 #endif
 
@@ -548,6 +593,150 @@ std::uint64_t cloneWorkspaceBytes(const std::vector<PsiFormerWF*>& components)
 #endif
 
 #ifndef PSIFORMER_MEMORY_COMPONENT
+/** Complete fixed-input requests, retaining only O(W*N) published outputs.
+ * Target mode visits every electron and never constructs a FULL workspace.
+ * NiH results here are kinetic-only; actual PP energy belongs to native VMC.
+ */
+void runCompleteRequest(const Options& options, const ModelMetadata& metadata, MemoryReport& report)
+{
+  report.snapshot("baseline");
+  pf::PsiFormer model(options.parameter_path, options.configuration_path);
+  report.realizedShape(model.ndet, model.dim, model.heads, model.blocks);
+  auto plan = makePlan(model);
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor spatial(model, value, plan);
+  report.snapshot("model_loaded", {{"model_numeric", metadata.accountedModelNumericBytes()}});
+  const std::size_t ne = metadata.electrons;
+  std::vector<double> positions(options.walkers * ne * 3);
+  for (std::size_t w = 0; w < options.walkers; ++w)
+  {
+    const auto input = model.cfg.configuration(w % metadata.configurations);
+    for (std::size_t i = 0; i < ne * 3; ++i)
+      positions[w * ne * 3 + i] = input.x[i] + 0.0007 * w * (i % 3 + 1);
+  }
+  std::vector<double> outputs;
+  std::size_t owner_bytes = 0;
+  auto emit = [&](double number) {
+    // Release benchmarks may use fast-math: inspect IEEE bits rather than let
+    // finite-math assumptions erase this failure gate.
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(number));
+    std::memcpy(&bits, &number, sizeof(bits));
+    if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+      throw std::runtime_error("Nonfinite complete-request output");
+    outputs.push_back(number);
+  };
+  const auto started = std::chrono::steady_clock::now();
+  double preparation_seconds = 0, evaluation_seconds = 0;
+  if (options.scenario == "batch_value")
+  {
+    pf::DirectBatchExecutor batch(value, spatial);
+    auto workspace = batch.makeWorkspace();
+    const pf::DirectBatchCapacityPlan capacity{{options.walkers, 0, 0, 0, 0},
+                                               {options.configuration_tile, 0, 0}};
+    if (workspace->storageRequirement(capacity).totalBytes() > options.owner_budget)
+      throw std::length_error("VALUE owner exceeds benchmark cap before preparation");
+    workspace->prepare(capacity);
+    workspace->resize(pf::DirectBatchMode::VALUE_ONLY, options.walkers);
+    owner_bytes = workspace->vectorStorageBytes();
+    if (owner_bytes > options.owner_budget) throw std::length_error("VALUE owner exceeds benchmark cap");
+    preparation_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    report.snapshot("prepared", {{"workspace_numeric", owner_bytes}, {"model_numeric", metadata.accountedModelNumericBytes()},
+                                  {"logical_positions", positions.capacity() * sizeof(double)}});
+    for (std::size_t w = 0; w < options.walkers; ++w)
+      workspace->setPositions(w, pf::GeometryPositionView::interleaved(positions.data() + 3 * ne * w, ne));
+    const auto evaluation_start = std::chrono::steady_clock::now();
+    const auto result = batch.evaluateValues(*workspace);
+    evaluation_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - evaluation_start).count();
+    for (std::size_t w = 0; w < options.walkers; ++w)
+    { emit(result.sign[w]); emit(result.logabs[w]); }
+    report.snapshot("complete_request", {{"workspace_numeric", owner_bytes}, {"model_numeric", metadata.accountedModelNumericBytes()},
+                                          {"logical_positions", positions.capacity() * sizeof(double)},
+                                          {"published_outputs", outputs.capacity() * sizeof(double)}});
+  }
+  else
+  {
+    const auto& shape = plan.modelShape();
+    const std::size_t targets = options.target_tile ? options.target_tile : ne;
+    if (targets > ne) throw std::invalid_argument("Target tile exceeds physical electrons");
+    // The same checked storage formula admits FULL before its larger allocation.
+    const auto predicted = pf::targetSpatialWorkspaceStorageRequirement(
+        {ne, shape.nuclei, shape.determinants, shape.feature_dimension,
+         shape.attention_heads, value.layout()->inputWidth(), 0, 0}, targets);
+    if (predicted > options.owner_budget) throw std::length_error("Spatial owner exceeds benchmark cap");
+    auto workspace = options.target_tile ? spatial.makeTargetWorkspace(targets, options.owner_budget)
+                                        : spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+    owner_bytes = workspace->vectorStorageBytes();
+    if (owner_bytes > options.owner_budget) throw std::length_error("Realized spatial owner exceeds benchmark cap");
+    preparation_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    report.snapshot("prepared", {{"workspace_numeric", owner_bytes}, {"model_numeric", metadata.accountedModelNumericBytes()},
+                                  {"logical_positions", positions.capacity() * sizeof(double)}});
+    for (std::size_t w = 0; w < options.walkers; ++w)
+    {
+      workspace->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 3 * ne * w, ne));
+      double kinetic = 0, sign = 0, logabs = 0;
+      for (std::size_t begin = 0; begin < ne; begin += targets)
+      {
+        const std::size_t count = std::min(targets, ne - begin);
+        const auto evaluation_start = std::chrono::steady_clock::now();
+        const auto result = options.target_tile ? spatial.evaluateTarget(*workspace, begin, count)
+                                               : spatial.evaluateFull(*workspace);
+        evaluation_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - evaluation_start).count();
+        if (begin == 0) { sign = result.sign; logabs = result.logabs; emit(sign); emit(logabs); }
+        else if (sign != result.sign || logabs != result.logabs)
+          throw std::runtime_error("Target tiles disagree on complete value");
+        for (std::size_t t = 0; t < count; ++t)
+        {
+          for (std::size_t d = 0; d < 3; ++d) emit(result.gradient[3 * t + d]);
+          emit(result.lap_log[t]); emit(result.lap_ratio[t]);
+          kinetic -= 0.5 * result.lap_ratio[t];
+        }
+      }
+      emit(kinetic);
+      if (options.open_coulomb)
+      {
+        // Explicitly requested only for the neutral generated all-electron shapes.
+        // This is never a substitute for NiH's nonlocal pseudopotential energy.
+        auto inverse_distance = [](const double* a, const double* b) {
+          double square = 0;
+          for (std::size_t d = 0; d < 3; ++d) square += (a[d] - b[d]) * (a[d] - b[d]);
+          if (!(square > 0)) throw std::runtime_error("Coincident Coulomb centers");
+          return 1.0 / std::sqrt(square);
+        };
+        double potential = 0;
+        const double* position = positions.data() + 3 * ne * w;
+        for (std::size_t i = 0; i < ne; ++i)
+        {
+          for (std::size_t j = 0; j < i; ++j)
+            potential += inverse_distance(position + 3 * i, position + 3 * j);
+          for (std::size_t a = 0; a < metadata.nuclei; ++a)
+            potential -= model.cfg.charges.x[a] * inverse_distance(position + 3 * i, model.cfg.nuclei.x.data() + 3 * a);
+        }
+        for (std::size_t a = 0; a < metadata.nuclei; ++a)
+          for (std::size_t b = 0; b < a; ++b)
+            potential += model.cfg.charges.x[a] * model.cfg.charges.x[b] *
+                inverse_distance(model.cfg.nuclei.x.data() + 3 * a, model.cfg.nuclei.x.data() + 3 * b);
+        emit(kinetic + potential);
+      }
+      std::cerr << "completed_configuration: " << w + 1 << " electrons: " << ne << std::endl;
+    }
+    report.snapshot("complete_request", {{"workspace_numeric", owner_bytes}, {"model_numeric", metadata.accountedModelNumericBytes()},
+                                          {"logical_positions", positions.capacity() * sizeof(double)},
+                                          {"published_outputs", outputs.capacity() * sizeof(double)}});
+  }
+  if (options.output_path.empty()) throw std::invalid_argument("Complete requests require --output");
+  std::ofstream output(options.output_path + ".values.json");
+  if (!output) throw std::runtime_error("Cannot write complete request values");
+  output << std::setprecision(17) << "{\"elapsed_request_seconds\":"
+         << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+         << ",\"owner_preparation_seconds\":" << preparation_seconds
+         << ",\"numerical_evaluation_seconds\":" << evaluation_seconds
+         << ",\"configurations_completed\":" << options.walkers
+         << ",\"electrons_per_configuration\":" << ne << ",\"values\":[";
+  for (std::size_t i = 0; i < outputs.size(); ++i) output << (i ? "," : "") << outputs[i];
+  output << "]}\n";
+}
+
 /** Measure an isolated native value/spatial/score/kinetic workspace scenario. */
 void runNativeScenario(const Options& options, const ModelMetadata& metadata, MemoryReport& report)
 {
@@ -786,7 +975,10 @@ int run(int argc, char** argv)
 #ifdef PSIFORMER_MEMORY_COMPONENT
   runComponentScenario(options, metadata, report);
 #else
-  runNativeScenario(options, metadata, report);
+  if (options.scenario == "complete_vgl" || options.scenario == "batch_value")
+    runCompleteRequest(options, metadata, report);
+  else
+    runNativeScenario(options, metadata, report);
 #endif
   report.write();
   return EXIT_SUCCESS;
