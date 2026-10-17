@@ -33,15 +33,20 @@ def main():
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--energy-reference-profile", action="store_true",
                         help="Run only one bounded two-iteration CPU ENERGY/reference pilot")
+    parser.add_argument("--energy-reference-restart", action="store_true",
+                        help="Check CPU ENERGY/reference full/split exact restart after pilot qualification")
     args = parser.parse_args()
+    if args.energy_reference_restart:
+        args.energy_reference_profile = True
     executable, fixture = args.qmcpack.resolve(), args.fixture.resolve()
     root = args.workdir or Path(tempfile.mkdtemp(prefix="complex_orbital_mse_"))
     root.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + (60 if args.energy_reference_profile else 120)
+    deadline = time.monotonic() + (60 if args.energy_reference_profile and not args.energy_reference_restart else 120)
     report = {"workdir": str(root), "executable": str(executable), "app_sha256": digest(executable),
               "fixture_sha256": digest(fixture), "scope": "CPU complex fixed-gauge FreeOrbital orbital-MSE only"}
     if args.energy_reference_profile:
-        report["scope"] = "CPU paired ENERGY/reference pilot only; no restart qualification"
+        report["scope"] = ("CPU paired ENERGY/reference exact restart" if args.energy_reference_restart else
+                           "CPU paired ENERGY/reference pilot only; no restart qualification")
     print(f"Evidence: {root}", flush=True)
     active = None
 
@@ -120,6 +125,11 @@ def main():
                 r"difference_error (\S+) ess (\S+) maximum_weight (\S+) valid ([01])", console)]
             assert len(receipts) == 6 * len(rows), receipts
             previous_values, previous_state = None, None
+            if restart is not None:
+                prior = sorted(restart.parent.rglob("*.parameters.h5"))[-1]
+                previous_values = datasets(prior)["values"]
+                prior_bundle = prior.parent / (prior.name.removesuffix(".parameters.h5") + ".checkpoint")
+                previous_state = datasets(next(prior_bundle.glob("*.state.h5")))
             models = sorted(directory.rglob("*.parameters.h5"))
             assert len(models) == len(rows), models
             for ordinal, row in enumerate(rows):
@@ -142,7 +152,7 @@ def main():
                         ("first_moment", "second_moment", "accepted_update_count")]
                 assert all(key in state for key in keys) and np.isfinite(values).all()
                 if alpha == 0:
-                    if ordinal == 0:
+                    if ordinal == 0 and restart is None:
                         assert int(row["parameter_version"]) == 0, row
                     if previous_values is not None:
                         np.testing.assert_array_equal(values, previous_values)
@@ -172,7 +182,7 @@ def main():
 
     try:
         continuous, rows = run("continuous")
-        if args.energy_reference_profile:
+        if args.energy_reference_profile and not args.energy_reference_restart:
             assert digest(fixture) == report["fixture_sha256"], "source fixture changed"
             report["maximum_rss_kib"] = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)",
                 (continuous / "resource_time.txt").read_text()).group(1))
@@ -195,11 +205,16 @@ def main():
         for key in lhs:
             np.testing.assert_array_equal(lhs[key], rhs[key], err_msg=f"exact restart model: {key}")
         first = datasets(models[0])
-        assert np.isfinite(lhs["values"]).all() and np.any(lhs["values"] != first["values"])
+        assert np.isfinite(lhs["values"]).all()
+        if not args.energy_reference_profile or rows[-1]["committed"] == "1":
+            assert np.any(lhs["values"] != first["values"])
         names = [text_value(value) for value in np.asarray(lhs["layout/names"]).reshape(-1)]
         offsets = np.asarray(lhs["layout/offsets"]).reshape(-1)
         imaginary = [slice(int(offsets[i]), int(offsets[i + 1])) for i, name in enumerate(names) if name == "w_imag"]
-        assert imaginary and any(np.any(lhs["values"][part] != first["values"][part]) for part in imaginary)
+        assert imaginary
+        imaginary_changed = any(np.any(lhs["values"][part] != first["values"][part]) for part in imaginary)
+        if not args.energy_reference_profile:
+            assert imaginary_changed
         for pattern in ("*.state.h5", "*.rank_*.h5"):
             left = models[-1].parent / (models[-1].name.removesuffix(".parameters.h5") + ".checkpoint")
             right = restored[-1].parent / (restored[-1].name.removesuffix(".parameters.h5") + ".checkpoint")
@@ -219,17 +234,27 @@ def main():
         def teacher_twist(tree):
             tree.find(".//wavefunction[@name='teacher']//sposet").set("twist", "0.18 -0.11 0.07")
 
-        run("reject_teacher_twist", restart=checkpoint, mutate=teacher_twist,
-            rejection="Complex orbital target twist mismatch")
+        if args.energy_reference_profile:
+            run("reject_cpu_endpoints", iterations=1,
+                mutate=lambda tree: setattr(tree.find("qmc/training/parameter[@name='line_search']"), "text", "endpoints"),
+                rejection="except CPU ENERGY reference search")
+        else:
+            run("reject_teacher_twist", restart=checkpoint, mutate=teacher_twist,
+                rejection="Complex orbital target twist mismatch")
 
         def changed_cell(tree):
             tree.find(".//simulationcell/parameter[@name='lattice']").text = "8.1 0 0 0.8 8 0 0.4 0.6 8"
 
-        run("reject_restart_cell", restart=checkpoint, mutate=changed_cell,
-            rejection="Training checkpoint stage identity or configuration mismatch")
+        if not args.energy_reference_profile:
+            run("reject_restart_cell", restart=checkpoint, mutate=changed_cell,
+                rejection="Training checkpoint stage identity or configuration mismatch")
         assert protected == {str(path): digest(path) for path in split.rglob("*.h5")}
-        report.update(status="PASS", committed_updates=2, samples_per_update=1,
-                      exact_model_optimizer_sampler_restart=True, imaginary_head_changed=True)
+        report.update(status="PASS", committed_updates=sum(int(row["committed"]) for row in rows),
+                      samples_per_update=4 if args.energy_reference_profile else 1,
+                      exact_model_optimizer_sampler_restart=True, imaginary_head_changed=imaginary_changed)
+        if args.energy_reference_profile:
+            report.update(selected_alphas=[float(row["selected_alpha"]) for row in rows],
+                          initial_parameter_equality="not independently observable", exact_restart_qualified=True)
     except BaseException as error:
         report.update(status="FAIL", error=str(error))
         raise

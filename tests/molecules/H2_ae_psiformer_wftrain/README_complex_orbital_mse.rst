@@ -28,3 +28,10 @@ For an initial rejection, version0 and zero moments/count are checked; initial
 accepted parameter equality is not independently observable through this XML.
 Later rejections compare exact previous values and optimizer state. Existing
 isolation units supply candidate ownership proof, not this native pilot.
+
+After the separately qualified pilot, ``--energy-reference-restart`` reuses the
+same settings for continuous2/split1/resume2 under a 120-second aggregate limit.
+It compares model values, Adam state/count, sampler/RNG, nonclock scientific
+history and physical inference exactly, and checks one early CPU endpoints
+rejection. Initial tensor equality remains unobserved; any imaginary-head change
+reported here compares first and second accepted exports, not initialization.
