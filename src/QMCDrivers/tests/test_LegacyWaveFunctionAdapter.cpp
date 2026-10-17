@@ -3516,7 +3516,6 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
         const auto gradient = factor.scoreCovarianceGradient();
         const ParameterGradientView objective{schema.fingerprint(), candidate.version, ReductionDomain::GLOBAL,
             {gradient.data(), gradient.size()}};
-        if (!csf)
         {
           // A finite Jastrow update is not a Ritz state; verify the shared
           // shear independently, then its physical first-order tangent.
