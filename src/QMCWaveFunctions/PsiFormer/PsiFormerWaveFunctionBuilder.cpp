@@ -276,16 +276,18 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
     const auto request = normalizedAcceleratorRequest(gpu);
     const bool explicit_gpu = request == "cuda" || request == "hip";
-    const bool internal_gpu_ecp = explicit_gpu && system == "pseudopotential" &&
-        initialization == "psiformer_complex_periodic_v1" && parameters.empty() && parameter_checkpoint.empty();
+    // A standalone model starts fresh training under the CURRENT validated PP Hamiltonian;
+    // its values are not a sampler restart or a saved PP-provenance guarantee.
+    const bool gpu_ecp = explicit_gpu && system == "pseudopotential" && parameter_checkpoint.empty() &&
+        ((initialization == "psiformer_complex_periodic_v1" && parameters.empty()) || direct_model);
     if ((!explicit_gpu && request != "no" && request != "cpu") || optimization_enabled ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Complex PsiFormer requires CPU or strict cuda/hip, optimize=no and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
-        feature_policy != "periodic_torus_v1" || (system != "all_electron" && !internal_gpu_ecp) ||
+        feature_policy != "periodic_torus_v1" || (system != "all_electron" && !gpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
-      throw std::invalid_argument("Complex PsiFormer requires explicit periodic all-electron native inference metadata");
+      throw std::invalid_argument("Complex PsiFormer requires explicit qualified periodic native metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
     if (explicit_gpu)
       gpu_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_gpu_numeric_bytes"), "max_gpu_numeric_bytes");

@@ -4464,6 +4464,70 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     close(lhs, rhs, 3e-9);
   }
   CHECK(gpu.snapshotParameters().values == accepted.values);
+  // Parameters-only PP import is fresh Gamma training state, not a sampler/PP restart.
+  // Reuse this mathematical fixture's ACTUAL virtual positions/bare weights, but
+  // recompute Gamma ratios: its original nonzero-twist ratios are not transferable.
+  ParticleSet gamma_p(p), loaded_p(p);
+  gamma_p.setTwist(ParticleSet::PosType{}); loaded_p.setTwist(ParticleSet::PosType{});
+  PsiFormerComplexWF exported("pp_import", initialized, gamma_p, source, clone_cap,
+      {}, 64 * 1024 * 1024, {}, "pseudopotential");
+  auto changed = exported.snapshotParameters();
+  changed.values.back() += .002;
+  const auto publication = exported.gpuParameterPublicationRequirements();
+  REQUIRE(exported.publishBudgetedGpuParameters(changed, 0, publication.device_bytes, publication.host_bytes) == 1);
+  const auto export_state = exported.snapshotParameters();
+  const auto export_log = evaluate(exported, gamma_p);
+  const auto export_g = gamma_p.G; const auto export_l = gamma_p.L;
+  const auto path = "psiformer_pp_direct." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  exported.exportModel(path);
+  WaveFunctionComponentBuilder::PSetMap import_sources;
+  import_sources.emplace("ion0", std::make_unique<ParticleSet>(source));
+  PsiFormerWaveFunctionBuilder importer(OHMMS::Controller, loaded_p, import_sources);
+  auto load = [&](const std::string& controls, const std::string& kind = "pseudopotential") {
+    Libxml2Document xml;
+    REQUIRE(xml.parseFromString("<psiformer name='pp_import' parameters='" + path +
+        "' source='ion0' system='" + kind + "' feature_policy='periodic_torus_v1' "
+        "optimize='no' max_clone_numeric_bytes='8388608' " + controls + "/>"));
+    return importer.buildComponent(xml.getRoot());
+  };
+  CHECK_THROWS_AS(load("gpu='no' twist='0 0 0'"), std::invalid_argument);
+  CHECK_THROWS_AS(load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='.1 0 0'"), std::invalid_argument);
+  CHECK_THROWS_AS(load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='0 0 0'", "all_electron"), std::invalid_argument);
+  auto loaded_base = load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='0 0 0'");
+  auto* loaded = dynamic_cast<PsiFormerComplexWF*>(loaded_base.get());
+  REQUIRE(loaded != nullptr); REQUIRE(loaded->gpuInferenceEnabled());
+  CHECK(loaded->isPseudopotentialSystem());
+  CHECK(export_state.version == 1); CHECK(loaded->snapshotParameters().version == 0);
+  CHECK(loaded->snapshotParameters().values == export_state.values);
+  close(evaluate(*loaded, loaded_p), export_log, 3e-9);
+  for (int e = 0; e < loaded_p.getTotalNum(); ++e)
+  {
+    close(loaded_p.L[e], export_l[e], 3e-9);
+    for (int d = 0; d < 3; ++d) close(loaded_p.G[e][d], export_g[e][d], 3e-9);
+  }
+  std::array<C, 2> imported_energy{
+      exported.observeCoulombEnergy(gamma_p, 0).kinetic,
+      loaded->observeCoulombEnergy(loaded_p, 0).kinetic};
+  for (const auto& point : grid)
+    if (point.sample == 0)
+      for (std::size_t owner = 0; owner < 2; ++owner)
+      {
+        auto& target = owner ? loaded_p : gamma_p;
+        VirtualParticleSet vp(target);
+        ParticleSet::PosType delta;
+        for (int d = 0; d < 3; ++d) delta[d] = point.replacement_position[d] - target.R[point.electron][d];
+        vp.makeMoves(target, point.electron, std::vector<ParticleSet::PosType>{delta});
+        std::vector<WaveFunctionComponent::ValueType> ratios(1);
+        (owner ? *loaded : exported).evaluateRatios(vp, ratios);
+        imported_energy[owner] += point.bare_weight * ratios[0];
+      }
+  // This fixture's complete Hamiltonian is T+NLPP; native LiH/Ewald proof is separate.
+  close(imported_energy[1], imported_energy[0], 3e-9);
+  CHECK(exported.snapshotParameters().version == export_state.version);
+  CHECK(exported.snapshotParameters().values == export_state.values);
+  CHECK(gpu.snapshotParameters().values == accepted.values);
+  std::filesystem::remove(path);
+  std::printf("COMPLEX_PP_MODEL_FILE PASS fresh_version0 exact_values Gamma_full_GL complete_same_grid_energy source_unchanged\n");
   const int mass_attribute = p.getSpeciesSet().addAttribute("mass");
   p.getSpeciesSet()(mass_attribute, 0) = 2; p.resetGroups();
   CHECK_THROWS(gpu.observeCapturedLocalEnergy(p, *op, 0, ham.getLocalPotential()));
