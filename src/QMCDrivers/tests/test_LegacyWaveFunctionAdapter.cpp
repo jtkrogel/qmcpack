@@ -4823,7 +4823,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         checkClose(derivativeValue(evaluator->findMSD().front().get().evaluateAcceptedReferenceOrbitalRatioDerivatives(
             private_particles, zero->electron, zero->electron, adapter.registrationVariables(),
             {derivative.data(), derivative.size()})), {});
-        for (const auto value : derivative) CHECK(std::isfinite(std::real(value)) && std::isfinite(std::imag(value)));
+        for (const auto value : derivative) CHECK((std::isfinite(std::real(value)) && std::isfinite(std::imag(value))));
         CHECK(std::any_of(derivative.begin(), derivative.end(), [](auto x) { return std::abs(x) > 1e-8; }));
         // Accepted reference is regular but its py excitation is exactly zero.
         replay->prepareSample(0);
