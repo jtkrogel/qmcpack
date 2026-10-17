@@ -2129,6 +2129,12 @@ struct Parameters
    */
   PreparedFlatValues prepare_same_version_flat_values(std::vector<double>&& new_values, size_t expected_version)
   {
+    // Moving live canonical/leaf storage would mutate the model during preparation.
+    if (&new_values == &values)
+      throw std::invalid_argument("PsiFormer mirror download aliases live canonical storage");
+    for (const auto& entry : nodes)
+      if (entry.second && &new_values == &entry.second->value.x)
+        throw std::invalid_argument("PsiFormer mirror download aliases a live graph leaf");
     auto leaves = resolve_flat_replacement(new_values, expected_version, false);
     return PreparedFlatValues(*this, expected_version, std::move(new_values), std::move(leaves), false);
   }

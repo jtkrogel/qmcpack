@@ -399,6 +399,16 @@ TEST_CASE("PsiFormer same-version mirror refresh preserves graph storage",
   CHECK(parameters.nodes.at({"tiny", "bias"}) == bias);
 
   const auto accepted = parameters.flat_values();
+  CHECK_THROWS_AS(parameters.prepare_same_version_flat_values(std::move(parameters.values), 3), std::invalid_argument);
+  CHECK(parameters.flat_values() == accepted);
+  CHECK(parameters.values.data() == flat_storage);
+  pf::Parameters sole({1.0, 2.0}, {{"tiny", "only", {2}, 0, 2}});
+  const auto sole_leaf = sole.nodes.at({"tiny", "only"});
+  const auto* sole_storage = sole_leaf->value.x.data();
+  CHECK_THROWS_AS(sole.prepare_same_version_flat_values(std::move(sole_leaf->value.x), 0), std::invalid_argument);
+  CHECK(sole_leaf->value.x == sole.flat_values());
+  CHECK(sole_leaf->value.x.data() == sole_storage);
+  CHECK(sole.version() == 0);
   CHECK_THROWS_AS(parameters.prepare_same_version_flat_values(std::vector<double>(accepted), 2), std::runtime_error);
   CHECK_THROWS_AS(parameters.prepare_same_version_flat_values({1.0}, 3), std::invalid_argument);
   auto nonfinite = accepted;
