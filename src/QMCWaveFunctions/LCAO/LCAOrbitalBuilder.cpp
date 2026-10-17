@@ -244,14 +244,23 @@ void LCAOrbitalBuilder::checkSourceIdentity(hdf_archive& archive)
   if (!error.empty()) throw std::runtime_error(error);
   if (!file_identity_)
   {
-    myComm->bcast(hex);
-    std::shared_ptr<const LCAOFileImageIdentity> prepared;
+    // Preflight the bounded receive allocation before broadcasting its bytes;
+    // std::string's generic broadcast otherwise resizes on receiving ranks.
+    int extent = hex.size();
+    myComm->bcast(extent);
+    std::shared_ptr<LCAOFileImageIdentity> prepared;
     int ready = 1;
-    try { prepared = std::make_shared<const LCAOFileImageIdentity>(LCAOFileImageIdentity{h5_path, std::move(hex)}); }
+    try
+    {
+      hex.resize(extent);
+      prepared = std::make_shared<LCAOFileImageIdentity>(LCAOFileImageIdentity{h5_path, {}});
+    }
     catch (const std::exception&) { ready = 0; }
     myComm->allreduce(ready);
     if (ready != myComm->size())
       throw std::runtime_error("LCAO file-image record allocation failed on a rank");
+    myComm->bcast(hex.data(), extent);
+    prepared->image_hex.swap(hex);
     file_identity_ = std::move(prepared);
   }
 }
