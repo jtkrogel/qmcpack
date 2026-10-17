@@ -4391,10 +4391,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 3; ++model)
+  for (int model = 0; model < 5; ++model)
   {
     CAPTURE(model);
-    const bool many = model == 2;
+    const bool md = model >= 3, node = model == 1 || model == 4;
+    const bool many = model >= 2;
     ParticleSetPool pool(OHMMS::Controller);
     Libxml2Document particle_xml;
     REQUIRE(particle_xml.parseFromString(R"(<qmcsystem>
@@ -4433,6 +4434,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       particles.R[0] = {1, 0, 0};
       particles.R[1] = {-2, 0, 0};
     }
+    if (model == 4)
+    {
+      particles.R[0] = {1, 1, 0}; particles.R[1] = {0, 0, 1};
+      particles.R[2] = {-1, 1, 0}; particles.R[3] = {0, 0, 2};
+    }
     const std::string coefficients = many ? "1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1" :
         model == 0 ? "1 0 0 0  0 1 0 0  0 0 1 0" : node_coefficients;
     REQUIRE(!coefficients.empty());
@@ -4460,14 +4466,36 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
           {"elementType=\"Be\"", "elementType=\"C\""}, {"size=\"3\"", "size=\"4\""}}})
         for (std::size_t position = 0; (position = wavefunction_xml.find(before, position)) != std::string::npos; position += after.size())
           wavefunction_xml.replace(position, before.size(), after);
+    if (md)
+    {
+      const auto begin = wavefunction_xml.find("<rotated_sposet");
+      const auto end = wavefunction_xml.find("</rotated_sposet>", begin) + std::string("</rotated_sposet>").size();
+      auto down = wavefunction_xml.substr(begin, end - begin);
+      for (const auto& [before, after] : {std::pair{"name=\"rot\"", "name=\"rot_dn\""},
+                                       std::pair{"name=\"base\"", "name=\"base_dn\""}})
+        down.replace(down.find(before), std::string(before).size(), after);
+      wavefunction_xml.insert(end, down);
+      const auto first = wavefunction_xml.find("<slaterdeterminant>"),
+                 last = wavefunction_xml.find("</slaterdeterminant>") + std::string("</slaterdeterminant>").size();
+      wavefunction_xml.replace(first, last - first, R"(<multideterminant optimize="no" spo_0="rot" spo_1="rot_dn" algorithm="precomputed_table_method">
+        <detlist size="2" type="DETS" nc0="0" ne0="2" nc1="0" ne1="2" nstates="4" cutoff="1e-20">
+          <ci id="CI0" coeff="1" occ0="1100" occ1="1100"/>
+          <ci id="CI1" coeff="0.1" occ0="1010" occ1="1010"/>
+        </detlist></multideterminant>)");
+    }
     REQUIRE(definition.parseFromString(wavefunction_xml));
     WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
     auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
     REQUIRE(source);
-    const auto rotated = [](TrialWaveFunction& wf) -> RotatedSPOs& {
+    const auto rotated = [md](TrialWaveFunction& wf, int spin = 0) -> RotatedSPOs& {
+      if (md) return dynamic_cast<RotatedSPOs&>(*wf.findMSD().front().get().getDet(spin).getPhi());
       auto& slater = wf.findSD().front().get();
       REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
       return dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
+    };
+    const auto isolate = [&](TrialWaveFunction& wf) {
+      for (int spin = 0; spin < (md ? 2 : 1); ++spin) rotated(wf, spin).isolateOptimizationState();
+      if (md) wf.findMSD().front().get().isolateOptimizationState();
     };
     // Cartesian input expands a complete p shell. Old models select three
     // orbitals; neutral carbon retains the full four-orbital identity bank.
@@ -4480,15 +4508,27 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       for (int column = 0; column < 4; ++column)
         CHECK((*initial_lcao.C)(row, column) == (column == selected[row] ? 1.0 : 0.0));
     particles.update();
+    ParticleSet ordinary_particles(particles);
+    std::unique_ptr<TrialWaveFunction> ordinary, ordinary_sibling;
+    if (md)
+    {
+      // Retain ordinary source/sibling state. Only the detached capture
+      // object and its private descendants receive the numerical opt-in.
+      ordinary = source->makeClone(ordinary_particles);
+      ordinary_sibling = ordinary->makeClone(ordinary_particles);
+      isolate(*source);
+      source->findMSD().front().get().enableAcceptedReferenceOrbitalVirtualRatios();
+      CHECK_FALSE(ordinary->findMSD().front().get().usesAcceptedReferenceOrbitalVirtualRatios());
+    }
     source->evaluateLog(particles);
     LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
-    REQUIRE(adapter.snapshotParameters().values.size() == (many ? 8 : 6));
+    REQUIRE(adapter.snapshotParameters().values.size() == (md ? 16 : many ? 8 : 6));
     ParticleSet unsupported_j3_particles(particles);
     auto unsupported_j3 = source->makeClone(unsupported_j3_particles);
     addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
     CHECK_THROWS_WITH(adapter.validateNonLocalECPProfile(*unsupported_j3, unsupported_j3_particles),
         Catch::Matchers::ContainsSubstring("fixed single Slater without active orbitals"));
-    ECPComponentBuilder builder(many ? "C" : "Be", OHMMS::Controller, model == 1 ? 3 : 2, 1);
+    ECPComponentBuilder builder(many ? "C" : "Be", OHMMS::Controller, node ? 3 : 2, 1);
     const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
         (many ? "tests/pseudopotentials_for_tests/C.BFD.xml" : "tests/pseudopotentials_for_tests/Be.BFD.xml");
     REQUIRE(builder.read_pp_file(asset.string()));
@@ -4511,14 +4551,14 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       QMCTraits::FullPrecRealType operator()() override { ++draws; return 0; }
       std::size_t draws = 0;
     } zero_rng;
-    nl->setRandomGenerator(model != 1 ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
+    nl->setRandomGenerator(!node ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
     ResourceCollection ps_resources("orb_ecp_P"), wf_resources("orb_ecp_WF"), ham_resources("orb_ecp_H");
     particles.createResource(ps_resources);
     source->createResource(wf_resources);
     ham.createResource(ham_resources);
     const auto positions = particles.R;
     const auto ion_positions = ions.R;
-    for (int step = 0; step < (model == 0 ? 3 : 1); ++step)
+    for (int step = 0; step < (model == 0 || model == 3 ? 3 : 1); ++step)
     {
       CAPTURE(step);
       if (step > 0)
@@ -4527,10 +4567,17 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         candidate.values[0] += step == 1 ? 0.03 : -0.02;
         candidate.values[1] += step == 1 ? -0.01 : 0.04;
         candidate.values[2] += 0.002;
+        if (md)
+        {
+          candidate.values[6] += step == 1 ? -0.025 : 0.015;
+          candidate.values[7] += step == 1 ? 0.01 : -0.035;
+        }
         adapter.installSnapshot(*source, particles, candidate);
         adapter.publishParameters(candidate, candidate.version);
-        if (step == 2)
+        if (step == 2 && !md)
           CHECK(rotated(*source).fullRotationCoordinates()[2] != 0.0);
+        if (step == 2 && md)
+          for (int spin = 0; spin < 2; ++spin) CHECK(rotated(*source, spin).fullRotationCoordinates()[3] != 0.0);
       }
       const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
       const auto source_log = source->getLogPsi();
@@ -4539,11 +4586,14 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       const auto source_coefficients = *source_lcao.C;
       const auto source_reference = source_lcao.originalRotationCoefficients();
       const auto source_full = rotated(*source).fullRotationCoordinates();
+      const auto down_coefficients = md ? *dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).C : source_coefficients;
+      const auto down_reference = md ? dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).originalRotationCoefficients() : source_reference;
+      const auto down_full = md ? rotated(*source, 1).fullRotationCoordinates() : source_full;
       ParticleSet private_particles(particles), sibling_particles(particles);
       auto evaluator = source->makeClone(private_particles), sibling = source->makeClone(sibling_particles);
       private_particles.update();
       sibling_particles.update();
-      rotated(*evaluator).isolateOptimizationState();
+      isolate(*evaluator);
       sibling->evaluateLog(sibling_particles);
       const auto sibling_log = sibling->getLogPsi();
       const auto sibling_energy = kineticEnergy(sibling_particles);
@@ -4587,13 +4637,13 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       }
       const auto rng_after_capture = rng;
       const auto zero_draws_after_capture = zero_rng.draws;
-      if (model == 1) CHECK(zero_draws_after_capture > 0);
+      if (node) CHECK(zero_draws_after_capture > 0);
       const auto quadrature = nl->captureQuadratureState();
       auto record = consumer->releaseJVPReplay();
       REQUIRE(record->gridFingerprint() == accepted.grid_fingerprint);
       const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
       REQUIRE(points.size() >= 2);
-      if (model == 1)
+      if (node)
       {
         std::ostringstream diagnostic;
         diagnostic << std::setprecision(17);
@@ -4602,7 +4652,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
           private_particles.R = positions;
           for (int d = 0; d < 3; ++d) private_particles.R[point.electron][d] = point.replacement_position[d];
           private_particles.update();
-          SPOSet::ValueVector values(3);
+          SPOSet::ValueVector values(many ? 4 : 3);
           rotated(*evaluator).Phi_->evaluateValue(private_particles, point.electron, values);
           diagnostic << "electron=" << point.electron << " q=" << point.replacement_position[0] << ','
                      << point.replacement_position[1] << ',' << point.replacement_position[2]
@@ -4619,15 +4669,46 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       for (int electron = 0; electron < particles.getTotalNum(); ++electron)
         for (int other = 0; other < electron; ++other)
           fixed_potential += 1.0 / std::sqrt(dot(positions[electron] - positions[other], positions[electron] - positions[other]));
+      // Independent physical MD numerator: signed occupied 2x2 matrices,
+      // fixed CI contraction and separately evaluated J, including at nodes.
+      const auto dense_value = [&](TrialWaveFunction& wf, ParticleSet& p) {
+        std::array<QMCTraits::ValueType, 2> products{1, 1};
+        for (int spin = 0; spin < 2; ++spin)
+        {
+          SPOSet::ValueMatrix values(2, 4), laps(2, 4);
+          SPOSet::GradMatrix gradients(2, 4);
+          rotated(wf, spin).evaluate_notranspose(p, 2 * spin, 2 * spin + 2, values, gradients, laps);
+          for (int term = 0; term < 2; ++term)
+            products[term] *= values(0, 0) * values(1, 1 + term) - values(0, 1 + term) * values(1, 0);
+        }
+        double j = 0;
+        p.G = QMCTraits::GradType{}; p.L = QMCTraits::ValueType{};
+        for (auto& component : wf.getOrbitals())
+          if (!component->isFermionic()) j += component->evaluateLog(p, p.G, p.L).real();
+        const auto& c = wf.findMSD().front().get().get_C();
+        return (c[0] * products[0] + c[1] * products[1]) * std::exp(j);
+      };
       // Independent signed complete-ratio FD oracle uses ordinary proposed
       // moves and rejects them, never a virtual-point inverse/logarithm.
       const auto fixed_grid_energy = [&](const StructuredParameterSnapshot& candidate, bool kinetic) {
         ParticleSet p(particles);
         auto wf = source->makeClone(p);
         p.update();
-        rotated(*wf).isolateOptimizationState();
+        isolate(*wf);
         adapter.installSnapshot(*wf, p, candidate);
         DerivativeValue energy = kinetic ? kineticEnergy(p) + fixed_potential : DerivativeValue{};
+        if (md)
+        {
+          const auto accepted_value = dense_value(*wf, p);
+          for (const auto& point : points)
+          {
+            p.R = positions;
+            for (int d = 0; d < 3; ++d) p.R[point.electron][d] = point.replacement_position[d];
+            p.update();
+            energy += point.bare_weight * derivativeValue(dense_value(*wf, p) / accepted_value);
+          }
+          return energy;
+        }
         for (const auto& point : points)
         {
           auto replacement = p.R[point.electron];
@@ -4644,9 +4725,9 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         ParticleSet p(particles);
         auto wf = source->makeClone(p);
         p.update();
-        rotated(*wf).isolateOptimizationState();
+        isolate(*wf);
         adapter.installSnapshot(*wf, p, candidate);
-        return wf->getLogPsi();
+        return md ? std::log(std::abs(dense_value(*wf, p))) : wf->getLogPsi();
       };
       const std::array<VJPCoefficientChannel, 3> channels{{
           {"total", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), total_mask},
@@ -4675,7 +4756,64 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         dual += direction[parameter] * rows.result()[0][parameter];
         score_dual += direction[parameter] * rows.result()[2][parameter];
       }
-      if (model == 1)
+      if (node && md)
+      {
+        // A zero accepted spatial-reference derivative must use only the
+        // private fallback. Independently difference the full physical Psi,
+        // not log(Psi), to check its complete kinetic energy.
+        bool zero_spatial_reference = false;
+        for (int spin = 0; spin < 2; ++spin)
+        {
+          const auto& det = source->findMSD().front().get().getDet(spin);
+          CHECK(det.usesPrivateAcceptedReferenceOrbitalRows());
+          CHECK_FALSE(ordinary->findMSD().front().get().getDet(spin).usesPrivateAcceptedReferenceOrbitalRows());
+          CHECK_FALSE(ordinary_sibling->findMSD().front().get().getDet(spin).usesPrivateAcceptedReferenceOrbitalRows());
+          for (int i = 0; i < 2; ++i)
+            for (int d = 0; d < 3; ++d) zero_spatial_reference |= det.getGrads()(0, i)[d] == QMCTraits::ValueType{};
+        }
+        REQUIRE(zero_spatial_reference);
+        ParticleSet spatial_particles(particles);
+        auto spatial = source->makeClone(spatial_particles);
+        isolate(*spatial);
+        spatial_particles.update(); adapter.installSnapshot(*spatial, spatial_particles, *snapshot);
+        const auto psi = dense_value(*spatial, spatial_particles);
+        QMCTraits::ValueType laplacian{};
+        constexpr double h = 1e-4;
+        for (int electron = 0; electron < 4; ++electron)
+          for (int dimension = 0; dimension < 3; ++dimension)
+          {
+            spatial_particles.R = positions; spatial_particles.R[electron][dimension] += h; spatial_particles.update();
+            const auto plus = dense_value(*spatial, spatial_particles);
+            spatial_particles.R = positions; spatial_particles.R[electron][dimension] -= h; spatial_particles.update();
+            laplacian += plus + dense_value(*spatial, spatial_particles) - 2.0 * psi;
+          }
+        CHECK(std::real(-0.5 * laplacian / (h * h * psi)) == Catch::Approx(source_energy.real()).epsilon(3e-5).margin(3e-6));
+        const auto zero = std::find_if(points.begin(), points.end(), [](const auto& p) { return p.complete_ratio == DerivativeValue{}; });
+        REQUIRE(zero != points.end());
+        replay->prepareSample(0);
+        adapter.installSnapshot(*evaluator, private_particles, *snapshot);
+        for (int d = 0; d < 3; ++d) private_particles.R[zero->electron][d] = zero->replacement_position[d];
+        private_particles.update();
+        SPOSet::ValueMatrix values(2, 4), laps(2, 4);
+        SPOSet::GradMatrix gradients(2, 4);
+        const int spin = zero->electron / 2;
+        rotated(*evaluator, spin).evaluate_notranspose(private_particles, 2 * spin, 2 * spin + 2, values, gradients, laps);
+        for (int term = 0; term < 2; ++term)
+          CHECK(values(0, 0) * values(1, 1 + term) - values(0, 1 + term) * values(1, 0) == QMCTraits::ValueType{});
+        std::vector<QMCTraits::ValueType> derivative(snapshot->values.size());
+        CHECK(evaluator->findMSD().front().get().evaluateAcceptedReferenceOrbitalRatioDerivatives(
+            private_particles, zero->electron, zero->electron, adapter.registrationVariables(),
+            {derivative.data(), derivative.size()}) == QMCTraits::ValueType{});
+        CHECK(std::any_of(derivative.begin(), derivative.end(), [](auto x) { return std::abs(x) > 1e-8; }));
+        // Accepted reference is regular but its py excitation is exactly zero.
+        replay->prepareSample(0);
+        private_particles.R[0] = {1, 0, 0}; private_particles.update();
+        evaluator->evaluateLog(private_particles);
+        CHECK_THROWS_WITH(evaluator->findMSD().front().get().validateAcceptedOrbitalDerivativeState(),
+            "Private orbital ECP accepted excitation matrix is singular or nonfinite");
+        replay->prepareSample(0);
+      }
+      else if (model == 1)
       {
         // The zero-ratio knot itself contributes a finite NONZERO derivative.
         const auto zero = std::find_if(points.begin(), points.end(), [](const auto& p) { return p.complete_ratio == DerivativeValue{}; });
@@ -4727,6 +4865,29 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       CHECK(*source_lcao.C == source_coefficients);
       CHECK(source_lcao.originalRotationCoefficients() == source_reference);
       CHECK(rotated(*source).fullRotationCoordinates() == source_full);
+      if (md)
+      {
+        auto& down = dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_);
+        CHECK(*down.C == down_coefficients);
+        CHECK(down.originalRotationCoefficients() == down_reference);
+        CHECK(rotated(*source, 1).fullRotationCoordinates() == down_full);
+        CHECK_FALSE(ordinary->findMSD().front().get().usesAcceptedReferenceOrbitalVirtualRatios());
+        CHECK_FALSE(ordinary_sibling->findMSD().front().get().usesAcceptedReferenceOrbitalVirtualRatios());
+        for (int spin = 0; spin < 2; ++spin)
+        {
+          CHECK(dynamic_cast<LCAOrbitalSet&>(*rotated(*ordinary, spin).Phi_).C !=
+                dynamic_cast<LCAOrbitalSet&>(*rotated(*source, spin).Phi_).C);
+          const auto& original = dynamic_cast<LCAOrbitalSet&>(*rotated(*ordinary, spin).Phi_);
+          for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+            {
+              CHECK((*original.C)(row, column) == (row == column ? 1.0 : 0.0));
+              CHECK(original.originalRotationCoefficients()(row, column) == (row == column ? 1.0 : 0.0));
+            }
+          CHECK(original.C == dynamic_cast<LCAOrbitalSet&>(*rotated(*ordinary_sibling, spin).Phi_).C);
+          CHECK(rotated(*ordinary, spin).fullRotationCoordinates() == std::vector<double>(6, 0));
+        }
+      }
       for (int e = 0; e < particles.getTotalNum(); ++e)
         for (int d = 0; d < 3; ++d) CHECK(particles.R[e][d] == positions[e][d]);
       for (int ion = 0; ion < ions.getTotalNum(); ++ion) CHECK(ions.R[ion] == ion_positions[ion]);
