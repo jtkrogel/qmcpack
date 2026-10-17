@@ -1587,6 +1587,11 @@ void WFTrainBatched::process(xmlNodePtr node)
           (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
         throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7 (DEVICE authority B>0), fixed unmodified step and explicit caps");
       validateResidentCoulomb(population_.get_golden_hamiltonian());
+      if (resident_adam_budget_)
+        resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
+      else
+        resident_sr_incremental_bytes_ = device_provider->prepareResidentEnergySR(crowds_.front()->size(), resident_sr_budget_);
+      // Authority activation borrows the admitted C3 lane; it allocates no new image.
       if (resident_device_authority_)
       {
         const auto bytes = device_provider->prepareResidentDeviceAuthority();
@@ -1599,10 +1604,6 @@ void WFTrainBatched::process(xmlNodePtr node)
                   << ", successor DEVICE=" << resident_successor_cap_ << ", cold HOST mirror=" << bytes.cold_host_bytes
                   << "; default HOST path unchanged; warm publication uses metadata only" << std::endl;
       }
-      if (resident_adam_budget_)
-        resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
-      else
-        resident_sr_incremental_bytes_ = device_provider->prepareResidentEnergySR(crowds_.front()->size(), resident_sr_budget_);
     }
     // ContextForSteps only borrows an RNG reference; all MC draws follow admission.
     createStepContexts(crowds_.size());
