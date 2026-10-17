@@ -991,6 +991,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     return result;
   };
   const auto vgl = positive("PSIFORMER_GPU_VGL_TARGETS");
+  const auto parallel_trace_bytes = positive("PSIFORMER_GPU_VGL_PARALLEL_TRACE_BYTES");
   const auto kinetic = positive("PSIFORMER_GPU_KINETIC_TARGETS");
   const auto lifted = positive("PSIFORMER_GPU_LIFTED_CHANNELS");
   const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
@@ -1016,6 +1017,8 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   }();
   if ((select_vgl && vgl) || (select_kinetic && kinetic))
     throw std::invalid_argument("GPU target selection cannot override explicit targets for the same family");
+  if (parallel_trace_bytes && (!vgl || select_vgl || select_kinetic || active_inference_crowds > 1))
+    throw std::invalid_argument("Parallel GPU VGL traces require explicit VGL targets, no automatic selection and one crowd");
   if (lifted && !kinetic && !select_kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic || select_vgl || select_kinetic) ? (!bytes || !work) : (bytes || work))
@@ -1034,11 +1037,16 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
     throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open sampling");
   if (vgl || select_vgl)
-    preparation.vgl = {vgl, bytes, work};
+    preparation.vgl = {vgl, bytes, work, parallel_trace_bytes};
   if (kinetic || select_kinetic)
     preparation.kinetic = {kinetic, bytes, work, lifted};
   preparation = psiformer::device::resolveDeviceTargetSelection(plan, preparation);
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
+  if (parallel_trace_bytes)
+    app_log() << "  PsiFormer parallel VGL B1 preallocation: trace_workspace_limit_bytes=" << parallel_trace_bytes
+              << ", composite_owner_device_bytes="
+              << psiformer::device::estimatePreparedTargetVglCost(plan, 1, preparation.vgl).device_workspace_bytes
+              << "; excludes shared image and vendor/private reserve" << std::endl;
   if (select_vgl)
     psiformer::device::reportDeviceTargetSelection(app_log(), "VGL_B1_preflight", plan, 1,
         preparation.vgl.max_targets, psiformer::device::estimatePreparedTargetVglCost(plan, 1, preparation.vgl),

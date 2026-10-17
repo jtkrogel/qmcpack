@@ -70,6 +70,7 @@ public:
     std::lock_guard<std::mutex> lock(control_mutex_);
     // B=1 startup admission cannot authorize a later larger numerical owner.
     const auto preparation = resolveDeviceTargetSelection(image_->plan(), preparation_, capacity);
+    validateDeviceExecutionPreparation(image_->plan(), preparation, capacity);
     if (preparation_.select_vgl_targets)
       reportDeviceTargetSelection(std::cout, "VGL_actual_owner", image_->plan(), capacity,
           preparation.vgl.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation.vgl),

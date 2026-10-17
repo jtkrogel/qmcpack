@@ -158,6 +158,14 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     try { (void)resolveDeviceTargetSelection(plan, prepared); }
     catch (const std::invalid_argument&) { auto_denied = true; }
     if (!auto_denied) throw std::runtime_error("Parallel VGL admitted implicit target selection");
+    prepared.select_vgl_targets = false;
+    PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, prepared);
+    const auto before_context = metrics.snapshot();
+    bool batch_denied = false;
+    try { (void)backend.prepare(2); }
+    catch (const std::invalid_argument&) { batch_denied = true; }
+    if (!batch_denied || metrics.snapshot().allocation_calls != before_context.allocation_calls)
+      throw std::runtime_error("Parallel VGL actual B2 owner allocated before rejection");
     const auto reject = [&](TargetVglPreparation bad, bool retained = false, std::size_t batch = 1) {
       const auto before = metrics.snapshot();
       bool denied = false;
