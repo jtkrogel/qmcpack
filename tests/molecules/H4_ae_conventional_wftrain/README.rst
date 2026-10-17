@@ -126,13 +126,21 @@ The component whitelist is still only fixed-orbital MSD plus TwoBodyJastrow,
 real CPU and all-electron. No mixed LM/ALM, orbital, ECP or conventional GPU
 qualification follows from this result.
 
-The candidate ``--mdj-alm`` mode reuses this exact DETS P9 fixture with
+The ``--mdj-alm`` mode reuses this exact DETS P9 fixture with
 the reviewed mixed fixed-reference normalization. It selects one ALM-only
 full import/re-export/inference/strict initialized-split workflow, two committed
 32-sample updates and explicit CI1/J2 changes while C0=.6 and the SPO stay fixed.
 The bounded controls are damping .01, Krylov 64 iterations/256 applications/
 15 seconds/relative tolerance 1e-6, augmented dimension 10 and ALM inner
-iterations 32/restart 10. Native qualification and registration are pending.
+iterations 32/restart 10. Native round 110 passed on its first attempt with
+application source ``74faae29447276004e0cd03ea69ab4ad80f82ee1`` and SHA256
+``51cd57f38ff4545d97d415442a1d754f93c873a92a7dfa8e1ee414f2b44cfe6c``;
+executed checker SHA256 is
+``d8a194011ff154e4776b7286ccffe4f9ddb99f95322ca0a61cc398ae1e4d1491``.
+Both updates committed with 32 samples, and strict initialized restart passed.
+One guarded real/full-precision/nonoffload/Python CTest has a 300-second limit.
+CSF has mathematical coverage only here, not native ALM qualification. No
+native LM, CSF, orbital or ECP extension is implied by this ALM result.
 Historical AE mixed-LM guard-rejection statements above describe their original
 sources; the new numerical policy is separately reviewed, while ECP/orbital
 mixed LM rejection remains in force. No old default or strict comparison changes.
