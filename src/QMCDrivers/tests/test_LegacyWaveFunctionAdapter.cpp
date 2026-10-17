@@ -2635,6 +2635,32 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   H5Fclose(linked_file);
   Libxml2Document linked;
   CHECK_THROWS_WITH(build(linked, xml(temporary)), Catch::Matchers::ContainsSubstring("rejects non-hard links"));
+  const auto unsupported_dataset = [&](bool virtual_storage) {
+    const hid_t file = H5Fopen(temporary.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    REQUIRE(file >= 0);
+    if (H5Lexists(file, "external", H5P_DEFAULT) > 0)
+      REQUIRE(H5Ldelete(file, "external", H5P_DEFAULT) >= 0);
+    if (H5Lexists(file, "unsupported", H5P_DEFAULT) > 0)
+      REQUIRE(H5Ldelete(file, "unsupported", H5P_DEFAULT) >= 0);
+    const hsize_t extent = 1;
+    const hid_t space = H5Screate_simple(1, &extent, nullptr);
+    const hid_t properties = H5Pcreate(H5P_DATASET_CREATE);
+    if (virtual_storage)
+      REQUIRE(H5Pset_virtual(properties, space, "untracked.h5", "/data", space) >= 0);
+    else
+      REQUIRE(H5Pset_external(properties, "untracked.raw", 0, sizeof(double)) >= 0);
+    const hid_t dataset = H5Dcreate2(file, "unsupported", H5T_NATIVE_DOUBLE, space,
+                                   H5P_DEFAULT, properties, H5P_DEFAULT);
+    REQUIRE(dataset >= 0);
+    H5Dclose(dataset);
+    H5Pclose(properties);
+    H5Sclose(space);
+    H5Fclose(file);
+    Libxml2Document input;
+    CHECK_THROWS_WITH(build(input, xml(temporary)), Catch::Matchers::ContainsSubstring("external storage and virtual datasets"));
+  };
+  unsupported_dataset(false);
+  unsupported_dataset(true);
   // Qualification of one recognized collection never authorizes unrelated
   // paths elsewhere in the model XML.
   xmlSetProp(definition.getRoot(), BAD_CAST "filename", BAD_CAST "unqualified.h5");
