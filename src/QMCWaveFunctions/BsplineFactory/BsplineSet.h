@@ -31,6 +31,14 @@ class SplineSetReader;
 template<class ST>
 class HybridRepSetReader;
 
+/// Immutable source and realized-table provenance; no coefficient table copy.
+struct BsplineSourceIdentity
+{
+  std::string source_report, effective_table_fingerprint;
+  std::shared_ptr<const std::string> image_hex;
+  std::size_t used_coefficient_bytes;
+};
+
 /** BsplineSet is the base class for SplineC2C, SplineC2R, SplineR2R.
  * Its derived template classes manage the storage and evaluation at given precision.
  * BsplineSet also implements a few fallback routines in case optimized implementation is not necessary in the derived class.
@@ -52,6 +60,7 @@ protected:
   std::vector<SPOSet::PosType> kPoints;
   ///remap splines to orbitals
   aligned_vector<int> BandIndexMap;
+  std::shared_ptr<const BsplineSourceIdentity> source_identity_;
 
 public:
   BsplineSet(const std::string& my_name, size_t size, const Lattice& prim_lattice)
@@ -59,6 +68,9 @@ public:
   {}
 
   virtual std::string getKeyword() const = 0;
+
+  /// Null means provenance is unsupported, not that ordinary evaluation failed.
+  const std::shared_ptr<const BsplineSourceIdentity>& sourceIdentity() const noexcept { return source_identity_; }
 
   auto& getHalfG() const { return HalfG; }
 

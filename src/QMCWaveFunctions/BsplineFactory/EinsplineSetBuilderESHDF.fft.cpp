@@ -42,11 +42,58 @@ bool sortByIndex(BandInfo leftB, BandInfo rightB)
     return (leftB.BandIndex < rightB.BandIndex);
 };
 
+std::string EinsplineSetBuilder::captureSourceImage(hdf_archive& archive) noexcept
+{
+  // Unsupported storage and allocation failures only disable the new record.
+  try
+  {
+    const hid_t file = archive.getFileID(), properties = H5Fget_access_plist(file);
+    const bool serial = properties >= 0 && H5Pget_driver(properties) == H5FD_SEC2;
+    if (properties >= 0) H5Pclose(properties);
+    unsigned intent = ~0U;
+    if (!serial || H5Fget_intent(file, &intent) < 0 || intent != H5F_ACC_RDONLY) return {};
+    const auto extent = H5Fget_file_image(file, nullptr, 0);
+    if (extent <= 0 || static_cast<std::size_t>(extent) > source_image_max_bytes) return {};
+    const auto links = [](hid_t, const char*, const H5L_info_t* info, void*) -> herr_t {
+      return info->type == H5L_TYPE_HARD ? 0 : -1;
+    };
+    const auto datasets = [](hid_t location, const char* name, const H5O_info_t* info, void*) -> herr_t {
+      if (info->type != H5O_TYPE_DATASET) return 0;
+      const hid_t dataset = H5Dopen2(location, name, H5P_DEFAULT);
+      const hid_t creation = dataset >= 0 ? H5Dget_create_plist(dataset) : -1;
+      const bool contained = creation >= 0 && H5Pget_external_count(creation) == 0 &&
+          H5Pget_layout(creation) != H5D_VIRTUAL && H5Pget_layout(creation) != H5D_LAYOUT_ERROR;
+      if (creation >= 0) H5Pclose(creation);
+      if (dataset >= 0) H5Dclose(dataset);
+      return contained ? 0 : -1;
+    };
+    if (H5Lvisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, links, nullptr) < 0 ||
+        H5Ovisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, datasets, nullptr) < 0) return {};
+    std::vector<unsigned char> image(static_cast<std::size_t>(extent));
+    if (H5Fget_file_image(file, image.data(), image.size()) != extent) return {};
+    constexpr char digits[] = "0123456789abcdef";
+    std::string hex(image.size() * 2, '0');
+    for (std::size_t i = 0; i < image.size(); ++i)
+    {
+      hex[2 * i] = digits[image[i] >> 4];
+      hex[2 * i + 1] = digits[image[i] & 15];
+    }
+    return hex;
+  }
+  catch (...) { return {}; }
+}
+
 void EinsplineSetBuilder::ReadOrbitalInfo(bool skipChecks)
 {
   if (!H5File.open(H5FileName, H5F_ACC_RDONLY))
     throw std::runtime_error("Could not open HDF5 file \"" + std::string(H5FileName) +
                              "\" in EinsplineSetBuilder::ReadOrbitalInfo.\n");
+
+#ifndef QMC_COMPLEX
+  source_image.reset();
+  source_image_consistent = true;
+  auto initial_image = captureSourceImage(H5File);
+#endif
 
   {
     // Read format
@@ -61,6 +108,14 @@ void EinsplineSetBuilder::ReadOrbitalInfo(bool skipChecks)
   }
 
   ReadOrbitalInfo_ESHDF(skipChecks);
+#ifndef QMC_COMPLEX
+  try
+  {
+    if (!initial_image.empty() && initial_image == captureSourceImage(H5File))
+      source_image = std::make_shared<const std::string>(std::move(initial_image));
+  }
+  catch (...) { source_image.reset(); }
+#endif
 }
 
 void EinsplineSetBuilder::ReadOrbitalInfo_ESHDF(bool skipChecks)

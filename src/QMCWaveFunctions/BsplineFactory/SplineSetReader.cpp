@@ -28,6 +28,9 @@
 #include "Message/CommOperators.h"
 #include "spline2/SplineUtils.h"
 #include "spline2/MultiBspline.hpp"
+#include <cstring>
+#include <iomanip>
+#include <type_traits>
 #if defined(HAVE_MPI)
 #include "spline2/MultiBsplineMPIShared.hpp"
 #endif
@@ -52,6 +55,47 @@ std::unique_ptr<SPOSet> SplineSetReader<ST>::create_spline_set(const std::string
     app_summary() << "    Running on CPU." << std::endl;
 
   auto [distributed_ranks, shared_ranks] = distributed_and_shared_ranks;
+
+  // Only the bounded real Gamma CPU table is captured; legacy readers keep
+  // their existing evaluation/cache behavior when provenance is unsupported.
+  bool capture = false;
+#ifndef QMC_COMPLEX
+  capture = std::is_same_v<ST, double> && !use_offload && !use_duplex_splines_ &&
+      distributed_ranks == 1 && shared_ranks == 1 && spin == 0 && mybuilder->NumTwists == 1;
+  for (int i = 0; i < 3; ++i) capture = capture && mybuilder->TargetPtcl.getLattice().BoxBConds[i];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      capture = capture && mybuilder->TileMatrix(i, j) == (i == j ? 1 : 0);
+  for (const auto& band : bandgroup.myBands)
+    capture = capture && mybuilder->primcell_kpoints[band.TwistIndex] == TinyVector<double, 3>(0);
+#endif
+  int eligible = capture;
+  myComm->allreduce(eligible);
+  capture = eligible == myComm->size();
+  int image_size = capture && myComm->rank() == 0 && mybuilder->source_image
+      ? mybuilder->source_image->size() : 0;
+  myComm->bcast(image_size);
+  int image_ready = image_size > 0;
+  std::shared_ptr<std::string> received_image;
+  if (image_ready)
+  {
+    try
+    {
+      if (myComm->rank() != 0) received_image = std::make_shared<std::string>(image_size, '0');
+    }
+    catch (...) { image_ready = 0; }
+    myComm->allreduce(image_ready);
+    if (image_ready == myComm->size())
+    {
+      // MPI reads but does not modify the root buffer; preserve its immutable
+      // ownership without copying the image to satisfy the mutable MPI API.
+      auto* data = myComm->rank() == 0 ? const_cast<char*>(mybuilder->source_image->data()) : received_image->data();
+      myComm->bcast(data, image_size);
+      if (received_image) mybuilder->source_image = std::move(received_image);
+    }
+    else capture = false;
+  }
+  else capture = false;
 
   if (use_offload)
   {
@@ -181,6 +225,61 @@ std::unique_ptr<SPOSet> SplineSetReader<ST>::create_spline_set(const std::string
     app_log() << "  Time to bcast the table = " << now.elapsed() << std::endl;
   }
 
+  if (capture)
+  {
+    int ready = mybuilder->source_image_consistent;
+    if (myComm->rank() == 0)
+      ready = ready && EinsplineSetBuilder::captureSourceImage(mybuilder->H5File) == *mybuilder->source_image;
+    std::shared_ptr<BsplineSourceIdentity> identity;
+    std::uint64_t table_hash = 14695981039346656037ULL;
+    try
+    {
+      // Fingerprint only used lanes, never alignment padding. The physical
+      // identity follows the realized bank, including any restored cache.
+      const auto& table = multi_splines.getBlock(0);
+      const auto mix = [&](unsigned char byte) { table_hash = (table_hash ^ byte) * 1099511628211ULL; };
+      std::ostringstream metadata;
+      metadata << "real-gamma-spline-v1:" << sizeof(ST) << ':' << N << ':' << spin << ':' << std::hexfloat;
+      for (const auto& grid : {table.x_grid, table.y_grid, table.z_grid})
+        metadata << grid.start << ':' << grid.end << ':' << grid.num << ':';
+      for (const auto& bc : {table.xBC, table.yBC, table.zBC})
+        metadata << bc.lCode << ':' << bc.rCode << ':' << bc.lVal << ':' << bc.rVal << ':';
+      for (const auto& band : bandgroup.myBands) metadata << band.TwistIndex << ':' << band.BandIndex << ':';
+      for (int orbital = 0; orbital < N; ++orbital) metadata << bspline->BandIndexMap[orbital] << ':';
+      for (unsigned char byte : metadata.str()) mix(byte);
+      std::size_t used_bytes = 0;
+      for (int x = 0; x < table.x_grid.num + 3; ++x)
+        for (int y = 0; y < table.y_grid.num + 3; ++y)
+          for (int z = 0; z < table.z_grid.num + 3; ++z)
+            for (int orbital = 0; orbital < N; ++orbital)
+            {
+              const ST value = table.coefs[x * table.x_stride + y * table.y_stride + z * table.z_stride + orbital];
+              std::uint64_t bits = 0;
+              std::memcpy(&bits, &value, sizeof(value));
+              // The capture path is FP64 only; inspect exponent bits so this
+              // rejection also holds under the project's fast-math flags.
+              if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+                throw std::runtime_error("Nonfinite used B-spline coefficient");
+              for (std::size_t byte = 0; byte < sizeof(value); ++byte) mix((bits >> (8 * byte)) & 255);
+              used_bytes += sizeof(value);
+            }
+      std::ostringstream fingerprint;
+      fingerprint << metadata.str() << std::hex << table_hash;
+      identity = std::make_shared<BsplineSourceIdentity>(BsplineSourceIdentity{
+          mybuilder->H5FileName.string() + (foundspline ? ";restored=" + getSplineDumpFileName(bandgroup) : ";fft"),
+          fingerprint.str(), mybuilder->source_image, used_bytes});
+    }
+    catch (...) { ready = 0; }
+    myComm->allreduce(ready);
+    if (ready == myComm->size())
+    {
+      auto root_hash = table_hash;
+      myComm->bcast(root_hash);
+      int same_table = root_hash == table_hash;
+      myComm->allreduce(same_table);
+      if (same_table == myComm->size()) bspline->source_identity_ = std::move(identity);
+    }
+  }
   return bspline;
 }
 
@@ -213,10 +312,17 @@ void SplineSetReader<ST>::initialize_spline_pio_gather(const int spin,
   hdf_archive h5f(&band_group_comm, false);
   Vector<std::complex<double>> cG(mybuilder->Gvecs[0].size());
   const std::vector<BandInfo>& cur_bands = bandgroup.myBands;
+  if (band_group_comm.isGroupLeader()) h5f.open(mybuilder->H5FileName, H5F_ACC_RDONLY);
+  int source_matches = 1;
+  if (mybuilder->source_image && band_group_comm.isGroupLeader())
+    source_matches = EinsplineSetBuilder::captureSourceImage(h5f) == *mybuilder->source_image;
+  // Best-effort capture never throws into the existing FFT/gather schedule.
+  // Agree within the actual reader subgroup before beginning its work.
+  band_group_comm.bcast(source_matches);
+  mybuilder->source_image_consistent = mybuilder->source_image_consistent && source_matches;
   if (band_group_comm.isGroupLeader())
   {
     auto& group_leader_comm = band_group_comm.getInterGroupComm();
-    h5f.open(mybuilder->H5FileName, H5F_ACC_RDONLY);
     for (int iorb = iorb_first; iorb < iorb_last; iorb++)
     {
       const auto& cur_band = cur_bands[band_index_map[iorb]];
@@ -232,6 +338,9 @@ void SplineSetReader<ST>::initialize_spline_pio_gather(const int spin,
         multi_splines.setOneSpline(oneband.get_spline_r(), iorb);
     }
 
+    if (mybuilder->source_image)
+      mybuilder->source_image_consistent = mybuilder->source_image_consistent &&
+          EinsplineSetBuilder::captureSourceImage(h5f) == *mybuilder->source_image;
     {
       group_leader_comm.barrier();
       Timer now;

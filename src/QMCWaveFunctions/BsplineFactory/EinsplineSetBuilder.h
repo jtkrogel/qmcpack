@@ -117,6 +117,12 @@ public:
   using PSetMap      = std::map<std::string, const std::unique_ptr<ParticleSet>>;
   using UnitCellType = CrystalLattice<ParticleSet::Scalar_t, DIM>;
 
+  /// Bounded best-effort provenance, independent of the LCAO source-image cap.
+  static constexpr std::size_t source_image_max_bytes = 2 * 1024 * 1024;
+  static std::string captureSourceImage(hdf_archive& archive) noexcept;
+  std::shared_ptr<const std::string> source_image;
+  bool source_image_consistent = true;
+
   ///reference to the particleset pool
   const PSetMap& ParticleSets;
   ///quantum particle set
