@@ -3281,6 +3281,7 @@ private:
         const auto after = session.transferSnapshot();
         app_log() << "  PsiFormer regular-node real GPU accepted-grid ECP replay: points="
                   << ecp_replay_->points().size() << ", channels=" << count
+                  << ", prepared_score_capacity=" << capacity
                   << ", weighted_virtual_tiles=" << session.weightedScoreTiles() - before_tiles
                   << ", weighted_virtual_configurations=" << session.weightedScoreConfigurations() - before_configurations
                   << ", last_virtual_tile_count=" << last_tile_count
