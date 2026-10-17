@@ -365,7 +365,8 @@ private:
 
 /** Own one immutable canonical parameter image within a shared metadata family.
  * Workspaces retain an image through submitted work; successors share layout and
- * fixed-ion storage but own independent parameter buffers and scalar caches.
+ * fixed-ion storage. An admitted candidate may share its immutable payload with
+ * its successor; ordinary HOST and copying successors remain independent.
  */
 class PreparedDeviceModel
 {
@@ -393,8 +394,8 @@ public:
     CandidateSnapshot& operator=(const CandidateSnapshot&) = delete;
     CandidateSnapshot(CandidateSnapshot&&) noexcept = default;
 
-    /// Report independently owned numeric storage, excluding shared metadata.
-    std::size_t deviceBytes() const noexcept { return sizeof(double) * parameters_.capacity(); }
+    /// Report retained payload bytes; a shared successor aliases, not duplicates, them.
+    std::size_t deviceBytes() const noexcept { return parameters_ ? sizeof(double) * parameters_->capacity() : 0; }
 
     /// Identify the immutable source version without reading its HOST parameters.
     std::size_t sourceVersion() const noexcept { return source_version_; }
@@ -407,12 +408,14 @@ public:
     CandidateSnapshot(const std::shared_ptr<CandidateControl>& control,
         const std::shared_ptr<const PreparedDeviceModel>& source)
         : control_(control), metadata_(source->metadata_), source_version_(source->version_),
-          generation_(control->generation), parameters_(source->plan().parameterCount()) {}
+          generation_(control->generation),
+          parameters_(std::make_shared<DeviceBuffer<double>>(source->plan().parameterCount())) {}
 
     std::weak_ptr<CandidateControl> control_;
     std::shared_ptr<const PreparedDeviceModelMetadata> metadata_;
     std::size_t source_version_, generation_;
-    DeviceBuffer<double> parameters_;
+    // Only Adam writes, before finite admission; exposed receipts/images are immutable.
+    std::shared_ptr<DeviceBuffer<double>> parameters_;
   };
 
   /// One independent candidate or successor owns exactly one canonical P vector.
@@ -476,18 +479,19 @@ public:
   std::shared_ptr<const PreparedDeviceModel> makeUpdatedImage(const CandidateSnapshot& candidate,
                                                             std::size_t device_budget) const
   {
-    validateCurrentDevice();
-    const auto control = candidate.control_.lock();
-    if (!control || !control->live || control->generation != candidate.generation_ ||
-        control->source.lock().get() != this || candidate.metadata_ != metadata_ ||
-        candidate.source_version_ != version_ || candidate.parameters_.capacity() != plan().parameterCount())
-      throw std::invalid_argument("Device candidate is foreign, stale, rejected or source-expired");
-    if (version_ == std::numeric_limits<std::size_t>::max())
-      throw std::overflow_error("Device candidate successor version exhausted");
+    validateCandidate(candidate);
     const auto bytes = candidateDeviceBytes(plan().parameterCount());
     if (!device_budget || device_budget == std::numeric_limits<std::size_t>::max() || bytes > device_budget)
       throw std::length_error("Device candidate successor exceeds its explicit byte budget");
     return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(metadata_, candidate));
+  }
+
+  /// Retain already admitted immutable bytes: zero additional DEVICE allocation/copy.
+  /// Construction failure never steals or revokes the receipt's retryable owner.
+  std::shared_ptr<const PreparedDeviceModel> makeSharedUpdatedImage(const CandidateSnapshot& candidate) const
+  {
+    validateCandidate(candidate);
+    return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(metadata_, candidate, true));
   }
 
   /// Check a fixed-layout successor before any prepared graph changes ownership.
@@ -501,7 +505,7 @@ public:
   std::size_t version() const noexcept { return version_; }
 
   /// Return shared parameter storage; callers cannot mutate it through this API.
-  const double* parameters() const noexcept { return parameters_.data(); }
+  const double* parameters() const noexcept { return parameterStorage().data(); }
 
   /// Cold explicit mirror boundary; the owning image keeps bytes stable through download.
   void downloadCanonical(std::vector<double>& values) const
@@ -509,7 +513,7 @@ public:
     validateCurrentDevice();
     if (values.size() != plan().parameterCount())
       throw std::invalid_argument("Canonical mirror download extent mismatch");
-    parameters_.download(values.data(), values.size());
+    parameterStorage().download(values.data(), values.size());
   }
 
   /// Return fixed-ion geometry stored once per shared image.
@@ -524,24 +528,51 @@ public:
   /// Supply the opposite-spin cusp scalar for this exact model version.
   double oppositeAlpha() const noexcept { return opposite_alpha_; }
 
-  /// Account canonical shared device storage once, separately from crowd scratch.
+  /// Logical image footprint, including shared payload/family. Do not sum aliasing
+  /// image/receipt footprints; the aggregate allocation ledger counts physical bytes once.
   std::size_t deviceStorageBytes() const
   {
-    return spatial_detail::checkedAdd(checkedDeviceBytes<double>(parameters_.capacity()),
+    return spatial_detail::checkedAdd(checkedDeviceBytes<double>(parameterStorage().capacity()),
         metadata_->deviceStorageBytes(), "Device model storage overflow");
   }
 
 private:
+  /// Keep identical provenance and device checks for copying and sharing factories.
+  void validateCandidate(const CandidateSnapshot& candidate) const
+  {
+    validateCurrentDevice();
+    const auto control = candidate.control_.lock();
+    if (!control || !control->live || control->generation != candidate.generation_ ||
+        control->source.lock().get() != this || candidate.metadata_ != metadata_ ||
+        candidate.source_version_ != version_ || !candidate.parameters_ ||
+        candidate.parameters_->capacity() != plan().parameterCount())
+      throw std::invalid_argument("Device candidate is foreign, stale, rejected or source-expired");
+    if (version_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device candidate successor version exhausted");
+  }
+
+  /// Only one payload path is populated; shared storage is read-only after admission.
+  const DeviceBuffer<double>& parameterStorage() const noexcept
+  {
+    return shared_parameters_ ? *shared_parameters_ : parameters_;
+  }
+
   /// Copy only admitted DEVICE values; unchanged metadata never crosses HOST again.
-  PreparedDeviceModel(std::shared_ptr<const PreparedDeviceModelMetadata> metadata, const CandidateSnapshot& candidate)
+  PreparedDeviceModel(std::shared_ptr<const PreparedDeviceModelMetadata> metadata, const CandidateSnapshot& candidate,
+                      bool share_payload = false)
       : metadata_(std::move(metadata)), version_(candidate.source_version_ + 1),
         candidate_control_(candidate.control_), candidate_generation_(candidate.generation_)
   {
-    parameters_.reserve(plan().parameterCount());
-    parameters_.copyFromDevice(candidate.parameters_, plan().parameterCount());
+    if (share_payload)
+      shared_parameters_ = candidate.parameters_;
+    else
+    {
+      parameters_.reserve(plan().parameterCount());
+      parameters_.copyFromDevice(*candidate.parameters_, plan().parameterCount());
+    }
     if (const auto* same = plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
-      parameters_.download(&same_alpha_, 1, same->begin);
-    parameters_.download(&opposite_alpha_, 1, plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin);
+      parameterStorage().download(&same_alpha_, 1, same->begin);
+    parameterStorage().download(&opposite_alpha_, 1, plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin);
   }
 
   /// Upload only canonical parameters after the immutable family is established.
@@ -565,6 +596,7 @@ private:
   std::size_t version_;
   double same_alpha_ = 1, opposite_alpha_ = 1;
   DeviceBuffer<double> parameters_;
+  std::shared_ptr<const DeviceBuffer<double>> shared_parameters_;
   std::weak_ptr<CandidateControl> candidate_control_;
   std::size_t candidate_generation_ = 0;
 };

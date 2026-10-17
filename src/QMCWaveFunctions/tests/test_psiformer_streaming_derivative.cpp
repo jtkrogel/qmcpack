@@ -1622,7 +1622,7 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
   const auto norm_bytes = gpu.prepareResidentEnergyAdam(48 * p + 4096);
   const auto allowances = gpu.prepareResidentDeviceAuthority();
   CHECK(allowances.snapshot_device_bytes == bytes);
-  CHECK(allowances.successor_device_bytes == bytes);
+  CHECK(allowances.successor_device_bytes == 0);
   CHECK(allowances.cold_host_bytes == bytes);
   std::vector<ps::device::AdamBlock> blocks;
   for (const auto& block : gpu.parameterSchema().blocks())
@@ -1697,14 +1697,14 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
     CHECK(proposal->displacementNorm() == Catch::Approx(displacement_norm).epsilon(2e-8).margin(2e-10));
     CHECK_THROWS(gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes - 1));
     proposal = propose();
-    CHECK_THROWS(gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step, bytes));
+    CHECK_THROWS(gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step, 0));
     proposal = propose();
-    CHECK_THROWS(cpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes));
+    CHECK_THROWS(cpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, 0));
     proposal = propose();
-    { auto discarded = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes); }
+    { auto discarded = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, 0); }
     CHECK(gpu.parameterVersion() == step - 1);
     proposal = propose();
-    auto publication = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes);
+    auto publication = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, 0);
     auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
     const auto before = metrics.snapshot();
     CHECK(publication->commit() == step);

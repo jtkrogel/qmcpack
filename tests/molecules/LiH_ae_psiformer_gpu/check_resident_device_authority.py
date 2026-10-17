@@ -44,7 +44,7 @@ def selected(record, suffix):
 
 
 def validate_warm_transfers(windows, count, expected_d2h):
-    assert all(int(upload) < 8 * count and int(download) == expected_d2h and int(copied) == 16 * count + 384
+    assert all(int(upload) < 8 * count and int(download) == expected_d2h and int(copied) == 8 * count + 384
                for upload, download, copied in windows), windows
 
 
