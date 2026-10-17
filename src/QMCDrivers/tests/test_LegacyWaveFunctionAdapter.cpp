@@ -11,6 +11,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Particle/ParticleSet.h"
@@ -2493,6 +2494,8 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 #ifndef QMC_COMPLEX
 TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapter][ci_family_oracle]")
 {
+  const bool csf = GENERATE(false, true);
+  CAPTURE(csf);
   ParticleSetPool pool(OHMMS::Controller);
   Libxml2Document definition;
   const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
@@ -2505,6 +2508,29 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     if (xmlStrEqual(node->name, BAD_CAST "wavefunction")) wavefunction = node;
   }
   REQUIRE(wavefunction);
+  if (csf)
+  {
+    // Two open-shell CSFs, each with two spin-interchanged determinants. The
+    // frozen CSF coefficient is .6, not its first expanded determinant weight.
+    Libxml2Document csf_xml;
+    REQUIRE(csf_xml.parseFromString(R"(<detlist size="2" type="CSF" nca="0" ncb="0" nea="2" neb="2" nstates="3" cutoff="0">
+      <csf id="CI0" coeff="0.6" occ="211" exctLvl="1">
+        <det coeff="0.7071067811865475244" alpha="110" beta="101"/>
+        <det coeff="0.7071067811865475244" alpha="101" beta="110"/>
+      </csf>
+      <csf id="CI1" coeff="0" occ="121" exctLvl="1">
+        <det coeff="0.7071067811865475244" alpha="110" beta="011"/>
+        <det coeff="0.7071067811865475244" alpha="011" beta="110"/>
+      </csf></detlist>)"));
+    auto* determinantset = xmlFirstElementChild(wavefunction);
+    while (determinantset && !xmlStrEqual(determinantset->name, BAD_CAST "determinantset"))
+      determinantset = xmlNextElementSibling(determinantset);
+    REQUIRE(determinantset);
+    auto* old_list = xmlFirstElementChild(xmlFirstElementChild(determinantset));
+    REQUIRE(old_list);
+    auto* removed = xmlReplaceNode(old_list, xmlDocCopyNode(csf_xml.getRoot(), definition.getRoot()->doc, 1));
+    xmlFreeNode(removed);
+  }
   for (auto* j = xmlFirstElementChild(wavefunction); j; j = xmlNextElementSibling(j))
     if (xmlStrEqual(j->name, BAD_CAST "jastrow"))
       for (auto* correlation = xmlFirstElementChild(j); correlation; correlation = xmlNextElementSibling(correlation))
@@ -2520,6 +2546,12 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
   source->evaluateLog(particles);
   const auto source_log = source->getLogPsi();
   const auto fixed_coefficients = source->findMSD()[0].get().get_C();
+  CHECK(source->findMSD()[0].get().fixedCoefficientReference() == 0.6);
+  if (csf)
+  {
+    REQUIRE(fixed_coefficients.size() == 4);
+    CHECK(std::abs(fixed_coefficients[0] - 0.6) > 0.1);
+  }
   LegacyWaveFunctionAdapter adapter("ci/family-oracle", *source, adapterOptions());
   REQUIRE(adapter.parameterSchema().parameterCount() == 1);
   REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
@@ -2564,6 +2596,22 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
       evaluator->evaluateDerivatives(private_particles, active, scores, local_energy);
       score[sample] = scores[0];
       del[sample] = local_energy[0];
+      if (csf)
+      {
+        const double epsilon = 1e-5;
+        auto plus = parameters, minus = parameters;
+        plus.values[0] += epsilon;
+        minus.values[0] -= epsilon;
+        adapter.installSnapshot(*evaluator, private_particles, plus);
+        const double plus_log = evaluator->getLogPsi();
+        const auto plus_energy = kineticEnergy(private_particles);
+        adapter.installSnapshot(*evaluator, private_particles, minus);
+        CHECK(score[sample] == Catch::Approx((plus_log - evaluator->getLogPsi()) / (2 * epsilon))
+            .epsilon(2e-6).margin(2e-8));
+        CHECK(del[sample] == Catch::Approx(((plus_energy - kineticEnergy(private_particles)) / (2 * epsilon)).real())
+            .epsilon(2e-6).margin(2e-8));
+        CHECK(evaluator->findMSD()[0].get().fixedCoefficientReference() == 0.6);
+      }
     }
     double mean = 0, mean_energy = 0;
     for (int i = 0; i < 4; ++i) { mean += score[i] / 4; mean_energy += energies[i].real() / 4; }
@@ -2636,8 +2684,20 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
             CHECK(ratio == Catch::Approx(1 + rate * ((v0 + v1 * (score[sample] - mean)) / gauge - 1))
                 .epsilon(2e-10).margin(2e-10));
             CHECK(evaluator->findMSD()[0].get().get_C()[0] == fixed_coefficients[0]);
+            CHECK(evaluator->findMSD()[0].get().fixedCoefficientReference() == 0.6);
+            if (csf)
+              CHECK(evaluator->findMSD()[0].get().get_C()[1] == fixed_coefficients[1]);
           }
         }
+    if (csf)
+    {
+      // This slice qualifies LM/ALM only; do not silently expand the PII family.
+      source->evaluateLog(particles);
+      CHECK(source->getLogPsi() == source_log);
+      CHECK(source->findMSD()[0].get().get_C() == fixed_coefficients);
+      CHECK(adapter.snapshotParameters().values[0] == 0);
+      continue;
+    }
     ProjectedInverseIterationFactor pii_factor(factor, kinetic);
     PIIUpdateControl control;
     control.shift_mode = PIIShiftMode::EXPLICIT;

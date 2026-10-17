@@ -117,6 +117,12 @@ public:
   /// Report whether coefficients describe spin-adapted CSFs rather than explicit DETS.
   bool hasCSFExpansion() const noexcept { return static_cast<bool>(csf_data_); }
 
+  /// Actual frozen optimization reference: CSF0 before expansion, or DETS C0.
+  ValueType fixedCoefficientReference() const
+  {
+    return csf_data_ ? csf_data_->coeffs.at(0) : C->at(0);
+  }
+
   LogValue evaluate_vgl_impl(const ParticleSet& P,
                              ParticleSet::ParticleGradient& g_tmp,
                              ParticleSet::ParticleLaplacian& l_tmp);
