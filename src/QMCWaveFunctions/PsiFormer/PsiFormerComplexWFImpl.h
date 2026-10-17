@@ -3674,6 +3674,7 @@ PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
     throw std::invalid_argument("Fixed-grid energy reference requires an authoritative same-traversal native receipt");
   const char* error = "Fixed-grid energy reference HOST admission overflow";
   auto bytes = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), native->hostBytes(), error);
+  pf::addStorageBytes(bytes, sizeof(Impl::GpuNonLocalReplay), error); // Retain the descriptor as well as its arrays.
   pf::addStorageBytes(bytes, replay->storageDiagnostics().retained_numeric_bytes, error);
   pf::addStorageBytes(bytes, pf::checkedStorageProduct(p.R.size(), sizeof(double) + sizeof(int), error), error);
   if (bytes > host_cap) throw std::length_error("Fixed-grid energy reference exceeds HOST cap before allocation");
@@ -3686,6 +3687,7 @@ PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
   result->groups.assign(p.GroupID.begin(), p.GroupID.end());
   result->validateParticles(*impl_, p);
   auto actual = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), result->native->hostBytes(), error);
+  pf::addStorageBytes(actual, sizeof(Impl::GpuNonLocalReplay), error);
   pf::addStorageBytes(actual, result->replay->storageDiagnostics().retained_numeric_bytes, error);
   pf::addStorageBytes(actual, pf::checkedStorageBytes<double>(result->inverse_masses.capacity(), error), error);
   pf::addStorageBytes(actual, pf::checkedStorageBytes<int>(result->groups.capacity(), error), error);
