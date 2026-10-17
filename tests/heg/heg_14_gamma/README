@@ -162,7 +162,8 @@ twist and changed cell/cutoff continuation are rejected. No CI, orbital rotation
 ECP, backflow, arbitrary periodic models or performance claim follows.
 Binding-level cold import is covered separately. Public parameter_file reuse
 uses the same strict selected-pair Binding/Hamiltonian checks before publication.
-Its follow-up native qualification is pending; the bounded command is:
+Its MPI2/OMP1 native reuse qualification passed at source
+4c4526a7095b8097eff69d6fceb51ee2cc41bdeb; the bounded command is:
 
   python3 ../../molecules/H2_ae_conventional_wftrain/check_sj_training.py /absolute/complex/qmcpack wftrain_heg.xml --complex-periodic-heg --model-import --ranks 2
 
