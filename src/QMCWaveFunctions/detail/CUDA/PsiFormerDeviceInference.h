@@ -999,7 +999,7 @@ private:
         // Fresh compact logical prefixes reuse the max-K allocation. Tail planes
         // and configuration strides must shrink together for folded GEMM.
         setTargetRange(begin, count);
-        evaluatePreparedTile();
+        evaluatePreparedTile(begin != 0);
         admitTileBase(begin == 0);
         checkRuntime(launchScatterSpatialTargets(queue_.getNative(), final_.output, result_layout_,
             phase_.data(), output_.data(), lap_ratio_.data(), full_phase_.data(), full_output_.data(),
@@ -1146,12 +1146,12 @@ private:
   }
 
   /// Execute one admitted shape against the geometry uploaded by the logical request.
-  void evaluatePreparedTile()
+  void evaluatePreparedTile(bool reuse_target_base = false)
   {
     resetStatusAdmission();
     MixedValueAttempt mixed_attempt(mixed_dense_.get(), model_);
     evaluatePreparedTrunk();
-    finishPreparedTile(mixed_attempt);
+    finishPreparedTile(mixed_attempt, reuse_target_base);
   }
 
   /// Shared real prefix in its original order; no head or determinant publication.
@@ -1216,7 +1216,7 @@ private:
   }
 
   /// Complete the unchanged real head after the shared neural prefix is admitted.
-  void finishPreparedTile(MixedValueAttempt& mixed_attempt)
+  void finishPreparedTile(MixedValueAttempt& mixed_attempt, bool reuse_target_base = false)
   {
     const auto stream = queue_.getNative();
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
@@ -1241,14 +1241,26 @@ private:
     // Only values need compact packing for factorization and the score-head ABI.
     // Spatial traces borrow the existing orbital planes with a configuration stride,
     // avoiding a second B*4Ne*D*Ne^2 derivative tensor and two copies per configuration.
-    for (std::size_t configuration = 0; configuration < batch_; ++configuration)
+    if (parallel_traces_)
     {
-      const auto origin = configuration * orbitals_.orbitals.configuration_stride;
-      copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
+      // Only later tiles of this request may reuse successful bitwise-equal bases.
+      // Every public/direct tile call and every new coordinate attempt starts fresh.
+      checkRuntime(launchDeterminantTargetFactorization(stream, orbital_jets_.data(), batch_,
+          shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base,
+          matrices_.data(), lu_.data(), inverse_.data(), permutations_.data(), solve_.data(),
+          factors_.data()), "model target determinants");
     }
-    checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
-        mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
-        permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+    else
+    {
+      for (std::size_t configuration = 0; configuration < batch_; ++configuration)
+      {
+        const auto origin = configuration * orbitals_.orbitals.configuration_stride;
+        copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
+      }
+      checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
+          mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
+          permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+    }
     checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
         term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
     // Value-only evaluation deliberately avoids inverse/traces and all spatial

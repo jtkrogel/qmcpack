@@ -44,6 +44,39 @@ __global__ void determinantFactorizationKernel(
       solve ? solve + vector_offset : nullptr);
 }
 
+/// Compare before packing: signed zeros differ, and nonfinite inputs never reuse.
+__global__ void determinantTargetFactorizationKernel(
+    const double* current, std::size_t matrix_count, std::size_t determinant_count,
+    std::size_t matrix_size, std::size_t configuration_stride, bool reuse_previous,
+    double* packed, double* lu, double* inverse, std::size_t* permutation,
+    double* solve, device_determinant::FactorizationMetadata* metadata)
+{
+  const std::size_t matrix = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (matrix >= matrix_count)
+    return;
+  const std::size_t elements = matrix_size * matrix_size;
+  const std::size_t offset = matrix * elements;
+  const double* source = current + (matrix / determinant_count) * configuration_stride +
+      (matrix % determinant_count) * elements;
+  bool identical = reuse_previous &&
+      metadata[matrix].status == device_determinant::FactorizationStatus::REGULAR &&
+      metadata[matrix].inverse_available;
+  for (std::size_t element = 0; identical && element < elements; ++element)
+  {
+    // Match the binary64 union convention used by the shared determinant math.
+    union Binary64 { double floating; std::uint64_t integer; };
+    const Binary64 previous{packed[offset + element]}, next{source[element]};
+    identical = device_determinant::isFiniteBinary64(next.floating) && previous.integer == next.integer;
+  }
+  if (identical)
+    return;
+  for (std::size_t element = 0; element < elements; ++element)
+    packed[offset + element] = source[element];
+  metadata[matrix] = device_determinant::factorizeScaledReal(
+      packed + offset, matrix_size, lu + offset, permutation + matrix * matrix_size,
+      true, inverse + offset, solve + matrix * matrix_size);
+}
+
 __global__ void determinantCombinationKernel(
     const device_determinant::FactorizationMetadata* channel_metadata,
     const double* coefficients,
@@ -259,6 +292,43 @@ Error launchDeterminantFactorization(
   determinantFactorizationKernel<<<block_count, determinant_block_size, 0, stream>>>(
       matrices, matrix_count, matrix_size, prepare_inverse, lu, inverse,
       permutation, solve, metadata);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+Error launchDeterminantTargetFactorization(
+    Stream stream, const double* current_matrices, std::size_t configuration_count,
+    std::size_t determinant_count, std::size_t matrix_size, std::size_t configuration_stride,
+    bool reuse_previous, double* packed_matrices, double* lu, double* inverse,
+    std::size_t* permutation, double* solve,
+    device_determinant::FactorizationMetadata* metadata)
+{
+  const auto count = checkedProduct(configuration_count, determinant_count,
+      "PsiFormer target determinant matrix-count overflow");
+  if (!count)
+    return success;
+  if (!matrix_size || !current_matrices || !packed_matrices || !lu || !inverse ||
+      !permutation || !solve || !metadata)
+    throw std::invalid_argument("PsiFormer target determinants require nonempty matrix/inverse storage");
+  const auto elements = checkedProduct(matrix_size, matrix_size,
+      "PsiFormer target determinant matrix extent overflow");
+  const auto packed_stride = checkedProduct(determinant_count, elements,
+      "PsiFormer target determinant configuration extent overflow");
+  (void)checkedProduct(count, elements, "PsiFormer target determinant batch extent overflow");
+  (void)checkedProduct(count, matrix_size, "PsiFormer target determinant vector extent overflow");
+  const auto origin = checkedProduct(configuration_count - 1, configuration_stride,
+      "PsiFormer target determinant source extent overflow");
+  if (configuration_stride < packed_stride || origin > std::numeric_limits<std::size_t>::max() - packed_stride)
+    throw std::invalid_argument("PsiFormer target determinant source stride is invalid");
+  if (count > std::numeric_limits<unsigned int>::max())
+    throw std::length_error("PsiFormer target determinant grid exceeds the CUDA/HIP x dimension");
+  const auto blocks = static_cast<unsigned int>((count + determinant_block_size - 1) / determinant_block_size);
+  determinantTargetFactorizationKernel<<<blocks, determinant_block_size, 0, stream>>>(
+      current_matrices, count, determinant_count, matrix_size, configuration_stride, reuse_previous,
+      packed_matrices, lu, inverse, permutation, solve, metadata);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else

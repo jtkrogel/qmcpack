@@ -45,6 +45,17 @@ Error launchDeterminantFactorization(
     double* solve,
     device_determinant::FactorizationMetadata* metadata);
 
+/** Pack strided VALUE matrices and reuse only exact finite, successful inverses.
+ * The caller owns all buffers on one queue and permits reuse only within one
+ * coordinate request. The first tile must pass false, including after failure.
+ */
+Error launchDeterminantTargetFactorization(
+    Stream stream, const double* current_matrices, std::size_t configuration_count,
+    std::size_t determinant_count, std::size_t matrix_size, std::size_t configuration_stride,
+    bool reuse_previous, double* packed_matrices, double* lu, double* inverse,
+    std::size_t* permutation, double* solve,
+    device_determinant::FactorizationMetadata* metadata);
+
 /** Serial-per-configuration signed-log determinant-channel reduction. */
 Error launchDeterminantCombination(
     Stream stream,

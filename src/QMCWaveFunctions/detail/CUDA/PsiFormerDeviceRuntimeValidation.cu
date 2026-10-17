@@ -600,6 +600,94 @@ void determinants(Queue& queue)
   std::cout << "PASS determinants inverse signed_sum singular_nonfinite\n";
 }
 
+/// Prove request-local exact reuse without counters or additional production owners.
+void determinantTargetReuse(Queue& queue)
+{
+  constexpr std::size_t batch = 3, channels = 2, size = 2, stride = 11, count = batch * channels;
+  std::vector<double> source(batch * stride, std::numeric_limits<double>::quiet_NaN());
+  for (std::size_t matrix = 0; matrix < count; ++matrix)
+  {
+    const auto origin = (matrix / channels) * stride + (matrix % channels) * 4;
+    source[origin] = 1.2 + matrix * 0.1;
+    source[origin + 1] = 0.0;
+    source[origin + 2] = -0.3;
+    source[origin + 3] = 1.8;
+  }
+  auto input = upload(source);
+  DeviceBuffer<double> packed(4 * count), lu(4 * count), inverse(4 * count), solve(size * count);
+  DeviceBuffer<std::size_t> permutation(size * count);
+  DeviceBuffer<device_determinant::FactorizationMetadata> metadata(count);
+  const std::vector<double> sentinel(4 * count, 19.0);
+  auto run = [&](bool reuse) {
+    input.upload(source.data(), source.size());
+    checkRuntime(launchDeterminantTargetFactorization(queue.getNative(), input.data(), batch,
+        channels, size, stride, reuse, packed.data(), lu.data(), inverse.data(), permutation.data(),
+        solve.data(), metadata.data()), "target determinant reuse");
+    queue.sync();
+  };
+  run(false);
+  const auto first_inverse = download(inverse);
+  lu.upload(sentinel.data(), sentinel.size());
+  run(true);
+  if (download(lu) != sentinel || download(inverse) != first_inverse)
+    throw std::runtime_error("identical target bases did not preserve factors/inverses");
+
+  // Both a one-bit numerical change and a signed-zero bit change must refactor.
+  source[0] = std::nextafter(source[0], 2.0);
+  source[5] = -0.0;
+  run(true);
+  const auto changed_lu = download(lu);
+  if (changed_lu[0] == 19.0 || changed_lu[4] == 19.0)
+    throw std::runtime_error("changed target base reused old factorization");
+  for (std::size_t element = 8; element < changed_lu.size(); ++element)
+    near(changed_lu[element], 19.0, "unchanged channel reuse sentinel");
+  const auto target_inverse = download(inverse);
+  const auto target_metadata = download(metadata);
+  checkRuntime(launchDeterminantFactorization(queue.getNative(), packed.data(), batch, channels,
+      size, true, lu.data(), inverse.data(), permutation.data(), solve.data(), metadata.data()),
+      "independent legacy target factorization");
+  queue.sync();
+  const auto reference_inverse = download(inverse);
+  const auto reference_metadata = download(metadata);
+  for (std::size_t element = 0; element < target_inverse.size(); ++element)
+    near(target_inverse[element], reference_inverse[element], "target fallback inverse");
+  for (std::size_t matrix = 0; matrix < count; ++matrix)
+  {
+    near(target_metadata[matrix].log_abs, reference_metadata[matrix].log_abs, "target fallback log");
+    if (target_metadata[matrix].status != reference_metadata[matrix].status ||
+        !target_metadata[matrix].inverse_available)
+      throw std::runtime_error("target fallback metadata");
+  }
+
+  // Identical data cannot reuse an unsuccessful/missing-inverse receipt.
+  auto invalid = reference_metadata;
+  invalid[0].inverse_available = false;
+  invalid[1].status = device_determinant::FactorizationStatus::SINGULAR;
+  metadata.upload(invalid.data(), invalid.size());
+  lu.upload(sentinel.data(), sentinel.size());
+  run(true);
+  const auto repaired = download(lu);
+  if (repaired[0] == 19.0 || repaired[4] == 19.0)
+    throw std::runtime_error("invalid target receipt reused");
+  source[0] = std::numeric_limits<double>::quiet_NaN();
+  run(true);
+  lu.upload(sentinel.data(), sentinel.size());
+  run(true);
+  if (download(lu)[0] != 0.0 ||
+      download(metadata)[0].status != device_determinant::FactorizationStatus::NONFINITE_INPUT)
+    throw std::runtime_error("nonfinite target receipt reused");
+  source[0] = 1.2;
+  run(true);
+  if (!download(metadata)[0].inverse_available)
+    throw std::runtime_error("target receipt recovery");
+  lu.upload(sentinel.data(), sentinel.size());
+  run(false);
+  for (const auto element : download(lu))
+    if (element == 19.0)
+      throw std::runtime_error("first target tile failed to revoke reuse");
+  std::cout << "PASS target_factor_reuse exact_bits signed_zero one_bit invalid_recovery first_tile\n";
+}
+
 /// Exercise bounded response products, finite diagnostics and ordered ECP folds.
 void boundedResponses(Queue& queue)
 {
@@ -785,6 +873,7 @@ int main(int argc, char** argv)
     denseAndReverse(queue, handle);
     softmax(queue);
     determinants(queue);
+    determinantTargetReuse(queue);
     boundedResponses(queue);
     batchedScoreLeaves(queue);
     validateDerivativeRealVectors(queue);
