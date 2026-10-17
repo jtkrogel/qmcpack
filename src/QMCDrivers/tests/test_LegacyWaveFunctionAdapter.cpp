@@ -5122,8 +5122,9 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
 
 TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapter][external_lcao]")
 {
-  const bool ecp = GENERATE(false, true);
-  CAPTURE(ecp);
+  const int model = GENERATE(0, 1, 2, 3, 4);
+  const bool ecp = model != 0, active = model >= 2;
+  CAPTURE(model);
   ParticleSetPool pool(OHMMS::Controller);
   auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
   auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
@@ -5167,7 +5168,7 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
       ("lcao_identity_" + std::to_string(OHMMS::Controller->rank()) + "_" +
        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
   FileCleanup cleanup(temporary);
-  std::filesystem::copy_file(asset, temporary);
+  if (!active) std::filesystem::copy_file(asset, temporary);
   const auto xml = [&](const std::filesystem::path& file, std::size_t cap = 1048576) {
     std::string input = "<wavefunction name='psi0' target='e'><sposet_collection type='MolecularOrbital' name='LCAOBSet' "
         "source='ion0' transform='yes' source_identity='file_image' source_identity_max_bytes='" +
@@ -5191,6 +5192,13 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
       const auto begin = input.find("<correlation"), end = input.find("</correlation>", begin);
       input.erase(begin, end + std::string("</correlation>").size() - begin);
     }
+    if (active)
+    {
+      const auto begin = input.find("<sposet name="), end = input.find("</sposet>", begin) + 9;
+      input.replace(begin, end - begin, R"(<rotated_sposet name="spo-ud"><sposet name="base" size="3">
+        <occupation mode="ground"/><coefficient size="62" spindataset="0"/>
+        </sposet></rotated_sposet>)");
+    }
     return input;
   };
   const auto build = [&](Libxml2Document& document, const std::string& input) {
@@ -5203,8 +5211,20 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   };
   Libxml2Document definition, relocated_definition;
   auto source = build(definition, xml(asset));
-  auto relocated = build(relocated_definition, xml(temporary));
-  const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(source->findSD()[0].get().getPhi(0));
+  auto relocated = build(relocated_definition, xml(active ? asset : temporary));
+  const auto rotation = [](TrialWaveFunction& wf) -> RotatedSPOs& {
+    auto& sd = wf.findSD()[0].get();
+    REQUIRE(&sd.getPhi(0) == &sd.getPhi(1));
+    return dynamic_cast<RotatedSPOs&>(sd.getPhi(0));
+  };
+  const auto isolate = [&](TrialWaveFunction& wf) {
+    if (active) rotation(wf).isolateOptimizationState();
+  };
+  const auto leaf = [&](TrialWaveFunction& wf) -> LCAOrbitalSet& {
+    return dynamic_cast<LCAOrbitalSet&>(active ? *rotation(wf).Phi_ : wf.findSD()[0].get().getPhi(0));
+  };
+  isolate(*source);
+  const auto& lcao = leaf(*source);
   REQUIRE(lcao.fileImageIdentity());
   CHECK(lcao.fileImageIdentity()->byteCount() == std::filesystem::file_size(asset));
   // LCAO distance tables read the source's coordinate storage, not just R.
@@ -5212,8 +5232,6 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   ions.update();
   particles.update();
   source->evaluateLog(particles);
-  const double original_log = source->getLogPsi();
-  const auto original_energy = kineticEnergy(particles);
   QMCHamiltonian ham;
   ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
   if (ecp)
@@ -5231,12 +5249,40 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
     ham.addObservables(particles);
     particles.update(); source->evaluateLog(particles);
   }
+  if (active)
+  {
+    REQUIRE(lcao.C->rows() == 3);
+    REQUIRE(lcao.C->cols() == 72);
+    LegacyWaveFunctionAdapter history("legacy/external/history", *source, adapterOptions());
+    REQUIRE(history.snapshotParameters().values.size() == 6);
+    // Fresh fixture per stage: initial, one rotation, then a noncommuting rotation.
+    for (int step = 0; step < model - 2; ++step)
+    {
+      auto point = history.snapshotParameters();
+      point.values[0] += step == 0 ? .03 : -.02;
+      point.values[1] += step == 0 ? -.01 : .04;
+      history.installSnapshot(*source, particles, point);
+      history.publishParameters(point, point.version);
+    }
+    if (model == 4) CHECK(rotation(*source).fullRotationCoordinates()[2] != 0);
+  }
+  const double original_log = source->getLogPsi();
+  const auto original_energy = kineticEnergy(particles);
+  const auto accepted_coefficients = *lcao.C;
+  const auto accepted_reference = active ? lcao.originalRotationCoefficients() : LCAOrbitalSet::OffloadValueMatrix{};
+  const auto accepted_frame = active ? rotation(*source).fullRotationCoordinates() : std::vector<double>{};
   ParticleSet private_particles(particles), sibling_particles(particles);
   auto evaluator = source->makeClone(private_particles), sibling = source->makeClone(sibling_particles);
+  isolate(*evaluator); isolate(*sibling);
   private_particles.update(); sibling_particles.update(); sibling->evaluateLog(sibling_particles);
   const auto sibling_log = sibling->getLogPsi();
-  const auto& cloned_lcao = dynamic_cast<const LCAOrbitalSet&>(evaluator->findSD()[0].get().getPhi(0));
+  const auto& cloned_lcao = leaf(*evaluator);
   CHECK(cloned_lcao.fileImageIdentity() == lcao.fileImageIdentity());
+  if (active)
+  {
+    CHECK(cloned_lcao.C.get() != lcao.C.get());
+    CHECK(leaf(*sibling).C.get() != lcao.C.get());
+  }
   TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
   TrainingWaveFunctionBinding relocated_binding(*relocated, particles, adapterOptions(), *OHMMS::Controller);
   binding.setHamiltonian(ham);
@@ -5244,7 +5290,7 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   CHECK(binding.modelIdentity() == relocated_binding.modelIdentity());
   const auto exported = temporary.string() + ".parameters.h5";
   FileCleanup export_cleanup(exported);
-  if (ecp)
+  if (ecp && !active)
   {
     binding.exportModel(exported);
     CHECK(relocated_binding.readModel(exported).values == binding.snapshotParameters().values);
@@ -5258,7 +5304,7 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   }
   LegacyWaveFunctionAdapter adapter("legacy/external", *source, adapterOptions());
   const auto snapshot = adapter.snapshotParameters();
-  REQUIRE(snapshot.values.size() == (ecp ? 4 : 8));
+  REQUIRE(snapshot.values.size() == (active ? 6 : ecp ? 4 : 8));
   auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, std::vector<double>{0});
   auto frame = std::make_shared<const StructuredParameterSnapshot>(snapshot);
   auto op = adapter.makeDerivativeOperator(replay, frame, 0, 0);
@@ -5296,10 +5342,16 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
         fixed_potential += ham.getComponent(i)->evaluate(*source, particles);
   }
   const auto rng_after_capture = rng;
+  NonLocalECPotential* nonlocal = nullptr;
+  for (int i = 0; i < ham.size(); ++i)
+    if (auto* component = dynamic_cast<NonLocalECPotential*>(ham.getComponent(i))) nonlocal = component;
+  const auto quadrature = nonlocal ? nonlocal->captureQuadratureState() : NonLocalECPotential::QuadratureState{};
+  const auto pp_identity = ecp ? ham.ecpModelProvenance()->scientific_definition : std::string{};
   const auto source_positions = particles.R, ion_positions = ions.R;
   const auto full_energy = [&](const StructuredParameterSnapshot& point) {
     ParticleSet p(particles);
     auto wf = source->makeClone(p);
+    isolate(*wf);
     p.update(); adapter.installSnapshot(*wf, p, point);
     DerivativeValue energy = kineticEnergy(p) + fixed_potential;
     for (const auto& knot : points)
@@ -5314,9 +5366,11 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   };
   if (ecp) CHECK(full_energy(snapshot).real() == Catch::Approx(captured_energy).epsilon(3e-12).margin(3e-12));
   const std::vector<DerivativeValue> unit{1};
-  const std::array<VJPCoefficientChannel, 2> channels{{
+  std::vector<VJPCoefficientChannel> channels{
       {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0},
-      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), terms}}};
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), terms}};
+  if (active) channels.push_back({"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP,
+      coefficientsFor(*op, unit), localEnergyTermBit(LocalEnergyTerm::KINETIC)});
   RecordingParameterSink rows;
   op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
   RecordingParameterSink hermitian;
@@ -5324,18 +5378,22 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   std::vector<DerivativeValue> direction(snapshot.values.size(), 0.125);
   const StructuredParameterVectorConstView vector(adapter.parameterSchema(), op->parameterVersion(),
                                                  {direction.data(), direction.size()});
-  RecordingSampleSink score_jvp, energy_jvp;
+  RecordingSampleSink score_jvp, energy_jvp, kinetic_jvp;
   op->applyScoreJVP(vector, score_jvp);
   op->applyLocalEnergyJVP(vector, terms, energy_jvp);
-  DerivativeValue score_dual{}, energy_dual{};
+  if (active) op->applyLocalEnergyJVP(vector, localEnergyTermBit(LocalEnergyTerm::KINETIC), kinetic_jvp);
+  DerivativeValue score_dual{}, energy_dual{}, kinetic_dual{};
   for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
   {
-    for (int channel = 0; channel < 2; ++channel) checkClose(hermitian.result()[channel][parameter], std::conj(rows.result()[channel][parameter]));
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+      checkClose(hermitian.result()[channel][parameter], std::conj(rows.result()[channel][parameter]));
     score_dual += direction[parameter] * rows.result()[0][parameter];
     energy_dual += direction[parameter] * rows.result()[1][parameter];
+    if (active) kinetic_dual += direction[parameter] * rows.result()[2][parameter];
   }
   checkClose(score_jvp.result()[0], score_dual);
   checkClose(energy_jvp.result()[0], energy_dual);
+  if (active) checkClose(kinetic_jvp.result()[0], kinetic_dual);
   for (std::size_t parameter = 0; parameter < snapshot.values.size(); ++parameter)
   {
     auto plus = snapshot, minus = snapshot;
@@ -5347,10 +5405,13 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
       CHECK(private_particles.R[electron] == source_positions[electron]);
     adapter.installSnapshot(*evaluator, private_particles, plus);
     const double plus_log = evaluator->getLogPsi();
+    const auto plus_kinetic = kineticEnergy(private_particles);
     const auto plus_energy = ecp ? full_energy(plus) : kineticEnergy(private_particles);
     replay->prepareSample(0);
     adapter.installSnapshot(*evaluator, private_particles, minus);
     CHECK(rows.result()[0][parameter].real() == Catch::Approx((plus_log - evaluator->getLogPsi()) / 2e-5).margin(2e-8));
+    if (active) CHECK(rows.result()[2][parameter].real() ==
+        Catch::Approx(((plus_kinetic - kineticEnergy(private_particles)) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
     const auto minus_energy = ecp ? full_energy(minus) : kineticEnergy(private_particles);
     CHECK(rows.result()[1][parameter].real() == Catch::Approx(((plus_energy - minus_energy) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
   }
@@ -5363,6 +5424,25 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   CHECK(rng() == expected_rng());
   for (int electron = 0; electron < particles.getTotalNum(); ++electron) CHECK(particles.R[electron] == source_positions[electron]);
   for (int ion = 0; ion < ions.getTotalNum(); ++ion) CHECK(ions.R[ion] == ion_positions[ion]);
+  if (active)
+  {
+    CHECK(rotation(*source).fullRotationCoordinates() == accepted_frame);
+    CHECK(rotation(*sibling).fullRotationCoordinates() == accepted_frame);
+    for (std::size_t i = 0; i < accepted_coefficients.size(); ++i)
+    {
+      CHECK(lcao.C->data()[i] == accepted_coefficients.data()[i]);
+      CHECK(leaf(*sibling).C->data()[i] == accepted_coefficients.data()[i]);
+      CHECK(lcao.originalRotationCoefficients().data()[i] == accepted_reference.data()[i]);
+    }
+    Libxml2Document unchanged_definition;
+    auto unchanged = build(unchanged_definition, xml(asset));
+    CHECK(leaf(*unchanged).fileImageIdentity()->image_hex == lcao.fileImageIdentity()->image_hex);
+    CHECK(std::filesystem::file_size(asset) == 244008);
+    CHECK(nonlocal->captureQuadratureState().coordinates == quadrature.coordinates);
+    CHECK(ham.ecpModelProvenance()->scientific_definition == pp_identity);
+    CHECK(binding.modelIdentity() == relocated_binding.modelIdentity());
+    return; // The tracked HDF image stays read-only; mutation negatives below use disposable copies only.
+  }
   Libxml2Document too_small;
   CHECK_THROWS_WITH(build(too_small, xml(asset, 1024)), Catch::Matchers::ContainsSubstring("source_identity_max_bytes"));
   // Capture basis bytes, then change only a disposable file before the actual
