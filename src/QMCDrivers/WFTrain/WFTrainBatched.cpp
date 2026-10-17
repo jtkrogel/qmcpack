@@ -1414,11 +1414,14 @@ void WFTrainBatched::process(xmlNodePtr node)
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
-        // CPU candidates own isolated parameter state; only fixed-reference
-        // physical ENERGY selection is admitted, not MSE/GPU/endpoints.
-        const bool cpu_energy_reference = !complex->gpuInferenceEnabled() &&
+        // GPU reference candidates require the separate budgeted private lane/image route.
+        const bool energy_reference =
             training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
-            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE;
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE &&
+            (!complex->gpuInferenceEnabled() ||
+             ((optimizer == O::ADAM || optimizer == O::SGD || optimizer == O::STOCHASTIC_RECONFIGURATION) &&
+              training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
+              training_input_.getMaximumUpdateNorm() == 0));
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
@@ -1431,14 +1434,14 @@ void WFTrainBatched::process(xmlNodePtr node)
             !supported_optimizer ||
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
-            (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF && !cpu_energy_reference) ||
+            (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF && !energy_reference) ||
             (!complex->gpuInferenceEnabled() &&
              (training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
               training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
           throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
               "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls "
-              "except CPU ENERGY reference search, "
+              "except ENERGY reference search with default update controls, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
               "and positive finite maximum_retained_bytes; CPU single-reference orbital_mse admits Adam/plainSGD");
         if (complex->gpuInferenceEnabled() && training_input_.getWeightDecay() != 0 &&
@@ -1783,17 +1786,27 @@ void WFTrainBatched::run()
         const auto r = complex->gpuDerivativeRequirements(samples, largest_batch, limits.kinetic_targets,
             std::min(p, training_input_.getParameterChunkSize()));
         const auto q = complex->gpuParameterPublicationRequirements();
-        const auto device = checkedMemoryAdd(r.device_bytes, q.device_bytes);
-        const auto host = checkedMemoryAdd(r.host_bytes, q.host_bytes);
+        auto generation_device = q.device_bytes, generation_host = q.host_bytes;
+        if (training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
+        {
+          const auto isolation = complex->gpuCandidateIsolationRequirements();
+          // Private current I1 plus next I2 coexist; source I0 is shared, not copied.
+          generation_device = checkedMemoryAdd(isolation.device_bytes, checkedMemoryMultiply(2, q.device_bytes));
+          // Isolation owns flat/leaves; caller snapshot and prepared native candidate add two P vectors.
+          generation_host = checkedMemoryAdd(isolation.host_bytes, checkedMemoryMultiply(2, q.host_bytes));
+        }
+        const auto device = checkedMemoryAdd(r.device_bytes, generation_device);
+        const auto host = checkedMemoryAdd(r.host_bytes, generation_host);
         if (device > limits.device_bytes || host > limits.host_bytes || r.matrix_work > limits.maximum_matrix_work)
           throw std::length_error(
               "WFTrainBatched: paired GPU derivative+successor device/HOST/work cap exceeded before sampling");
         derivative_bytes = checkedMemoryAdd(r.device_bytes, r.host_bytes);
-        successor_bytes = checkedMemoryAdd(q.device_bytes, q.host_bytes);
+        successor_bytes = checkedMemoryAdd(generation_device, generation_host);
         app_log() << "WFTrain paired GPU admitted additional device=" << device << " HOST=" << host
-                  << " derivative=" << derivative_bytes << " successor=" << successor_bytes
+                  << " derivative=" << derivative_bytes << " successor_or_private_selector=" << successor_bytes
                   << " K=" << limits.kinetic_targets << " matrix_work=" << r.matrix_work
-                  << "; successor HOST includes one native candidate vector; excludes prepared inference generation, "
+                  << "; reference includes private scratch/current+successor images and snapshot/prepared HOST; "
+                     "OFF includes one successor/native candidate; excludes source inference generation, "
                      "native/image model HOST and vendor storage" << std::endl;
       }
       else if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)

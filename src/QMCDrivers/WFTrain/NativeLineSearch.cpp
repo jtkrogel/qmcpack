@@ -16,6 +16,7 @@
 #include "Particle/ParticleSet.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "Utilities/RandomBase.h"
 #include <algorithm>
@@ -40,6 +41,13 @@ StructuredParameterProvider& providerOf(TrialWaveFunction& wavefunction, const s
   for (auto provider : wavefunction.extractStructuredParameterProviders())
     if (provider.get().parameterSchema().providerId() == id)
       return provider.get();
+#ifdef QMC_COMPLEX
+  // GPU discovery stays closed globally; only this sole-component private route resolves it.
+  if (wavefunction.getOrbitals().size() == 1)
+    if (auto* paired = dynamic_cast<PsiFormerComplexWF*>(wavefunction.getOrbitals().front().get());
+        paired && paired->gpuInferenceEnabled() && paired->parameterSchema().providerId() == id)
+      return *paired;
+#endif
   throw std::invalid_argument("Candidate wavefunction lacks selected provider");
 }
 
@@ -192,7 +200,18 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
       particles = std::make_unique<ParticleSet>(configurations.front().get());
       wavefunction = prototype.makeClone(*particles);
       if (!conventional)
-        providerOf(*wavefunction, provider_id).isolateParameterState();
+      {
+        auto& provider = providerOf(*wavefunction, provider_id);
+#ifdef QMC_COMPLEX
+        if (auto* paired = dynamic_cast<PsiFormerComplexWF*>(&provider); paired && paired->gpuInferenceEnabled())
+        {
+          const auto q = paired->gpuCandidateIsolationRequirements();
+          paired->isolateBudgetedGpuParameterState(q.device_bytes, q.host_bytes);
+        }
+        else
+#endif
+          provider.isolateParameterState();
+      }
       ham = hamiltonian.makeClone(*particles, *wavefunction);
     }
   }
@@ -214,9 +233,18 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
       return;
     }
     auto& provider = providerOf(*wavefunction, provider_id);
+    // Private generations advance per trial; interpolation always uses fixed production endpoints.
     auto candidate = provider.snapshotParameters();
     for (std::size_t i = 0; i < candidate.values.size(); ++i)
       candidate.values[i] = old.values[i] + alpha * (full.values[i] - old.values[i]);
+#ifdef QMC_COMPLEX
+    if (auto* paired = dynamic_cast<PsiFormerComplexWF*>(&provider); paired && paired->gpuInferenceEnabled())
+    {
+      const auto q = paired->gpuParameterPublicationRequirements();
+      paired->publishBudgetedGpuParameters(candidate, candidate.version, q.device_bytes, q.host_bytes);
+      return;
+    }
+#endif
     provider.publishParameters(candidate, candidate.version);
   };
   using Positions = ParticleSet::ParticlePos;
