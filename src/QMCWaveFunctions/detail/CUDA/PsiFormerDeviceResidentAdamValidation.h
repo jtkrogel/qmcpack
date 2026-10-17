@@ -324,7 +324,12 @@ inline void validateResidentOpenEnergy(pf::PsiFormer& model, const PsiFormerExec
   fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, 0, cost.host_bytes); });
   fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes, std::numeric_limits<std::size_t>::max()); });
   require(before.allocation_calls == session->transferSnapshot().allocation_calls, "Resident open ENERGY cap denial allocated");
+  const auto cold_device = session->deviceWorkspaceBytes(), cold_host = session->hostWorkspaceBytes();
   session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes, cost.host_bytes);
+  require(session->deviceWorkspaceBytes()-cold_device == cost.device_bytes &&
+      session->hostWorkspaceBytes()-cold_host == cost.host_bytes &&
+      session->transferSnapshot().live_bytes-before.live_bytes == cost.device_bytes,
+      "Resident open ENERGY actual cold owner differs from its exact cost");
   session->prepareScoreContractions(3, version); host->prepareScoreContractions(3, version);
   auto coordinates = image->prepareCoordinates(2, checkedDeviceBytes<double>(6*ne)); coordinates->upload(positions);
   pf::DirectValueExecutor value(model, plan); pf::DirectSpatialExecutor spatial(model, value, plan);
