@@ -37,5 +37,11 @@ the same real CPU guard and strict comparisons, not an optimizer ULP exception.
 The optional ``--unequal-spin-orbital-ecp`` mode derives one charged C^-
 3-up/2-down case from the same XML. It adds the numerical fixture's third
 up coordinate and uses up occupations 1110/1101, giving five/six orbital
-pairs and joint P16. Its native qualification and registration are pending;
-both unequal-spin orientations passed the separate numerical gate.
+pairs and joint P16. Native round 98 passed on its first attempt with app
+source ``38729b657`` and SHA256
+``8661f27b0705af800303736617c66693154eed69eaa35444378f832c2fb78033``;
+the newer helper-only source is ``2cd6d4fe0`` (checker SHA256
+``d2ec1d8d332ed0174a2a12773f534f3e68d65811fe112849e806d99e23996c28``).
+One guarded 3/2 native case is registered with the same strict comparisons.
+The swapped 2/3 orientation is numerical-only: both passed the separate
+6,024-assertion physical gate. No arbitrary polarization/size claim is made.
