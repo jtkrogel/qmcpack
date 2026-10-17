@@ -212,6 +212,39 @@ def vmc_physical_trace(directory):
     return result
 
 
+def prepare_periodic_spline_fixture(original, destination):
+    """Derive the qualified diamond model, reusing existing tiny native controls."""
+    tree = ET.parse(original)
+    root = tree.getroot()
+    system = root.find("qmcsystem")
+    assert system is not None
+    for node in list(system):
+        root.append(node)
+    root.remove(system)
+    root.remove(root.find("qmc"))
+    root.insert(1, ET.Element("random", seed="1931"))
+    cell = root.find("simulationcell")
+    cell.find("parameter[@name='LR_dim_cutoff']").text = "30"
+    ET.SubElement(cell, "parameter", name="LR_handler").text = "ewald"
+    collection = root.find("wavefunction/sposet_collection")
+    collection.set("href", str((original.parent / collection.get("href")).resolve()))
+    collection.set("gpu", "no")
+    collection.find("sposet").set("optimize", "no")
+    assert collection.get("precision") == "double" and collection.find("sposet").get("size") == "4"
+    ham = root.find("hamiltonian")
+    for node in list(ham):
+        if node.get("type") == "MPC" or node.tag == "estimator":
+            ham.remove(node)
+    pp = ham.find("pairpot/pseudo")
+    pp.set("href", str((original.parent / pp.get("href")).resolve()))
+    pp.set("format", "xml"); pp.set("nrule", "4"); pp.set("l-local", "1")
+    pairpot = next(node for node in ham if pp in list(node))
+    pairpot.set("algorithm", "batched"); pairpot.set("DLA", "no")
+    root.append(ET.parse(Path(__file__).with_name("wftrain_sj.xml")).find("qmc"))
+    tree.write(destination)
+    return destination
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
@@ -230,6 +263,8 @@ def main():
                         help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
     parser.add_argument("--external-orbital-ecp", action="store_true",
                         help="derive shared three-MO external orbital/J2 ECP P6 with a full-history VP reference")
+    parser.add_argument("--periodic-spline", action="store_true",
+                        help="derive Gamma diamond fixed-spline/J1/J2 Ewald30 locality-ECP Adam P24")
     parser.add_argument("--orbital-ecp", action="store_true",
                         help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
     parser.add_argument("--many-occupied-orbital-ecp", action="store_true",
@@ -362,6 +397,18 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
+    spline_image = None
+    if args.periodic_spline:
+        assert args.ranks == args.threads == 1 and args.ci_representation == "dets"
+        assert not any((args.periodic_heg, args.complex_periodic_heg, args.external_lcao,
+                        args.external_orbital_ecp, args.md_orbital, orbital_ecp_profile, args.ci_pii,
+                        args.ci_lm, args.csf_lm, args.csf_pii, args.mdj_pii, args.csf_j2_pii, args.mdj_alm,
+                        args.sj_reference_line_search, args.old_new, args.family_screen, args.family_method,
+                        args.optimizer_screen, args.profile_only, args.restart, args.preflight))
+        fixture = prepare_periodic_spline_fixture(fixture, work / "diamond-wftrain.xml")
+        spline_source = Path(ET.parse(fixture).find("wavefunction/sposet_collection").get("href"))
+        spline_image = spline_source.read_bytes()
+        args.model_import = True
     if args.periodic_heg or args.md_orbital or args.external_lcao or orbital_ecp_profile:
         assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
                     args.many_occupied_orbital_ecp, args.md_orbital_ecp)) == 1, "select one bounded qualification profile"
@@ -390,7 +437,7 @@ def main():
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
     if j3_ecp:
         assert not md_ecp and fixture_tree.find(".//rotated_sposet") is None
-    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
+    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.periodic_spline or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
     external_asset = None
     external_reference = None
     if args.external_lcao:
@@ -664,7 +711,8 @@ def main():
             if isinstance(reject, tuple):
                 assert label == "reject_changed_import_pp" or (external_ecp and label in
                     ("reject_changed_import_pp_Li", "reject_changed_import_pp_H")) or (args.complex_periodic_heg and label in
-                    ("reject_changed_cell_import", "reject_changed_cutoff_import")), \
+                    ("reject_changed_cell_import", "reject_changed_cutoff_import")) or \
+                    (args.periodic_spline and label == "reject_changed_spline_cutoff_import"), \
                     "alternative diagnostics are limited to qualified PP/complex periodic identity rejection"
                 assert any(message in text for message in reject), (directory, reject, text[-4000:])
             else:
@@ -788,6 +836,10 @@ def main():
                     previous_optimizer = optimizer_state
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if args.periodic_spline:
+                        assert parameters.size == 24
+                        assert not np.array_equal(parameters[:8], previous[:8]), (model, "J1 did not update")
+                        assert not np.array_equal(parameters[8:], previous[8:]), (model, "J2 did not update")
                     if args.mdj_alm:
                         assert parameters.size == 9 and names[0] == "CI1", model
                         assert parameters[0] != previous[0], (model, "CI1 did not update")
@@ -841,7 +893,7 @@ def main():
                                   f"rule={pseudo.get('nrule')};local_channel={pseudo.get('l-local')};")
                     assert descriptor in physical, (model, descriptor)
                     if not external_ecp or species == "Li":
-                        assert "knots=4;" in physical, model
+                        assert f"knots={12 if args.periodic_spline else 4};" in physical, model
                     assert f"species={species} href={pseudo.get('href')}" in text_value(group["ecp_source_report"][()]).splitlines(), model
                 if periodic_profile:
                     physical = text_value(group["physical_definition"][()])
@@ -876,11 +928,21 @@ def main():
                                (retained.tag, retained.attrib, (retained.text or "").split()), model
                 coefficients = exported.find(".//sposet/coefficient")
                 if fixed is None:
-                    assert periodic_profile and coefficients is None, model
+                    assert (periodic_profile or args.periodic_spline) and coefficients is None, model
                     def fixed_spo_definition(node):
                         return [(child.tag, child.attrib, (child.text or "").split()) for child in node.iter()]
+                    expected_spo = ET.fromstring(ET.tostring(tree.find("wavefunction/sposet_collection")))
+                    if args.periodic_spline:
+                        del expected_spo.attrib["href"]
+                        physical = text_value(group["physical_definition"][()])
+                        assert f"spline_source_v1:{len(spline_image)}:{spline_image.hex()};used_table:" in physical, model
+                        assert re.search(r";used_table:[^;]+;", physical), model
+                        assert int(np.asarray(group["immutable_asset_bytes"][()]).reshape(-1)[0]) == len(spline_image)
+                        assert physical.count("handler=EwaldHandler3D;") == 3, model
+                        assert physical.count(";lr_dim_cutoff=0x1.ep+4;") == 3, model
+                        assert "periodic_local_pp:" in physical and "CoulombPBCAB:" in physical, model
                     assert fixed_spo_definition(exported.find("sposet_collection")) == fixed_spo_definition(
-                        tree.find("wavefunction/sposet_collection")), model
+                        expected_spo), model
                 else:
                     assert coefficients.attrib == fixed.attrib, model
                     assert (coefficients.text or "").split() == (fixed.text or "").split(), model
@@ -1173,7 +1235,7 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
-        if args.md_orbital or args.mdj_alm or args.sj_reference_line_search:
+        if args.md_orbital or args.mdj_alm or args.sj_reference_line_search or args.periodic_spline:
             original_row, resumed_row = history(trained)[-1], history(resumed)[0]
             diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
             assert original_row.keys() == resumed_row.keys()
@@ -1285,6 +1347,14 @@ def main():
             print(f"PASS: external CPU LCAO{' active P6/full-history VP physical reference tol=3e-12 ONLY; bitwise accepted-C restart;' if args.external_orbital_ecp else ''}"
                   f"{' plus ordinary-locality ECP' if external_ecp else ''} Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
                   f"immutable asset bytes={len(external_original)} (separate from derivative scratch)")
+        if args.periodic_spline:
+            def tighten_spline_cutoff(tree):
+                tree.find("simulationcell/parameter[@name='LR_dim_cutoff']").text = "32"
+            run("reject_changed_spline_cutoff_import", vmc=True, parameter_file=exported, mutate=tighten_spline_cutoff,
+                reject=("Conventional model export identity mismatch",
+                        "Conventional artifact has an invalid or oversized required field: model_identity"))
+            run("reject_changed_spline_cutoff_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
+                mutate=tighten_spline_cutoff, reject="Training checkpoint stage identity or configuration mismatch")
         pseudos = ET.parse(fixture).findall("hamiltonian/pairpot/pseudo")
         for pseudo in pseudos:
             species = pseudo.get("elementType")
@@ -1299,7 +1369,11 @@ def main():
                 reject=("Conventional model export identity mismatch",
                         "Conventional artifact has an invalid or oversized required field: model_identity"))
             assert source.read_bytes() == original
-        if args.complex_periodic_heg:
+        if args.periodic_spline:
+            assert spline_source.read_bytes() == spline_image
+            print("PASS: real Gamma diamond fixed-spline/J1/J2 P24 Adam, actual source/used-table and Ewald30, "
+                  "ordinary rule4 locality ECP, physical model reuse and strict exact initialized restart")
+        elif args.complex_periodic_heg:
             print("PASS: CPU complex Gamma HEG14 real-J2 artifact VMC reference, fresh training/re-export/re-import, "
                   "complete exact initialized split restart and changed identity/import rejection")
         elif args.periodic_heg:
