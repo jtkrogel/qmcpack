@@ -2576,14 +2576,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
   REQUIRE(!points.empty());
   CHECK(std::any_of(points.begin(), points.end(), [](const auto& q) { return q.complete_ratio == DerivativeValue{}; }));
-  bool nonzero_ci_at_zero_ratio = false, nonzero_total_at_reference_node = false;
+  bool nonzero_ci_at_zero_ratio = false;
   for (const auto& q : points)
   {
-    const int first = q.electron < 2 ? 0 : 2;
-    const double other = positions[first + (q.electron == first ? 1 : 0)][0];
-    if (q.replacement_position[0] * q.replacement_position[0] == other * other &&
-        q.complete_ratio != DerivativeValue{})
-      nonzero_total_at_reference_node = true;
     if (q.complete_ratio != DerivativeValue{}) continue;
     replay->prepareSample(0);
     adapter.installSnapshot(*replay_wf, replay_p, *snapshot);
@@ -2596,10 +2591,10 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
         [](auto value) { return std::abs(value) > 0.1; });
   }
   CHECK(nonzero_ci_at_zero_ratio);
-  CHECK(nonzero_total_at_reference_node);
   op->bindNonLocalECPJVPReplay(std::move(record));
   const double local_value = loc->evaluate(p);
   // Independent occupied 2x2 determinant polynomials, not the bordered helper.
+  auto oracle_points = points;
   const auto fixed_energy = [&](const StructuredParameterSnapshot& candidate) {
     ParticleSet trial(p);
     auto twf = wf->makeClone(trial);
@@ -2616,7 +2611,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     const double accepted_j = jlog(*twf, trial);
     trial.R = positions; trial.update(); adapter.installSnapshot(*twf, trial, candidate);
     DerivativeValue energy = kineticEnergy(trial) + local_value;
-    for (const auto& q : points)
+    for (const auto& q : oracle_points)
     {
       auto r = positions;
       for (int dim = 0; dim < 3; ++dim) r[q.electron][dim] = q.replacement_position[dim];
@@ -2662,6 +2657,43 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   CHECK(wf->getLogPsi() == live_log);
   checkClose(kineticEnergy(p), live_energy);
   CHECK_FALSE(source.usesAcceptedReferenceVirtualRatios());
+
+  // The physical octahedral grid cannot hit q_x=+-2 for the radius-1 first
+  // electron. Exercise that exact reference node in a separately labeled
+  // synthetic replay, not by changing or relabeling the accepted PP grid.
+  NonLocalECPReplayPoint node{};
+  node.sample = 0; node.electron = 0; node.replacement_position = {-2, 0, 0}; node.bare_weight = 1;
+  oracle_points = {node};
+  node.complete_ratio = fixed_energy(*snapshot) - live_energy - local_value;
+  REQUIRE(node.complete_ratio != DerivativeValue{});
+  CHECK(node.replacement_position[0] * node.replacement_position[0] == positions[1][0] * positions[1][0]);
+  auto node_op = adapter.makeDerivativeOperator(replay, snapshot, 1, 0);
+  auto node_capture = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 1, 0);
+  const VJPCoefficientChannel node_channel{"node", DerivativeProduct::LOCAL_ENERGY_VJP,
+      coefficientsFor(*node_op, unit), ecp_mask};
+  const NonLocalECPDerivativeContext context{adapter.parameterSchema().providerId(),
+      adapter.parameterSchema().fingerprint(), snapshot->version, 1, 0, 1, 1, 456};
+  node_capture->begin(context, {&node_channel, 1}, idle);
+  const std::vector<std::size_t> offsets{0, 1};
+  const std::vector<VirtualParticleBatch::Segment> segments{{0, 0, true, 0}};
+  const std::vector<ParticleSet::PosType> replacements{{-2, 0, 0}};
+  VirtualParticleBatch tile(1, offsets, segments, replacements);
+  const QMCTraits::ValueType bare{1}, ratio{node.complete_ratio.real()};
+  node_capture->consume({tile, {&bare, 1}, {&ratio, 1}, {}, 0, 456});
+  node_capture->end();
+  node_op->bindNonLocalECPJVPReplay(node_capture->releaseJVPReplay());
+  const VJPCoefficientChannel node_total{"node_total", DerivativeProduct::LOCAL_ENERGY_VJP,
+      coefficientsFor(*node_op, unit), total_mask};
+  RecordingParameterSink node_rows;
+  node_op->applyVJPs({&node_total, 1}, DerivativeAdjoint::TRANSPOSE, node_rows);
+  for (std::size_t parameter = 0; parameter < 5; ++parameter)
+  {
+    auto plus = *snapshot, minus = *snapshot;
+    plus.values[parameter] += 1e-5; minus.values[parameter] -= 1e-5;
+    const auto fd = (fixed_energy(plus) - fixed_energy(minus)) / 2e-5;
+    CHECK(node_rows.result()[0][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-6).margin(3e-8));
+  }
+  CHECK(rng.draws == draws);
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
