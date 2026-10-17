@@ -105,7 +105,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
   hAttrib.add(defaultKE, "default");
   hAttrib.put(cur);
 #ifdef QMC_COMPLEX
-  // This first public profile is one complete CPU Coulomb ansatz, not a generic capability registry.
+  // Validate declared XML structure first; selected-driver admission checks the built objects later.
   const PsiFormerComplexWF* complex = nullptr;
   if (psi_optional_)
     for (const auto& component : psi_optional_->get().getOrbitals())
@@ -116,11 +116,14 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
     if (psi_optional_->get().getOrbitals().size() != 1 || defaultKE != "yes")
       throw std::invalid_argument("Complex PsiFormer requires a sole component and ordinary bare kinetic energy");
     const auto& source = complex->sourceParticles();
+    const bool pp = complex->isPseudopotentialSystem() && complex->gpuInferenceEnabled();
     std::array<bool, 3> seen{};
     processChildren(cur, [&](const std::string& kind, xmlNodePtr element) {
       if (element->type != XML_ELEMENT_NODE)
         return; // formatted XML text/comments are not Hamiltonian operators
-      if (kind != "pairpot" || getXMLAttributeValue(element, "type") != "coulomb")
+      const auto type = getXMLAttributeValue(element, "type");
+      const bool pseudo = type == "pseudo";
+      if (kind != "pairpot" || (type != "coulomb" && !(pp && pseudo)))
         throw std::invalid_argument("Complex PsiFormer admits only three physical periodic Coulomb pair terms");
       // Mirror CoulombPotentialFactory defaults, including e/e when source/target are omitted.
       std::string from = targetPtcl.getName(), to = targetPtcl.getName();
@@ -137,7 +140,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
       if (!physical || pbc != "yes" || forces != "no" || (gpu != "no" && gpu != "cpu"))
         throw std::invalid_argument("Complex PsiFormer requires physical periodic CPU Coulomb without forces");
       std::size_t term = 3;
-      if (from == targetPtcl.getName() && to == targetPtcl.getName())
+      if (!pseudo && from == targetPtcl.getName() && to == targetPtcl.getName())
         term = 0;
       else if (from == source.getName() && (to == targetPtcl.getName() || to == source.getName()))
       {
@@ -146,7 +149,8 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
           throw std::invalid_argument("Complex PsiFormer Coulomb source differs from its fixed ion source");
         term = to == targetPtcl.getName() ? 1 : 2;
       }
-      if (term == 3 || seen[term])
+      // A PP pair replaces, never supplements, bare electron-ion Coulomb.
+      if ((pseudo && term != 1) || (pp && !pseudo && term == 1) || term == 3 || seen[term])
         throw std::invalid_argument("Complex PsiFormer Coulomb source pair is unqualified or duplicated");
       seen[term] = true;
     });
