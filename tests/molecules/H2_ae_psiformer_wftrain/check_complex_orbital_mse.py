@@ -137,9 +137,15 @@ def main():
             compare_archives(left, right, pattern)
         final_scalar = sorted((continuous / "complex_orbital_mse.s000.inference").glob("*.scalar.dat"))[-1]
         restored_scalar = sorted((resumed / "complex_orbital_mse.s000.inference").glob("*.scalar.dat"))[-1]
-        physical_rows = lambda path: [line.split() for line in path.read_text().splitlines()
-                                      if line.strip() and not line.startswith("#")]
-        assert physical_rows(final_scalar) == physical_rows(restored_scalar), "exact restart inference"
+        def physical_row(path):
+            text = path.read_text().splitlines()
+            header = next(line.split()[1:] for line in text if line.startswith("#") and "BlockWeight" in line)
+            values = next(line.split() for line in text if line.strip() and not line.startswith("#"))
+            assert len(header) == len(values)
+            # Wall-clock CPU time is not a physical inference result or restart state.
+            return {name: value for name, value in zip(header, values) if name != "BlockCPU"}
+
+        assert physical_row(final_scalar) == physical_row(restored_scalar), "exact restart inference"
 
         def teacher_twist(tree):
             tree.find(".//wavefunction[@name='teacher']//sposet").set("twist", "0.18 -0.11 0.07")
