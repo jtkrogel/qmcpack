@@ -2056,7 +2056,7 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
       r0.device_bytes, r0.host_bytes, r2.device_bytes, r2.host_bytes, r2.matrix_work);
   CHECK(r2.device_bytes == r0.device_bytes);
   CHECK(r2.host_bytes == r0.host_bytes + 32 * samples * 4);
-  CHECK(component.gpuDerivativeRequirements(4, 2, 3, 7).host_bytes == r0.host_bytes + 32 * 4 * 4);
+  CHECK(component.gpuDerivativeRequirements(4, samples, 3, 7).host_bytes == r0.host_bytes + 32 * 4 * 4);
   auto& metrics = dev::deviceMemoryMetrics(ordinal);
   const auto before = metrics.snapshot();
   CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
