@@ -398,6 +398,7 @@ private:
 class PreparedDeviceModel
 {
   friend class PreparedDeviceAdam;
+  friend class PreparedDevicePcg;
 
   /// Revocable identity only: never retain moment buffers or an old parameter image.
   struct CandidateControl
@@ -409,11 +410,12 @@ class PreparedDeviceModel
 
 public:
   /** Own finite-admitted immutable candidate bytes, not model publication authority.
-   * Same-thread Adam mutation revokes admission, never this buffer's lifetime.
+   * Same-thread optimizer mutation revokes admission, never this buffer's lifetime.
    */
   class CandidateSnapshot
   {
     friend class PreparedDeviceAdam;
+    friend class PreparedDevicePcg;
     friend class PreparedDeviceModel;
 
   public:
@@ -427,11 +429,11 @@ public:
     /// Identify the immutable source version without reading its HOST parameters.
     std::size_t sourceVersion() const noexcept { return source_version_; }
 
-    /// Identify one Adam proposal, not a reused scratch pointer.
+    /// Identify one optimizer proposal, not a reused scratch pointer.
     std::size_t proposalGeneration() const noexcept { return generation_; }
 
   private:
-    /// Allocate private storage now; expose it only after finite Adam admission.
+    /// Allocate private storage now; expose it only after finite admission.
     CandidateSnapshot(const std::shared_ptr<CandidateControl>& control,
         const std::shared_ptr<const PreparedDeviceModel>& source)
         : control_(control), metadata_(source->metadata_), source_version_(source->version_),
@@ -441,7 +443,7 @@ public:
     std::weak_ptr<CandidateControl> control_;
     std::shared_ptr<const PreparedDeviceModelMetadata> metadata_;
     std::size_t source_version_, generation_;
-    // Only Adam writes, before finite admission; exposed receipts/images are immutable.
+    // Only the proposing optimizer writes before admission; exposed storage is immutable.
     std::shared_ptr<DeviceBuffer<double>> parameters_;
   };
 

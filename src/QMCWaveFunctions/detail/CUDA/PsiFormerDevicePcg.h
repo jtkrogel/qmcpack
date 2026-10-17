@@ -64,6 +64,15 @@ public:
     bool candidate_ready = false;
   };
 
+  /// The caller's strong lease keeps receipt acceptance state alive, never borrowed r_.
+  struct DeviceEnergyCandidate
+  {
+    EnergyResult result;
+    double displacement_norm;
+    std::unique_ptr<const PreparedDeviceModel::CandidateSnapshot> snapshot;
+    std::shared_ptr<PreparedDevicePcg> owner;
+  };
+
   /// Include the entire metric/fixed C owner, persistent RHS and distinct PCG scratch.
   static Cost requiredBytes(std::size_t p, std::size_t b, std::size_t ne, std::size_t c, std::size_t f = 0)
   {
@@ -231,6 +240,7 @@ public:
     std::lock_guard lock(session_.mutex_);
     if (!retained_)
       throw std::invalid_argument("Retained ENERGY consume requires its explicit retained factory");
+    rejectDeviceCandidate();
     Retirement retirement{*this};
     try
     {
@@ -250,11 +260,90 @@ public:
     }
   }
 
+  /// Return finite immutable bytes, deferring healthy consumed_ until publication accepts.
+  DeviceEnergyCandidate consumeRetainedEnergyDevice(const std::shared_ptr<PreparedDevicePcg>& owner,
+      const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, std::size_t generation,
+      double weight, double energy, double damping, double learning_rate,
+      const wftrain::KrylovSolverControl& control, std::size_t device_cap, std::size_t host_cap,
+      std::size_t snapshot_cap)
+  {
+    if (owner.get() != this)
+      throw std::invalid_argument("DEVICE SR candidate requires its exact strong solver lease");
+    std::lock_guard lock(session_.mutex_);
+    rejectDeviceCandidate();
+    if (!snapshot_cap || snapshot_cap == std::numeric_limits<std::size_t>::max() ||
+        PreparedDeviceModel::candidateDeviceBytes(parameters_) > snapshot_cap)
+      throw std::length_error("DEVICE SR snapshot exceeds its explicit byte budget");
+    if (proposal_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("DEVICE SR proposal generation exhausted");
+    Retirement retirement{*this};
+    try
+    {
+      bindEnergyUnderControl(positions, weights, frozen, version, damping, device_cap, host_cap);
+      const auto image = metric_->image_;
+      if (image->version() == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("DEVICE SR successor version exhausted");
+      auto identity = std::make_shared<PreparedDeviceModel::CandidateControl>();
+      identity->source = image;
+      identity->generation = ++proposal_generation_;
+      std::unique_ptr<PreparedDeviceModel::CandidateSnapshot> snapshot(
+          new PreparedDeviceModel::CandidateSnapshot(identity, image));
+      std::vector<double> unused;
+      double displacement = 0;
+      const auto result = consumeEnergyUnderControl(version, generation, unused, weight, energy,
+          learning_rate, control, unused, &displacement);
+      if (!result.candidate_ready || !result.solve.converged)
+        throw wftrain::MatrixFreeNumericalError("DEVICE SR candidate requires a converged solve");
+      snapshot->parameters_->copyFromDevice(r_, parameters_);
+      pending_control_ = std::move(identity);
+      return {result, displacement, std::move(snapshot), owner};
+    }
+    catch (...) { failed_ = true; throw; }
+  }
+
+  /// Resolve source/image/device and receipt errors before final publication readiness.
+  void validateDeviceAcceptance(const PreparedDeviceModel::CandidateSnapshot& candidate,
+      const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
+    std::lock_guard lock(session_.mutex_);
+    const auto identity = candidate.control_.lock();
+    const auto source = identity ? identity->source.lock() : nullptr;
+    if (failed_ || !identity || !identity->live || identity != pending_control_ ||
+        candidate.generation_ != proposal_generation_ || !source || session_.active_image_ != source ||
+        !successor || successor->candidate_control_.lock() != identity ||
+        successor->candidate_generation_ != proposal_generation_ || successor->metadata_ != candidate.metadata_ ||
+        successor->version() != candidate.source_version_ + 1)
+      throw std::invalid_argument("DEVICE SR acceptance has a foreign, expired or stale proposal");
+    source->validateCandidate(candidate);
+    successor->validateCurrentDevice();
+  }
+
+  /// Prevalidated same-thread acceptance only: no GPU/lock/allocation/numeric retirement.
+  void acceptPreparedDeviceCandidate(const PreparedDeviceModel::CandidateSnapshot& candidate,
+      const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
+  {
+    if (failed_ || !pending_control_ || !pending_control_->live || candidate.control_.lock() != pending_control_ ||
+        candidate.generation_ != proposal_generation_ || !successor ||
+        successor->candidate_control_.lock() != pending_control_)
+      std::terminate();
+    consumed_ = true;
+    rejectDeviceCandidate();
+  }
+
+  /// Revocation changes metadata only; independently owning snapshot bytes survive.
+  void rejectDeviceCandidate() noexcept
+  {
+    if (pending_control_) pending_control_->live = false;
+    pending_control_.reset();
+  }
+
 private:
   /// Preserve the ordinary ENERGY body/order while its two explicit wrappers own the lock.
   EnergyResult consumeEnergyUnderControl(std::size_t version, std::size_t generation,
       const std::vector<double>& parameters, double weight, double energy, double learning_rate,
-      const wftrain::KrylovSolverControl& control, std::vector<double>& candidate)
+      const wftrain::KrylovSolverControl& control, std::vector<double>& candidate,
+      double* device_displacement = nullptr)
   {
     rhs_ready_ = iterate_ready_ = false;
     try
@@ -264,7 +353,7 @@ private:
       if (version != metric_->image_->version() || session_.energy_image_ != metric_->image_.get() ||
           generation != session_.contraction_transaction_ || !source || !source->ready_ ||
           source->channels_ != 3 || source->parameters_ != parameters_ ||
-          parameters.size() != parameters_ || candidate.size() != parameters_ ||
+          (!device_displacement && (parameters.size() != parameters_ || candidate.size() != parameters_)) ||
           energy_host_.size() != PreparedDeviceAdam::energyGradientRequiredBytes(parameters_) / sizeof(double) ||
           energy_partials_.capacity() != energy_host_.size() || energy_status_.capacity() != 1 ||
           energy_status_host_.size() != 1 || weight != metric_->weight_ ||
@@ -274,14 +363,16 @@ private:
       Metric::advance(rhs_generation_);
       try
       {
-        x_.upload(parameters.data(), parameters_);
+        if (!device_displacement)
+          x_.upload(parameters.data(), parameters_);
 #ifdef QMC_CUDA2HIP
         checkRuntime(hipMemsetAsync(energy_status_.data(), 0xff, sizeof(std::uint64_t), session_.queue_.getNative()), "SR ENERGY status reset");
 #else
         checkRuntime(cudaMemsetAsync(energy_status_.data(), 0xff, sizeof(std::uint64_t), session_.queue_.getNative()), "SR ENERGY status reset");
 #endif
         checkRuntime(launchAdamEnergyGradient(session_.queue_.getNative(), parameters_, source->sums_.data(),
-            x_.data(), metric_->image_->parameters(), weight, energy, rhs_.data(), energy_partials_.data(),
+            device_displacement ? metric_->image_->parameters() : x_.data(), metric_->image_->parameters(),
+            weight, energy, rhs_.data(), energy_partials_.data(),
             energy_status_.data()), "SR resident ENERGY gradient");
         session_.queue_.sync();
         energy_status_.download(energy_status_host_.data(), 1);
@@ -316,7 +407,16 @@ private:
           checkRuntime(launchDerivativeCopy(session_.queue_.getNative(),
               {interval.second, interval.first, 1, interval.first, 1}, metric_->image_->parameters(), r_.data()),
               "SR frozen candidate preservation");
-        r_.download(candidate.data(), parameters_);
+        if (device_displacement)
+        {
+          scan(r_);
+          checkRuntime(launchDerivativeCopy(session_.queue_.getNative(), {parameters_, 0, 1, 0, 1},
+              metric_->image_->parameters(), x_.data()), "SR rounded displacement seed");
+          axpy({-1, 0}, Slot::R, Slot::X);
+          *device_displacement = norm(Slot::X); // Explicit checked raw-square, not HOST hypot domain.
+        }
+        else
+          r_.download(candidate.data(), parameters_);
         result.candidate_ready = true;
         return result;
       }
@@ -608,6 +708,8 @@ private:
   std::size_t binding_version_, retained_device_cap_ = 0, retained_host_cap_ = 0;
   bool retained_ = false, consumed_ = false;
   bool rhs_ready_ = false, iterate_ready_ = false, failed_ = false;
+  std::size_t proposal_generation_ = 0;
+  std::shared_ptr<PreparedDeviceModel::CandidateControl> pending_control_;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif

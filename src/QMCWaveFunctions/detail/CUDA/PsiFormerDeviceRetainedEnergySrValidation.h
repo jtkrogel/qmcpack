@@ -60,16 +60,18 @@ inline void validateRetainedEnergySr(pf::PsiFormer& model, const PsiFormerExecut
     energy /= weight;
   };
   population(0);
-  const auto build = [&](std::size_t version, ScoreContractionRole role = ScoreContractionRole::ENERGY_T_EO_O) {
-    const auto generation = session->beginScoreContraction(3, version, role);
+  const auto build = [&](std::size_t version, ScoreContractionRole role = ScoreContractionRole::ENERGY_T_EO_O,
+                         PreparedDeviceProductSession* selected = nullptr) {
+    auto& target = selected ? *selected : *session;
+    const auto generation = target.beginScoreContraction(3, version, role);
     std::vector<std::complex<double>> score(3), kinetic(3), imaginary_weights(3);
     for (std::size_t s = 0; s < b; ++s)
     {
       score[1] = weights[s] * (-2.3 + 0.09 * s); score[2] = weights[s]; kinetic[0] = weights[s];
-      session->accumulateKineticContraction(positions.data() + s * 3 * ne, drift.data(), imaginary.data(),
+      target.accumulateKineticContraction(positions.data() + s * 3 * ne, drift.data(), imaginary.data(),
           masses.data(), score.data(), kinetic.data(), imaginary_weights.data(), 3, version);
     }
-    session->finishScoreContraction(version);
+    target.finishScoreContraction(version);
     return generation;
   };
   wftrain::KrylovSolverControl control;
@@ -185,6 +187,156 @@ inline void validateRetainedEnergySr(pf::PsiFormer& model, const PsiFormerExecut
     fails([&] { cache->consumeRetainedEnergy(positions, weights, frozen, version, fresh, parameters,
         weight, energy, damping, learning_rate, control, cost.device_bytes, cost.host_bytes, candidate); });
   }
+  // DEVICE publication is a separate numerical contract; no public driver admission.
+  auto device_parameters = model.p.flat_values();
+  auto device_backend = std::make_shared<PreparedDeviceBatchBackend>(
+      caller_image->makeUpdatedImage(device_parameters, first_version));
+  auto device_session = device_backend->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 4);
+  device_session->prepareScoreContractions(3, first_version);
+  population(0);
+  std::shared_ptr<Owner> cache = Owner::prepareRetainedEnergy(*device_session, positions, weights, frozen,
+      first_version, damping, cost.device_bytes, cost.host_bytes);
+  pf::DirectScoreExecutor cpu_score(model, plan);
+  pf::DirectKineticExecutor cpu_kinetic(model, plan);
+  auto score_workspace = cpu_score.makeWorkspace();
+  auto kinetic_workspace = cpu_kinetic.makeWorkspace();
+  const auto original_parameters = model.p.flat_values();
+  for (std::size_t step = 0; step < 3; ++step)
+  {
+    const auto version = first_version + step;
+    population(step);
+    model.p.set_flat_values(device_parameters);
+    std::vector<double> scores(b * p), t(p), eo(p), o(p), rhs(p), cpu_expected(p), actual(p);
+    for (std::size_t sample = 0; sample < b; ++sample)
+    {
+      const auto* position = positions.data() + sample * 3 * ne;
+      score_workspace->setPositions(pf::GeometryPositionView::interleaved(position, ne));
+      kinetic_workspace->setPositions(pf::GeometryPositionView::interleaved(position, ne));
+      const auto score = cpu_score.evaluate(*score_workspace);
+      const auto kinetic = cpu_kinetic.evaluate(*kinetic_workspace, drift.data(), drift.size(), masses.data(), masses.size());
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        scores[sample * p + i] = score.parameter_score[i];
+        t[i] += weights[sample] * kinetic.kinetic_parameter_response[i];
+        eo[i] += weights[sample] * (-2.3 + .09 * sample) * score.parameter_score[i];
+        o[i] += weights[sample] * score.parameter_score[i];
+      }
+    }
+    double gradient_norm = 0;
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      const double gradient = 2 * (t[i] + eo[i] - energy * o[i]) / weight;
+      gradient_norm = std::hypot(gradient_norm, gradient);
+      rhs[i] = i < 2 || i + 1 == p ? 0 : gradient;
+    }
+    PcgCpuReference cpu_reference(scores, weights, rhs, damping);
+    wftrain::KrylovSolveDiagnostics cpu_solve;
+    wftrain::krylov_detail::runPreconditionedConjugateGradient(cpu_reference, control, p, cpu_solve);
+    require(cpu_solve.converged, "DEVICE SR CPU oracle failed to converge");
+    double displacement = 0;
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      volatile double product = -learning_rate * cpu_reference.get(wftrain::krylov_detail::PcgSlot::X)[i];
+      cpu_expected[i] = device_parameters[i] + product;
+      displacement = std::hypot(displacement, cpu_expected[i] - device_parameters[i]);
+    }
+    const auto build_device = [&] { return build(version, ScoreContractionRole::ENERGY_T_EO_O, device_session.get()); };
+    const auto consume_device = [&](std::size_t generation, std::size_t cap) {
+      return cache->consumeRetainedEnergyDevice(cache, positions, weights, frozen, version, generation,
+          weight, energy, damping, learning_rate, control, cost.device_bytes, cost.host_bytes, cap);
+    };
+    auto generation = build_device();
+    const auto cap_before = device_session->transferSnapshot();
+    fails([&] { consume_device(generation, 8 * p - 1); });
+    require(device_session->transferSnapshot().allocation_calls == cap_before.allocation_calls,
+        "DEVICE SR denied snapshot allocated");
+    // Successful discard is healthy, unlike an actually failed numerical owner.
+    {
+      auto discarded = consume_device(build_device(), 8 * p);
+      auto source = device_backend->currentImage();
+      auto successor = source->makeSharedUpdatedImage(*discarded.snapshot);
+      cache->validateDeviceAcceptance(*discarded.snapshot, successor);
+      { PreparedDeviceBatchBackend::PreparedDevicePublication cancelled(device_backend, source, successor); }
+      cache->rejectDeviceCandidate();
+      fails([&] { source->makeSharedUpdatedImage(*discarded.snapshot); });
+      require(discarded.snapshot->deviceBytes() == 8 * p, "Rejected DEVICE SR bytes lost ownership");
+    }
+    generation = build_device();
+    auto ordinary = Owner::prepareEnergy(*device_session, positions, weights, frozen, version, damping,
+        cost.device_bytes, cost.host_bytes);
+    const auto oracle_before = device_session->transferSnapshot();
+    const auto oracle = ordinary->consumeEnergy(version, generation, device_parameters, weight, energy,
+        learning_rate, control, expected);
+    const auto oracle_after = device_session->transferSnapshot();
+    ordinary.reset();
+    generation = build_device();
+    const auto device_before = device_session->transferSnapshot();
+    auto proposal = consume_device(generation, 8 * p);
+    const auto device_after = device_session->transferSnapshot();
+    require(device_after.allocation_calls == device_before.allocation_calls + 1 &&
+        device_after.live_bytes == device_before.live_bytes + 8 * p &&
+        device_after.uploaded_bytes - device_before.uploaded_bytes ==
+            oracle_after.uploaded_bytes - oracle_before.uploaded_bytes - 8 * p &&
+        device_after.downloaded_bytes - device_before.downloaded_bytes ==
+            oracle_after.downloaded_bytes - oracle_before.downloaded_bytes - 8 * p + 64 * (p / 4096 + (p % 4096 != 0)) + 24,
+        "DEVICE SR warm traffic/single immutable allocation changed");
+    require(proposal.owner == cache && proposal.result.solve.converged &&
+        proposal.result.solve.iterations == cpu_solve.iterations &&
+        proposal.result.solve.operator_applications == cpu_solve.operator_applications,
+        "DEVICE SR solve/strong lease differs from CPU");
+    near(proposal.result.gradient_norm, gradient_norm);
+    near(proposal.result.direction_norm, oracle.direction_norm);
+    near(proposal.result.metric_norm, oracle.metric_norm);
+    near(proposal.displacement_norm, displacement);
+    auto source = device_backend->currentImage();
+    auto successor = source->makeSharedUpdatedImage(*proposal.snapshot);
+    auto foreign = std::shared_ptr<Owner>(Owner::prepareRetainedEnergy(*device_session, positions, weights, frozen,
+        version, damping, cost.device_bytes, cost.host_bytes));
+    fails([&] { foreign->validateDeviceAcceptance(*proposal.snapshot, successor); });
+    fails([&] { cache->validateDeviceAcceptance(*proposal.snapshot, source); });
+    cache->validateDeviceAcceptance(*proposal.snapshot, successor);
+    {
+      PreparedDeviceBatchBackend::PreparedDevicePublication publication(device_backend, source, successor);
+      const auto commit_before = device_session->transferSnapshot();
+      publication.commit();
+      cache->acceptPreparedDeviceCandidate(*proposal.snapshot, successor);
+      const auto commit_after = device_session->transferSnapshot();
+      require(commit_after.allocation_calls == commit_before.allocation_calls &&
+          commit_after.free_calls == commit_before.free_calls &&
+          commit_after.uploaded_bytes == commit_before.uploaded_bytes &&
+          commit_after.downloaded_bytes == commit_before.downloaded_bytes &&
+          commit_after.device_copied_bytes == commit_before.device_copied_bytes,
+          "DEVICE SR no-fail commit called runtime or retired numeric storage");
+      publication.unlock();
+    }
+    fails([&] { source->makeSharedUpdatedImage(*proposal.snapshot); });
+    successor->downloadCanonical(actual); // Explicit cold oracle, outside warm/commit accounting.
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      near(actual[i], cpu_expected[i]); near(actual[i], expected[i]);
+      if (i < 2 || i + 1 == p) require(actual[i] == device_parameters[i], "DEVICE SR altered frozen bits");
+    }
+    device_parameters = actual;
+    std::cout << "device_energy_sr step=" << step << " source_version=" << version
+              << " cpu_oracle=1 shared_snapshot_bytes=" << 8 * p << " discard_retry=1 nofail_commit=1\n";
+  }
+  // No candidate escapes a stopped solve, and failed storage requires explicit re-prepare.
+  const auto stopped_version = first_version + 3;
+  auto stopped_generation = build(stopped_version, ScoreContractionRole::ENERGY_T_EO_O, device_session.get());
+  std::shared_ptr<Owner> stopped_owner = Owner::prepareRetainedEnergy(*device_session, positions, weights, frozen,
+      stopped_version, damping, cost.device_bytes, cost.host_bytes);
+  auto stopped_control = control;
+  stopped_control.maximum_iterations = 0;
+  fails([&] { stopped_owner->consumeRetainedEnergyDevice(stopped_owner, positions, weights, frozen,
+      stopped_version, stopped_generation, weight, energy, damping, learning_rate, stopped_control,
+      cost.device_bytes, cost.host_bytes, 8 * p); });
+  stopped_generation = build(stopped_version, ScoreContractionRole::ENERGY_T_EO_O, device_session.get());
+  fails([&] { stopped_owner->consumeRetainedEnergyDevice(stopped_owner, positions, weights, frozen,
+      stopped_version, stopped_generation, weight, energy, damping, learning_rate, control,
+      cost.device_bytes, cost.host_bytes, 8 * p); });
+  require(device_backend->currentImage()->version() == stopped_version, "Failed DEVICE SR published a model");
+  model.p.set_flat_values(original_parameters);
+  std::cout << "PASS DEVICE retained ENERGY SR three_updates=3 immutable_shared_successor=1 public_authority=0 raw_square_displacement_domain=1\n";
   std::cout << "PASS retained numerical ENERGY SR cold_device_allocations=15 two_successor_steps=2 weak_old_image_expired=1"
             << " max_ordinary_candidate=" << max_candidate << " aggregate_publication_peak_unchanged=0 production_bound=0\n";
 }
