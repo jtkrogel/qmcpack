@@ -108,3 +108,14 @@ inputs, logs, executable/input hashes, source, elapsed time and GNU-time
 per-process maximum RSS; the latter is not an aggregate memory bound. Different
 algorithms need not yield equal updates, better energies, or equal-quality
 timings. This short integration check does not rank convergence or efficiency.
+
+The candidate ``--sj-reference-line-search`` mode reuses the fixed H2 P8 Adam
+fixture with reference search and its existing five nonzero alphas
+.125/.25/.5/.75/1. Four-sample ESS fraction .5, confidence 2 and maximum weight
+.5 are explicit (default .25 would reject every nonuniform four-sample trial).
+It accepts the natural selected alpha, including zero, checks finite candidate
+receipts and exact unchanged parameters/Adam moments/count for rejected steps,
+and reuses strict full/import/export/inference/initialized-split comparisons.
+Private-bank isolation is a separate component-unit proof, not native pointer
+telemetry. Existing line-search-off defaults stay unchanged; native qualification
+and registration are pending, with no ECP or other line-search profile implied.

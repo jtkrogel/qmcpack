@@ -272,9 +272,22 @@ def main():
                         help="mixed DETS/J2 PII/minPII tangent updates, inference and restart")
     parser.add_argument("--mdj-alm", action="store_true",
                         help="one fixed-orbital H4 DETS/J2 AE ALM full model-import round trip")
+    parser.add_argument("--sj-reference-line-search", action="store_true",
+                        help="H2 SJ Adam reference search with existing five alphas and natural decisions")
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.sj_reference_line_search:
+        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+                args.restart, args.preflight, args.model_import, args.old_new, args.family_screen,
+                args.family_method, args.profile_only, args.optimizer_screen, args.ci_pii, args.ci_lm,
+                args.csf_lm, args.csf_pii, args.mdj_pii, args.mdj_alm, args.csf_j2_pii, args.periodic_heg,
+                args.complex_periodic_heg, args.md_orbital, args.external_lcao, args.external_orbital_ecp,
+                args.orbital_ecp, args.many_occupied_orbital_ecp, args.md_orbital_ecp,
+                args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_minpii,
+                args.unequal_spin_orbital_ecp, args.csf_orbital_ecp, args.orbital_jastrow)):
+            parser.error("--sj-reference-line-search selects one single-rank H2 SJ AE workflow")
+        args.model_import = True
     if args.mdj_alm:
         if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
                 args.restart, args.preflight, args.model_import, args.old_new, args.family_screen,
@@ -357,6 +370,10 @@ def main():
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
     fixture_tree = ET.parse(fixture)
+    if args.sj_reference_line_search:
+        assert not fixture_tree.findall(".//multideterminant") and not fixture_tree.findall(".//pseudo")
+        assert not fixture_tree.findall(".//rotated_sposet")
+        assert sum(len(node.text.split()) for node in fixture_tree.findall(".//jastrow/correlation/coefficients")) == 8
     if args.mdj_alm:
         assert fixture_tree.find(".//detlist").get("type") == "DETS"
         assert not fixture_tree.findall(".//rotated_sposet") and not fixture_tree.findall(".//pseudo")
@@ -453,6 +470,8 @@ def main():
         directory.mkdir()
         if optimizer is None:
             optimizer = "alm" if args.mdj_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+        if args.sj_reference_line_search:
+            require_committed = False
         if args.mdj_alm:
             samples_per_rank = 32
         if periodic_profile:
@@ -583,6 +602,12 @@ def main():
         qmc = tree.find("qmc")
         training = qmc.find("training")
         training.set("optimizer", optimizer)
+        if args.sj_reference_line_search:
+            training.find("parameter[@name='line_search']").text = "reference"
+            # Twice uniform for four samples; .25 would reject every nonuniform trial.
+            for name, value in (("line_search_maximum_weight", "0.5"),
+                                ("line_search_minimum_ess_fraction", "0.5"), ("line_search_confidence", "2")):
+                ET.SubElement(training, "parameter", name=name).text = value
         if args.mdj_alm:
             # The P9 fixture uses its full ten-dimensional augmented subspace.
             qmc.find("parameter[@name='walkers_per_rank']").text = "4"
@@ -660,6 +685,22 @@ def main():
         rows = history(directory)
         expected_rows = iterations if restart is None else 1
         assert len(rows) == expected_rows, (directory, rows)
+        if args.sj_reference_line_search:
+            receipts = re.findall(r"WFTrain candidate alpha (\S+) loss (\S+) loss_difference (\S+) "
+                                  r"difference_error (\S+) ess (\S+) maximum_weight (\S+) valid ([01])", text)
+            assert len(receipts) == 6 * expected_rows, (directory, receipts)
+            for ordinal, row in enumerate(rows):
+                candidates = [tuple(map(float, receipt)) for receipt in receipts[6*ordinal:6*(ordinal+1)]]
+                assert all(math.isfinite(value) for candidate in candidates for value in candidate), directory
+                assert {candidate[0] for candidate in candidates} == {0, .125, .25, .5, .75, 1}, directory
+                assert all(0 < candidate[4] <= samples_per_rank and 0 < candidate[5] <= 1
+                           for candidate in candidates), directory
+                alpha = float(row["selected_alpha"])
+                assert alpha in {0, .125, .25, .5, .75, 1} and row["committed"] == str(int(alpha > 0)), row
+                assert alpha == 0 or any(candidate[0] == alpha and candidate[6] == 1 and
+                                        candidate[2] + 2*candidate[3] < 0 for candidate in candidates), row
+                print(f"reference search: {directory.name} iteration={row['iteration']} selected_alpha={alpha}; "
+                      "five nonzero candidates, finite receipts, natural decision", flush=True)
         for row in rows:
             if require_committed:
                 assert row["committed"] == "1", (directory, row)
@@ -703,6 +744,11 @@ def main():
                     datasets(parameter_file)["conventional_wavefunction/parameters"].reshape(-1))
         fixed = tree.find(".//sposet/coefficient")
         orbital_history = []
+        optimizer_keys = tuple("wftrain_checkpoint/optimizer/" + name for name in
+                               ("first_moment", "second_moment", "accepted_update_count"))
+        previous_optimizer = None
+        if args.sj_reference_line_search and restart is not None:
+            previous_optimizer = datasets(sorted((restart.parent / "sj.s000.training").rglob("*.state.h5"))[-1])
         for model, row in zip(models, rows):
             with h5py.File(model, "r") as handle:
                 group = handle["conventional_wavefunction"]
@@ -729,6 +775,17 @@ def main():
                         assert all(node.get("id") not in names for node in linear_nodes), model
                     else:
                         assert all(node.get("id") in names for node in linear_nodes[1:]), model
+                if args.sj_reference_line_search and float(row["selected_alpha"]) == 0:
+                    np.testing.assert_array_equal(parameters, previous,
+                        err_msg="rejected reference search changed accepted parameters")
+                if args.sj_reference_line_search:
+                    bundle = model.parent / (model.name[:-len(".parameters.h5")] + ".checkpoint")
+                    optimizer_state = datasets(next(bundle.glob("*.state.h5")))
+                    if float(row["selected_alpha"]) == 0:
+                        for key in optimizer_keys:
+                            expected = previous_optimizer[key] if previous_optimizer is not None else np.zeros_like(optimizer_state[key])
+                            np.testing.assert_array_equal(optimizer_state[key], expected, err_msg=f"rejected search: {key}")
+                    previous_optimizer = optimizer_state
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
                     if args.mdj_alm:
@@ -1116,7 +1173,7 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
-        if args.md_orbital or args.mdj_alm:
+        if args.md_orbital or args.mdj_alm or args.sj_reference_line_search:
             original_row, resumed_row = history(trained)[-1], history(resumed)[0]
             diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
             assert original_row.keys() == resumed_row.keys()
@@ -1251,6 +1308,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.sj_reference_line_search:
+            print("PASS: H2 SJ Adam reference search, five nonzero alphas, finite candidate receipts, "
+                  "natural decisions/accepted-state preservation and strict exact initialized restart")
         elif args.mdj_alm:
             print("PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed 32-sample updates, "
                   "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
