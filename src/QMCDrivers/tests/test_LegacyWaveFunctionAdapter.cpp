@@ -5779,6 +5779,8 @@ TEST_CASE("Diamond Gamma spline Jastrow products preserve the captured physical 
   WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
   auto source = factory.buildTWF(definition, RuntimeOptions{});
   REQUIRE(source);
+  // The builder adds J1 distance tables after the fixture's initial update.
+  particles.update();
   source->evaluateLog(particles);
   auto& spline = dynamic_cast<SplineR2R<double>&>(source->findSD()[0].get().getPhi(0));
   REQUIRE(!spline.isOMPoffload());
