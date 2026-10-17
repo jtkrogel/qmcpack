@@ -228,6 +228,10 @@ public:
    *@param refPtcl if given, the id of the reference particle in virtual moves
    */
   void evaluateDetsForPtclMove(const ParticleSet& P, int iat, int refPtcl = -1);
+
+  /// Fixed real CPU virtual determinants / accepted reference, including virtual
+  /// nodes. Requires initialized invertible accepted caches; never updates them.
+  void evaluateDetsToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios);
   /// multi walker version of evaluateDetsForPtclMove
   void static mw_evaluateDetsForPtclMove(const RefVectorWithLeader<MultiDiracDeterminant>& det_list,
                                          const RefVectorWithLeader<ParticleSet>& P_list,
@@ -549,6 +553,10 @@ private:
   OffloadVector<ValueType> ratios_to_ref_;
   /// new determinant ratios with respect to the updated reference determinant upon a proposed move
   OffloadVector<ValueType> new_ratios_to_ref_;
+
+  /// Reusable rank-(k+1) virtual scratch, independent of quadrature count.
+  Matrix<ValueType> accepted_reference_border_;
+  std::vector<int> accepted_reference_pivots_;
   /// new value of the reference determinant over the old value upon a proposed move
   ValueType curRatio;
   /// log value of the reference determinant

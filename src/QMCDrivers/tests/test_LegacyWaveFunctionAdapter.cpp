@@ -2192,6 +2192,150 @@ TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and i
   CHECK(op->storageDiagnostics().shared_workspace_bytes <= adapterOptions().maximum_derivative_scratch_bytes);
 }
 
+TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes",
+          "[legacy_adapter][accepted_reference_virtual]")
+{
+#ifdef QMC_COMPLEX
+  SKIP("Accepted-reference primitive qualifies only fixed real CPU orbitals");
+#endif
+  class PolynomialSPO final : public SPOSet
+  {
+  public:
+    PolynomialSPO() : SPOSet("accepted_reference_polynomial", 4) {}
+    std::string getClassName() const override { return "PolynomialSPO"; }
+    std::unique_ptr<SPOSet> makeClone() const override { return std::make_unique<PolynomialSPO>(); }
+    void evaluateValue(const ParticleSet& p, int i, ValueVector& values) override
+    {
+      const double x = p.R[i][0];
+      values[0] = 1; values[1] = x * x; values[2] = x; values[3] = x * x * x;
+    }
+    void evaluateVGL(const ParticleSet& p, int i, ValueVector& values, GradVector& gradients,
+                     ValueVector& laplacians) override
+    {
+      evaluateValue(p, i, values);
+      gradients = GradType{};
+      laplacians = ValueType{};
+      const double x = p.R[i][0];
+      gradients[1][0] = 2 * x; gradients[2][0] = 1; gradients[3][0] = 3 * x * x;
+      laplacians[1] = 2; laplacians[3] = 6 * x;
+    }
+    void evaluate_notranspose(const ParticleSet& p, int first, int last, ValueMatrix& values,
+                               GradMatrix& gradients, ValueMatrix& laplacians) override
+    {
+      for (int i = first; i < last; ++i)
+      {
+        ValueVector v(values[i - first], 4), l(laplacians[i - first], 4);
+        GradVector g(gradients[i - first], 4);
+        evaluateVGL(p, i, v, g, l);
+      }
+    }
+  };
+  const SimulationCell cell;
+  ParticleSet accepted(cell), virtual_positions(cell);
+  accepted.create({2, 2});
+  virtual_positions.create({1});
+  for (int i = 0; i < 4; ++i) accepted.R[i] = {double(1 + i % 2), 0, 0};
+  accepted.update();
+  const auto original_positions = accepted.R;
+  std::vector<ci_configuration2> configurations(4);
+  configurations[0].occup = {0, 1}; configurations[1].occup = {0, 2};
+  configurations[2].occup = {1, 2}; configurations[3].occup = {2, 3};
+  std::array<std::unique_ptr<MultiDiracDeterminant>, 2> spins;
+  std::array<std::vector<std::size_t>, 2> mappings;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    spins[spin] = std::make_unique<MultiDiracDeterminant>(std::make_unique<PolynomialSPO>(), false, 2 * spin, 2);
+    spins[spin]->createDetData(0, configurations, {0, 1, 2, 3}, mappings[spin]);
+    spins[spin]->evaluateForWalkerMove(accepted);
+  }
+  // Independent occupied 2x2 determinant, not the rank-(k+1) implementation.
+  const auto determinant = [](const ci_configuration2& configuration, double first, double second) {
+    const std::array<double, 4> a{1, first * first, first, first * first * first};
+    const std::array<double, 4> b{1, second * second, second, second * second * second};
+    return a[configuration.occup[0]] * b[configuration.occup[1]] -
+        a[configuration.occup[1]] * b[configuration.occup[0]];
+  };
+  for (int spin = 0; spin < 2; ++spin)
+    for (int moved = 0; moved < 2; ++moved)
+    {
+      CAPTURE(spin, moved);
+      auto& block = *spins[spin];
+      const int particle = 2 * spin + moved;
+      const auto original_log = block.getLogValueRefDet();
+      const std::vector<QMCTraits::ValueType> original_ratios(
+          block.getRatiosToRefDet().begin(), block.getRatiosToRefDet().end());
+      virtual_positions.R[0] = {3, 0, 0};
+      block.evaluateDetsForPtclMove(virtual_positions, 0, particle);
+      const auto regular_reference = block.getRefDetRatio();
+      const std::vector<QMCTraits::ValueType> regular_ratios(
+          block.getNewRatiosToRefDet().begin(), block.getNewRatiosToRefDet().end());
+      Vector<QMCTraits::ValueType> actual(4);
+      const auto* output_storage = actual.data();
+      for (double replacement : {-2., -1., 0., 1., 2., 3.})
+      {
+        CAPTURE(replacement);
+        virtual_positions.R[0] = {replacement, 0, 0};
+        block.evaluateDetsToAcceptedReference(virtual_positions, 0, particle, actual);
+        CHECK(actual.data() == output_storage);
+        for (int term = 0; term < 4; ++term)
+        {
+          const auto& configuration = block.getConfiguration(term);
+          const double expected = determinant(configuration, moved == 0 ? replacement : 1,
+              moved == 1 ? replacement : 2) / 3;
+          CHECK(std::real(actual[term]) == Catch::Approx(expected).epsilon(2e-13).margin(2e-13));
+          CHECK(block.getRatiosToRefDet()[term] == original_ratios[term]);
+        }
+        CHECK(block.getLogValueRefDet() == original_log);
+        const auto ref = mappings[spin][0], alt = mappings[spin][1];
+        const double stationary = std::real(spins[1 - spin]->getRatiosToRefDet()[mappings[1 - spin][1]]);
+        const double old_term = std::real(original_ratios[alt]) * stationary;
+        const double new_term = std::real(actual[alt]) * stationary;
+        const double denominator = 1 - 6 * old_term;
+        const double ratio = (std::real(actual[ref]) - 6 * new_term) / denominator;
+        const double derivative = (new_term - ratio * old_term) / denominator;
+        if ((moved == 0 && replacement == -2) || (moved == 1 && replacement == -1))
+        {
+          CHECK(actual[ref] == QMCTraits::ValueType{});
+          CHECK(std::abs(ratio) > 1); // zero virtual reference, nonzero total CI
+        }
+        if (replacement == 1 + moved)
+        {
+          CHECK(ratio == Catch::Approx(1).margin(2e-13));
+          CHECK(derivative == Catch::Approx(0).margin(2e-13));
+        }
+        if (moved == 0 && replacement == 0)
+        {
+          CHECK(actual[mappings[spin][3]] == QMCTraits::ValueType{});
+          // Both spins have accepted alt/ref=1/3. C1=-6 makes Psi(Q)=0
+          // while Psi(R)/reference_product=1/3 and dRatio/dC1=2/3.
+          CHECK(ratio == Catch::Approx(0).margin(2e-13));
+          CHECK(derivative == Catch::Approx(2. / 3).epsilon(2e-13));
+          const double epsilon = 1e-6;
+          const auto dense_ratio = [&](double coefficient) {
+            return (4. / 3 + coefficient * (2. / 9)) / (1 + coefficient / 9);
+          };
+          CHECK(derivative == Catch::Approx((dense_ratio(-6 + epsilon) - dense_ratio(-6 - epsilon)) /
+              (2 * epsilon)).epsilon(2e-8));
+        }
+      }
+      CHECK_THROWS_AS(block.evaluateDetsToAcceptedReference(virtual_positions, 0, 2 * spin - 1, actual),
+                      std::invalid_argument);
+      virtual_positions.R[0][0] = std::numeric_limits<double>::quiet_NaN();
+      CHECK_THROWS_AS(block.evaluateDetsToAcceptedReference(virtual_positions, 0, particle, actual), std::domain_error);
+      virtual_positions.R[0] = {3, 0, 0};
+      block.evaluateDetsToAcceptedReference(virtual_positions, 0, particle, actual);
+      block.evaluateDetsForPtclMove(virtual_positions, 0, particle);
+      CHECK(block.getRefDetRatio() == regular_reference);
+      for (int term = 0; term < 4; ++term)
+      {
+        CHECK(block.getNewRatiosToRefDet()[term] == regular_ratios[term]);
+        CHECK(block.getRatiosToRefDet()[term] == original_ratios[term]);
+      }
+      CHECK(block.getLogValueRefDet() == original_log);
+      for (int i = 0; i < 4; ++i) CHECK(accepted.R[i] == original_positions[i]);
+    }
+}
+
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
           "[drivers][training][legacy_adapter][multideterminant][conventional_binding][mpi]")
 {

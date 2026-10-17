@@ -23,6 +23,9 @@
 #include "OMPTarget/ompReductionComplex.hpp"
 #include "OhmmsPETE/ompReductionTinyVector.hpp"
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include "Numerics/DeterminantOperators.h"
 
 using uint32_t = std::uint32_t;
 
@@ -489,6 +492,100 @@ void MultiDiracDeterminant::mw_evaluateDetsForPtclMove(const RefVectorWithLeader
   {
     MultiDiracDeterminant& det = (det_list[iw]);
     det.curRatio               = curRatio_list_ptr[iw];
+  }
+}
+
+void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
+    const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios)
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("Accepted-reference virtual determinants require a real CPU build");
+#endif
+  const int row = refPtcl - FirstIndex;
+  if (is_spinor_ || Phi->isOMPoffload() || Phi->isOptimizable() ||
+      P.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS ||
+      iat < 0 || iat >= P.getTotalNum() || row < 0 || row >= NumPtcls || NumPtcls <= 0 ||
+      psiMinv.rows() != NumPtcls || psiMinv.cols() != NumPtcls ||
+      psiM.rows() != NumPtcls || psiM.cols() != NumOrbitals)
+    throw std::invalid_argument("Accepted-reference virtual determinants require initialized fixed CPU caches and valid indices");
+  // IEEE bits retain finite admission under fast-math, including accepted nodes.
+  const auto finite_real = [](double value) {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value) && std::numeric_limits<double>::is_iec559);
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  };
+  const auto finite_value = [&](ValueType value) {
+    return finite_real(std::real(value)) && finite_real(std::imag(value));
+  };
+  bool inverse_nonzero = false;
+  for (const auto value : psiMinv)
+  {
+    if (!finite_value(value)) throw std::domain_error("Accepted reference inverse is nonfinite");
+    inverse_nonzero |= value != ValueType{};
+  }
+  if (!inverse_nonzero || !finite_real(log_value_ref_det_.real()) || !finite_real(log_value_ref_det_.imag()))
+    throw std::domain_error("Accepted reference determinant is uninitialized or singular");
+  for (const auto value : psiM)
+    if (!finite_value(value)) throw std::domain_error("Accepted orbital values are nonfinite");
+  Vector<ValueType> psi_view(psiV.data(), psiV.size());
+  Phi->evaluateValue(P, iat, psi_view);
+  for (const auto value : psiV)
+    if (!finite_value(value)) throw std::domain_error("Virtual orbital values are nonfinite");
+  // Rebuild only the existing accepted excitation-table entries, not an inverse.
+  for (std::size_t pair = 0; pair < uniquePairs->size(); ++pair)
+  {
+    const int i = uniquePairs->data(0)[pair], j = uniquePairs->data(1)[pair];
+    table_matrix(i, j) = simd::dot(psiMinv[i], TpsiM[j], NumPtcls);
+  }
+  // One common delta-reference-row * A^-1 projection per virtual point.
+  for (int electron = 0; electron < NumPtcls; ++electron)
+  {
+    workV1[electron] = ValueType{};
+    for (int orbital = 0; orbital < NumPtcls; ++orbital)
+      workV1[electron] += (psiV[(*refdet_occup)[orbital]] - psiM(row, (*refdet_occup)[orbital])) *
+          psiMinv(orbital, electron);
+  }
+  accepted_reference_border_.resize(NumPtcls + 1, NumPtcls + 1);
+  accepted_reference_pivots_.resize(NumPtcls + 1);
+  ratios.resize(getNumDets());
+  const int* excitation = detData->data();
+  for (int determinant = 0; determinant < getNumDets(); ++determinant)
+  {
+    const int k = *excitation, rank = k + 1;
+    if (k < 0 || k > NumPtcls) throw std::logic_error("Invalid accepted-reference excitation rank");
+    const int* positions = excitation + 1;
+    const int* replacements = positions + k;
+    for (int electron = 0; electron < NumPtcls; ++electron) workV2[electron] = workV1[electron];
+    for (int i = 0; i < k; ++i)
+    {
+      const int position = positions[i], replacement = replacements[i], original = (*refdet_occup)[position];
+      const auto extra = psiV[replacement] - psiM(row, replacement) - (psiV[original] - psiM(row, original));
+      for (int electron = 0; electron < NumPtcls; ++electron)
+        workV2[electron] += extra * psiMinv(position, electron);
+    }
+    auto* border = accepted_reference_border_.data();
+    for (int i = 0; i < k; ++i)
+    {
+      for (int j = 0; j < k; ++j) border[i * rank + j] = table_matrix(positions[i], replacements[j]);
+      border[i * rank + k] = psiMinv(positions[i], row);
+    }
+    for (int j = 0; j < k; ++j)
+    {
+      ValueType value{};
+      for (int electron = 0; electron < NumPtcls; ++electron)
+        value += workV2[electron] * (psiM(electron, replacements[j]) -
+            psiM(electron, (*refdet_occup)[positions[j]]));
+      border[k * rank + j] = value;
+    }
+    border[k * rank + k] = ValueType(1) + workV2[row];
+    for (int entry = 0; entry < rank * rank; ++entry)
+      if (!finite_value(border[entry])) throw std::domain_error("Accepted-reference bordered determinant is nonfinite");
+    const auto value = (*DetSigns)[determinant] *
+        Determinant(border, rank, rank, accepted_reference_pivots_.data());
+    if (!finite_value(value)) throw std::domain_error("Accepted-reference virtual determinant is nonfinite");
+    ratios[determinant] = value;
+    excitation += 3 * k + 1;
   }
 }
 
