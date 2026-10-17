@@ -2475,6 +2475,20 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     return a[configuration.occup[0]] * b[configuration.occup[1]] -
         a[configuration.occup[1]] * b[configuration.occup[0]];
   };
+  // Independent column substitution: +phi_q into p and -phi_p into q.
+  // Its denominator stays the ORIGINAL accepted reference, not a rotated one.
+  const auto generated_determinant = [](const ci_configuration2& configuration, double first, double second,
+                                       int p, int q, double theta) {
+    std::array<double, 4> a{1, first * first, first, first * first * first};
+    std::array<double, 4> b{1, second * second, second, second * second * second};
+    std::array<double, 4> da{}, db{};
+    da[p] = a[q]; da[q] = -a[p]; db[p] = b[q]; db[q] = -b[p];
+    const int i = configuration.occup[0], j = configuration.occup[1];
+    const double derivative = da[i] * b[j] + a[i] * db[j] - da[j] * b[i] - a[j] * db[i];
+    for (int orbital = 0; orbital < 4; ++orbital)
+    { a[orbital] += theta * da[orbital]; b[orbital] += theta * db[orbital]; }
+    return std::make_pair(a[i] * b[j] - a[j] * b[i], derivative);
+  };
   for (int spin = 0; spin < 2; ++spin)
     for (int moved = 0; moved < 2; ++moved)
     {
@@ -2490,7 +2504,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       const std::vector<QMCTraits::ValueType> regular_ratios(
           block.getNewRatiosToRefDet().begin(), block.getNewRatiosToRefDet().end());
       Vector<QMCTraits::ValueType> actual(4);
+      Vector<QMCTraits::ValueType> orbital_derivatives(4);
       const auto* output_storage = actual.data();
+      const auto* derivative_storage = orbital_derivatives.data();
       for (double replacement : {-2., -1., 0., 1., 2., 3.})
       {
         CAPTURE(replacement);
@@ -2506,6 +2522,49 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
           CHECK(block.getRatiosToRefDet()[term] == original_ratios[term]);
         }
         CHECK(block.getLogValueRefDet() == original_log);
+        const std::vector<QMCTraits::ValueType> base_ratios(actual.begin(), actual.end());
+        for (const auto [p, q] : {std::pair{0, 1}, std::pair{0, 2}, std::pair{0, 3}, std::pair{1, 2}})
+        {
+          CAPTURE(p, q);
+          block.evaluateOrbitalGeneratorToAcceptedReference(virtual_positions, 0, particle, p, q,
+                                                           actual, orbital_derivatives);
+          CHECK(actual.data() == output_storage);
+          CHECK(orbital_derivatives.data() == derivative_storage);
+          constexpr double epsilon = 1. / 65536; // dyadic column secant, not log differentiation
+          for (int term = 0; term < 4; ++term)
+          {
+            const auto& configuration = block.getConfiguration(term);
+            const auto oracle = [&](double theta) {
+              return generated_determinant(configuration, moved == 0 ? replacement : 1,
+                                           moved == 1 ? replacement : 2, p, q, theta);
+            };
+            CHECK(actual[term] == base_ratios[term]);
+            CHECK(std::real(orbital_derivatives[term]) == Catch::Approx(oracle(0).second / 3).margin(3e-13));
+            CHECK(std::real(orbital_derivatives[term]) == Catch::Approx(
+                (oracle(epsilon).first - oracle(-epsilon).first) / (6 * epsilon)).margin(3e-11));
+            const bool occupied_p = std::find(configuration.occup.begin(), configuration.occup.end(), p) != configuration.occup.end();
+            const bool occupied_q = std::find(configuration.occup.begin(), configuration.occup.end(), q) != configuration.occup.end();
+            if (occupied_p == occupied_q) CHECK(orbital_derivatives[term] == QMCTraits::ValueType{});
+            CHECK(block.getRatiosToRefDet()[term] == original_ratios[term]);
+          }
+          if (moved == 0 && replacement == 0 && p == 0 && q == 2)
+          {
+            const auto node = mappings[spin][2]; // occupied {1,2}, but substituted {1,0} is nonzero
+            CHECK(actual[node] == QMCTraits::ValueType{});
+            CHECK(std::real(orbital_derivatives[node]) == Catch::Approx(4. / 3).margin(3e-13));
+          }
+          if (moved == 0 && replacement == 0 && p == 1 && q == 2)
+          {
+            const auto ref = mappings[spin][0], alt = mappings[spin][1];
+            // Stationary alt/ref=1/3 and CI1=-6 contract to -2. This is
+            // the raw CI numerator with fixed reference product, NOT d(PsiQ/PsiR).
+            CHECK(determinant(configurations[0], 0, 2) - 2 * determinant(configurations[1], 0, 2) == 0);
+            CHECK(std::real(actual[ref] - 2 * actual[alt]) == Catch::Approx(0).margin(3e-13));
+            CHECK(std::real(orbital_derivatives[ref] - 2 * orbital_derivatives[alt]) ==
+                  Catch::Approx(10. / 3).margin(3e-13));
+          }
+          CHECK(block.getLogValueRefDet() == original_log);
+        }
         const auto ref = mappings[spin][0], alt = mappings[spin][1];
         const double stationary = std::real(spins[1 - spin]->getRatiosToRefDet()[mappings[1 - spin][1]]);
         const double old_term = std::real(original_ratios[alt]) * stationary;
@@ -2540,9 +2599,21 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       }
       CHECK_THROWS_AS(block.evaluateDetsToAcceptedReference(virtual_positions, 0, 2 * spin - 1, actual),
                       std::invalid_argument);
+      for (const auto [p, q] : {std::pair{-1, 2}, std::pair{1, 1}, std::pair{2, 1}, std::pair{0, 4}})
+        CHECK_THROWS_AS(block.evaluateOrbitalGeneratorToAcceptedReference(
+            virtual_positions, 0, particle, p, q, actual, orbital_derivatives), std::invalid_argument);
+      CHECK_THROWS_AS(block.evaluateOrbitalGeneratorToAcceptedReference(
+          virtual_positions, 0, particle, 0, 2, actual, actual), std::invalid_argument);
+      Vector<QMCTraits::ValueType> attached(actual.data(), actual.size());
+      CHECK_THROWS_AS(block.evaluateOrbitalGeneratorToAcceptedReference(
+          virtual_positions, 0, particle, 0, 2, attached, orbital_derivatives), std::invalid_argument);
       virtual_positions.R[0][0] = std::numeric_limits<double>::quiet_NaN();
       CHECK_THROWS_AS(block.evaluateDetsToAcceptedReference(virtual_positions, 0, particle, actual), std::domain_error);
+      CHECK_THROWS_AS(block.evaluateOrbitalGeneratorToAcceptedReference(
+          virtual_positions, 0, particle, 0, 2, actual, orbital_derivatives), std::domain_error);
       virtual_positions.R[0] = {3, 0, 0};
+      block.evaluateOrbitalGeneratorToAcceptedReference(virtual_positions, 0, particle, 0, 2,
+                                                       actual, orbital_derivatives);
       block.evaluateDetsToAcceptedReference(virtual_positions, 0, particle, actual);
       block.evaluateDetsForPtclMove(virtual_positions, 0, particle);
       CHECK(block.getRefDetRatio() == regular_reference);
