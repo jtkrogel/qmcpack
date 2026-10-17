@@ -5394,6 +5394,15 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   checkClose(score_jvp.result()[0], score_dual);
   checkClose(energy_jvp.result()[0], energy_dual);
   if (active) checkClose(kinetic_jvp.result()[0], kinetic_dual);
+  // Each orbital FD half starts from the exact accepted frame, never a previous probe chart.
+  const auto fresh_log_kinetic = [&](const StructuredParameterSnapshot& point) {
+    ParticleSet p(particles);
+    auto wf = source->makeClone(p);
+    isolate(*wf);
+    p.update();
+    adapter.installSnapshot(*wf, p, point);
+    return std::pair{wf->getLogPsi(), kineticEnergy(p)};
+  };
   for (std::size_t parameter = 0; parameter < snapshot.values.size(); ++parameter)
   {
     auto plus = snapshot, minus = snapshot;
@@ -5403,15 +5412,18 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
     replay->prepareSample(0);
     if (ecp) for (int electron = 0; electron < particles.getTotalNum(); ++electron)
       CHECK(private_particles.R[electron] == source_positions[electron]);
-    adapter.installSnapshot(*evaluator, private_particles, plus);
-    const double plus_log = evaluator->getLogPsi();
-    const auto plus_kinetic = kineticEnergy(private_particles);
+    if (!active) adapter.installSnapshot(*evaluator, private_particles, plus);
+    const auto plus_result = active ? fresh_log_kinetic(plus) :
+        std::pair{evaluator->getLogPsi(), kineticEnergy(private_particles)};
+    const auto [plus_log, plus_kinetic] = plus_result;
     const auto plus_energy = ecp ? full_energy(plus) : kineticEnergy(private_particles);
     replay->prepareSample(0);
-    adapter.installSnapshot(*evaluator, private_particles, minus);
-    CHECK(rows.result()[0][parameter].real() == Catch::Approx((plus_log - evaluator->getLogPsi()) / 2e-5).margin(2e-8));
+    if (!active) adapter.installSnapshot(*evaluator, private_particles, minus);
+    const auto minus_result = active ? fresh_log_kinetic(minus) :
+        std::pair{evaluator->getLogPsi(), kineticEnergy(private_particles)};
+    CHECK(rows.result()[0][parameter].real() == Catch::Approx((plus_log - minus_result.first) / 2e-5).margin(2e-8));
     if (active) CHECK(rows.result()[2][parameter].real() ==
-        Catch::Approx(((plus_kinetic - kineticEnergy(private_particles)) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
+        Catch::Approx(((plus_kinetic - minus_result.second) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
     const auto minus_energy = ecp ? full_energy(minus) : kineticEnergy(private_particles);
     CHECK(rows.result()[1][parameter].real() == Catch::Approx(((plus_energy - minus_energy) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
   }
