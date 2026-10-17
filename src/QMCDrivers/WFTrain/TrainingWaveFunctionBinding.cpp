@@ -320,6 +320,19 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   const bool nonlocal_ecp = hamiltonian.hasPhysicalNLPP();
   const auto& lattice = prototype_particles_.getLattice();
   const bool periodic = lattice.BoxBConds[0] || lattice.BoxBConds[1] || lattice.BoxBConds[2];
+#ifdef QMC_COMPLEX
+  // Complex classical training has real J2 coordinates on one fixed Gamma
+  // HEG14 model. This is not admission of complex coefficients/phase updates.
+  if constexpr (sizeof(QMCTraits::ValueType) != sizeof(DerivativeValue))
+    throw std::runtime_error("Conventional complex Gamma HEG14 requires FP64 wavefunction scalars");
+  if (!periodic || prototype_particles_.isSpinor() ||
+      prototype_particles_.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS ||
+      prototype_.getOrbitals().size() != 2 || parameterSchema().parameterCount() != 10)
+    throw std::runtime_error("Conventional complex training requires CPU Gamma HEG14 fixed-FreeOrbital/J2");
+  for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    if (prototype_particles_.getTwist()[dimension] != 0)
+      throw std::runtime_error("Conventional complex Gamma HEG14 training does not admit twist");
+#endif
   if (lcao_source_)
   {
 #ifdef QMC_COMPLEX
@@ -341,27 +354,28 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   }
   if (periodic)
   {
-#ifdef QMC_COMPLEX
-    throw std::runtime_error("Conventional periodic training currently requires real Gamma orbitals");
-#else
     // This first periodic slice is the existing closed-shell HEG14 model,
     // not blanket admission of arbitrary periodic wavefunctions/operators.
     if (!lattice.BoxBConds[0] || !lattice.BoxBConds[1] || !lattice.BoxBConds[2] || lattice.ndim != 3 ||
         nonlocal_ecp || multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1 ||
         prototype_particles_.groups() != 2 || prototype_particles_.groupsize(0) != 7 ||
         prototype_particles_.groupsize(1) != 7)
-      throw std::runtime_error("Conventional periodic training requires the real Gamma HEG14 fixed-Slater/J2 profile");
+      throw std::runtime_error("Conventional periodic training requires the Gamma HEG14 fixed-Slater/J2 profile");
     for (const auto& component : prototype_.getOrbitals())
       if (component->getClassName() != "SlaterDet" && component->getClassName() != "TwoBodyJastrow")
         throw std::runtime_error("Conventional periodic training admits only fixed FreeOrbital Slater and J2");
     const auto& slater = prototype_.findSD().front().get();
     if (slater.getNumDets() != 2)
       throw std::runtime_error("Conventional periodic training requires two HEG14 spin determinants");
+#ifdef QMC_COMPLEX
+    if (&slater.getPhi(0) != &slater.getPhi(1))
+      throw std::runtime_error("Conventional complex Gamma HEG14 requires one shared fixed FreeOrbital SPO");
+#endif
     constexpr double two_pi = 6.283185307179586476925286766559;
     for (int determinant = 0; determinant < slater.getNumDets(); ++determinant)
     {
       const auto* free = dynamic_cast<const FreeOrbital*>(&slater.getPhi(determinant));
-      if (!free || free->getOrbitalSetSize() != 7 || free->isOptimizable())
+      if (!free || free->getOrbitalSetSize() != 7 || free->isOptimizable() || free->isOMPoffload())
         throw std::runtime_error("Conventional periodic training requires fixed Gamma FreeOrbital SPOs");
       for (const auto& k : free->kVectors())
         for (int translation = 0; translation < OHMMS_DIM; ++translation)
@@ -373,7 +387,6 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
             throw std::runtime_error("Conventional periodic FreeOrbital vectors are not Gamma reciprocal vectors");
         }
     }
-#endif
   }
   if (nonlocal_ecp)
   {
@@ -395,6 +408,17 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   if (periodic && particles.size() != 1)
     throw std::runtime_error("Conventional periodic HEG profile cannot contain ionic sources");
   std::ostringstream identity;
+#ifdef QMC_COMPLEX
+  // Distinguish physical scalar representation at the cold identity boundary;
+  // existing real model identities and checkpoint formats remain unchanged.
+  identity << "legacy_scalar_domains:parameter=REAL64;wavefunction=COMPLEX128;"
+           << "complex_Gamma_FreeOrbital_kvectors_v1:" << std::hexfloat;
+  const auto& free = dynamic_cast<const FreeOrbital&>(prototype_.findSD().front().get().getPhi(0));
+  for (const auto& vector : free.kVectors())
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      identity << vector[dimension] << ':';
+  identity << ';' << std::defaultfloat;
+#endif
   int periodic_coulomb = 0, periodic_kinetic = 0;
   for (const auto& [name, definition] : particles)
     identity << name.size() << ':' << name << ':' << definition.size() << ':' << definition << ';';
