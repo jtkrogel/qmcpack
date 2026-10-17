@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--ci-lm", action="store_true",
                         help="bounded pure-DETS H4 LM/ALM retraction, exported inference and exact restart")
     parser.add_argument("--csf-lm", action="store_true",
-                        help="bounded two-DETS-per-CSF H4 LM/ALM with actual frozen CSF reference")
+                        help="two-DETS-per-CSF LM positive and sampled complex-root ALM refusal")
     args = parser.parse_args()
     linear_ci = args.ci_lm or args.csf_lm
     pure_ci = args.ci_pii or linear_ci
@@ -557,6 +557,26 @@ def main():
                 for name, value in limits.items():
                     ET.SubElement(training, "parameter", name=name).text = value
             try:
+                if args.csf_lm and optimizer == "alm":
+                    # This protected sample pencil has a complex-conjugate pair.
+                    # Refusal is correct; do not tune the fixture to force a root.
+                    directory = run(optimizer, optimizer=optimizer, mutate=controls,
+                                    samples_per_rank=32, reject="Live LM solve failed: untrusted_root")
+                    csv_file = directory / "sj.s000.training_info.csv"
+                    assert not csv_file.exists() or not history(directory), directory
+                    assert not list(directory.rglob("*.h5")), directory
+                    log = (directory / "run.log").read_text()
+                    assert "WFTrain refreshed parameter version" not in log, directory
+                    assert "WFTrain iteration 0 version" not in log, directory
+                    definition = ET.parse(directory / "run.xml")
+                    csfs = definition.findall(".//detlist/csf")
+                    assert [node.get("coeff") for node in csfs] == ["0.6", "0"]
+                    assert all(len(node) == 2 for node in csfs)
+                    assert all(node.get("optimize") == "no" for node in definition.findall(
+                        "wavefunction/jastrow/correlation/coefficients"))
+                    reports.append((optimizer, "expected_untrusted_root", ""))
+                    print("alm: expected complex-root refusal before update/publication", flush=True)
+                    continue
                 directory = run(optimizer, optimizer=optimizer, mutate=controls,
                                 samples_per_rank=32, require_committed=pure_ci)
                 if pure_ci:
@@ -593,14 +613,16 @@ def main():
             writer = csv.writer(handle)
             writer.writerow(("optimizer", "status", "committed"))
             writer.writerows(reports)
-        assert all(status == "complete" for _, status, _ in reports), work
+        assert all(status == "complete" or (args.csf_lm and method == "alm" and
+                   status == "expected_untrusted_root") for method, status, _ in reports), work
         if linear_ci:
             def mixed_ci_j2(tree):
                 tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
             run("reject_mixed_ci_j2_lm", optimizer="lm", mutate=mixed_ci_j2,
                 reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
-            print(f"PASS: {representation} LM/ALM projective updates, fixed reference/SPO/J2/expansion, exact exported inference/restart; mixed CI/J2 rejected")
+            methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
+            print(f"PASS: {representation} {methods}, fixed reference/SPO/J2/expansion, exact positive exported inference/restart; mixed CI/J2 rejected")
         elif args.ci_pii:
             print("PASS: pure-CI PII/minPII committed updates, fixed C0/SPO/J2 and exact exported inference; not mixed CI/Jastrow qualification")
         else:
