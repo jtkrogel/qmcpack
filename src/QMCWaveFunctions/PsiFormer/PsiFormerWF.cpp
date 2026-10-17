@@ -3118,10 +3118,22 @@ private:
     if (hasDeviceProducts())
     {
       // Replay exactly the accepted grid. Only scalar JVPs cross the device boundary.
+      const auto capacity = deviceScoreCapacity();
+      const auto points = ecp_replay_->points();
+#ifndef QMC_COMPLEX
+      const bool tile_virtuals = capacity > 1 && !points.empty();
+#else
+      const bool tile_virtuals = false; // Complex-build replay keeps its existing scalar qualification.
+#endif
+      if (tile_virtuals && shared_scratch_->device_ecp_positions.size() <
+          checkedPositionCount(capacity, electron_count_))
+        throw std::logic_error("GPU ECP JVP exceeds its cold HOST tile preparation");
+      std::size_t components = 0, completed_tiles = 0, configurations = 0, last_count = 0;
       for (unsigned component = 0; component < 2; ++component)
       {
         if (!prepareDeviceDirection(direction, component))
           continue;
+        ++components;
         const wftrain::DerivativeValue factor = component == 0
             ? wftrain::DerivativeValue(1.0, 0.0) : wftrain::DerivativeValue(0.0, 1.0);
         for (std::size_t sample = 0; sample < sample_count_; ++sample)
@@ -3129,18 +3141,55 @@ private:
           setScoreWorkspacePositions(sample);
           reference_score_products_[sample] = evaluatePreparedDeviceJVP();
         }
-        for (const auto& point : ecp_replay_->points())
+        if (tile_virtuals)
         {
-          setReplayPointPositions(point);
-          const wftrain::DerivativeValue weight = point.bare_weight * point.complete_ratio;
-          requireFinite(weight, "accepted-grid weight");
-          const wftrain::DerivativeValue contribution = factor * weight *
-              (evaluatePreparedDeviceJVP() - reference_score_products_[point.sample]);
-          requireFinite(contribution, "accepted-grid JVP contribution");
-          sample_products_[point.sample] += contribution;
-          requireFinite(sample_products_[point.sample], "accepted-grid sample JVP");
+          for (std::size_t begin = 0; begin < points.size(); begin += capacity)
+          {
+            const auto count = std::min(capacity, points.size() - begin);
+            const auto elements = 3 * electron_count_;
+            for (std::size_t local = 0; local < count; ++local)
+            {
+              const auto& point = points[begin + local];
+              auto* destination = shared_scratch_->device_ecp_positions.data() + local * elements;
+              std::copy_n(positions_.data() + point.sample * elements, elements, destination);
+              std::copy_n(point.replacement_position.data(), 3, destination + 3 * point.electron);
+            }
+            const auto& products = shared_scratch_->device_products->scoreJvpPreparedTile(
+                shared_scratch_->device_ecp_positions.data(), count, parameter_version_);
+            // Consume the borrowed O(B) scalars before any subsequent session action.
+            for (std::size_t local = 0; local < count; ++local)
+            {
+              const auto& point = points[begin + local];
+              const wftrain::DerivativeValue weight = point.bare_weight * point.complete_ratio;
+              requireFinite(weight, "accepted-grid weight");
+              const wftrain::DerivativeValue contribution = factor * weight *
+                  (products[local] - reference_score_products_[point.sample]);
+              requireFinite(contribution, "accepted-grid JVP contribution");
+              sample_products_[point.sample] += contribution;
+              requireFinite(sample_products_[point.sample], "accepted-grid sample JVP");
+            }
+            ++completed_tiles;
+            configurations += count;
+            last_count = count;
+          }
         }
+        else
+          for (const auto& point : points)
+          {
+            setReplayPointPositions(point);
+            const wftrain::DerivativeValue weight = point.bare_weight * point.complete_ratio;
+            requireFinite(weight, "accepted-grid weight");
+            const wftrain::DerivativeValue contribution = factor * weight *
+                (evaluatePreparedDeviceJVP() - reference_score_products_[point.sample]);
+            requireFinite(contribution, "accepted-grid JVP contribution");
+            sample_products_[point.sample] += contribution;
+            requireFinite(sample_products_[point.sample], "accepted-grid sample JVP");
+          }
       }
+      app_log() << "  PsiFormer real GPU accepted-grid ECP JVP: points=" << points.size()
+                << ", prepared_score_capacity=" << capacity << ", direction_components=" << components
+                << ", virtual_jvp_tiles=" << completed_tiles << ", virtual_jvp_configurations=" << configurations
+                << ", last_virtual_tile_count=" << last_count << "; CPU derivative fallback=no" << std::endl;
       return;
     }
 #endif
