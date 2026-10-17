@@ -503,6 +503,15 @@ public:
   /// Return shared parameter storage; callers cannot mutate it through this API.
   const double* parameters() const noexcept { return parameters_.data(); }
 
+  /// Cold explicit mirror boundary; the owning image keeps bytes stable through download.
+  void downloadCanonical(std::vector<double>& values) const
+  {
+    validateCurrentDevice();
+    if (values.size() != plan().parameterCount())
+      throw std::invalid_argument("Canonical mirror download extent mismatch");
+    parameters_.download(values.data(), values.size());
+  }
+
   /// Return fixed-ion geometry stored once per shared image.
   const double* nuclei() const noexcept { return metadata_->nuclei(); }
 

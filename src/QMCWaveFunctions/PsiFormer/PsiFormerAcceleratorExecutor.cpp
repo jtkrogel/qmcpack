@@ -100,6 +100,28 @@ void PsiFormerAcceleratorSharedModel::complete(std::size_t source_version,
   staged_version_ = 0;
 }
 
+PsiFormerAcceleratorSharedModel::PreparedCompletion
+PsiFormerAcceleratorSharedModel::prepareCompletion(std::size_t version, const PsiFormerAcceleratorHooks& hooks) const
+{
+  if (publication_hooks_owner_ != &hooks || !publication_pending_ || staged_version_ != version)
+    throw std::logic_error("Prepared device completion has foreign or stale staged authority");
+  return {this, version, nextGeneration(publication_generation_), stagingSlot()};
+}
+
+void PsiFormerAcceleratorSharedModel::completePrepared(const PreparedCompletion& prepared) noexcept
+{
+  if (prepared.owner != this || !publication_pending_ || staged_version_ != prepared.version ||
+      prepared.generation != publication_generation_ + 1 || prepared.slot != stagingSlot())
+    std::terminate();
+  active_slot_ = prepared.slot;
+  active_version_ = prepared.version;
+  publication_generation_ = prepared.generation;
+  slot_versions_[active_slot_] = prepared.version;
+  slot_publication_generations_[active_slot_] = prepared.generation;
+  publication_pending_ = false;
+  staged_version_ = 0;
+}
+
 void PsiFormerAcceleratorSharedModel::cancel(std::size_t source_version,
                                              PsiFormerAcceleratorHooks& hooks)
 {

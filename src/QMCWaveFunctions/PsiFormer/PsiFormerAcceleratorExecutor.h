@@ -140,6 +140,19 @@ public:
   /// Atomically publish the staged slot after its backend completion event.
   void complete(std::size_t source_version, PsiFormerAcceleratorHooks& hooks);
 
+  /// Nonowning control receipt; its publisher retains this model and exclusive authority.
+  struct PreparedCompletion
+  {
+    const PsiFormerAcceleratorSharedModel* owner;
+    std::size_t version, generation, slot;
+  };
+
+  /// Resolve every fallible completion check before publication readiness.
+  PreparedCompletion prepareCompletion(std::size_t source_version, const PsiFormerAcceleratorHooks& hooks) const;
+
+  /// Adopt only a still-staged prepared receipt, without hooks/runtime/allocation.
+  void completePrepared(const PreparedCompletion& prepared) noexcept;
+
   /// Cancel the staged image while leaving the active slot and generation unchanged.
   void cancel(std::size_t source_version, PsiFormerAcceleratorHooks& hooks);
 

@@ -1214,6 +1214,14 @@ public:
     if (numerical_tile_backend && (direct_value_mode != DirectBackendMode::DIRECT ||
         direct_spatial_mode != DirectBackendMode::DIRECT))
       throw std::invalid_argument("PsiFormer GPU inference requires direct value/spatial modes, not CPU oracle or compare modes");
+    if (numerical_tile_backend)
+      if (const char* flag = std::getenv("PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY"))
+      {
+        if (std::string(flag) != "0" && std::string(flag) != "1")
+          throw std::invalid_argument("PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY must be 0 or 1");
+        resident_device_authority_requested = std::string(flag) == "1";
+      }
+    host_mirror_version = model.p.version();
     if (twist_phase.active() &&
         execution_plan.environment().boundary != psiformer::BoundaryCondition::PERIODIC)
       throw std::invalid_argument(
@@ -1245,9 +1253,63 @@ public:
                                                 [&]() { parameters.set_flat_values(values); });
     else
       parameters.set_flat_values(values);
+    host_mirror_version = parameters.version();
+  }
+
+  /// Refresh cached native leaves without upgrading a held shared model lock.
+  void ensureHostMirror()
+  {
+#ifdef ENABLE_CUDA
+    std::lock_guard refresh_lock(host_refresh_mutex);
+    for (;;)
+    {
+      std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+      std::size_t version;
+      {
+        std::shared_lock read(mutex);
+        version = model.p.version();
+        if (host_mirror_version == version)
+          return;
+        const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(numerical_tile_backend.get());
+        if (!resident_device_authority_enabled || !backend)
+          throw std::logic_error("PsiFormer stale HOST mirror without DEVICE authority");
+        image = backend->currentImage();
+        if (image->version() != version)
+          throw std::logic_error("PsiFormer DEVICE image/native metadata version mismatch");
+      }
+      app_log() << "PsiFormer cold HOST mirror refresh: attempted_bytes="
+                << 8 * image->plan().parameterCount() << ", version=" << version << std::endl;
+      std::vector<double> values(image->plan().parameterCount());
+      image->downloadCanonical(values);
+      std::unique_lock write(mutex);
+      const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(numerical_tile_backend.get());
+      if (model.p.version() != version || !backend || backend->currentImage() != image)
+        continue;
+      auto install = model.p.prepare_same_version_flat_values(std::move(values), version);
+      install.commit();
+      host_mirror_version = version;
+      return;
+    }
+#endif
+  }
+
+  /// Partial HOST writers must reacquire and recheck after the cold fence.
+  std::unique_lock<std::shared_mutex> acquireHostWrite()
+  {
+    for (;;)
+    {
+      ensureHostMirror();
+      std::unique_lock write(mutex);
+      if (host_mirror_version == model.p.version())
+        return write;
+    }
   }
 
   mutable std::shared_mutex mutex;
+  std::mutex host_refresh_mutex;
+  std::size_t host_mirror_version = 0;
+  bool resident_device_authority_requested = false;
+  bool resident_device_authority_enabled = false;
   /// Factory lock is separate from the scratch execution lease and model lock.
   mutable std::mutex derivative_scratch_factory_mutex;
   std::weak_ptr<PsiFormerDerivativeScratch> derivative_scratch;
@@ -1304,6 +1366,8 @@ public:
   /// Explicit resident ENERGY keeps one existing lane/tapes alive across iterations.
   std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_scratch;
 #ifdef ENABLE_CUDA
+  psiformer::device::DeviceMemorySnapshot resident_transfer_baseline;
+  bool resident_transfer_window_active = false;
   /// Optimizer workspace dies BEFORE its anchored Session; source diagnostics exclude it.
   std::unique_ptr<psiformer::device::PreparedDevicePcg> resident_energy_sr_workspace;
 #endif
@@ -1348,18 +1412,31 @@ public:
 class PsiFormerReadTransaction
 {
 public:
-  explicit PsiFormerReadTransaction(PsiFormerSharedState& state)
-      : state_(state), lock_(state_.mutex), parameter_version_(state_.model.p.version())
-  {}
+  explicit PsiFormerReadTransaction(PsiFormerSharedState& state, bool device_only = false)
+      : state_(state), lock_(state_.mutex)
+  {
+    while (!device_only && state_.host_mirror_version != state_.model.p.version())
+    {
+      lock_.unlock();
+      state_.ensureHostMirror();
+      lock_.lock();
+    }
+    parameter_version_ = state_.model.p.version();
+  }
 
   const PsiFormerSharedState& state() const noexcept { return state_; }
-  const pf::PsiFormer& model() const noexcept { return state_.model; }
+  const pf::PsiFormer& model() const
+  {
+    if (state_.host_mirror_version != parameter_version_)
+      throw std::logic_error("DEVICE-only PsiFormer transaction cannot consume stale HOST leaves");
+    return state_.model;
+  }
   std::size_t parameterVersion() const noexcept { return parameter_version_; }
 
 private:
   PsiFormerSharedState& state_;
   std::shared_lock<std::shared_mutex> lock_;
-  const std::size_t parameter_version_;
+  std::size_t parameter_version_ = 0;
 };
 
 /** Extend one model transaction with the optimizer mapping using state-first order. */
@@ -1621,7 +1698,7 @@ public:
     if (sample >= sample_count_ || !output || output_count != channel_count_)
       throw std::invalid_argument(
           "PsiFormer determinant-channel amplitude request has invalid extent");
-    std::shared_lock state_lock(model_state_->mutex);
+    PsiFormerReadTransaction state_lock(*model_state_);
     requireBoundVersion();
     setWorkspacePositions(sample);
 #ifdef ENABLE_CUDA
@@ -1655,7 +1732,7 @@ public:
         !output || output_count != schema_->parameterCount())
       throw std::invalid_argument(
           "PsiFormer determinant-channel score request has invalid extent");
-    std::shared_lock state_lock(model_state_->mutex);
+    PsiFormerReadTransaction state_lock(*model_state_);
     requireBoundVersion();
     setWorkspacePositions(sample);
 #ifdef ENABLE_CUDA
@@ -2277,7 +2354,7 @@ public:
     if (hasDeviceProducts())
     {
       PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_);
       requireBoundVersion();
       const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
           schema_->parameterCount(), MAXIMUM_VJP_CHANNELS);
@@ -2308,13 +2385,13 @@ protected:
   /// A terminal consumer shares physical arithmetic but bypasses host P emission.
   void evaluateVJPsImpl(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink* sink,
-      const std::function<void(std::size_t)>& terminal = {}) const
+      const std::function<void(std::size_t)>& terminal = {}, bool device_authority_terminal = false) const
   {
     NativeTimerScope timer(phase_timers_.parameter_vjp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_, device_authority_terminal && model_state_->resident_device_authority_enabled);
       requireBoundVersion();
       if (!terminal)
         for (std::size_t channel = 0; channel < channels.size(); ++channel)
@@ -2356,7 +2433,8 @@ protected:
       const bool resident_scores = hasDeviceProducts() && !needs_kinetic &&
           score_channel_count != 0 && sample_count_ > 2 * score_channel_count;
       const bool resident_kinetic = hasDeviceProducts() && needs_kinetic &&
-          device_channel_count != 0 && sample_count_ > 2 * device_channel_count;
+          device_channel_count != 0 && (sample_count_ > 2 * device_channel_count ||
+              (device_authority_terminal && terminal && sample_count_ > 0 && model_state_->resident_device_authority_enabled));
       const bool resident_products = resident_scores || resident_kinetic;
       // Mixed kinetic/ECP requests retain their existing host coordinate boundary.
       const bool retained_score_input = retained_coordinates_ && !needs_kinetic && !needs_ecp;
@@ -2601,7 +2679,7 @@ protected:
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_);
       requireBoundVersion();
 #ifdef ENABLE_CUDA
       if (hasDeviceProducts())
@@ -2696,7 +2774,7 @@ protected:
 
     if ((local_energy_term_mask & kinetic_mask) != 0)
     {
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_);
       requireBoundVersion();
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
@@ -3014,7 +3092,7 @@ private:
   {
     if (!ecp_replay_)
       throw std::logic_error("PsiFormer ECP JVP replay is not bound");
-    std::shared_lock state_lock(model_state_->mutex);
+    PsiFormerReadTransaction state_lock(*model_state_);
     requireBoundVersion();
 #ifdef ENABLE_CUDA
     if (hasDeviceProducts())
@@ -3581,7 +3659,7 @@ public:
           "PsiFormer ECP consumer requires an idle parameter sink");
 
     {
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_);
       requireBoundVersion();
     }
     for (const auto& input : channels)
@@ -3715,7 +3793,7 @@ public:
                                          tile.evaluation_stamps.begin(),
                                          tile.evaluation_stamps.end());
 
-      std::shared_lock state_lock(model_state_->mutex);
+      PsiFormerReadTransaction state_lock(*model_state_);
       requireBoundVersion();
       for (std::size_t segment_index = 0;
            segment_index < tile.virtual_particles.segmentCount(); ++segment_index)
@@ -3816,7 +3894,7 @@ public:
         throw std::logic_error(
             "PsiFormer ECP replay did not capture the complete traversal");
       {
-        std::shared_lock state_lock(model_state_->mutex);
+        PsiFormerReadTransaction state_lock(*model_state_);
         requireBoundVersion();
         for (std::size_t sample = 0; !replay_only_ && sample < sample_count_; ++sample)
         {
@@ -6040,7 +6118,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       accepted_state_requirement_(other.accepted_state_requirement_),
       current_sign_(other.current_sign_)
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   synchronizeParameterVersion(model_state_->model.p.version());
   clearProposalState();
 }
@@ -6689,7 +6767,7 @@ PsiFormerWF::makeStreamingDerivativeOperator(
   // Bind the copied configurations and both direct workspaces to one immutable
   // parameter version.  Publication needs the exclusive side of this lock and
   // therefore cannot race the factory snapshot or operator construction.
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_, model_state_->resident_device_authority_enabled);
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer streaming derivative requires the direct score backend");
@@ -6809,7 +6887,7 @@ PsiFormerWF::makeDeterminantChannelBatch(
     throw std::invalid_argument(
         "PsiFormer determinant-channel factory requires matching nonempty leader-first batches");
 
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer determinant-channel evaluation requires the direct score backend");
@@ -6892,7 +6970,7 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
         "PsiFormer ECP consumer requires a positive parameter chunk size");
 
   // Publication cannot race the reference snapshot or score-tape construction.
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer ECP consumer requires the direct score backend");
@@ -6947,7 +7025,7 @@ void PsiFormerWF::isolateParameterState()
 {
   requireNoPlannedProposalMutation("candidate model isolation");
   auto original = model_state_;
-  std::shared_lock lock(original->mutex);
+  PsiFormerReadTransaction lock(*original);
   // Parameters' graph leaves are shared pointers: rebuilding the owning flat
   // store also recreates leaves, preventing oracle trials from mutating live nodes.
   pf::Parameters independent_parameters(original->model.p.flat_values(), original->model.p.layouts);
@@ -7099,7 +7177,7 @@ private:
 
 std::vector<wftrain::AffineParameterBlock> PsiFormerWF::affineParameterBlocks() const
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   return nativeAffineParameterBlocks(model_state_->execution_plan, *structured_parameter_schema_);
 }
 
@@ -7150,7 +7228,7 @@ void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
 
 wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   const pf::Parameters& parameters = model_state_->model.p;
   return {structured_parameter_schema_->fingerprint(), parameters.version(),
           parameters.flat_values()};
@@ -7168,7 +7246,7 @@ double PsiFormerWF::evaluateOrbitalMSE(const ParticleSet& particles,
     model_state_->orbital_pretraining_scratch = scratch;
   }
   PsiFormerDerivativeLease scratch_lease(*scratch);
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   if (model_state_->model.p.version() != expected_version)
     throw std::runtime_error("PsiFormer orbital-MSE target batch has a stale parameter version");
   const auto& shape = model_state_->execution_plan.modelShape();
@@ -9225,10 +9303,11 @@ std::size_t PsiFormerWF::plannedSingleTransactionCountForTesting() const noexcep
 // Deliberately create model-version drift behind a pending proposal for testing.
 std::size_t PsiFormerWF::advanceParameterVersionForTesting()
 {
-  std::unique_lock state_lock(model_state_->mutex);
+  auto state_lock = model_state_->acquireHostWrite();
   pf::Parameters& parameters = model_state_->model.p;
   const std::vector<double> unchanged_values = parameters.flat_values();
   parameters.set_flat_values(unchanged_values);
+  model_state_->host_mirror_version = parameters.version();
   return parameters.version();
 }
 
@@ -9276,7 +9355,7 @@ void PsiFormerWF::checkInVariablesExclusive(OptVariables& active)
   if (!optimization_metadata_->enabled)
     return;
 
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   synchronizeParameterVersion(model_state_->model.p.version());
   for (std::size_t local_index = 0;
@@ -9440,7 +9519,7 @@ bool PsiFormerWF::canReuseFullSpatialReplay(const ParticleSet& live,
                                            double expected_log,
                                            double expected_phase) const
 {
-  PsiFormerReadTransaction transaction(*model_state_);
+  PsiFormerReadTransaction transaction(*model_state_, model_state_->resident_device_authority_enabled);
   const auto count = static_cast<std::size_t>(live.getTotalNum());
   if (live.R.size() != count || saved.R.size() != count ||
       live.GroupID.size() != count || saved.GroupID.size() != count)
@@ -10695,7 +10774,7 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
     return;
   requireNoPlannedProposalMutation("optimizer reset");
 
-  std::unique_lock state_lock(model_state_->mutex);
+  auto state_lock = model_state_->acquireHostWrite();
   requireNoPlannedProposalMutation("optimizer reset");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::Parameters& parameters = model_state_->model.p;
@@ -10781,7 +10860,10 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
       model_state_->setParameterValues(complete_values);
     }
     else
+    {
       parameters.set_flat_values(active_flat_indices, active_values);
+      model_state_->host_mirror_version = parameters.version();
+    }
   }
   const std::size_t parameter_version = parameters.version();
 
@@ -10798,7 +10880,7 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   if (!optimization_metadata_->enabled)
     return;
 
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   std::shared_lock metadata_lock(optimization_metadata_->mutex);
   const pf::PsiFormer& model = model_state_->model;
 
@@ -10923,7 +11005,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   input.pop();
   input.pop();
 
-  std::unique_lock state_lock(model_state_->mutex);
+  auto state_lock = model_state_->acquireHostWrite();
   requireNoPlannedProposalMutation("variational-parameter restore");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::PsiFormer& model = model_state_->model;
@@ -10985,7 +11067,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
 // Return the parameter version shared by this component and all of its clones.
 std::size_t PsiFormerWF::parameterVersion() const
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_, true);
   return model_state_->model.p.version();
 }
 
@@ -11122,7 +11204,7 @@ void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, cons
 
 void PsiFormerWF::exportModel(const std::string& path) const
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   writeStandaloneModel(path, model_state_->model, model_state_->execution_plan.environment(),
       model_state_->initialization_profile, model_state_->initialization_seed, system_kind_,
       model_state_->twist_phase.reduced);
@@ -11130,7 +11212,7 @@ void PsiFormerWF::exportModel(const std::string& path) const
 
 void PsiFormerWF::exportParameters(const std::string& path) const
 {
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   model_state_->model.p.write(path);
 }
 
@@ -11145,7 +11227,7 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
     throw std::invalid_argument("PsiFormer does not support spinor electrons or spin-orbit pseudopotentials");
   validateMatchingLattices(electrons, ions);
 
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   const auto& environment = model_state_->execution_plan.environment();
   validateRuntimeLattice(electrons, environment, "PsiFormer runtime electron set");
   const pf::PsiFormer& model = model_state_->model;
@@ -12312,7 +12394,7 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
   std::shared_ptr<PsiFormerDerivativeScratch> scratch;
   std::size_t p = 0, c3 = 0, norm = 0;
   {
-    std::shared_lock state_lock(model_state_->mutex);
+    PsiFormerReadTransaction state_lock(*model_state_);
     const auto& environment = model_state_->execution_plan.environment();
     if (!model_state_->numerical_tile_backend ||
         model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
@@ -12330,7 +12412,7 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
   }
   // Match evaluation lock order: never wait for the lane while holding a model read.
   PsiFormerDerivativeLease lease(*scratch);
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
   app_log() << "Resident ENERGY bridge admitted: C3 device bytes=" << c3 << ", norm device bytes=" << norm
             << ", C3 status host bytes=" << c3 - 48 * p << ", norm host bytes=" << norm
@@ -12383,6 +12465,175 @@ double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivative
 #endif
 }
 
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+namespace
+{
+/// Keep Adam and its admitted immutable candidate alive through publication readiness.
+struct ResidentAuthorityProposal final : PsiFormerWF::ResidentDeviceAdamProposal
+{
+  std::shared_ptr<PsiFormerSharedState> state;
+  std::shared_ptr<psiformer::device::PreparedDeviceAdam> adam;
+  psiformer::device::PreparedDeviceAdam::DeviceEnergyCandidate candidate;
+
+  std::size_t sourceVersion() const noexcept override { return candidate.snapshot->sourceVersion(); }
+
+  double gradientNorm() const noexcept override { return candidate.gradient_norm; }
+
+  double displacementNorm() const noexcept override { return candidate.displacement_norm; }
+};
+
+/// Hold final model/backend authority; retire all numeric owners only after unlocking.
+struct ResidentAuthorityPublication final : PsiFormerWF::PreparedResidentDeviceAdamPublication
+{
+  std::unique_ptr<ResidentAuthorityProposal> proposal;
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> successor;
+  std::unique_ptr<psiformer::device::PreparedDeviceBatchBackend::PreparedDevicePublication> backend;
+  std::unique_lock<std::shared_mutex> authority;
+
+  std::size_t commit() noexcept override
+  {
+    if (!authority.owns_lock())
+      std::terminate();
+    backend->commit();
+    const auto version = proposal->sourceVersion() + 1;
+    proposal->state->model.p.parameter_version = version;
+    proposal->adam->acceptPreparedDeviceCandidate(*proposal->candidate.snapshot, successor);
+    backend->unlock();
+    authority.unlock();
+    return version;
+  }
+};
+}
+#endif
+
+/// The strict GPU-only opt-in was frozen when the shared numerical owner was constructed.
+bool PsiFormerWF::residentDeviceAuthorityRequested() const noexcept
+{
+  return model_state_->resident_device_authority_requested;
+}
+
+/// Observe a whole iteration without resetting shared metrics or synchronizing the device.
+void PsiFormerWF::residentDeviceAuthorityTransferWindow(const char* label, bool begin) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  PsiFormerReadTransaction read(*model_state_, true);
+  const auto& scratch = model_state_->resident_energy_scratch;
+  if (!model_state_->resident_device_authority_enabled || !scratch || !label)
+    throw std::logic_error("Resident DEVICE transfer window requires active authority");
+  const auto now = scratch->device_products->transferSnapshot();
+  if (begin)
+  {
+    if (model_state_->resident_transfer_window_active)
+      throw std::logic_error("Resident DEVICE transfer window already active");
+    model_state_->resident_transfer_baseline = now;
+    model_state_->resident_transfer_window_active = true;
+    return;
+  }
+  if (!model_state_->resident_transfer_window_active)
+    throw std::logic_error("Resident DEVICE transfer window has no baseline");
+  const auto& before = model_state_->resident_transfer_baseline;
+  app_log() << "Resident DEVICE authority window: label=" << label
+            << ", parameter_version=" << read.parameterVersion()
+            << ", uploaded_bytes=" << now.uploaded_bytes - before.uploaded_bytes
+            << ", downloaded_bytes=" << now.downloaded_bytes - before.downloaded_bytes
+            << ", device_copied_bytes=" << now.device_copied_bytes - before.device_copied_bytes
+            << ", counter_scope=device_wide, cold_checkpoint_excluded=yes" << std::endl;
+  model_state_->resident_transfer_window_active = false;
+#else
+  throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
+/// Activate only the admitted real/open family; allocations remain separately budgeted.
+PsiFormerWF::ResidentDeviceAuthorityRequirements PsiFormerWF::prepareResidentDeviceAuthority() const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  auto lock = model_state_->acquireHostWrite();
+  const auto& environment = model_state_->execution_plan.environment();
+  if (!residentDeviceAuthorityRequested() || !model_state_->resident_energy_scratch ||
+      !model_state_->numerical_tile_backend || batch_execution_plan_ ||
+      model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+      environment.boundary != psiformer::BoundaryCondition::OPEN ||
+      environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+    throw std::invalid_argument("DEVICE authority requires explicitly prepared real/open resident Adam");
+  const auto bytes = checkedBatchMemoryMultiply(structured_parameter_schema_->parameterCount(),
+      sizeof(double), "Resident DEVICE authority canonical image");
+  model_state_->resident_device_authority_enabled = true;
+  return {bytes, bytes, bytes};
+#else
+  throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
+/// Produce a finite owning snapshot without exposing or downloading a HOST P vector.
+std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeResidentEnergyAdamDevice(
+    const wftrain::StreamingDerivativeOperator& derivative,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    const std::shared_ptr<psiformer::device::PreparedDeviceAdam>& adam,
+    double weight, double energy, double beta1, double beta2, double correction1, double correction2,
+    double epsilon, std::size_t snapshot_device_cap) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (!adam || !model_state_->resident_device_authority_enabled || !source ||
+      source->model_state_.get() != model_state_.get() || derivative.sampleCount() == 0 ||
+      source->shared_scratch_ != model_state_->resident_energy_scratch || channels.size() != 3 ||
+      channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      channels[1].product != wftrain::DerivativeProduct::SCORE_VJP ||
+      channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
+    throw std::invalid_argument("DEVICE authority requires this provider's prepared T/EO/O batch");
+  (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
+  auto proposal = std::make_unique<ResidentAuthorityProposal>();
+  proposal->state = model_state_;
+  proposal->adam = adam;
+  source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr,
+      [&](std::size_t generation) {
+        proposal->candidate = source->shared_scratch_->device_products->consumeEnergyAdamDeviceCandidate(
+            *adam, derivative.parameterVersion(), generation, weight, energy, beta1, beta2,
+            correction1, correction2, epsilon, snapshot_device_cap, true);
+      }, true);
+  return proposal;
+#else
+  throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
+/// Finish all fallible successor/receipt work before the caller's collective readiness.
+std::unique_ptr<PsiFormerWF::PreparedResidentDeviceAdamPublication>
+PsiFormerWF::prepareResidentDeviceAdamPublication(std::unique_ptr<ResidentDeviceAdamProposal> opaque,
+    std::size_t expected_version, std::size_t successor_device_cap)
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  auto* proposal = dynamic_cast<ResidentAuthorityProposal*>(opaque.get());
+  if (!proposal || proposal->state != model_state_ || proposal->sourceVersion() != expected_version)
+    throw std::invalid_argument("Resident DEVICE proposal is foreign or stale");
+  const auto backend = std::dynamic_pointer_cast<const psiformer::device::PreparedDeviceBatchBackend>(
+      model_state_->numerical_tile_backend);
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> source;
+  {
+    PsiFormerReadTransaction read(*model_state_, true);
+    if (read.parameterVersion() != expected_version || !backend)
+      throw std::invalid_argument("Resident DEVICE source version changed");
+    source = backend->currentImage();
+  }
+  auto successor = source->makeUpdatedImage(*proposal->candidate.snapshot, successor_device_cap);
+  auto publication = std::make_unique<ResidentAuthorityPublication>();
+  publication->authority = std::unique_lock<std::shared_mutex>(model_state_->mutex);
+  requireNoPlannedProposalMutation("resident DEVICE publication");
+  if (model_state_->model.p.version() != expected_version)
+    throw std::invalid_argument("Resident DEVICE publication version changed");
+  proposal->adam->validateDeviceAcceptance(*proposal->candidate.snapshot, successor);
+  publication->backend = std::make_unique<psiformer::device::PreparedDeviceBatchBackend::PreparedDevicePublication>(
+      backend, source, successor);
+  publication->successor = std::move(successor);
+  publication->proposal.reset(static_cast<ResidentAuthorityProposal*>(opaque.release()));
+  return publication;
+#else
+  throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
 /// Resolve both explicit SR caps together; CPU never parses GPU-only controls.
 std::pair<std::size_t, std::size_t> PsiFormerWF::residentEnergySRBudget() const
 {
@@ -12430,7 +12681,7 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
   std::shared_ptr<PsiFormerDerivativeScratch> scratch;
   std::size_t incremental = 0, c3 = 0;
   {
-    std::shared_lock state_lock(model_state_->mutex);
+    PsiFormerReadTransaction state_lock(*model_state_);
     const auto& environment = model_state_->execution_plan.environment();
     if (!model_state_->numerical_tile_backend || model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
         environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL || environment.boundary != psiformer::BoundaryCondition::OPEN ||
@@ -12454,7 +12705,7 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
               << "; named caps exclude existing model/tapes/compatibility/source/coefficients/sampling/vendor/checkpoints" << std::endl;
   }
   PsiFormerDerivativeLease lease(*scratch); // Never wait execution while holding Model read.
-  std::shared_lock state_lock(model_state_->mutex);
+  PsiFormerReadTransaction state_lock(*model_state_);
   model_state_->resident_energy_sr_workspace.reset(); // Explicit stage boundary, never runtime retry.
   model_state_->resident_energy_sr_workspace_started = false;
   model_state_->resident_energy_sr_reuse = reuse;
@@ -12635,7 +12886,7 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
       use_drift != deviceSamplingUsesDrift() || (use_drift && !drift))
     throw std::invalid_argument("Device sampling needs an enabled, nonempty homogeneous crowd");
   auto& resource = requireMultiWalkerResource(wfc_list);
-  PsiFormerReadTransaction transaction(*model_state_);
+  PsiFormerReadTransaction transaction(*model_state_, model_state_->resident_device_authority_enabled);
   const auto ne = transaction.state().execution_plan.modelShape().electrons();
   const auto extent = psiformer::spatial_detail::checkedProduct(wfc_list.size(),
       psiformer::spatial_detail::checkedProduct(3, ne, "Sampling physical stride overflow"),
@@ -12697,7 +12948,7 @@ void PsiFormerWF::mw_evaluateLog(
 
     const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
     auto& resource     = requireMultiWalkerResource(wfc_list);
-    PsiFormerReadTransaction transaction(*leader.model_state_);
+    PsiFormerReadTransaction transaction(*leader.model_state_, leader.model_state_->resident_device_authority_enabled);
     const std::size_t parameter_version = transaction.parameterVersion();
     const std::size_t electrons =
         transaction.state().execution_plan.modelShape().electrons();

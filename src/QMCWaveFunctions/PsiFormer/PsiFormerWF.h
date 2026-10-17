@@ -512,6 +512,9 @@ public:
   /// Frozen strict GPU-only opt-in; CPU and default providers never enable authority.
   bool residentDeviceAuthorityRequested() const noexcept;
 
+  /// Observe existing device-wide transfer counters across one warm native iteration.
+  void residentDeviceAuthorityTransferWindow(const char* label, bool begin) const;
+
   /// Activate only after driver profile admission; report allowances before allocation.
   ResidentDeviceAuthorityRequirements prepareResidentDeviceAuthority() const;
 

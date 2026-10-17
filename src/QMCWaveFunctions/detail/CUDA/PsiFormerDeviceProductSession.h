@@ -263,7 +263,8 @@ public:
   /// Finish ENERGY into owning DEVICE bytes; this does not publish a model or native mirror.
   PreparedDeviceAdam::DeviceEnergyCandidate consumeEnergyAdamDeviceCandidate(PreparedDeviceAdam& adam,
       std::size_t version, std::size_t generation, double weight, double energy, double beta1, double beta2,
-      double correction1, double correction2, double epsilon, std::size_t candidate_device_budget)
+      double correction1, double correction2, double epsilon, std::size_t candidate_device_budget,
+      bool with_displacement_norm = false)
   {
     std::lock_guard lock(mutex_);
     try
@@ -272,7 +273,7 @@ public:
       if (energy_image_ != image_.get() || generation != contraction_transaction_ || !score_contraction_)
         throw std::invalid_argument("Device ENERGY candidate source/image/generation is stale or untagged");
       auto result = adam.proposeEnergyDeviceCandidate(*score_contraction_, image_, weight, energy,
-          beta1, beta2, correction1, correction2, epsilon, candidate_device_budget);
+          beta1, beta2, correction1, correction2, epsilon, candidate_device_budget, with_displacement_norm);
       invalidateScoreContraction();
       return result;
     }

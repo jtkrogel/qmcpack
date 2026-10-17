@@ -52,6 +52,7 @@ public:
   {
     double gradient_norm;
     std::unique_ptr<const PreparedDeviceModel::CandidateSnapshot> snapshot;
+    double displacement_norm = 0;
   };
 
   /// Revoke pending admission before destroying moment or scratch owners.
@@ -143,7 +144,8 @@ private:
   /// Return only owning bytes after current ENERGY and moment admission succeeds.
   DeviceEnergyCandidate proposeEnergyDeviceCandidate(const PreparedDeviceScoreContraction& source,
       const std::shared_ptr<const PreparedDeviceModel>& image, double weight, double energy,
-      double beta1, double beta2, double correction1, double correction2, double epsilon, std::size_t device_budget)
+      double beta1, double beta2, double correction1, double correction2, double epsilon, std::size_t device_budget,
+      bool with_displacement_norm)
   {
     validateDevice();
     revokeCandidate();
@@ -166,13 +168,15 @@ private:
         new PreparedDeviceModel::CandidateSnapshot(control, image));
     try
     {
+      double displacement = 0;
       const auto norm = proposeEnergyImpl(source, image->parameters(), nullptr, weight, energy,
-          beta1, beta2, correction1, correction2, epsilon, nullptr);
+          beta1, beta2, correction1, correction2, epsilon, nullptr,
+          with_displacement_norm ? &displacement : nullptr);
       snapshot->parameters_.copyFromDevice(gradient_candidate_, count_);
       pending_control_ = std::move(control);
       device_image_ = image;
       device_bound_ = true;
-      return {norm, std::move(snapshot)};
+      return {norm, std::move(snapshot), displacement};
     }
     catch (...) { reject(); throw; }
   }
@@ -189,7 +193,8 @@ private:
   /// Share unchanged recurrence/status kernels; the optional HOST boundary stays explicit.
   double proposeEnergyImpl(const PreparedDeviceScoreContraction& source, const double* image_parameters,
       const std::vector<double>* parameters, double weight, double energy, double beta1, double beta2,
-      double correction1, double correction2, double epsilon, std::vector<double>* candidate)
+      double correction1, double correction2, double epsilon, std::vector<double>* candidate,
+      double* displacement_norm = nullptr)
   {
     validateDevice();
     revokeCandidate();
@@ -219,20 +224,29 @@ private:
       norm = std::hypot(norm, norm_host_[index] * std::sqrt(norm_host_[index + 1]));
     if (!device_math::isFiniteBinary64(norm))
       throw std::overflow_error("Device ENERGY gradient norm is nonfinite");
-    completeProposal(beta1, beta2, correction1, correction2, epsilon, candidate, current);
+    completeProposal(beta1, beta2, correction1, correction2, epsilon, candidate, current, displacement_norm);
     return norm;
   }
 
   /// Share precisely the old recurrence, status admission and candidate transfer.
   void completeProposal(double beta1, double beta2, double correction1, double correction2,
-      double epsilon, std::vector<double>* candidate, const double* current)
+      double epsilon, std::vector<double>* candidate, const double* current, double* displacement_norm = nullptr)
   {
     resetStatus();
     checkRuntime(launchAdamCandidate(queue_.getNative(), count_, blocks_.data(), blocks_.capacity(),
         current, gradient_candidate_.data(), committed_->first.data(), committed_->second.data(),
         staged_->first.data(), staged_->second.data(), beta1, beta2, correction1, correction2, epsilon,
-        status_.data()), "Device Adam candidate");
+        status_.data(), displacement_norm ? norm_partials_.data() : nullptr), "Device Adam candidate");
     admitStatus();
+    if (displacement_norm)
+    {
+      norm_partials_.download(norm_host_.data(), norm_host_.size());
+      *displacement_norm = 0;
+      for (std::size_t i = 0; i < norm_host_.size(); i += 2)
+        *displacement_norm = std::hypot(*displacement_norm, norm_host_[i] * std::sqrt(norm_host_[i + 1]));
+      if (!device_math::isFiniteBinary64(*displacement_norm))
+        throw std::overflow_error("Device Adam displacement norm is nonfinite");
+    }
     if (candidate)
       gradient_candidate_.download(candidate->data(), count_);
     pending_ = true;
@@ -263,6 +277,14 @@ public:
   void acceptDeviceCandidate(const PreparedDeviceModel::CandidateSnapshot& candidate,
                             const std::shared_ptr<const PreparedDeviceModel>& successor)
   {
+    validateDeviceAcceptance(candidate, successor);
+    acceptPreparedDeviceCandidate(candidate, successor);
+  }
+
+  /// Resolve device/provenance errors before retaining final publication readiness.
+  void validateDeviceAcceptance(const PreparedDeviceModel::CandidateSnapshot& candidate,
+                            const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
     validateDevice();
     const auto control = candidate.control_.lock();
     if (!pending_ || !control || !control->live || control != pending_control_ ||
@@ -272,6 +294,16 @@ public:
         successor->metadata_ != candidate.metadata_ || successor->version() != candidate.source_version_ + 1)
       throw std::invalid_argument("Device Adam moment acceptance has a foreign, rejected or stale candidate");
     successor->validateCurrentDevice();
+  }
+
+  /// Prevalidated same-thread receipt only; no runtime call or moment-owner retirement.
+  void acceptPreparedDeviceCandidate(const PreparedDeviceModel::CandidateSnapshot& candidate,
+                            const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
+  {
+    if (!pending_ || !pending_control_ || !pending_control_->live ||
+        candidate.control_.lock() != pending_control_ || candidate.generation_ != proposal_generation_ ||
+        !successor || successor->candidate_control_.lock() != pending_control_)
+      std::terminate();
     commitMoments();
     device_image_ = successor;
     device_bound_ = true;

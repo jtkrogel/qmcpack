@@ -29,6 +29,6 @@ Error launchAdamCandidate(Stream stream, std::size_t count, const AdamBlock* blo
     std::size_t block_count, const double* parameters, double* gradient_candidate,
     const double* first, const double* second, double* next_first, double* next_second,
     double beta1, double beta2, double correction1, double correction2, double epsilon,
-    std::uint64_t* status);
+    std::uint64_t* status, double* displacement_partials = nullptr);
 } // namespace qmcplusplus::psiformer::device
 #endif

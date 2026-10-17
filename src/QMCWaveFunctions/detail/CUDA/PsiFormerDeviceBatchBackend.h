@@ -340,6 +340,89 @@ public:
     return numerical_tiles_.load(std::memory_order_relaxed);
   }
 
+  /// Retain the exact immutable active image for a cold download or successor preparation.
+  std::shared_ptr<const PreparedDeviceModel> currentImage() const
+  {
+    std::lock_guard lock(control_mutex_);
+    return image_;
+  }
+
+  /** Own final backend publication authority and both images. The component
+   * publisher additionally owns its model lock and exact moment receipt.
+   */
+  class PreparedDevicePublication
+  {
+  public:
+    /// Stage only prevalidated FP64 same-family images before readiness.
+    PreparedDevicePublication(std::shared_ptr<const PreparedDeviceBatchBackend> owner,
+        std::shared_ptr<const PreparedDeviceModel> source, std::shared_ptr<const PreparedDeviceModel> next)
+        : owner_(std::move(owner)), source_(std::move(source)), next_(std::move(next)),
+          publication_(owner_->inference_concurrency_.publicationBoundary()), control_(owner_->control_mutex_)
+    {
+      if (owner_->image_ != source_ || owner_->mixed_parameters_)
+        throw std::invalid_argument("DEVICE authority needs the exact current FP64 image");
+      source_->validateCurrentDevice();
+      source_->validateSuccessor(next_);
+      auto& hooks = owner_->publication_hooks_;
+      hooks.candidate = &next_;
+      hooks.mixed_candidate = &mixed_;
+      hooks.commit_native = &unused_;
+      try
+      {
+        owner_->owner_.stage(owner_->owner_.activeProvenance().layout_fingerprint, next_->version(), hooks);
+        staged_ = true;
+        completion_ = owner_->owner_.prepareCompletion(next_->version(), hooks);
+      }
+      catch (...)
+      {
+        if (staged_) owner_->owner_.cancel(next_->version(), hooks);
+        clearHooks();
+        throw;
+      }
+    }
+
+    /// Cancel uncommitted control while locked; images retire only after both locks.
+    ~PreparedDevicePublication()
+    {
+      if (staged_)
+      {
+        owner_->owner_.cancel(next_->version(), owner_->publication_hooks_);
+        clearHooks();
+      }
+    }
+
+    /// Adopt without hooks, runtime calls or last-owner retirement; authority remains held.
+    void commit() noexcept
+    {
+      if (!staged_) std::terminate();
+      owner_->image_ = next_;
+      owner_->owner_.completePrepared(completion_);
+      staged_ = false;
+      clearHooks();
+    }
+
+    /// Release only after the component's version/moments also become current.
+    void unlock() noexcept { control_.unlock(); publication_.unlock(); }
+
+  private:
+    /// Hook fields borrow this action only during staged ownership.
+    void clearHooks() noexcept
+    {
+      owner_->publication_hooks_.candidate = nullptr;
+      owner_->publication_hooks_.mixed_candidate = nullptr;
+      owner_->publication_hooks_.commit_native = nullptr;
+    }
+
+    std::shared_ptr<const PreparedDeviceBatchBackend> owner_;
+    std::shared_ptr<const PreparedDeviceModel> source_, next_;
+    std::shared_ptr<PreparedDeviceMixedDenseParameters> mixed_;
+    std::function<void()> unused_;
+    PsiFormerAcceleratorSharedModel::PreparedCompletion completion_{};
+    bool staged_ = false;
+    std::unique_lock<std::shared_mutex> publication_;
+    std::unique_lock<std::mutex> control_;
+  };
+
   /// Upload privately, then commit native values and active control provenance.
   /// The caller holds the model's exclusive lock throughout this transaction.
   void publishParameters(const std::vector<double>& values, std::size_t version,
