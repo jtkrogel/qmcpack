@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -30,13 +31,17 @@ def main():
     parser.add_argument("--qmcpack", required=True, type=Path)
     parser.add_argument("--fixture", type=Path, default=Path(__file__).with_name("wftrain_complex_orbital_mse.xml"))
     parser.add_argument("--workdir", type=Path)
+    parser.add_argument("--energy-reference-profile", action="store_true",
+                        help="Run only one bounded two-iteration CPU ENERGY/reference pilot")
     args = parser.parse_args()
     executable, fixture = args.qmcpack.resolve(), args.fixture.resolve()
     root = args.workdir or Path(tempfile.mkdtemp(prefix="complex_orbital_mse_"))
     root.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + (60 if args.energy_reference_profile else 120)
     report = {"workdir": str(root), "executable": str(executable), "app_sha256": digest(executable),
               "fixture_sha256": digest(fixture), "scope": "CPU complex fixed-gauge FreeOrbital orbital-MSE only"}
+    if args.energy_reference_profile:
+        report["scope"] = "CPU paired ENERGY/reference pilot only; no restart qualification"
     print(f"Evidence: {root}", flush=True)
     active = None
 
@@ -59,17 +64,32 @@ def main():
         directory.mkdir()
         tree = ET.parse(fixture)
         training = tree.find("qmc/training")
+        if args.energy_reference_profile:
+            training.set("objective", "energy")
+            for name in ("teacher", "target_provenance", "orbital_target"):
+                training.remove(training.find(f"parameter[@name='{name}']"))
+            training.find("parameter[@name='line_search']").text = "reference"
+            for name, value in (("line_search_minimum_ess_fraction", ".5"),
+                                ("line_search_maximum_weight", ".5"), ("line_search_confidence", "2")):
+                ET.SubElement(training, "parameter", name=name).text = value
+            tree.find("qmc/parameter[@name='walkers_per_rank']").text = "2"
+            tree.find("qmc/parameter[@name='blocks']").text = "2"
         training.find("parameter[@name='iterations']").text = str(iterations)
         if restart is not None:
             ET.SubElement(training, "parameter", name="restart_path").text = str(restart.resolve())
         if mutate:
             mutate(tree)
         tree.write(directory / "run.xml")
-        remaining = min(45, deadline - time.monotonic())
+        if args.energy_reference_profile:
+            report["derived_xml_sha256"] = digest(directory / "run.xml")
+        remaining = min(60 if args.energy_reference_profile else 45, deadline - time.monotonic())
         assert remaining > 0, "aggregate 120-second deadline exhausted"
         env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
         with (directory / "console.log").open("w") as output:
-            process = subprocess.Popen([str(executable), "run.xml"], cwd=directory, env=env,
+            command = [str(executable), "run.xml"]
+            if args.energy_reference_profile:
+                command = ["/usr/bin/time", "-v", "-o", "resource_time.txt", *command]
+            process = subprocess.Popen(command, cwd=directory, env=env,
                                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
             active = process
             try:
@@ -80,18 +100,58 @@ def main():
                 except ProcessLookupError:
                     pass
                 process.wait()
+                (directory / "run.exit").write_text(str(process.returncode) + "\n")
                 raise AssertionError(f"{label}: bounded process timeout; see {directory}")
+        (directory / "run.exit").write_text(str(code) + "\n")
         console = (directory / "console.log").read_text()
         if rejection:
             assert code != 0 and rejection in console, (label, code, console[-6000:])
             assert not list(directory.rglob("*.parameters.h5")), directory
             return directory
         assert code == 0, (label, code, console[-6000:])
-        assert "paired CPU orbital-MSE score owner=" in console, directory
+        assert ("WFTrain paired CPU prospective named numeric bytes plus allowance=" if args.energy_reference_profile
+                else "paired CPU orbital-MSE score owner=") in console, directory
         with (directory / "complex_orbital_mse.s000.training_info.csv").open() as handle:
             rows = list(csv.DictReader(handle))
         assert len(rows) == (iterations if restart is None else 1), (label, rows)
+        if args.energy_reference_profile:
+            receipts = [tuple(map(float, values)) for values in re.findall(
+                r"WFTrain candidate alpha (\S+) loss (\S+) loss_difference (\S+) "
+                r"difference_error (\S+) ess (\S+) maximum_weight (\S+) valid ([01])", console)]
+            assert len(receipts) == 6 * len(rows), receipts
+            previous_values, previous_state = None, None
+            models = sorted(directory.rglob("*.parameters.h5"))
+            assert len(models) == len(rows), models
+            for ordinal, row in enumerate(rows):
+                candidates = receipts[6*ordinal:6*(ordinal+1)]
+                assert {value[0] for value in candidates} == {0, .125, .25, .5, .75, 1}, candidates
+                assert all(math.isfinite(value) for candidate in candidates for value in candidate), candidates
+                assert all(0 < value[4] <= 4 and 0 < value[5] <= 1 for value in candidates), candidates
+                alpha = float(row["selected_alpha"])
+                committed = int(row["committed"])
+                assert alpha in {value[0] for value in candidates} and committed == int(alpha > 0), row
+                assert alpha == 0 or any(value[0] == alpha and value[6] == 1 and
+                    value[2] + 2*value[3] < 0 for value in candidates), row
+                assert row["objective"] == "energy" and int(row["samples"]) == 4, row
+                assert int(row["parameter_version"]) == int(row["sample_version"]) + committed, row
+                assert all(math.isfinite(float(row[key])) for key in ("mean_energy", "variance", "gradient_norm")), row
+                values = datasets(models[ordinal])["values"]
+                bundle = models[ordinal].parent / (models[ordinal].name.removesuffix(".parameters.h5") + ".checkpoint")
+                state = datasets(next(bundle.glob("*.state.h5")))
+                keys = ["wftrain_checkpoint/optimizer/" + key for key in
+                        ("first_moment", "second_moment", "accepted_update_count")]
+                assert all(key in state for key in keys) and np.isfinite(values).all()
+                if alpha == 0:
+                    if ordinal == 0:
+                        assert int(row["parameter_version"]) == 0, row
+                    if previous_values is not None:
+                        np.testing.assert_array_equal(values, previous_values)
+                    for key in keys:
+                        np.testing.assert_array_equal(state[key], previous_state[key] if previous_state else np.zeros_like(state[key]))
+                previous_values, previous_state = values, state
         for row in rows:
+            if args.energy_reference_profile:
+                continue
             assert row["objective"] == "orbital_mse" and row["committed"] == "1", row
             assert int(row["samples"]) == 1, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + 1, row
@@ -112,6 +172,15 @@ def main():
 
     try:
         continuous, rows = run("continuous")
+        if args.energy_reference_profile:
+            assert digest(fixture) == report["fixture_sha256"], "source fixture changed"
+            report["maximum_rss_kib"] = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)",
+                (continuous / "resource_time.txt").read_text()).group(1))
+            report.update(status="PASS", iterations=2, samples_per_iteration=4,
+                          selected_alphas=[float(row["selected_alpha"]) for row in rows],
+                          first_rejection_initial_parameter_equality="not independently observable",
+                          exact_restart_qualified=False)
+            return
         split, _ = run("split", iterations=1)
         checkpoint = split / "complex_orbital_mse.s000.last_checkpoint.h5"
         protected = {str(path): digest(path) for path in split.rglob("*.h5")}
