@@ -46,5 +46,18 @@ else()
           "Skipping LiH_ae tests because gaussian basis sets are not supported by complex build (QMC_COMPLEX=1)")
 endif()
 
+# Qualified small external LCAO profile: real CPU only, no backend matrix.
+if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE CONVENTIONAL_LCAO_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
+  if(CONVENTIONAL_LCAO_PYTHON_MODULES EQUAL 0)
+    add_test(NAME short-LiH-ae-conventional-external-lcao
+             COMMAND ${Python3_EXECUTABLE}
+                     "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_external_lcao.xml" --external-lcao)
+    set_tests_properties(short-LiH-ae-conventional-external-lcao PROPERTIES TIMEOUT 300 PROCESSORS 1)
+  endif()
+endif()
+
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")
