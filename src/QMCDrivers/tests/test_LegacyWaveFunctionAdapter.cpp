@@ -3723,7 +3723,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     local = local_owner.get();
     local->add(0, std::move(builder.pp_loc), builder.Zeff);
     ham.addOperator(std::make_unique<BareKineticEnergy>(private_particles), "Kinetic");
-    ham.addOperator(std::make_unique<CoulombPotential>(private_particles, private_particles, true), "ElecElec");
+    ham.addOperator(std::make_unique<CoulombPotential>(private_particles, true, false), "ElecElec");
     ham.addOperator(std::move(local_owner), "LocalECP");
     ham.addOperator(std::move(nonlocal), "NonLocalECP");
     ham.addObservables(private_particles);
