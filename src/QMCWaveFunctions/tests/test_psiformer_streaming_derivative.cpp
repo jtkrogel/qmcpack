@@ -20,6 +20,11 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceRuntime.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
+#endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
 #include "psiformer_test_utils.h"
@@ -30,6 +35,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1349,5 +1355,208 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
     CHECK(full.storage.parameter_scratch_bytes == target.storage.parameter_scratch_bytes);
   }
 }
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
+          "[wavefunction][psiformer][training][streaming][gpu_ecp_replay]")
+{
+  using namespace testing::psiformer;
+  namespace ps = psiformer;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: accepted-grid GPU ECP replay requires a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: accepted-grid GPU ECP replay requires a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  // Small descriptor fixture, not a new public architecture or physical PP model.
+  auto leaves = makeLayout(4, 2, true, 1, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256 || extent == 64) extent = 8;
+  ps::InitializedPsiFormerParameters initialized;
+  initialized.model_shape = {2, 2, 2, 2, 8, 2, 1};
+  initialized.profile = ps::DEEPQMC_PSIFORMER_V1;
+  initialized.seed = 37;
+  initialized.values = makeParameters("lih", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto begin = cursor; cursor += product(leaf.shape);
+    initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, begin, cursor});
+  }
+  const SimulationCell cell;
+  auto electrons = makeElectrons(cell);
+  ParticleSet ions(cell); ions.setName("ion0"); ions.create({1, 1});
+  auto& species = ions.getSpeciesSet(); species.addSpecies("Li"); species.addSpecies("H");
+  const int charge = species.addAttribute("charge"); species(charge, 0) = 3; species(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0}; ions.R[1] = {0, 0, 3.01392421}; ions.resetGroups(); ions.update();
+  auto resolution = ps::PsiFormerAcceleratorResolution{};
+#ifdef QMC_CUDA2HIP
+  resolution.backend = ps::PsiFormerAcceleratorBackend::HIP;
+#else
+  resolution.backend = ps::PsiFormerAcceleratorBackend::CUDA;
+#endif
+  resolution.reason = ps::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
+  resolution.readiness_records_consulted = 1;
+  resolution.validated_operations = ps::psiFormerAcceleratorInferenceOperations();
+  PsiFormerWF cpu("ecp_grid", initialized, electrons, ions);
+  PsiFormerWF gpu("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+  const auto p = cpu.parameterSchema().parameterCount();
+  std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
+  const auto ecp = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  const std::vector<std::size_t> offsets{0, 5, 9};
+  const std::vector<VirtualParticleBatch::Segment> segments{{0, 0}, {0, 1}};
+  std::vector<ParticleSet::PosType> points;
+  std::vector<QMCTraits::ValueType> bare;
+  for (int i = 0; i < 9; ++i)
+  {
+    points.push_back(electrons.R[i < 5 ? 0 : 1] + ParticleSet::PosType{.003 * (i + 1), -.011, .007});
+    bare.push_back((i % 2 ? -.13 : .21) / (i + 1));
+  }
+  const VirtualParticleBatch batch(1, offsets, segments, points);
+  const std::vector<std::vector<DerivativeValue>> coefficients{{{.7, -.2}}, {{-.3, .4}}, {{.1, .6}}};
+  const auto channelsFor = [&](const StreamingDerivativeOperator& op) {
+    std::vector<VJPCoefficientChannel> channels;
+    for (std::size_t i = 0; i < coefficients.size(); ++i)
+      channels.push_back({"ecp" + std::to_string(i), DerivativeProduct::LOCAL_ENERGY_VJP,
+                          coefficientsFor(op, coefficients[i]), ecp});
+    return channels;
+  };
+  auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+  std::size_t aggregate_downloads = 0;
+  const auto capture = [&](PsiFormerWF& component, std::size_t ordinal, std::size_t chunk, bool replay_only,
+                           bool empty_grid = false, bool zero_weight_node = false) {
+    RefVectorWithLeader<WaveFunctionComponent> components(component, {component});
+    RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+    auto op = component.makeStreamingDerivativeOperator(components, particles, ordinal, 0, chunk);
+    auto consumer = component.makeNonLocalECPDerivativeConsumer(components, particles, chunk, true, replay_only);
+    if (replay_only) CHECK(consumer->storageDiagnostics().parameter_scratch_bytes == 0);
+    wftrain::NonLocalECPDerivativeContext context;
+    context.provider_id = op->parameterSchema().providerId(); context.schema_fingerprint = op->parameterSchema().fingerprint();
+    context.parameter_version = op->parameterVersion(); context.batch_ordinal = ordinal;
+    context.sample_count = 1; context.expected_point_count = empty_grid ? 0 : points.size();
+    context.grid_fingerprint = 0x731934d1;
+    auto channels = channelsFor(*op);
+    SelectedParameterSink sink(selected);
+    consumer->begin(context, {channels.data(), channels.size()}, sink);
+    if (empty_grid)
+    {
+      consumer->end();
+      op->bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+      return op;
+    }
+    VirtualParticleSet virtual_set(electrons);
+    RefVectorWithLeader<VirtualParticleSet> virtuals(virtual_set, {virtual_set});
+    ResourceCollection prototype("gpu_ecp_grid"); component.createResource(prototype);
+    ResourceCollection resources(prototype);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    auto grid_points = points;
+    auto grid_bare = bare;
+    if (zero_weight_node) { grid_points[0] = electrons.R[1]; grid_bare[0] = 0; }
+    const VirtualParticleBatch current_batch(1, offsets, segments, grid_points);
+    std::vector<QMCTraits::ValueType> ratios(points.size());
+    const auto stamp = component.mw_evaluateVirtualRatios(components, particles, virtuals, current_batch, ratios);
+    for (std::size_t i = 0; i < ratios.size(); ++i)
+      ratios[i] *= std::exp(.23 * (grid_points[i][0] - electrons.R[i < 5 ? 0 : 1][0]));
+    const std::vector<WaveFunctionComponent::EvaluationStamp> stamps{stamp};
+    const auto before = metrics.snapshot();
+    consumer->consume({current_batch, {grid_bare.data(), grid_bare.size()}, {ratios.data(), ratios.size()},
+        {stamps.data(), stamps.size()}, 0, context.grid_fingerprint});
+    consumer->end();
+    aggregate_downloads = metrics.snapshot().downloaded_bytes - before.downloaded_bytes;
+    if (replay_only) CHECK(sink.state() == DerivativeSinkState::IDLE);
+    op->bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+    return op;
+  };
+  auto reference = capture(cpu, 1, 3, true);
+  auto first = capture(gpu, 1, 3, true);
+  const auto before_growth = first->storageDiagnostics();
+  std::vector<std::unique_ptr<StreamingDerivativeOperator>> retained;
+  for (std::size_t block = 0; block < 9; ++block) retained.push_back(capture(gpu, block + 2, 5, true));
+  const auto grown = first->storageDiagnostics();
+  CHECK(grown.shared_workspace_bytes > before_growth.shared_workspace_bytes);
+  CHECK(grown.storage_fingerprint != before_growth.storage_fingerprint);
+  for (const auto& op : retained)
+  {
+    const auto storage = op->storageDiagnostics();
+    CHECK(storage.shared_workspace_identity == grown.shared_workspace_identity);
+    CHECK(storage.shared_workspace_bytes == grown.shared_workspace_bytes);
+    CHECK(storage.retained_numeric_bytes - storage.shared_workspace_bytes < p * sizeof(DerivativeValue));
+  }
+  const auto compare = [&](wftrain::DerivativeAdjoint adjoint) {
+    SelectedParameterSink expected(selected), actual(selected);
+    auto cpu_channels = channelsFor(*reference), gpu_channels = channelsFor(*first);
+    reference->applyVJPs({cpu_channels.data(), cpu_channels.size()}, adjoint, expected);
+    const auto before = metrics.snapshot();
+    first->applyVJPs({gpu_channels.data(), gpu_channels.size()}, adjoint, actual);
+    const auto bytes = metrics.snapshot().downloaded_bytes - before.downloaded_bytes;
+    for (std::size_t c = 0; c < coefficients.size(); ++c)
+      for (std::size_t i = 0; i < p; ++i) checkClose(actual.results()[c][i], expected.results()[c][i]);
+    return bytes;
+  };
+  const auto replay_downloads = compare(wftrain::DerivativeAdjoint::TRANSPOSE);
+  compare(wftrain::DerivativeAdjoint::HERMITIAN);
+  auto aggregate = capture(gpu, 90, 5, false);
+  CHECK(aggregate_downloads > replay_downloads); // Same Q+reference scores, fewer P transfers.
+  std::vector<DerivativeValue> direction(p);
+  for (std::size_t i = 0; i < p; ++i) direction[i] = {.005 * (int(i % 7) - 3), 0};
+  const wftrain::StructuredParameterVectorConstView vector(cpu.parameterSchema(), cpu.snapshotParameters().version,
+      {direction.data(), direction.size()});
+  RecordingSampleSink cpu_jvp, gpu_jvp;
+  reference->applyLocalEnergyJVP(vector, ecp, cpu_jvp); first->applyLocalEnergyJVP(vector, ecp, gpu_jvp);
+  checkClose(gpu_jvp.results()[0], cpu_jvp.results()[0]);
+  SelectedParameterSink dual(selected);
+  auto dual_channels = channelsFor(*first);
+  first->applyVJPs({dual_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, dual);
+  DerivativeValue dot{};
+  for (std::size_t i = 0; i < p; ++i) dot += direction[i] * dual.results()[0][i];
+  checkClose(dot, coefficients[0][0] * gpu_jvp.results()[0]);
+  SelectedParameterSink failed(selected); failed.armConsumeFailure();
+  auto channels = channelsFor(*first);
+  CHECK_THROWS(first->applyVJPs({channels.data(), channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, failed));
+  CHECK(failed.state() == DerivativeSinkState::POISONED);
+  compare(wftrain::DerivativeAdjoint::TRANSPOSE); // Clean retry after callback abort.
+  auto empty = capture(gpu, 91, 5, true, true);
+  auto empty_channels = channelsFor(*empty);
+  SelectedParameterSink zero(selected);
+  empty->applyVJPs({empty_channels.data(), empty_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, zero);
+  for (const auto& channel : zero.results())
+    for (const auto value : channel) checkClose(value, {});
+  // Independent finite difference of complete ratios on the exact same frozen grid.
+  const auto base = cpu.snapshotParameters();
+  const auto energy = [&](double displacement) {
+    auto candidate = base; candidate.version = cpu.snapshotParameters().version;
+    for (std::size_t i = 0; i < p; ++i) candidate.values[i] += displacement * direction[i].real();
+    cpu.publishParameters(candidate, candidate.version);
+    RefVectorWithLeader<WaveFunctionComponent> components(cpu, {cpu});
+    RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+    VirtualParticleSet virtual_set(electrons);
+    RefVectorWithLeader<VirtualParticleSet> virtuals(virtual_set, {virtual_set});
+    ResourceCollection prototype("ecp_fd"); cpu.createResource(prototype);
+    ResourceCollection resources(prototype);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    std::vector<QMCTraits::ValueType> ratios(points.size());
+    cpu.mw_evaluateVirtualRatios(components, particles, virtuals, batch, ratios);
+    double result = 0;
+    for (std::size_t i = 0; i < points.size(); ++i)
+      result += bare[i] * ratios[i] * std::exp(.23 * (points[i][0] - electrons.R[i < 5 ? 0 : 1][0]));
+    return result;
+  };
+  const double epsilon = 2e-5;
+  const double finite_difference = (energy(epsilon) - energy(-epsilon)) / (2 * epsilon);
+  CHECK(gpu_jvp.results()[0].real() == Catch::Approx(finite_difference).epsilon(2e-6).margin(2e-8));
+  // A same-spin coincidence is undefined even when its physical coefficient is zero.
+  CHECK_THROWS(([&]() {
+    auto node = capture(gpu, 92, 5, true, false, true);
+    auto node_channels = channelsFor(*node);
+    SelectedParameterSink rejected(selected);
+    node->applyVJPs({node_channels.data(), node_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected);
+  }()));
+}
+#endif
 
 } // namespace qmcplusplus
