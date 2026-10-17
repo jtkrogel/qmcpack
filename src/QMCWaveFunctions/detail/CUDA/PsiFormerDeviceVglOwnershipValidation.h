@@ -27,7 +27,7 @@ inline void validateVglOwnershipAdmission()
 /// Measure one complete B1 request, never eager co-owned reverse/score tapes.
 /// Each FULL/K1 comparison uses a fresh process; CPU oracles run separately.
 inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
-                               bool target_k1, std::ostream& output)
+                               bool target_k1, std::ostream& output, std::size_t parallel_trace_bytes = 0)
 {
   validateVglOwnershipAdmission();
   int ordinal = -1;
@@ -53,17 +53,21 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
     throw std::invalid_argument("VGL ownership requires one complete configuration");
   const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * ne);
   TargetVglPreparation preparation;
-  if (target_k1)
+  if (target_k1 || parallel_trace_bytes)
   {
-    const auto cost = estimateTargetVglCost(plan, 1, 1);
-    preparation = {1, cost.device_workspace_bytes, cost.charged_scalar_work_units};
+    preparation.max_targets = target_k1 ? 1 : ne;
+    preparation.parallel_trace_workspace_budget_bytes = parallel_trace_bytes;
+    const auto cost = estimatePreparedTargetVglCost(plan, 1, preparation);
+    preparation.device_workspace_budget_bytes = cost.device_workspace_bytes;
+    preparation.scalar_work_budget = cost.charged_scalar_work_units;
   }
   compute::Queue<PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
   auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
   const auto image_bytes = metrics.snapshot().live_bytes;
   std::cout << "VGL_OWNERSHIP before_scratch mode=" << (target_k1 ? "K1" : "FULL")
-            << " Ne=" << ne << " image_device_bytes=" << image_bytes << std::endl;
+            << " Ne=" << ne << " image_device_bytes=" << image_bytes
+            << " parallel_trace_budget_bytes=" << parallel_trace_bytes << std::endl;
   const auto preparing = std::chrono::steady_clock::now();
   try
   {
@@ -112,6 +116,7 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
               << " D=" << model.ndet << " width=" << model.dim << " heads=" << model.heads << " blocks=" << model.blocks
               << " image_device_bytes=" << image_bytes << " scratch_device_bytes=" << owner.deviceWorkspaceBytes()
               << " scratch_host_bytes=" << owner.hostWorkspaceBytes() << " native_live_bytes=" << after.live_bytes
+              << " parallel_trace_budget_bytes=" << parallel_trace_bytes
               << " native_peak_bytes=" << after.peak_bytes << " device_compute_seconds="
               << std::chrono::duration<double>(computed - start).count() << " host_complete_seconds="
               << std::chrono::duration<double>(completed - start).count()

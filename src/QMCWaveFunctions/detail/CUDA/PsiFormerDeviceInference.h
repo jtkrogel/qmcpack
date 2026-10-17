@@ -22,6 +22,7 @@
 #include "PsiFormerDeviceResources.h"
 #include "PsiFormerDeviceCoordinates.h"
 #include "PsiFormerDeviceSpatial.h"
+#include "PsiFormerDeviceSpatialTraces.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
 #include "PsiFormerDeviceMixedValueDense.h"
@@ -59,6 +60,8 @@ struct TargetVglPreparation
   std::size_t max_targets = 0;
   std::size_t device_workspace_budget_bytes = 0;
   std::size_t scalar_work_budget = 0;
+  /// Default zero preserves scalar traces; positive cap admits an additional real/open B1 leaf.
+  std::size_t parallel_trace_workspace_budget_bytes = 0;
 };
 
 struct TargetVglCost
@@ -142,6 +145,30 @@ inline TargetVglCost estimateTargetVglCost(const PsiFormerExecutionPlan& plan, s
   const auto cube = mul(ne, mul(ne, ne)), bd = mul(batch, dets);
   cost.charged_scalar_work_units = add(mul(3, mul(bd, mul(ne, cube))),
       mul(4, mul(bd, mul(cost.tile_count, cube))));
+  return cost;
+}
+
+/// Charge the optional bounded trace leaf before any composite graph allocation.
+inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
+                                                  const TargetVglPreparation& preparation)
+{
+  auto cost = estimateTargetVglCost(plan, batch, preparation.max_targets);
+  if (preparation.parallel_trace_workspace_budget_bytes)
+  {
+    const auto& environment = plan.environment();
+    if (batch != 1 || environment.boundary != BoundaryCondition::OPEN ||
+        environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+        environment.compute_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+      throw std::invalid_argument("Parallel VGL traces require fixed-ion real/open B1 FP64");
+    const auto& shape = plan.modelShape();
+    const auto k = preparation.max_targets;
+    const auto trace = planSpatialTraceWorkspace({batch, shape.determinants, shape.electrons(),
+        spatial_detail::checkedProduct(3, k, "Parallel trace lanes overflow"), k},
+        preparation.parallel_trace_workspace_budget_bytes);
+    cost.device_workspace_bytes = spatial_detail::checkedAdd(cost.device_workspace_bytes,
+        trace.total_device_bytes, "Parallel VGL composite bytes overflow");
+  }
   return cost;
 }
 
@@ -753,6 +780,10 @@ private:
       throw std::invalid_argument("Ordinary score tape requires a value-only graph");
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
+    if (target_preparation_.parallel_trace_workspace_budget_bytes &&
+        (real_trunk_only || retained_targets || retain_score_tape || retain_spatial_tape ||
+         mode_ != SpatialJetMode::FULL_VGL || !target_preparation_.max_targets))
+      throw std::invalid_argument("Parallel VGL traces reject trunks, retained tapes and implicit targets");
     const auto& environment = plan_.environment();
     const bool head_free_targets = real_trunk_only && target_preparation_.max_targets;
     if (kinetic_trunk_only && (!real_trunk_only || batch_size != 1 || !retain_spatial_tape ||
@@ -798,7 +829,7 @@ private:
         throw std::invalid_argument("Retained targets require one configuration and spatial tapes");
       target_cost_ = retained_targets_
           ? estimateRetainedTargetForwardCost(plan_, target_preparation_.max_targets)
-          : estimateTargetVglCost(plan_, batch_capacity_, target_preparation_.max_targets);
+          : estimatePreparedTargetVglCost(plan_, batch_capacity_, target_preparation_);
       if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
           target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
         throw std::length_error("Target VGL preparation exceeds its explicit workspace or scalar-work budget");
@@ -888,6 +919,11 @@ private:
       tile_phase_.resize(batch_); tile_log_.resize(batch_);
       canonical_phase_.resize(batch_); canonical_log_.resize(batch_);
       host_combinations_.resize(batch_);
+      if (target_preparation_.parallel_trace_workspace_budget_bytes)
+        parallel_traces_ = std::make_unique<PreparedDeviceSpatialTraces>(
+            device_determinant::SpatialLayout{batch_, shape_.determinants, ne_,
+                3 * target_preparation_.max_targets, target_preparation_.max_targets}, queue_.getNative(),
+            target_preparation_.parallel_trace_workspace_budget_bytes);
       // Keep the pre-allocation accounting an executable invariant. Model image
       // and vendor storage are deliberately not charged to this owned workspace.
       if (!retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
@@ -939,6 +975,7 @@ private:
   /// Revoke every previous output before validating or copying replacement input.
   void beginCoordinateEvaluation()
   {
+    if (parallel_traces_) parallel_traces_->invalidate();
     value_tape_valid_ = false;
     result_valid_ = false;
     target_tape_valid_ = false;
@@ -1233,14 +1270,29 @@ private:
         orbitals_.orbitals.configuration_stride, orbitals_.orbitals.configuration_stride};
     // These layouts use packed D*Ne*Ne planes. The view starts at the first
     // requested derivative plane, and its stride skips the remaining jet planes.
-    checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
+    const auto* trace_status = det_status_.data();
+    const auto* trace_gradient = det_gradient_.data();
+    const auto* trace_lap_log = det_lap_log_.data();
+    // Borrow leaf outputs only on this queue; no host staging or extra device copy.
+    if (parallel_traces_)
+    {
+      const auto result = parallel_traces_->evaluate(determinant_layout,
+          {factors_.data(), combinations_.data(), normalized_.data(), inverse_.data(),
+           orbital_jets_.data() + orbitals_.orbitals.plane_stride,
+           orbital_jets_.data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride});
+      trace_status = result.status;
+      trace_gradient = result.log_gradient;
+      trace_lap_log = result.lap_log;
+    }
+    else
+      checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
         normalized_.data(), inverse_.data(), orbital_jets_.data() + orbitals_.orbitals.plane_stride,
         orbital_jets_.data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
     evaluateCusp();
     checkOpen(batch_);
-    checkRuntime(launchFinalSpatialCombination(stream, final_, combinations_.data(), det_status_.data(),
-        det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), phase_.data(), output_.data(),
+    checkRuntime(launchFinalSpatialCombination(stream, final_, combinations_.data(), trace_status,
+        trace_gradient, trace_lap_log, cusp_jets_.data(), phase_.data(), output_.data(),
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
     if (mixed_dense_)
@@ -1379,6 +1431,7 @@ private:
     value_tape_valid_ = false;
     result_valid_ = false;
     target_tape_valid_ = false;
+    if (parallel_traces_) parallel_traces_->invalidate();
   }
 
 public:
@@ -1537,6 +1590,7 @@ public:
     add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
     add(checkedDeviceBytes<InferenceStatusWord>(sticky_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
+    if (parallel_traces_) add(parallel_traces_->deviceWorkspaceBytes());
     for (const auto& tape : value_tape_)
       add(tape->storageBytes());
     return bytes;
@@ -1830,6 +1884,8 @@ private:
   bool value_tape_valid_ = false;
   bool result_valid_ = false;
   std::size_t evaluation_generation_ = 0;
+  // Drain the borrowed stream before any earlier-declared orbital input buffers retire.
+  std::unique_ptr<PreparedDeviceSpatialTraces> parallel_traces_;
 };
 
 /** Explicit matched approximate value/VGL with whole-request FP64 replay.

@@ -98,6 +98,8 @@ inline std::size_t selectDeviceTargetCapacity(std::size_t electrons, std::size_t
 inline DeviceExecutionPreparation resolveDeviceTargetSelection(const PsiFormerExecutionPlan& plan,
     DeviceExecutionPreparation preparation, std::size_t vgl_capacity = 1)
 {
+  if (preparation.vgl.parallel_trace_workspace_budget_bytes && preparation.select_vgl_targets)
+    throw std::invalid_argument("Parallel VGL traces require an explicit target capacity");
   if (!preparation.select_vgl_targets && !preparation.select_kinetic_targets)
     return preparation;
   const auto& environment = plan.environment();
@@ -155,13 +157,15 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
   };
   validate(preparation.vgl.max_targets, preparation.vgl.device_workspace_budget_bytes,
       preparation.vgl.scalar_work_budget);
+  if (preparation.vgl.parallel_trace_workspace_budget_bytes && !preparation.vgl.max_targets)
+    throw std::invalid_argument("Parallel VGL traces require explicit positive targets");
   validate(preparation.kinetic.max_targets, preparation.kinetic.device_workspace_budget_bytes,
       preparation.kinetic.scalar_work_budget);
   if (preparation.kinetic.lifted_channel_slots && !preparation.kinetic.max_targets)
     throw std::invalid_argument("Lifted GEMM channels require explicit kinetic targets");
   if (preparation.vgl.max_targets)
   {
-    const auto cost = estimateTargetVglCost(plan, vgl_capacity, preparation.vgl.max_targets);
+    const auto cost = estimatePreparedTargetVglCost(plan, vgl_capacity, preparation.vgl);
     if (cost.device_workspace_bytes > preparation.vgl.device_workspace_budget_bytes ||
         cost.charged_scalar_work_units > preparation.vgl.scalar_work_budget)
       throw std::length_error("Device target VGL exceeds its per-owner workspace/request work limit");

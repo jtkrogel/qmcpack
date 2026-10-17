@@ -123,6 +123,107 @@ void writeReferences(const std::string& filename, const std::vector<Reference>& 
   }
   if (!output) throw std::runtime_error("Reference output write failed");
 }
+/// Exercise composite ownership independently of unrelated reverse/score graphs.
+void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+                         const Reference& reference)
+{
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  AcceleratorBlasHandle handle(queue);
+  const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+  int ordinal = 0;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "parallel VGL test device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "parallel VGL test device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+  for (const auto k : {std::size_t(1), std::min<std::size_t>(3, model.ne), model.ne})
+  {
+    TargetVglPreparation request{k, 0, 0, 1024 * 1024};
+    const auto base = estimateTargetVglCost(plan, 1, k);
+    const auto cost = estimatePreparedTargetVglCost(plan, 1, request);
+    const auto leaf = planSpatialTraceWorkspace({1, model.ndet, model.ne, 3 * k, k},
+        request.parallel_trace_workspace_budget_bytes);
+    if (cost.device_workspace_bytes != base.device_workspace_bytes + leaf.total_device_bytes ||
+        cost.host_workspace_bytes != base.host_workspace_bytes)
+      throw std::runtime_error("Parallel VGL composite cost lost a numeric owner");
+    request.device_workspace_budget_bytes = cost.device_workspace_bytes;
+    request.scalar_work_budget = cost.charged_scalar_work_units;
+    DeviceExecutionPreparation prepared;
+    prepared.vgl = request;
+    validateDeviceExecutionPreparation(plan, prepared);
+    prepared.select_vgl_targets = true;
+    bool auto_denied = false;
+    try { (void)resolveDeviceTargetSelection(plan, prepared); }
+    catch (const std::invalid_argument&) { auto_denied = true; }
+    if (!auto_denied) throw std::runtime_error("Parallel VGL admitted implicit target selection");
+    const auto reject = [&](TargetVglPreparation bad, bool retained = false, std::size_t batch = 1) {
+      const auto before = metrics.snapshot();
+      bool denied = false;
+      try { PreparedDeviceInference graph(image, batch, queue, handle, SpatialJetMode::FULL_VGL,
+                                          false, retained, InferenceStatusPolicy::DEFERRED_NEURAL, bad); }
+      catch (const std::invalid_argument&) { denied = true; }
+      catch (const std::length_error&) { denied = true; }
+      if (!denied || metrics.snapshot().allocation_calls != before.allocation_calls)
+        throw std::runtime_error("Parallel VGL denial allocated scratch");
+    };
+    auto bad = request;
+    --bad.device_workspace_budget_bytes;
+    reject(bad);
+    bad = request;
+    bad.parallel_trace_workspace_budget_bytes = 1;
+    reject(bad);
+    reject(request, true);
+    reject(request, false, 2);
+    PreparedDeviceInference graph(image, 1, queue, handle, SpatialJetMode::FULL_VGL,
+                                 false, false, InferenceStatusPolicy::DEFERRED_NEURAL, request);
+    if (graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
+        graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
+      throw std::runtime_error("Parallel VGL actual composite charge disagrees");
+    const auto check = [&] {
+      const auto before = metrics.snapshot();
+      graph.evaluate(positions);
+      const auto& layout = graph.resultLayout();
+      std::vector<double> phase(1), jets(spatialJetSpanElements(layout)), ratios(model.ne);
+      graph.downloadResults(phase, jets, ratios);
+      near(phase[0], reference.sign, "parallel complete phase");
+      near(jets[layout.uncheckedValueOffset(0, 0)], reference.logabs, "parallel complete logabs");
+      for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+        near(jets[layout.uncheckedGradientOffset(0, lane, 0)], reference.gradient[lane], "parallel complete G");
+      double kinetic = 0;
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+      {
+        near(jets[layout.uncheckedLaplacianOffset(0, electron, 0)], reference.lap_log[electron], "parallel complete Llog");
+        near(ratios[electron], reference.lap_ratio[electron], "parallel complete Lratio");
+        kinetic -= .5 * ratios[electron];
+      }
+      near(kinetic, reference.kinetic, "parallel complete kinetic");
+      const auto after = metrics.snapshot();
+      if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+          after.live_bytes != before.live_bytes || graph.admittedTargetTiles() != cost.tile_count)
+        throw std::runtime_error("Parallel VGL warm request changed ownership or coverage");
+    };
+    check(); check();
+    auto invalid = positions;
+    invalid.back() = std::numeric_limits<double>::quiet_NaN();
+    bool failed = false;
+    try { graph.evaluate(invalid); } catch (const std::exception&) { failed = true; }
+    if (!failed) throw std::runtime_error("Parallel VGL admitted nonfinite coordinates");
+    bool revoked = false;
+    try {
+      std::vector<double> phase(1), jets(spatialJetSpanElements(graph.resultLayout())), ratios(model.ne);
+      graph.downloadResults(phase, jets, ratios);
+    } catch (const std::logic_error&) { revoked = true; }
+    if (!revoked) throw std::runtime_error("Parallel VGL exposed failed results");
+    check();
+    const auto successor = image->makeUpdatedImage(model.p.flat_values(), 1);
+    graph.rebindModel(successor);
+    check();
+  }
+  std::cout << "PASS parallel complete VGL FULL/K1/K3-tail, exact composite cost, denial, warm reuse, failure/retry and rebind\n";
+}
+
 } // namespace
 
 /// Load portable fixtures; require actual-device work unless explicitly CPU-only.
@@ -144,13 +245,14 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--device-candidate-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] [--retained-energy-sr-only] "
-                                  "[--vgl-ownership FULL|K1] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--vgl-ownership FULL|K1] [--vgl-trace-bytes BYTES] [--parallel-vgl-check] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
     bool cpu_only = false;
+    bool parallel_vgl_check = false;
     bool coordinate_only = false;
     bool device_coordinates_only = false;
     bool target_kinetic_spot = false;
@@ -164,6 +266,7 @@ int main(int argc, char** argv)
     bool energy_sr_only = false;
     bool retained_energy_sr_only = false;
     std::string vgl_ownership;
+    std::size_t vgl_trace_bytes = 0;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -175,6 +278,8 @@ int main(int argc, char** argv)
       const std::string option(argv[argument]);
       if (option == "--cpu-only" && !cpu_only)
         cpu_only = true;
+      else if (option == "--parallel-vgl-check" && !parallel_vgl_check)
+        parallel_vgl_check = true;
       else if (option == "--coordinate-only" && !coordinate_only)
         coordinate_only = true;
       else if (option == "--device-coordinates-only" && !device_coordinates_only)
@@ -204,6 +309,15 @@ int main(int argc, char** argv)
         vgl_ownership = argv[++argument];
         if (vgl_ownership != "FULL" && vgl_ownership != "K1")
           throw std::invalid_argument("VGL ownership mode must be FULL or K1");
+      }
+      else if (option == "--vgl-trace-bytes" && !vgl_trace_bytes && argument + 1 < argc)
+      {
+        const std::string token(argv[++argument]);
+        if (token.empty() || token.find_first_not_of("0123456789") != std::string::npos)
+          throw std::invalid_argument("VGL trace budget must be a positive decimal byte count");
+        vgl_trace_bytes = std::stoull(token);
+        if (!vgl_trace_bytes || vgl_trace_bytes > 8 * 1024 * 1024)
+          throw std::invalid_argument("VGL trace budget must be within 8 MiB");
       }
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
@@ -252,6 +366,8 @@ int main(int argc, char** argv)
       throw std::invalid_argument("Metropolis-only validation cannot request other modes or exports");
     if ((resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (!shape_supplied || determinants != 4 || width != 16 || heads != 4 || blocks != 2))
       throw std::invalid_argument("Resident PCG/ENERGY SR gate requires explicit tiny --shape 4 16 4 2");
+    if (vgl_trace_bytes && vgl_ownership.empty())
+      throw std::invalid_argument("Parallel trace measurement requires --vgl-ownership");
     if (!vgl_ownership.empty())
     {
       if (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot || kinetic_trunk_only ||
@@ -266,11 +382,18 @@ int main(int argc, char** argv)
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
+    if (parallel_vgl_check)
+    {
+      if (argc != 10 || !shape_supplied || model.ne != 4)
+        throw std::invalid_argument("Parallel VGL check requires only --shape D W H B and --parallel-vgl-check on Ne4");
+      validateParallelVgl(model, plan, cpuReferences(model, plan, 1).front());
+      return 0;
+    }
     if (!vgl_ownership.empty())
     {
       std::ofstream output(argv[3]);
       if (!output) throw std::runtime_error("Cannot open VGL ownership output");
-      measureVglOwnership(model, plan, vgl_ownership == "K1", output);
+      measureVglOwnership(model, plan, vgl_ownership == "K1", output, vgl_trace_bytes);
       return 0; // Before CPU references, score/kinetic owners or any parameter trace.
     }
     if ((resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (plan.parameterCount() != 3922 || model.ne != 4 || model.cfg.nup != 2))
