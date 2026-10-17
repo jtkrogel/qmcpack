@@ -481,6 +481,53 @@ public:
   /// Explicit numerical bridge cap; CPU profiles do not read its control.
   std::size_t residentEnergyAdamBudget() const;
 
+  /// Exact additional numerical allowances; cold HOST refresh owns one moved P vector.
+  struct ResidentDeviceAuthorityRequirements
+  {
+    std::size_t snapshot_device_bytes, successor_device_bytes, cold_host_bytes;
+  };
+
+  /// Own one finite DEVICE proposal and its numerical moment owner, never a borrowed pointer.
+  class ResidentDeviceAdamProposal
+  {
+  public:
+    virtual ~ResidentDeviceAdamProposal() = default;
+
+    virtual std::size_t sourceVersion() const noexcept = 0;
+
+    virtual double gradientNorm() const noexcept = 0;
+
+    virtual double displacementNorm() const noexcept = 0;
+  };
+
+  /// Same-thread owning final authority; discard is unchanged, commit is runtime/allocation-free.
+  class PreparedResidentDeviceAdamPublication
+  {
+  public:
+    virtual ~PreparedResidentDeviceAdamPublication() = default;
+
+    virtual std::size_t commit() noexcept = 0;
+  };
+
+  /// Frozen strict GPU-only opt-in; CPU and default providers never enable authority.
+  bool residentDeviceAuthorityRequested() const noexcept;
+
+  /// Activate only after driver profile admission; report allowances before allocation.
+  ResidentDeviceAuthorityRequirements prepareResidentDeviceAuthority() const;
+
+  /// Consume admitted physical C3 without HOST P; retain the exact finite moment receipt.
+  std::unique_ptr<ResidentDeviceAdamProposal> consumeResidentEnergyAdamDevice(
+      const wftrain::StreamingDerivativeOperator& derivative,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      const std::shared_ptr<psiformer::device::PreparedDeviceAdam>& adam, double weight, double energy,
+      double beta1, double beta2, double correction1, double correction2, double epsilon,
+      std::size_t snapshot_device_cap) const;
+
+  /// Prepare DEVICE successor, moment/control receipts and final exclusive authority.
+  std::unique_ptr<PreparedResidentDeviceAdamPublication> prepareResidentDeviceAdamPublication(
+      std::unique_ptr<ResidentDeviceAdamProposal> candidate, std::size_t expected_version,
+      std::size_t successor_device_cap);
+
   /// Complete named SR numeric caps (device, host); CPU never reads these controls.
   std::pair<std::size_t, std::size_t> residentEnergySRBudget() const;
 
