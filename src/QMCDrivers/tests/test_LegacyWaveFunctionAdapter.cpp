@@ -2430,10 +2430,16 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
                   std::invalid_argument);
   CHECK_THROWS_AS(private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, 0, 4, active, {row.data(), 1}),
                   std::invalid_argument);
-  active[0] = -9; // accepted total zero, reference determinants still invertible
+  // The original 1/3 ratios can leave a tiny valid nonzero total at C1=-9.
+  // Use binary-exact 1/4 ratios only for this accepted-zero negative.
+  owned.R[1][0] = owned.R[3][0] = 3;
+  owned.update();
+  active[0] = -16;
   private_msd.resetParametersExclusive(active);
   evaluate(private_msd, owned);
   CHECK_THROWS_AS(private_msd.evaluateRatios(vp, physical), std::domain_error);
+  owned.R[1][0] = owned.R[3][0] = 2;
+  owned.update();
   active[0] = std::numeric_limits<double>::quiet_NaN();
   private_msd.resetParametersExclusive(active);
   evaluate(private_msd, owned);
@@ -2441,6 +2447,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   active[0] = -6;
   private_msd.resetParametersExclusive(active);
   evaluate(private_msd, owned);
+  vp.makeMoves(owned, 0, displacements);
   private_msd.evaluateRatios(vp, physical);
   CHECK(std::real(physical[1]) == Catch::Approx(0).margin(2e-13));
   CHECK(private_msd.fixedCoefficientReference() == 1);
