@@ -64,14 +64,23 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
   const auto image_bytes = metrics.snapshot().live_bytes;
   std::cout << "VGL_OWNERSHIP before_scratch mode=" << (target_k1 ? "K1" : "FULL")
             << " Ne=" << ne << " image_device_bytes=" << image_bytes << std::endl;
+  const auto preparing = std::chrono::steady_clock::now();
   try
   {
     PreparedDeviceInference owner(image, 1, queue, blas, SpatialJetMode::FULL_VGL,
                                  false, false, configuredInferenceStatusPolicy(), preparation);
+    std::cout << "VGL_OWNERSHIP after_scratch elapsed_seconds="
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - preparing).count()
+              << " native_live_bytes=" << metrics.snapshot().live_bytes
+              << " native_peak_bytes=" << metrics.snapshot().peak_bytes << std::endl;
     const auto& layout = owner.resultLayout();
     std::vector<double> phase(1), jets(spatialJetSpanElements(layout)), ratios(ne);
     const auto download = [&] { owner.downloadResults(phase, jets, ratios); };
     owner.evaluate(positions); queue.sync(); download(); // Warm exact complete request.
+    std::cout << "VGL_OWNERSHIP after_warm elapsed_seconds="
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - preparing).count()
+              << " native_live_bytes=" << metrics.snapshot().live_bytes
+              << " native_peak_bytes=" << metrics.snapshot().peak_bytes << std::endl;
     const auto before = metrics.snapshot();
     const auto start = std::chrono::steady_clock::now();
     owner.evaluate(positions); queue.sync();
