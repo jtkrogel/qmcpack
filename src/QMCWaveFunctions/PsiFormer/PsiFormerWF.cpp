@@ -13543,8 +13543,12 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
   const auto counts = backend.advanceMetropolis(batch.numericalSamplingWorkspace(), positions, masses, tau,
       substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted, {}, use_drift, drift,
       retain_device_coordinates);
-  // All device work succeeded. Derived host caches remain intentionally stale
-  // until the driver's immediate ParticleSet update and full TWF evaluateLog.
+  if (retain_device_coordinates)
+    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+      // Sampler DEVICE coordinates stay authoritative; native FULL is dirty until the cold fence.
+      wfc_list.getCastedElement<PsiFormerWF>(walker).accepted_value_valid_ = false;
+  // All device work succeeded. Native refresh is immediate on the default path;
+  // the retained path keeps native caches dirty until its explicit cold fence.
   for (std::size_t walker = 0; !retain_device_coordinates && walker < wfc_list.size(); ++walker)
     for (std::size_t electron = 0; electron < ne; ++electron)
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
