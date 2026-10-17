@@ -4406,7 +4406,8 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
     close(selective_actual.values[0][i], selective_expected.values[0][i], 3e-9);
   selective_actual.reset(); CHECK_THROWS(bound_selective->applyVJPs({&selective_channel, 1}, DerivativeAdjoint::TRANSPOSE, selective_actual));
   CHECK(gpu.snapshotParameters().values == accepted.values);
-  std::printf("COMPLEX_SELECTIVE_RESPONSE PASS SCORE_allP=1 JVP=1 bound_ECP_bothadjoints=1 noKINETIC=1 exactbytes=1 caps_scope=1 callback_stale=1\n");
+  std::printf("COMPLEX_SELECTIVE_RESPONSE PASS SCORE_allP=1 JVP=1 bound_ECP_bothadjoints=1 noKINETIC=1 exactbytes=1 caps_scope=1 callback_stale=1 device_saved=%zu host_saved=%zu\n",
+      requirement.device_bytes - selective_requirement.device_bytes, requirement.host_bytes - selective_requirement.host_bytes);
 }
 TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and complex energy",
           "[wavefunction][psiformer][complex_actual_ecp]")
