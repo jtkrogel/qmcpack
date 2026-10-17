@@ -2663,7 +2663,9 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   unsupported_dataset(true);
   // Qualification of one recognized collection never authorizes unrelated
   // paths elsewhere in the model XML.
-  xmlSetProp(definition.getRoot(), BAD_CAST "filename", BAD_CAST "unqualified.h5");
+  // storeXMLNode deep-copies the builder input; mutate the retained definition
+  // that Binding actually reads, not the disposable Libxml2Document.
+  xmlSetProp(source->getNode(), BAD_CAST "filename", BAD_CAST "unqualified.h5");
   TrainingWaveFunctionBinding unrelated(*source, particles, adapterOptions(), *OHMMS::Controller);
   unrelated.setHamiltonian(ham);
   CHECK_THROWS_WITH(unrelated.modelIdentity(), Catch::Matchers::ContainsSubstring("external"));
