@@ -896,10 +896,18 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
 
 void MultiSlaterDetTableMethod::validateAcceptedReferenceOrbitalProfile() const
 {
-  if (csf_data_ || CI_Optimizable || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 ||
+  if (csf_data_ || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 ||
       Dets[0]->getNumPtcls() != Dets[1]->getNumPtcls())
-    throw std::invalid_argument("Private orbital ECP rows require fixed-CI DETS and equal multiple-occupied spins");
+    throw std::invalid_argument("Private orbital ECP rows require DETS and equal multiple-occupied spins");
   validatePreparedRotatedCoefficientState(*this);
+  if (CI_Optimizable)
+  {
+    if (C->size() != myVars->size() + 1 || C->front() == ValueType{} || !finiteAcceptedRatio(C->front()))
+      throw std::invalid_argument("Private joint CI/orbital ECP rows require finite nonzero frozen C0 and C[1:] variables");
+    for (int variable = 0; variable < myVars->size(); ++variable)
+      if (myVars->getType(variable) != optimize::LINEAR_P)
+        throw std::invalid_argument("Private joint CI/orbital ECP rows require linear coefficient variables");
+  }
   for (const auto& det : Dets)
   {
     const auto& rotated = dynamic_cast<const RotatedSPOs&>(*det->getPhi());
@@ -940,7 +948,18 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
   validateAcceptedOrbitalDerivativeState();
   if (derivatives.size < active.size_of_active() || (derivatives.size && !derivatives.data))
     throw std::invalid_argument("Private orbital ECP derivative row has incorrect size");
-  const auto ratio = acceptedReferenceVirtualRatio(P, iat, refPtcl);
+  if (CI_Optimizable)
+    for (int variable = 0; variable < myVars->size(); ++variable)
+    {
+      const int location = active.getLoc(myVars->name(variable)), index = myVars->where(variable);
+      if (location < 0 || active.where(location) != index || active.getType(location) != optimize::LINEAR_P ||
+          (index >= 0 && static_cast<std::size_t>(index) >= derivatives.size))
+        throw std::invalid_argument("Private joint CI/orbital ECP rows require matching registered coefficient indices");
+    }
+  // Add CI rows once from the same physical numerator before contracting orbital rows.
+  const auto ratio = CI_Optimizable
+      ? evaluateAcceptedReferenceRatioDerivatives(P, iat, refPtcl, active, derivatives)
+      : acceptedReferenceVirtualRatio(P, iat, refPtcl);
   const int moved = getDetID(refPtcl);
   for (int spin = 0; spin < 2; ++spin)
   {
