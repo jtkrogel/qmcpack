@@ -23,6 +23,31 @@ if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND NOT QMC_COMPLEX)
                        TIMEOUT 300 LABELS "deterministic;psiformer;gpu;precision")
 endif()
 
+# Optional generated numerical fixture: no external trained/scientific asset is bundled.
+if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE
+   AND DEFINED ENV{PSIFORMER_TEST_RESIDENT_MODEL_EXPORT} AND EXISTS "$ENV{PSIFORMER_TEST_RESIDENT_MODEL_EXPORT}")
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE DEVICE_SR_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
+  if(DEVICE_SR_PYTHON_MODULES EQUAL 0)
+    execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${qmcpack_SOURCE_DIR}
+                    OUTPUT_VARIABLE DEVICE_SR_SOURCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT DEVICE_SR_SOURCE_COMMIT)
+      set(DEVICE_SR_SOURCE_COMMIT unavailable)
+    endif()
+    add_test(NAME deterministic-LiH-ae-psiformer-device-sr-restart
+             COMMAND ${QMC_GPU_TEST_LAUNCHER} ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/check_resident_device_sr_native.py
+                     --binary $<TARGET_FILE:qmcpack> --source ${qmcpack_SOURCE_DIR}
+                     --input ${CMAKE_CURRENT_SOURCE_DIR}/input.xml
+                     --model "$ENV{PSIFORMER_TEST_RESIDENT_MODEL_EXPORT}"
+                     --output ${CMAKE_CURRENT_BINARY_DIR}/device_sr_native
+                     --source-commit ${DEVICE_SR_SOURCE_COMMIT} --full-workflow)
+    SET_TEST_GPU_RESOURCES(deterministic-LiH-ae-psiformer-device-sr-restart)
+    set_tests_properties(deterministic-LiH-ae-psiformer-device-sr-restart PROPERTIES
+                         TIMEOUT 200 PROCESSORS 1 LABELS "deterministic;psiformer;gpu;sr;restart")
+  endif()
+endif()
+
 # Gamma periodic runs in real or complex builds; a complex build additionally
 # checks the fixed outer Bloch phase through the identical production XML path.
 if(ENABLE_CUDA AND NOT QMC_CUDA2HIP)
