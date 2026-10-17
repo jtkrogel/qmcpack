@@ -29,6 +29,58 @@ Error peekAtLastError()
 #endif
 }
 
+/// Small molecular counterpart: deterministic scalar sums, no additional arena.
+__global__ void residentOpenEnergy(SpatialJetLayout layout, const double* root,
+    const double* positions, const double* nuclei, std::size_t ions,
+    const double* masses, const double* charges, double* energy, std::uint64_t* status)
+{
+  *status = static_cast<std::uint64_t>(OpenKineticReverseStatus::NONFINITE_INPUT_OR_RESULT);
+  for (std::size_t i = 0; i < 5; ++i) energy[i] = 0;
+  for (std::size_t i = 0; i < 3 * layout.electron_count; ++i)
+    if (!open_kinetic_reverse::finite(positions[i])) return;
+  for (std::size_t i = 0; i < 3 * ions; ++i)
+    if (!open_kinetic_reverse::finite(nuclei[i])) return;
+  for (std::size_t e = 0; e < layout.electron_count; ++e)
+  {
+    double lap = root[layout.uncheckedLaplacianOffset(0, e, 0)];
+    for (std::size_t d = 0; d < 3; ++d)
+    {
+      const double g = root[layout.uncheckedGradientOffset(0, 3 * e + d, 0)];
+      lap += g * g;
+    }
+    energy[0] -= 0.5 * masses[e] * lap;
+  }
+  // Every pair is inspected even when its charge or eventual coefficient is zero.
+  for (std::size_t kind = 0; kind < 3; ++kind)
+  {
+    const std::size_t left = kind == 2 ? ions : layout.electron_count;
+    const std::size_t right = kind == 0 ? layout.electron_count : ions;
+    for (std::size_t i = 0; i < left; ++i)
+      for (std::size_t j = kind == 1 ? 0 : i + 1; j < right; ++j)
+      {
+        double r2 = 0;
+        for (std::size_t d = 0; d < 3; ++d)
+        {
+          const double delta = (kind == 2 ? nuclei : positions)[3 * i + d] -
+              (kind == 0 ? positions : nuclei)[3 * j + d];
+          r2 += delta * delta;
+        }
+        if (!open_kinetic_reverse::finite(r2)) return;
+        if (r2 == 0)
+        {
+          *status = static_cast<std::uint64_t>(OpenKineticReverseStatus::COALESCENCE);
+          return;
+        }
+        const double charge = kind == 0 ? 1 : kind == 1 ? -charges[j] : charges[i] * charges[j];
+        energy[kind + 1] += charge / sqrt(r2);
+      }
+  }
+  energy[4] = energy[0] + energy[1] + energy[2] + energy[3];
+  for (std::size_t i = 0; i < 5; ++i)
+    if (!open_kinetic_reverse::finite(energy[i])) return;
+  *status = static_cast<std::uint64_t>(OpenKineticReverseStatus::REGULAR);
+}
+
 // Each numerical destination has one writer. Only the failure word is atomic.
 struct OrbitalReversePointers
 {
@@ -398,6 +450,22 @@ Error launchOpenCuspKineticReverse(
   else
     openCuspKineticReverseKernel<false><<<1, 1, 0, stream>>>(
         layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response, status, {});
+  return peekAtLastError();
+}
+
+Error launchResidentOpenEnergy(Stream stream, const SpatialJetLayout& layout,
+    const double* root, const double* positions, const double* nuclei, std::size_t ions,
+    const double* inverse_masses, const double* charges, double* energy, std::uint64_t* status)
+{
+  validateSpatialJetLayout(layout);
+  if (layout.mode != SpatialJetMode::FULL_VGL || layout.configuration_count != 1 ||
+      layout.element_count != 1 || layout.gradient_lanes != 3 * layout.electron_count ||
+      layout.laplacian_lanes != layout.electron_count || layout.target_electron_begin != 0 ||
+      !root || !positions || !nuclei ||
+      !ions || !inverse_masses || !charges || !energy || !status)
+    throw std::invalid_argument("Resident open energy requires one complete molecular FULL root");
+  residentOpenEnergy<<<1, 1, 0, stream>>>(layout, root, positions, nuclei, ions,
+      inverse_masses, charges, energy, status);
   return peekAtLastError();
 }
 

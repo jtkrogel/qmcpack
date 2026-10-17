@@ -18,6 +18,11 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Observe one open real FULL root and straight-Coulomb geometry without HOST R/G/L.
+Error launchResidentOpenEnergy(Stream stream, const SpatialJetLayout& root_layout,
+    const double* root, const double* positions, const double* nuclei, std::size_t ions,
+    const double* inverse_masses, const double* charges, double* energy, std::uint64_t* status);
+
 /** Reverse one retained open orbital FULL_VGL tape.
  *
  * Null parallel_failure preserves the single-thread reference. An admitted

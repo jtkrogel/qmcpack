@@ -23,6 +23,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
 #include <exception>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -62,7 +63,124 @@ class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
     {}
   };
 
+  /// Optional physical constants/scalars only; all FULL and P arenas are reused.
+  struct ResidentOpenWorkspace
+  {
+    std::vector<double> masses, charges;
+    DeviceBuffer<double> device_masses, device_charges, energy;
+    DeviceBuffer<std::uint64_t> status;
+    std::array<double, 5> host_energy{};
+    std::uint64_t host_status = 0;
+    std::shared_ptr<const std::size_t> token = std::make_shared<const std::size_t>(0);
+    std::size_t epoch = 0;
+    ResidentOpenWorkspace(const std::vector<double>& m, const std::vector<double>& z)
+        : masses(m), charges(z), device_masses(m.size()), device_charges(z.size()), energy(5), status(1)
+    { device_masses.upload(masses.data(), masses.size()); device_charges.upload(charges.data(), charges.size()); }
+  };
+
 public:
+  struct ResidentOpenEnergyCost { std::size_t device_bytes, host_bytes; };
+
+  /// Scalar observation pins provenance, not the borrowed session/backend lifetime.
+  struct ResidentOpenEnergyObservation
+  {
+    std::array<double, 5> energy{}; // K, ee, ei, ii, total
+  private:
+    friend class PreparedDeviceProductSession;
+    PackedDeviceCoordinatesView coordinates;
+    std::shared_ptr<const PreparedDeviceModel> image;
+    std::shared_ptr<const std::size_t> token;
+    std::size_t epoch = 0;
+  };
+
+  /// Numeric arrays plus one revocation token; metadata/vendor/caller receipts excluded.
+  static ResidentOpenEnergyCost estimateResidentOpenEnergyCost(std::size_t electrons, std::size_t ions)
+  {
+    if (!electrons || !ions) throw std::invalid_argument("Resident open energy requires electrons and ions");
+    const auto elements = spatial_detail::checkedAdd(spatial_detail::checkedAdd(electrons, ions,
+        "Resident open energy extent overflow"), 6, "Resident open energy extent overflow");
+    const auto bytes = checkedDeviceBytes<double>(elements);
+    return {bytes, spatial_detail::checkedAdd(bytes, sizeof(std::size_t), "Resident open token overflow")};
+  }
+
+  /// Cold numerical preparation, deliberately not an arbitrary native Hamiltonian claim.
+  void prepareResidentOpenEnergy(const std::vector<double>& inverse_masses,
+      const std::vector<double>& charges, std::size_t device_cap, std::size_t host_cap)
+  {
+    std::lock_guard lock(mutex_);
+    validateContractionControl(active_image_->version());
+    if (resident_open_ || !kinetic_ || target_kinetic_ || image_->periodicCell() ||
+        image_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL ||
+        inverse_masses.size() != image_->plan().modelShape().electrons() ||
+        charges.size() != image_->plan().modelShape().nuclei)
+      throw std::invalid_argument("Resident open energy requires an unprepared real/open full-kinetic lane");
+    for (auto value : inverse_masses)
+      if (!device_math::isFiniteBinary64(value) || value <= 0)
+        throw std::invalid_argument("Resident inverse masses must be finite and positive");
+    for (auto value : charges)
+      if (!device_math::isFiniteBinary64(value)) throw std::invalid_argument("Resident ion charge is nonfinite");
+    const auto cost = estimateResidentOpenEnergyCost(inverse_masses.size(), charges.size());
+    if (cost.device_bytes > device_cap || cost.host_bytes > host_cap)
+      throw std::length_error("Resident open energy cold numeric capacity exceeded");
+    auto prepared = std::make_unique<ResidentOpenWorkspace>(inverse_masses, charges);
+    const auto actual_host = estimateResidentOpenEnergyCost(
+        prepared->masses.capacity(), prepared->charges.capacity()).host_bytes;
+    if (actual_host > host_cap) throw std::length_error("Resident open energy actual HOST capacity exceeded");
+    resident_open_host_bytes_ = actual_host;
+    resident_open_ = std::move(prepared);
+  }
+
+  /// Observe one checked DEVICE coordinate generation using the existing FULL arena.
+  ResidentOpenEnergyObservation observeResidentOpenEnergy(const PackedDeviceCoordinatesView& coordinates,
+      std::size_t version)
+  {
+    ResidentOpenEnergyObservation result;
+    execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, nullptr, version, [&] {
+      if (!resident_open_ || !resident_open_->token)
+        throw std::logic_error("Resident open energy was not prepared or its generation is exhausted");
+      kinetic_->spatial.evaluateDeviceCoordinates(coordinates);
+      const auto head = kinetic_->spatial.spatialHeadTape();
+      checkRuntime(launchResidentOpenEnergy(queue_.getNative(), head.root_layout, head.root, head.positions,
+          image_->nuclei(), resident_open_->charges.size(), resident_open_->device_masses.data(),
+          resident_open_->device_charges.data(), resident_open_->energy.data(), resident_open_->status.data()),
+          "resident open energy");
+      queue_.sync();
+      resident_open_->status.download(&resident_open_->host_status, 1);
+      if (resident_open_->host_status != static_cast<std::uint64_t>(OpenKineticReverseStatus::REGULAR))
+        throw std::runtime_error("Resident open energy is nonfinite or coalescent");
+      resident_open_->energy.download(resident_open_->host_energy.data(), resident_open_->host_energy.size());
+      result.energy = resident_open_->host_energy;
+      result.coordinates = coordinates;
+      result.image = image_;
+      result.token = resident_open_->token;
+      result.epoch = resident_open_->epoch;
+    }, 1, &coordinates);
+    return result;
+  }
+
+  /// Recompute FULL before dK: an earlier sample's arena is never assumed retained.
+  void accumulateResidentKineticContraction(const ResidentOpenEnergyObservation& observation,
+      const std::complex<double>* score_coefficients, const std::complex<double>* kinetic_coefficients,
+      std::size_t channels, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, nullptr, version, [&] {
+      if (!resident_open_ || observation.token != resident_open_->token || observation.image != image_ ||
+          observation.epoch != resident_open_->epoch || !score_contraction_ ||
+          !score_coefficients || !kinetic_coefficients || !channels || channels > 3)
+        throw std::invalid_argument("Resident kinetic observation or channels are stale/foreign");
+      for (const auto* coefficients : {score_coefficients, kinetic_coefficients})
+        for (std::size_t c = 0; c < channels; ++c)
+          if (!device_math::isFiniteBinary64(coefficients[c].real()) ||
+              !device_math::isFiniteBinary64(coefficients[c].imag()))
+            throw std::invalid_argument("Resident kinetic coefficient is nonfinite");
+      // copyTo checks source lifetime/epoch before either score or dK can be folded.
+      kinetic_->spatial.evaluateDeviceCoordinates(observation.coordinates);
+      values_.evaluateDeviceCoordinates(observation.coordinates);
+      score_contraction_->accumulate(score_.reverse(values_, weights_), score_coefficients, channels);
+      score_contraction_->accumulate(kinetic_->reverse.evaluate(kinetic_->spatial, weights_,
+          resident_open_->masses, {}), kinetic_coefficients, channels);
+    }, 1, &observation.coordinates);
+  }
   /** Pin completed numeric provenance, not session lifetime. The outer owner and
    * exclusive provider lease must retain this session/backend through all reads.
    */
@@ -233,7 +351,7 @@ public:
       ScoreContractionRole role = ScoreContractionRole::GENERIC)
   {
     std::lock_guard lock(mutex_);
-    invalidateScoreContraction();
+    invalidateScoreContraction(false);
     validateContractionControl(version);
     if (!score_contraction_)
       throw std::logic_error("Device score contraction was not prepared");
@@ -750,6 +868,9 @@ public:
           "Device product target kinetic workspace overflow");
     bytes = spatial_detail::checkedAdd(bytes, contraction_device_bytes_.load(std::memory_order_acquire),
                                        "Device product contraction byte overflow");
+    if (resident_open_)
+      bytes = spatial_detail::checkedAdd(bytes, estimateResidentOpenEnergyCost(
+          resident_open_->masses.size(), resident_open_->charges.size()).device_bytes, "Resident device overflow");
     return bytes;
   }
 
@@ -783,6 +904,7 @@ public:
         "Device product channel factorization overflow");
     bytes = spatial_detail::checkedAdd(bytes, contraction_host_bytes_.load(std::memory_order_acquire),
                                        "Device product contraction host byte overflow");
+    bytes = spatial_detail::checkedAdd(bytes, resident_open_host_bytes_, "Resident HOST overflow");
     return bytes;
   }
 
@@ -820,8 +942,13 @@ private:
   }
 
   /// A failed/rebound lane can never publish an earlier partial or completed sum.
-  void invalidateScoreContraction() noexcept
+  void invalidateScoreContraction(bool revoke_observations = true) noexcept
   {
+    if (revoke_observations && resident_open_)
+    {
+      if (resident_open_->epoch == std::numeric_limits<std::size_t>::max()) resident_open_->token.reset();
+      else ++resident_open_->epoch;
+    }
     energy_image_ = nullptr;
     if (score_contraction_)
       score_contraction_->invalidate();
@@ -1032,6 +1159,8 @@ private:
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;
   std::unique_ptr<KineticWorkspace> kinetic_;
+  std::unique_ptr<ResidentOpenWorkspace> resident_open_;
+  std::size_t resident_open_host_bytes_ = 0;
   std::unique_ptr<PreparedDeviceTargetKinetic> target_kinetic_;
   std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
   const PreparedDeviceModel* energy_image_ = nullptr;
