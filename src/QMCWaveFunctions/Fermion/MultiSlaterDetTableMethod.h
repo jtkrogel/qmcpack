@@ -196,6 +196,14 @@ public:
 
   void evaluateRatios(const VirtualParticleSet& VP, std::vector<ValueType>& ratios) override;
 
+  /// Opt in only on an owned private fixed-DETS evaluator; ordinary VP stays legacy.
+  void enableAcceptedReferenceVirtualRatios();
+  /// Report the private mode, including propagation to descendants of that evaluator.
+  bool usesAcceptedReferenceVirtualRatios() const noexcept { return accepted_reference_virtual_mode_; }
+  /// Add physical dCI ratios to caller storage, using initialized accepted caches.
+  ValueType evaluateAcceptedReferenceRatioDerivatives(const ParticleSet& P, int iat, int refPtcl,
+      const OptVariables& active, ParameterDerivativeView derivatives);
+
   void evaluateSpinorRatios(const VirtualParticleSet& VP,
                             const std::pair<ValueVector, ValueVector>& spinor_multiplier,
                             std::vector<ValueType>& ratios) override;
@@ -319,6 +327,9 @@ private:
   // compute the new multi determinant to reference determinant ratio based on temporarycoordinates.
   PsiValue computeRatio_NewMultiDet_to_NewRefDet(int det_id) const;
 
+  /// Shared scalar helper for private energy VP and physical derivative rows.
+  ValueType acceptedReferenceVirtualRatio(const ParticleSet& P, int iat, int refPtcl);
+
   /** precompute C_otherDs for a given particle group
    * @param P a particle set
    * @param ig group id
@@ -368,6 +379,10 @@ private:
   PsiValue psi_ratio_to_ref_det_;
   /// new psi over new ref single det when one particle is moved
   PsiValue new_psi_ratio_to_new_ref_det_;
+
+  /// Explicit optimizer-private mode and one quadrature-independent unique-term row.
+  bool accepted_reference_virtual_mode_ = false;
+  Vector<ValueType> accepted_reference_virtual_terms_;
 
   size_t ActiveSpin;
   PsiValue curRatio;

@@ -16,6 +16,7 @@
 
 #include "Particle/ParticleSet.h"
 #include "Particle/ParticleSetPool.h"
+#include "Particle/VirtualParticleSet.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
@@ -2334,6 +2335,120 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       CHECK(block.getLogValueRefDet() == original_log);
       for (int i = 0; i < 4; ++i) CHECK(accepted.R[i] == original_positions[i]);
     }
+
+  // Component foundation only: explicit private mode must govern actual energy
+  // VP ratios and the physical dCI row through the very same scalar helper.
+  std::vector<std::unique_ptr<MultiDiracDeterminant>> determinants;
+  for (auto& spin : spins) determinants.push_back(std::move(spin));
+  MultiSlaterDetTableMethod source(accepted, std::move(determinants), false);
+  auto maps = std::make_unique<std::vector<std::vector<std::size_t>>>(2);
+  for (int spin = 0; spin < 2; ++spin) (*maps)[spin] = {mappings[spin][0], mappings[spin][1]};
+  auto coefficients = std::make_unique<std::vector<QMCTraits::ValueType>>(
+      std::initializer_list<QMCTraits::ValueType>{1, -6});
+  auto variables = std::make_unique<optimize::VariableSet>();
+  variables->insert("CI1", -6, true, optimize::LINEAR_P);
+  variables->resetIndex();
+  auto active = *variables;
+  source.initialize(std::move(maps), std::move(coefficients), std::move(variables), nullptr, true, true);
+  source.checkOutVariables(active);
+  const auto evaluate = [](MultiSlaterDetTableMethod& component, ParticleSet& particles) {
+    ParticleSet::ParticleGradient g(particles.getTotalNum());
+    ParticleSet::ParticleLaplacian l(particles.getTotalNum());
+    g = QMCTraits::GradType{}; l = QMCTraits::ValueType{};
+    return component.evaluateLog(particles, g, l);
+  };
+  const auto source_log = evaluate(source, accepted);
+  ParticleSet owned(accepted), sibling_particles(accepted), descendant_particles(accepted);
+  auto owned_component = source.makeClone(owned), sibling_component = source.makeClone(sibling_particles);
+  auto& private_msd = dynamic_cast<MultiSlaterDetTableMethod&>(*owned_component);
+  auto& sibling = dynamic_cast<MultiSlaterDetTableMethod&>(*sibling_component);
+  private_msd.isolateOptimizationState();
+  private_msd.enableAcceptedReferenceVirtualRatios();
+  private_msd.checkOutVariables(active);
+  evaluate(private_msd, owned);
+  evaluate(sibling, sibling_particles);
+  CHECK_FALSE(source.usesAcceptedReferenceVirtualRatios());
+  CHECK_FALSE(sibling.usesAcceptedReferenceVirtualRatios());
+  CHECK(private_msd.usesAcceptedReferenceVirtualRatios());
+  CHECK(source.get_C().data() == sibling.get_C().data());
+  CHECK(source.get_C().data() != private_msd.get_C().data());
+  auto descendant_component = private_msd.makeClone(descendant_particles);
+  CHECK(dynamic_cast<MultiSlaterDetTableMethod&>(*descendant_component).usesAcceptedReferenceVirtualRatios());
+  dynamic_cast<MultiSlaterDetTableMethod&>(*descendant_component).isolateOptimizationState();
+  VirtualParticleSet ordinary(accepted), vp(owned);
+  ordinary.makeMoves(accepted, 0, {{2, 0, 0}});
+  std::vector<QMCTraits::ValueType> ordinary_before(1), ordinary_after(1), physical(4);
+  source.evaluateRatios(ordinary, ordinary_before);
+  const std::vector<ParticleSet::PosType> displacements{{-3, 0, 0}, {-1, 0, 0}, {0, 0, 0}, {2, 0, 0}};
+  vp.makeMoves(owned, 0, displacements);
+  private_msd.evaluateRatios(vp, physical);
+  for (int point = 0; point < 4; ++point)
+  {
+    std::array<QMCTraits::ValueType, 2> row{0, 123};
+    const auto ratio = private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, point, 0, active,
+        {row.data(), row.size()});
+    CHECK(ratio == physical[point]);
+    CHECK(row[1] == 123);
+    const double x = vp.R[point][0];
+    const double a = (4 - x * x) / 3, b = (2 - x) / 9;
+    const auto oracle = [=](double c) { return (a + c * b) / (1 + c / 9); };
+    CHECK(std::real(ratio) == Catch::Approx(oracle(-6)).epsilon(2e-13).margin(2e-13));
+    const double epsilon = 1e-6;
+    CHECK(std::real(row[0]) == Catch::Approx((oracle(-6 + epsilon) - oracle(-6 - epsilon)) /
+        (2 * epsilon)).epsilon(2e-8).margin(2e-9));
+    if (point == 0) CHECK(std::real(ratio) == Catch::Approx(-8).epsilon(2e-13));
+    if (point == 1)
+    {
+      CHECK(std::real(ratio) == Catch::Approx(0).margin(2e-13));
+      CHECK(std::real(row[0]) == Catch::Approx(2. / 3).epsilon(2e-13));
+    }
+    // Independent actual coefficient perturbations refresh accepted denominators.
+    std::array<double, 2> finite_difference;
+    for (int sign = 0; sign < 2; ++sign)
+    {
+      active[0] = -6 + (sign == 0 ? epsilon : -epsilon);
+      private_msd.resetParametersExclusive(active);
+      evaluate(private_msd, owned);
+      std::array<QMCTraits::ValueType, 1> scratch{};
+      finite_difference[sign] = std::real(private_msd.evaluateAcceptedReferenceRatioDerivatives(
+          vp, point, 0, active, {scratch.data(), scratch.size()}));
+    }
+    CHECK(std::real(row[0]) == Catch::Approx((finite_difference[0] - finite_difference[1]) / (2 * epsilon))
+        .epsilon(2e-8).margin(2e-9));
+    active[0] = -6;
+    private_msd.resetParametersExclusive(active);
+    evaluate(private_msd, owned);
+  }
+  CHECK_THROWS_AS(private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, 0, 0, active, {}), std::invalid_argument);
+  std::array<QMCTraits::ValueType, 1> row{};
+  vp.makeMoves(owned, 2, displacements);
+  private_msd.evaluateRatios(vp, physical);
+  CHECK(private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, 1, 2, active, {row.data(), 1}) == physical[1]);
+  CHECK(std::real(row[0]) == Catch::Approx(2. / 3).epsilon(2e-13));
+  vp.makeMoves(owned, 0, displacements);
+  CHECK_THROWS_AS(source.evaluateAcceptedReferenceRatioDerivatives(vp, 0, 0, active, {row.data(), 1}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, 0, 4, active, {row.data(), 1}),
+                  std::invalid_argument);
+  active[0] = -9; // accepted total zero, reference determinants still invertible
+  private_msd.resetParametersExclusive(active);
+  evaluate(private_msd, owned);
+  CHECK_THROWS_AS(private_msd.evaluateRatios(vp, physical), std::domain_error);
+  active[0] = std::numeric_limits<double>::quiet_NaN();
+  private_msd.resetParametersExclusive(active);
+  evaluate(private_msd, owned);
+  CHECK_THROWS_AS(private_msd.evaluateRatios(vp, physical), std::domain_error);
+  active[0] = -6;
+  private_msd.resetParametersExclusive(active);
+  evaluate(private_msd, owned);
+  private_msd.evaluateRatios(vp, physical);
+  CHECK(std::real(physical[1]) == Catch::Approx(0).margin(2e-13));
+  CHECK(private_msd.fixedCoefficientReference() == 1);
+  CHECK(source.get_C()[1] == -6);
+  CHECK(sibling.get_C()[1] == -6);
+  CHECK(evaluate(source, accepted) == source_log);
+  source.evaluateRatios(ordinary, ordinary_after);
+  CHECK(ordinary_before == ordinary_after);
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",

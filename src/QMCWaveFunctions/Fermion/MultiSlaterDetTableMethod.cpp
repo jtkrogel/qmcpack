@@ -28,6 +28,22 @@ using uint32_t = std::uint32_t;
 
 namespace qmcplusplus
 {
+namespace
+{
+/// Preserve finite admission for physical ratios even under fast-math builds.
+bool finiteAcceptedRatio(WaveFunctionComponent::ValueType value)
+{
+  for (double part : {std::real(value), std::imag(value)})
+  {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(part) && std::numeric_limits<double>::is_iec559);
+    std::memcpy(&bits, &part, sizeof(bits));
+    if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+  }
+  return true;
+}
+}
+
 struct MultiSlaterDetTableMethod::MultiSlaterDetTableMethodMultiWalkerResource : public Resource
 {
   MultiSlaterDetTableMethodMultiWalkerResource() : Resource("MultiSlaterDetTableMethod") {}
@@ -98,6 +114,7 @@ std::unique_ptr<WaveFunctionComponent> MultiSlaterDetTableMethod::makeClone(Part
   auto clone = std::make_unique<MultiSlaterDetTableMethod>(tqp, std::move(dets_clone), use_pre_computing_);
 
   clone->CI_Optimizable = CI_Optimizable;
+  clone->accepted_reference_virtual_mode_ = accepted_reference_virtual_mode_;
   clone->C2node         = C2node;
   clone->C              = C;
   clone->myVars         = myVars;
@@ -754,6 +771,15 @@ void MultiSlaterDetTableMethod::evaluateRatios(const VirtualParticleSet& VP, std
 {
   ScopedTimer local_timer(RatioTimer);
 
+  if (accepted_reference_virtual_mode_)
+  {
+    if (ratios.size() != VP.getTotalNum())
+      throw std::invalid_argument("Private accepted-reference VP output has incorrect size");
+    for (int point = 0; point < VP.getTotalNum(); ++point)
+      ratios[point] = acceptedReferenceVirtualRatio(VP, point, VP.refPtcl);
+    return;
+  }
+
   const int det_id = getDetID(VP.refPtcl);
 
   for (size_t iat = 0; iat < VP.getTotalNum(); ++iat)
@@ -766,6 +792,72 @@ void MultiSlaterDetTableMethod::evaluateRatios(const VirtualParticleSet& VP, std
     if (ratios[iat] != ValueType(0))
       ratios[iat] *= psiNew / psi_ratio_to_ref_det_;
   }
+}
+
+void MultiSlaterDetTableMethod::enableAcceptedReferenceVirtualRatios()
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("Private accepted-reference VP requires a real CPU build");
+#endif
+  if (csf_data_ || Dets.size() != 2 || Last.size() != 2 ||
+      std::any_of(Dets.begin(), Dets.end(), [](const auto& det) {
+        return det->isSpinor() || det->getPhi()->isOMPoffload();
+      }))
+    throw std::invalid_argument("Private accepted-reference VP requires two fixed CPU DETS spin components");
+  validatePreparedCoefficientState(*this);
+  accepted_reference_virtual_mode_ = true;
+}
+
+MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::acceptedReferenceVirtualRatio(
+    const ParticleSet& P, int iat, int refPtcl)
+{
+  if (!accepted_reference_virtual_mode_ || refPtcl < 0 || refPtcl > Last.back())
+    throw std::invalid_argument("Private accepted-reference VP mode or reference index is invalid");
+  if (psi_ratio_to_ref_det_ == PsiValue{} || !finiteAcceptedRatio(static_cast<ValueType>(psi_ratio_to_ref_det_)))
+    throw std::domain_error("Private accepted-reference VP has a zero or nonfinite accepted total");
+  const int moved = getDetID(refPtcl);
+  Dets[moved]->evaluateDetsToAcceptedReference(P, iat, refPtcl, accepted_reference_virtual_terms_);
+  PsiValue numerator{};
+  for (std::size_t term = 0; term < C->size(); ++term)
+  {
+    ValueType value = accepted_reference_virtual_terms_[(*C2node)[moved][term]];
+    for (std::size_t spin = 0; spin < Dets.size(); ++spin)
+      if (spin != moved) value *= Dets[spin]->getRatiosToRefDet()[(*C2node)[spin][term]];
+    numerator += (*C)[term] * value;
+  }
+  const ValueType ratio = static_cast<ValueType>(numerator / psi_ratio_to_ref_det_);
+  if (!finiteAcceptedRatio(ratio)) throw std::domain_error("Private accepted-reference VP ratio is nonfinite");
+  return ratio;
+}
+
+MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAcceptedReferenceRatioDerivatives(
+    const ParticleSet& P, int iat, int refPtcl, const OptVariables& active, ParameterDerivativeView derivatives)
+{
+  if (derivatives.size < active.size_of_active() || (derivatives.size && !derivatives.data))
+    throw std::invalid_argument("Private physical CI ratio derivative row has incorrect size");
+  for (int variable = 0; variable < myVars->size(); ++variable)
+    if (myVars->where(variable) >= 0 && static_cast<std::size_t>(myVars->where(variable)) >= derivatives.size)
+      throw std::invalid_argument("Private physical CI ratio derivative index is out of range");
+  const auto ratio = acceptedReferenceVirtualRatio(P, iat, refPtcl);
+  const int moved = getDetID(refPtcl);
+  for (int variable = 0; variable < myVars->size(); ++variable)
+  {
+    const int index = myVars->where(variable);
+    if (index < 0) continue;
+    const std::size_t term = variable + 1;
+    ValueType old_term{1}, new_term = accepted_reference_virtual_terms_[(*C2node)[moved][term]];
+    for (std::size_t spin = 0; spin < Dets.size(); ++spin)
+    {
+      const auto value = Dets[spin]->getRatiosToRefDet()[(*C2node)[spin][term]];
+      old_term *= value;
+      if (spin != moved) new_term *= value;
+    }
+    const ValueType value = static_cast<ValueType>((new_term - ratio * old_term) / psi_ratio_to_ref_det_);
+    if (!finiteAcceptedRatio(value) || !finiteAcceptedRatio(derivatives[index] + value))
+      throw std::domain_error("Private physical CI ratio derivative is nonfinite");
+    derivatives[index] += value;
+  }
+  return ratio;
 }
 
 void MultiSlaterDetTableMethod::evaluateSpinorRatios(const VirtualParticleSet& VP,
