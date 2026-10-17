@@ -183,6 +183,30 @@ public:
     metrics_->downloaded(checkedDeviceBytes<T>(count));
   }
 
+  /// Copy admitted device storage without crossing a HOST mirror boundary.
+  void copyFromDevice(const DeviceBuffer& source, std::size_t count)
+  {
+    validateTransfer(source.data(), count);
+    if (count > source.capacity_ || (count && device_ordinal_ != source.device_ordinal_))
+      throw std::invalid_argument("PsiFormer device copy extent or owning device mismatch");
+    if (!count)
+      return;
+    int current = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&current), "Device copy current device");
+#else
+    checkRuntime(cudaGetDevice(&current), "Device copy current device");
+#endif
+    if (current != device_ordinal_)
+      throw std::invalid_argument("PsiFormer device copy used a foreign current device");
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpy(data_, source.data(), checkedDeviceBytes<T>(count), hipMemcpyDeviceToDevice), "Device copy");
+#else
+    checkRuntime(cudaMemcpy(data_, source.data(), checkedDeviceBytes<T>(count), cudaMemcpyDeviceToDevice), "Device copy");
+#endif
+    metrics_->copied(checkedDeviceBytes<T>(count));
+  }
+
   /// Preserve synchronous host lifetime while ordering only the caller's queue.
   void uploadOnStream(const T* source, std::size_t count, Stream stream)
   {

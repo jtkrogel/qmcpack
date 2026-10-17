@@ -47,6 +47,16 @@ class PreparedDeviceAdam
   };
 
 public:
+  /// Own a finite pending candidate independently of reusable optimizer scratch.
+  struct DeviceEnergyCandidate
+  {
+    double gradient_norm;
+    std::unique_ptr<const PreparedDeviceModel::CandidateSnapshot> snapshot;
+  };
+
+  /// Revoke pending admission before destroying moment or scratch owners.
+  ~PreparedDeviceAdam() { revokeCandidate(); }
+
   /// Lazy ENERGY-only norm capacity; existing status and P scratch are reused.
   static std::size_t energyGradientRequiredBytes(std::size_t count)
   {
@@ -102,6 +112,9 @@ public:
   void seed(const std::vector<double>& first, const std::vector<double>& second)
   {
     validateDevice();
+    revokeCandidate();
+    device_image_.reset();
+    device_bound_ = false;
     seeded_ = pending_ = false;
     if (first.size() != count_ || second.size() != count_)
       throw std::invalid_argument("Device Adam seed moment extent mismatch");
@@ -116,24 +129,72 @@ public:
       std::vector<double>& candidate)
   {
     validateDevice();
+    revokeCandidate();
     pending_ = false;
     if (!seeded_ || parameters.size() != count_ || candidate.size() != count_ || !gradient)
       throw std::invalid_argument("Device Adam inputs/seed are incomplete");
     // Two explicit P uploads: host canonical parameters and global host gradient.
     parameters_.upload(parameters.data(), count_);
     gradient_candidate_.upload(gradient, count_);
-    completeProposal(beta1, beta2, correction1, correction2, epsilon, candidate);
+    completeProposal(beta1, beta2, correction1, correction2, epsilon, &candidate, parameters_.data());
   }
 
 private:
+  /// Return only owning bytes after current ENERGY and moment admission succeeds.
+  DeviceEnergyCandidate proposeEnergyDeviceCandidate(const PreparedDeviceScoreContraction& source,
+      const std::shared_ptr<const PreparedDeviceModel>& image, double weight, double energy,
+      double beta1, double beta2, double correction1, double correction2, double epsilon, std::size_t device_budget)
+  {
+    validateDevice();
+    revokeCandidate();
+    pending_ = false;
+    if (!image || image->plan().parameterCount() != count_ ||
+        image->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL ||
+        (device_bound_ && device_image_.lock() != image))
+      throw std::invalid_argument("Device Adam candidate has a foreign or expired source image");
+    image->validateCurrentDevice();
+    if (image->version() == std::numeric_limits<std::size_t>::max() ||
+        proposal_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device Adam candidate generation/version exhausted");
+    if (!device_budget || device_budget == std::numeric_limits<std::size_t>::max() ||
+        PreparedDeviceModel::candidateDeviceBytes(count_) > device_budget)
+      throw std::length_error("Device Adam candidate snapshot exceeds its explicit byte budget");
+    auto control = std::make_shared<PreparedDeviceModel::CandidateControl>();
+    control->source = image;
+    control->generation = ++proposal_generation_;
+    auto snapshot = std::unique_ptr<PreparedDeviceModel::CandidateSnapshot>(
+        new PreparedDeviceModel::CandidateSnapshot(control, image));
+    try
+    {
+      const auto norm = proposeEnergyImpl(source, image->parameters(), nullptr, weight, energy,
+          beta1, beta2, correction1, correction2, epsilon, nullptr);
+      snapshot->parameters_.copyFromDevice(gradient_candidate_, count_);
+      pending_control_ = std::move(control);
+      device_image_ = image;
+      device_bound_ = true;
+      return {norm, std::move(snapshot)};
+    }
+    catch (...) { reject(); throw; }
+  }
+
   /// Only a locked, current ProductSession can supply resident ordered C3 storage.
   double proposeEnergy(const PreparedDeviceScoreContraction& source, const double* image_parameters,
       const std::vector<double>& parameters, double weight, double energy, double beta1, double beta2,
       double correction1, double correction2, double epsilon, std::vector<double>& candidate)
   {
+    return proposeEnergyImpl(source, image_parameters, &parameters, weight, energy, beta1, beta2,
+        correction1, correction2, epsilon, &candidate);
+  }
+
+  /// Share unchanged recurrence/status kernels; the optional HOST boundary stays explicit.
+  double proposeEnergyImpl(const PreparedDeviceScoreContraction& source, const double* image_parameters,
+      const std::vector<double>* parameters, double weight, double energy, double beta1, double beta2,
+      double correction1, double correction2, double epsilon, std::vector<double>* candidate)
+  {
     validateDevice();
+    revokeCandidate();
     pending_ = false;
-    if (!seeded_ || parameters.size() != count_ || candidate.size() != count_ || !image_parameters ||
+    if (!seeded_ || (parameters && parameters->size() != count_) || (candidate && candidate->size() != count_) || !image_parameters ||
         !source.ready_ || source.channels_ != 3 || source.parameters_ != count_ ||
         norm_host_.size() != energyGradientRequiredBytes(count_) / sizeof(double) ||
         norm_partials_.capacity() != norm_host_.size() ||
@@ -144,9 +205,11 @@ private:
         !device_math::isFiniteBinary64(correction2) || correction2 <= 0 || correction2 > 1 ||
         !device_math::isFiniteBinary64(epsilon) || epsilon <= 0)
       throw std::invalid_argument("Device ENERGY Adam inputs, C3 provenance or preparation are invalid");
-    parameters_.upload(parameters.data(), count_);
+    if (parameters)
+      parameters_.upload(parameters->data(), count_);
+    const double* current = parameters ? parameters_.data() : image_parameters;
     resetStatus();
-    checkRuntime(launchAdamEnergyGradient(queue_.getNative(), count_, source.sums_.data(), parameters_.data(),
+    checkRuntime(launchAdamEnergyGradient(queue_.getNative(), count_, source.sums_.data(), current,
         image_parameters, weight, energy, gradient_candidate_.data(), norm_partials_.data(), status_.data()),
         "Device ENERGY gradient");
     admitStatus();
@@ -156,21 +219,22 @@ private:
       norm = std::hypot(norm, norm_host_[index] * std::sqrt(norm_host_[index + 1]));
     if (!device_math::isFiniteBinary64(norm))
       throw std::overflow_error("Device ENERGY gradient norm is nonfinite");
-    completeProposal(beta1, beta2, correction1, correction2, epsilon, candidate);
+    completeProposal(beta1, beta2, correction1, correction2, epsilon, candidate, current);
     return norm;
   }
 
   /// Share precisely the old recurrence, status admission and candidate transfer.
   void completeProposal(double beta1, double beta2, double correction1, double correction2,
-      double epsilon, std::vector<double>& candidate)
+      double epsilon, std::vector<double>* candidate, const double* current)
   {
     resetStatus();
     checkRuntime(launchAdamCandidate(queue_.getNative(), count_, blocks_.data(), blocks_.capacity(),
-        parameters_.data(), gradient_candidate_.data(), committed_->first.data(), committed_->second.data(),
+        current, gradient_candidate_.data(), committed_->first.data(), committed_->second.data(),
         staged_->first.data(), staged_->second.data(), beta1, beta2, correction1, correction2, epsilon,
         status_.data()), "Device Adam candidate");
     admitStatus();
-    gradient_candidate_.download(candidate.data(), count_);
+    if (candidate)
+      gradient_candidate_.download(candidate->data(), count_);
     pending_ = true;
   }
 
@@ -195,19 +259,46 @@ private:
   }
 
 public:
+  /// Validate the exact pending proposal and its copied successor before moment adoption.
+  void acceptDeviceCandidate(const PreparedDeviceModel::CandidateSnapshot& candidate,
+                            const std::shared_ptr<const PreparedDeviceModel>& successor)
+  {
+    validateDevice();
+    const auto control = candidate.control_.lock();
+    if (!pending_ || !control || !control->live || control != pending_control_ ||
+        control->generation != proposal_generation_ || candidate.generation_ != proposal_generation_ ||
+        !successor || successor->candidate_control_.lock() != control ||
+        successor->candidate_generation_ != proposal_generation_ ||
+        successor->metadata_ != candidate.metadata_ || successor->version() != candidate.source_version_ + 1)
+      throw std::invalid_argument("Device Adam moment acceptance has a foreign, rejected or stale candidate");
+    successor->validateCurrentDevice();
+    accept();
+    device_image_ = successor;
+    device_bound_ = true;
+  }
+
   /// Publish already admitted moments with no runtime call, copy or allocation.
   void accept() noexcept
   {
     assert(pending_);
     committed_.swap(staged_);
     pending_ = false;
+    revokeCandidate();
+    device_image_.reset();
+    device_bound_ = false;
   }
 
   /// Discard only speculative scratch after selection/publication rejection.
-  void reject() noexcept { pending_ = false; }
+  void reject() noexcept { pending_ = false; revokeCandidate(); }
 
   /// Restore commits only invalidate the seed; next propose uploads host mirrors.
-  void invalidateSeed() noexcept { seeded_ = pending_ = false; }
+  void invalidateSeed() noexcept
+  {
+    seeded_ = pending_ = false;
+    revokeCandidate();
+    device_image_.reset();
+    device_bound_ = false;
+  }
 
   /// Report whether a restored host payload still needs its cold upload.
   bool seeded() const noexcept { return seeded_; }
@@ -226,6 +317,14 @@ public:
   std::size_t deviceBytes() const noexcept { return bytes_; }
 
 private:
+  /// Revocation invalidates receipts, not their independently owned numeric buffers.
+  void revokeCandidate() noexcept
+  {
+    if (pending_control_)
+      pending_control_->live = false;
+    pending_control_.reset();
+  }
+
   /// Allocate admitted buffers and upload only compact immutable metadata.
   PreparedDeviceAdam(std::size_t count, const std::vector<AdamBlock>& blocks, std::size_t bytes)
       : count_(count), bytes_(bytes), committed_(std::make_unique<Moments>(count)),
@@ -263,6 +362,10 @@ private:
   std::vector<double> norm_host_;
   bool seeded_ = false, pending_ = false;
   int device_ = -1;
+  std::shared_ptr<PreparedDeviceModel::CandidateControl> pending_control_;
+  std::weak_ptr<const PreparedDeviceModel> device_image_;
+  std::size_t proposal_generation_ = 0;
+  bool device_bound_ = false;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif
