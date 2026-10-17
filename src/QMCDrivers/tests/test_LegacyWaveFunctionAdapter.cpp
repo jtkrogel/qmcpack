@@ -2303,6 +2303,9 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
     REQUIRE(snapshot.values[0] == 0.0);
     const auto original_coefficients = source_msd.get_C();
+    const auto original_log = source->getLogPsi();
+    const auto original_energy = kineticEnergy(electrons);
+    const auto* original_spo = &source->getSPOSet("spo");
     for (double coefficient : {0.0, -0.17})
     {
       CAPTURE(coefficient);
@@ -2350,6 +2353,145 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
       }
       CHECK(source_msd.get_C() == original_coefficients);
       CHECK(sibling_msd.get_C() == original_coefficients);
+      if (!csf)
+      {
+        // Mixed DETS/J2 inverse iteration uses the same local additive tangent
+        // policy as nonlinear models, not LM's centered Ritz-vector retraction.
+        constexpr std::size_t n = 9, m = 4;
+        auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
+            std::vector<double>{-0.12, -0.03, 0.07, 0.18});
+        auto products = adapter.makeDerivativeOperator(replay,
+            std::make_shared<const StructuredParameterSnapshot>(candidate), 0, 0);
+        std::array<std::array<double, n>, m> scores{}, del{};
+        std::array<DerivativeValue, m> energies{};
+        std::array<double, m> weights{1, 2, 1, 2};
+        std::array<double, n> mean{};
+        double mean_energy = 0;
+        auto active = adapter.registrationVariables();
+        active[0] = coefficient;
+        for (std::size_t sample = 0; sample < m; ++sample)
+        {
+          replay->prepareSample(sample);
+          adapter.installSnapshot(*evaluator, private_particles, candidate);
+          energies[sample] = kineticEnergy(private_particles);
+          mean_energy += weights[sample] * energies[sample].real() / 6;
+          Vector<QMCTraits::ValueType> raw(n), energy_row(n);
+          raw = energy_row = 0;
+          evaluator->evaluateDerivatives(private_particles, active, raw, energy_row);
+          for (std::size_t parameter = 0; parameter < n; ++parameter)
+          {
+            scores[sample][parameter] = std::real(raw[parameter]);
+            del[sample][parameter] = std::real(energy_row[parameter]);
+            mean[parameter] += weights[sample] * scores[sample][parameter] / 6;
+          }
+        }
+        const auto& schema = adapter.parameterSchema();
+        const ScoreCovarianceBatch batch{products.get(), {weights.data(), m}, {energies.data(), m}};
+        ScoreCovarianceFactor factor(schema, candidate.version, {&batch, 1});
+        ProjectedInverseIterationFactor pii_factor(factor, localEnergyTermBit(LocalEnergyTerm::KINETIC));
+        PIIUpdateControl control;
+        control.shift_mode = PIIShiftMode::EXPLICIT;
+        control.explicit_shift = mean_energy - 1;
+        control.damping = 0.3;
+        control.learning_rate = 0.01;
+        control.maximum_damping_retries = 0;
+        control.gmres.restart_length = 16;
+        control.gmres.krylov.maximum_iterations = 64;
+        control.gmres.krylov.maximum_operator_applications = 256;
+        control.gmres.krylov.maximum_seconds = 5;
+        std::vector<std::vector<double>> matrix(n, std::vector<double>(n));
+        std::vector<double> rhs(n);
+        for (std::size_t row = 0; row < n; ++row)
+        {
+          matrix[row][row] = control.damping;
+          for (std::size_t sample = 0; sample < m; ++sample)
+          {
+            const double left = weights[sample] * (scores[sample][row] - mean[row]) / 6;
+            rhs[row] += left * (energies[sample].real() - mean_energy);
+            for (std::size_t column = 0; column < n; ++column)
+              matrix[row][column] += left * (del[sample][column] +
+                  (energies[sample].real() - control.explicit_shift) * (scores[sample][column] - mean[column]));
+          }
+        }
+        // Same pivoted dense elimination recipe as the independent PII tests.
+        for (std::size_t column = 0; column < n; ++column)
+        {
+          std::size_t pivot = column;
+          for (std::size_t row = column + 1; row < n; ++row)
+            if (std::abs(matrix[row][column]) > std::abs(matrix[pivot][column])) pivot = row;
+          REQUIRE(std::abs(matrix[pivot][column]) > 1e-13);
+          std::swap(matrix[pivot], matrix[column]);
+          std::swap(rhs[pivot], rhs[column]);
+          for (std::size_t row = column + 1; row < n; ++row)
+          {
+            const double multiplier = matrix[row][column] / matrix[column][column];
+            for (std::size_t entry = column; entry < n; ++entry)
+              matrix[row][entry] -= multiplier * matrix[column][entry];
+            rhs[row] -= multiplier * rhs[column];
+          }
+        }
+        std::vector<double> direction(n);
+        for (std::size_t reverse = n; reverse > 0; --reverse)
+        {
+          const auto row = reverse - 1;
+          double value = rhs[row];
+          for (std::size_t column = row + 1; column < n; ++column) value -= matrix[row][column] * direction[column];
+          direction[row] = value / matrix[row][row];
+        }
+        const auto gradient = factor.scoreCovarianceGradient();
+        const ParameterGradientView objective{schema.fingerprint(), candidate.version, ReductionDomain::GLOBAL,
+            {gradient.data(), gradient.size()}};
+        ProjectedInverseIterationUpdateRule pii(pii_factor, control);
+        MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
+        for (const auto& mapped : {pii.propose(schema, candidate, objective), minpii.propose(schema, candidate, objective)})
+          for (std::size_t parameter = 0; parameter < n; ++parameter)
+            CHECK(mapped.values[parameter] == Catch::Approx(candidate.values[parameter] -
+                control.learning_rate * direction[parameter]).epsilon(2e-9).margin(2e-11));
+        pii.proposalRejected();
+        minpii.proposalRejected();
+        for (std::size_t sample = 0; sample < m; ++sample)
+        {
+          double expected_log = 0, expected_energy = 0;
+          for (std::size_t parameter = 0; parameter < n; ++parameter)
+          {
+            expected_log += scores[sample][parameter] * direction[parameter];
+            expected_energy += del[sample][parameter] * direction[parameter];
+          }
+          double previous_log_error = 0, previous_energy_error = 0;
+          for (double step : {1e-3, 5e-4})
+          {
+            auto plus = candidate, minus = candidate;
+            for (std::size_t parameter = 0; parameter < n; ++parameter)
+            {
+              plus.values[parameter] += step * direction[parameter];
+              minus.values[parameter] -= step * direction[parameter];
+            }
+            replay->prepareSample(sample);
+            adapter.installSnapshot(*evaluator, private_particles, plus);
+            const double plus_log = evaluator->getLogPsi(), plus_energy = kineticEnergy(private_particles).real();
+            adapter.installSnapshot(*evaluator, private_particles, minus);
+            const double log_error = std::abs((plus_log - evaluator->getLogPsi()) / (2 * step) - expected_log);
+            const double energy_error = std::abs((plus_energy - kineticEnergy(private_particles).real()) / (2 * step) - expected_energy);
+            CHECK(std::isfinite(log_error));
+            CHECK(std::isfinite(energy_error));
+            if (step == 5e-4)
+            {
+              CHECK(log_error <= 0.4 * previous_log_error + 5e-9);
+              CHECK(energy_error <= 0.4 * previous_energy_error + 5e-9);
+            }
+            previous_log_error = log_error;
+            previous_energy_error = energy_error;
+            CHECK(private_msd.fixedCoefficientReference() == 0.6);
+            CHECK(private_msd.get_C()[0] == original_coefficients[0]);
+          }
+        }
+        source->evaluateLog(electrons);
+        CHECK(source->getLogPsi() == original_log);
+        CHECK(kineticEnergy(electrons) == original_energy);
+        CHECK(&source->getSPOSet("spo") == original_spo);
+        CHECK(source_msd.get_C() == original_coefficients);
+        CHECK(adapter.snapshotParameters().values == snapshot.values);
+      }
     }
     optimize::VariableSet source_variables;
     source->checkInVariables(source_variables);
