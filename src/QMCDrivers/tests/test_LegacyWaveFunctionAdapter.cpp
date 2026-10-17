@@ -2848,6 +2848,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     ParticleSet trial(p);
     auto twf = wf->makeClone(trial);
     twf->findMSD().front().get().isolateOptimizationState();
+    trial.R = oracle_positions;
     trial.update(); adapter.installSnapshot(*twf, trial, candidate);
     const auto& expanded = twf->findMSD().front().get().get_C();
     const double ref_coefficient = std::real(expanded[0] + (csf ? expanded[2] : QMCTraits::ValueType{}));
@@ -2862,19 +2863,20 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     const double accepted_j = jlog(*twf, trial);
     trial.R = oracle_positions; trial.update(); adapter.installSnapshot(*twf, trial, candidate);
     DerivativeValue energy = kineticEnergy(trial) + oracle_local_value;
+    const auto determinant = [](const ParticleSet::ParticlePos& r, int spin, bool alt) {
+      const double x = r[2 * spin][0], y = r[2 * spin + 1][0];
+      return alt ? y - x : y * y - x * x;
+    };
+    const double accepted_reference = determinant(oracle_positions, 0, false) * determinant(oracle_positions, 1, false);
+    const double accepted_alternative = determinant(oracle_positions, 0, true) * determinant(oracle_positions, 1, true);
     for (const auto& q : oracle_points)
     {
       auto r = oracle_positions;
       for (int dim = 0; dim < 3; ++dim) r[q.electron][dim] = q.replacement_position[dim];
-      const auto determinant = [&](int spin, bool alt) {
-        const double x = r[2 * spin][0], y = r[2 * spin + 1][0];
-        return alt ? y - x : y * y - x * x;
-      };
       const double common_ratio = (1 + r[q.electron][1] + r[q.electron][2]) /
           (1 + oracle_positions[q.electron][1] + oracle_positions[q.electron][2]);
-      const double accepted_reference = csf ? 64 : 9, accepted_alternative = csf ? 4 : 1;
-      const double ratio = common_ratio * (ref_coefficient * determinant(0, false) * determinant(1, false) +
-          alt_coefficient * determinant(0, true) * determinant(1, true)) /
+      const double ratio = common_ratio * (ref_coefficient * determinant(r, 0, false) * determinant(r, 1, false) +
+          alt_coefficient * determinant(r, 0, true) * determinant(r, 1, true)) /
           (accepted_reference * ref_coefficient + accepted_alternative * alt_coefficient);
       trial.R = r; trial.update();
       energy += q.bare_weight * ratio * std::exp(jlog(*twf, trial) - accepted_j);
