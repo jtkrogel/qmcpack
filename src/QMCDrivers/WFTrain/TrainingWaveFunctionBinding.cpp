@@ -81,24 +81,28 @@ RotationLayout rotationLayout(const TrialWaveFunction& wavefunction)
 {
   RotationLayout result;
   std::set<std::string> names;
+  const auto add = [&](SPOSet& spo) {
+    auto* rotated = dynamic_cast<RotatedSPOs*>(&spo);
+    if (!rotated)
+    {
+      result.aliases.push_back(-1);
+      return;
+    }
+    auto found = std::find(result.unique.begin(), result.unique.end(), rotated);
+    if (found == result.unique.end())
+    {
+      if (rotated->SPOSet::getName().empty() || !names.insert(rotated->SPOSet::getName()).second)
+        throw std::invalid_argument("Conventional orbital frames require unique nonempty SPO names");
+      found = result.unique.insert(result.unique.end(), rotated);
+    }
+    result.aliases.push_back(static_cast<int>(found - result.unique.begin()));
+  };
   for (auto& slater : wavefunction.findSD())
     for (int determinant = 0; determinant < slater.get().getNumDets(); ++determinant)
-    {
-      auto* rotated = dynamic_cast<RotatedSPOs*>(&slater.get().getPhi(determinant));
-      if (!rotated)
-      {
-        result.aliases.push_back(-1);
-        continue;
-      }
-      auto found = std::find(result.unique.begin(), result.unique.end(), rotated);
-      if (found == result.unique.end())
-      {
-        if (rotated->SPOSet::getName().empty() || !names.insert(rotated->SPOSet::getName()).second)
-          throw std::invalid_argument("Conventional orbital frames require unique nonempty SPO names");
-        found = result.unique.insert(result.unique.end(), rotated);
-      }
-      result.aliases.push_back(static_cast<int>(found - result.unique.begin()));
-    }
+      add(slater.get().getPhi(determinant));
+  for (auto& multideterminant : wavefunction.findMSD())
+    for (int spin = 0; spin < multideterminant.get().getDetSize(); ++spin)
+      add(*multideterminant.get().getDet(spin).getPhi());
   return result;
 }
 
@@ -214,12 +218,21 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
   multideterminant_ = !prototype.findMSD().empty();
   const auto rotations = rotationLayout(prototype);
   orbital_rotations_ = !rotations.unique.empty();
-  if (orbital_rotations_ && (multideterminant_ || prototype.findSD().size() != 1))
-    throw std::invalid_argument("Conventional orbital training requires one single-Slater component");
+  if (orbital_rotations_)
+  {
+    const bool single = !multideterminant_ && prototype.findSD().size() == 1;
+    const bool multi = prototype.findSD().empty() && prototype.findMSD().size() == 1 &&
+        rotations.unique.size() == 2 && rotations.aliases == std::vector<int>{0, 1};
+    if (!single && !multi)
+      throw std::invalid_argument("Conventional orbital training requires single Slater or two distinct active MD spin owners");
+  }
   for (const auto* rotated : rotations.unique)
     rotated->validatePreparedRotationState(*rotated);
   for (auto& determinant : prototype.findMSD())
-    determinant.get().validatePreparedCoefficientState(determinant.get());
+    if (orbital_rotations_)
+      determinant.get().validatePreparedRotatedCoefficientState(determinant.get());
+    else
+      determinant.get().validatePreparedCoefficientState(determinant.get());
   const auto& variables = adapter_.registrationVariables();
   registration_identity_ = prototype.conventionalRegistrationIdentity();
   if (!registration_identity_)
@@ -510,7 +523,10 @@ std::size_t TrainingWaveFunctionBinding::publishPrepared(
       coefficient_banks.back().reserve(targets.size());
       for (std::size_t i = 0; i < targets.size(); ++i)
       {
-        targets[i].get().validatePreparedCoefficientState(canonical[i].get());
+        if (orbital_rotations_)
+          targets[i].get().validatePreparedRotatedCoefficientState(canonical[i].get());
+        else
+          targets[i].get().validatePreparedCoefficientState(canonical[i].get());
         coefficient_banks.back().emplace_back(&targets[i].get(), &canonical[i].get());
       }
       const auto target_rotations = rotationLayout(*wf);
@@ -589,7 +605,8 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(fixed_values, "registration_values");
   output.write(definition_, "wavefunction_xml");
   writeOrbitalFrame(output);
-  output.write(std::string(orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
+  output.write(std::string(orbital_rotations_ ? (multideterminant_ ? "conventional-rotated-lcao-mdj-v1"
+                                                                 : "conventional-rotated-lcao-sj-v1")
                           : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
                                              : "conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
   output.pop();
@@ -607,7 +624,8 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModelState(
   if (!input.open(path, H5F_ACC_RDONLY)) throw std::runtime_error("Cannot read conventional model export");
   input.push("conventional_wavefunction", false);
   const auto expected_identity = modelIdentity();
-  const std::string expected_cookie = orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
+  const std::string expected_cookie = orbital_rotations_ ? (multideterminant_ ? "conventional-rotated-lcao-mdj-v1"
+                                                                          : "conventional-rotated-lcao-sj-v1")
                                      : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
                                                         : "conventional-fixed-slater-j1-j2-v1";
   const auto& variables = *registration_identity_;

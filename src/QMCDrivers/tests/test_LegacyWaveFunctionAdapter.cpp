@@ -1460,6 +1460,184 @@ TEST_CASE("Legacy orbital products preserve cumulative private rotation history"
       CHECK(particles.R[electron][dimension] == positions[electron][dimension]);
 }
 
+TEST_CASE("Legacy distinct-spin MD orbital products include CI Jastrow and full kinetic tangents",
+          "[drivers][training][legacy_adapter][md_orbital]")
+{
+#ifdef QMC_COMPLEX
+  SKIP("This gate qualifies real CPU distinct-owner MD orbital coordinates");
+#endif
+  ParticleSetPool pool(OHMMS::Controller);
+  auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto& ions = *ion_owner;
+  auto& particles = *electron_owner;
+  ions.setName("ion0");
+  ions.create({1});
+  ions.getSpeciesSet().addSpecies("He");
+  ions.R[0] = {0, 0, 0};
+  ions.resetGroups();
+  ions.update();
+  particles.setName("e");
+  particles.create({1, 1});
+  particles.R[0] = {0.7, 0.2, 0.4};
+  particles.R[1] = {-0.5, 0.3, 0.8};
+  auto& species = particles.getSpeciesSet();
+  const int u = species.addSpecies("u"), d = species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, u) = species(mass, d) = 1;
+  particles.resetGroups();
+  pool.addParticleSet(std::move(ion_owner));
+  pool.addParticleSet(std::move(electron_owner));
+  Libxml2Document definition;
+  REQUIRE(definition.parseFromString(R"(
+    <wavefunction name="psi0" target="e">
+      <sposet_collection type="MolecularOrbital" source="ion0">
+        <basisset keyword="STO" transform="no">
+          <atomicBasisSet type="STO" elementType="He" normalized="no">
+            <basisGroup rid="R0" l="0" m="0" type="Slater"><radfunc n="1" exponent="2.0"/></basisGroup>
+            <basisGroup rid="R1" l="0" m="0" type="Slater"><radfunc n="2" exponent="1.0"/></basisGroup>
+            <basisGroup rid="R2" l="0" m="0" type="Slater"><radfunc n="3" exponent="0.7"/></basisGroup>
+          </atomicBasisSet>
+        </basisset>
+        <rotated_sposet name="rot_up"><sposet name="base_up" size="3">
+          <coefficient size="3" id="up_identity">1 0 0 0 1 0 0 0 1</coefficient>
+        </sposet></rotated_sposet>
+        <rotated_sposet name="rot_dn"><sposet name="base_dn" size="3">
+          <coefficient size="3" id="dn_identity">1 0 0 0 1 0 0 0 1</coefficient>
+        </sposet></rotated_sposet>
+      </sposet_collection>
+      <determinantset>
+        <multideterminant optimize="yes" spo_0="rot_up" spo_1="rot_dn" algorithm="precomputed_table_method">
+          <detlist size="2" type="DETS" nc0="0" ne0="1" nc1="0" ne1="1" nstates="3" cutoff="1e-20">
+            <ci id="CI0" coeff="1" occ0="100" occ1="100"/>
+            <ci id="CI1" coeff="0.1" occ0="010" occ1="010"/>
+          </detlist>
+        </multideterminant>
+      </determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow>
+    </wavefunction>)"));
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+  REQUIRE(source);
+  source->storeXMLNode(definition.getRoot());
+  particles.update();
+  source->evaluateLog(particles);
+  auto& md = source->findMSD().front().get();
+  const auto owner = [](TrialWaveFunction& wf, int spin) -> RotatedSPOs& {
+    return dynamic_cast<RotatedSPOs&>(*wf.findMSD().front().get().getDet(spin).getPhi());
+  };
+  const auto bank = [&](TrialWaveFunction& wf, int spin) -> LCAOrbitalSet& {
+    return dynamic_cast<LCAOrbitalSet&>(*owner(wf, spin).Phi_);
+  };
+  CHECK(&owner(*source, 0) != &owner(*source, 1));
+  CHECK(bank(*source, 0).C != bank(*source, 1).C);
+  CHECK_THROWS(md.validatePreparedCoefficientState(md));
+  TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian hamiltonian;
+  hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  binding.setHamiltonian(hamiltonian);
+  const auto snapshot = binding.snapshotParameters();
+  REQUIRE(snapshot.values.size() == 11);
+  const auto source_log = source->getLogPsi();
+  const auto source_kinetic = kineticEnergy(particles);
+  const auto source_ci = md.get_C();
+  const auto* fixed_map = &md.get_C2node();
+  ParticleSet private_particles(particles), sibling_particles(particles);
+  auto evaluator = binding.makePrivateClone(private_particles);
+  auto sibling = source->makeClone(sibling_particles);
+  private_particles.update();
+  sibling_particles.update();
+  sibling->evaluateLog(sibling_particles);
+  const auto sibling_log = sibling->getLogPsi();
+  CHECK(bank(*evaluator, 0).C != bank(*source, 0).C);
+  CHECK(bank(*evaluator, 1).C != bank(*source, 1).C);
+  binding.attachLive(*sibling, sibling_particles);
+  auto& adapter = binding.adapter();
+  auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*evaluator},
+                                            RefVector<ParticleSet>{private_particles}, 0, 0);
+  const std::vector<DerivativeValue> coefficient{{0.7, -0.2}};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, coefficient), 0},
+      {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, coefficient),
+       localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  RecordingParameterSink transpose, hermitian;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, transpose);
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+  std::vector<DerivativeValue> direction(11);
+  for (std::size_t p = 0; p < direction.size(); ++p)
+    direction[p] = 0.03 * (static_cast<int>(p % 5) - 2);
+  StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot.version,
+                                           {direction.data(), direction.size()});
+  RecordingSampleSink score_jvp, energy_jvp;
+  op->applyScoreJVP(vector, score_jvp);
+  op->applyLocalEnergyJVP(vector, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy_jvp);
+  for (std::size_t channel = 0; channel < channels.size(); ++channel)
+  {
+    DerivativeValue contracted{};
+    for (std::size_t p = 0; p < direction.size(); ++p)
+      contracted += transpose.result()[channel][p] * direction[p];
+    checkClose(contracted, coefficient[0] * (channel == 0 ? score_jvp.result()[0] : energy_jvp.result()[0]));
+  }
+  const auto probe = [&](const StructuredParameterSnapshot& point) {
+    ParticleSet probe_particles(particles);
+    auto probe_wf = binding.makePrivateClone(probe_particles);
+    probe_particles.update();
+    adapter.installSnapshot(*probe_wf, probe_particles, point);
+    return std::array<DerivativeValue, 2>{DerivativeValue{probe_wf->getLogPsi()}, kineticEnergy(probe_particles)};
+  };
+  for (std::size_t p = 0; p < snapshot.values.size(); ++p)
+  {
+    CAPTURE(p);
+    constexpr double epsilon = 1e-5;
+    auto plus = snapshot, minus = snapshot;
+    plus.values[p] += epsilon;
+    minus.values[p] -= epsilon;
+    const auto positive = probe(plus), negative = probe(minus);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto fd = (positive[channel] - negative[channel]) / (2 * epsilon);
+      const auto actual = transpose.result()[channel][p] / coefficient[0];
+      CHECK(actual.real() == Catch::Approx(fd.real()).epsilon(2e-6).margin(2e-8));
+      CHECK(actual.imag() == Catch::Approx(fd.imag()).margin(2e-8));
+      checkClose(hermitian.result()[channel][p], std::conj(actual) * coefficient[0]);
+    }
+  }
+  source->evaluateLog(particles);
+  sibling->evaluateLog(sibling_particles);
+  CHECK(source->getLogPsi() == source_log);
+  CHECK(sibling->getLogPsi() == sibling_log);
+  CHECK(kineticEnergy(particles) == source_kinetic);
+  CHECK(md.get_C() == source_ci);
+  CHECK(&md.get_C2node() == fixed_map);
+  CHECK(binding.snapshotParameters().values == snapshot.values);
+
+  // The legacy MD derivative implementation requires both spin owners to be
+  // optimizable. Reject a one-active-spin model before any attempted update.
+  Libxml2Document incomplete;
+  incomplete.newDoc("test");
+  auto* incomplete_node = xmlDocCopyNode(definition.getRoot(), incomplete.getDocument(), 1);
+  REQUIRE(incomplete_node);
+  incomplete.addChild(incomplete_node);
+  auto* collection = xmlFirstElementChild(incomplete_node);
+  auto* down_wrapper = xmlLastElementChild(collection);
+  REQUIRE(std::string(reinterpret_cast<const char*>(down_wrapper->name)) == "rotated_sposet");
+  auto* down_spo = xmlFirstElementChild(down_wrapper);
+  xmlUnlinkNode(down_spo);
+  xmlSetProp(down_spo, BAD_CAST "name", BAD_CAST "rot_dn");
+  xmlReplaceNode(down_wrapper, down_spo);
+  xmlFreeNode(down_wrapper);
+  WaveFunctionFactory incomplete_factory(particles, pool.getPool(), OHMMS::Controller);
+  auto incomplete_wf = incomplete_factory.buildTWF(incomplete_node, RuntimeOptions{});
+  REQUIRE(incomplete_wf);
+  CHECK_THROWS_WITH(TrainingWaveFunctionBinding(*incomplete_wf, particles, adapterOptions(), *OHMMS::Controller),
+                    Catch::Matchers::ContainsSubstring("two distinct active MD spin owners"));
+  CHECK(binding.snapshotParameters().values == snapshot.values);
+}
+
 TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejection",
           "[drivers][training][legacy_adapter][jastrow][private_banks]")
 {

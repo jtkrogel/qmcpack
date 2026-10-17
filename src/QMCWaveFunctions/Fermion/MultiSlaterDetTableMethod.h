@@ -107,6 +107,7 @@ public:
   void buildOptVariables();
 
   inline const MultiDiracDeterminant& getDet(int i) const { return *Dets[i]; }
+  inline MultiDiracDeterminant& getDet(int i) { return *Dets[i]; }
   // number of MultiDiracDet sets in this MultiSlaterDet
   inline int getDetSize() const { return Dets.size(); };
   inline int getNumSlaterDets() const { return C->size(); };
@@ -236,6 +237,8 @@ public:
 
   /// Fallible preflight for a private coefficient bank with identical fixed structure/gauge.
   void validatePreparedCoefficientState(const MultiSlaterDetTableMethod& prepared) const;
+  /// Separate opt-in contract: both spin determinants own distinct CPU LCAO rotations.
+  void validatePreparedRotatedCoefficientState(const MultiSlaterDetTableMethod& prepared) const;
 
   /** Activate a previously validated coefficient bank without allocation/reset.
    * The caller must serialize activation and refresh configuration-dependent
@@ -271,6 +274,7 @@ public:
                   bool CI_optimizable);
 
 private:
+  void validatePreparedCoefficientLayout(const MultiSlaterDetTableMethod& prepared) const;
   //get Det ID. It should be consistent with particle group id within the particle set.
   inline int getDetID(const int iat) const
   {

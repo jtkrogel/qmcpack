@@ -15,6 +15,7 @@
 
 #include "MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Fermion/MultiDiracDeterminant.h"
+#include "QMCWaveFunctions/RotatedSPOs.h"
 #include "CPU/VectorOps.h"
 #include "Platforms/OMPTarget/ompReductionComplex.hpp"
 #include <cstdint>
@@ -123,6 +124,38 @@ void MultiSlaterDetTableMethod::validatePreparedCoefficientState(const MultiSlat
   for (const auto& determinant : prepared.Dets)
     if (determinant->isOptimizable())
       throw std::invalid_argument("Prepared coefficient-only multideterminant bank requires fixed orbitals");
+  validatePreparedCoefficientLayout(prepared);
+}
+
+void MultiSlaterDetTableMethod::validatePreparedRotatedCoefficientState(
+    const MultiSlaterDetTableMethod& prepared) const
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("Multideterminant orbital activation currently requires a real CPU build");
+#endif
+  if (Dets.size() != 2 || prepared.Dets.size() != 2)
+    throw std::invalid_argument("Multideterminant orbital activation requires two distinct active spin owners");
+  const RotatedSPOs* previous = nullptr;
+  const RotatedSPOs* previous_prepared = nullptr;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto* rotation = dynamic_cast<const RotatedSPOs*>(Dets[spin]->getPhi());
+    const auto* replacement = dynamic_cast<const RotatedSPOs*>(prepared.Dets[spin]->getPhi());
+    if (!rotation || !replacement ||
+        (previous && (previous == rotation || previous->SPOSet::getName() == rotation->SPOSet::getName())) ||
+        (previous_prepared && (previous_prepared == replacement ||
+                              previous_prepared->SPOSet::getName() == replacement->SPOSet::getName())))
+      throw std::invalid_argument("Multideterminant orbital activation requires two distinct active spin owners");
+    rotation->validatePreparedRotationState(*replacement);
+    previous = rotation;
+    previous_prepared = replacement;
+  }
+  validatePreparedCoefficientLayout(prepared);
+}
+
+void MultiSlaterDetTableMethod::validatePreparedCoefficientLayout(
+    const MultiSlaterDetTableMethod& prepared) const
+{
   if (CI_Optimizable != prepared.CI_Optimizable || C2node != prepared.C2node ||
       !C || !prepared.C || C->empty() || C->size() != prepared.C->size() ||
       !myVars || !prepared.myVars || myVars->size() != prepared.myVars->size() ||

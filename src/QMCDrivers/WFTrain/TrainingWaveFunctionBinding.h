@@ -31,7 +31,7 @@ struct ConventionalOrbitalFrame
   std::vector<Orbitals> orbitals;
 };
 /** Driver-owned CPU binding for SJ/MDJ with J1/J2/J3 and CI coordinates.
- * Single-Slater CPU LCAO rotations use complete accepted coefficient/rotation
+ * Single-Slater or distinct-per-spin MD CPU LCAO rotations use accepted coefficient/rotation
  * frames; their active coordinates alone are not a physical model checkpoint.
  * The periodic slice is restricted to real Gamma HEG14 FreeOrbital/J2 with
  * actual CPU 3D Ewald identity; other periodic and external-asset models fail.
