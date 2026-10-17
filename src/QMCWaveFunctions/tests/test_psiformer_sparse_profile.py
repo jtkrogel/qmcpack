@@ -49,6 +49,26 @@ class SparseProfileContracts(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 profile.validate_manifest(manifest)
 
+    def test_native_pilot_is_w1_only(self):
+        self.manifest["cases"][0].update(request="native_vmc", walkers=1)
+        profile.validate_manifest(self.manifest)
+        self.manifest["cases"][0]["walkers"] = 2
+        with self.assertRaises(AssertionError):
+            profile.validate_manifest(self.manifest)
+
+    def test_native_scalar_and_owner_contract(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "console.log").write_text("CPU target VGL: maxK=1,\nCPU target VGL crowd: live_clones=1,\n")
+            scalar = root / "pilot.s000.scalar.dat"
+            header = "# index LocalEnergy LocalEnergy_sq BlockWeight AcceptRatio\n"
+            scalar.write_text(header + "0 -2 4 1 1\n")
+            self.assertEqual(profile.validate_native_vmc(root)["LocalEnergy"], -2)
+            for bad in ("0 nan 4 1 1\n", "0 -2 4 2 1\n", "0 -2 4 1 0\n"):
+                scalar.write_text(header + bad)
+                with self.assertRaises(AssertionError):
+                    profile.validate_native_vmc(root)
+
     def test_all_results_compared_and_nonfinite_rejected(self):
         with tempfile.TemporaryDirectory() as name:
             first, second = Path(name) / "first.json", Path(name) / "second.json"

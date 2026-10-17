@@ -120,11 +120,30 @@ def validate_manifest(manifest):
     assert len(identifiers) == len(set(identifiers)) <= 10
     assert all(identifier and all(c.isalnum() or c in "_-" for c in identifier) for identifier in identifiers)
     for case in manifest["cases"]:
-        assert case["request"] in ("value", "complete_vgl", "native_actual_ecp_adam")
+        assert case["request"] in ("value", "complete_vgl", "native_actual_ecp_adam", "native_vmc")
         assert 1 <= case["walkers"] <= 4
         assert case.get("ranks", 1) == (2 if case["request"] == "native_actual_ecp_adam" else 1)
         assert case.get("configuration_tile", 1) in (1, 2)
         assert case.get("target_tile", "FULL") in ("FULL", 1)
+        if case["request"] == "native_vmc":
+            assert case["walkers"] == 1, "native K1 pilot is W1 only"
+
+
+def validate_native_vmc(directory):
+    """Validate this one-block physical W1 pilot, not an optimizer CSV."""
+    log = (directory / "console.log").read_text()
+    assert "CPU target VGL: maxK=1," in log and "CPU target VGL crowd: live_clones=1," in log
+    scalar, = directory.glob("*.scalar.dat")
+    lines = scalar.read_text().splitlines()
+    header = next(line.split()[1:] for line in lines if line.startswith("#") and "LocalEnergy" in line)
+    data = [line.split() for line in lines if line.strip() and not line.startswith("#")]
+    assert len(data) == 1 and len(data[0]) == len(header), "require one complete native scalar block"
+    values = dict(zip(header, map(float, data[0])))
+    assert all(math.isfinite(value) for value in values.values()), "nonfinite native VMC scalar"
+    assert values["BlockWeight"] == 1 and 0 < values["AcceptRatio"] <= 1, "native population/moves mismatch"
+    assert math.isfinite(values["LocalEnergy_sq"] - values["LocalEnergy"]**2)
+    assert not list(directory.glob("*.training*")), "VMC pilot must not train"
+    return values
 
 
 def compare_values(first, second):
@@ -151,7 +170,7 @@ def execute(manifest, manifest_path, identifier):
     allocation = str(manifest["allocation_id"])
     assert allocation.isdigit() and manifest["allocation_verified_utc"] and manifest["node"]
     case = next(case for case in manifest["cases"] if case["id"] == identifier)
-    native = case["request"] == "native_actual_ecp_adam"
+    native = case["request"] in ("native_actual_ecp_adam", "native_vmc")
     executable = Path(manifest["application_executable"] if native else manifest["benchmark_executable"])
     source = manifest["application_source" if native else "benchmark_source"]
     assert len(source) == 40 and all(c in "0123456789abcdef" for c in source)
@@ -189,9 +208,16 @@ def execute(manifest, manifest_path, identifier):
                    "--open-coulomb", "1" if model.get("generated") else "0",
                    "--owner-budget", str(10 * 1024**3)]
     plan = dict(command=command, caps=manifest["caps"], case=case, source=source)
-    save(directory / "rank_plan.json", plan)
     environment = dict(os.environ, OMP_NUM_THREADS="2", OMP_DYNAMIC="FALSE",
                        OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", BLIS_NUM_THREADS="1")
+    if case["request"] == "native_vmc":
+        controls = dict(PSIFORMER_CPU_VGL_TARGETS="1", PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE="16777216",
+                        **{f"PSIFORMER_{mode}_BACKEND": "direct" for mode in ("VALUE", "SPATIAL", "SCORE", "KINETIC")})
+        environment.update(controls)
+        for key in ("PSIFORMER_CPU_KINETIC_TARGETS", "PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE"):
+            environment.pop(key, None)
+        plan["native_environment"] = controls
+    save(directory / "rank_plan.json", plan)
     if manifest.get("runtime_library_path"):
         environment["LD_LIBRARY_PATH"] = manifest["runtime_library_path"] + ":" + environment.get("LD_LIBRARY_PATH", "")
     launch = ["srun", "--jobid=" + allocation, "--exclusive", "--exact", "--nodes=1",
@@ -226,7 +252,11 @@ def execute(manifest, manifest_path, identifier):
             lanes = (2 if case["request"] == "value" else
                      3 + 5 * values["electrons_per_configuration"] + int(bool(model.get("generated"))))
             assert len(values["values"]) == case["walkers"] * lanes, "incomplete output lanes"
-        if not code and native:
+        if not code and case["request"] == "native_vmc":
+            result["native_scalars"] = validate_native_vmc(directory)
+            for key in ("parameter", "configuration"):
+                assert sha256(model[key + "_path"]) == model[key + "_sha256"], "protected native input changed"
+        elif not code and native:
             csv_path, = directory.glob("*.training_info.csv")
             rows = list(csv.DictReader(csv_path.open()))
             assert len(rows) == 1 and rows[0]["committed"] == "1" and rows[0]["samples"] == "4", "native work mismatch"
