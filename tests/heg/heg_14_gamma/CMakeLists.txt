@@ -24,7 +24,7 @@ if(NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
                COMMAND ${Python3_EXECUTABLE}
                        "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
                        $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml"
-                       --complex-periodic-heg --ranks ${CONVENTIONAL_COMPLEX_HEG_RANKS}
+                       --complex-periodic-heg --model-import --ranks ${CONVENTIONAL_COMPLEX_HEG_RANKS}
                        ${CONVENTIONAL_COMPLEX_HEG_MPI_ARGS})
       set_tests_properties(short-heg14-gamma-complex-conventional-wftrain
                            PROPERTIES TIMEOUT 300 PROCESSORS ${CONVENTIONAL_COMPLEX_HEG_RANKS})
