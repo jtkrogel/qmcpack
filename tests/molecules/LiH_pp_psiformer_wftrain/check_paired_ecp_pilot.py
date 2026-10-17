@@ -11,6 +11,11 @@ p = argparse.ArgumentParser(description=__doc__)
 for name in ("binary", "input", "output"):
     p.add_argument("--" + name, type=Path, required=True)
 p.add_argument("--source-commit", required=True)
+p.add_argument(
+    "--import-model",
+    type=Path,
+    help="fresh version0 training values, not a sampler/Hamiltonian restart",
+)
 a = p.parse_args()
 
 
@@ -40,11 +45,29 @@ training = root.find("qmc/training")
 assert training.get("objective") == "energy" and training.get("optimizer") == "adam"
 assert training.find("parameter[@name='learning_rate']").text.strip() == "1e-10"
 protected = {str(a.input.resolve()): sha(a.input)}
+imported_values = None
+if a.import_model:
+    model = a.import_model.resolve(strict=True)
+    protected[str(model)] = sha(model)
+    with h5py.File(model) as archive:
+        assert text(archive["psiformer_model/system"][()]) == "pseudopotential"
+        assert (
+            int(
+                np.asarray(archive["psiformer_model/paired_complex"][()]).reshape(-1)[0]
+            )
+            == 1
+        )
+        imported_values = archive["values"][()]
+        assert np.isfinite(imported_values).all()
+    # Keep current PP/XML/MC controls: standalone values are fresh initialization only.
+    for key in ("initialization", "initialization_seed"):
+        del head.attrib[key]
+    head.set("parameters", str(model))
 for pseudo in root.findall("qmcsystem/hamiltonian/pairpot/pseudo"):
     path = (a.input.parent / pseudo.get("href")).resolve()
     protected[str(path)] = sha(path)
     pseudo.set("href", str(path))
-assert len(protected) == 3
+assert len(protected) == (4 if a.import_model else 3)
 
 
 def parameter(name, value):
@@ -166,6 +189,18 @@ try:
     assert np.any(delta != 0), "No trainable bit changed between accepted versions1and2"
     delta_norm = float(np.linalg.norm(delta))
     assert np.isfinite(delta).all() and math.isfinite(delta_norm)
+    if imported_values is not None:
+        assert values[0].shape == imported_values.shape
+        changed_from_import = int(np.count_nonzero(values[0] != imported_values))
+        assert changed_from_import > 0, (
+            "No trainable value changed on the first fresh imported-model update"
+        )
+        report.update(
+            imported_model_sha256=protected[str(model)],
+            fresh_initialization=True,
+            first_update_changed_values=changed_from_import,
+            scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
+        )
     assert all(sha(Path(path)) == digest for path, digest in protected.items())
     rss = re.search(
         r"Maximum resident set size \(kbytes\): (\d+)",
