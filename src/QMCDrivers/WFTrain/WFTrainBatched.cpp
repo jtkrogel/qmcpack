@@ -2941,6 +2941,11 @@ void WFTrainBatched::run()
               retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                   checkedMemoryMultiply(checkedMemoryAdd(schema.parameterCount(), factor.localSampleVectorSize()),
                                         sizeof(wftrain::DerivativeValue)));
+            // ALM's projected overlap check owns two FP64 subspace-norm arrays.
+            // Name their numeric reservation, not an allocator/vendor/RSS peak.
+            if (accelerated)
+              retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                  checkedMemoryMultiply(checkedMemoryMultiply(2, lm_control.maximum_subspace_dimension), sizeof(double)));
             enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
             wftrain::MatrixFreeLinearMethodResult result;
             if (accelerated)
