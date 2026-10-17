@@ -125,3 +125,14 @@ exported inference/full-split restart. Mixed CSF/J2 LM remains rejected.
 The component whitelist is still only fixed-orbital MSD plus TwoBodyJastrow,
 real CPU and all-electron. No mixed LM/ALM, orbital, ECP or conventional GPU
 qualification follows from this result.
+
+The candidate ``--mdj-alm`` mode reuses this exact DETS P9 fixture with
+the reviewed mixed fixed-reference normalization. It selects one ALM-only
+full import/re-export/inference/strict initialized-split workflow, two committed
+32-sample updates and explicit CI1/J2 changes while C0=.6 and the SPO stay fixed.
+The bounded controls are damping .01, Krylov 64 iterations/256 applications/
+15 seconds/relative tolerance 1e-6, augmented dimension 10 and ALM inner
+iterations 32/restart 10. Native qualification and registration are pending.
+Historical AE mixed-LM guard-rejection statements above describe their original
+sources; the new numerical policy is separately reviewed, while ECP/orbital
+mixed LM rejection remains in force. No old default or strict comparison changes.

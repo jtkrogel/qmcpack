@@ -270,9 +270,22 @@ def main():
                         help="two-DETS-per-CSF PII/minPII additive updates, inference and restart")
     parser.add_argument("--mdj-pii", action="store_true",
                         help="mixed DETS/J2 PII/minPII tangent updates, inference and restart")
+    parser.add_argument("--mdj-alm", action="store_true",
+                        help="one fixed-orbital H4 DETS/J2 AE ALM full model-import round trip")
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.mdj_alm:
+        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+                args.restart, args.preflight, args.model_import, args.old_new, args.family_screen,
+                args.family_method, args.profile_only, args.optimizer_screen, args.ci_pii, args.ci_lm,
+                args.csf_lm, args.csf_pii, args.mdj_pii, args.csf_j2_pii, args.periodic_heg,
+                args.complex_periodic_heg, args.md_orbital, args.external_lcao, args.external_orbital_ecp,
+                args.orbital_ecp, args.many_occupied_orbital_ecp, args.md_orbital_ecp,
+                args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_minpii,
+                args.unequal_spin_orbital_ecp, args.csf_orbital_ecp, args.orbital_jastrow)):
+            parser.error("--mdj-alm selects one single-rank fixed-orbital DETS/J2 AE workflow")
+        args.model_import = True
     if args.joint_ci_orbital_ecp_minpii:
         if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
                 args.csf_orbital_ecp)) or args.ci_representation != "dets":
@@ -344,6 +357,10 @@ def main():
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
     fixture_tree = ET.parse(fixture)
+    if args.mdj_alm:
+        assert fixture_tree.find(".//detlist").get("type") == "DETS"
+        assert not fixture_tree.findall(".//rotated_sposet") and not fixture_tree.findall(".//pseudo")
+        assert [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")] == ["0.6", "0"]
     external_ecp = args.external_lcao and bool(fixture_tree.findall("hamiltonian/pairpot/pseudo"))
     if external_ecp:
         assert [node.get("size") for node in fixture_tree.findall("particleset[@name='e']/group")] == ["1", "1"]
@@ -435,7 +452,9 @@ def main():
         directory = work / label
         directory.mkdir()
         if optimizer is None:
-            optimizer = "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+            optimizer = "alm" if args.mdj_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+        if args.mdj_alm:
+            samples_per_rank = 32
         if periodic_profile:
             samples_per_rank = 8
         tree = ET.parse(fixture)
@@ -564,6 +583,16 @@ def main():
         qmc = tree.find("qmc")
         training = qmc.find("training")
         training.set("optimizer", optimizer)
+        if args.mdj_alm:
+            # The P9 fixture uses its full ten-dimensional augmented subspace.
+            qmc.find("parameter[@name='walkers_per_rank']").text = "4"
+            qmc.find("parameter[@name='blocks']").text = "8"
+            limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
+                      "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
+                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "10",
+                      "lm_inner_iterations": "32", "lm_inner_restart_length": "10"}
+            for name, value in limits.items():
+                ET.SubElement(training, "parameter", name=name).text = value
         if args.joint_ci_orbital_ecp_minpii and optimizer == "minpii":
             # Reuse bounded family controls without changing the physical sampler.
             limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
@@ -642,6 +671,8 @@ def main():
             if args.joint_ci_orbital_ecp_minpii:
                 assert 0 < int(row["krylov_operator_applications"]) <= 256, row
                 assert 0 <= int(row["krylov_iterations"]) <= 64, row
+            if args.mdj_alm:
+                assert row["optimizer"] == "alm" and 0 < int(row["krylov_operator_applications"]) <= 256, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + int(row["committed"]), row
         assert (directory / "sj.s000.last_checkpoint.h5").is_file(), directory
         family = directory / "sj.s000.inference"
@@ -700,6 +731,10 @@ def main():
                         assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if args.mdj_alm:
+                        assert parameters.size == 9 and names[0] == "CI1", model
+                        assert parameters[0] != previous[0], (model, "CI1 did not update")
+                        assert not np.array_equal(parameters[1:], previous[1:]), (model, "J2 did not update")
                     if args.external_orbital_ecp:
                         names = [text_value(value) for value in group["variable_names"][()].reshape(-1)]
                         indices = group["active_indices"][()].reshape(-1)
@@ -939,15 +974,16 @@ def main():
         if linear_ci:
             def mixed_ci_j2(tree):
                 tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
-            run("reject_mixed_ci_j2_lm", optimizer="lm", mutate=mixed_ci_j2,
-                reject="mixed updates remain unqualified")
+            if md_ecp:
+                run("reject_mixed_ci_j2_lm", optimizer="lm", mutate=mixed_ci_j2,
+                    reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
             methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
             physics = "ordinary-locality ECP" if md_ecp else "all-electron"
             print(f"PASS: {representation} {physics} {methods}, fixed reference/SPO/J2/expansion, "
-                  "exact positive exported inference/restart; mixed CI/J2 rejected")
+                  "exact positive exported inference/restart; AE mixed CI/J2 has separate qualification")
         elif args.ci_pii or args.csf_pii:
-            if args.csf_pii:
+            if args.csf_pii and md_ecp:
                 def mixed_csf_j2(tree):
                     tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
                 run("reject_mixed_csf_j2_lm", optimizer="lm", mutate=mixed_csf_j2,
@@ -955,16 +991,16 @@ def main():
             representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
         elif mixed_ci:
-            run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
             if md_ecp:
+                run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
                 run("reject_mixed_ci_ecp_alm", optimizer="alm", reject="mixed updates remain unqualified")
-            if args.mdj_pii:
+            if args.mdj_pii and md_ecp:
                 run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
                     reject="mixed updates remain unqualified")
             representation = "nontrivial CSF/J2" if args.csf_j2_pii else "DETS/J2"
             physics = "ordinary-locality ECP" if md_ecp else "all-electron"
             print(f"PASS: mixed {representation} {physics} PII/minPII updates, fixed reference/SPO/expansion, "
-                  "exact exported inference/restart; mixed LM rejected")
+                  "exact exported inference/restart; ECP mixed LM remains rejected")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
@@ -989,7 +1025,7 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+    adam = run("alm" if args.mdj_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
                samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
@@ -1080,7 +1116,7 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
-        if args.md_orbital:
+        if args.md_orbital or args.mdj_alm:
             original_row, resumed_row = history(trained)[-1], history(resumed)[0]
             diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
             assert original_row.keys() == resumed_row.keys()
@@ -1215,6 +1251,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.mdj_alm:
+            print("PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed 32-sample updates, "
+                  "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
         elif args.csf_orbital_ecp:
             print("PASS: real CPU signed-child CSF/orbital/J2 ECP Adam P17, frozen outer CSF0=.6/expanded C0=.48, "
                   "immutable child gauge, both frames, physical VMC reuse and strict exact initialized restart")
