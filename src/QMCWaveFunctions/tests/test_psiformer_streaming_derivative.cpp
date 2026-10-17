@@ -1530,31 +1530,43 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   const auto after_real_jvp = metrics.snapshot();
   CHECK(after_real_jvp.allocation_calls == before_real_jvp.allocation_calls);
   CHECK(after_real_jvp.live_bytes == before_real_jvp.live_bytes);
-  std::vector<DerivativeValue> complex_direction(direction);
+  std::vector<DerivativeValue> alternate_direction(direction);
   for (std::size_t i = 0; i < p; ++i)
-    complex_direction[i].imag(.003 * (int(i % 5) - 2));
-  const wftrain::StructuredParameterVectorConstView complex_vector(cpu.parameterSchema(),
-      cpu.snapshotParameters().version, {complex_direction.data(), complex_direction.size()});
-  RecordingSampleSink cpu_complex, gpu_complex;
-  reference->applyLocalEnergyJVP(complex_vector, ecp, cpu_complex);
-  const auto before_complex_jvp = metrics.snapshot();
-  first->applyLocalEnergyJVP(complex_vector, ecp, gpu_complex);
-  const auto after_complex_jvp = metrics.snapshot();
-  checkClose(gpu_complex.results()[0], cpu_complex.results()[0]);
-  CHECK(after_complex_jvp.uploaded_bytes - before_complex_jvp.uploaded_bytes ==
-        2 * (after_real_jvp.uploaded_bytes - before_real_jvp.uploaded_bytes));
-  CHECK(after_complex_jvp.allocation_calls == before_complex_jvp.allocation_calls);
-  CHECK(after_complex_jvp.live_bytes == before_complex_jvp.live_bytes);
+    alternate_direction[i] = {.003 * (int(i % 5) - 2), 0};
+  const wftrain::StructuredParameterVectorConstView alternate_vector(cpu.parameterSchema(),
+      cpu.snapshotParameters().version, {alternate_direction.data(), alternate_direction.size()});
+  RecordingSampleSink cpu_alternate, gpu_alternate;
+  reference->applyLocalEnergyJVP(alternate_vector, ecp, cpu_alternate);
+  const auto before_alternate_jvp = metrics.snapshot();
+  first->applyLocalEnergyJVP(alternate_vector, ecp, gpu_alternate);
+  const auto after_alternate_jvp = metrics.snapshot();
+  checkClose(gpu_alternate.results()[0], cpu_alternate.results()[0]);
+  CHECK(after_alternate_jvp.uploaded_bytes - before_alternate_jvp.uploaded_bytes ==
+        after_real_jvp.uploaded_bytes - before_real_jvp.uploaded_bytes);
+  CHECK(after_alternate_jvp.allocation_calls == before_alternate_jvp.allocation_calls);
+  CHECK(after_alternate_jvp.live_bytes == before_alternate_jvp.live_bytes);
+  // REAL64 public tangents reject imaginary values before any numerical work.
+  auto invalid_direction = direction;
+  invalid_direction[0].imag(.1);
+  RecordingSampleSink rejected_direction;
+  CHECK_THROWS_WITH(([&]() {
+    const wftrain::StructuredParameterVectorConstView invalid(cpu.parameterSchema(),
+        cpu.snapshotParameters().version, {invalid_direction.data(), invalid_direction.size()});
+    first->applyLocalEnergyJVP(invalid, ecp, rejected_direction);
+  }()), Catch::Matchers::ContainsSubstring("JVP direction for real parameters has a nonzero imaginary part"));
+  CHECK(rejected_direction.state() == DerivativeSinkState::IDLE);
+  CHECK(metrics.snapshot().uploaded_bytes == after_alternate_jvp.uploaded_bytes);
+  CHECK(metrics.snapshot().downloaded_bytes == after_alternate_jvp.downloaded_bytes);
   CHECK(first->storageDiagnostics().storage_fingerprint == jvp_storage.storage_fingerprint);
   CHECK(first->storageDiagnostics().retained_numeric_bytes == jvp_storage.retained_numeric_bytes);
   RecordingSampleSink failed_jvp;
   failed_jvp.armConsumeFailure();
-  CHECK_THROWS(first->applyLocalEnergyJVP(complex_vector, ecp, failed_jvp));
+  CHECK_THROWS(first->applyLocalEnergyJVP(alternate_vector, ecp, failed_jvp));
   CHECK(failed_jvp.state() == DerivativeSinkState::POISONED);
   CHECK_THROWS(failed_jvp.results());
   RecordingSampleSink retried_jvp;
-  first->applyLocalEnergyJVP(complex_vector, ecp, retried_jvp);
-  checkClose(retried_jvp.results()[0], cpu_complex.results()[0]);
+  first->applyLocalEnergyJVP(alternate_vector, ecp, retried_jvp);
+  checkClose(retried_jvp.results()[0], cpu_alternate.results()[0]);
   SelectedParameterSink dual(selected);
   auto dual_channels = channelsFor(*first);
   const auto before_scalar_c1 = metrics.snapshot();
@@ -1563,9 +1575,9 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   DerivativeValue dot{};
   for (std::size_t i = 0; i < p; ++i) dot += direction[i] * dual.results()[0][i];
   checkClose(dot, coefficients[0][0] * gpu_jvp.results()[0]);
-  DerivativeValue complex_dot{};
-  for (std::size_t i = 0; i < p; ++i) complex_dot += complex_direction[i] * dual.results()[0][i];
-  checkClose(complex_dot, coefficients[0][0] * gpu_complex.results()[0]);
+  DerivativeValue alternate_dot{};
+  for (std::size_t i = 0; i < p; ++i) alternate_dot += alternate_direction[i] * dual.results()[0][i];
+  checkClose(alternate_dot, coefficients[0][0] * gpu_alternate.results()[0]);
   // Exact-real C1 reuses the existing B4 score owner for Q9 => 4+4+tail1.
   const std::vector<DerivativeValue> real_coefficient{{.7, 0}};
   auto real_channels = [&](const StreamingDerivativeOperator& op) {
@@ -1615,8 +1627,8 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   auto scalar = capture(scalar_gpu, 94, 5, true);
   CHECK(scalar->capabilities().maximum_sample_tile_size == 1);
   RecordingSampleSink scalar_jvp;
-  scalar->applyLocalEnergyJVP(complex_vector, ecp, scalar_jvp);
-  checkClose(scalar_jvp.results()[0], cpu_complex.results()[0]);
+  scalar->applyLocalEnergyJVP(alternate_vector, ecp, scalar_jvp);
+  checkClose(scalar_jvp.results()[0], cpu_alternate.results()[0]);
   auto scalar_channels = real_channels(*scalar);
   SelectedParameterSink scalar_result(selected);
   scalar->applyVJPs({scalar_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, scalar_result);
@@ -1671,11 +1683,11 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   CHECK_THROWS(([&]() {
     auto node = capture(gpu, 95, 5, true, false, true);
     RecordingSampleSink rejected;
-    node->applyLocalEnergyJVP(complex_vector, ecp, rejected);
+    node->applyLocalEnergyJVP(alternate_vector, ecp, rejected);
   }()));
   RecordingSampleSink after_node_failure;
-  first->applyLocalEnergyJVP(complex_vector, ecp, after_node_failure);
-  checkClose(after_node_failure.results()[0], cpu_complex.results()[0]);
+  first->applyLocalEnergyJVP(alternate_vector, ecp, after_node_failure);
+  checkClose(after_node_failure.results()[0], cpu_alternate.results()[0]);
 }
 #endif
 
