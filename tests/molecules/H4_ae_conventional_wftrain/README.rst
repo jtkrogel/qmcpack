@@ -77,3 +77,18 @@ row, HDF checkpoint/model output or publication. This correct refusal is not an
 ALM convergence positive; seeds, controls and tolerances are not tuned to force
 a real root. Mixed active CI/J2 remains rejected. This is a real CPU,
 all-electron fixed-orbital profile, not ECP, orbital or GPU qualification.
+
+Pure-CSF PII/minPII regression
+-----------------------------
+
+``--csf-pii`` uses the same nontrivial two-DETs-per-CSF model with frozen J2.
+The actual CSF reference is preserved; both existing methods apply additive
+coefficient updates rather than LM's Ritz-vector retraction. The physical
+oracle compares both methods to the dense centered scalar system and checks
+actual private wavefunction ratios and every fixed expansion term.
+
+The native regression passed on source ``f2544a843``: both methods commit two
+32-sample updates, preserve CSF0/expansion/SPO/J2, and pass exact exported-model
+inference and full/split model/state/sampler/scientific history. Mixed CSF/J2
+is explicitly rejected by this profile. There is no mixed-coordinate, orbital,
+ECP, conventional GPU or convergence-quality claim.
