@@ -24,9 +24,13 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
       add_test(NAME short-H4-ae-conventional-wftrain-csf-pii
                COMMAND ${Python3_EXECUTABLE} "${MDJ_CHECKER}" $<TARGET_FILE:qmcpack>
                        "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_mdj.xml" --csf-pii)
+      add_test(NAME short-H4-ae-conventional-wftrain-mdj-pii
+               COMMAND ${Python3_EXECUTABLE} "${MDJ_CHECKER}" $<TARGET_FILE:qmcpack>
+                       "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_mdj.xml" --mdj-pii)
       set_tests_properties(short-H4-ae-conventional-wftrain-ci-pii short-H4-ae-conventional-wftrain-ci-lm
                            short-H4-ae-conventional-wftrain-csf-lm
                            short-H4-ae-conventional-wftrain-csf-pii
+                           short-H4-ae-conventional-wftrain-mdj-pii
                            PROPERTIES TIMEOUT 300 PROCESSORS 1)
     endif()
   endif()

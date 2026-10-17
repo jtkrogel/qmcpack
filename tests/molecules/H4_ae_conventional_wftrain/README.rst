@@ -93,3 +93,19 @@ guard ``f2544a843``): both methods commit two
 inference and full/split model/state/sampler/scientific history. Mixed CSF/J2
 is explicitly rejected by this profile. There is no mixed-coordinate, orbital,
 ECP, conventional GPU or convergence-quality claim.
+
+Mixed DETS/J2 PII/minPII regression
+---------------------------------
+
+``--mdj-pii`` retains all nine active coordinates: CI1 and the eight J2 values.
+Both existing methods use the local additive tangent update, not an LM
+Ritz-vector normalization. A separate physical oracle compares both solves to
+an explicit dense 9x9 system with unequal sample weights and checks joint
+log-wavefunction/kinetic directional derivatives and quadratic convergence.
+
+Native full source ``afe1d724d6ab704994157d8a729fd8d6bf5f650a`` passed two
+committed 32-sample updates per method, fixed C0/SPO, exact exported inference
+and full/split model/state/sampler/scientific history. Mixed LM and CSF/J2
+are explicitly rejected. Only real CPU all-electron fixed-orbital DETS plus
+TwoBodyJastrow is qualified here; J1/J3, orbital and ECP extensions are not
+implied. No convergence-quality or timing claim is made.
