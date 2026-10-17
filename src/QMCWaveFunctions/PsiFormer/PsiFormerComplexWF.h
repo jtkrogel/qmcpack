@@ -287,6 +287,11 @@ public:
   /// ECP/virtual ratios require a separately qualified complex path.
   void evaluateRatios(const VirtualParticleSet&, std::vector<ValueType>&) override;
 
+  /// Capture ragged paired VALUE with exact shared-family/version provenance.
+  EvaluationStamp mw_evaluateVirtualRatios(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const RefVectorWithLeader<VirtualParticleSet>&,
+      const VirtualParticleBatch&, std::vector<ValueType>&) const override;
+
   /// Derivative ratios are not implied by internal complex score availability.
   void evaluateDerivRatios(const VirtualParticleSet&, const OptVariables&,
                           std::vector<ValueType>&, Matrix<ValueType>&) override;

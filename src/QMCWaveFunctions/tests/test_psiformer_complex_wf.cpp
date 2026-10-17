@@ -29,6 +29,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCHamiltonians/HamiltonianFactory.h"
 #include "Particle/VirtualParticleSet.h"
+#include "Particle/VirtualParticleBatch.h"
 #include "Utilities/ResourceCollection.h"
 #include "psiformer_test_utils.h"
 #ifdef ENABLE_CUDA
@@ -3806,6 +3807,49 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
   CHECK(component.numericStorage().fingerprint == storage.fingerprint);
   CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
   close(evaluate(sibling, sibling_p), accepted_log);
+  VirtualParticleSet scratch0(p), scratch1(sibling_p);
+  RefVectorWithLeader<WaveFunctionComponent> capture_components(component, {component, sibling});
+  RefVectorWithLeader<ParticleSet> capture_particles(p, {p, sibling_p});
+  RefVectorWithLeader<VirtualParticleSet> capture_scratch(scratch0, {scratch0, scratch1});
+  const std::vector<std::size_t> offsets{0, 3, 4};
+  const std::vector<VirtualParticleBatch::Segment> segments{{0, 0}, {1, 2}};
+  std::vector<ParticleSet::PosType> points{p.R[0], p.R[0], p.R[0], sibling_p.R[2]};
+  points[1][0] += .023; points[3][2] -= .019;
+  const VirtualParticleBatch batch(2, offsets, segments, points);
+  std::vector<C> captured(4, C{71, -9});
+  const auto capture = [&] {
+    return component.mw_evaluateVirtualRatios(capture_components, capture_particles, capture_scratch, batch, captured);
+  };
+  const auto stamp = capture();
+  REQUIRE(stamp.isVersioned());
+  const auto expected_capture = captured;
+  CHECK(capture() == stamp);
+  CHECK(captured == expected_capture);
+  close(captured[0], C{1, 0}); close(captured[2], C{1, 0});
+  for (std::size_t segment = 0; segment < 2; ++segment)
+  {
+    const auto slice = batch.slice(segment);
+    auto& scratch = capture_scratch[segment];
+    scratch.makeMovesAbsolute(capture_particles[segment], slice.electronId(), slice.positions());
+    std::vector<C> scalar(slice.size());
+    capture_components[segment].evaluateRatios(scratch, scalar);
+    for (std::size_t q = 0; q < slice.size(); ++q) close(captured[slice.flatOffset() + q], scalar[q]);
+  }
+  RefVectorWithLeader<VirtualParticleSet> aliases(scratch0, {scratch0, scratch0});
+  CHECK_THROWS(component.mw_evaluateVirtualRatios(capture_components, capture_particles, aliases, batch, captured));
+  CHECK(captured == expected_capture);
+  PsiFormerComplexWF foreign_capture("foreign", initialized, sibling_p, source, clone_cap, twist);
+  evaluate(foreign_capture, sibling_p);
+  RefVectorWithLeader<WaveFunctionComponent> foreign_components(component, {component, foreign_capture});
+  CHECK_THROWS(component.mw_evaluateVirtualRatios(foreign_components, capture_particles, capture_scratch, batch, captured));
+  CHECK(captured == expected_capture);
+  p.makeMove(0, ParticleSet::PosType{.01, 0, 0}); component.ratio(p, 0);
+  CHECK_THROWS(capture()); CHECK(captured == expected_capture);
+  component.restore(0); p.rejectMove(0);
+  points.back()[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(capture()); CHECK(captured == expected_capture);
+  points.back()[0] = sibling_p.R[2][0];
+  CHECK(capture() == stamp);
   VirtualParticleSet vp(p);
   vp.makeMoves(p, 0, {ParticleSet::PosType{.02, 0, 0}});
   std::vector<C> sentinel(1, C{71, -9});
@@ -3814,6 +3858,8 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
   CHECK(sentinel == std::vector<C>(1, C{71, -9}));
   evaluate(component, p);
   component.evaluateRatios(vp, sentinel);
+  evaluate(sibling, sibling_p);
+  CHECK(capture() != stamp);
   // A zero BASE is undefined; no determinant inverse or undefined score is needed to reject it.
   auto zero = initialized;
   for (const auto& leaf : zero.layouts)
@@ -3860,6 +3906,17 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
       close(gpu_ratios[q], cpu_ratios[q]);
     CHECK(gpu.get_log_value() == gpu_log);
     CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    const std::vector<std::size_t> gpu_offsets{0, positions.size()};
+    const std::vector<VirtualParticleBatch::Segment> gpu_segments{{0, 0}};
+    const VirtualParticleBatch gpu_batch(1, gpu_offsets, gpu_segments, positions);
+    RefVectorWithLeader<WaveFunctionComponent> gpu_components(gpu, {gpu});
+    RefVectorWithLeader<ParticleSet> gpu_particles(gpu_p, {gpu_p});
+    RefVectorWithLeader<VirtualParticleSet> gpu_scratch(gpu_vp, {gpu_vp});
+    const auto gpu_stamp = gpu.mw_evaluateVirtualRatios(gpu_components, gpu_particles, gpu_scratch, gpu_batch, gpu_ratios);
+    CHECK(gpu_stamp.isVersioned());
+    for (std::size_t q = 0; q < gpu_ratios.size(); ++q) close(gpu_ratios[q], cpu_ratios[q]);
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    std::printf("COMPLEX_VIRTUAL_CAPTURE GPU PASS versioned=1 Q=3 warm_allocations=0\n");
     std::printf("COMPLEX_VIRTUAL_VALUE GPU PASS Q=3 warm_allocations=0\n");
   }
   else

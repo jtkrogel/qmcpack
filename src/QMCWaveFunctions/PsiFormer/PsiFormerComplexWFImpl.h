@@ -2996,6 +2996,63 @@ void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet& virtuals, std:
   std::copy(staged.begin(), staged.end(), ratios.begin());
 }
 
+/// Reuse the scalar numerical path without recursive Model locks, publishing only one exact version.
+WaveFunctionComponent::EvaluationStamp PsiFormerComplexWF::mw_evaluateVirtualRatios(
+    const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& particles,
+    const RefVectorWithLeader<VirtualParticleSet>& scratch,
+    const VirtualParticleBatch& batch, std::vector<ValueType>& ratios) const
+{
+  const auto state = impl_->state;
+  std::size_t version;
+  {
+    std::shared_lock read(state->mutex);
+    impl_->requireNoCollective();
+    if (&components.getLeader() != this || components.size() != batch.walkerCount() ||
+        particles.size() != components.size() || scratch.size() != components.size())
+      throw std::invalid_argument("Complex virtual capture leader/list extent mismatch");
+    batch.validateOutputExtent(ratios.size());
+    batch.validateFor(particles);
+    for (std::size_t sample = 0; sample < components.size(); ++sample)
+    {
+      const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[sample]);
+      if (!component || component->impl_->state != state || component->impl_->particles != &particles[sample])
+        throw std::invalid_argument("Complex virtual capture requires exact same-family reference clones");
+      component->impl_->requireIdle(particles[sample]);
+      component->impl_->validate(particles[sample], 0);
+      component->impl_->formRatio(component->impl_->accepted, particles[sample], 0, &particles[sample].R[0]);
+    }
+    // Outer stage + base stage + segment output + scalar stage coexist at worst Q each.
+    const auto bytes = pf::checkedStorageBytes<ValueType>(
+        pf::checkedStorageProduct(4, batch.size(), "Complex virtual capture staging overflow"),
+        "Complex virtual capture staging overflow");
+    if (bytes > impl_->numeric_limit - impl_->numeric_required)
+      throw std::length_error("Complex virtual capture nested staging exceeds clone numeric cap");
+    app_log() << "Complex virtual capture before allocation: HOST_nested_staging_bytes=" << bytes
+              << "; four_Q_complex_peak=yes; existing_clone_numeric_cap=yes" << std::endl;
+    version = state->model.p.version();
+  }
+  std::vector<ValueType> staged(ratios.size());
+  // Base validates distinct component/scratch objects, nonalias, spin and ragged descriptors.
+  WaveFunctionComponent::mw_evaluateVirtualRatios(components, particles, scratch, batch, staged);
+  {
+    std::shared_lock read(state->mutex);
+    if (impl_->state != state || state->model.p.version() != version ||
+        state->pending_proposals.load(std::memory_order_relaxed))
+      throw std::logic_error("Complex virtual capture family/version changed during VALUE traversal");
+    impl_->requireNoCollective();
+    for (std::size_t sample = 0; sample < components.size(); ++sample)
+    {
+      const auto& component = static_cast<const PsiFormerComplexWF&>(components[sample]);
+      if (component.impl_->state != state)
+        throw std::logic_error("Complex virtual capture clone changed family during VALUE traversal");
+      component.impl_->requireIdle(particles[sample]);
+    }
+    ratios.swap(staged);
+    return EvaluationStamp::versioned(state.get(), static_cast<std::uint64_t>(version));
+  }
+}
+
 /// Internal score does not qualify virtual parameter response.
 void PsiFormerComplexWF::evaluateDerivRatios(const VirtualParticleSet&, const OptVariables&,
     std::vector<ValueType>&, Matrix<ValueType>&)
