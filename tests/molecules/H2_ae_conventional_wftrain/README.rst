@@ -109,7 +109,7 @@ per-process maximum RSS; the latter is not an aggregate memory bound. Different
 algorithms need not yield equal updates, better energies, or equal-quality
 timings. This short integration check does not rank convergence or efficiency.
 
-The candidate ``--sj-reference-line-search`` mode reuses the fixed H2 P8 Adam
+The ``--sj-reference-line-search`` mode reuses the fixed H2 P8 Adam
 fixture with reference search and its existing five nonzero alphas
 .125/.25/.5/.75/1. Four-sample ESS fraction .5, confidence 2 and maximum weight
 .5 are explicit (default .25 would reject every nonuniform four-sample trial).
@@ -117,5 +117,14 @@ It accepts the natural selected alpha, including zero, checks finite candidate
 receipts and exact unchanged parameters/Adam moments/count for rejected steps,
 and reuses strict full/import/export/inference/initialized-split comparisons.
 Private-bank isolation is a separate component-unit proof, not native pointer
-telemetry. Existing line-search-off defaults stay unchanged; native qualification
-and registration are pending, with no ECP or other line-search profile implied.
+telemetry. Native round 111 passed on its first attempt with application source
+``ba28083fd2b4f9298f498ad916126f4c581e5fd8`` and SHA256
+``a5258f0a666baa88ae116ef1773e9b3123e9aeb96830e2b1b2fea6260059e1ae``;
+executed checker SHA256 is
+``988b110b8bbfa285228d31c7bbd96c3b10e62d4195a3c788ec771842a3efa7d6``.
+All six full/import/split/resume training iterations naturally selected alpha 1;
+zero-alpha conditional assertions were not exercised. Private-bank rejection
+isolation remains component-unit proof only. Strict initialized restart passed.
+One guarded real/full-precision/nonoffload/Python CTest uses the same 300-second
+limit. Existing off defaults stay unchanged; no ECP or other search profile is
+implied by this result.
