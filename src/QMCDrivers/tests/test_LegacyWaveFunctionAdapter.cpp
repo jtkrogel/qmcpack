@@ -5287,7 +5287,12 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   TrainingWaveFunctionBinding relocated_binding(*relocated, particles, adapterOptions(), *OHMMS::Controller);
   binding.setHamiltonian(ham);
   relocated_binding.setHamiltonian(ham);
-  CHECK(binding.modelIdentity() == relocated_binding.modelIdentity());
+  const auto source_identity = binding.modelIdentity(), relocated_identity = relocated_binding.modelIdentity();
+  if (!active || model == 2)
+    CHECK(source_identity == relocated_identity);
+  else
+    // Registration identity includes initial active values: accepted history is not the unrotated start.
+    CHECK(source_identity != relocated_identity);
   const auto exported = temporary.string() + ".parameters.h5";
   FileCleanup export_cleanup(exported);
   if (ecp && !active)
@@ -5452,7 +5457,8 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
     CHECK(std::filesystem::file_size(asset) == 244008);
     CHECK(nonlocal->captureQuadratureState().coordinates == quadrature.coordinates);
     CHECK(ham.ecpModelProvenance()->scientific_definition == pp_identity);
-    CHECK(binding.modelIdentity() == relocated_binding.modelIdentity());
+    CHECK(binding.modelIdentity() == source_identity);
+    CHECK(relocated_binding.modelIdentity() == relocated_identity);
     return; // The tracked HDF image stays read-only; mutation negatives below use disposable copies only.
   }
   Libxml2Document too_small;
