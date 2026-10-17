@@ -314,9 +314,15 @@ def main():
                         help="one fixed-orbital H4 DETS/J2 AE ALM full model-import round trip")
     parser.add_argument("--sj-reference-line-search", action="store_true",
                         help="H2 SJ Adam reference search with existing five alphas and natural decisions")
+    parser.add_argument("--sj-endpoints-line-search", action="store_true",
+                        help="same H2 SJ workflow with private endpoint warmup/sampling1 and natural decisions")
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.sj_endpoints_line_search:
+        if args.sj_reference_line_search:
+            parser.error("select only one SJ line-search mode")
+        args.sj_reference_line_search = True  # Reuse the strict fixed H2 search workflow below.
     if args.sj_reference_line_search:
         if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
                 args.restart, args.preflight, args.model_import, args.old_new, args.family_screen,
@@ -655,7 +661,10 @@ def main():
         training = qmc.find("training")
         training.set("optimizer", optimizer)
         if args.sj_reference_line_search:
-            training.find("parameter[@name='line_search']").text = "reference"
+            training.find("parameter[@name='line_search']").text = "endpoints" if args.sj_endpoints_line_search else "reference"
+            if args.sj_endpoints_line_search:
+                for name in ("line_search_warmup_steps", "line_search_sampling_steps"):
+                    ET.SubElement(training, "parameter", name=name).text = "1"
             # Twice uniform for four samples; .25 would reject every nonuniform trial.
             for name, value in (("line_search_maximum_weight", "0.5"),
                                 ("line_search_minimum_ess_fraction", "0.5"), ("line_search_confidence", "2")):
@@ -741,19 +750,36 @@ def main():
         if args.sj_reference_line_search:
             receipts = re.findall(r"WFTrain candidate alpha (\S+) loss (\S+) loss_difference (\S+) "
                                   r"difference_error (\S+) ess (\S+) maximum_weight (\S+) valid ([01])", text)
-            assert len(receipts) == 6 * expected_rows, (directory, receipts)
+            cursor = 0
             for ordinal, row in enumerate(rows):
-                candidates = [tuple(map(float, receipt)) for receipt in receipts[6*ordinal:6*(ordinal+1)]]
+                remaining = [tuple(map(float, receipt)) for receipt in receipts[cursor:]]
+                assert len(remaining) >= 6, (directory, remaining)
+                expanded = args.sj_endpoints_line_search and remaining[4][0] != 0
+                count = (7 if expanded else 10) if args.sj_endpoints_line_search else 6
+                candidates = remaining[:count]
+                cursor += count
                 assert all(math.isfinite(value) for candidate in candidates for value in candidate), directory
-                assert {candidate[0] for candidate in candidates} == {0, .125, .25, .5, .75, 1}, directory
                 assert all(0 < candidate[4] <= samples_per_rank and 0 < candidate[5] <= 1
                            for candidate in candidates), directory
+                if args.sj_endpoints_line_search:
+                    pattern = [0, 1, 0, 1, .5, 1.5, 2] if expanded else [0, 1, 0, 1, 0, 1, .125, .25, .5, .75]
+                    assert [candidate[0] for candidate in candidates] == pattern, (directory, candidates)
+                    gate = candidates[2][6] == candidates[3][6] == 1 and candidates[2][2] - 2*candidates[2][3] > 0
+                    assert expanded == gate, (directory, candidates)
+                    candidates = candidates[2:] if expanded else candidates[4:]
+                else:
+                    assert {candidate[0] for candidate in candidates} == {0, .125, .25, .5, .75, 1}, directory
                 alpha = float(row["selected_alpha"])
-                assert alpha in {0, .125, .25, .5, .75, 1} and row["committed"] == str(int(alpha > 0)), row
+                assert alpha in {candidate[0] for candidate in candidates} and row["committed"] == str(int(alpha > 0)), row
+                baseline = candidates[0]
                 assert alpha == 0 or any(candidate[0] == alpha and candidate[6] == 1 and
-                                        candidate[2] + 2*candidate[3] < 0 for candidate in candidates), row
-                print(f"reference search: {directory.name} iteration={row['iteration']} selected_alpha={alpha}; "
-                      "five nonzero candidates, finite receipts, natural decision", flush=True)
+                    ((candidate[1] - baseline[1] + 2*(candidate[3] + baseline[3]) < 0) if expanded else
+                     candidate[2] + 2*candidate[3] < 0) for candidate in candidates), row
+                detail = f"{count} finite phase receipts" if args.sj_endpoints_line_search else "five nonzero candidates, finite receipts"
+                mode = "endpoint" if args.sj_endpoints_line_search else "reference"
+                print(f"{mode} search: {directory.name} iteration={row['iteration']} selected_alpha={alpha}; "
+                      f"{detail}, natural decision", flush=True)
+            assert cursor == len(receipts), (directory, receipts)
         for row in rows:
             if require_committed:
                 assert row["committed"] == "1", (directory, row)
@@ -1389,7 +1415,9 @@ def main():
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
         elif args.sj_reference_line_search:
-            print("PASS: H2 SJ Adam reference search, five nonzero alphas, finite candidate receipts, "
+            mode = "endpoint" if args.sj_endpoints_line_search else "reference"
+            detail = "finite candidate receipts" if args.sj_endpoints_line_search else "five nonzero alphas, finite candidate receipts"
+            print(f"PASS: H2 SJ Adam {mode} search, {detail}, "
                   "natural decisions/accepted-state preservation and strict exact initialized restart")
         elif args.mdj_alm:
             print("PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed 32-sample updates, "
