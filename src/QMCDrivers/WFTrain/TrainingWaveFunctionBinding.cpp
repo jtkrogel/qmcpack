@@ -380,14 +380,7 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     const auto& provenance = hamiltonian.ecpModelProvenance();
     if (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())
       throw std::runtime_error("Conventional ECP training requires complete parsed-PP content and ordinary-locality VP identity");
-    if (multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1)
-      throw std::runtime_error("Conventional ECP training currently requires one fixed single-Slater component");
-    for (const auto& component : prototype_.getOrbitals())
-    {
-      const auto kind = component->getClassName();
-      if (kind != "SlaterDet" && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow")
-        throw std::runtime_error("Conventional ECP training currently admits only fixed Slater and J1/J2");
-    }
+    adapter_.validateNonLocalECPProfile(prototype_, prototype_particles_);
   }
   std::map<std::string, std::string> particles;
   particles.emplace(prototype_particles_.getName(), particleIdentity(prototype_particles_, false));

@@ -1150,6 +1150,11 @@ std::unique_ptr<StreamingDerivativeOperator> LegacyWaveFunctionAdapter::makeDeri
       options_.maximum_derivative_scratch_bytes);
 }
 
+void LegacyWaveFunctionAdapter::validateNonLocalECPProfile(TrialWaveFunction& evaluator, ParticleSet& particles) const
+{
+  validateECPProfile({evaluator, particles});
+}
+
 std::unique_ptr<NonLocalECPDerivativeConsumer> LegacyWaveFunctionAdapter::makeNonLocalECPDerivativeConsumer(
     std::shared_ptr<LegacyWaveFunctionReplay> replay,
     std::shared_ptr<const StructuredParameterSnapshot> snapshot,

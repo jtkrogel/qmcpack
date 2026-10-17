@@ -95,6 +95,9 @@ public:
 
   const optimize::VariableSet& registrationVariables() const noexcept { return *registration_template_; }
 
+  /// Reuse the exact product-profile admission in the native physical binding.
+  void validateNonLocalECPProfile(TrialWaveFunction& evaluator, ParticleSet& particles) const;
+
   /// Reset only caller-owned private component state; do not evaluate or mutate particles.
   void resetPrivateParameters(TrialWaveFunction& evaluator,
                               const StructuredParameterSnapshot& snapshot) const;

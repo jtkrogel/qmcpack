@@ -68,7 +68,7 @@ def text_value(value):
 
 
 def check_orbital_frame(group, tree, parameters, row, model):
-    """Check the qualified three-basis SD or distinct-spin MD models."""
+    """Check qualified three-MO frames against each explicit inline AO definition."""
     wrappers = tree.findall(".//rotated_sposet")
     multideterminant = tree.find(".//multideterminant") is not None
     assert len(wrappers) == (2 if multideterminant else 1)
@@ -89,13 +89,14 @@ def check_orbital_frame(group, tree, parameters, row, model):
         assert wrapper.find("sposet").get("size") == "3"
         orbital = frame[f"spo_{ordinal}"]
         assert text_value(orbital["name"][()]) == wrapper.get("name")
-        np.testing.assert_array_equal(orbital["shape"][()], [3, 3])
         initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
+        assert initial.size in (9, 12)
+        np.testing.assert_array_equal(orbital["shape"][()], [3, initial.size // 3])
         reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
         accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
         full = np.asarray(orbital["full_rotation"][()]).reshape(-1)
         np.testing.assert_array_equal(reference, initial)
-        assert accepted.size == 9 and full.size == 3
+        assert accepted.size == initial.size and full.size == 3
         assert np.isfinite(accepted).all() and np.isfinite(full).all()
         if row["committed"] == "1":
             assert not np.array_equal(accepted, reference), model
@@ -179,6 +180,8 @@ def main():
                         help="bounded distinct-spin MD orbital/CI/J2 Adam/SR and complete-frame model reuse")
     parser.add_argument("--external-lcao", action="store_true",
                         help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
+    parser.add_argument("--orbital-ecp", action="store_true",
+                        help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -212,13 +215,13 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
-    if args.periodic_heg or args.md_orbital or args.external_lcao:
-        assert sum((args.periodic_heg, args.md_orbital, args.external_lcao)) == 1, "select one bounded qualification profile"
+    if args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp:
+        assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp)) == 1, "select one bounded qualification profile"
         assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao else None
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -284,6 +287,11 @@ def main():
             if not href.is_absolute():
                 pseudo.set("href", str((fixture.parent / href).resolve()))
         orbital_model = tree.find(".//rotated_sposet") is not None
+        if args.orbital_ecp:
+            assert orbital_model and tree.find(".//multideterminant") is None
+            coefficients = tree.find(".//rotated_sposet/sposet/coefficient")
+            assert coefficients.get("size") == "3" and len(coefficients.text.split()) == 12
+            assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == ["1", "1"]
         if args.orbital_jastrow:
             assert orbital_model and tree.find("wavefunction/jastrow") is None, fixture
             tree.find("wavefunction").append(ET.fromstring('''
@@ -732,6 +740,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.orbital_ecp:
+            print("PASS: real CPU one-occupied Be orbital/J2 ordinary-locality ECP Adam, 4AO/3MO full frames, "
+                  "physical VMC model reuse and exact initialized restart; mathematical nodal coverage is the separate unit gate")
         else:
             print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
                   "exact initialized split restart and malformed/unsupported import rejection")
