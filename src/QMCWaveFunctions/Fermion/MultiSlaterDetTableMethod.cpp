@@ -141,7 +141,7 @@ void MultiSlaterDetTableMethod::validatePreparedRotatedCoefficientState(
   {
     const auto* rotation = dynamic_cast<const RotatedSPOs*>(Dets[spin]->getPhi());
     const auto* replacement = dynamic_cast<const RotatedSPOs*>(prepared.Dets[spin]->getPhi());
-    if (!rotation || !replacement ||
+    if (!Dets[spin]->isOptimizable() || !prepared.Dets[spin]->isOptimizable() || !rotation || !replacement ||
         (previous && (previous == rotation || previous->SPOSet::getName() == rotation->SPOSet::getName())) ||
         (previous_prepared && (previous_prepared == replacement ||
                               previous_prepared->SPOSet::getName() == replacement->SPOSet::getName())))
