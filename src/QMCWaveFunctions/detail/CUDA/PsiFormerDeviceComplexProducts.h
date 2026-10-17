@@ -449,6 +449,7 @@ public:
     }
   }
 
+  /// Expose only the final complete response with its exact term mask.
   LocalEnergyJvpView localEnergyJvpView() const
   {
     image_->validateCurrentDevice();
@@ -457,6 +458,7 @@ public:
     return {this, image_.get(), generation_, jvp_samples_, sample_products_.data(), local_terms_};
   }
 
+  /// Reject mismatched mathematical kind as well as stale/foreign ownership.
   void validate(const LocalEnergyJvpView& view) const
   {
     const auto current = localEnergyJvpView();
@@ -558,11 +560,13 @@ public:
   }
 
 private:
+  /// Preserve finite checks even in fast-math builds.
   static bool finiteComplex(Complex value)
   {
     return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
   }
 
+  /// Reject unsupported masks before any numerical launch.
   static bool hasKinetic(LocalTerms terms)
   {
     if (terms != LocalTerms::KINETIC && terms != LocalTerms::NONLOCAL_ECP && terms != LocalTerms::COMPLETE)
@@ -570,8 +574,10 @@ private:
     return terms != LocalTerms::NONLOCAL_ECP;
   }
 
+  /// Called only after the exact mask admission above.
   static bool hasNonlocal(LocalTerms terms) { return terms != LocalTerms::KINETIC; }
 
+  /// Validate all kinetic inputs before either response producer runs.
   void validateKinetic(const std::vector<double>& masses, const std::array<double, 3>& kappa, std::size_t samples) const
   {
     if (masses.size() != samples * cost_.electrons)
@@ -583,6 +589,7 @@ private:
       if (!device_math::isFiniteBinary64(value)) throw std::invalid_argument("Complex local-energy kappa nonfinite");
   }
 
+  /// Upload one real canonical direction for every response in this request.
   void prepareDirection(const Complex* direction, std::size_t count)
   {
     if (!direction || count != cost_.parameters)
@@ -596,6 +603,7 @@ private:
     direction_.upload(direction_host_.data(), count);
   }
 
+  /// Reuse the admitted dot workspace and return only two scalar components.
   Complex dotResponse(const cuDoubleComplex* response)
   {
     for (std::size_t component = 0; component < 2; ++component)
@@ -614,6 +622,7 @@ private:
     return {result[0], result[1]};
   }
 
+  /// Share adjoint algebra across ordinary, complete-energy and EO/O channels.
   void accumulateResponse(const cuDoubleComplex* response, Complex coefficient, bool hermitian,
       std::size_t channel = 0)
   {

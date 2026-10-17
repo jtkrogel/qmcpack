@@ -786,6 +786,7 @@ struct PsiFormerComplexWF::Impl
       }
     }
 
+    /// Map only the three implemented complete-response masks at the execution fence.
     static GpuDerivativeLane::Products::LocalTerms localTerms(std::uint32_t mask)
     {
       using namespace wftrain;
