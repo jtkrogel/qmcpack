@@ -5350,6 +5350,109 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         }
         CHECK(energies[0] != energies[1]);
         ScoreCovarianceFactor factor(adapter.parameterSchema(), snapshot->version, {batches.data(), batches.size()});
+        {
+          // The accepted two-step orbital history defines a LOCAL tangent chart.
+          // CI, both orbital owners and J2 use one mixed reference shear; a
+          // finite nonlinear candidate is not asserted equal to a Ritz state.
+          constexpr std::size_t augmented = n + 1;
+          const auto& schema = adapter.parameterSchema();
+          const DerivativeArrayView<const ScoreCovarianceBatch> views{batches.data(), batches.size()};
+          std::array<std::array<double, augmented>, augmented> dense_s{}, dense_raw{}, dense_h{};
+          for (std::size_t sample = 0; sample < m; ++sample)
+          {
+            std::array<double, augmented> d{1}, l{energies[sample].real()};
+            for (std::size_t p = 0; p < n; ++p)
+            {
+              d[p + 1] = scores[sample][p] - mean[p];
+              l[p + 1] = del[sample][p] + energies[sample].real() * d[p + 1];
+            }
+            for (std::size_t row = 0; row < augmented; ++row)
+              for (std::size_t column = 0; column < augmented; ++column)
+              {
+                dense_s[row][column] += weights[sample] * d[row] * d[column] / 3;
+                dense_raw[row][column] += weights[sample] * d[row] * l[column] / 3;
+                dense_h[row][column] += weights[sample] * (d[row] * l[column] + l[row] * d[column]) / 6;
+              }
+          }
+          SampledLinearMethodOperator h(factor, views, total_mask, false, true, 0);
+          SampledLinearMethodOperator raw_h(factor, views, total_mask, false, false, 0);
+          SampledLinearMethodOperator s(factor, views, total_mask, true, false, 0);
+          for (std::size_t column = 0; column < augmented; ++column)
+          {
+            std::array<DerivativeValue, augmented> basis{}, ha{}, raw{}, sa{};
+            basis[column] = 1;
+            h.apply({basis.data(), augmented}, {ha.data(), augmented});
+            raw_h.apply({basis.data(), augmented}, {raw.data(), augmented});
+            s.apply({basis.data(), augmented}, {sa.data(), augmented});
+            for (std::size_t row = 0; row < augmented; ++row)
+            {
+              CHECK(ha[row].real() == Catch::Approx(dense_h[row][column]).epsilon(2e-10).margin(2e-10));
+              CHECK(raw[row].real() == Catch::Approx(dense_raw[row][column]).epsilon(2e-10).margin(2e-10));
+              CHECK(sa[row].real() == Catch::Approx(dense_s[row][column]).epsilon(2e-10).margin(2e-10));
+              CHECK(ha[row].imag() == Catch::Approx(0).margin(2e-10));
+            }
+          }
+          MatrixFreeLinearMethodResult tangent;
+          tangent.provider_id = schema.providerId(); tangent.schema_fingerprint = schema.fingerprint();
+          tangent.parameter_version = snapshot->version; tangent.converged = true;
+          tangent.stop_reason = LinearMethodStopReason::CONVERGED;
+          tangent.eigenvector.resize(augmented); tangent.eigenvector[0] = 1;
+          std::array<bool, n> linear{}, orbital{};
+          const auto registration = adapter.registrationVariables();
+          std::size_t linear_count = 0, orbital_count = 0;
+          for (const auto& block : schema.blocks())
+          {
+            for (std::size_t p = block.offset; p < block.offset + block.count; ++p)
+            {
+              linear[p] = block.update_group == "legacy_linear";
+              orbital[p] = registration.name(p).find("_orb_rot_") != std::string::npos;
+              orbital_count += orbital[p];
+              linear_count += linear[p];
+              tangent.eigenvector[p + 1] = linear[p] ? .03 : .002 * (1 + int(p % 3)) * (p % 2 ? 1 : -1);
+            }
+          }
+          REQUIRE(linear_count == 1);
+          REQUIRE(orbital_count == 12);
+          double ell = 0, qn = 0, orbital_j2_cross = 0;
+          for (std::size_t p = 0; p < n; ++p)
+          {
+            if (linear[p]) ell += mean[p] * tangent.eigenvector[p + 1].real();
+            for (std::size_t q = 0; q < n; ++q)
+            {
+              if (!linear[p] && !linear[q])
+                qn += tangent.eigenvector[p + 1].real() * dense_s[p + 1][q + 1] * tangent.eigenvector[q + 1].real();
+              if (orbital[p] && !orbital[q] && !linear[q])
+                orbital_j2_cross = std::max(orbital_j2_cross, std::abs(dense_s[p + 1][q + 1]));
+            }
+          }
+          REQUIRE(orbital_j2_cross > 1e-10);
+          const double denominator = 1 - ell + qn / (1 + std::sqrt(1 + qn));
+          const auto gradient = factor.scoreCovarianceGradient();
+          const ParameterGradientView objective{schema.fingerprint(), snapshot->version, ReductionDomain::GLOBAL,
+              {gradient.data(), gradient.size()}};
+          for (double rate : {1e-3, 5e-4})
+          {
+            LinearMethodUpdateRule update(factor, tangent, rate, .5,
+                LinearMethodNormalization::MIXED_FIXED_REFERENCE, views);
+            const auto mapped = update.propose(schema, *snapshot, objective);
+            auto opposite = *snapshot;
+            double expected_log = 0, expected_energy = 0;
+            for (std::size_t p = 0; p < n; ++p)
+            {
+              const double delta = tangent.eigenvector[p + 1].real() / denominator;
+              CHECK(mapped.values[p] == Catch::Approx(snapshot->values[p] + rate * delta).margin(3e-12));
+              opposite.values[p] -= rate * delta;
+              expected_log += rows.result()[2][p].real() * delta;
+              expected_energy += rows.result()[0][p].real() * delta;
+            }
+            // These helpers start fresh isolated BOTH-spin frames at the same
+            // accepted history, using independent signed determinants and grid.
+            CHECK((reference_log(mapped) - reference_log(opposite)) / (2 * rate) ==
+                  Catch::Approx(expected_log).epsilon(3e-6).margin(3e-8));
+            CHECK(((fixed_grid_energy(mapped, true) - fixed_grid_energy(opposite, true)) / (2 * rate)).real() ==
+                  Catch::Approx(expected_energy).epsilon(3e-6).margin(3e-8));
+          }
+        }
         ProjectedInverseIterationFactor pii_factor(factor, total_mask);
         PIIUpdateControl control;
         control.shift_mode = PIIShiftMode::EXPLICIT; control.explicit_shift = mean_energy - 1;
