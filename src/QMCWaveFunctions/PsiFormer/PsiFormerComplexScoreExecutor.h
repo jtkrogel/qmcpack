@@ -24,6 +24,23 @@ struct DirectComplexScoreResult
   std::size_t parameter_count = 0, parameter_version = 0, evaluation_generation = 0;
 };
 
+/// Caller owns the real P output; it must not alias targets, model or workspace storage.
+struct DirectComplexOrbitalMSEArguments
+{
+  const qmcplusplus::psiformer::determinant::Complex* target = nullptr;
+  std::size_t target_size = 0;
+  double* parameter_gradient = nullptr;
+  std::size_t gradient_size = 0;
+};
+
+/// Borrow raw G-free orbital matrices until the next workspace mutation/evaluation.
+struct DirectComplexOrbitalMSEResult
+{
+  double loss = 0;
+  const qmcplusplus::psiformer::determinant::Complex* orbital_matrices = nullptr;
+  std::size_t orbital_count = 0, parameter_version = 0, evaluation_generation = 0;
+};
+
 /// Stable executor addresses bind prepared clones to immutable metadata.
 class DirectComplexScoreExecutor;
 
@@ -84,7 +101,8 @@ public:
   /// Failed requests have no observed parameter version.
   std::size_t observedParameterVersion() const noexcept
   {
-    return valid_ ? result_.parameter_version : std::numeric_limits<std::size_t>::max();
+    return valid_ ? result_.parameter_version :
+        (orbital_mse_valid_ ? orbital_mse_result_.parameter_version : std::numeric_limits<std::size_t>::max());
   }
 
   /// Borrow completed publication; caller must match parameter_version to the current model.
@@ -93,6 +111,14 @@ public:
     if (!valid_)
       throw std::logic_error("PsiFormer complex score unavailable");
     return result_;
+  }
+
+  /// MSE publication is distinct from a log-score publication and never implies one.
+  const DirectComplexOrbitalMSEResult& orbitalMSEResult() const
+  {
+    if (!orbital_mse_valid_)
+      throw std::logic_error("PsiFormer complex orbital-MSE unavailable");
+    return orbital_mse_result_;
   }
 
   /// Account for all owned numeric buffers, including the real trunk's one P scratch.
@@ -148,6 +174,7 @@ private:
   void invalidate()
   {
     valid_ = false;
+    orbital_mse_valid_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("PsiFormer complex score generation exhausted");
     ++generation_;
@@ -161,8 +188,10 @@ private:
   qmcplusplus::psiformer::determinant::ComplexDeterminantWorkspace determinant_;
   std::vector<C> matrix_adjoint_, score_;
   DirectComplexScoreResult result_;
+  DirectComplexOrbitalMSEResult orbital_mse_result_;
   std::size_t generation_ = 0;
   bool valid_ = false;
+  bool orbital_mse_valid_ = false;
 };
 
 /** Analytic complex log score through one real tape and two real reverse passes.
@@ -302,7 +331,111 @@ public:
     return w.result_;
   }
 
+  /** Raw complex orbital loss with the real executor's per-spin normalization.
+   * Ordinary matrix cotangents are 2*scale*conj(A-T); take the real response
+   * for real canonical parameters. No determinant inverse, cusp or node gate.
+   * No new workspace vectors: caller output is copied only after all checks.
+   */
+  DirectComplexOrbitalMSEResult evaluateOrbitalMSE(DirectComplexScoreWorkspace& w,
+                                                 DirectComplexOrbitalMSEArguments arguments) const
+  {
+    using namespace qmcplusplus::psiformer;
+    w.invalidate();
+    if (w.owner_ != this)
+      throw std::invalid_argument("PsiFormer complex orbital-MSE workspace belongs to another executor");
+    if (arguments.target_size != w.orbitals_.element_count || !arguments.target ||
+        arguments.gradient_size != parameter_count_ || !arguments.parameter_gradient)
+      throw std::invalid_argument("PsiFormer complex orbital-MSE target/gradient extent mismatch");
+    const auto target_bytes = checkedStorageBytes<C>(arguments.target_size, "complex MSE target bytes overflow");
+    const auto output_bytes = checkedStorageBytes<double>(parameter_count_, "complex MSE output bytes overflow");
+    const auto rejects_output_alias = [&](const void* pointer, std::size_t bytes) {
+      if (memoryOverlap(arguments.parameter_gradient, output_bytes, pointer, bytes))
+        throw std::invalid_argument("PsiFormer complex orbital-MSE output aliases borrowed storage");
+    };
+    rejects_output_alias(arguments.target, target_bytes);
+    rejects_output_alias(parameters_.flat_values().data(), output_bytes);
+    rejects_output_alias(w.head_.data(), target_bytes);
+    rejects_output_alias(w.score_.data(), checkedStorageBytes<C>(w.score_.size(), "complex MSE score bytes"));
+    rejects_output_alias(w.matrix_adjoint_.data(), target_bytes);
+    rejects_output_alias(w.feature_seed_.data(), checkedStorageBytes<double>(w.feature_seed_.size(), "complex MSE seeds"));
+    rejects_output_alias(w.envelopes_.data(), checkedStorageBytes<double>(w.envelopes_.size(), "complex MSE envelopes"));
+    if (memoryOverlap(arguments.target, target_bytes, w.head_.data(), target_bytes))
+      throw std::invalid_argument("PsiFormer complex orbital-MSE target aliases mutable raw matrices");
+    for (std::size_t i = 0; i < arguments.target_size; ++i)
+      if (!determinant::isFiniteReal(arguments.target[i].real()) || !determinant::isFiniteReal(arguments.target[i].imag()))
+        throw std::invalid_argument("PsiFormer complex orbital-MSE target is nonfinite");
+
+    const auto tape = trunk_.evaluateTrunk(*w.trunk_);
+    const double* p = parameters_.flat_values().data();
+    const std::size_t n = descriptor_.electrons, channels = descriptor_.determinants * n;
+    const auto& radii = tape.geometry->electronNucleusPairs().distances();
+    for (std::size_t row = 0; row < n; ++row)
+      for (std::size_t channel = 0; channel < channels; ++channel)
+      {
+        const std::size_t spin = row < descriptor_.spin_up ? 0 : 1;
+        w.envelopes_[(channel / n * n + row) * n + channel % n] = realOrbitalEnvelopeValue(
+            radii.data() + row * nuclei_, p + pi_[spin].begin + channel * nuclei_,
+            p + zeta_[spin].begin + channel * nuclei_, nuclei_);
+      }
+    ComplexOrbitalHeadParameters heads;
+    heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
+    heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};
+    w.head_.evaluate(tape.features, tape.feature_count, w.envelopes_.data(), w.envelopes_.size(),
+                     tape.packed_positions, 3 * n, heads);
+    double loss = 0;
+    for (std::size_t determinant = 0; determinant < descriptor_.determinants; ++determinant)
+      for (std::size_t row = 0; row < n; ++row)
+        for (std::size_t column = 0; column < n; ++column)
+        {
+          const std::size_t index = (determinant * n + row) * n + column;
+          const std::size_t spin_rows = row < descriptor_.spin_up ? descriptor_.spin_up : n - descriptor_.spin_up;
+          const double scale = 1.0 / static_cast<double>(descriptor_.determinants * spin_rows * n);
+          const C residual = w.head_.data()[index] - arguments.target[index];
+          loss += scale * std::norm(residual);
+          w.matrix_adjoint_[index] = 2.0 * scale * std::conj(residual);
+        }
+    std::fill(w.score_.begin(), w.score_.end(), C{});
+    reverseHead(w, tape, p);
+    std::fill(w.feature_seed_.begin(), w.feature_seed_.end(), 0.0);
+    for (std::size_t row = 0; row < n; ++row)
+      for (std::size_t channel = 0; channel < channels; ++channel)
+      {
+        const std::size_t spin = row < descriptor_.spin_up ? 0 : 1;
+        const std::size_t element = (channel / n * n + row) * n + channel % n;
+        const C seed = w.matrix_adjoint_[element] * w.envelopes_[element];
+        for (std::size_t feature = 0; feature < descriptor_.feature_width; ++feature)
+        {
+          const std::size_t index = feature * channels + channel;
+          w.feature_seed_[row * descriptor_.feature_width + feature] +=
+              (seed * C{p[real_[spin].begin + index], p[imaginary_[spin].begin + index]}).real();
+        }
+      }
+    const auto reverse = trunk_.reverseTrunk(*w.trunk_, tape, w.feature_seed_.data(), w.feature_seed_.size());
+    for (std::size_t parameter = 0; parameter < parameter_count_; ++parameter)
+      w.score_[parameter] += reverse.parameter_score[parameter];
+    if (!determinant::isFiniteReal(loss))
+      throw std::overflow_error("PsiFormer complex orbital-MSE loss overflow");
+    for (C value : w.score_)
+      if (!determinant::isFiniteReal(value.real()) || !determinant::isFiniteReal(value.imag()))
+        throw std::overflow_error("PsiFormer complex orbital-MSE response overflow");
+    for (std::size_t parameter = 0; parameter < parameter_count_; ++parameter)
+      arguments.parameter_gradient[parameter] = w.score_[parameter].real();
+    w.orbital_mse_result_ = {loss, w.head_.data(), w.orbitals_.element_count, tape.parameter_version, w.generation_};
+    w.orbital_mse_valid_ = true;
+    return w.orbital_mse_result_;
+  }
+
 private:
+  /// Bounded byte ranges reject writable aliases without a registry or allocations.
+  static bool memoryOverlap(const void* left, std::size_t left_bytes, const void* right, std::size_t right_bytes)
+  {
+    const auto a = reinterpret_cast<std::uintptr_t>(left), b = reinterpret_cast<std::uintptr_t>(right);
+    if (left_bytes > std::numeric_limits<std::uintptr_t>::max() - a ||
+        right_bytes > std::numeric_limits<std::uintptr_t>::max() - b)
+      throw std::invalid_argument("PsiFormer complex orbital-MSE address range overflow");
+    return left_bytes && right_bytes && a < b + right_bytes && b < a + left_bytes;
+  }
+
   /// Enforce the current full/G-free paired periodic profile and exact model dimensions.
   static const qmcplusplus::psiformer::PsiFormerExecutionPlan& admit(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
