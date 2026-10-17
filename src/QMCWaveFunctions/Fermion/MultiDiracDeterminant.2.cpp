@@ -546,14 +546,17 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
       workV1[electron] += (psiV[(*refdet_occup)[orbital]] - psiM(row, (*refdet_occup)[orbital])) *
           psiMinv(orbital, electron);
   }
-  accepted_reference_border_.resize(NumPtcls + 1, NumPtcls + 1);
-  accepted_reference_pivots_.resize(NumPtcls + 1);
+  const int maximum_rank = getMaxExcLevel() + 1;
+  if (maximum_rank <= 0 || maximum_rank > NumPtcls + 1)
+    throw std::logic_error("Invalid accepted-reference maximum excitation rank");
+  accepted_reference_border_.resize(maximum_rank, maximum_rank);
+  accepted_reference_pivots_.resize(maximum_rank);
   ratios.resize(getNumDets());
   const int* excitation = detData->data();
   for (int determinant = 0; determinant < getNumDets(); ++determinant)
   {
     const int k = *excitation, rank = k + 1;
-    if (k < 0 || k > NumPtcls) throw std::logic_error("Invalid accepted-reference excitation rank");
+    if (k < 0 || rank > maximum_rank) throw std::logic_error("Invalid accepted-reference excitation rank");
     const int* positions = excitation + 1;
     const int* replacements = positions + k;
     for (int electron = 0; electron < NumPtcls; ++electron) workV2[electron] = workV1[electron];
