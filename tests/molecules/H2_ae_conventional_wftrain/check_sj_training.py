@@ -204,16 +204,19 @@ def main():
                         help="two-DETS-per-CSF LM positive and sampled complex-root ALM refusal")
     parser.add_argument("--csf-pii", action="store_true",
                         help="two-DETS-per-CSF PII/minPII additive updates, inference and restart")
+    parser.add_argument("--mdj-pii", action="store_true",
+                        help="mixed DETS/J2 PII/minPII tangent updates, inference and restart")
     args = parser.parse_args()
     linear_ci = args.ci_lm or args.csf_lm
     csf_ci = args.csf_lm or args.csf_pii
     pure_ci = args.ci_pii or args.csf_pii or linear_ci
-    if pure_ci:
+    ci_workflow = pure_ci or args.mdj_pii
+    if ci_workflow:
         if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
                 args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
                 args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
-                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii)) != 1:
-            parser.error("--ci-pii/--ci-lm/--csf-lm/--csf-pii select separate single-rank pure-CI bounded workflows")
+                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii, args.mdj_pii)) != 1:
+            parser.error("select one single-rank --ci-pii/--ci-lm/--csf-lm/--csf-pii/--mdj-pii workflow")
         args.family_screen = True
         args.family_method = ("lm", "alm") if linear_ci else ("pii", "minpii")
     if args.threads <= 0 or args.ranks <= 0:
@@ -291,19 +294,20 @@ def main():
 
     def run(label, *, optimizer="adam", inference=True, iterations=2, restart=None, mutate=None, reject=False,
             samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None,
-            legacy_vp=None, legacy_reference=None, completed_restore=False):
+            legacy_vp=None, legacy_reference=None, completed_restore=False, ci_representation=None):
         directory = work / label
         directory.mkdir()
         if args.periodic_heg:
             samples_per_rank = 8
         tree = ET.parse(fixture)
-        if pure_ci:
+        if ci_workflow:
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
             assert float(expansion[0].get("coeff")) != 0 and float(expansion[1].get("coeff")) == 0
             assert tree.find(".//rotated_sposet") is None
-            for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
-                node.set("optimize", "no")
+            if pure_ci:
+                for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
+                    node.set("optimize", "no")
             if csf_ci:
                 expansion.set("type", "CSF")
                 for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
@@ -339,7 +343,7 @@ def main():
                     <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
                   </correlation>
                 </jastrow>'''))
-        if args.ci_representation == "csf":
+        if (ci_representation or args.ci_representation) == "csf":
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS", fixture
             expansion.set("type", "CSF")
@@ -581,13 +585,13 @@ def main():
                     print("alm: expected complex-root refusal before update/publication", flush=True)
                     continue
                 directory = run(optimizer, optimizer=optimizer, mutate=controls,
-                                samples_per_rank=32, require_committed=pure_ci)
-                if pure_ci:
+                                samples_per_rank=32, require_committed=ci_workflow)
+                if ci_workflow:
                     final = sorted((directory / "sj.s000.training").rglob("*.parameters.h5"))[-1]
                     loaded = run(f"{optimizer}_export_vmc", vmc=True, parameter_file=final)
                     reference = run(f"{optimizer}_explicit_vmc", vmc=True, reference_file=final)
                     np.testing.assert_array_equal(vmc_physical_trace(loaded), vmc_physical_trace(reference))
-                if linear_ci or args.csf_pii:
+                if linear_ci or args.csf_pii or args.mdj_pii:
                     split = run(f"{optimizer}_split", optimizer=optimizer, iterations=1,
                                 mutate=controls, samples_per_rank=32)
                     resumed = run(f"{optimizer}_resumed", optimizer=optimizer,
@@ -634,6 +638,11 @@ def main():
                     reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
+        elif args.mdj_pii:
+            run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
+            run("reject_mixed_csf_j2_pii", optimizer="pii", ci_representation="csf",
+                reject="mixed updates remain unqualified")
+            print("PASS: mixed DETS/J2 PII/minPII updates, fixed C0/SPO, exact exported inference/restart; mixed LM and CSF rejected")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
