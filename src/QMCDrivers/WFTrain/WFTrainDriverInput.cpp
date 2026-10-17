@@ -670,7 +670,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   const std::initializer_list<std::string_view> adam_attributes = {"adam_beta1", "adam_beta2", "epsilon"};
   const std::initializer_list<std::string_view> matrix_free_attributes = {
       "damping", "damping_multiplier", "minimum_retry_damping", "maximum_damping_attempts",
-      "maximum_update_norm", "maximum_metric_norm", "center_shift", "objective_tolerance",
+      "maximum_metric_norm", "center_shift", "objective_tolerance",
       "spring_history_decay", "spring_maximum_update_norm_squared", "krylov_relative_tolerance",
       "krylov_absolute_tolerance", "krylov_maximum_iterations", "krylov_maximum_operator_applications",
       "krylov_maximum_seconds", "krylov_stagnation_window", "krylov_minimum_relative_improvement",

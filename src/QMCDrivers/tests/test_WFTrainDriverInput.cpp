@@ -34,6 +34,22 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 
 } // namespace
 
+TEST_CASE("First-order input admits the shared Euclidean update bound only",
+          "[drivers][wf_train][host_controls]")
+{
+  for (const std::string optimizer : {"sgd", "momentum_sgd", "rmsprop", "adam", "amsgrad"})
+  {
+    const auto parse = [&](const std::string& control) {
+      return parseTrainingInput("<qmc><training optimizer=\"" + optimizer + "\">" + control +
+                                "</training></qmc>");
+    };
+    CHECK(parse(R"(<parameter name="maximum_update_norm">0.00001</parameter>)").getMaximumUpdateNorm() ==
+          Catch::Approx(0.00001));
+    CHECK_THROWS(parse(R"(<parameter name="maximum_metric_norm">1</parameter>)"));
+    CHECK_THROWS(parse(R"(<parameter name="maximum_update_norm">-1</parameter>)"));
+  }
+}
+
 TEST_CASE("WFTrain inference uses native VMC inputs and completed-attempt cadence", "[drivers][wf_train]")
 {
   const auto parse = [](const std::string& xml) {
