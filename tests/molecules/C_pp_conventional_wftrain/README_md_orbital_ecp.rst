@@ -108,3 +108,12 @@ this is preserved as FIRSTFAIL, not full/import/restart qualification, and
 not a demonstrated MPI defect. No seed, root, tolerance or sample count was
 changed. Compact evidence is task46 ``validation/joint_alm_mpi_ad308``;
 the already-qualified single-rank workflow and its CTest remain unchanged.
+
+``--csf-orbital-ecp-alm`` prepares ONE single-rank ALM workflow from the existing
+signed-child CSF P17 recipe, with the same 32-sample/ALM controls above. The
+outer CSF0=.6 versus expanded C0=.48, child map, both frames and strict
+model/import/initialized restart checks are unchanged. Fixed-CI ALM and CSF
+minPII must reach capability rejection (no LM-only controls on minPII).
+Initial root refusal is negative only with no history/HDF; any later refusal
+is failure, never a tuned positive. Numerical127 passed15,423 assertions;
+this native CSF ALM workflow is prepared, NOT yet qualified or registered.

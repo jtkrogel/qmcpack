@@ -286,6 +286,8 @@ def main():
                         help="derive one charged C^- 3up/2down joint P16 orbital ECP case")
     parser.add_argument("--csf-orbital-ecp", action="store_true",
                         help="derive one signed-child CSF/orbital/J2 ECP Adam P17 case")
+    parser.add_argument("--csf-orbital-ecp-alm", action="store_true",
+                        help="same signed-child CSF P17 strict workflow with ALM only")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -323,6 +325,14 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.csf_orbital_ecp_alm:
+        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+                args.csf_orbital_ecp, args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_alm,
+                args.joint_ci_orbital_ecp_minpii, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
+                args.mdj_alm, args.mdj_ecp_alm)):
+            parser.error("--csf-orbital-ecp-alm selects one single-rank signed-child CSF recipe")
+        args.csf_orbital_ecp = True
+    orbital_alm = args.joint_ci_orbital_ecp_alm or args.csf_orbital_ecp_alm
     if args.mdj_ecp_alm:
         if args.mdj_alm:
             parser.error("select only one AE or locality-ECP mixed ALM profile")
@@ -548,10 +558,10 @@ def main():
         directory = work / label
         directory.mkdir()
         if optimizer is None:
-            optimizer = "alm" if args.mdj_alm or args.joint_ci_orbital_ecp_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+            optimizer = "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
         if args.sj_reference_line_search:
             require_committed = False
-        if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
+        if args.mdj_alm or orbital_alm:
             samples_per_rank = 32
         if periodic_profile:
             samples_per_rank = 8
@@ -690,18 +700,19 @@ def main():
             for name, value in (("line_search_maximum_weight", "0.5"),
                                 ("line_search_minimum_ess_fraction", "0.5"), ("line_search_confidence", "2")):
                 ET.SubElement(training, "parameter", name=name).text = value
-        if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
+        if args.mdj_alm or orbital_alm:
             # Complete augmented subspace: Be P5, H4 P9 or joint-orbital P17.
             qmc.find("parameter[@name='walkers_per_rank']").text = "4"
             qmc.find("parameter[@name='blocks']").text = "8"
-            limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
-                      "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
-                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension":
-                      "18" if args.joint_ci_orbital_ecp_alm else "6" if args.mdj_ecp_alm else "10"}
-            if optimizer == "alm":
-                limits.update(lm_inner_iterations="32", lm_inner_restart_length="10")
-            for name, value in limits.items():
-                ET.SubElement(training, "parameter", name=name).text = value
+            if optimizer in ("lm", "alm"):
+                limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
+                          "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
+                          "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension":
+                          "18" if orbital_alm else "6" if args.mdj_ecp_alm else "10"}
+                if optimizer == "alm":
+                    limits.update(lm_inner_iterations="32", lm_inner_restart_length="10")
+                for name, value in limits.items():
+                    ET.SubElement(training, "parameter", name=name).text = value
         if args.joint_ci_orbital_ecp_minpii and optimizer == "minpii":
             # Reuse bounded family controls without changing the physical sampler.
             limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
@@ -743,7 +754,7 @@ def main():
                 assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
         result, text = launch(directory)
-        if (args.mdj_ecp_alm or args.joint_ci_orbital_ecp_alm) and label == "alm" and result.returncode != 0 and \
+        if (args.mdj_ecp_alm or orbital_alm) and label == "alm" and result.returncode != 0 and \
                 "Live LM solve failed: untrusted_root" in text:
             # A nonphysical sampled root is a protected refusal, never a tuned positive.
             csv_file = directory / "sj.s000.training_info.csv"
@@ -751,8 +762,11 @@ def main():
             assert not list(directory.rglob("*.h5")), directory
             assert "WFTrain refreshed parameter version" not in text and "WFTrain iteration 0 version" not in text
             definition = ET.parse(directory / "run.xml")
-            assert [node.get("coeff") for node in definition.findall(".//detlist/ci")] == \
-                [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")]
+            if args.csf_orbital_ecp_alm:
+                assert ET.tostring(definition.find(".//detlist")) == ET.tostring(tree.find(".//detlist"))
+            else:
+                assert [node.get("coeff") for node in definition.findall(".//detlist/ci")] == \
+                    [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")]
             assert ET.tostring(definition.find("wavefunction/sposet_collection")) == \
                 ET.tostring(fixture_tree.find("wavefunction/sposet_collection"))
             print("EXPECTED REFUSAL: selected mixed DETS/J2 or joint-orbital ALM untrusted root before update/publication; "
@@ -829,7 +843,7 @@ def main():
             if args.joint_ci_orbital_ecp_minpii:
                 assert 0 < int(row["krylov_operator_applications"]) <= 256, row
                 assert 0 <= int(row["krylov_iterations"]) <= 64, row
-            if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
+            if args.mdj_alm or orbital_alm:
                 assert row["optimizer"] == "alm" and 0 < int(row["krylov_operator_applications"]) <= 256, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + int(row["committed"]), row
         assert (directory / "sj.s000.last_checkpoint.h5").is_file(), directory
@@ -1210,7 +1224,7 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("alm" if args.mdj_alm or args.joint_ci_orbital_ecp_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+    adam = run("alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
                samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
@@ -1301,7 +1315,7 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
-        if args.md_orbital or args.mdj_alm or args.joint_ci_orbital_ecp_alm or args.sj_reference_line_search or args.periodic_spline:
+        if args.md_orbital or args.mdj_alm or orbital_alm or args.sj_reference_line_search or args.periodic_spline:
             original_row, resumed_row = history(trained)[-1], history(resumed)[0]
             diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
             assert original_row.keys() == resumed_row.keys()
@@ -1324,7 +1338,7 @@ def main():
         for pattern in ("*.state.h5", "*.rank_*.h5"):
             compare_archives(final_bundle, restored_bundle, pattern,
                              optimizer_max_ulps=8 if args.md_orbital and pattern == "*.state.h5" else 0)
-        if args.joint_ci_orbital_ecp_alm:
+        if orbital_alm:
             for bundle in (final_bundle, restored_bundle):
                 shards = sorted(bundle.glob("*.rank_*.h5"))
                 rank_ids = [int(re.search(r"\.rank_(\d+)\.h5$", shard.name).group(1)) for shard in shards]
@@ -1469,7 +1483,13 @@ def main():
             print(f"PASS: real CPU fixed-orbital {profile}, two committed {32 * args.ranks}-sample updates, "
                   "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
         elif args.csf_orbital_ecp:
-            print("PASS: real CPU signed-child CSF/orbital/J2 ECP Adam P17, frozen outer CSF0=.6/expanded C0=.48, "
+            if args.csf_orbital_ecp_alm:
+                run("reject_fixed_csf_orbital_alm", optimizer="alm",
+                    mutate=lambda tree: tree.find(".//multideterminant").set("optimize", "no"),
+                    reject="mixed updates remain unqualified")
+                run("reject_csf_orbital_minpii", optimizer="minpii", reject="mixed updates remain unqualified")
+            method = "ALM" if args.csf_orbital_ecp_alm else "Adam"
+            print(f"PASS: real CPU signed-child CSF/orbital/J2 ECP {method} P17, frozen outer CSF0=.6/expanded C0=.48, "
                   "immutable child gauge, both frames, physical VMC reuse and strict exact initialized restart")
         elif args.unequal_spin_orbital_ecp:
             print("PASS: real CPU charged C^- 3up/2down joint CI1/orbital/J2 ECP P16, "
