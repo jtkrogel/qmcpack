@@ -330,7 +330,16 @@ def main():
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
     if args.ci_old_new:
-        if args.old_new or args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or args.orbital_jastrow:
+        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+                args.old_new, args.restart, args.preflight, args.model_import, args.profile_only,
+                args.optimizer_screen, args.family_screen, args.family_method, args.ci_pii, args.ci_lm,
+                args.csf_lm, args.csf_pii, args.mdj_pii, args.mdj_alm, args.mdj_ecp_alm,
+                args.csf_j2_ecp_lm, args.csf_j2_pii, args.orbital_jastrow, args.periodic_heg,
+                args.complex_periodic_heg, args.periodic_spline, args.md_orbital, args.external_lcao,
+                args.external_orbital_ecp, args.orbital_ecp, args.many_occupied_orbital_ecp,
+                args.md_orbital_ecp, args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_minpii,
+                args.joint_ci_orbital_ecp_alm, args.unequal_spin_orbital_ecp, args.csf_orbital_ecp,
+                args.csf_orbital_ecp_alm, args.sj_reference_line_search, args.sj_endpoints_line_search)):
             parser.error("--ci-old-new selects its own one-rank pure-DETS candidate comparison")
         args.old_new = True  # Reuse only existing bounded process/resource bookkeeping.
     if args.csf_orbital_ecp_alm:
