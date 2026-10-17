@@ -40,5 +40,21 @@ apply. No controls are tuned to force acceptance.
 
 This profile passed on source ``5f0460dc8``, alongside a separate 65-assertion
 dense centered CI oracle. It qualifies pure DETS CI only. Mixed active
-CI/Jastrow, CI/orbital, CSF and LM/ALM remain gated; no convergence-quality,
+CI/Jastrow, CI/orbital and CSF remain gated; no convergence-quality,
 equal-update or GPU claim is made.
+
+Pure-DETS CI LM/ALM regression
+-----------------------------
+
+``--ci-lm`` freezes J2 and uses the same fixed-orbital model, with only CI1
+active. It requires two committed 32-sample updates for each existing LM/ALM
+solver, unchanged frozen C0/SPO/J2, exact exported-model physical inference and
+exact split model/state/sampler/scientific history. Mixed active CI/J2 is rejected.
+The centered Ritz vector uses A=v0-mean(Jv), deltaCI=learning_rate*vi/A, preserving
+fixed C0. Nonlinear xi normalization is not applied to these linear coordinates;
+Hamiltonian/overlap stabilization remains in the existing solved H/S actions.
+
+This bounded real CPU profile passed on source ``dd9ee31a8``, following a
+574-assertion numerical gate including physical zero/nonzero-CI ratio checks for
+both solvers. It does not qualify mixed CI/Jastrow/orbital, CSF, ECP or GPU CI.
+Use the shared checker with ``--ci-lm`` instead of ``--ci-pii`` to reproduce it.
