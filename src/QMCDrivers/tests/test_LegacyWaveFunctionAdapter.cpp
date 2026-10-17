@@ -90,6 +90,21 @@ DerivativeValue derivativeValue(QMCTraits::ValueType value)
   return {std::real(value), std::imag(value)};
 }
 
+/// Add the qualified eight-coordinate polynomial functor; default spin slots alias.
+void addPolynomialJ3(TrialWaveFunction& wavefunction, ParticleSet& particles, ParticleSet& ions)
+{
+  Libxml2Document input;
+  REQUIRE(input.parseFromString(R"(<jastrow name="J3" type="eeI" function="polynomial" source="ion0">
+    <correlation ispecies=")" + ions.getSpeciesSet().getSpeciesName(0) + R"(" especies1="u" especies2="u"
+                 isize="2" esize="2" rcut="4">
+      <coefficients id="j3" type="Array" optimize="yes">
+        0.000001 -0.000002 0.000003 -0.000004 0.000002 -0.000001 0.000003 -0.000002
+      </coefficients>
+    </correlation></jastrow>)"));
+  eeI_JastrowBuilder builder(OHMMS::Controller, particles, ions);
+  wavefunction.addComponent(builder.buildComponent(input.getRoot()));
+}
+
 /// Deterministic nonlinear Jastrow-like component using the legacy scalar API.
 class LegacyJastrowComponent final : public WaveFunctionComponent, public OptimizableObject
 {
@@ -858,6 +873,8 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
 #ifdef QMC_COMPLEX
   SKIP("This gate qualifies real CPU fixed-Slater/Jastrow ECP products");
 #endif
+  const bool polynomial_j3 = GENERATE(false, true);
+  CAPTURE(polynomial_j3);
   ParticleSetPool pool(OHMMS::Controller);
   auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
   auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
@@ -906,19 +923,25 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
   auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
   REQUIRE(source);
+  if (polynomial_j3) addPolynomialJ3(*source, particles, ions);
   ions.update();
   particles.update();
   source->evaluateLog(particles);
   const auto initial_positions = particles.R;
   const auto initial_ions = ions.R;
   const auto initial_log = source->getLogPsi();
+  ParticleSet sibling_particles(particles);
+  auto sibling = source->makeClone(sibling_particles);
+  sibling_particles.update();
+  sibling->evaluateLog(sibling_particles);
+  const auto sibling_log = sibling->getLogPsi();
   ParticleSet private_particles(particles);
   auto private_wf = source->makeClone(private_particles);
   private_particles.update();
   auto replay = std::make_shared<ShiftedLegacyReplay>(*private_wf, private_particles, std::vector<double>{0});
   LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
   const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
-  REQUIRE(snapshot->values.size() == 4);
+  REQUIRE(snapshot->values.size() == (polynomial_j3 ? 12 : 4));
   auto op = adapter.makeDerivativeOperator(replay, snapshot, 3, 7);
   auto consumer = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 3, 7);
   const std::vector<DerivativeValue> unit{1};
@@ -974,6 +997,8 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   op->bindNonLocalECPJVPReplay(std::move(grid));
   CHECK(op->capabilities().coversLocalEnergyTerms(total_mask));
   const auto storage = op->storageDiagnostics();
+  // The adapter cap excludes component-owned J3 P*Ne caches and private clones.
+  CHECK(storage.real_parameter_vectors == 2);
   CHECK(storage.retained_numeric_bytes >= storage.shared_workspace_bytes + grid_bytes);
   CHECK(storage.retained_numeric_bytes == storage.shared_workspace_bytes + storage.sample_position_bytes +
         storage.sample_auxiliary_bytes);
@@ -1009,7 +1034,11 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   op->applyVJPs({&total, 1}, DerivativeAdjoint::HERMITIAN, hermitian);
   constexpr double step = 1e-5;
   std::vector<DerivativeValue> direction{0.5, -0.2, 0.3, -0.1};
+  direction.resize(snapshot->values.size());
+  for (std::size_t parameter = 4; parameter < direction.size(); ++parameter)
+    direction[parameter] = 0.03 * (parameter - 3);
   DerivativeValue expected_direction{};
+  double j3_response_norm = 0;
   for (std::size_t parameter = 0; parameter < snapshot->values.size(); ++parameter)
   {
     auto plus = *snapshot, minus = *snapshot;
@@ -1019,7 +1048,9 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
     CHECK(transpose.result()[0][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-7).margin(3e-8));
     checkClose(hermitian.result()[0][parameter], std::conj(transpose.result()[0][parameter]));
     expected_direction += direction[parameter] * transpose.result()[0][parameter];
+    if (parameter >= 4) j3_response_norm = std::hypot(j3_response_norm, transpose.result()[0][parameter].real());
   }
+  if (polynomial_j3) REQUIRE(j3_response_norm > 1e-8);
   StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot->version,
                                             {direction.data(), direction.size()});
   RecordingSampleSink first, second;
@@ -1036,6 +1067,8 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
     CHECK(ions.R[0][dimension] == initial_ions[0][dimension]);
   source->evaluateLog(particles);
   CHECK(source->getLogPsi() == initial_log);
+  sibling->evaluateLog(sibling_particles);
+  CHECK(sibling->getLogPsi() == sibling_log);
   OptVariables live_parameters;
   source->checkInVariables(live_parameters);
   live_parameters.resetIndex();
@@ -1050,6 +1083,12 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   RecordingParameterSink score_sink;
   op->applyVJPs({&score_only, 1}, DerivativeAdjoint::TRANSPOSE, score_sink);
   CHECK(replay->prepareCalls() == calls_before_score + 1); // No ECP replay in metric actions.
+  RecordingSampleSink score_jvp;
+  op->applyScoreJVP(vector, score_jvp);
+  DerivativeValue score_expected{};
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+    score_expected += direction[parameter] * score_sink.result()[0][parameter];
+  checkClose(score_jvp.result()[0], score_expected);
 
   // Exercise empty/ragged tiles, zero accepted ratios and stale binding without
   // a fresh energy traversal. Zero ratios have zero response ONLY because every
@@ -2753,6 +2792,11 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   const auto live_energy = kineticEnergy(p);
   const auto positions = p.R;
   LegacyWaveFunctionAdapter adapter("conventional", *wf, adapterOptions());
+  ParticleSet unsupported_j3_particles(p);
+  auto unsupported_j3 = wf->makeClone(unsupported_j3_particles);
+  addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
+  CHECK_THROWS_WITH(adapter.validateNonLocalECPProfile(*unsupported_j3, unsupported_j3_particles),
+      Catch::Matchers::ContainsSubstring("fixed single Slater without active orbitals"));
   const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
   REQUIRE(snapshot->values.size() == 5);
   ParticleSet replay_p(p);
@@ -3911,6 +3955,11 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
     source->evaluateLog(particles);
     LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
     REQUIRE(adapter.snapshotParameters().values.size() == 6);
+    ParticleSet unsupported_j3_particles(particles);
+    auto unsupported_j3 = source->makeClone(unsupported_j3_particles);
+    addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
+    CHECK_THROWS_WITH(adapter.validateNonLocalECPProfile(*unsupported_j3, unsupported_j3_particles),
+        Catch::Matchers::ContainsSubstring("fixed single Slater without active orbitals"));
     ECPComponentBuilder builder("Be", OHMMS::Controller, model == 0 ? 2 : 3, 1);
     const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
         "tests/pseudopotentials_for_tests/Be.BFD.xml";

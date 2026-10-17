@@ -16,6 +16,8 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
+#include "QMCWaveFunctions/Jastrow/JeeIOrbitalSoA.h"
+#include "QMCWaveFunctions/Jastrow/PolynomialFunctor3D.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 
@@ -263,6 +265,7 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
   std::size_t slaters = 0;
   bool orbital = false;
   bool dets = false;
+  bool polynomial_j3 = false;
   for (const auto& component : sample.wavefunction.getOrbitals())
     if (const auto* msd = dynamic_cast<const MultiSlaterDetTableMethod*>(component.get()))
     {
@@ -295,8 +298,12 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
           throw std::invalid_argument("Legacy orbital ECP products require two CPU inline three-orbital (0,q) owners");
       }
     }
+    else if (dynamic_cast<const JeeIOrbitalSoA<PolynomialFunctor3D>*>(component.get()))
+      polynomial_j3 = true;
     else if (component->getClassName() != "J1OrbitalSoA" && component->getClassName() != "TwoBodyJastrow")
       throw std::invalid_argument("Legacy ECP products admit only qualified Slater/DETS and J1/J2 components");
+  if (polynomial_j3 && (dets || orbital))
+    throw std::invalid_argument("Legacy polynomial J3 ECP products require a fixed single Slater without active orbitals");
   if (slaters != 1)
     throw std::invalid_argument("Legacy ECP products require exactly one fixed Slater component");
   return dets ? LegacyECPProfile::DETS : orbital ? LegacyECPProfile::ORBITAL : LegacyECPProfile::FIXED_SLATER;
