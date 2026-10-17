@@ -3699,8 +3699,8 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
   auto evaluator = source->makeClone(private_particles);
   private_particles.update();
   evaluator->findMSD()[0].get().isolateOptimizationState();
-  auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
-      std::vector<double>{-0.12, -0.03, 0.07, 0.18});
+  const std::vector<double> sample_shifts{-0.12, -0.03, 0.07, 0.18};
+  auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, sample_shifts);
   QMCHamiltonian ham;
   LocalECPotential* local = nullptr;
   StdRandom<QMCTraits::FullPrecRealType> rng(1931);
@@ -3769,9 +3769,13 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
       del[sample] = local_energy[0];
       if (ecp)
       {
-        auto one = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, std::vector<double>{0});
+        const auto accepted_positions = private_particles.R;
+        auto one = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
+            std::vector<double>{sample_shifts[sample]});
         auto products = adapter.makeDerivativeOperator(one, frame, sample + 1, sample);
         auto consumer = adapter.makeNonLocalECPDerivativeConsumer(one, frame, sample + 1, sample);
+        for (int electron = 0; electron < private_particles.getTotalNum(); ++electron)
+          CHECK(private_particles.R[electron] == accepted_positions[electron]);
         const std::vector<DerivativeValue> unit{1};
         const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP,
             coefficientsFor(*products, unit), localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
@@ -3783,6 +3787,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
           energies[sample] = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
               hs, ws, ps, *consumer, {&capture, 1}, idle).local_energies[0];
         }
+        CHECK(evaluator->getLogPsi() == log[sample]);
         auto grid = consumer->releaseJVPReplay();
         const auto points = std::vector<NonLocalECPReplayPoint>(grid->points().begin(), grid->points().end());
         products->bindNonLocalECPJVPReplay(std::move(grid));
