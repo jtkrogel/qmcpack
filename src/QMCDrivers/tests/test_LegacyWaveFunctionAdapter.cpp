@@ -4076,6 +4076,7 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
         const auto physical_ratio = [&](double displacement) {
           ParticleSet p(particles);
           auto wf = source->makeClone(p);
+          p.update();
           auto point = initial; point.values[parameter] += displacement;
           adapter.installSnapshot(*wf, p, point);
           const double base_log = wf->getLogPsi(), base_phase = wf->getPhase();
