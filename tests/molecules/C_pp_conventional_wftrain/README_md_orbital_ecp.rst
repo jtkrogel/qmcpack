@@ -93,3 +93,11 @@ pair evidence led to reusing LM's norm-product backward-error policy for ALM,
 with unchanged multiplier/controls and fail-closed material-asymmetry tests.
 Focused LM/ALM units passed 477 assertions/21cases before native126. No initial
 untrusted-root refusal was needed, and no seed, shift or tolerance was tuned.
+
+The same ALM helper now accepts ``--ranks 2 --threads 1`` for a bounded
+distributed closure gate (not yet qualified). It retains 32 samples/rank,
+checks 64 global samples/update and exactly two bitwise-equal full/resume
+sampler shards, plus all non-resource history fields and existing model/frame
+checks. Only this flag permits two ranks; other orbital profiles stay single
+rank. The two-rank attempt has 120s/application and 300s/whole-helper caps.
+No additional CTest matrix or native LM qualification is implied.

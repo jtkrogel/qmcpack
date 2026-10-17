@@ -436,7 +436,8 @@ def main():
     if args.periodic_heg or args.md_orbital or args.external_lcao or orbital_ecp_profile:
         assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
                     args.many_occupied_orbital_ecp, args.md_orbital_ecp)) == 1, "select one bounded qualification profile"
-        assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
+        allowed_ranks = (1, 2) if args.joint_ci_orbital_ecp_alm else (1,)
+        assert args.ranks in allowed_ranks and args.threads == 1, "bounded profile MPI/OpenMP layout"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
@@ -508,7 +509,8 @@ def main():
             command = [args.mpiexec, "-np", str(args.ranks)] + command
         if args.old_new:
             command = ["/usr/bin/time", "-v", "-o", "resource_time.txt"] + command
-        timeout = 180 if deadline is None else min(180, deadline - time.monotonic())
+        child_cap = 120 if args.joint_ci_orbital_ecp_alm and args.ranks == 2 else 180
+        timeout = child_cap if deadline is None else min(child_cap, deadline - time.monotonic())
         assert timeout > 0, (directory, "whole-checker 300s cap reached")
         started = time.monotonic()
         with (directory / "run.log").open("w") as log:
@@ -1299,7 +1301,7 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
-        if args.md_orbital or args.mdj_alm or args.sj_reference_line_search or args.periodic_spline:
+        if args.md_orbital or args.mdj_alm or args.joint_ci_orbital_ecp_alm or args.sj_reference_line_search or args.periodic_spline:
             original_row, resumed_row = history(trained)[-1], history(resumed)[0]
             diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
             assert original_row.keys() == resumed_row.keys()
@@ -1322,6 +1324,13 @@ def main():
         for pattern in ("*.state.h5", "*.rank_*.h5"):
             compare_archives(final_bundle, restored_bundle, pattern,
                              optimizer_max_ulps=8 if args.md_orbital and pattern == "*.state.h5" else 0)
+        if args.joint_ci_orbital_ecp_alm:
+            for bundle in (final_bundle, restored_bundle):
+                shards = sorted(bundle.glob("*.rank_*.h5"))
+                rank_ids = [int(re.search(r"\.rank_(\d+)\.h5$", shard.name).group(1)) for shard in shards]
+                assert rank_ids == list(range(args.ranks)), (bundle, rank_ids)
+            assert all(int(row["samples"]) == 32 * args.ranks
+                       for directory in (adam, trained, split, resumed) for row in history(directory))
         # A second import still uses ORIGINAL inline XML and original registration
         # identity, rather than a rewritten XML whose baseline masks a loader bug.
         second_vmc = run("reimported_vmc", vmc=True, parameter_file=final)
@@ -1473,6 +1482,9 @@ def main():
             method = "ALM" if args.joint_ci_orbital_ecp_alm else "minPII" if args.joint_ci_orbital_ecp_minpii else "Adam"
             print(f"PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP {method} P17, "
                   "frozen C0/original XML, two complete frames, physical VMC reuse and strict exact initialized restart")
+            if args.joint_ci_orbital_ecp_alm:
+                print(f"PASS: P17 ALM {args.ranks} MPI x 1 OpenMP, {32 * args.ranks} global samples/update, "
+                      f"{args.ranks} exact initialized-restart sampler shards", flush=True)
         elif args.md_orbital_ecp:
             print("PASS: real CPU fixed-CI distinct-spin MD orbital/J2 ordinary-locality ECP Adam P16, "
                   "two complete 4AO/4MO frames, physical VMC model reuse and strict exact initialized restart")
