@@ -687,8 +687,9 @@ def main():
             qmc.find("parameter[@name='blocks']").text = "8"
             limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
                       "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
-                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "6" if args.mdj_ecp_alm else "10",
-                      "lm_inner_iterations": "32", "lm_inner_restart_length": "10"}
+                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "6" if args.mdj_ecp_alm else "10"}
+            if optimizer == "alm":
+                limits.update(lm_inner_iterations="32", lm_inner_restart_length="10")
             for name, value in limits.items():
                 ET.SubElement(training, "parameter", name=name).text = value
         if args.joint_ci_orbital_ecp_minpii and optimizer == "minpii":
