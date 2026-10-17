@@ -297,10 +297,137 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
                "native authority unchanged; wrong-GPU execution NOT_RUN on single-device qualification\n";
 }
 
+/// Independently qualify one-capacity borrowed-coordinate complete open ENERGY/C3.
+inline void validateResidentOpenEnergy(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+    const std::shared_ptr<const PreparedDeviceModel>& image)
+{
+  const auto p = plan.parameterCount(), ne = model.ne, ni = model.cfg.nuclei.shape[0], version = image->version();
+  const auto require = [](bool okay, const char* message) { if (!okay) throw std::runtime_error(message); };
+  const auto fails = [&](const auto& action) {
+    bool rejected = false; try { action(); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "Resident open ENERGY accepted invalid admission/provenance");
+  };
+  const auto near = [&](double actual, double expected) {
+    require(device_math::isFiniteBinary64(actual) && std::abs(actual-expected) <= 5e-10*(1+std::abs(expected)),
+        "Resident open ENERGY differs from independent CPU FULL/Coulomb/C3/Adam");
+  };
+  require(ne == 4 && ni == 2 && model.cfg.nconfig >= 2 && p < 100000, "Resident open ENERGY needs existing bounded fixture");
+  std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin()+6*ne), masses(ne), zero(p);
+  for (std::size_t i = 0; i < ne; ++i) masses[i] = .7 + .13*i;
+  const auto cost = PreparedDeviceProductSession::estimateResidentOpenEnergyCost(ne, ni);
+  require(cost.device_bytes == 96 && cost.host_bytes == 104, "Resident open ENERGY cold capacity changed");
+  PreparedDeviceBatchBackend backend(image);
+  auto session = backend.prepareProductSession(), host = backend.prepareProductSession();
+  auto before = session->transferSnapshot();
+  fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes-1, cost.host_bytes); });
+  fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes, cost.host_bytes-1); });
+  fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, 0, cost.host_bytes); });
+  fails([&] { session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes, std::numeric_limits<std::size_t>::max()); });
+  require(before.allocation_calls == session->transferSnapshot().allocation_calls, "Resident open ENERGY cap denial allocated");
+  session->prepareResidentOpenEnergy(masses, model.cfg.charges.x, cost.device_bytes, cost.host_bytes);
+  session->prepareScoreContractions(3, version); host->prepareScoreContractions(3, version);
+  auto coordinates = image->prepareCoordinates(2, checkedDeviceBytes<double>(6*ne)); coordinates->upload(positions);
+  pf::DirectValueExecutor value(model, plan); pf::DirectSpatialExecutor spatial(model, value, plan);
+  pf::DirectScoreExecutor score(model, plan); pf::DirectKineticExecutor kinetic(model, plan);
+  auto full = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  auto sw = score.makeWorkspace(); auto kw = kinetic.makeWorkspace();
+  std::vector<std::complex<double>> cpu(3*p), actual(3*p), host_rows(3*p);
+  std::vector<double> imaginary(3*ne);
+  std::array<double, 2> energy{};
+  const auto distance = [](const double* a, const double* b) {
+    double r = 0; for (int d = 0; d < 3; ++d) r += (a[d]-b[d])*(a[d]-b[d]); return std::sqrt(r);
+  };
+  before = session->transferSnapshot();
+  const std::array observations{session->observeResidentOpenEnergy(coordinates->view(0, 1), version),
+      session->observeResidentOpenEnergy(coordinates->view(1, 1), version)};
+  require(before.allocation_calls == session->transferSnapshot().allocation_calls,
+      "Resident open ENERGY B1 observation reuse allocated");
+  auto generation = session->beginScoreContraction(3, version, ScoreContractionRole::ENERGY_T_EO_O);
+  host->beginScoreContraction(3, version, ScoreContractionRole::ENERGY_T_EO_O);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    const auto* x = positions.data()+3*ne*sample;
+    const auto view = pf::GeometryPositionView::interleaved(x, ne);
+    full->setPositions(view); sw->setPositions(view); kw->setPositions(view);
+    const auto f = spatial.evaluateFull(*full); const auto s = score.evaluate(*sw);
+    const auto k = kinetic.evaluate(*kw, f.gradient.data(), f.gradient.size(), masses.data(), masses.size());
+    std::array<double, 5> expected{};
+    for (std::size_t i = 0; i < ne; ++i)
+    {
+      expected[0] -= .5*masses[i]*f.lap_ratio[i];
+      for (std::size_t j = i+1; j < ne; ++j) expected[1] += 1/distance(x+3*i, x+3*j);
+      for (std::size_t j = 0; j < ni; ++j) expected[2] -= model.cfg.charges.x[j]/distance(x+3*i, model.cfg.nuclei.x.data()+3*j);
+    }
+    for (std::size_t i = 0; i < ni; ++i) for (std::size_t j = i+1; j < ni; ++j)
+      expected[3] += model.cfg.charges.x[i]*model.cfg.charges.x[j]/distance(model.cfg.nuclei.x.data()+3*i, model.cfg.nuclei.x.data()+3*j);
+    for (int i = 0; i < 4; ++i) expected[4] += expected[i];
+    energy[sample] = expected[4];
+    const double w = .8+.07*sample;
+    const std::complex<double> sc[3]{{}, w*expected[4], w}, kc[3]{w, {}, {}}, ic[3]{};
+    before = session->transferSnapshot();
+    const auto& observed = observations[sample]; // Its FULL arena has since held the OTHER sample.
+    for (int i = 0; i < 5; ++i) near(observed.energy[i], expected[i]);
+    session->accumulateResidentKineticContraction(observed, sc, kc, 3, version);
+    const auto after = session->transferSnapshot();
+    require(after.allocation_calls == before.allocation_calls && after.free_calls == before.free_calls,
+        "Resident open ENERGY warm request allocated");
+    host->accumulateKineticContraction(x, f.gradient.data(), imaginary.data(), masses.data(), sc, kc, ic, 3, version);
+    for (std::size_t i = 0; i < p; ++i)
+    { cpu[i] += w*k.kinetic_parameter_response[i]; cpu[p+i] += sc[1]*s.parameter_score[i]; cpu[2*p+i] += w*s.parameter_score[i]; }
+  }
+  session->finishScoreContraction(version); host->finishScoreContraction(version);
+  for (std::size_t c = 0; c < 3; ++c)
+  {
+    session->downloadScoreContraction(c, actual.data()+c*p, p, version);
+    host->downloadScoreContraction(c, host_rows.data()+c*p, p, version);
+    for (std::size_t i = 0; i < p; ++i) { near(actual[c*p+i].real(), cpu[c*p+i].real()); near(actual[c*p+i].imag(), 0); near(host_rows[c*p+i].real(), cpu[c*p+i].real()); }
+  }
+  const std::vector<AdamBlock> blocks{{0, p, .0017, 1}};
+  auto adam = PreparedDeviceAdam::prepare(p, blocks, estimateAdamBytes(p, 1)); adam->seed(zero, zero);
+  adam->prepareEnergyGradient(PreparedDeviceAdam::energyGradientRequiredBytes(p));
+  std::vector<double> candidate(p), gradient(p), expected(p); const auto values = model.p.flat_values();
+  const double weight = .8+.87, mean = (.8*energy[0]+.87*energy[1])/weight;
+  double norm = 0;
+  for (std::size_t i = 0; i < p; ++i)
+  { gradient[i] = 2*(cpu[i]+cpu[p+i]-mean*cpu[2*p+i]).real()/weight; norm = std::hypot(norm, gradient[i]); expected[i] = values[i]-.0017*gradient[i]/(std::abs(gradient[i])+1e-8); }
+  near(session->consumeEnergyAdam(*adam, version, generation, values, weight, mean, .9, .999, .1, .001, 1e-8, candidate), norm);
+  for (std::size_t i = 0; i < p; ++i) near(candidate[i], expected[i]);
+  adam->accept();
+  std::vector<double> first(p), second(p); adam->download(first, second);
+  for (std::size_t i = 0; i < p; ++i) { near(first[i], .1*gradient[i]); near(second[i], .001*gradient[i]*gradient[i]); }
+  const auto stale_view = coordinates->view(0, 1); coordinates->upload(positions);
+  fails([&] { session->observeResidentOpenEnergy(stale_view, version); });
+  fails([&] { session->observeResidentOpenEnergy(coordinates->view(0, 2), version); });
+  fails([&] { session->observeResidentOpenEnergy(coordinates->view(0, 1), version+1); });
+  auto foreign_image = std::make_shared<PreparedDeviceModel>(plan, values, model.cfg.nuclei.x, version);
+  auto foreign = foreign_image->prepareCoordinates(1, checkedDeviceBytes<double>(3*ne));
+  foreign->upload(std::vector<double>(positions.begin(), positions.begin()+3*ne));
+  fails([&] { session->observeResidentOpenEnergy(foreign->view(0, 1), version); });
+  auto old = session->observeResidentOpenEnergy(coordinates->view(0, 1), version);
+  session->abortScoreContraction();
+  const std::complex<double> none[3]{};
+  session->beginScoreContraction(3, version);
+  fails([&] { session->accumulateResidentKineticContraction(old, none, none, 3, version); });
+  std::copy_n(model.cfg.nuclei.x.data(), 3, positions.data()); coordinates->upload(positions);
+  // Observation itself must reject coalescence, before any coefficient shortcut.
+  fails([&] { session->observeResidentOpenEnergy(coordinates->view(0, 1), version); });
+  std::copy_n(model.cfg.electrons.x.data(), 3*ne, positions.data()); coordinates->upload(positions);
+  near(session->observeResidentOpenEnergy(coordinates->view(0, 1), version).energy[4], energy[0]);
+  old = session->observeResidentOpenEnergy(coordinates->view(0, 1), version);
+  backend.publishParameters(values, version+1, []() {});
+  near(session->observeResidentOpenEnergy(coordinates->view(0, 1), version+1).energy[4], energy[0]);
+  session->beginScoreContraction(3, version+1);
+  fails([&] { session->accumulateResidentKineticContraction(old, none, none, 3, version+1); });
+  require(image->version() == version && model.p.flat_values() == values, "Resident observer modified its source model");
+  std::cout << "PASS resident open energy: B=1 samples=2 CPU_allP=yes HOST_C3=yes retained_coordinates=yes "
+               "complete_K_ee_ei_ii=yes Adam_values_moments=yes coalescence_before_coefficients=yes warm_no_alloc=yes\n";
+}
+
 /// Qualify only the numerical ENERGY C3/Adam bridge, not a training driver binding.
 inline void validateResidentAdam(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
     const std::shared_ptr<const PreparedDeviceModel>& image)
 {
+  validateResidentOpenEnergy(model, plan, image);
   const auto count = plan.parameterCount(), ne = model.ne, version = image->version();
   const auto require = [](bool okay, const char* message) {
     if (!okay) throw std::runtime_error(message);
