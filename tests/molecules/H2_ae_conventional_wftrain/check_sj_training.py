@@ -266,6 +266,11 @@ def main():
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
     fixture_tree = ET.parse(fixture)
+    external_ecp = args.external_lcao and bool(fixture_tree.findall("hamiltonian/pairpot/pseudo"))
+    if external_ecp:
+        assert [node.get("size") for node in fixture_tree.findall("particleset[@name='e']/group")] == ["1", "1"]
+        assert {node.get("elementType"): node.get("l-local") for node in
+                fixture_tree.findall("hamiltonian/pairpot/pseudo")} == {"Li": "1", "H": "0"}
     md_ecp = (fixture_tree.find("wavefunction/determinantset/multideterminant") is not None and
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
     csf_ecp = md_ecp and args.ci_representation == "csf"
@@ -534,8 +539,7 @@ def main():
                 previous = parameters
                 if orbital_model:
                     orbital_history.append(check_orbital_frame(group, tree, parameters, row, model))
-                pseudo = tree.find("hamiltonian/pairpot/pseudo")
-                if pseudo is not None:
+                for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
                     physical = text_value(group["physical_definition"][()])
                     assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
                     assert "rule=2;local_channel=1;" in physical and "knots=4;" in physical, model
@@ -550,6 +554,8 @@ def main():
                         assert "parameter=REAL64;wavefunction=COMPLEX128;" in physical, model
                         assert "complex_Gamma_FreeOrbital_kvectors_v1:" in physical, model
                 if args.external_lcao:
+                    if external_ecp:
+                        assert parameters.size == 4 and not orbital_model and not linear_nodes, model
                     image = external_asset.read_bytes()
                     physical = text_value(group["physical_definition"][()])
                     assert f"lcao_file_image_v1:{len(image)}:{image.hex()};" in physical, model
@@ -946,15 +952,17 @@ def main():
             run("reject_uncaptured_lcao", mutate=remove_capture, reject="external")
             assert external_source.read_bytes() == external_original
             assert external_asset.read_bytes() == external_original
-            print(f"PASS: external CPU LCAO Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
+            print(f"PASS: external CPU LCAO{' plus ordinary-locality ECP' if external_ecp else ''} Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
                   f"immutable asset bytes={len(external_original)} (separate from derivative scratch)")
-        if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
-            source = (fixture.parent / ET.parse(fixture).find("hamiltonian/pairpot/pseudo").get("href")).resolve()
+        pseudos = ET.parse(fixture).findall("hamiltonian/pairpot/pseudo")
+        for pseudo in pseudos:
+            species = pseudo.get("elementType")
+            source = (fixture.parent / pseudo.get("href")).resolve()
             original = source.read_bytes()
-            changed = work / "changed-import-pseudopotential.xml"
+            changed = work / f"changed-import-pseudopotential-{species}.xml"
             changed.write_bytes(original + b"\n<!-- imported model PP identity regression -->\n")
-            run("reject_changed_import_pp", parameter_file=exported, vmc=True,
-                mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)),
+            run("reject_changed_import_pp" + (f"_{species}" if len(pseudos) > 1 else ""), parameter_file=exported, vmc=True,
+                mutate=lambda tree: tree.find(f"hamiltonian/pairpot/pseudo[@elementType='{species}']").set("href", str(changed)),
                 # A changed variable-width hex fingerprint may fail the trusted
                 # model_identity string-width guard before content comparison.
                 reject=("Conventional model export identity mismatch",
