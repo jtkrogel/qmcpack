@@ -371,6 +371,7 @@ TEST_CASE("PsiFormer same-version mirror refresh preserves graph storage",
                             {{"tiny", "weight", {2}, 0, 2}, {"tiny", "bias", {}, 2, 3}});
   const auto weight = parameters.nodes.at({"tiny", "weight"});
   const auto bias = parameters.nodes.at({"tiny", "bias"});
+  weight->value.x.reserve(3); // The later malformed-extent probe must not invalidate this baseline itself.
   const auto* flat_storage = parameters.values.data();
   const auto* weight_storage = weight->value.x.data();
   const auto* bias_storage = bias->value.x.data();
