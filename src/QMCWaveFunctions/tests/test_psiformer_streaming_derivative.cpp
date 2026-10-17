@@ -1874,6 +1874,7 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
   const auto p = cpu.parameterSchema().parameterCount();
   std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
   std::vector<std::unique_ptr<ParticleSet>> samples;
+  std::vector<std::unique_ptr<PsiFormerWF>> gpu_copies, cpu_copies;
   RefVectorWithLeader<WaveFunctionComponent> gc(gpu), cc(cpu);
   for (int i = 0; i < 8; ++i)
   {
@@ -1881,7 +1882,13 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
     samples.back()->R[0][0] += .003 * i; samples.back()->update();
     samples.back()->G = QMCTraits::GradType{}; samples.back()->L = QMCTraits::ValueType{};
     cpu.evaluateLog(*samples.back(), samples.back()->G, samples.back()->L);
-    gc.push_back(gpu); cc.push_back(cpu);
+    for (auto& gradient : samples.back()->G) gradient[0] += .23; // Fixed complete-ratio companion.
+    if (i == 0) { gc.push_back(gpu); cc.push_back(cpu); }
+    else
+    {
+      gpu_copies.push_back(std::make_unique<PsiFormerWF>(gpu)); cpu_copies.push_back(std::make_unique<PsiFormerWF>(cpu));
+      gc.push_back(*gpu_copies.back()); cc.push_back(*cpu_copies.back());
+    }
   }
   // RefVectorWithLeader requires the first stored sample to be its actual leader.
   RefVectorWithLeader<ParticleSet> batch(*samples.front());
@@ -1903,6 +1910,57 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
         {"zero", DerivativeProduct::SCORE_VJP, coefficientsFor(op, weights[2]), 0}}};
   };
   auto expected_channels = channels(*reference), actual_channels = channels(*products);
+  // Reuse the signed ragged accepted-grid fixture, now across all eight immutable samples.
+  const auto bind_grid = [&](PsiFormerWF& component, RefVectorWithLeader<WaveFunctionComponent>& components,
+                             StreamingDerivativeOperator& op, bool node = false) {
+    std::vector<std::size_t> offsets{0};
+    std::vector<VirtualParticleBatch::Segment> segments;
+    std::vector<ParticleSet::PosType> points;
+    std::vector<QMCTraits::ValueType> bare;
+    for (std::size_t sample = 0; sample < samples.size(); ++sample)
+    {
+      segments.push_back({static_cast<int>(sample), 0}); // The fixture has exactly eight samples.
+      for (std::size_t i = 0; i < (sample == 0 ? 2 : 1); ++i)
+      {
+        points.push_back(samples[sample]->R[0] + ParticleSet::PosType{.003 * (sample + i + 1), -.011, .007});
+        bare.push_back((sample % 2 ? -.13 : .21) / (sample + i + 1));
+      }
+      offsets.push_back(points.size());
+    }
+    if (node) { points[0] = samples[0]->R[1]; bare[0] = 0; }
+    VirtualParticleBatch grid(8, offsets, segments, points);
+    std::vector<std::unique_ptr<VirtualParticleSet>> virtual_owners;
+    for (auto& sample : samples) virtual_owners.push_back(std::make_unique<VirtualParticleSet>(*sample));
+    RefVectorWithLeader<VirtualParticleSet> virtuals(*virtual_owners.front());
+    for (auto& owner : virtual_owners) virtuals.push_back(*owner);
+    std::vector<QMCTraits::ValueType> ratios(points.size());
+    WaveFunctionComponent::EvaluationStamp stamp;
+    ResourceCollection prototype("host_ecp_grid"); component.createResource(prototype);
+    ResourceCollection resources(prototype);
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+      stamp = component.mw_evaluateVirtualRatios(components, batch, virtuals, grid, ratios);
+    }
+    for (std::size_t sample = 0; sample < samples.size(); ++sample)
+      for (auto i = offsets[sample]; i < offsets[sample + 1]; ++i)
+        ratios[i] *= std::exp(.23 * (points[i][0] - samples[sample]->R[0][0]));
+    auto consumer = component.makeNonLocalECPDerivativeConsumer(components, batch, 17, true, true);
+    wftrain::NonLocalECPDerivativeContext context;
+    context.provider_id = op.parameterSchema().providerId(); context.schema_fingerprint = op.parameterSchema().fingerprint();
+    context.parameter_version = op.parameterVersion(); context.batch_ordinal = op.batchOrdinal();
+    context.sample_count = 8; context.expected_point_count = 9; context.grid_fingerprint = 0x731934d1;
+    auto capture = channels(op);
+    capture[0].local_energy_term_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+    SelectedParameterSink idle(selected);
+    consumer->begin(context, {capture.data(), 1}, idle);
+    consumer->consume({grid, {bare.data(), bare.size()}, {ratios.data(), ratios.size()}, {&stamp, 1}, 0,
+        context.grid_fingerprint});
+    consumer->end();
+    CHECK(idle.state() == DerivativeSinkState::IDLE);
+    op.bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+  };
+  bind_grid(cpu, cc, *reference); bind_grid(gpu, gc, *products);
+  CHECK(products->storageDiagnostics().complex_parameter_vectors == 0);
   SelectedParameterSink expected(selected), actual(selected);
   reference->applyVJPs({expected_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
   products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
@@ -1940,6 +1998,25 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
   CHECK(after.allocation_calls == before.allocation_calls);
   CHECK(after.live_bytes == before.live_bytes);
   CHECK(products->storageDiagnostics().storage_fingerprint == warm.storage_fingerprint);
+  const auto complete = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  expected_channels[0].local_energy_term_mask = actual_channels[0].local_energy_term_mask = complete;
+  expected.reset(); actual.reset();
+  reference->applyVJPs({expected_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare();
+  CHECK(products->storageDiagnostics().complex_parameter_vectors == 0);
+  auto bad = gpu.makeStreamingDerivativeOperator(gc, batch, 2, 0, 17);
+  bind_grid(gpu, gc, *bad, true);
+  auto bad_channels = channels(*bad); bad_channels[0].local_energy_term_mask = complete;
+  actual.reset();
+  CHECK_THROWS(bad->applyVJPs({bad_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  CHECK(actual.state() == DerivativeSinkState::POISONED);
+  CHECK(gpu.parameterVersion() == products->parameterVersion());
+  CHECK(gpu.snapshotParameters().values == initialized.values);
+  actual.reset();
+  products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare(); // Failed zero-weight nodal geometry did not replace the good immutable replay.
   auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
   actual.reset();
   actual.onConsumeOnce([&]() { gpu.publishParameters(candidate, candidate.version); });
@@ -1953,16 +2030,25 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
   {
     sample->G = QMCTraits::GradType{}; sample->L = QMCTraits::ValueType{};
     cpu.evaluateLog(*sample, sample->G, sample->L);
+    for (auto& gradient : sample->G) gradient[0] += .23;
   }
   auto fresh_reference = cpu.makeStreamingDerivativeOperator(cc, batch, 1, 0, 17);
   auto fresh_products = gpu.makeStreamingDerivativeOperator(gc, batch, 1, 0, 17);
+  bind_grid(cpu, cc, *fresh_reference); bind_grid(gpu, gc, *fresh_products);
   auto fresh_expected = channels(*fresh_reference), fresh_actual = channels(*fresh_products);
   expected.reset(); actual.reset();
   fresh_reference->applyVJPs({fresh_expected.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
   fresh_products->applyVJPs({fresh_actual.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
   compare();
   const auto before_fallback = fresh_products->storageDiagnostics();
+  fresh_expected[0].local_energy_term_mask = fresh_actual[0].local_energy_term_mask = complete;
+  std::swap(fresh_expected[0], fresh_expected[1]); std::swap(fresh_actual[0], fresh_actual[1]);
+  expected.reset(); actual.reset();
+  fresh_reference->applyVJPs({fresh_expected.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  fresh_products->applyVJPs({fresh_actual.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare(); // Same complete response, nonmatching order must use the original full-HOST fallback.
   auto zero_energy = fresh_actual[0];
+  zero_energy.product = DerivativeProduct::LOCAL_ENERGY_VJP;
   zero_energy.local_energy_term_mask = 0;
   SelectedParameterSink zero_only(selected);
   CHECK_THROWS(fresh_products->applyVJPs({&zero_energy, 1}, DerivativeAdjoint::TRANSPOSE, zero_only));
@@ -1977,6 +2063,7 @@ TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
   CHECK(materialized.shared_workspace_bytes == before_fallback.shared_workspace_bytes +
         before_fallback.shared_workspace_reserved_bytes);
   std::cout << "PASS real HOST chunks: W8/C3 tail/complex-zero, cold_HOST_channels=0, reserved=48P, publication/reentry/abort/retry\n";
+  std::cout << "PASS ordered ECP HOST C3: W8/Q9 signed complete CPU parity, no double ECP, node retry, publication, ordered fallback\n";
 }
 
 TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",

@@ -2409,7 +2409,10 @@ public:
     if (hasDeviceProducts())
     {
       PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
-      shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(), true);
+      // Large resident HOST-C3 may append before its single finish. Other
+      // requests materialize the admitted fallback before their model read.
+      shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(),
+          sample_count_ <= 2 * MAXIMUM_VJP_CHANNELS);
       PsiFormerReadTransaction state_lock(*model_state_, model_state_->deviceOnlyValueReads());
       requireBoundVersion();
       const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
@@ -2457,18 +2460,32 @@ protected:
     NativeTimerScope timer(phase_timers_.parameter_vjp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
+    bool append_ecp_host = false;
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
     std::optional<psiformer::device::PreparedDeviceProductSession::CompletedScoreContraction> completed;
     std::array<std::size_t, MAXIMUM_VJP_CHANNELS> completed_slots{};
     completed_slots.fill(MAXIMUM_VJP_CHANNELS);
     if (hasDeviceProducts() && !terminal)
     {
+      const auto complete_energy = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+          wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+      append_ecp_host = ecp_replay_ && sample_count_ > 2 * MAXIMUM_VJP_CHANNELS && channels.size() == 3 &&
+          model_state_->precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+          model_state_->execution_plan.environment().boundary == psiformer::BoundaryCondition::OPEN &&
+          model_state_->execution_plan.environment().amplitude_scalar_domain == psiformer::ScalarDomain::REAL &&
+          channels[0].product == wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+          channels[0].local_energy_term_mask == complete_energy &&
+          channels[1].product == wftrain::DerivativeProduct::SCORE_VJP &&
+          channels[2].product == wftrain::DerivativeProduct::SCORE_VJP;
+      const bool requests_ecp = std::any_of(channels.begin(), channels.end(), [](const auto& channel) {
+        return channel.local_energy_term_mask & wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+      });
       const bool has_contracted_response = std::any_of(channels.begin(), channels.end(), [](const auto& channel) {
         return channel.product == wftrain::DerivativeProduct::SCORE_VJP ||
             (channel.local_energy_term_mask & wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC));
       });
       shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(),
-          sample_count_ <= 2 * MAXIMUM_VJP_CHANNELS || ecp_replay_ || !has_contracted_response);
+          sample_count_ <= 2 * MAXIMUM_VJP_CHANNELS || (requests_ecp && !append_ecp_host) || !has_contracted_response);
     }
 #endif
     {
@@ -2699,10 +2716,12 @@ protected:
       {
         auto& session = *shared_scratch_->device_products;
         // Append physical ECP to the tagged ENERGY sum before its single finite admission.
-        // Native DEVICE-authority ECP eligibility remains independently closed in the driver.
+        // Native DEVICE-authority ECP admission remains independently controlled by the driver.
         try
         {
-          if (terminal && needs_ecp)
+          // Ordered HOST reuse keeps the existing GENERIC transaction; only
+          // the independently admitted driver terminal uses the ENERGY role.
+          if ((terminal || append_ecp_host) && needs_ecp)
             accumulateECPReplayVJPs(channels, true);
           session.finishScoreContraction(parameter_version_);
         }
@@ -2717,7 +2736,7 @@ protected:
           return; // RAII releases BOTH source leases before caller publication.
         }
 #if !defined(QMC_COMPLEX)
-        if (!needs_ecp && sample_count_ > 2 * MAXIMUM_VJP_CHANNELS)
+        if ((!needs_ecp || append_ecp_host) && sample_count_ > 2 * MAXIMUM_VJP_CHANNELS)
         {
           completed = session.completedScoreContraction(parameter_version_);
           for (std::size_t slot = 0; slot < contracted_count; ++slot)
@@ -2727,6 +2746,7 @@ protected:
                     << shared_scratch_->device_ecp_chunk.capacity() << ", retained_full_HOST_channel_bytes="
                     << (channel_accumulators_[0].capacity() + channel_accumulators_[1].capacity() +
                         channel_accumulators_[2].capacity()) * sizeof(wftrain::DerivativeValue)
+                    << ", complete_ECP_appended=" << append_ecp_host
                     << "; completed generation pinned through sink callbacks" << std::endl;
         }
         else
@@ -2764,7 +2784,7 @@ protected:
         }
       }
 #endif
-      if (needs_ecp)
+      if (needs_ecp && !append_ecp_host)
         accumulateECPReplayVJPs(channels);
     }
 
