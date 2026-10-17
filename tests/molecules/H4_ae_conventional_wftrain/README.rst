@@ -155,3 +155,17 @@ The frozen later application source ``2b8f88a99``/SHA256
 passed 64-global-sample updates and strict initialized two-rank checkpoint
 restart. It is not the original round110 binary. The old PASS message's
 hardcoded 32 was diagnostic only; actual CSV sample counts were 64.
+
+Actual pure-CI candidate comparison
+----------------------------------
+
+``short-H4-ae-conventional-ci-old-new`` is available under the existing real
+FP64/non-offload/Python dependency guards when ``test_new_drivers`` exists.
+The optional checker pair ``--ci-old-new --ci-oracle TEST_EXE`` runs one old
+OneShiftOnly and one new full-LM step, maps actual CI1 scalars, then supplies
+their immutable file to the existing four-configuration physical/dense oracle.
+The source C0=.6, SPO and J2 stay fixed. Native sampling is independent; no
+equal-update, energy-improvement, statistical ranking or convergence is claimed.
+Actual133 qualified the native pair and2781 oracle assertions, preserving132's
+checker branch failure. This registration adds no scientific rerun; process
+caps and owned-group cleanup are unchanged (oracle90s, whole helper300s).

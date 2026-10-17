@@ -40,6 +40,13 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
                            short-H4-ae-conventional-wftrain-mdj-pii
                            short-H4-ae-conventional-wftrain-csf-j2-pii
                            PROPERTIES TIMEOUT 300 PROCESSORS 1)
+      if(TARGET test_new_drivers)
+        add_test(NAME short-H4-ae-conventional-ci-old-new
+                 COMMAND ${Python3_EXECUTABLE} "${MDJ_CHECKER}" $<TARGET_FILE:qmcpack>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_mdj.xml" --ci-old-new
+                         --ci-oracle $<TARGET_FILE:test_new_drivers>)
+        set_tests_properties(short-H4-ae-conventional-ci-old-new PROPERTIES TIMEOUT 310 PROCESSORS 1)
+      endif()
     endif()
   endif()
 endif()

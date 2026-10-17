@@ -262,6 +262,8 @@ def main():
                         help="bounded original batched OneShiftOnly versus new Adam integration comparison")
     parser.add_argument("--ci-old-new", action="store_true",
                         help="one H4 pure-CI OneShiftOnly/full-LM candidate pair; no equal-update claim")
+    parser.add_argument("--ci-oracle", type=Path,
+                        help="existing test_new_drivers for the --ci-old-new actual-candidate physical oracle")
     parser.add_argument("--periodic-heg", action="store_true",
                         help="bounded HEG14 Gamma Adam/SR, full model import/restart and periodic identity negatives")
     parser.add_argument("--md-orbital", action="store_true",
@@ -329,6 +331,8 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.ci_oracle and not args.ci_old_new:
+        parser.error("--ci-oracle requires --ci-old-new")
     if args.ci_old_new:
         if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
                 args.old_new, args.restart, args.preflight, args.model_import, args.profile_only,
@@ -553,14 +557,17 @@ def main():
         print(f"VP physical reference max_abs_difference={np.max(np.abs(actual - expected)):.17g}; "
               "rtol=atol=3e-12; discrete fields exact", flush=True)
 
-    def launch(directory):
+    def launch(directory, ci_oracle=False):
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
         command = [str(executable), "run.xml"]
+        if ci_oracle:
+            environment["TASK46_CI_CANDIDATE_FILE"] = str((work / "candidate_c1.txt").resolve())
+            command = [str(args.ci_oracle.resolve(strict=True)), "[legacy_adapter][ci_family_oracle]"]
         if args.ranks > 1:
             command = [args.mpiexec, "-np", str(args.ranks)] + command
         if args.old_new:
             command = ["/usr/bin/time", "-v", "-o", "resource_time.txt"] + command
-        child_cap = 120 if args.joint_ci_orbital_ecp_alm and args.ranks == 2 else 180
+        child_cap = 90 if ci_oracle else 120 if args.joint_ci_orbital_ecp_alm and args.ranks == 2 else 180
         timeout = child_cap if deadline is None else min(child_cap, deadline - time.monotonic())
         assert timeout > 0, (directory, "whole-checker 300s cap reached")
         started = time.monotonic()
@@ -588,7 +595,7 @@ def main():
                 "elapsed_seconds": time.monotonic() - started, "exit_code": result.returncode,
                 "native_source": source.group(1) if source else "unreported", "command": command,
                 "environment": {name: environment.get(name) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS")},
-                "input_sha256": hashlib.sha256((directory / "run.xml").read_bytes()).hexdigest(),
+                "input_sha256": hashlib.sha256((work / "candidate_c1.txt" if ci_oracle else directory / "run.xml").read_bytes()).hexdigest(),
                 "memory_scope": "resource_time.txt per-process maxRSS, not aggregate peak"
             }, indent=2) + "\n")
         return result, text
@@ -1340,6 +1347,24 @@ def main():
             old_policy="OneShiftOnly shift_i=1 shift_s=1", new_policy="full LM damping=.01",
             scope="independent native sampling; candidate plumbing only; same-config physical/Rayleigh check pending; no equal/improving update claim"
         ), indent=2) + "\n")
+        if args.ci_oracle:
+            oracle = work / "candidate_oracle"
+            oracle.mkdir()
+            candidate_hash = hashlib.sha256((work / "candidate_c1.txt").read_bytes()).hexdigest()
+            result, output = launch(oracle, ci_oracle=True)
+            assert result.returncode == 0 and "NOT_RUN" not in output, (oracle, output[-6000:])
+            matches = re.findall(r"TASK46_NATIVE_CI_CANDIDATES_PASS C1=(\S+),(\S+) physical_Rayleigh=(\S+),(\S+)", output)
+            assert len(matches) == 1 and all(np.isfinite(float(value)) for value in matches[0]), oracle
+            np.testing.assert_array_equal(np.asarray(matches[0][:2], dtype=float), list(candidates.values()))
+            assert hashlib.sha256((work / "candidate_c1.txt").read_bytes()).hexdigest() == candidate_hash
+            comparison = json.loads((work / "candidate_comparison.json").read_text())
+            comparison.update(oracle_test_sha256=hashlib.sha256(args.ci_oracle.read_bytes()).hexdigest(),
+                              candidate_file_sha256=candidate_hash,
+                              same_configuration_physical_Rayleigh=list(map(float, matches[0][2:])),
+                              scope="independently sampled native candidates; same-state physical/dense objective checked; no quality ranking")
+            (work / "candidate_comparison.json").write_text(json.dumps(comparison, indent=2) + "\n")
+            print("PASS actual CI candidates: native receipts plus same-configuration physical/dense Rayleigh oracle")
+            return
         print("PASS candidate plumbing only: actual pure-CI OneShiftOnly/LM scalars mapped by CI1; physical oracle pending")
         return
     if args.periodic_heg or args.md_orbital:
