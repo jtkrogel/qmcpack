@@ -384,8 +384,9 @@ public:
   {}
 
   /// Record actual loaded model dimensions, not manifest guesses.
-  void realizedShape(std::size_t determinants, std::size_t width, std::size_t heads, std::size_t blocks)
-  { realized_shape_ = {determinants, width, heads, blocks}; }
+  void realizedShape(std::size_t determinants, std::size_t width, std::size_t heads,
+                     std::size_t blocks, std::size_t input_width)
+  { realized_shape_ = {determinants, width, heads, blocks, input_width}; }
 
   /// Record RSS and peak RSS at one explicit lifetime boundary.
   void snapshot(std::string name, std::map<std::string, std::uint64_t> categories = {})
@@ -397,6 +398,8 @@ public:
     const std::uint64_t current = currentResidentBytes();
     const std::uint64_t peak    = std::max(current, peakResidentBytes());
     phases_.push_back({std::move(name), current, peak, accounted, std::move(categories)});
+    if (!options_.output_path.empty() && (options_.scenario == "complete_vgl" || options_.scenario == "batch_value"))
+      write(); // Preserve completed preparation evidence if a later request is censored.
   }
 
   /// Emit the report to stdout or the requested file.
@@ -443,11 +446,12 @@ private:
            << ",\"configurations\":" << metadata_.configurations
            << ",\"electrons\":" << metadata_.electrons
            << ",\"nuclei\":" << metadata_.nuclei
+           << ",\"nuclei_per_electron\":" << static_cast<double>(metadata_.nuclei) / metadata_.electrons
            << ",\"spin_up\":" << metadata_.spin_up
            << ",\"spin_down\":" << metadata_.spin_down << "},\n"
            << "  \"realized_shape\":{\"determinants\":" << realized_shape_[0]
            << ",\"width\":" << realized_shape_[1] << ",\"heads\":" << realized_shape_[2]
-           << ",\"blocks\":" << realized_shape_[3] << "},\n"
+           << ",\"blocks\":" << realized_shape_[3] << ",\"input_width\":" << realized_shape_[4] << "},\n"
            << "  \"provenance\":{\n"
            << "    \"qmcpack_version\":"
            << jsonString(std::to_string(QMCPACK_VERSION_MAJOR) + "." +
@@ -529,7 +533,7 @@ private:
   Options options_;
   ModelMetadata metadata_;
   std::vector<Phase> phases_;
-  std::array<std::size_t, 4> realized_shape_{};
+  std::array<std::size_t, 5> realized_shape_{};
 };
 
 /** Write the standard generated export to a persistent caller-owned directory. */
@@ -601,9 +605,9 @@ void runCompleteRequest(const Options& options, const ModelMetadata& metadata, M
 {
   report.snapshot("baseline");
   pf::PsiFormer model(options.parameter_path, options.configuration_path);
-  report.realizedShape(model.ndet, model.dim, model.heads, model.blocks);
   auto plan = makePlan(model);
   pf::DirectValueExecutor value(model, plan);
+  report.realizedShape(model.ndet, model.dim, model.heads, model.blocks, value.layout()->inputWidth());
   pf::DirectSpatialExecutor spatial(model, value, plan);
   report.snapshot("model_loaded", {{"model_numeric", metadata.accountedModelNumericBytes()}});
   const std::size_t ne = metadata.electrons;
@@ -634,7 +638,9 @@ void runCompleteRequest(const Options& options, const ModelMetadata& metadata, M
     auto workspace = batch.makeWorkspace();
     const pf::DirectBatchCapacityPlan capacity{{options.walkers, 0, 0, 0, 0},
                                                {options.configuration_tile, 0, 0}};
-    if (workspace->storageRequirement(capacity).totalBytes() > options.owner_budget)
+    const auto attempted = workspace->storageRequirement(capacity).totalBytes();
+    std::cerr << "attempted_owner_bytes: " << attempted << std::endl;
+    if (attempted > options.owner_budget)
       throw std::length_error("VALUE owner exceeds benchmark cap before preparation");
     workspace->prepare(capacity);
     workspace->resize(pf::DirectBatchMode::VALUE_ONLY, options.walkers);
@@ -663,6 +669,7 @@ void runCompleteRequest(const Options& options, const ModelMetadata& metadata, M
     const auto predicted = pf::targetSpatialWorkspaceStorageRequirement(
         {ne, shape.nuclei, shape.determinants, shape.feature_dimension,
          shape.attention_heads, value.layout()->inputWidth(), 0, 0}, targets);
+    std::cerr << "attempted_owner_bytes: " << predicted << std::endl;
     if (predicted > options.owner_budget) throw std::length_error("Spatial owner exceeds benchmark cap");
     auto workspace = options.target_tile ? spatial.makeTargetWorkspace(targets, options.owner_budget)
                                         : spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
