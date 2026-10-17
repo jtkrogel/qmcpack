@@ -12951,7 +12951,7 @@ PsiFormerWF::prepareResidentDeviceAdamPublication(std::unique_ptr<ResidentDevice
 #endif
 }
 
-/// Consume one admitted real/open AE C3 into owning DEVICE bytes, never a HOST candidate.
+/// Consume one admitted real/open complete C3 into owning DEVICE bytes, never a HOST candidate.
 std::unique_ptr<PsiFormerWF::ResidentDeviceSRProposal> PsiFormerWF::consumeResidentEnergySRDevice(
     const wftrain::StreamingDerivativeOperator& derivative,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
@@ -12961,14 +12961,17 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceSRProposal> PsiFormerWF::consumeResid
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
-  if (system_kind_ != "all_electron" || !model_state_->resident_device_authority_enabled ||
+  const bool has_ecp = source && source->ecp_replay_;
+  const auto complete_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+      (has_ecp ? wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) : 0);
+  if (system_kind_ != (has_ecp ? "pseudopotential" : "all_electron") || !model_state_->resident_device_authority_enabled ||
       !model_state_->resident_energy_sr_reuse || !source || source->model_state_ != model_state_ ||
-      source->shared_scratch_ != model_state_->resident_energy_scratch || source->ecp_replay_ ||
+      source->shared_scratch_ != model_state_->resident_energy_scratch ||
       !derivative.sampleCount() || weights.size() != derivative.sampleCount() || channels.size() != 3 ||
       channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
-      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      channels[0].local_energy_term_mask != complete_mask ||
       channels[1].product != wftrain::DerivativeProduct::SCORE_VJP || channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
-    throw std::invalid_argument("DEVICE SR authority requires this provider's retained real/open AE T/EO/O batch");
+    throw std::invalid_argument("DEVICE SR authority requires this provider's retained real/open complete T/EO/O batch");
   (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
   using Owner = psiformer::device::PreparedDevicePcg;
   std::vector<Owner::FrozenInterval> frozen;

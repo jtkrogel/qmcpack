@@ -553,7 +553,7 @@ public:
     virtual std::size_t commit() noexcept = 0;
   };
 
-  /// Hidden real/open AE terminal: exact C3, retained solver and explicit DEVICE authority only.
+  /// Hidden real/open terminal: exact complete C3, retained solver and explicit DEVICE authority only.
   std::unique_ptr<ResidentDeviceSRProposal> consumeResidentEnergySRDevice(
       const wftrain::StreamingDerivativeOperator& derivative,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,

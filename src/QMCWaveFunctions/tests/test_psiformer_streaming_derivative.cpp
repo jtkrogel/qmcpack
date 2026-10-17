@@ -1776,6 +1776,146 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     }
     CHECK_THROWS(propose()); // Old accepted grid/source cannot survive publication.
   }
+  // Component-only complete ECP SR: native Hamiltonian/mask admission remains closed.
+  {
+    ScopedEnvironmentVariable authority_flag("PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY", "1");
+    ScopedEnvironmentVariable reuse("PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE", "on");
+    auto sr_resolution = resolution; sr_resolution.validated_operations = ps::allPsiFormerAcceleratorOperations();
+    PsiFormerWF sr_cpu("sr_ecp", initialized, electrons, ions);
+    PsiFormerWF sr_gpu("sr_ecp", initialized, electrons, ions, false, {}, false, {}, {}, sr_resolution);
+    sr_cpu.validateSystem(electrons, ions, "pseudopotential");
+    sr_gpu.validateSystem(electrons, ions, "pseudopotential");
+    const std::pair<std::size_t, std::size_t> budget{64 * 1024 * 1024, 1024 * 1024};
+    sr_gpu.prepareResidentEnergySR(2, budget);
+    const auto allowance = sr_gpu.prepareResidentDeviceAuthority();
+    ParticleSet second_sample(electrons); second_sample.R[0][0] += .031; second_sample.update();
+    RefVectorWithLeader<ParticleSet> samples(electrons, {electrons, second_sample});
+    const std::vector<double> weights{1, 2};
+    constexpr double total_weight = 3, mean_energy = (-2.3 - 3.8) / 3, damping = .3, rate = 1e-4;
+    const auto complete_mask = ecp | wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+    const std::vector<DerivativeValue> w{{1, 0}, {2, 0}}, ew{{-2.3, 0}, {-3.8, 0}};
+    const auto channels_for = [&](const StreamingDerivativeOperator& op) {
+      return std::vector<VJPCoefficientChannel>{
+        {"T", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(op, w), complete_mask},
+        {"EO", DerivativeProduct::SCORE_VJP, coefficientsFor(op, ew)},
+        {"O", DerivativeProduct::SCORE_VJP, coefficientsFor(op, w)}};
+    };
+    const auto capture_two = [&](PsiFormerWF& component, std::size_t version, bool node = false) {
+      PsiFormerWF copy(component);
+      RefVectorWithLeader<WaveFunctionComponent> components(component, {component, copy});
+      auto op = component.makeStreamingDerivativeOperator(components, samples, version, 0, 17);
+      auto consumer = component.makeNonLocalECPDerivativeConsumer(components, samples, 17, true, true);
+      wftrain::NonLocalECPDerivativeContext context;
+      context.provider_id = op->parameterSchema().providerId(); context.schema_fingerprint = op->parameterSchema().fingerprint();
+      context.parameter_version = op->parameterVersion(); context.batch_ordinal = version;
+      context.sample_count = 2; context.expected_point_count = 18; context.grid_fingerprint = 0x731934d2;
+      auto channels = channels_for(*op); SelectedParameterSink unused(selected);
+      consumer->begin(context, {channels.data(), channels.size()}, unused);
+      std::vector<ParticleSet::PosType> grid; std::vector<QMCTraits::ValueType> factors;
+      for (std::size_t s = 0; s < 2; ++s)
+        for (std::size_t q = 0; q < 9; ++q)
+        {
+          grid.push_back(samples[s].R[q < 5 ? 0 : 1] + ParticleSet::PosType{.003 * (q + 1), -.011, .007});
+          factors.push_back(bare[q]);
+        }
+      if (node) { grid[0] = samples[0].R[1]; factors[0] = 0; }
+      const std::vector<std::size_t> two_offsets{0, 5, 9, 14, 18};
+      const std::vector<VirtualParticleBatch::Segment> two_segments{{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+      const VirtualParticleBatch two_batch(2, two_offsets, two_segments, grid);
+      VirtualParticleSet v0(electrons), v1(second_sample);
+      RefVectorWithLeader<VirtualParticleSet> virtuals(v0, {v0, v1});
+      ResourceCollection prototype("sr_ecp_grid"); component.createResource(prototype);
+      ResourceCollection resources(prototype);
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+      std::vector<QMCTraits::ValueType> ratios(grid.size());
+      const auto stamp = component.mw_evaluateVirtualRatios(components, samples, virtuals, two_batch, ratios);
+      for (std::size_t i = 0; i < grid.size(); ++i)
+        ratios[i] *= std::exp(.23 * (grid[i][0] - samples[i / 9].R[i % 9 < 5 ? 0 : 1][0]));
+      const std::vector<WaveFunctionComponent::EvaluationStamp> stamps{stamp};
+      consumer->consume({two_batch, {factors.data(), factors.size()}, {ratios.data(), ratios.size()},
+          {stamps.data(), stamps.size()}, 0, context.grid_fingerprint});
+      consumer->end(); op->bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+      return op;
+    };
+    wftrain::KrylovSolverControl control;
+    control.maximum_iterations = 20; control.maximum_operator_applications = 24;
+    control.relative_tolerance = 1e-9; control.absolute_tolerance = 1e-10;
+    for (std::size_t step = 0; step < 2; ++step)
+    {
+      for (std::size_t s = 0; s < samples.size(); ++s)
+      {
+        auto& sample = samples[s];
+        sample.G = QMCTraits::GradType{}; sample.L = QMCTraits::ValueType{};
+        sr_cpu.evaluateLog(sample, sample.G, sample.L);
+      }
+      auto co = capture_two(sr_cpu, step), go = capture_two(sr_gpu, step);
+      auto c = channels_for(*co), g = channels_for(*go);
+      SelectedParameterSink oracle(selected), score_rows(selected);
+      co->applyVJPs({c.data(), c.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, oracle);
+      const std::vector<DerivativeValue> first{{1, 0}, {}}, second{{}, {1, 0}};
+      const VJPCoefficientChannel rows[]{
+        {"first", DerivativeProduct::SCORE_VJP, coefficientsFor(*co, first)},
+        {"second", DerivativeProduct::SCORE_VJP, coefficientsFor(*co, second)}};
+      co->applyVJPs({rows, 2}, wftrain::DerivativeAdjoint::TRANSPOSE, score_rows);
+      auto expected = sr_cpu.snapshotParameters();
+      std::vector<double> gradient(p), delta(p); double squared = 0, dot = 0, gradient_norm = 0, displacement = 0;
+      for (const auto& block : sr_cpu.parameterSchema().blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          const double full = 2 / total_weight * (oracle.results()[0][i].real() + oracle.results()[1][i].real()
+              - mean_energy * oracle.results()[2][i].real());
+          gradient_norm = std::hypot(gradient_norm, full);
+          gradient[i] = block.trainable ? full : 0;
+          delta[i] = block.trainable ? score_rows.results()[0][i].real() - score_rows.results()[1][i].real() : 0;
+          squared += delta[i] * delta[i]; dot += delta[i] * gradient[i];
+        }
+      constexpr double a = 2.0 / 9;
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        const double direction = gradient[i] / damping - a * delta[i] * dot / (damping * (damping + a * squared));
+        const double old = expected.values[i]; expected.values[i] -= rate * direction;
+        displacement = std::hypot(displacement, expected.values[i] - old);
+      }
+      const auto propose = [&] { return sr_gpu.consumeResidentEnergySRDevice(*go, {g.data(), g.size()},
+          weights, total_weight, mean_energy, damping, rate, control, budget, allowance.snapshot_device_bytes); };
+      auto incomplete = g; incomplete[0].local_energy_term_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+      CHECK_THROWS(sr_gpu.consumeResidentEnergySRDevice(*go, {incomplete.data(), incomplete.size()}, weights,
+          total_weight, mean_energy, damping, rate, control, budget, allowance.snapshot_device_bytes));
+      if (!step)
+        CHECK_THROWS(([&] {
+          auto bad = capture_two(sr_gpu, step, true); auto bad_channels = channels_for(*bad);
+          sr_gpu.consumeResidentEnergySRDevice(*bad, {bad_channels.data(), bad_channels.size()}, weights,
+              total_weight, mean_energy, damping, rate, control, budget, allowance.snapshot_device_bytes);
+        }()));
+      { auto discarded = propose(); }
+      auto proposal = propose();
+      CHECK(proposal->diagnostics().solve.converged); CHECK(proposal->diagnostics().solve.iterations == 2);
+      CHECK(proposal->diagnostics().gradient_norm == Catch::Approx(gradient_norm).epsilon(2e-7).margin(2e-9));
+      CHECK(proposal->displacementNorm() == Catch::Approx(displacement).epsilon(2e-7).margin(2e-9));
+      CHECK_THROWS(sr_cpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0));
+      proposal = propose();
+      { auto cancelled = sr_gpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0); }
+      CHECK(sr_gpu.parameterVersion() == step);
+      proposal = propose(); auto publication = sr_gpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0);
+      const auto before = metrics.snapshot(); CHECK(publication->commit() == step + 1);
+      const auto after = metrics.snapshot(); publication.reset();
+      CHECK(after.uploaded_bytes == before.uploaded_bytes); CHECK(after.downloaded_bytes == before.downloaded_bytes);
+      CHECK(after.allocation_calls == before.allocation_calls); CHECK(after.free_calls == before.free_calls);
+      CHECK(after.device_copied_bytes == before.device_copied_bytes);
+      CHECK_THROWS(propose());
+      const auto cold = metrics.snapshot(); const auto actual = sr_gpu.snapshotParameters();
+      CHECK(metrics.snapshot().downloaded_bytes - cold.downloaded_bytes == 8 * p);
+      for (const auto& block : sr_cpu.parameterSchema().blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          CHECK(actual.values[i] == Catch::Approx(expected.values[i]).epsilon(2e-7).margin(2e-9));
+          if (!block.trainable) CHECK(actual.values[i] == expected.values[i]);
+        }
+      expected.values = actual.values; sr_cpu.publishParameters(expected, step);
+    }
+    sr_gpu.releaseResidentEnergySRWorkspace();
+    std::cout << "PASS component ECP DEVICE SR: two_updates=2, samples=2/distinct, Q=18, CPU_rank_one=1, cold_fence=1, native_driver=closed\n";
+  }
   // Independent finite difference of complete ratios on the exact same frozen grid.
   const auto base = cpu.snapshotParameters();
   const auto energy = [&](double displacement) {
