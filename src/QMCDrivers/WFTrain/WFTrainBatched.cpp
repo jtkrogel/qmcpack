@@ -1385,18 +1385,20 @@ void WFTrainBatched::process(xmlNodePtr node)
         complex_training_component_ = complex;
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
+        const auto optimizer = training_input_.getOptimizer();
+        const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
+            optimizer == O::STOCHASTIC_RECONFIGURATION ||
+            (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
-             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
-              training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION)))
+             !supported_optimizer))
           throw UniformCommunicateError(
-              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY Adam/plainSGD "
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY host first-order "
               "or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
             training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-            (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
-             training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION) ||
+            !supported_optimizer ||
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
@@ -1405,7 +1407,7 @@ void WFTrainBatched::process(xmlNodePtr node)
               training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
           throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
-              "or positively damped parameter-space SR, no metric-norm/selection controls, "
+              "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
               "and positive finite maximum_retained_bytes");
         if (complex->gpuInferenceEnabled() && training_input_.getWeightDecay() != 0 &&
@@ -1669,8 +1671,22 @@ void WFTrainBatched::run()
           checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
       const auto configuration_bytes = checkedMemoryMultiply(samples, checkedMemoryAdd(sizeof(double),
           checkedMemoryMultiply(n, sizeof(target.R[0]) + sizeof(target.G[0]) + sizeof(target.L[0]))));
-      const auto optimizer_bytes = training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM
-          ? checkedMemoryMultiply(checkedMemoryMultiply(2, p), sizeof(double)) : 0;
+      // Name actual persistent host recurrence storage BEFORE allocating it.
+      // Snapshot/selection copies belong to the separate conservative allowance.
+      std::size_t optimizer_vectors = 0;
+      using O = WFTrainDriverInput::Optimizer;
+      switch (training_input_.getOptimizer())
+      {
+      case O::SGD: break;
+      case O::MOMENTUM_SGD:
+      case O::RMSPROP: optimizer_vectors = 1; break;
+      case O::ADAM: optimizer_vectors = 2; break;
+      case O::AMSGRAD: optimizer_vectors = 3; break;
+      default: break;
+      }
+      const auto optimizer_bytes = checkedMemoryMultiply(checkedMemoryMultiply(optimizer_vectors, p), sizeof(double));
+      app_log() << "WFTrain paired host recurrence before allocation: vectors=" << optimizer_vectors
+                << " named_numeric_bytes=" << optimizer_bytes << std::endl;
       // Explicit conservative allowance, NOT measured retained storage or a hard process-peak claim.
       allowance = checkedMemoryAdd(checkedMemoryMultiply(p,
           12 * sizeof(double) + 3 * sizeof(wftrain::DerivativeValue)),
