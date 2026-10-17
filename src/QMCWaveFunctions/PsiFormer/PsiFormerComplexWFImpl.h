@@ -623,8 +623,6 @@ struct PsiFormerComplexWF::Impl
         for (const auto* storage : std::array<const std::vector<C>*, 2>{&complete_weights, &sample_coefficients})
           psiformer::determinant::detail::mixStorage(d.storage_fingerprint, *storage);
         psiformer::determinant::detail::mixStorage(d.storage_fingerprint, references);
-        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, virtual_positions);
-        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, joined_positions);
       }
       return d;
     }
@@ -654,13 +652,8 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Complex replay source/grid/schema/reference diagnostics mismatch");
       if (samples > lane->maximum_samples || points.size() > lane->maximum_samples - samples)
         throw std::length_error("Complex replay B+Q exceeds the existing numerical request capacity");
-      const auto stride = positions.size() / samples;
       const char* message = "Complex replay HOST admission overflow";
-      const auto virtual_count = pf::checkedStorageProduct(points.size(), stride, message);
-      const auto joined_count = pf::checkedStorageProduct(samples + points.size(), stride, message);
       std::size_t extra = diagnostics.retained_numeric_bytes;
-      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(virtual_count, message), message);
-      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(joined_count, message), message);
       pf::addStorageBytes(extra, pf::checkedStorageBytes<std::size_t>(points.size(), message), message);
       pf::addStorageBytes(extra, pf::checkedStorageBytes<C>(samples + points.size(), message), message);
       const auto current_host = storageDiagnostics().retained_numeric_bytes - lane->products->cost().device_bytes;
@@ -719,26 +712,19 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Complex replay tile coverage is incomplete");
       app_log() << "Complex replay before allocation: HOST_additional_bytes=" << extra
                 << ", bases=" << samples << ", points=" << points.size() << "; DEVICE_additional_bytes=0; C1_only=yes" << std::endl;
-      std::vector<double> virtuals(virtual_count), joined(joined_count);
       std::vector<std::size_t> refs(points.size());
       std::vector<C> weights(points.size()), coefficients(samples);
-      std::copy(positions.begin(), positions.end(), joined.begin());
       for (std::size_t q = 0; q < points.size(); ++q)
       {
         const auto& point = points[q]; refs[q] = point.sample; weights[q] = point.bare_weight * point.complete_ratio;
-        std::copy_n(positions.data() + point.sample * stride, stride, virtuals.data() + q * stride);
-        std::copy(point.replacement_position.begin(), point.replacement_position.end(), virtuals.data() + q * stride + 3 * point.electron);
       }
-      std::copy(virtuals.begin(), virtuals.end(), joined.begin() + positions.size());
       std::size_t actual = diagnostics.retained_numeric_bytes;
-      for (const auto* storage : {&virtuals, &joined})
-        pf::addStorageBytes(actual, pf::checkedStorageBytes<double>(storage->capacity(), message), message);
       for (const auto* storage : {&weights, &coefficients})
         pf::addStorageBytes(actual, pf::checkedStorageBytes<C>(storage->capacity(), message), message);
       pf::addStorageBytes(actual, pf::checkedStorageBytes<std::size_t>(refs.capacity(), message), message);
       if (actual > host_cap || current_host > host_cap - actual)
         throw std::length_error("Complex replay concrete HOST capacities exceed factory admission");
-      virtual_positions.swap(virtuals); joined_positions.swap(joined); references.swap(refs);
+      references.swap(refs);
       complete_weights.swap(weights); sample_coefficients.swap(coefficients); replay = std::move(incoming);
       replay_bound.store(true, std::memory_order_release);
     }
@@ -748,12 +734,19 @@ struct PsiFormerComplexWF::Impl
     {
       std::size_t bytes = 0;
       const char* message = "Complex replay HOST capacity overflow";
-      for (const auto* storage : {&virtual_positions, &joined_positions})
-        pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(storage->capacity(), message), message);
       for (const auto* storage : std::array<const std::vector<C>*, 2>{&complete_weights, &sample_coefficients})
         pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(storage->capacity(), message), message);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<std::size_t>(references.capacity(), message), message);
       return bytes;
+    }
+
+    /// Borrow immutable move metadata only; this accessor never locks or calls the model.
+    auto replacementAccessor() const
+    {
+      return [this](std::size_t q) {
+        const auto& point = replay->points()[q];
+        return psiformer::device::ComplexVirtualReplacement{point.electron, point.replacement_position};
+      };
     }
 
     /// Every action/binding starts under the same execution lease and exact Model read fence.
@@ -822,7 +815,7 @@ struct PsiFormerComplexWF::Impl
         if (!replay) throw std::invalid_argument("Complex local-energy JVP requires bound replay");
         const auto terms = localTerms(mask);
         std::unique_lock gpu(lane->generation->mutex);
-        lane->products->evaluateLocalEnergyJVP(joined_positions, samples, references, complete_weights,
+        lane->products->evaluateLocalEnergyJVPReplacements(positions, replacementAccessor(), references, complete_weights,
             inverse_masses, lane->state->cartesian_twist, terms, direction.values().data(), direction.values().size());
         const auto result = lane->products->localEnergyJvpView(); lane->products->validate(result); output = result.data;
       }
@@ -877,7 +870,7 @@ struct PsiFormerComplexWF::Impl
           if (replay && energy_channel != requested.size())
           {
             std::copy_n(requested[energy_channel].coefficients.values.data(), samples, sample_coefficients.data());
-            lane->products->evaluateLocalEnergyVJP(positions, virtual_positions, references, complete_weights,
+            lane->products->evaluateLocalEnergyVJPReplacements(positions, replacementAccessor(), references, complete_weights,
                 sample_coefficients, inverse_masses, lane->state->cartesian_twist,
                 localTerms(requested[energy_channel].local_energy_term_mask), adjoint == DerivativeAdjoint::HERMITIAN,
                 requested.size() > 1 ? &lane->channels : nullptr, energy_channel);
@@ -910,7 +903,6 @@ struct PsiFormerComplexWF::Impl
     std::vector<double> positions, inverse_masses;
     std::unique_ptr<wftrain::NonLocalECPJVPReplay> replay;
     std::atomic<bool> replay_bound{false};
-    std::vector<double> virtual_positions, joined_positions;
     std::vector<std::size_t> references;
     std::vector<C> complete_weights;
     mutable std::vector<C> sample_coefficients;
@@ -1027,9 +1019,6 @@ struct PsiFormerComplexWF::Impl
           sizeof(wftrain::NonLocalECPReplayTile), sizeof(WaveFunctionComponent::EvaluationStamp)})
         pf::addStorageBytes(bytes, pf::checkedStorageProduct(q, size, error), error);
       std::size_t extra = bytes;
-      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(
-          pf::checkedStorageProduct(pf::checkedStorageSum(samples,
-              pf::checkedStorageProduct(2, q, error), error), stride, error), error), error);
       pf::addStorageBytes(extra, pf::checkedStorageBytes<std::size_t>(q, error), error);
       pf::addStorageBytes(extra, pf::checkedStorageBytes<C>(pf::checkedStorageSum(samples, q, error), error), error);
       return {bytes, extra};

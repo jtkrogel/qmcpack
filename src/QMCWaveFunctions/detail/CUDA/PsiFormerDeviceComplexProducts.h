@@ -13,6 +13,9 @@ namespace qmcplusplus::psiformer::device
 /// Direct numerical callers retain HOST results unless bounded output is explicit.
 enum class ComplexProductsHostOutput { RETAINED, CHUNKED };
 
+/// One domain-neutral virtual move, supplied by an immutable caller-owned accessor.
+struct ComplexVirtualReplacement { std::size_t electron; std::array<double, 3> xyz; };
+
 /// Complete numerical ownership, excluding shared immutable image/vendor/caller inputs.
 struct ComplexProductsCost
 {
@@ -225,25 +228,64 @@ public:
       std::size_t energy_channel = 0)
   {
     ready_ = jvp_ready_ = false;
+    const auto stride = positions_.size();
+    if (virtual_positions.size() % stride)
+      throw std::invalid_argument("Complex nonlocal packed coordinate extent mismatch");
+    evaluateLocalEnergyVJPSource(base_positions, virtual_positions.size() / stride,
+        [&](std::size_t q) { std::copy_n(virtual_positions.data() + q * stride, stride, positions_.data()); },
+        references, complete_weights, coefficients, inverse_masses, kappa, terms, hermitian, channels, energy_channel);
+  }
+
+  /// Reconstruct virtual coordinates in existing scratch; accessor must be pure and immutable for this request.
+  template<class Replacement>
+  void evaluateLocalEnergyVJPReplacements(const std::vector<double>& base_positions, Replacement replacement,
+      const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const std::vector<Complex>& coefficients, const std::vector<double>& inverse_masses,
+      const std::array<double, 3>& kappa, LocalTerms terms, bool hermitian = false,
+      const std::vector<Channel>* channels = nullptr, std::size_t energy_channel = 0)
+  {
+    evaluateLocalEnergyVJPSource(base_positions, references.size(),
+        [&](std::size_t q) { loadReplacement(base_positions, references[q], replacement(q)); },
+        references, complete_weights, coefficients, inverse_masses, kappa, terms, hermitian, channels, energy_channel);
+  }
+
+private:
+  /// Share packed and replacement-source arithmetic, including one final finite publication.
+  template<class LoadVirtual>
+  void evaluateLocalEnergyVJPSource(const std::vector<double>& base_positions, std::size_t q,
+      LoadVirtual load_virtual, const std::vector<std::size_t>& references,
+      const std::vector<Complex>& complete_weights, const std::vector<Complex>& coefficients,
+      const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
+      LocalTerms terms, bool hermitian, const std::vector<Channel>* channels, std::size_t energy_channel)
+  {
+    ready_ = jvp_ready_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
     ++generation_;
     image_->validateCurrentDevice();
     const auto stride = 3 * cost_.electrons;
-    const auto b = base_positions.size() / stride, q = virtual_positions.size() / stride;
+    const auto b = base_positions.size() / stride;
     const bool kinetic = hasKinetic(terms), nonlocal = hasNonlocal(terms);
     if (!cost_.channels || !b || b > cost_.maximum_samples || (nonlocal && q > cost_.maximum_samples - b) ||
-        base_positions.size() % stride || virtual_positions.size() % stride ||
+        base_positions.size() % stride ||
         coefficients.size() != b || references.size() != q || complete_weights.size() != q)
       throw std::invalid_argument("Complex nonlocal C1 packed grid/request extent mismatch");
     if (kinetic) validateKinetic(inverse_masses, kappa, b);
     const auto finite = [](Complex value) {
       return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
     };
-    for (const auto* positions : {&base_positions, &virtual_positions})
-      for (double value : *positions)
+    for (double value : base_positions)
         if (!device_math::isFiniteBinary64(value))
           throw std::invalid_argument("Complex nonlocal nonfinite coordinate");
+    for (std::size_t point = 0; point < q; ++point)
+    {
+      if (references[point] >= b)
+        throw std::invalid_argument("Complex nonlocal virtual reference is invalid");
+      load_virtual(point);
+      for (double value : positions_)
+        if (!device_math::isFiniteBinary64(value))
+          throw std::invalid_argument("Complex nonlocal nonfinite virtual coordinate");
+    }
     for (auto value : coefficients)
       if (!finite(value)) throw std::invalid_argument("Complex nonlocal nonfinite sample coefficient");
     // Optional SCORE EO/O channels share the base score and the single finite publication.
@@ -284,7 +326,8 @@ public:
     {
       const auto weighted = coefficients[references[point]] *
           (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
-      accumulateNonlocalScore(virtual_positions.data() + point * stride, weighted, hermitian, energy_channel);
+      load_virtual(point);
+      accumulateNonlocalScore(positions_.data(), weighted, hermitian, energy_channel);
     }
     // Evaluate even zero-weight references/virtuals: undefined node scores are not zero.
     for (std::size_t sample = 0; sample < b; ++sample)
@@ -315,11 +358,35 @@ public:
     publishCompleted();
   }
 
+  /// Apply one admitted move over its accepted base in the existing single-configuration scratch.
+  void loadReplacement(const std::vector<double>& bases, std::size_t reference, ComplexVirtualReplacement move)
+  {
+    if (reference >= bases.size() / positions_.size() || move.electron >= cost_.electrons)
+      throw std::invalid_argument("Complex virtual replacement reference/electron is invalid");
+    std::copy_n(bases.data() + reference * positions_.size(), positions_.size(), positions_.data());
+    std::copy(move.xyz.begin(), move.xyz.end(), positions_.begin() + 3 * move.electron);
+  }
+
+public:
+
   /** Full-score-then-device-dot JVP for a REAL canonical direction.
    * Upload oneP direction per request, reuse across B1 numerical samples, and
    * download only complex scalar/status results. No B*P Jacobian or CPU tape.
    */
   void evaluateScoreJVP(const std::vector<double>& positions, const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
+    if (positions.size() % positions_.size())
+      throw std::invalid_argument("Complex score JVP coordinate extent mismatch");
+    evaluateScoreJVPSource(positions.size() / positions_.size(), [&](std::size_t sample) {
+      std::copy_n(positions.data() + sample * positions_.size(), positions_.size(), positions_.data());
+    }, direction, count);
+  }
+
+private:
+  /// Validate every source coordinate before uploading the one shared direction.
+  template<class LoadSample>
+  void evaluateScoreJVPSource(std::size_t b, LoadSample load_sample, const Complex* direction, std::size_t count)
   {
     ready_ = jvp_ready_ = false;
     nonlocal_jvp_ = false;
@@ -328,16 +395,20 @@ public:
       throw std::overflow_error("Complex products generation exhausted");
     ++generation_;
     image_->validateCurrentDevice();
-    const auto n = cost_.electrons, p = cost_.parameters, b = positions.size() / (3 * n);
-    if (!b || b > cost_.maximum_samples || positions.size() != b * 3 * n || !direction || count != p)
+    const auto p = cost_.parameters;
+    if (!b || b > cost_.maximum_samples || !direction || count != p)
       throw std::invalid_argument("Complex score JVP coordinate/direction extent mismatch");
-    for (double value : positions)
-      if (!device_math::isFiniteBinary64(value))
-        throw std::invalid_argument("Complex score JVP nonfinite coordinate");
+    for (std::size_t sample = 0; sample < b; ++sample)
+    {
+      load_sample(sample);
+      for (double value : positions_)
+        if (!device_math::isFiniteBinary64(value))
+          throw std::invalid_argument("Complex score JVP nonfinite coordinate");
+    }
     prepareDirection(direction, count);
     for (std::size_t sample = 0; sample < b; ++sample)
     {
-      std::copy_n(positions.data() + 3 * sample * n, 3 * n, positions_.data());
+      load_sample(sample);
       score_->evaluate(positions_);
       const auto score = score_->resultView();
       if (score.image != image_.get() || score.count != p)
@@ -348,6 +419,8 @@ public:
     jvp_ready_ = true;
   }
 
+public:
+
   /** Borrow combined [B base, Q virtual] packing and produce one complete response per base.
    * Existing full-score/device-dot work uploads one REAL direction; Wq includes
    * all fixed component and outer-phase ratios. No coordinate/scalar array is allocated.
@@ -357,9 +430,23 @@ public:
       const Complex* direction, std::size_t count)
   {
     ready_ = jvp_ready_ = false;
-    const auto stride = 3 * cost_.electrons, total = positions.size() / stride;
+    if (positions.size() % positions_.size())
+      throw std::invalid_argument("Complex nonlocal JVP packed coordinate extent mismatch");
+    evaluateNonlocalJVPSource(positions.size() / positions_.size(), bases, [&](std::size_t sample) {
+      std::copy_n(positions.data() + sample * positions_.size(), positions_.size(), positions_.data());
+    }, references, complete_weights, direction, count);
+  }
+
+private:
+  /// Keep all base dots intact until every virtual-minus-base difference is formed.
+  template<class LoadSample>
+  void evaluateNonlocalJVPSource(std::size_t total, std::size_t bases, LoadSample load_sample,
+      const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
     if (!cost_.channels || !bases || bases > total || total > cost_.maximum_samples ||
-        positions.size() % stride || references.size() != total - bases || complete_weights.size() != references.size())
+        references.size() != total - bases || complete_weights.size() != references.size())
       throw std::invalid_argument("Complex nonlocal JVP C1 packed grid/request extent mismatch");
     const auto finite = [](Complex value) {
       return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
@@ -369,7 +456,7 @@ public:
         throw std::invalid_argument("Complex nonlocal JVP invalid reference/complete weight");
     try
     {
-      evaluateScoreJVP(positions, direction, count); // Checks every coordinate/direction and regular node.
+      evaluateScoreJVPSource(total, load_sample, direction, count); // Validates coordinates and regular nodes.
       jvp_ready_ = false; // Internal score completion must never escape a later reduction failure.
       for (std::size_t point = 0; point < references.size(); ++point)
       {
@@ -395,6 +482,8 @@ public:
     }
   }
 
+public:
+
   /// Borrow [B base,Q virtual] packing; charge B extra dots when kinetic and ECP are combined.
   void evaluateLocalEnergyJVP(const std::vector<double>& positions, std::size_t bases,
       const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
@@ -402,8 +491,42 @@ public:
       LocalTerms terms, const Complex* direction, std::size_t count)
   {
     ready_ = jvp_ready_ = false;
+    if (positions.size() % positions_.size())
+      throw std::invalid_argument("Complex local-energy JVP packed coordinate extent mismatch");
+    evaluateLocalEnergyJVPSource(positions, positions.size() / positions_.size(), bases,
+        [&](std::size_t sample) {
+          std::copy_n(positions.data() + sample * positions_.size(), positions_.size(), positions_.data());
+        }, references, complete_weights, inverse_masses, kappa, terms, direction, count);
+  }
+
+  /// Borrow pure immutable virtual moves instead of constructing combined coordinate packing.
+  template<class Replacement>
+  void evaluateLocalEnergyJVPReplacements(const std::vector<double>& base_positions, Replacement replacement,
+      const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
+      LocalTerms terms, const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
+    const auto bases = base_positions.size() / positions_.size();
+    evaluateLocalEnergyJVPSource(base_positions, spatial_detail::checkedAdd(bases, references.size(),
+        "Complex replacement JVP extent overflow"), bases, [&](std::size_t sample) {
+      if (sample < bases)
+        std::copy_n(base_positions.data() + sample * positions_.size(), positions_.size(), positions_.data());
+      else loadReplacement(base_positions, references[sample - bases], replacement(sample - bases));
+    }, references, complete_weights, inverse_masses, kappa, terms, direction, count);
+  }
+
+private:
+  /// Share complete-response term/work/receipt semantics for either coordinate source.
+  template<class LoadSample>
+  void evaluateLocalEnergyJVPSource(const std::vector<double>& positions, std::size_t total, std::size_t bases,
+      LoadSample load_sample, const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
+      LocalTerms terms, const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
     const bool kinetic = hasKinetic(terms), nonlocal = hasNonlocal(terms);
-    const auto stride = 3 * cost_.electrons, total = positions.size() / stride;
+    const auto stride = 3 * cost_.electrons;
     if (!bases || bases > total || bases > cost_.maximum_samples || positions.size() % stride ||
         (nonlocal && total > cost_.maximum_samples) ||
         (kinetic && nonlocal && bases > cost_.maximum_samples - total))
@@ -412,16 +535,20 @@ public:
     try
     {
       if (nonlocal)
-        evaluateNonlocalJVP(positions, bases, references, complete_weights, direction, count);
+        evaluateNonlocalJVPSource(total, bases, load_sample, references, complete_weights, direction, count);
       else
       {
         if (generation_ == std::numeric_limits<std::size_t>::max())
           throw std::overflow_error("Complex products generation exhausted");
         ++generation_;
         image_->validateCurrentDevice();
-        for (double value : positions)
-          if (!device_math::isFiniteBinary64(value))
-            throw std::invalid_argument("Complex local-energy JVP nonfinite coordinate");
+        for (std::size_t sample = 0; sample < total; ++sample)
+        {
+          load_sample(sample);
+          for (double value : positions_)
+            if (!device_math::isFiniteBinary64(value))
+              throw std::invalid_argument("Complex local-energy JVP nonfinite coordinate");
+        }
         prepareDirection(direction, count);
         std::fill_n(sample_products_.begin(), bases, Complex{});
       }
@@ -448,6 +575,8 @@ public:
       throw;
     }
   }
+
+public:
 
   /// Expose only the final complete response with its exact term mask.
   LocalEnergyJvpView localEnergyJvpView() const

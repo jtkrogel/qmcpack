@@ -372,6 +372,11 @@ void validateComplexProducts()
       }
     };
     physical_weights();
+    const auto replacement = [&](std::size_t point) {
+      const auto electron = point % 4;
+      return ComplexVirtualReplacement{electron, {virtuals[12 * point + 3 * electron],
+          virtuals[12 * point + 3 * electron + 1], virtuals[12 * point + 3 * electron + 2]}};
+    };
     std::vector<std::vector<C>> base_scores(b);
     std::vector<C> tangent(p);
     for (std::size_t i = 0; i < p; ++i) tangent[i] = .01 * (int(i % 13) - 6) / std::sqrt(double(p));
@@ -520,6 +525,10 @@ void validateComplexProducts()
     std::copy_n(virtuals.data() + 3, 3, virtuals.data()); // Same-spin node in the FIRST virtual, with exactly zero weight.
     weights[0] = C{};
     fails([&] { nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions); });
+    fails([&] { nonlocal->evaluateLocalEnergyVJPReplacements(positions, replacement, refs, weights,
+        contractions, masses, kappa, Owner::LocalTerms::NONLOCAL_ECP); });
+    fails([&] { nonlocal->evaluateLocalEnergyJVPReplacements(positions, replacement, refs, weights,
+        masses, kappa, Owner::LocalTerms::NONLOCAL_ECP, tangent.data(), p); });
     auto nodal_joined = positions;
     nodal_joined.insert(nodal_joined.end(), virtuals.begin(), virtuals.end());
     fails([&] { nonlocal->evaluateNonlocalJVP(nodal_joined, b, refs, weights, tangent.data(), p); });
@@ -570,10 +579,30 @@ void validateComplexProducts()
         require(std::abs(local.data[sample] - expected) <= 3e-9 * (1 + std::abs(expected)),
             "Complete local-energy per-base CPU JVP mismatch");
       }
+      const auto before_streamed = metrics.snapshot();
+      nonlocal->evaluateLocalEnergyJVPReplacements(positions, replacement, refs, weights, masses, kappa,
+          terms, tangent.data(), p);
+      const auto streamed = nonlocal->localEnergyJvpView();
+      fails([&] { nonlocal->validate(local); });
+      require(metrics.snapshot().uploaded_bytes - before_streamed.uploaded_bytes == local_traffic[term_index - 1][0] &&
+          metrics.snapshot().downloaded_bytes - before_streamed.downloaded_bytes == local_traffic[term_index - 1][1],
+          "Replacement JVP changed direction ingress or scalar transfers");
+      for (std::size_t sample = 0; sample < b; ++sample)
+        require(streamed.data[sample] == local_dots[sample], "Packed/replacement JVP ordering changed");
       for (bool adjoint : {false, true})
       {
         nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa, terms, adjoint);
         fails([&] { nonlocal->validate(local); });
+        const auto packed = nonlocal->completedResult();
+        for (std::size_t offset = 0; offset < p; offset += chunk)
+        {
+          const auto count = std::min(chunk, p - offset);
+          const auto* values = nonlocal->downloadCompletedChunk(packed, 0, offset, count);
+          std::copy_n(values, count, gpu.data() + offset);
+        }
+        nonlocal->evaluateLocalEnergyVJPReplacements(positions, replacement, refs, weights, contractions,
+            masses, kappa, terms, adjoint);
+        fails([&] { nonlocal->downloadCompletedChunk(packed, 0, 0, 1); });
         const auto completed = nonlocal->completedResult();
         C contracted{};
         for (std::size_t offset = 0; offset < p; offset += chunk)
@@ -582,6 +611,7 @@ void validateComplexProducts()
           const auto* result = nonlocal->downloadCompletedChunk(completed, 0, offset, count);
           for (std::size_t i = 0; i < count; ++i)
           {
+            require(result[i] == gpu[offset + i], "Packed/replacement VJP changed arithmetic order");
             C expected = terms == Terms::KINETIC ? C{} : (adjoint ? conjugate_reference : reference)[offset + i];
             for (std::size_t sample = 0; terms != Terms::NONLOCAL_ECP && sample < b; ++sample)
               expected += contractions[sample] * (adjoint ? std::conj(kinetic_rows[sample][offset + i]) :
@@ -642,6 +672,31 @@ void validateComplexProducts()
     nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa,
         Terms::COMPLETE, false, &complete_channels, 1);
     const auto complete_receipt = nonlocal->completedResult();
+    nonlocal->evaluateLocalEnergyVJPReplacements(positions, replacement, refs, weights, contractions,
+        masses, kappa, Terms::COMPLETE, false, &complete_channels, 1);
+    fails([&] { nonlocal->downloadCompletedChunk(complete_receipt, 1, 0, 1); });
+    const auto before_bad_replacement = metrics.snapshot();
+    const auto invalid_replacement = [&](std::size_t point) {
+      auto move = replacement(point); if (point == q - 1) move.electron = 4; return move;
+    };
+    fails([&] { nonlocal->evaluateLocalEnergyVJPReplacements(positions, invalid_replacement, refs, weights,
+        contractions, masses, kappa, Terms::COMPLETE); });
+    fails([&] { (void)nonlocal->completedResult(); });
+    fails([&] { nonlocal->evaluateLocalEnergyJVPReplacements(positions, invalid_replacement, refs, weights,
+        masses, kappa, Terms::COMPLETE, tangent.data(), p); });
+    fails([&] { (void)nonlocal->localEnergyJvpView(); });
+    require(metrics.snapshot().uploaded_bytes == before_bad_replacement.uploaded_bytes &&
+        metrics.snapshot().downloaded_bytes == before_bad_replacement.downloaded_bytes,
+        "Invalid last replacement launched numerical work");
+    const auto nonfinite_replacement = [&](std::size_t point) {
+      auto move = replacement(point);
+      if (point == q - 1) move.xyz[2] = std::numeric_limits<double>::quiet_NaN();
+      return move;
+    };
+    fails([&] { nonlocal->evaluateLocalEnergyJVPReplacements(positions, nonfinite_replacement, refs, weights,
+        masses, kappa, Terms::COMPLETE, tangent.data(), p); });
+    require(metrics.snapshot().uploaded_bytes == before_bad_replacement.uploaded_bytes,
+        "Nonfinite replacement uploaded direction before complete coordinate preflight");
     const auto before_bad_channel = metrics.snapshot();
     score_coefficients.back() = {std::numeric_limits<double>::infinity(), 0};
     fails([&] { nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa,
@@ -654,6 +709,7 @@ void validateComplexProducts()
         Terms::COMPLETE, false, &complete_channels, 1);
     fails([&] { nonlocal->downloadCompletedChunk(complete_receipt, 1, 0, 1); });
     std::cout << "PASS complex complete C3 energy_slot=1 finite_publication=1 stale_retry=1 same_storage=1\n";
+    std::cout << "PASS complex replacement coordinates B2Q9 packed_exact=1 bothadjoints=1 JVP=1 preflight=1 no_new_owner=1\n";
     std::cout << "PASS complex complete response B=2 Q=9 capacity=13 K_ECP_BOTH=1 CPU_allP=1 physical_FD=1 typed=1 retry=1\n";
     require(nonlocal->storageFingerprint() == nf && metrics.snapshot().allocation_calls == nw.allocation_calls &&
         metrics.snapshot().free_calls == nw.free_calls, "Nonlocal warm request changed prepared ownership");

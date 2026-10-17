@@ -4360,7 +4360,10 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   const auto capture_bytes = gpu.gpuNonLocalReplayRequiredBytes(*op);
   const auto shape_bytes = gpu.gpuNonLocalReplayRequirements(2, 126);
   CHECK(shape_bytes.capture_host_bytes == capture_bytes);
-  CHECK(shape_bytes.bound_host_extra_bytes > capture_bytes);
+  // Binding owns only Q references/weights plus B coefficients; no virtual/joined coordinate bank.
+  CHECK(shape_bytes.bound_host_extra_bytes == capture_bytes + 126 * sizeof(std::size_t) + 128 * sizeof(C));
+  const auto removed_coordinate_bytes = 24 * p.getTotalNum() * (2 + 2 * 126);
+  CHECK(removed_coordinate_bytes == 24384);
   CHECK_THROWS(gpu.gpuNonLocalReplayRequirements(0, 126));
   CHECK_THROWS(gpu.gpuNonLocalReplayRequirements(2, std::numeric_limits<std::size_t>::max()));
   auto& metrics = ps::device::deviceMemoryMetrics(device);
