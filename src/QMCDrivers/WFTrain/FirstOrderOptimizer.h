@@ -87,8 +87,11 @@ public:
 
   using ResidentDeviceAdamConsumer = std::function<double(
       const std::shared_ptr<psiformer::device::PreparedDeviceAdam>&, double, double, double, double, double)>;
-  /// Explicit initial/restart moment upload, before the warm DEVICE-only window.
-  void seedResidentDeviceAdam();
+  /// Seed cold state; a frozen nonzero 2P allowance also vacates HOST mirrors before warm work.
+  void seedResidentDeviceAdam(std::size_t cold_host_allowance = 0);
+
+  /// Actual HOST moment capacity only; this metadata query never materializes a mirror.
+  std::size_t hostMomentMirrorBytes() const noexcept;
   /// Metadata-only proposal; the callback owns its DEVICE candidate and moment owner.
   void proposeResidentDeviceAdam(const StructuredParameterSchema& schema, std::size_t source_version,
                                 const ResidentDeviceAdamConsumer& consume, double& norm);
@@ -146,10 +149,10 @@ public:
   /// Return host mirrors plus owned device recurrence bytes, counted once.
   std::size_t retainedBytes() const noexcept;
 
-  /// Expose the committed first moment for deterministic validation.
+  /// Borrow committed elements until the next mutating optimizer operation (including mirror vacation).
   const std::vector<double>& firstMoment() const;
 
-  /// Expose the committed second moment for deterministic validation.
+  /// Borrow committed elements until the next mutating optimizer operation (including mirror vacation).
   const std::vector<double>& secondMoment() const;
 
   /// Expose the independent AMSGrad running maximum of the second-moment EMA.
@@ -204,6 +207,7 @@ private:
   bool resident_device_proposal_ = false;
   std::size_t resident_source_version_ = 0;
   mutable bool moment_mirrors_stale_ = false;
+  std::size_t cold_moment_host_allowance_ = 0;
 #ifdef ENABLE_CUDA
   std::shared_ptr<psiformer::device::PreparedDeviceAdam> device_adam_;
 #endif
