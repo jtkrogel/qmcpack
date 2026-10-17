@@ -2545,8 +2545,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
         }
         CHECK(block.getLogValueRefDet() == original_log);
         const std::vector<QMCTraits::ValueType> base_ratios(actual.begin(), actual.end());
-        for (const auto [p, q] : {std::pair{0, 1}, std::pair{0, 2}, std::pair{0, 3}, std::pair{1, 2}})
+        for (const auto pair : {std::pair{0, 1}, std::pair{0, 2}, std::pair{0, 3}, std::pair{1, 2}})
         {
+          const int p = pair.first, q = pair.second;
           CAPTURE(p, q);
           block.evaluateOrbitalGeneratorToAcceptedReference(virtual_positions, 0, particle, p, q,
                                                            actual, orbital_derivatives);
