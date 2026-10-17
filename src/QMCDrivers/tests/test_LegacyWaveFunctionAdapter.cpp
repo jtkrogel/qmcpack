@@ -4529,7 +4529,9 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       CHECK_FALSE(ordinary->findMSD().front().get().usesAcceptedReferenceOrbitalVirtualRatios());
     }
     source->evaluateLog(particles);
-    LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
+    auto options = adapterOptions();
+    if (joint) options.maximum_parameter_count = 17;
+    LegacyWaveFunctionAdapter adapter("conventional", *source, options);
     REQUIRE(adapter.snapshotParameters().values.size() == (joint ? 17 : md ? 16 : many ? 8 : 6));
     if (joint)
     {
