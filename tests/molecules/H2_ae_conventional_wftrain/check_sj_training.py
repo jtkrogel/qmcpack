@@ -177,6 +177,8 @@ def main():
                         help="bounded HEG14 Gamma Adam/SR, full model import/restart and periodic identity negatives")
     parser.add_argument("--md-orbital", action="store_true",
                         help="bounded distinct-spin MD orbital/CI/J2 Adam/SR and complete-frame model reuse")
+    parser.add_argument("--external-lcao", action="store_true",
+                        help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -210,13 +212,21 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
-    if args.periodic_heg or args.md_orbital:
-        assert not (args.periodic_heg and args.md_orbital), "select one bounded qualification profile"
+    if args.periodic_heg or args.md_orbital or args.external_lcao:
+        assert sum((args.periodic_heg, args.md_orbital, args.external_lcao)) == 1, "select one bounded qualification profile"
         assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital else None
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao else None
+    external_asset = None
+    if args.external_lcao:
+        collection = ET.parse(fixture).find("wavefunction/sposet_collection")
+        assert collection.get("source_identity") == "file_image"
+        external_source = (fixture.parent / collection.get("href")).resolve()
+        external_original = external_source.read_bytes()
+        external_asset = work / "original-lcao.h5"
+        shutil.copyfile(external_source, external_asset)
 
     def launch(directory):
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
@@ -265,6 +275,8 @@ def main():
         if args.periodic_heg:
             samples_per_rank = 8
         tree = ET.parse(fixture)
+        if args.external_lcao:
+            tree.find("wavefunction/sposet_collection").set("href", str(external_asset))
         # Recipes run in fresh evidence directories, not beside their PP asset.
         # Keep the tracked source untouched; scientific identity uses its bytes.
         for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
@@ -410,6 +422,12 @@ def main():
                     assert "handler=EwaldHandler3D;" in physical, model
                     assert "3d-uniform-neutralizing-background+self-v1" in physical, model
                     assert parameters.size == 10
+                if args.external_lcao:
+                    image = external_asset.read_bytes()
+                    physical = text_value(group["physical_definition"][()])
+                    assert f"lcao_file_image_v1:{len(image)}:{image.hex()};" in physical, model
+                    assert int(np.asarray(group["immutable_asset_bytes"][()]).reshape(-1)[0]) == len(image), model
+                    assert text_value(group["lcao_source_report"][()]) == str(external_asset), model
                 serialized = group["wavefunction_xml"][()]
                 if isinstance(serialized, np.ndarray):
                     serialized = serialized.reshape(-1)[0]
@@ -425,7 +443,10 @@ def main():
                         tree.find("wavefunction/sposet_collection")), model
                 else:
                     assert coefficients.attrib == fixed.attrib, model
-                    assert coefficients.text.split() == fixed.text.split(), model
+                    assert (coefficients.text or "").split() == (fixed.text or "").split(), model
+                if args.external_lcao:
+                    captured = exported.find("sposet_collection")
+                    assert "href" not in captured.attrib and captured.get("source_identity") == "file_image", model
                 if orbital_model:
                     assert exported.find(".//rotated_sposet").attrib == tree.find(".//rotated_sposet").attrib
                     assert not exported.findall(".//sposet[@optimize='yes']"), model
@@ -658,6 +679,44 @@ def main():
                 run(f"reject_changed_{label}_restart", restart=adam / "sj.s000.last_checkpoint.h5", iterations=3,
                     mutate=change_periodic_identity,
                     reject="Training checkpoint stage identity or configuration mismatch")
+        if args.external_lcao:
+            def route_lcao(path):
+                return lambda tree: tree.find("wavefunction/sposet_collection").set("href", str(path))
+            relocated = work / "relocated-lcao.h5"
+            shutil.copyfile(external_asset, relocated)
+            relocated_vmc = run("relocated_import_vmc", vmc=True, parameter_file=exported,
+                                mutate=route_lcao(relocated))
+            np.testing.assert_array_equal(vmc_physical_trace(imported_vmc), vmc_physical_trace(relocated_vmc))
+            # Mutate copies only: both the loaded basis and loaded coefficient
+            # values must participate in physical identity, not just a filename.
+            for label, dataset in (("basis", "basisset/atomicBasisSet0/basisGroup0/radfunctions/DataRad0/exponent"),
+                                   ("coefficients", "Super_Twist/eigenset_0")):
+                changed = work / f"changed-{label}.h5"
+                shutil.copyfile(external_asset, changed)
+                with h5py.File(changed, "r+") as handle:
+                    if label == "basis":
+                        candidates = []
+                        handle["basisset"].visititems(lambda name, node: candidates.append(node.name)
+                            if isinstance(node, h5py.Dataset) and name.endswith("exponent") else None)
+                        assert candidates, changed
+                        dataset = candidates[0]
+                    node = handle[dataset]
+                    value = np.asarray(node[()])
+                    value.flat[0] += 0.001
+                    node[...] = value
+                run(f"reject_changed_{label}_import", vmc=True, parameter_file=exported,
+                    mutate=route_lcao(changed), reject="Conventional model export identity mismatch")
+                run(f"reject_changed_{label}_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
+                    mutate=route_lcao(changed), reject="Training checkpoint stage identity or configuration mismatch")
+            def remove_capture(tree):
+                collection = tree.find("wavefunction/sposet_collection")
+                del collection.attrib["source_identity"]
+                del collection.attrib["source_identity_max_bytes"]
+            run("reject_uncaptured_lcao", mutate=remove_capture, reject="external")
+            assert external_source.read_bytes() == external_original
+            assert external_asset.read_bytes() == external_original
+            print(f"PASS: external CPU LCAO Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
+                  f"immutable asset bytes={len(external_original)} (separate from derivative scratch)")
         if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
             source = (fixture.parent / ET.parse(fixture).find("hamiltonian/pairpot/pseudo").get("href")).resolve()
             original = source.read_bytes()
