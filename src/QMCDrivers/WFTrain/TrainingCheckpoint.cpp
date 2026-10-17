@@ -280,6 +280,7 @@ struct TrainingCheckpoint::PreparedRestore::Impl
   std::unique_ptr<OptimizerCheckpointContributor::PreparedRestore> optimizer;
   std::unique_ptr<SamplerCheckpointContributor::PreparedRestore> sampler;
   std::unique_ptr<ModelCheckpointContributor::PreparedRestore> complete_model;
+  std::unique_ptr<PreparedParameterPublication> prepared_model;
   bool model_published = false;
   bool committed       = false;
 };
@@ -295,6 +296,16 @@ TrainingCheckpoint::PreparedRestore::PreparedRestore(PreparedRestore&&) noexcept
 TrainingCheckpoint::PreparedRestore& TrainingCheckpoint::PreparedRestore::operator=(
     PreparedRestore&&) noexcept = default;
 
+TrainingCheckpoint::PreparedRestore::PublicationRole
+TrainingCheckpoint::PreparedRestore::publicationRole() const noexcept
+{
+  if (!implementation_)
+    std::terminate();
+  if (implementation_->complete_model)
+    return PublicationRole::COMPLETE_MODEL;
+  return implementation_->prepared_model ? PublicationRole::PREPARED : PublicationRole::LEGACY;
+}
+
 std::size_t TrainingCheckpoint::PreparedRestore::publishModel()
 {
   if (!implementation_)
@@ -303,11 +314,17 @@ std::size_t TrainingCheckpoint::PreparedRestore::publishModel()
     throw std::logic_error("Training checkpoint model has already been published");
   // Conventional rotations are path dependent: publish the complete saved
   // frame, not merely the optimizer's active coordinate vector.
-  const std::size_t committed_version = implementation_->complete_model
-      ? implementation_->complete_model->publishModel(
-          implementation_->model, implementation_->expected_runtime_version)
-      : implementation_->provider.publishParameters(
-          implementation_->model, implementation_->expected_runtime_version);
+  std::size_t committed_version;
+  if (implementation_->complete_model)
+    committed_version = implementation_->complete_model->publishModel(
+        implementation_->model, implementation_->expected_runtime_version);
+  else if (implementation_->prepared_model)
+    committed_version = implementation_->prepared_model->commit();
+  else
+    committed_version = implementation_->provider.publishParameters(
+        implementation_->model, implementation_->expected_runtime_version);
+  if (implementation_->prepared_model && committed_version != implementation_->expected_runtime_version + 1)
+    throw std::logic_error("Prepared checkpoint model returned an invalid committed version");
   implementation_->model_published = true;
   implementation_->coordinator.parameter_version = committed_version;
   return committed_version;
@@ -540,6 +557,17 @@ TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
       std::move(prepared_optimizer),
       std::move(prepared_sampler),
       std::move(complete_model)});
+  // LAST fallible model work: the action may retain exclusive publication
+  // authority. Do not subsequently re-enter provider/model state. Distributed
+  // sampler-shard preparation touches only walker/RNG/quadrature payloads.
+  if (!implementation->complete_model)
+    if (auto* contributor = dynamic_cast<PreparedParameterPublicationContributor*>(&provider))
+    {
+      implementation->prepared_model = contributor->prepareParameterPublication(
+          implementation->model, implementation->expected_runtime_version);
+      if (!implementation->prepared_model)
+        throw std::runtime_error("Checkpoint provider returned no prepared model publication");
+    }
   return PreparedRestore(std::move(implementation));
 }
 

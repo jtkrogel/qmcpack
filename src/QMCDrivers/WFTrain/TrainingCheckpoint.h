@@ -121,10 +121,16 @@ class TrainingCheckpoint
 public:
   static constexpr std::array<int, 3> FORMAT_VERSION{1, 0, 0};
 
-  /** Fully validated owning restore state whose live targets are still unchanged. */
+  /** Fully validated owning restore state whose live targets are still unchanged.
+   * A provider may retain exclusive/device authority: commit or discard on the
+   * preparing thread, without re-entering model state while the action is held.
+   */
   class PreparedRestore
   {
   public:
+    /// Publication paths have different collective and failure contracts.
+    enum class PublicationRole { LEGACY, PREPARED, COMPLETE_MODEL };
+
     ~PreparedRestore();
     PreparedRestore(PreparedRestore&&) noexcept;
     PreparedRestore& operator=(PreparedRestore&&) noexcept;
@@ -135,6 +141,9 @@ public:
     /// Publish the prepared model (including a conventional orbital frame when
     /// present), retaining all other prepared state until publication consensus.
     std::size_t publishModel();
+
+    /// Read only prepared ownership, without re-entering a retained model lock.
+    PublicationRole publicationRole() const noexcept;
 
     /// Install driver and contributor state after distributed publication consensus.
     void commitAfterPublication(std::size_t committed_version) noexcept;

@@ -10,9 +10,11 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Message/CommOperators.h"
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "io/hdf/hdf_archive.h"
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -35,7 +37,7 @@ namespace
 {
 
 /// Minimal replicated provider used to test distributed checkpoint coordination.
-class DistributedToyProvider final : public StructuredParameterProvider
+class DistributedToyProvider : public StructuredParameterProvider
 {
 public:
   DistributedToyProvider()
@@ -60,10 +62,84 @@ public:
     return ++version_;
   }
 
+protected:
+  /// Same scalar replacement, with every expected validation already prepared.
+  std::size_t installPrepared(double value, std::size_t expected_version) noexcept
+  {
+    if (version_ != expected_version)
+      std::terminate();
+    value_ = value;
+    return ++version_;
+  }
+
 private:
   StructuredParameterSchema schema_;
   std::size_t version_ = 0;
   double value_ = 1.0;
+};
+
+/// Prepared checkpoint provider with no hidden model reentry while authority is held.
+class PreparedCheckpointProvider final : public DistributedToyProvider,
+                                         public PreparedParameterPublicationContributor
+{
+public:
+  std::unique_ptr<PreparedParameterPublication> prepareParameterPublication(
+      const StructuredParameterSnapshot& candidate, std::size_t expected_version) override
+  {
+    ++prepare_calls;
+    if (fail_preparation)
+      throw std::runtime_error("injected checkpoint model preparation failure");
+    const auto current = snapshotParameters();
+    validateTrainingCandidate(parameterSchema(), current, candidate);
+    if (exclusive_ || current.version != expected_version)
+      throw std::logic_error("Checkpoint model preparation lost exclusive version");
+    auto prepared = std::make_unique<Action>(*this, candidate.values[0], expected_version);
+    exclusive_ = true;
+    return prepared;
+  }
+
+  std::size_t publishParameters(const StructuredParameterSnapshot& candidate, std::size_t version) override
+  {
+    ++legacy_calls;
+    return DistributedToyProvider::publishParameters(candidate, version);
+  }
+
+  bool fail_preparation = false;
+  std::size_t prepare_calls = 0;
+  std::size_t commit_calls = 0;
+  std::size_t discard_calls = 0;
+  std::size_t legacy_calls = 0;
+
+private:
+  class Action final : public PreparedParameterPublication
+  {
+  public:
+    Action(PreparedCheckpointProvider& owner, double value, std::size_t expected_version)
+        : owner_(owner), value_(value), expected_version_(expected_version)
+    {}
+    ~Action() override
+    {
+      if (!committed_)
+        ++owner_.discard_calls;
+      owner_.exclusive_ = false;
+    }
+    std::size_t commit() noexcept override
+    {
+      if (committed_ || !owner_.exclusive_)
+        std::terminate();
+      const auto version = owner_.installPrepared(value_, expected_version_);
+      ++owner_.commit_calls;
+      committed_ = true;
+      return version;
+    }
+
+  private:
+    PreparedCheckpointProvider& owner_;
+    const double value_;
+    const std::size_t expected_version_;
+    bool committed_ = false;
+  };
+  bool exclusive_ = false;
 };
 
 /// Minimal rank-local sampler contributor with injectable shard-write failure.
@@ -148,7 +224,125 @@ SamplerShardTopology toyTopology(Communicate& communicator)
           static_cast<std::size_t>(communicator.rank()), 1, 1, 1, {2}};
 }
 
+/// Exercise the existing file family with real Adam state and group-local control.
+void checkPreparedCheckpointRestore(Communicate& communicator, int group_id, bool reject_first)
+{
+  const std::filesystem::path manifest = "wftrain_prepared_restore.g" + std::to_string(group_id) + ".h5";
+  removeCheckpointFamily(manifest, communicator);
+  const auto topology = toyTopology(communicator);
+  FirstOrderOptimizerOptions options;
+  options.learning_rates = {{"weight", 0.2 * (group_id + 1)}};
+  DistributedToyProvider source_provider;
+  FirstOrderOptimizer source_optimizer(source_provider.parameterSchema(), options);
+  const auto original_source = source_provider.snapshotParameters();
+  const std::vector<double> gradient{0.3 * (group_id + 1)};
+  const ParameterGradientView objective{source_provider.parameterSchema().fingerprint(), original_source.version,
+                                        ReductionDomain::GLOBAL, {gradient.data(), gradient.size()}};
+  const auto source_version = completeParameterUpdate(
+      source_provider, original_source, objective, source_optimizer, {});
+  TrainingIterationState source_state{1, source_version, source_provider.parameterSchema().fingerprint()};
+  TrainingStageState source_stage{"energy", 0, 1, "prepared-restore-v1"};
+  DistributedToySampler source_sampler(communicator.rank(), communicator.size());
+  source_sampler.advance();
+  DistributedTrainingCheckpoint::saveAtomic(manifest, communicator, source_provider, source_state,
+      source_stage, &source_optimizer, source_sampler, topology);
+
+  PreparedCheckpointProvider target;
+  FirstOrderOptimizer optimizer(target.parameterSchema(), options);
+  DistributedToySampler sampler(communicator.rank(), communicator.size());
+  sampler.advance();
+  sampler.advance();
+  TrainingIterationState state{99, 0, target.parameterSchema().fingerprint()};
+  TrainingStageState stage{"energy", 7, 88, "prepared-restore-v1"};
+  const auto old_model = target.snapshotParameters();
+  const auto old_sampler = sampler.value();
+  const auto old_first = optimizer.firstMoment();
+  const auto old_second = optimizer.secondMoment();
+  target.fail_preparation = reject_first && communicator.rank() == communicator.size() - 1;
+  if (reject_first)
+  {
+    CHECK_THROWS(DistributedTrainingCheckpoint::restore(manifest, communicator, target, state, stage,
+                                                       &optimizer, sampler, topology));
+    CHECK(target.snapshotParameters().values == old_model.values);
+    CHECK(target.snapshotParameters().version == old_model.version);
+    CHECK(target.commit_calls == 0);
+    CHECK(target.discard_calls == (target.fail_preparation ? 0 : 1));
+    CHECK(target.legacy_calls == 0);
+    CHECK(optimizer.firstMoment() == old_first);
+    CHECK(optimizer.secondMoment() == old_second);
+    CHECK(optimizer.acceptedUpdateCount() == 0);
+    CHECK(sampler.value() == old_sampler);
+    CHECK(state.completed_iterations == 99);
+    CHECK(state.parameter_version == 0);
+    CHECK(stage.stage_ordinal == 7);
+    CHECK(stage.completed_stage_iterations == 88);
+  }
+  else
+  {
+    CHECK_NOTHROW(DistributedTrainingCheckpoint::restore(manifest, communicator, target, state, stage,
+                                                         &optimizer, sampler, topology));
+    CHECK(target.commit_calls == 1);
+  }
+
+  target.fail_preparation = false;
+  CHECK_NOTHROW(DistributedTrainingCheckpoint::restore(manifest, communicator, target, state, stage,
+                                                       &optimizer, sampler, topology));
+  CHECK(target.snapshotParameters().values == source_provider.snapshotParameters().values);
+  CHECK(target.snapshotParameters().version == (reject_first ? 1 : 2));
+  CHECK(target.commit_calls == (reject_first ? 1 : 2));
+  CHECK(target.legacy_calls == 0);
+  CHECK(optimizer.firstMoment() == source_optimizer.firstMoment());
+  CHECK(optimizer.secondMoment() == source_optimizer.secondMoment());
+  CHECK(optimizer.acceptedUpdateCount() == source_optimizer.acceptedUpdateCount());
+  CHECK(sampler.value() == source_sampler.value());
+  CHECK(state.completed_iterations == source_state.completed_iterations);
+  CHECK(state.parameter_version == target.snapshotParameters().version);
+  CHECK(stage.stage_ordinal == source_stage.stage_ordinal);
+  CHECK(stage.completed_stage_iterations == source_stage.completed_stage_iterations);
+
+  if (communicator.size() > 1)
+  {
+    DistributedToyProvider legacy;
+    StructuredParameterProvider& mixed = communicator.rank() == communicator.size() - 1
+        ? static_cast<StructuredParameterProvider&>(legacy) : static_cast<StructuredParameterProvider&>(target);
+    const auto before_model = mixed.snapshotParameters();
+    const auto before_commits = target.commit_calls;
+    const auto before_sampler = sampler.value();
+    const auto before_first = optimizer.firstMoment();
+    const auto before_second = optimizer.secondMoment();
+    const auto before_state = state;
+    CHECK_THROWS_WITH(DistributedTrainingCheckpoint::restore(manifest, communicator, mixed, state, stage,
+                                                            &optimizer, sampler, topology),
+                      Catch::Matchers::ContainsSubstring("publication role mismatch"));
+    CHECK(mixed.snapshotParameters().values == before_model.values);
+    CHECK(mixed.snapshotParameters().version == before_model.version);
+    CHECK(target.commit_calls == before_commits);
+    CHECK(optimizer.firstMoment() == before_first);
+    CHECK(optimizer.secondMoment() == before_second);
+    CHECK(sampler.value() == before_sampler);
+    CHECK(state.completed_iterations == before_state.completed_iterations);
+    CHECK(state.parameter_version == before_state.parameter_version);
+  }
+  removeCheckpointFamily(manifest, communicator);
+}
+
 } // namespace
+
+TEST_CASE("Distributed checkpoint prepares model publication before restoring live state",
+          "[drivers][training][checkpoint][prepared_restore][mpi]")
+{
+  checkPreparedCheckpointRestore(*OHMMS::Controller, 0, true);
+}
+
+TEST_CASE("Prepared checkpoint rejection and continuation remain subgroup local",
+          "[drivers][training][checkpoint][prepared_restore][subgroup][mpi]")
+{
+  Communicate& world = *OHMMS::Controller;
+  if (world.size() < 4)
+    return;
+  Communicate group(world, 2);
+  checkPreparedCheckpointRestore(group, group.getGroupID(), group.getGroupID() == 0);
+}
 
 TEST_CASE("Distributed iteration bundles preserve immutable archives and latest resolution",
           "[drivers][training][checkpoint][mpi][iteration_bundle]")

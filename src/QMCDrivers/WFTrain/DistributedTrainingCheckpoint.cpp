@@ -552,6 +552,15 @@ void DistributedTrainingCheckpoint::restore(
   }
   requireCollectiveSuccess(communicator, prepare_failure, "restore preparation");
 
+  // Complete-model bindings may use their own fallible collectives, generic
+  // prepared actions have no-fail commit, and legacy providers remain one-phase.
+  // Agree that schedule BEFORE any rank publishes; reuse cold allocated storage.
+  std::uint64_t publication_role = static_cast<std::uint64_t>(prepared_root->publicationRole());
+  communicator.allgather(&publication_role, published_versions.data(), 1);
+  if (!std::all_of(published_versions.begin(), published_versions.end(),
+                   [publication_role](std::uint64_t role) { return role == publication_role; }))
+    throw std::runtime_error("Distributed checkpoint model publication role mismatch");
+
   std::size_t committed_version = 0;
   std::exception_ptr publication_failure;
   try
@@ -566,8 +575,8 @@ void DistributedTrainingCheckpoint::restore(
   communicator.allreduce(publication_failures);
   if (publication_failures != 0)
   {
-    // StructuredParameterProvider currently has no rollback/two-phase publish API.
-    // If only a subset published, continuing would silently diverge ranks; stop here.
+    // Legacy/complete-model publication can still fail after a peer publishes.
+    // Prepared commit is no-fail; no path promises rollback after publication.
     if (publication_failure)
       std::rethrow_exception(publication_failure);
     throw std::runtime_error(
