@@ -43,6 +43,11 @@ def selected(record, suffix):
     return matches[0]
 
 
+def validate_warm_transfers(windows, count, expected_d2h):
+    assert all(int(upload) < 8 * count and int(download) == expected_d2h and int(copied) == 16 * count + 384
+               for upload, download, copied in windows), windows
+
+
 def render(template, model, destination, iterations, restart=None):
     tree = copy.deepcopy(template)
     root = tree.getroot()
@@ -92,7 +97,21 @@ def main():
     protected = {str(path): sha(path) for path in (fixture, args.model, helper)}
     initial = fields(args.model)
     count = np.asarray(initial['values']).size
-    assert count > 0 and np.isfinite(initial['values']).all()
+    # This is the protected numerical fixture, not a generic transfer allowance.
+    assert count == 666 and np.isfinite(initial['values']).all()
+    np.testing.assert_array_equal(np.asarray(initial['psiformer_model/shape']).reshape(-1), [2, 2, 2, 2, 8, 2, 1])
+    for key in ('paired_complex', 'periodic'):
+        assert int(np.asarray(initial['psiformer_model/' + key]).reshape(-1)[0]) == 0
+    def text(value):
+        item = np.asarray(value).reshape(-1)[0]
+        return item.decode().rstrip('\0') if isinstance(item, bytes) else str(item)
+    assert text(initial['psiformer_model/precision']) == 'fp64_reference'
+    assert text(initial['psiformer_model/system']) == 'all_electron'
+    assert text(initial['psiformer_model/feature_policy']) == 'open_euclidean_v1'
+    assert int(np.asarray(initial['psiformer_model/seed']).reshape(-1)[0]) == 37
+    np.testing.assert_array_equal(np.asarray(initial['psiformer_model/nuclear_charges']).reshape(-1), [3, 1])
+    np.testing.assert_array_equal(np.asarray(initial['psiformer_model/nuclear_positions']).reshape(-1),
+                                 [0, 0, 0, 3.0154361724853516, 0, 0])
     original = ET.parse(fixture)
     if args.output:
         args.output = args.output.resolve()
@@ -100,7 +119,7 @@ def main():
     else:
         args.output = Path(tempfile.mkdtemp(prefix='psiformer_resident_authority_'))
     report = dict(status='FAIL', app_sha256=sha(args.app), protected=protected, canonical_count=count,
-                  device_cap=args.device_bytes, benchmark=False, cases={})
+                  harness_sha256=sha(Path(__file__).resolve()), device_cap=args.device_bytes, benchmark=False, cases={})
     deadline = time.monotonic() + args.timeout
     def execute(command, **kwargs):
         remaining = deadline - time.monotonic()
@@ -117,6 +136,7 @@ def main():
             PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES=str(args.device_bytes),
             PSIFORMER_GPU_EXTERNAL_RESERVE_BYTES=str(256 * 1024**2),
             PSIFORMER_GPU_METROPOLIS_BYTES=str(16 * 1024**2), PSIFORMER_GPU_ADAM_BYTES=str(16 * 1024**2),
+            PSIFORMER_GPU_STATUS_CHECKS='synchronous',
             PSIFORMER_GPU_VGL_TARGETS='1', PSIFORMER_GPU_TARGET_WORKSPACE_BYTES=str(256 * 1024**2),
             PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET=str(10**9))
         if authority:
@@ -173,15 +193,26 @@ def main():
         assert not np.array_equal(selected(continuous[2], '/model/values').reshape(-1), initial['values'].reshape(-1))
         # Counter format is supplied by the component's fixed existing-metrics
         # window hook; it includes sampling, producer, proposal and FULL refresh.
-        windows = re.findall(r'Resident DEVICE authority window:.*uploaded_bytes=(\d+).*downloaded_bytes=(\d+).*device_copied_bytes=(\d+)',
-                             (continuous[4] / 'console.log').read_text())
+        log = (continuous[4] / 'console.log').read_text()
+        window_matches = list(re.finditer(r'Resident DEVICE authority window:.*uploaded_bytes=(\d+).*downloaded_bytes=(\d+).*device_copied_bytes=(\d+)', log))
+        windows = [match.groups() for match in window_matches]
         assert len(windows) == 3, ('Expected all three complete native warm windows', windows)
-        assert all(int(upload) < 8 * count and int(download) < 8 * count and int(copied) >= 16 * count
-                   for upload, download, copied in windows), windows
+        # Source-linked native_transfer_accounting_B.rst: K1 targets electrons,
+        # not Cartesian directions. Synchronous small statuses exceed 8P for
+        # this tiny model; require their exact sum, never a widened heuristic.
+        small_d2h = dict(two_full=4720, sampler=924, c3_samples=1176, c3_finite=16,
+                         adam_norms_status=2 * (16 * math.ceil(count / 128)) + 16, successor_cusps=16)
+        expected_d2h = sum(small_d2h.values())
+        assert expected_d2h == 7060
+        validate_warm_transfers(windows, count, expected_d2h)
+        mirrors = list(re.finditer(r'cold HOST mirror refresh: attempted_bytes=(\d+), version=(\d+)', log))
+        assert len(mirrors) == 1 and mirrors[0].start() > window_matches[-1].end()
+        assert tuple(map(int, mirrors[0].groups())) == (8 * count, 3)
         assert protected == {path: sha(Path(path)) for path in protected}
         report.update(status='PASS', exact_restart=True, host_oracle_rtol=args.rtol, host_oracle_atol=args.atol,
                       warm_transfer_windows=[dict(uploaded=int(u), downloaded=int(d), device_copied=int(c))
                                              for u, d, c in windows],
+                      accounted_small_d2h=small_d2h, cold_mirror_bytes=8 * count,
                       cold_reader_gate='Separately required numerical cached-CPU-reader test',
                       profile='REAL/open AE ENERGY Adam MPI1/crowd1/W2/block1/step1 movealle/nodrift; no controls')
     finally:
