@@ -852,7 +852,7 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
       old_term *= value;
       if (spin != moved) new_term *= value;
     }
-    const ValueType value = static_cast<ValueType>((new_term - ratio * old_term) / psi_ratio_to_ref_det_);
+    const ValueType value = static_cast<ValueType>(PsiValue(new_term - ratio * old_term) / psi_ratio_to_ref_det_);
     if (!finiteAcceptedRatio(value) || !finiteAcceptedRatio(derivatives[index] + value))
       throw std::domain_error("Private physical CI ratio derivative is nonfinite");
     derivatives[index] += value;
