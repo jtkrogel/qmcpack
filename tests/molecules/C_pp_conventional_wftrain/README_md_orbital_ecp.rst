@@ -101,3 +101,10 @@ sampler shards, plus all non-resource history fields and existing model/frame
 checks. Only this flag permits two ranks; other orbital profiles stay single
 rank. The two-rank attempt has 120s/application and 300s/whole-helper caps.
 No additional CTest matrix or native LM qualification is implied.
+One actual two-node attempt on BESMS app ``1e2982b3``/``750f6177...`` committed
+the first 64-sample update, completed inference and wrote both rank shards.
+The second ALM solve naturally refused ``untrusted_root`` on both ranks:
+this is preserved as FIRSTFAIL, not full/import/restart qualification, and
+not a demonstrated MPI defect. No seed, root, tolerance or sample count was
+changed. Compact evidence is task46 ``validation/joint_alm_mpi_ad308``;
+the already-qualified single-rank workflow and its CTest remain unchanged.
