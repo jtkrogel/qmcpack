@@ -718,6 +718,37 @@ void MultiDiracDeterminant::evaluatePrivateOrbitalGeneratorToAcceptedReference(
   evaluateOrbitalGeneratorRowToAcceptedReference(row, accepted, p, q, reference_derivatives);
 }
 
+void MultiDiracDeterminant::evaluatePrivateAcceptedOrbitalDerivatives(
+    const ParticleSet& P, int p, int q, const ParticleSet::ParticleGradient* jastrow_gradients,
+    Vector<ValueType>& derivatives, Vector<ValueType>& kinetic, Vector<ValueType>& workspace)
+{
+  if (!private_accepted_reference_orbital_ || P.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS ||
+      p < 0 || p >= q || q >= NumOrbitals || NumPtcls <= 0 ||
+      psiMinv.rows() != NumPtcls || psiMinv.cols() != NumPtcls ||
+      psiM.rows() != NumPtcls || psiM.cols() != NumOrbitals || FirstIndex < 0 || LastIndex > P.getTotalNum() ||
+      dpsiM.rows() != NumPtcls || dpsiM.cols() != NumOrbitals ||
+      d2psiM.rows() != NumPtcls || d2psiM.cols() != NumOrbitals ||
+      &derivatives == &kinetic || &derivatives == &workspace || &kinetic == &workspace ||
+      derivatives.isAttached() || kinetic.isAttached() || workspace.isAttached() ||
+      (jastrow_gradients && jastrow_gradients->size() != P.getTotalNum()))
+    throw std::invalid_argument("Private accepted orbital rows require valid caches and distinct owning outputs");
+  // The denominator remains the original regular accepted reference. Column
+  // substitution differentiates the WHOLE determinant, including the replaced row.
+  evaluateOrbitalGeneratorRowToAcceptedReference(0, psiM.data(), p, q, derivatives);
+  kinetic.resize(getNumDets());
+  kinetic = ValueType{};
+  if (!jastrow_gradients) return;
+  for (int row = 0; row < NumPtcls; ++row)
+  {
+    for (int orbital = 0; orbital < NumOrbitals; ++orbital)
+      psiV[orbital] = d2psiM(row, orbital) +
+          RealType(2) * dot((*jastrow_gradients)[FirstIndex + row], dpsiM(row, orbital));
+    evaluateOrbitalGeneratorRowToAcceptedReference(row, psiV.data(), p, q, workspace);
+    for (int determinant = 0; determinant < getNumDets(); ++determinant)
+      kinetic[determinant] += workspace[determinant];
+  }
+}
+
 void MultiDiracDeterminant::evaluateDetsForPtclMove(const ParticleSet& P, int iat, int refPtcl)
 {
   ScopedTimer local_timer(evaluateDetsForPtclMove_timer);

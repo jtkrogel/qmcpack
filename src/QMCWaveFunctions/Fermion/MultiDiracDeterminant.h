@@ -245,6 +245,10 @@ public:
   /// Reuse one determinant workspace and two generator rows; all outputs are distinct owning vectors.
   void evaluatePrivateOrbitalGeneratorToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, int p, int q,
       Vector<ValueType>& workspace, Vector<ValueType>& reference_derivatives, Vector<ValueType>& virtual_derivatives);
+  /// Signed accepted dD/Dref and optional sum(Delta+2*Jgrad.grad)dD/Dref; no individual-D division.
+  void evaluatePrivateAcceptedOrbitalDerivatives(const ParticleSet& P, int p, int q,
+      const ParticleSet::ParticleGradient* jastrow_gradients, Vector<ValueType>& derivatives,
+      Vector<ValueType>& kinetic, Vector<ValueType>& workspace);
   /// multi walker version of evaluateDetsForPtclMove
   void static mw_evaluateDetsForPtclMove(const RefVectorWithLeader<MultiDiracDeterminant>& det_list,
                                          const RefVectorWithLeader<ParticleSet>& P_list,

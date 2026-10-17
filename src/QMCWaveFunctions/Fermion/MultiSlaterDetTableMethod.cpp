@@ -947,16 +947,16 @@ void MultiSlaterDetTableMethod::validateAcceptedOrbitalDerivativeState() const
   if (!accepted_reference_orbital_virtual_mode_ || psi_ratio_to_ref_det_ == PsiValue{} ||
       !finiteAcceptedRatio(static_cast<ValueType>(psi_ratio_to_ref_det_)))
     throw std::domain_error("Private orbital ECP rows require a finite nonzero accepted total");
-  // Legacy accepted parameter derivatives invert each excitation Y6. Reject its
-  // exact zeros, never near-zero values; virtual determinant zeros remain valid.
+  // A private signed-numerator fallback handles exact individual zeros. Reference
+  // and total nodes remain excluded; nonfinite excitation state is never usable.
   for (const auto& det : Dets)
   {
     const auto log = det->getLogValueRefDet();
     if (!finiteAcceptedRatio(ValueType(log.real())) || !finiteAcceptedRatio(ValueType(log.imag())))
       throw std::domain_error("Private orbital ECP rows require finite accepted references");
     for (const auto value : det->getRatiosToRefDet())
-      if (value == ValueType{} || !finiteAcceptedRatio(value))
-        throw std::domain_error("Private orbital ECP accepted excitation matrix is singular or nonfinite");
+      if (!finiteAcceptedRatio(value))
+        throw std::domain_error("Private orbital ECP accepted excitation matrix is nonfinite");
   }
 }
 
@@ -1012,6 +1012,96 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
     }
   }
   return ratio;
+}
+
+bool MultiSlaterDetTableMethod::needsAcceptedOrbitalZeroFallback() const
+{
+  if (!accepted_reference_orbital_virtual_mode_) return false;
+  for (const auto& det : Dets)
+    for (const auto value : det->getRatiosToRefDet())
+      if (value == ValueType{}) return true;
+  return false;
+}
+
+void MultiSlaterDetTableMethod::evaluateAcceptedOrbitalZeroDerivatives(
+    ParticleSet& P, const OptVariables& active, Vector<ValueType>& scores, Vector<ValueType>* kinetic)
+{
+  validateAcceptedOrbitalDerivativeState();
+  const auto& masses = P.get_mass_by_group();
+  if (masses.size() == 0 || std::any_of(masses.begin(), masses.end(), [](auto mass) { return mass != 1.0; }))
+    throw std::invalid_argument("Private accepted orbital derivatives require initialized unit electron masses");
+  ValueType base_spatial{};
+  if (kinetic)
+  {
+    // myG is grad(log MD), while P.G contains the complete accepted TWF.
+    myG_temp = P.G;
+    myG_temp -= myG;
+    for (int electron = 0; electron < P.getTotalNum(); ++electron)
+      base_spatial += myL[electron] + RealType(2) * dot(myG_temp[electron], myG[electron]);
+    for (int spin = 0; spin < 2; ++spin)
+    {
+      auto& row = accepted_reference_base_kinetic_[spin];
+      row.resize(Dets[spin]->getNumDets()); row = ValueType{};
+      for (int determinant = 0; determinant < Dets[spin]->getNumDets(); ++determinant)
+        for (int local = 0; local < Dets[spin]->getNumPtcls(); ++local)
+          row[determinant] += Dets[spin]->getLapls()(determinant, local) +
+              RealType(2) * dot(myG_temp[Dets[spin]->getFirstIndex() + local], Dets[spin]->getGrads()(determinant, local));
+    }
+  }
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& rotated = dynamic_cast<const RotatedSPOs&>(*Dets[spin]->getPhi());
+    const auto& variables = rotated.activeRotationVariables();
+    if (variables.size() != rotated.m_act_rot_inds_.size())
+      throw std::logic_error("Private accepted orbital rows require matching rotation pairs");
+    for (int variable = 0; variable < variables.size(); ++variable)
+    {
+      const int location = active.getLoc(variables.name(variable)), index = variables.where(variable);
+      if (location < 0 || active.where(location) != index ||
+          (index >= 0 && (index >= scores.size() || (kinetic && index >= kinetic->size()))))
+        throw std::invalid_argument("Private accepted orbital rows require matching registered generator indices");
+      if (index < 0) continue;
+      scores[index] = ValueType{};
+      if (kinetic) (*kinetic)[index] = ValueType{};
+    }
+  }
+  // Initialize all owned indices before either spin contributes. This also
+  // preserves additive semantics if a registered generator acts on both spins.
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& rotated = dynamic_cast<const RotatedSPOs&>(*Dets[spin]->getPhi());
+    const auto& variables = rotated.activeRotationVariables();
+    for (int variable = 0; variable < variables.size(); ++variable)
+    {
+      const int index = variables.where(variable);
+      if (index < 0) continue;
+      const auto pair = rotated.m_act_rot_inds_[variable];
+      Dets[spin]->evaluatePrivateAcceptedOrbitalDerivatives(P, pair.first, pair.second,
+          kinetic ? &myG_temp : nullptr, accepted_reference_orbital_old_, accepted_reference_orbital_new_,
+          accepted_reference_orbital_work_);
+      PsiValue value{}, spatial{};
+      for (std::size_t term = 0; term < C->size(); ++term)
+      {
+        const auto own = (*C2node)[spin][term], other = (*C2node)[1 - spin][term];
+        const auto opposite = Dets[1 - spin]->getRatiosToRefDet()[other];
+        value += (*C)[term] * accepted_reference_orbital_old_[own] * opposite;
+        if (kinetic)
+          spatial += (*C)[term] * (accepted_reference_orbital_new_[own] * opposite +
+              accepted_reference_orbital_old_[own] * accepted_reference_base_kinetic_[1 - spin][other]);
+      }
+      const auto score = static_cast<ValueType>(value / psi_ratio_to_ref_det_);
+      if (!finiteAcceptedRatio(score) || !finiteAcceptedRatio(scores[index] + score))
+        throw std::domain_error("Private accepted orbital score is nonfinite");
+      scores[index] += score;
+      if (kinetic)
+      {
+        const auto response = static_cast<ValueType>(-.5 * (spatial / psi_ratio_to_ref_det_ - base_spatial * score));
+        if (!finiteAcceptedRatio(response) || !finiteAcceptedRatio((*kinetic)[index] + response))
+          throw std::domain_error("Private accepted orbital kinetic response is nonfinite");
+        (*kinetic)[index] += response;
+      }
+    }
+  }
 }
 
 void MultiSlaterDetTableMethod::evaluateSpinorRatios(const VirtualParticleSet& VP,
@@ -1314,6 +1404,11 @@ void MultiSlaterDetTableMethod::evaluateMultiDiracDeterminantDerivatives(Particl
                                                                          Vector<ValueType>& dlogpsi,
                                                                          Vector<ValueType>& dhpsioverpsi)
 {
+  if (needsAcceptedOrbitalZeroFallback())
+  {
+    evaluateAcceptedOrbitalZeroDerivatives(P, optvars, dlogpsi, &dhpsioverpsi);
+    return;
+  }
   //Currently, the MultiDiracDeterminant::evaluateDerivatives works with a legacy design, essentially requiring only up and down determinants.
   //e.g. for spinor cases, we only have one determinant so this interface doesn't work.
   //Here we throw an error only if the optimization is turned on for MultiDiracDeterminants until the code is updated
@@ -1527,6 +1622,11 @@ void MultiSlaterDetTableMethod::evaluateMultiDiracDeterminantDerivativesWF(Parti
                                                                            const OptVariables& optvars,
                                                                            Vector<ValueType>& dlogpsi)
 {
+  if (needsAcceptedOrbitalZeroFallback())
+  {
+    evaluateAcceptedOrbitalZeroDerivatives(P, optvars, dlogpsi, nullptr);
+    return;
+  }
   //Currently, the MultiDiracDeterminant::evaluateDerivativesWF works with a legacy design, essentially requiring only up and down determinants.
   //e.g. for spinor cases, we only have one determinant so this interface doesn't work.
   //Here we throw an error only if the optimization is turned on for MultiDiracDeterminants until the code is updated

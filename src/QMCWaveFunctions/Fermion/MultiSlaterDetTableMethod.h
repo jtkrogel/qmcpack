@@ -21,6 +21,7 @@
 #include "Utilities/TimerManager.h"
 #include "OMPTarget/OffloadAlignedAllocators.hpp"
 #include "ResourceCollection.h"
+#include <array>
 
 namespace qmcplusplus
 {
@@ -296,6 +297,9 @@ public:
                   bool CI_optimizable);
 
 private:
+  bool needsAcceptedOrbitalZeroFallback() const;
+  void evaluateAcceptedOrbitalZeroDerivatives(ParticleSet& P, const OptVariables& active,
+      Vector<ValueType>& scores, Vector<ValueType>* kinetic);
   void validatePreparedCoefficientLayout(const MultiSlaterDetTableMethod& prepared) const;
   //get Det ID. It should be consistent with particle group id within the particle set.
   inline int getDetID(const int iat) const
@@ -393,6 +397,8 @@ private:
   bool accepted_reference_orbital_virtual_mode_ = false;
   Vector<ValueType> accepted_reference_virtual_terms_;
   Vector<ValueType> accepted_reference_orbital_work_, accepted_reference_orbital_old_, accepted_reference_orbital_new_;
+  /// Two reusable per-unique spatial rows, never retained per sample or parameter.
+  std::array<Vector<ValueType>, 2> accepted_reference_base_kinetic_;
 
   size_t ActiveSpin;
   PsiValue curRatio;

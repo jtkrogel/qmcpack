@@ -4724,12 +4724,13 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 10; ++model)
+  for (int model = 0; model < 11; ++model)
   {
     CAPTURE(model);
     const bool joint = model >= 5;
     const bool polarized = model == 7 || model == 8;
     const bool csf = model == 9;
+    const bool accepted_zero = model == 10;
     const bool md = model >= 3, node = model == 1 || model == 4 || model == 6;
     const bool many = model >= 2;
     ParticleSetPool pool(OHMMS::Controller);
@@ -4787,10 +4788,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       particles.R[0] = {1, 0, 0};
       particles.R[1] = {-2, 0, 0};
     }
-    if (model == 4 || model == 6)
+    if (model == 4 || model == 6 || accepted_zero)
     {
       particles.R[0] = {1, 1, 0}; particles.R[1] = {0, 0, 1};
       particles.R[2] = {-1, 1, 0}; particles.R[3] = {0, 0, 2};
+      if (accepted_zero) particles.R[0] = {1, 0, 0}; // Same formerly rejected accepted py node.
     }
     const std::string coefficients = many ? "1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1" :
         model == 0 ? "1 0 0 0  0 1 0 0  0 0 1 0" : node_coefficients;
@@ -4951,7 +4953,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
     CHECK_THROWS_WITH(adapter.validateNonLocalECPProfile(*unsupported_j3, unsupported_j3_particles),
         Catch::Matchers::ContainsSubstring("fixed single Slater without active orbitals"));
-    ECPComponentBuilder builder(many ? "C" : "Be", OHMMS::Controller, node ? 3 : 2, 1);
+    ECPComponentBuilder builder(many ? "C" : "Be", OHMMS::Controller, node || accepted_zero ? 3 : 2, 1);
     const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
         (many ? "tests/pseudopotentials_for_tests/C.BFD.xml" : "tests/pseudopotentials_for_tests/Be.BFD.xml");
     REQUIRE(builder.read_pp_file(asset.string()));
@@ -4974,7 +4976,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       QMCTraits::FullPrecRealType operator()() override { ++draws; return 0; }
       std::size_t draws = 0;
     } zero_rng;
-    nl->setRandomGenerator(!node ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
+    nl->setRandomGenerator(!(node || accepted_zero) ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
     ResourceCollection ps_resources("orb_ecp_P"), wf_resources("orb_ecp_WF"), ham_resources("orb_ecp_H");
     particles.createResource(ps_resources);
     source->createResource(wf_resources);
@@ -5035,6 +5037,20 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         CHECK((source_map == std::vector<std::vector<std::size_t>>{{0, 0, 1}, {0, 1, 0}}));
         checkClose(derivativeValue(source_ci[1]), snapshot->values[0] * std::sqrt(.5));
         checkClose(derivativeValue(source_ci[2]), -snapshot->values[0] * std::sqrt(.5));
+      }
+      if (accepted_zero)
+      {
+        auto& determinant = source->findMSD().front().get().getDet(0);
+        REQUIRE(determinant.getRatiosToRefDet()[1] == QMCTraits::ValueType{});
+        REQUIRE(std::isfinite(source_log));
+        CHECK_NOTHROW(source->findMSD().front().get().validateAcceptedOrbitalDerivativeState());
+        // Signed 2x2 identity: d(phi_px)=phi_py, d(phi_py)=-phi_px.
+        // Thus the zero {s,py} numerator has derivative -D_ref, not zero/zero.
+        Vector<QMCTraits::ValueType> derivative, spatial, workspace;
+        determinant.evaluatePrivateAcceptedOrbitalDerivatives(particles, 1, 2, nullptr,
+                                                              derivative, spatial, workspace);
+        checkClose(derivativeValue(derivative[0]), {});
+        checkClose(derivativeValue(derivative[1]), {-1, 0});
       }
       if (joint)
       {
@@ -5290,6 +5306,28 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         dual += direction[parameter] * rows.result()[0][parameter];
         score_dual += direction[parameter] * rows.result()[2][parameter];
       }
+      if (accepted_zero)
+      {
+        // Independently difference the literal signed 2x2 full wavefunction,
+        // including J2, rather than differentiating a per-D log derivative.
+        ParticleSet p(particles);
+        auto wf = source->makeClone(p);
+        isolate(*wf);
+        p.update(); adapter.installSnapshot(*wf, p, *snapshot);
+        const auto psi = dense_value(*wf, p, snapshot->values[0]);
+        QMCTraits::ValueType laplacian{};
+        constexpr double h = 1e-4;
+        for (int electron = 0; electron < p.getTotalNum(); ++electron)
+          for (int dimension = 0; dimension < 3; ++dimension)
+          {
+            p.R = positions; p.R[electron][dimension] += h; p.update();
+            const auto plus = dense_value(*wf, p, snapshot->values[0]);
+            p.R = positions; p.R[electron][dimension] -= h; p.update();
+            laplacian += plus + dense_value(*wf, p, snapshot->values[0]) - 2.0 * psi;
+          }
+        CHECK(std::real(-.5 * laplacian / (h * h * psi)) ==
+              Catch::Approx(source_energy.real()).epsilon(3e-5).margin(3e-6));
+      }
       if (node && md)
       {
         // A zero accepted spatial-reference derivative must use only the
@@ -5344,8 +5382,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         replay->prepareSample(0);
         private_particles.R[0] = {1, 0, 0}; private_particles.update();
         evaluator->evaluateLog(private_particles);
-        CHECK_THROWS_WITH(evaluator->findMSD().front().get().validateAcceptedOrbitalDerivativeState(),
-            "Private orbital ECP accepted excitation matrix is singular or nonfinite");
+        CHECK_NOTHROW(evaluator->findMSD().front().get().validateAcceptedOrbitalDerivativeState());
         replay->prepareSample(0);
       }
       else if (model == 1)
