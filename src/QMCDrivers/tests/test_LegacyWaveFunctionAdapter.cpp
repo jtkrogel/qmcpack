@@ -3516,6 +3516,52 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
         const auto gradient = factor.scoreCovarianceGradient();
         const ParameterGradientView objective{schema.fingerprint(), candidate.version, ReductionDomain::GLOBAL,
             {gradient.data(), gradient.size()}};
+        if (!csf)
+        {
+          // A finite Jastrow update is not a Ritz state; verify the shared
+          // shear independently, then its physical first-order tangent.
+          MatrixFreeLinearMethodResult solved;
+          solved.provider_id = schema.providerId(); solved.schema_fingerprint = schema.fingerprint();
+          solved.parameter_version = candidate.version; solved.converged = true;
+          solved.stop_reason = LinearMethodStopReason::CONVERGED;
+          solved.eigenvector.assign(n + 1, .02);
+          solved.eigenvector[0] = 1; solved.eigenvector[1] = .03;
+          double qn = 0;
+          for (std::size_t s = 0; s < m; ++s)
+          {
+            double centered_nonlinear = 0;
+            for (std::size_t p = 1; p < n; ++p)
+              centered_nonlinear += .02 * (scores[s][p] - mean[p]);
+            qn += weights[s] * centered_nonlinear * centered_nonlinear / 6;
+          }
+          const double denominator = 1 - .03 * mean[0] + qn / (1 + std::sqrt(1 + qn));
+          for (double rate : {1e-3, 5e-4})
+          {
+            LinearMethodUpdateRule mixed(factor, solved, rate, .5,
+                LinearMethodNormalization::MIXED_FIXED_REFERENCE, {&batch, 1});
+            auto mapped = mixed.propose(schema, candidate, objective), opposite = candidate;
+            double expected = 0;
+            for (std::size_t p = 0; p < n; ++p)
+            {
+              const double tangent = solved.eigenvector[p + 1].real() / denominator;
+              CHECK(mapped.values[p] == Catch::Approx(candidate.values[p] + rate * tangent).margin(1e-13));
+              opposite.values[p] -= rate * tangent;
+              expected += scores[0][p] * tangent;
+            }
+            replay->prepareSample(0);
+            adapter.installSnapshot(*evaluator, private_particles, mapped);
+            CHECK(private_msd.get_C()[0] == original_coefficients[0]);
+            CHECK(private_msd.fixedCoefficientReference() == .6);
+            const double plus = evaluator->getLogPsi();
+            adapter.installSnapshot(*evaluator, private_particles, opposite);
+            CHECK((plus - evaluator->getLogPsi()) / (2 * rate) ==
+                  Catch::Approx(expected).epsilon(2e-6).margin(2e-8));
+          }
+          CHECK(source_msd.get_C() == original_coefficients);
+          CHECK(sibling_msd.get_C() == original_coefficients);
+          CHECK(&source->getSPOSet("spo") == original_spo);
+          adapter.installSnapshot(*evaluator, private_particles, candidate);
+        }
         ProjectedInverseIterationUpdateRule pii(pii_factor, control);
         MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
         for (const auto& mapped : {pii.propose(schema, candidate, objective), minpii.propose(schema, candidate, objective)})

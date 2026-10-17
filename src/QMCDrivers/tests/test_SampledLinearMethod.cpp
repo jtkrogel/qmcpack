@@ -72,7 +72,7 @@ protected:
         for (std::size_t i = 0; i < 2; ++i)
         {
           const auto sample = sampleOffset() + i, parameter = chunk.parameter_offset;
-          DerivativeValue entry{matrix[sample][parameter], 0.0};
+          DerivativeValue entry{entryAt(matrix, sample, parameter), 0.0};
           if (channels[channel].product == DerivativeProduct::LOCAL_ENERGY_VJP)
             entry.imag(bad_energy_vjp_ ? std::numeric_limits<double>::quiet_NaN() :
                        (complex_energy_ ? imaginary_del[sample][parameter] : 0.0));
@@ -100,10 +100,10 @@ private:
   {
     std::array<DerivativeValue, 2> result{};
     for (std::size_t i = 0; i < 2; ++i)
-      for (std::size_t p = 0; p < 2; ++p)
+      for (std::size_t p = 0; p < schema_.parameterCount(); ++p)
       {
         const auto sample = sampleOffset() + i;
-        DerivativeValue entry{matrix[sample][p], 0.0};
+        DerivativeValue entry{entryAt(matrix, sample, p), 0.0};
         if (energy)
           entry.imag(bad_energy_jvp_ ? std::numeric_limits<double>::quiet_NaN() :
                      (complex_energy_ ? imaginary_del[sample][p] : 0.0));
@@ -114,6 +114,14 @@ private:
     SampleProductTileDescriptor descriptor{schema_.providerId(), schema_.fingerprint(), 7,
                                             ordinal_, sampleOffset(), 2, 0};
     sink.add({descriptor, {result.data(), result.size()}});
+  }
+  /// Extra columns reuse the same samples, with a zero frozen column and correlated groups.
+  double entryAt(const std::array<Row, 4>& matrix, std::size_t sample, std::size_t parameter) const
+  {
+    if (schema_.parameterCount() == 2) return matrix[sample][parameter];
+    return parameter < 2 ? matrix[sample][parameter] : parameter == 2 ?
+        2*matrix[sample][0]-matrix[sample][1] : parameter == 3 ?
+        matrix[sample][0]+2*matrix[sample][1] : 0;
   }
   const StructuredParameterSchema& schema_;
   std::size_t ordinal_;
@@ -416,6 +424,100 @@ TEST_CASE("Fixed-reference linear LM retraction is projective and rejects unusab
   CHECK(actual.values[0] == Catch::Approx(parameters.values[0] + 0.25 * 0.2 / denominator).margin(1e-12));
   CHECK(actual.values[1] == Catch::Approx(parameters.values[1] - 0.25 * 0.1 / denominator).margin(1e-12));
   CHECK(parameters.values == std::vector<double>{0.3, -0.2});
+}
+
+TEST_CASE("Mixed LM uses one weighted reference shear across noncontiguous groups",
+          "[drivers][wftrain][linear_method][mixed_retraction]")
+{
+  StructuredParameterSchema schema{"mixed/test", {
+      {"ci_a", {1}, 0, 1, ParameterScalarDomain::REAL64, true, "legacy_linear"},
+      {"jastrow_a", {1}, 1, 1, ParameterScalarDomain::REAL64, true, "legacy_other"},
+      {"ci_b", {1}, 2, 1, ParameterScalarDomain::REAL64, true, "legacy_linear"},
+      {"jastrow_b", {1}, 3, 1, ParameterScalarDomain::REAL64, true, "legacy_other"},
+      {"frozen", {1}, 4, 1, ParameterScalarDomain::REAL64, false, "legacy_other"}}};
+  ExactRows first(schema, 0), second(schema, 1);
+  std::array<ScoreCovarianceBatch, 2> batches{{
+      {&first, {weights.data(), 2}, {energies.data(), 2}},
+      {&second, {weights.data()+2, 2}, {energies.data()+2, 2}}}};
+  ScoreCovarianceFactor factor(schema, 7, {batches.data(), batches.size()});
+  StructuredParameterSnapshot accepted{schema.fingerprint(), 7, {.3, -.4, -.2, .1, 9}};
+  const auto gradient = factor.scoreCovarianceGradient();
+  const ParameterGradientView objective{schema.fingerprint(), 7, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  std::array<std::array<double, 5>, 4> raw{};
+  std::array<std::array<double, 5>, 5> covariance{};
+  std::array<double, 5> mean{};
+  for (std::size_t s = 0; s < 4; ++s)
+  {
+    raw[s] = {scores[s][0], scores[s][1], 2*scores[s][0]-scores[s][1],
+              scores[s][0]+2*scores[s][1], 0};
+    for (std::size_t p = 0; p < 5; ++p) mean[p] += weights[s]*raw[s][p]/6;
+  }
+  for (std::size_t p = 0; p < 5; ++p)
+    for (std::size_t q = 0; q < 5; ++q)
+      for (std::size_t s = 0; s < 4; ++s)
+        covariance[p][q] += weights[s]*(raw[s][p]-mean[p])*(raw[s][q]-mean[q])/6;
+  REQUIRE(std::abs(covariance[0][3]) > .1);
+  REQUIRE(std::abs(covariance[1][3]) > .1);
+  SampledLinearMethodOperator overlap(factor, {batches.data(), batches.size()}, kinetic, true, false, 0);
+  std::array<DerivativeValue, 6> basis{}, action{};
+  basis[4] = 1;
+  overlap.apply({basis.data(), basis.size()}, {action.data(), action.size()});
+  CHECK(action[1].real() == Catch::Approx(covariance[0][3]).margin(1e-12));
+  MatrixFreeLinearMethodResult solved;
+  solved.provider_id = schema.providerId(); solved.schema_fingerprint = schema.fingerprint();
+  solved.parameter_version = 7; solved.converged = true;
+  solved.stop_reason = LinearMethodStopReason::CONVERGED;
+  solved.eigenvector = {1, .2, .07, -.1, .15, 0};
+  const double qn = .07*.07*covariance[1][1]+2*.07*.15*covariance[1][3]+.15*.15*covariance[3][3];
+  double qall = 0;
+  for (std::size_t p = 0; p < 4; ++p)
+    for (std::size_t q = 0; q < 4; ++q)
+      qall += solved.eigenvector[p+1].real()*covariance[p][q]*solved.eigenvector[q+1].real();
+  REQUIRE(std::abs(qall-qn) > 1e-3); // Cross-coupled solve, deliberately NN-only normalization policy.
+  const auto propose = [&](MatrixFreeLinearMethodResult result, double rate, double xi,
+                           LinearMethodNormalization mode = LinearMethodNormalization::MIXED_FIXED_REFERENCE) {
+    LinearMethodUpdateRule rule(factor, std::move(result), rate, xi, mode, {batches.data(), batches.size()});
+    return rule.propose(schema, accepted, objective);
+  };
+  for (double xi : {0., .5, 1.})
+    for (double scale : {1., -3., 1e-8})
+      for (double rate : {1., .25})
+      {
+        auto scaled = solved;
+        for (auto& v : scaled.eigenvector) v *= scale;
+        const double denominator = 1 - (.2*mean[0]-.1*mean[2]) +
+            (1-xi)*qn/(1-xi+xi*std::sqrt(1+qn));
+        const auto mapped = propose(scaled, rate, xi);
+        for (std::size_t p : {0u, 1u, 2u, 3u})
+          CHECK(mapped.values[p] == Catch::Approx(accepted.values[p] +
+              rate*solved.eigenvector[p+1].real()/denominator).margin(1e-12));
+        CHECK(mapped.values[4] == accepted.values[4]);
+      }
+  auto pure = solved;
+  pure.eigenvector[2] = pure.eigenvector[4] = 0;
+  for (double reference : {1., 0.})
+  {
+    pure.eigenvector[0] = reference;
+    CHECK(propose(pure, .25, .5).values ==
+          propose(pure, .25, .5, LinearMethodNormalization::FIXED_REFERENCE_LINEAR).values);
+  }
+  pure = solved; pure.eigenvector[1] = pure.eigenvector[3] = 0;
+  CHECK(propose(pure, .25, .5).values[3] ==
+        Catch::Approx(accepted.values[3]+.25*.15/(1+qn/(1+std::sqrt(1+qn)))).margin(1e-12));
+  for (double reference : {0., 1e-14})
+  {
+    auto bad = solved; bad.eigenvector[0] = reference;
+    CHECK_THROWS(propose(bad, 1, .5));
+  }
+  auto bad = solved; bad.eigenvector[5] = .1;
+  CHECK_THROWS(propose(bad, 1, .5));
+  // At xi=1 the common denominator is exactly the linear reference shear.
+  bad = solved; bad.eigenvector[1] = 1/mean[0]; bad.eigenvector[3] = 0;
+  CHECK_THROWS(propose(bad, 1, 1));
+  bad = solved; bad.eigenvector[1] = {std::numeric_limits<double>::infinity(), 0};
+  CHECK_THROWS(propose(bad, 1, .5));
+  CHECK(accepted.values == std::vector<double>{.3, -.4, -.2, .1, 9});
 }
 
 } // namespace qmcplusplus::wftrain
