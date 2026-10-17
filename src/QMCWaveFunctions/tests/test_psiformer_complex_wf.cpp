@@ -3096,4 +3096,165 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
   CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
 }
 #endif
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer paired inference crowds own independent leased lanes",
+          "[wavefunction][psiformer][complex_gpu_crowds]")
+{
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: complex crowds require a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: complex crowds require a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "2");
+  std::size_t capacity = 2, target = 0;
+  SECTION("dense FULL tile and tail") {}
+  SECTION("B1 target K3 tail") { capacity = 1; target = 3; }
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", std::to_string(capacity));
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  {
+    const auto lattice = cell();
+    const SimulationCell simulation_cell(lattice);
+    std::array<ParticleSet, 6> p{electrons(simulation_cell), electrons(simulation_cell), electrons(simulation_cell),
+                               electrons(simulation_cell), electrons(simulation_cell), electrons(simulation_cell)};
+    auto extra_p = electrons(simulation_cell);
+    auto source = ions(simulation_cell);
+    const auto initialized = parameters();
+    const auto walkers = target ? std::size_t{1} : std::size_t{3};
+    for (std::size_t i = 0; i < 2 * walkers; ++i)
+    { p[i].R[i % 4][i % 3] += .013 * i; p[i].update(); }
+    const std::array<double, 3> twist{.17, -.11, .07};
+    ps::ExecutionEnvironment env;
+    env.boundary = ps::BoundaryCondition::PERIODIC;
+    env.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    env.periodic_axes = {true, true, true};
+    env.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    env.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d) env.lattice_vectors[a][d] = lattice.R(a, d);
+    const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, env);
+    const auto spatial = target ? dev::estimateComplexSpatialTargetCost(plan, target)
+                                : dev::estimateComplexSpatialCost(plan, capacity);
+    const auto owner_bytes = dev::estimateComplexValueCost(plan, capacity).device_bytes + spatial.device_bytes;
+    if (target)
+      controls.target(target, spatial.device_bytes,
+          dev::estimateHeadFreeTargetPrefixCost(plan, target).charged_scalar_work_units);
+    PsiFormerComplexWF gpu("crowds", initialized, p[0], source, clone_cap, twist, owner_bytes);
+    PsiFormerComplexWF cpu("crowds", initialized, p[0], source, clone_cap, twist);
+    std::vector<std::unique_ptr<WaveFunctionComponent>> gpu_clones, cpu_clones;
+    std::vector<WaveFunctionComponent*> g{&gpu}, c{&cpu};
+    for (std::size_t i = 1; i < 2 * walkers; ++i)
+    {
+      gpu_clones.push_back(gpu.makeClone(p[i])); cpu_clones.push_back(cpu.makeClone(p[i]));
+      g.push_back(gpu_clones.back().get()); c.push_back(cpu_clones.back().get());
+    }
+    RefVectorWithLeader<WaveFunctionComponent> team0(*g[0]), team1(*g[walkers]);
+    RefVectorWithLeader<ParticleSet> targets0(p[0]), targets1(p[walkers]);
+    RefVector<ParticleSet::ParticleGradient> gradients0, gradients1;
+    RefVector<ParticleSet::ParticleLaplacian> laplacians0, laplacians1;
+    for (std::size_t i = 0; i < walkers; ++i)
+    {
+      team0.push_back(*g[i]); team1.push_back(*g[walkers + i]);
+      targets0.push_back(p[i]); targets1.push_back(p[walkers + i]);
+      gradients0.push_back(p[i].G); gradients1.push_back(p[walkers + i].G);
+      laplacians0.push_back(p[i].L); laplacians1.push_back(p[walkers + i].L);
+    }
+    ResourceCollection prototype("paired concurrent"); gpu.createResource(prototype);
+    ResourceCollection resource0(prototype), resource1(prototype), missing("missing");
+    // This failure occurs after incrementing the family count; both subsequent loans must fit.
+    CHECK_THROWS(gpu.acquireResource(missing, team0));
+    const auto before_resources = metrics.snapshot();
+    ResourceCollectionTeamLock<WaveFunctionComponent> loan0(resource0, team0), loan1(resource1, team1);
+    CHECK(metrics.snapshot().live_bytes - before_resources.live_bytes == 2 * owner_bytes);
+    CHECK(metrics.snapshot().uploaded_bytes == before_resources.uploaded_bytes); // No second P image.
+    auto extra = gpu.makeClone(extra_p);
+    RefVectorWithLeader<WaveFunctionComponent> third(*extra, {*extra});
+    ResourceCollection resource2(prototype);
+    const auto denied = metrics.snapshot();
+    CHECK_THROWS(extra->acquireResource(resource2, third));
+    CHECK(metrics.snapshot().allocation_calls == denied.allocation_calls);
+    CHECK_THROWS(gpu.gpuDerivativeRequirements(1, 1, 1, 7));
+    RuntimeOptions options; TrialWaveFunction unsupported(options);
+    RefVectorWithLeader<TrialWaveFunction> trials(unsupported, {unsupported});
+    RefVectorWithLeader<ParticleSet> single(p[0], {p[0]});
+    CHECK_THROWS(gpu.makeBudgetedGpuDerivativeOperator(trials, single, 0, 0, 1, 1, 7,
+        64 * 1024 * 1024, 64 * 1024 * 1024, 1000000000));
+    CHECK(metrics.snapshot().allocation_calls == denied.allocation_calls);
+    const auto run = [&](std::size_t crowd, std::shared_future<void> start, int repeats) {
+#ifdef QMC_CUDA2HIP
+      dev::checkRuntime(hipSetDevice(ordinal), "bind paired concurrent worker");
+#else
+      dev::checkRuntime(cudaSetDevice(ordinal), "bind paired concurrent worker");
+#endif
+      start.wait();
+      auto& leader = *static_cast<PsiFormerComplexWF*>(g[crowd * walkers]);
+      for (int repeat = 0; repeat < repeats; ++repeat)
+      {
+        for (std::size_t i = crowd * walkers; i < (crowd + 1) * walkers; ++i)
+        { p[i].G = 0; p[i].L = 0; }
+        if (!crowd)
+          leader.mw_evaluateLog(team0, targets0, gradients0, laplacians0);
+        else
+          leader.mw_evaluateLog(team1, targets1, gradients1, laplacians1);
+      }
+    };
+    const auto pair = [&](int repeats) {
+      std::promise<void> begin; const auto start = begin.get_future().share();
+      auto first = std::async(std::launch::async, [&] { run(0, start, repeats); });
+      auto second = std::async(std::launch::async, [&] { run(1, start, repeats); });
+      begin.set_value(); first.get(); second.get();
+    };
+    const auto compare = [&] {
+      for (std::size_t i = 0; i < 2 * walkers; ++i)
+      {
+        const auto gradient = p[i].G; const auto laplacian = p[i].L;
+        close(g[i]->get_log_value(), evaluate(*c[i], p[i]));
+        for (std::size_t e = 0; e < 4; ++e)
+        {
+          for (int d = 0; d < 3; ++d) close(gradient[e][d], p[i].G[e][d]);
+          close(laplacian[e], p[i].L[e]);
+        }
+      }
+    };
+    pair(1); compare();
+    const auto warm = metrics.snapshot();
+    pair(3); compare();
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    // One poisoned lane cannot alter its peer's owner or outputs; retry reuses both lanes.
+    const auto saved = p[walkers - 1].R[0][0];
+    p[walkers - 1].R[0][0] = std::numeric_limits<double>::quiet_NaN();
+    std::promise<void> begin; const auto start = begin.get_future().share();
+    auto failed = std::async(std::launch::async, [&] { run(0, start, 1); });
+    auto healthy = std::async(std::launch::async, [&] { run(1, start, 1); });
+    begin.set_value(); CHECK_THROWS(failed.get()); CHECK_NOTHROW(healthy.get());
+    p[walkers - 1].R[0][0] = saved;
+    pair(1); compare();
+    auto changed = gpu.snapshotParameters();
+    changed.values[0] += .002;
+    const auto imaginary = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+        [](const auto& leaf) { return leaf.name == "w_imag"; });
+    REQUIRE(imaginary != initialized.layouts.end());
+    changed.values[imaginary->begin] += .003;
+    const auto required = gpu.gpuParameterPublicationRequirements();
+    CHECK(gpu.publishBudgetedGpuParameters(changed, changed.version, required.device_bytes, required.host_bytes) == 1);
+    CHECK(cpu.publishParameters(changed, changed.version) == 1);
+    CHECK_THROWS(gpu.publishBudgetedGpuParameters(changed, changed.version, required.device_bytes, required.host_bytes));
+    const auto before_rebind = metrics.snapshot();
+    pair(2); compare(); // Both idle resource lanes adopt the exact changed-weight image.
+    CHECK(metrics.snapshot().allocation_calls == before_rebind.allocation_calls);
+    std::printf("COMPLEX_CROWDS PASS capacity=%zu target=%zu W=%zu extra_native_bytes=%zu warm_allocations=0\n",
+        capacity, target, walkers, 2 * owner_bytes);
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+  CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
+}
+#endif
 } // namespace qmcplusplus

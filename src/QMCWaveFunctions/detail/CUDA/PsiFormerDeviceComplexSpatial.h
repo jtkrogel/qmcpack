@@ -130,7 +130,7 @@ public:
     if (positions.empty() || positions.size() % (3 * t.ne_) || positions.size() > t.positions_.capacity())
       throw std::invalid_argument("Complex FULL packed coordinates exceed capacity");
     t.setBatchCount(positions.size() / (3 * t.ne_));
-    t.positions_.upload(positions.data(), positions.size());
+    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
     t.resetStatusAdmission();
     t.evaluatePreparedTrunk();
     t.evaluateCusp();
@@ -164,10 +164,10 @@ public:
         view.lap_log != outputs_.data() + 3 * capacity_electrons_ || view.lap_ratio != outputs_.data() + 4 * capacity_electrons_ ||
         amplitude.size() != count || gradient.size() != 3 * count * n || lap_log.size() != count * n || lap_ratio.size() != count * n)
       throw std::invalid_argument("Complex FULL result is stale, foreign or wrong extent");
-    amplitude_.download(amplitude.data(), count);
-    outputs_.download(gradient.data(), gradient.size());
-    outputs_.download(lap_log.data(), lap_log.size(), 3 * capacity_electrons_);
-    outputs_.download(lap_ratio.data(), lap_ratio.size(), 4 * capacity_electrons_);
+    amplitude_.downloadOnStream(amplitude.data(), count, trunk_->queue_.getNative());
+    outputs_.downloadOnStream(gradient.data(), gradient.size(), trunk_->queue_.getNative());
+    outputs_.downloadOnStream(lap_log.data(), lap_log.size(), trunk_->queue_.getNative(), 3 * capacity_electrons_);
+    outputs_.downloadOnStream(lap_ratio.data(), lap_ratio.size(), trunk_->queue_.getNative(), 4 * capacity_electrons_);
   }
 
   /// Count standalone owned storage, excluding shared model/vendor reserves.
@@ -205,13 +205,13 @@ private:
     t.beginCoordinateEvaluation();
     if (positions.size() != 3 * t.ne_)
       throw std::invalid_argument("Complex target VGL requires one complete physical configuration");
-    t.positions_.upload(positions.data(), positions.size());
+    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
     for (std::size_t begin = 0; begin < t.ne_;)
     {
       const auto count = std::min(t.target_preparation_.max_targets, t.ne_ - begin);
       prepareTarget(begin, count);
       ComplexValueResult current;
-      amplitude_.download(&current, 1);
+      amplitude_.downloadOnStream(&current, 1, t.queue_.getNative());
       if (!begin)
         *canonical_ = current;
       else if (std::abs(current.log_abs - canonical_->log_abs) > 2e-11 ||
@@ -220,7 +220,7 @@ private:
       finishTarget(begin);
       begin += count;
     }
-    amplitude_.upload(canonical_.get(), 1);
+    amplitude_.uploadOnStream(canonical_.get(), 1, t.queue_.getNative());
     t.queue_.sync();
     valid_ = true;
   }
@@ -297,7 +297,7 @@ private:
   {
     trunk_->queue_.sync();
     std::uint64_t status;
-    status_.download(&status, 1);
+    status_.downloadOnStream(&status, 1, trunk_->queue_.getNative());
     if (status != std::numeric_limits<std::uint64_t>::max())
       throw std::runtime_error("Complex FULL node/inverse/nonfinite admission failed, status=" + std::to_string(status));
   }

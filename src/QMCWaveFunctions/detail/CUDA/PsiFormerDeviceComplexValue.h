@@ -121,7 +121,7 @@ public:
     if (positions.empty() || positions.size() % stride || positions.size() > t.positions_.capacity())
       throw std::invalid_argument("Complex VALUE packed physical input exceeds capacity");
     t.setBatchCount(positions.size() / stride);
-    t.positions_.upload(positions.data(), positions.size());
+    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
     t.resetStatusAdmission();
     t.evaluatePreparedTrunk();
     t.evaluateCusp();
@@ -169,7 +169,7 @@ public:
     if (!valid_ || view.owner != this || view.image != trunk_->model_.get() || view.generation != generation_ ||
         view.count != trunk_->batch_ || view.data != results_.data() || destination.size() != view.count)
       throw std::invalid_argument("Complex VALUE result view is stale, foreign or wrong extent");
-    results_.download(destination.data(), view.count);
+    results_.downloadOnStream(destination.data(), view.count, trunk_->queue_.getNative());
   }
 
   /// Report checked standalone storage, excluding shared image/queue/vendor reserves.
@@ -225,7 +225,7 @@ private:
   {
     trunk_->queue_.sync();
     std::uint64_t status;
-    status_.download(&status, 1);
+    status_.downloadOnStream(&status, 1, trunk_->queue_.getNative());
     if (status != std::numeric_limits<std::uint64_t>::max())
       throw std::runtime_error("Complex VALUE numerical failure, status=" + std::to_string(status));
   }
