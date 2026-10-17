@@ -1662,7 +1662,7 @@ void WFTrainBatched::process(xmlNodePtr node)
           training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
           (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
         throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7 (DEVICE authority B>0), fixed unmodified step and explicit caps");
-      validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_ && resident_adam_budget_);
+      validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
       if (resident_adam_budget_)
         resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
       else
@@ -2632,9 +2632,9 @@ void WFTrainBatched::run()
         }
         if (resident_adam_budget || resident_sr_budget.first)
         {
-          validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_ && resident_adam_budget);
+          validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
           const auto resident_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
-              (resident_device_authority_ && resident_adam_budget && has_nonlocal_ecp
+              (resident_device_authority_ && has_nonlocal_ecp
                   ? wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) : 0);
           std::optional<wftrain::StructuredParameterSnapshot> parameters;
           if (!resident_device_authority_)
@@ -2647,7 +2647,7 @@ void WFTrainBatched::run()
               batches[0].local_energy_term_mask != resident_mask ||
               training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != source_version ||
               training_state.completed_iterations == std::numeric_limits<std::size_t>::max())
-            throw std::invalid_argument("Resident ENERGY requires one current complete physical kinetic batch/state");
+            throw std::invalid_argument("Resident ENERGY requires one current complete physical kinetic/ECP batch/state");
           const auto& batch = batches.front();
           for (const auto energy : batch.local_energies)
             if (energy.imag() != 0)
