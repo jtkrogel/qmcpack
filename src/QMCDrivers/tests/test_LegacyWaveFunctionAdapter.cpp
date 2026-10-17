@@ -2231,8 +2231,14 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     pool.addParticleSet(std::move(electron_owner));
     const std::string expansion = csf ? R"(
       <detlist size="2" type="CSF" nca="0" ncb="0" nea="2" neb="2" nstates="3" cutoff="0">
-        <csf id="CI0" coeff="0.6" occ="220" exctLvl="0"><det coeff="1" alpha="110" beta="110"/></csf>
-        <csf id="CI1" coeff="0" occ="202" exctLvl="2"><det coeff="1" alpha="101" beta="101"/></csf>
+        <csf id="CI0" coeff="0.6" occ="211" exctLvl="1">
+          <det coeff="0.7071067811865475244" alpha="110" beta="101"/>
+          <det coeff="0.7071067811865475244" alpha="101" beta="110"/>
+        </csf>
+        <csf id="CI1" coeff="0" occ="121" exctLvl="1">
+          <det coeff="0.7071067811865475244" alpha="110" beta="011"/>
+          <det coeff="0.7071067811865475244" alpha="011" beta="110"/>
+        </csf>
       </detlist>)" : R"(
       <detlist size="2" type="DETS" nc0="0" nc1="0" ne0="2" ne1="2" nstates="3" cutoff="0">
         <ci id="CI0" coeff="0.6" occ0="110" occ1="110"/>
@@ -2292,7 +2298,7 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     auto& source_msd = source->findMSD()[0].get();
     auto& private_msd = evaluator->findMSD()[0].get();
     auto& sibling_msd = sibling->findMSD()[0].get();
-    REQUIRE(source_msd.get_C().size() == 2);
+    REQUIRE(source_msd.get_C().size() == (csf ? 4 : 2));
     CHECK(source_msd.get_C().data() == private_msd.get_C().data());
     private_msd.isolateOptimizationState();
     CHECK(source_msd.get_C().data() != private_msd.get_C().data());
@@ -2306,6 +2312,8 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     const auto original_log = source->getLogPsi();
     const auto original_energy = kineticEnergy(electrons);
     const auto* original_spo = &source->getSPOSet("spo");
+    const std::size_t active_term = csf ? 2 : 1;
+    const double expansion_factor = csf ? std::sqrt(0.5) : 1.0;
     for (double coefficient : {0.0, -0.17})
     {
       CAPTURE(coefficient);
@@ -2313,7 +2321,13 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
       candidate.values[0] = coefficient;
       adapter.installSnapshot(*evaluator, private_particles, candidate);
       CHECK(private_msd.get_C()[0] == original_coefficients[0]);
-      CHECK(private_msd.get_C()[1] == makeValue(coefficient));
+      CHECK(private_msd.fixedCoefficientReference() == 0.6);
+      CHECK(private_msd.get_C()[active_term] == makeValue(coefficient * expansion_factor));
+      if (csf)
+      {
+        CHECK(private_msd.get_C()[1] == original_coefficients[1]);
+        CHECK(private_msd.get_C()[3] == private_msd.get_C()[2]);
+      }
       CHECK(source_msd.get_C() == original_coefficients);
       CHECK(sibling_msd.get_C() == original_coefficients);
       auto op = adapter.makeDerivativeOperator(
@@ -2353,9 +2367,8 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
       }
       CHECK(source_msd.get_C() == original_coefficients);
       CHECK(sibling_msd.get_C() == original_coefficients);
-      if (!csf)
       {
-        // Mixed DETS/J2 inverse iteration uses the same local additive tangent
+        // Mixed CI/J2 inverse iteration uses the same local additive tangent
         // policy as nonlinear models, not LM's centered Ritz-vector retraction.
         constexpr std::size_t n = 9, m = 4;
         auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
@@ -2483,6 +2496,12 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
             previous_energy_error = energy_error;
             CHECK(private_msd.fixedCoefficientReference() == 0.6);
             CHECK(private_msd.get_C()[0] == original_coefficients[0]);
+            if (csf)
+            {
+              CHECK(private_msd.get_C()[1] == original_coefficients[1]);
+              CHECK(private_msd.get_C()[2] == makeValue(minus.values[0] * expansion_factor));
+              CHECK(private_msd.get_C()[3] == private_msd.get_C()[2]);
+            }
           }
         }
         source->evaluateLog(electrons);
@@ -2512,7 +2531,8 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     CHECK(&source->getSPOSet("spo") == fixed_spo);
     CHECK(&source_msd.get_C2node() == occupation_map);
     CHECK(source_msd.get_C()[0] == original_coefficients[0]);
-    CHECK(source_msd.get_C()[1] == makeValue(-0.23));
+    CHECK(source_msd.fixedCoefficientReference() == 0.6);
+    CHECK(source_msd.get_C()[active_term] == makeValue(-0.23 * expansion_factor));
     MultiSlaterDetTableMethod incompatible(electrons, {}, false);
     CHECK_THROWS_AS(source_msd.validatePreparedCoefficientState(incompatible), std::invalid_argument);
 
@@ -2554,7 +2574,13 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
       CHECK(&sibling_msd.get_C2node() == sibling_map);
       CHECK(&source_msd.get_C() == &sibling_msd.get_C());
       CHECK(source_msd.get_C()[0] == original_coefficients[0]);
-      CHECK(source_msd.get_C()[1] == makeValue(next.values[0]));
+      CHECK(source_msd.fixedCoefficientReference() == 0.6);
+      CHECK(source_msd.get_C()[active_term] == makeValue(next.values[0] * expansion_factor));
+      if (csf)
+      {
+        CHECK(source_msd.get_C()[1] == original_coefficients[1]);
+        CHECK(source_msd.get_C()[3] == source_msd.get_C()[2]);
+      }
       for (int spin = 0; spin < 2; ++spin)
       {
         CHECK(source_msd.getDet(spin).getPhi() == source_spos[spin]);
