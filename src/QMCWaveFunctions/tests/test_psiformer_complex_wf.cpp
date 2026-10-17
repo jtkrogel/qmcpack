@@ -1300,6 +1300,100 @@ public:
 };
 } // namespace
 
+TEST_CASE("PsiFormer paired CPU trial isolation preserves the shared source family",
+          "[wavefunction][psiformer][complex_wf][complex_parameter_isolation]")
+{
+  using namespace wftrain;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), sibling_p = electrons(simulation_cell);
+  auto trial_p = electrons(simulation_cell), reference_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  auto initialized = parameters();
+  PsiFormerComplexWF component("isolation", initialized, p, source, clone_cap, {.17, -.11, .07});
+  auto sibling_base = component.makeClone(sibling_p), trial_base = component.makeClone(trial_p);
+  auto& sibling = dynamic_cast<PsiFormerComplexWF&>(*sibling_base);
+  auto& trial = dynamic_cast<PsiFormerComplexWF&>(*trial_base);
+  // The retained source operator owns its original family, not the later trial family.
+  const auto prepare = [&](PsiFormerComplexWF& wf, ParticleSet& particles) {
+    RefVectorWithLeader<WaveFunctionComponent> wavefunctions(wf);
+    wavefunctions.push_back(wf);
+    RefVectorWithLeader<ParticleSet> configurations(particles);
+    configurations.push_back(particles);
+    return wf.makeBudgetedStreamingDerivativeOperator(wavefunctions, configurations, 0, 0, 5,
+                                                     wf.streamingDerivativeRequiredBytes(1));
+  };
+  const auto score = [&](StreamingDerivativeOperator& stream) {
+    const auto& schema = stream.parameterSchema();
+    const C one{1};
+    const VJPCoefficientChannel channel{"score", DerivativeProduct::SCORE_VJP,
+        {schema.providerId(), schema.fingerprint(), stream.parameterVersion(), 0, 0, {&one, 1}}, 0};
+    ComplexStreamingSink sink;
+    stream.applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, sink);
+    return sink.values[0];
+  };
+  const auto original = component.snapshotParameters();
+  const auto original_log = evaluate(component, p);
+  const auto original_g = p.G;
+  const auto original_l = p.L;
+  evaluate(sibling, sibling_p);
+  evaluate(trial, trial_p);
+  trial_p.makeMove(0, ParticleSet::PosType{.005, -.004, .003});
+  trial.ratio(trial_p, 0); // Warm the proposal VALUE lane independently of FULL and score.
+  trial.restore(0);
+  trial_p.rejectMove(0);
+  auto retained = prepare(component, p);
+  const auto original_score = score(*retained);
+  auto sibling_stream = prepare(sibling, sibling_p);
+  CHECK(score(*sibling_stream) == original_score);
+  trial.isolateParameterState();
+  CHECK(trial.snapshotParameters().values == original.values);
+  CHECK(trial.snapshotParameters().version == original.version);
+  auto candidate = original;
+  for (const auto& leaf : initialized.layouts)
+    if (leaf.name == "w" || leaf.name == "w_imag")
+      candidate.values[leaf.begin] += leaf.name == "w_imag" ? .04 : -.025;
+  for (int publication = 0; publication < 2; ++publication)
+  {
+    candidate.version = trial.snapshotParameters().version;
+    candidate.values[0] += .001;
+    CHECK(trial.publishParameters(candidate, candidate.version) == candidate.version + 1);
+    initialized.values = candidate.values;
+    PsiFormerComplexWF reference("independent", initialized, reference_p, source, clone_cap, {.17, -.11, .07});
+    const auto actual = evaluate(trial, trial_p);
+    close(actual, evaluate(reference, reference_p));
+    CHECK(std::abs(std::exp(actual - original_log) - C{1}) > 1e-8);
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      close(trial_p.L[electron], reference_p.L[electron]);
+      for (int dimension = 0; dimension < 3; ++dimension)
+        close(trial_p.G[electron][dimension], reference_p.G[electron][dimension]);
+    }
+    auto trial_stream = prepare(trial, trial_p), reference_stream = prepare(reference, reference_p);
+    const auto actual_score = score(*trial_stream), expected_score = score(*reference_stream);
+    REQUIRE(actual_score.size() == expected_score.size());
+    for (std::size_t i = 0; i < actual_score.size(); ++i)
+      close(actual_score[i], expected_score[i]);
+    CHECK(component.snapshotParameters().values == original.values);
+    CHECK(sibling.snapshotParameters().values == original.values);
+    CHECK(component.snapshotParameters().version == original.version);
+    CHECK(sibling.snapshotParameters().version == original.version);
+    CHECK(score(*retained) == original_score);
+    CHECK(evaluate(component, p) == original_log);
+    CHECK(p.G == original_g);
+    CHECK(p.L == original_l);
+    CHECK(evaluate(sibling, sibling_p) == original_log);
+    CHECK(sibling_p.G == original_g);
+    CHECK(sibling_p.L == original_l);
+  }
+  const auto accepted = trial.snapshotParameters();
+  CHECK_THROWS(trial.publishParameters(candidate, original.version));
+  candidate = accepted;
+  candidate.values[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(trial.publishParameters(candidate, accepted.version));
+  CHECK(trial.snapshotParameters().values == accepted.values);
+  CHECK(trial.snapshotParameters().version == accepted.version);
+}
+
 TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic contractions",
           "[wavefunction][psiformer][complex_wf][complex_streaming]")
 {
