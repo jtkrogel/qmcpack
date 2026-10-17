@@ -126,13 +126,14 @@ def validate_manifest(manifest):
         assert case.get("configuration_tile", 1) in (1, 2)
         assert case.get("target_tile", "FULL") in ("FULL", 1)
         if case["request"] == "native_vmc":
-            assert case["walkers"] == 1, "native K1 pilot is W1 only"
+            assert case["walkers"] in (1, 2), "native K1 pilot supports only reviewed W1/W2"
 
 
-def validate_native_vmc(directory):
-    """Validate this one-block physical W1 pilot, not an optimizer CSV."""
+def validate_native_vmc(directory, expected_walkers=1):
+    """Validate one reviewed physical W1/W2 block, not an optimizer CSV."""
+    assert expected_walkers in (1, 2)
     log = (directory / "console.log").read_text()
-    assert "CPU target VGL: maxK=1," in log and "CPU target VGL crowd: live_clones=1," in log
+    assert "CPU target VGL: maxK=1," in log and f"CPU target VGL crowd: live_clones={expected_walkers}," in log
     scalar, = directory.glob("*.scalar.dat")
     lines = scalar.read_text().splitlines()
     header = next(line.split()[1:] for line in lines if line.startswith("#") and "LocalEnergy" in line)
@@ -140,7 +141,7 @@ def validate_native_vmc(directory):
     assert len(data) == 1 and len(data[0]) == len(header), "require one complete native scalar block"
     values = dict(zip(header, map(float, data[0])))
     assert all(math.isfinite(value) for value in values.values()), "nonfinite native VMC scalar"
-    assert values["BlockWeight"] == 1 and 0 < values["AcceptRatio"] <= 1, "native population/moves mismatch"
+    assert values["BlockWeight"] == expected_walkers and 0 < values["AcceptRatio"] <= 1, "native population/moves mismatch"
     assert math.isfinite(values["LocalEnergy_sq"] - values["LocalEnergy"]**2)
     assert not list(directory.glob("*.training*")), "VMC pilot must not train"
     return values
@@ -253,7 +254,7 @@ def execute(manifest, manifest_path, identifier):
                      3 + 5 * values["electrons_per_configuration"] + int(bool(model.get("generated"))))
             assert len(values["values"]) == case["walkers"] * lanes, "incomplete output lanes"
         if not code and case["request"] == "native_vmc":
-            result["native_scalars"] = validate_native_vmc(directory)
+            result["native_scalars"] = validate_native_vmc(directory, case["walkers"])
             for key in ("parameter", "configuration"):
                 assert sha256(model[key + "_path"]) == model[key + "_sha256"], "protected native input changed"
         elif not code and native:
