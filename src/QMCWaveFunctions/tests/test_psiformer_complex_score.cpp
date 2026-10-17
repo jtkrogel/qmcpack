@@ -249,6 +249,14 @@ TEST_CASE("Complex raw orbital MSE has real parameter gradients and exact spin n
   evaluate();
   CHECK(workspace->vectorStorageBytes() == bytes);
   CHECK(workspace->storageFingerprint() == fingerprint);
+  // G-free raw heads and this fixed periodic-part target share one-cell periodicity.
+  const auto periodic = evaluate();
+  const auto periodic_gradient = gradient;
+  workspace->setPosition(0, 0, positions.x[0] + 8.0);
+  CHECK(evaluate().loss == Catch::Approx(periodic.loss).margin(2e-8));
+  for (std::size_t parameter = 0; parameter < gradient.size(); ++parameter)
+    CHECK(gradient[parameter] == Catch::Approx(periodic_gradient[parameter]).margin(2e-8));
+  workspace->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
   executor.evaluate(*workspace);
   CHECK_THROWS(workspace->orbitalMSEResult());
   CHECK(workspace->result().parameter_version == model.p.version());
