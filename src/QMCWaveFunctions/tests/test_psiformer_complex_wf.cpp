@@ -4057,7 +4057,7 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
           std::size_t(segments[s].walkerId()), std::size_t(segments[s].electronId()), false, std::size_t(-1)});
       for (std::size_t q = offsets[s]; q < offsets[s + 1]; ++q)
         replay->grid.push_back({std::size_t(segments[s].walkerId()), std::size_t(segments[s].electronId()),
-            {points[q][0], points[q][1], points[q][2]}, C{(q % 2 ? -.13 : .17) * (q + 1), .02 * q}, ratios[q]});
+            {points[q][0], points[q][1], points[q][2]}, C{(q % 2 ? -.13 : .17) * (q + 1), 0}, ratios[q]});
     }
     replay->tiles_.push_back({0, 0, 9, 0, 3, 0, 1, batch.fingerprint()}); replay->stamps.push_back(stamp);
     return replay;
@@ -4068,6 +4068,12 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   auto bad = replayFor(*op); ++bad->version;
   CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
   bad = replayFor(*op); bad->stamps[0] = {};
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->grid[0].bare_weight.imag(.01);
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->stamps.push_back(stamp); bad->tiles_[0].stamp_offset = 1;
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->stamps.push_back(stamp);
   CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
   bad = replayFor(*op); bad->grid.resize(12, bad->grid.front());
   CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));

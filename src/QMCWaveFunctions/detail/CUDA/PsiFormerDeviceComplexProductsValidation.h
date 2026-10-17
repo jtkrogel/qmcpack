@@ -533,7 +533,7 @@ void validateComplexProducts()
     require(nonlocal->storageFingerprint() == nf && metrics.snapshot().allocation_calls == nw.allocation_calls &&
         metrics.snapshot().free_calls == nw.free_calls, "Nonlocal warm request changed prepared ownership");
     std::cout << "PASS complex nonlocal C1 B=" << b << " Q=" << q << " allP=1 transpose=1 hermitian=1 physical_ratio_FD=1"
-              << " real_direction_duality=1 zero_weight_node_rejected=1 retry=1 warm_allocations=0\n";
+              << " real_direction_duality=1 zero_weight_node_rejected=1 retry=1 warm_allocations=0 storage_C3_unused_zero=1\n";
     std::cout << "PASS complex nonlocal JVP B=" << b << " Q=" << q
               << " per_base_CPU=1 physical_ratio_FD=1 VJP_duality=1 typed_receipts=1 overflow_revoked=1 same_transfers=1\n";
   }

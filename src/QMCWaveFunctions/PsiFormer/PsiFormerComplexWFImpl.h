@@ -660,13 +660,14 @@ struct PsiFormerComplexWF::Impl
       for (const auto& point : points)
       {
         if (point.sample >= samples || point.electron >= lane->state->model.ne ||
-            !finite(point.bare_weight) || !finite(point.complete_ratio) || !finite(point.bare_weight * point.complete_ratio))
+            !finite(point.bare_weight) || point.bare_weight.imag() != 0 || !finite(point.complete_ratio) ||
+            !finite(point.bare_weight * point.complete_ratio))
           throw std::invalid_argument("Complex replay point/complete coefficient is invalid");
         for (const auto x : point.replacement_position)
           if (!psiformer::determinant::isFiniteReal(x))
             throw std::invalid_argument("Complex replay replacement coordinate is nonfinite");
       }
-      std::size_t covered_points = 0, covered_segments = 0;
+      std::size_t covered_points = 0, covered_segments = 0, covered_stamps = 0;
       for (const auto& segment : incoming->segments())
       {
         if (segment.sample >= samples || segment.electron >= lane->state->model.ne ||
@@ -688,7 +689,8 @@ struct PsiFormerComplexWF::Impl
             tile.point_offset != covered_points || tile.segment_offset != covered_segments ||
             covered_points > points.size() || tile.point_count > points.size() - covered_points ||
             covered_segments > incoming->segments().size() || tile.segment_count > incoming->segments().size() - covered_segments ||
-            tile.stamp_offset > stamps.size() || tile.stamp_count > stamps.size() - tile.stamp_offset)
+            tile.stamp_offset != covered_stamps || covered_stamps > stamps.size() ||
+            tile.stamp_count > stamps.size() - covered_stamps)
           throw std::invalid_argument("Complex replay tile traversal/provenance range mismatch");
         bool matching = false;
         for (std::size_t s = 0; s < tile.stamp_count; ++s)
@@ -699,9 +701,10 @@ struct PsiFormerComplexWF::Impl
           pf::addStorageBytes(tile_points, incoming->segments()[covered_segments + s].point_count, message);
         if (tile_points != tile.point_count)
           throw std::invalid_argument("Complex replay tile/segment point counts disagree");
-        covered_points += tile.point_count; covered_segments += tile.segment_count;
+        covered_points += tile.point_count; covered_segments += tile.segment_count; covered_stamps += tile.stamp_count;
       }
-      if (covered_points != points.size() || covered_segments != incoming->segments().size())
+      if (covered_points != points.size() || covered_segments != incoming->segments().size() ||
+          covered_stamps != incoming->evaluationStamps().size())
         throw std::invalid_argument("Complex replay tile coverage is incomplete");
       app_log() << "Complex replay before allocation: HOST_additional_bytes=" << extra
                 << ", bases=" << samples << ", points=" << points.size() << "; DEVICE_additional_bytes=0; C1_only=yes" << std::endl;
@@ -819,6 +822,10 @@ struct PsiFormerComplexWF::Impl
       GpuDerivativeLane::Products::CompletedResult result;
       {
         std::shared_lock read(lane->state->mutex);
+        if (replay && (requested.size() != 1 ||
+            (requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP &&
+             requested[0].local_energy_term_mask != localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))))
+          throw std::invalid_argument("Complex bound replay requires current ECP-only C1 request admission");
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
