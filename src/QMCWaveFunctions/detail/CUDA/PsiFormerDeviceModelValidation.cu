@@ -200,14 +200,18 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     if (graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
         graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
       throw std::runtime_error("Parallel VGL actual composite charge disagrees");
-    const auto check = [&] {
+    const auto check = [&](std::size_t live = 0) {
+      live = live ? live : batch;
+      const std::vector<double> prefix(positions.begin(), positions.begin() + live * 3 * model.ne);
       const auto before = metrics.snapshot();
-      graph.evaluate(positions);
+      graph.evaluate(prefix);
       const auto& layout = graph.resultLayout();
-      std::vector<double> phase(batch), jets(spatialJetSpanElements(layout)), ratios(batch * model.ne);
+      if (layout.configuration_count != live)
+        throw std::runtime_error("Parallel VGL live prefix retained a stale result shape");
+      std::vector<double> phase(live), jets(spatialJetSpanElements(layout)), ratios(live * model.ne);
       graph.downloadResults(phase, jets, ratios);
       // Leaf outputs are packed per configuration even when input jet planes have gaps.
-      for (std::size_t configuration = 0; configuration < batch; ++configuration)
+      for (std::size_t configuration = 0; configuration < live; ++configuration)
       {
         const auto& reference = references[configuration];
         near(phase[configuration], reference.sign, "parallel complete phase");
@@ -225,25 +229,42 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
       }
       const auto after = metrics.snapshot();
       if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
-          after.live_bytes != before.live_bytes || graph.admittedTargetTiles() != cost.tile_count)
+          after.live_bytes != before.live_bytes || graph.admittedTargetTiles() != cost.tile_count ||
+          graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
+          graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
         throw std::runtime_error("Parallel VGL warm request changed ownership or coverage");
     };
     check(); check();
-    auto invalid = positions;
-    invalid.back() = std::numeric_limits<double>::quiet_NaN();
-    bool failed = false;
-    try { graph.evaluate(invalid); } catch (const std::exception&) { failed = true; }
-    if (!failed) throw std::runtime_error("Parallel VGL admitted nonfinite coordinates");
-    bool revoked = false;
-    try {
-      std::vector<double> phase(batch), jets(spatialJetSpanElements(graph.resultLayout())), ratios(batch * model.ne);
-      graph.downloadResults(phase, jets, ratios);
-    } catch (const std::logic_error&) { revoked = true; }
-    if (!revoked) throw std::runtime_error("Parallel VGL exposed failed results");
+    // A rejected full or short replacement must revoke every previously borrowed result.
+    const auto reject_nonfinite = [&](std::vector<double> invalid) {
+      invalid.back() = std::numeric_limits<double>::quiet_NaN();
+      bool failed = false;
+      try { graph.evaluate(invalid); } catch (const std::exception&) { failed = true; }
+      if (!failed) throw std::runtime_error("Parallel VGL admitted nonfinite coordinates");
+      bool revoked = false;
+      try {
+        const auto& failed_layout = graph.resultLayout();
+        std::vector<double> phase(failed_layout.configuration_count), jets(spatialJetSpanElements(failed_layout)),
+            ratios(failed_layout.configuration_count * model.ne);
+        graph.downloadResults(phase, jets, ratios);
+      } catch (const std::logic_error& error) {
+        revoked = std::string(error.what()) == "Device inference has no completed result for the current image";
+      }
+      if (!revoked) throw std::runtime_error("Parallel VGL exposed failed results");
+    };
+    reject_nonfinite(positions);
     check();
     const auto successor = image->makeUpdatedImage(model.p.flat_values(), 1);
     graph.rebindModel(successor);
     check();
+    if (batch == 3 && k == 3)
+    {
+      // Configuration tails and target tails vary independently on this one fixed owner.
+      check(3); check(1); check(2);
+      reject_nonfinite(std::vector<double>(positions.begin(), positions.begin() + 2 * 3 * model.ne));
+      check(3);
+      std::cout << "PASS parallel fixed B3 owner live3/1/2/3 with K3-tail, atomic failure and warm reuse\n";
+    }
   }
   std::cout << "PASS parallel complete VGL B" << batch
             << " FULL/K1/K3-tail, exact composite cost, denial, warm reuse, failure/retry and rebind\n";
