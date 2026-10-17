@@ -200,16 +200,19 @@ def main():
                         help="bounded pure-CI H4 PII/minPII updates and exported inference; freeze J2")
     parser.add_argument("--ci-lm", action="store_true",
                         help="bounded pure-DETS H4 LM/ALM retraction, exported inference and exact restart")
+    parser.add_argument("--csf-lm", action="store_true",
+                        help="bounded two-DETS-per-CSF H4 LM/ALM with actual frozen CSF reference")
     args = parser.parse_args()
-    pure_ci = args.ci_pii or args.ci_lm
+    linear_ci = args.ci_lm or args.csf_lm
+    pure_ci = args.ci_pii or linear_ci
     if pure_ci:
         if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
                 args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
                 args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
-                args.orbital_jastrow)) or args.ci_representation != "dets" or (args.ci_pii and args.ci_lm):
-            parser.error("--ci-pii/--ci-lm select separate single-rank pure-DETS bounded workflows")
+                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm)) != 1:
+            parser.error("--ci-pii/--ci-lm/--csf-lm select separate single-rank pure-CI bounded workflows")
         args.family_screen = True
-        args.family_method = ("lm", "alm") if args.ci_lm else ("pii", "minpii")
+        args.family_method = ("lm", "alm") if linear_ci else ("pii", "minpii")
     if args.threads <= 0 or args.ranks <= 0:
         parser.error("--threads and --ranks must be positive")
     if (args.profile_only or args.optimizer_screen or args.family_screen) and (args.restart or args.preflight):
@@ -298,6 +301,19 @@ def main():
             assert tree.find(".//rotated_sposet") is None
             for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
                 node.set("optimize", "no")
+            if args.csf_lm:
+                expansion.set("type", "CSF")
+                for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
+                    expansion.set(new, expansion.attrib.pop(old))
+                for node in list(expansion):
+                    expansion.remove(node)
+                for ordinal, (occupation, pairs) in enumerate((
+                        ("211", (("110", "101"), ("101", "110"))),
+                        ("121", (("110", "011"), ("011", "110"))))):
+                    csf = ET.SubElement(expansion, "csf", id=f"CI{ordinal}",
+                        coeff="0.6" if ordinal == 0 else "0", occ=occupation, exctLvl="1")
+                    for alpha, beta in pairs:
+                        ET.SubElement(csf, "det", coeff="0.7071067811865475244", alpha=alpha, beta=beta)
         if args.external_lcao:
             tree.find("wavefunction/sposet_collection").set("href", str(external_asset))
         # Recipes run in fresh evidence directories, not beside their PP asset.
@@ -492,6 +508,11 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
+                    if args.csf_lm:
+                        assert exported_list.get("type") == "CSF"
+                        for original, retained in zip(linear_nodes, list(exported_list)):
+                            assert len(original) == len(retained) == 2
+                            assert [det.attrib for det in original] == [det.attrib for det in retained], model
                 if pure_ci:
                     original_j2 = tree.findall("wavefunction/jastrow/correlation/coefficients")
                     retained_j2 = exported.findall("jastrow/correlation/coefficients")
@@ -527,9 +548,9 @@ def main():
                           "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
                           "krylov_relative_tolerance": "1e-6"}
                 if optimizer in ("lm", "alm"):
-                    limits.update(lm_maximum_subspace_dimension="2" if args.ci_lm else "9")
+                    limits.update(lm_maximum_subspace_dimension="2" if linear_ci else "9")
                     if optimizer == "alm":
-                        limits.update(lm_inner_iterations="32", lm_inner_restart_length="2" if args.ci_lm else "9")
+                        limits.update(lm_inner_iterations="32", lm_inner_restart_length="2" if linear_ci else "9")
                 else:
                     limits.update(gmres_restart_length="16", maximum_damping_retries="0",
                                   pii_energy_undershoot="1.0")
@@ -543,7 +564,7 @@ def main():
                     loaded = run(f"{optimizer}_export_vmc", vmc=True, parameter_file=final)
                     reference = run(f"{optimizer}_explicit_vmc", vmc=True, reference_file=final)
                     np.testing.assert_array_equal(vmc_physical_trace(loaded), vmc_physical_trace(reference))
-                if args.ci_lm:
+                if linear_ci:
                     split = run(f"{optimizer}_split", optimizer=optimizer, iterations=1,
                                 mutate=controls, samples_per_rank=32)
                     resumed = run(f"{optimizer}_resumed", optimizer=optimizer,
@@ -573,12 +594,13 @@ def main():
             writer.writerow(("optimizer", "status", "committed"))
             writer.writerows(reports)
         assert all(status == "complete" for _, status, _ in reports), work
-        if args.ci_lm:
+        if linear_ci:
             def mixed_ci_j2(tree):
                 tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
             run("reject_mixed_ci_j2_lm", optimizer="lm", mutate=mixed_ci_j2,
-                reject="mixed/CSF updates remain unqualified")
-            print("PASS: pure-DETS LM/ALM projective updates, fixed C0/SPO/J2, exact exported inference/restart; mixed CI/J2 rejected")
+                reject="mixed updates remain unqualified")
+            representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
+            print(f"PASS: {representation} LM/ALM projective updates, fixed reference/SPO/J2/expansion, exact exported inference/restart; mixed CI/J2 rejected")
         elif args.ci_pii:
             print("PASS: pure-CI PII/minPII committed updates, fixed C0/SPO/J2 and exact exported inference; not mixed CI/Jastrow qualification")
         else:
