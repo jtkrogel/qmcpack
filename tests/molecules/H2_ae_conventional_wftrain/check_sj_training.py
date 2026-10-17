@@ -542,8 +542,15 @@ def main():
                 for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
                     physical = text_value(group["physical_definition"][()])
                     assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
-                    assert "rule=2;local_channel=1;" in physical and "knots=4;" in physical, model
-                    assert pseudo.get("href") in text_value(group["ecp_source_report"][()]), model
+                    pairpot = next(node for node in tree.findall("hamiltonian/pairpot") if pseudo in list(node))
+                    species = pseudo.get("elementType")
+                    descriptor = (f"species={species};source={pairpot.get('source')};"
+                                  f"target={tree.find('hamiltonian').get('target')};format={pseudo.get('format')};"
+                                  f"rule={pseudo.get('nrule')};local_channel={pseudo.get('l-local')};")
+                    assert descriptor in physical, (model, descriptor)
+                    if not external_ecp or species == "Li":
+                        assert "knots=4;" in physical, model
+                    assert f"species={species} href={pseudo.get('href')}" in text_value(group["ecp_source_report"][()]).splitlines(), model
                 if periodic_profile:
                     physical = text_value(group["physical_definition"][()])
                     assert "handler=EwaldHandler3D;" in physical, model
