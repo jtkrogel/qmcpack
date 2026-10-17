@@ -83,6 +83,11 @@ public:
                                         const TrialWaveFunction& wavefunction,
                                         bool serializing_crowd_walkers);
 
+  /// Prove unchanged complete spatial state; never replaces a Hamiltonian observation.
+  static bool canReuseRejectedDeviceFullState(const TrialWaveFunction& wavefunction,
+                                             const ParticleSet& particles,
+                                             std::size_t accepted_moves, bool recompute);
+
   /** Advance and evaluate one production step for one crowd. */
   static void runVMCStep(int crowd_id,
                          const State& state,

@@ -80,6 +80,22 @@ void computeLogGreensFunction(const MCCoords<CT>& coordinates,
 
 } // namespace
 
+bool VMCBatchedSampling::canReuseRejectedDeviceFullState(const TrialWaveFunction& wavefunction,
+                                                       const ParticleSet& particles,
+                                                       std::size_t accepted_moves, bool recompute)
+{
+#ifdef QMC_COMPLEX
+  return false;
+#else
+  if (accepted_moves != 0 || recompute || wavefunction.getOrbitals().size() != 1 ||
+      particles.isSpinor() || particles.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
+    return false;
+  const auto* component = deviceSamplingComponent(wavefunction);
+  return component && component->canReuseFullSpatialReplay(particles, particles, component->parameterVersion(),
+                                                          wavefunction.getLogPsi(), wavefunction.getPhase());
+#endif
+}
+
 void VMCBatchedSampling::validateMoveConfiguration(const VMCDriverInput& input,
                                                    const ParticleSet& electrons,
                                                    const TrialWaveFunction& wavefunction,
@@ -133,6 +149,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     timers.check_log_and_gl(crowd, "checkGL_after_load");
 
   bool device_moves_completed = false;
+  std::size_t device_accepted_moves = 0;
 
   {
     ScopedTimer pbyp_local_timer(timers.move);
@@ -172,6 +189,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
         crowd.incAccept();
       for (std::size_t count = 0; count < counts.second; ++count)
         crowd.incReject();
+      device_accepted_moves = counts.first;
       device_moves_completed = true;
     }
     else if (move_kind != VMCDriverInput::MoveKind::PBYP)
@@ -404,10 +422,15 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     ScopedTimer buffer_local_timer(timers.buffer);
     if (device_moves_completed)
     {
-      // All substeps used only VALUE; restore canonical host state exactly once
-      // at the unchanged every-outer-step Hamiltonian/sample boundary.
+      // Keep native tables current even when an all-rejected window left its
+      // already complete FULL cache untouched. Any failed proof takes full replay.
       ps_dispatcher.flex_update(walker_elecs);
-      twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
+      bool reuse_full = device_accepted_moves == 0 && !recompute;
+      for (std::size_t walker = 0; walker < walker_twfs.size() && reuse_full; ++walker)
+        reuse_full = canReuseRejectedDeviceFullState(walker_twfs[walker], walker_elecs[walker],
+                                                    device_accepted_moves, recompute);
+      if (!reuse_full)
+        twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
     }
     else
       twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
