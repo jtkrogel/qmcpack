@@ -67,17 +67,32 @@ def text_value(value):
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def four_mo_md_pairs(tree):
+    """Derive expected local pairs from this fixture's explicit DETS occupations."""
+    expansion = tree.find(".//multideterminant/detlist")
+    assert expansion.get("type") == "DETS"
+    result = []
+    for spin in range(2):
+        occupations = [node.get(f"occ{spin}") for node in expansion]
+        assert all(len(value) == 4 for value in occupations)
+        core = {i for i in range(4) if all(value[i] == "1" for value in occupations)}
+        virtual = {i for i in range(4) if all(value[i] == "0" for value in occupations)}
+        result.append([(i, j) for i in range(4) for j in range(i + 1, 4)
+                       if not ({i, j} <= core or {i, j} <= virtual)])
+    return result
+
+
 def check_orbital_frame(group, tree, parameters, row, model):
     """Check qualified frames against each explicit inline AO definition."""
     wrappers = tree.findall(".//rotated_sposet")
     multideterminant = tree.find(".//multideterminant") is not None
     assert len(wrappers) == (2 if multideterminant else 1)
     many_occupied = wrappers[0].find("sposet").get("size") == "4"
-    pairs = (tuple((i, j) for i in range(4) for j in range(i + 1, 4)) if many_occupied and multideterminant else
-             ((0, 2), (0, 3), (1, 2), (1, 3)) if many_occupied else
+    pairs = (((0, 2), (0, 3), (1, 2), (1, 3)) if many_occupied else
              ((0, 1), (0, 2), (1, 2)) if multideterminant else ((0, 1), (0, 2)))
+    owner_pairs = four_mo_md_pairs(tree) if many_occupied and multideterminant else [pairs] * len(wrappers)
     expected = [f"{wrapper.get('name')}_orb_rot_{i:04d}_{j:04d}_r"
-                for wrapper in wrappers for i, j in pairs]
+                for wrapper, pairs in zip(wrappers, owner_pairs) for i, j in pairs]
     names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
     indices = np.asarray(group["active_indices"][()]).reshape(-1)
     assert sorted(name for name in names if "_orb_rot_" in name) == sorted(expected), (model, names)
@@ -192,6 +207,8 @@ def main():
                         help="bounded neutral-C fixed-CI two-owner MD orbital/J2 ECP Adam P16")
     parser.add_argument("--joint-ci-orbital-ecp", action="store_true",
                         help="derive joint P17 CI1/orbital/J2 ECP Adam from the fixed-CI XML")
+    parser.add_argument("--unequal-spin-orbital-ecp", action="store_true",
+                        help="derive one charged C^- 3up/2down joint P16 orbital ECP case")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -221,6 +238,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.unequal_spin_orbital_ecp:
+        if args.md_orbital_ecp or args.joint_ci_orbital_ecp:
+            parser.error("select only one fixed, joint, or unequal-spin orbital ECP mode")
+        args.joint_ci_orbital_ecp = True
     if args.joint_ci_orbital_ecp:
         if args.md_orbital_ecp:
             parser.error("select either fixed --md-orbital-ecp or --joint-ci-orbital-ecp")
@@ -349,6 +370,14 @@ def main():
             expansion = tree.find(".//multideterminant")
             assert expansion is not None and expansion.get("optimize") == "no"
             expansion.set("optimize", "yes")
+        if args.unequal_spin_orbital_ecp:
+            up = tree.find("particleset[@name='e']/group[@name='u']")
+            up.set("size", "3")
+            up.find("attrib[@name='position']").text = ".2 -.3 .4  .6 .2 -.5  .4 -.7 .6"
+            expansion = tree.find(".//multideterminant/detlist")
+            expansion.set("ne0", "3")
+            expansion[0].set("occ0", "1110")
+            expansion[1].set("occ0", "1101")
         if ci_workflow:
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
@@ -387,7 +416,8 @@ def main():
             coefficients = tree.find(".//rotated_sposet/sposet/coefficient")
             size, occupied = (4, 2) if args.many_occupied_orbital_ecp or args.md_orbital_ecp else (3, 1)
             assert coefficients.get("size") == str(size) and len(coefficients.text.split()) == 4 * size
-            assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == [str(occupied)] * 2
+            assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == \
+                   (["3", "2"] if args.unequal_spin_orbital_ecp else [str(occupied)] * 2)
             if args.many_occupied_orbital_ecp or args.md_orbital_ecp:
                 np.testing.assert_array_equal(np.asarray(coefficients.text.split(), dtype=float).reshape(4, 4), np.eye(4))
                 assert tree.find("hamiltonian/pairpot/pseudo").get("elementType") == "C"
@@ -396,8 +426,9 @@ def main():
                 assert expansion.get("optimize") == ("yes" if args.joint_ci_orbital_ecp else "no")
                 assert expansion.find("detlist").get("type") == "DETS"
                 assert [node.attrib for node in expansion.find("detlist")] == [
-                    dict(id="CI0", coeff="1", occ0="1100", occ1="1100"),
-                    dict(id="CI1", coeff="0.1", occ0="1010", occ1="1010")]
+                    dict(id="CI0", coeff="1", occ0="1110" if args.unequal_spin_orbital_ecp else "1100", occ1="1100"),
+                    dict(id="CI1", coeff="0.1", occ0="1101" if args.unequal_spin_orbital_ecp else "1010", occ1="1010")]
+                assert [len(pairs) for pairs in four_mo_md_pairs(tree)] == ([5, 6] if args.unequal_spin_orbital_ecp else [6, 6])
                 wrappers = tree.findall(".//rotated_sposet")
                 assert [node.get("name") for node in wrappers] == ["rot", "rot_dn"]
                 for wrapper in wrappers:
@@ -512,7 +543,8 @@ def main():
         initial = ([] if args.md_orbital_ecp and not args.joint_ci_orbital_ecp else
                    [float(node.get("coeff")) for node in linear_nodes[1:]])
         if orbital_model:
-            initial += [0.0] * (12 if args.md_orbital_ecp else 4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
+            initial += [0.0] * (sum(map(len, four_mo_md_pairs(tree))) if args.md_orbital_ecp else
+                               4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    if node.get("optimize") != "no"
                    for value in node.text.split()]
@@ -549,12 +581,13 @@ def main():
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
                     if args.md_orbital_ecp:
-                        assert parameters.size == (17 if args.joint_ci_orbital_ecp else 16)
+                        assert parameters.size == (17 if args.joint_ci_orbital_ecp and not args.unequal_spin_orbital_ecp else 16)
                         indices = np.asarray(group["active_indices"][()]).reshape(-1)
                         if args.joint_ci_orbital_ecp:
                             assert int(indices[names.index("CI1")]) == 0
                             assert parameters[0] != previous[0], (model, "CI1 did not update")
-                        for prefix, count in (("rot_orb_rot_", 6), ("rot_dn_orb_rot_", 6), ("ud_", 4)):
+                        for prefix, count in (("rot_orb_rot_", 5 if args.unequal_spin_orbital_ecp else 6),
+                                              ("rot_dn_orb_rot_", 6), ("ud_", 4)):
                             block = [int(index) for name, index in zip(names, indices) if name.startswith(prefix)]
                             assert len(block) == count and min(block) >= 0, (model, prefix)
                             assert not np.array_equal(parameters[block], previous[block]), (model, prefix, "did not update")
@@ -659,13 +692,17 @@ def main():
             first, second = orbital_history[0][0], orbital_history[1][0]
             delta = second - first
             if args.md_orbital_ecp:
-                def generator(values):
+                def generator(values, pairs):
                     matrix = np.zeros((4, 4))
-                    matrix[np.triu_indices(4, 1)] = values
+                    for (i, j), value in zip(pairs, values):
+                        matrix[i, j] = value
                     return matrix - matrix.T
-                for start in (0, 6):
-                    a, b = generator(first[start:start + 6]), generator(delta[start:start + 6])
+                start = 0
+                for pairs in four_mo_md_pairs(tree):
+                    end = start + len(pairs)
+                    a, b = generator(first[start:end], pairs), generator(delta[start:end], pairs)
                     assert np.linalg.norm(a @ b - b @ a) > 0, (directory, start, "fixture updates commute")
+                    start = end
             elif linear_nodes:
                 def generator(values):
                     matrix = np.zeros((3, 3))
@@ -1034,6 +1071,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.unequal_spin_orbital_ecp:
+            print("PASS: real CPU charged C^- 3up/2down joint CI1/orbital/J2 ECP P16, "
+                  "five/six-pair frames, frozen C0/original XML and strict exact initialized restart")
         elif args.joint_ci_orbital_ecp:
             print("PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP Adam P17, "
                   "frozen C0/original XML, two complete frames, physical VMC reuse and strict exact initialized restart")

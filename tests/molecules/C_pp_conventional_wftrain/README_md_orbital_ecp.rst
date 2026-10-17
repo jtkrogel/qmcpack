@@ -33,3 +33,9 @@ the helper-only source is ``c33d9e566`` (checker SHA256
 The independent joint physical gate passed separately (3,836 assertions).
 One joint mode is registered beside the unchanged fixed-P16 route, with
 the same real CPU guard and strict comparisons, not an optimizer ULP exception.
+
+The optional ``--unequal-spin-orbital-ecp`` mode derives one charged C^-
+3-up/2-down case from the same XML. It adds the numerical fixture's third
+up coordinate and uses up occupations 1110/1101, giving five/six orbital
+pairs and joint P16. Its native qualification and registration are pending;
+both unequal-spin orientations passed the separate numerical gate.
