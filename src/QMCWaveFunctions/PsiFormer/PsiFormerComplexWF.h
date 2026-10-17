@@ -56,6 +56,9 @@ public:
 
   /// Stable physical restart identity, independent of parameter values/version and runtime addresses.
   std::string trainingConfigurationFingerprint() const;
+
+  /// Match immutable model physics metadata to the native Hamiltonian route.
+  bool isPseudopotentialSystem() const;
   /// Export paired weights and immutable physical metadata without sampler state.
   void exportModel(const std::string& path) const;
 

@@ -2238,6 +2238,12 @@ double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
 }
 
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
+bool PsiFormerComplexWF::isPseudopotentialSystem() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return impl_->state->system_kind == "pseudopotential";
+}
+
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {
   std::shared_lock read(impl_->state->mutex);
