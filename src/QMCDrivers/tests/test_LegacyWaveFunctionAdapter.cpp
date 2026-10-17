@@ -2579,7 +2579,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     auto twf = wf->makeClone(trial);
     twf->findMSD().front().get().isolateOptimizationState();
     trial.update(); adapter.installSnapshot(*twf, trial, candidate);
-    const double c = twf->findMSD().front().get().get_C()[1];
+    const double c = std::real(twf->findMSD().front().get().get_C()[1]);
     const auto jlog = [&](TrialWaveFunction& state, ParticleSet& particles) {
       double value = 0;
       particles.G = QMCTraits::GradType{}; particles.L = QMCTraits::ValueType{};
