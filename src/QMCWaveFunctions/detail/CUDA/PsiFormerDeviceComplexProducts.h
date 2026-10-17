@@ -107,6 +107,18 @@ public:
     const Complex* data = nullptr;
   };
 
+  enum class LocalTerms : unsigned { KINETIC = 1, NONLOCAL_ECP = 2, COMPLETE = 3 };
+
+  /// A complete local-energy response cannot be consumed as a score or ECP-only receipt.
+  struct LocalEnergyJvpView
+  {
+    const PreparedDeviceComplexProducts* owner;
+    const PreparedDeviceModel* image;
+    std::size_t generation, samples;
+    const Complex* data;
+    LocalTerms terms;
+  };
+
   /// Reject checked combined device/host/work caps before either numerical owner allocates.
   static std::unique_ptr<PreparedDeviceComplexProducts> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
@@ -183,16 +195,7 @@ public:
       {
         const auto* response = channels[channel].role == Role::SCORE ? score_response : kinetic_response;
         const auto coefficient = channels[channel].values[sample];
-        // cuDoubleComplex is interleaved FP64; no std::complex aliasing is used.
-        static_assert(sizeof(cuDoubleComplex) == 2 * sizeof(double));
-        for (std::size_t component = 0; component < 2; ++component)
-        {
-          const double sign = hermitian && component ? -1 : 1;
-          checkRuntime(launchRealToComplexAxpy(queue_.getNative(), {p, component, 2, 2 * channel * p, 2},
-              sign * (component ? -coefficient.imag() : coefficient.real()),
-              sign * (component ? coefficient.real() : coefficient.imag()), reinterpret_cast<const double*>(response),
-              reinterpret_cast<double*>(accumulated_.data())), "complex products ordinary AXPY");
-        }
+        accumulateResponse(response, coefficient, hermitian, channel);
       }
     }
     publishCompleted();
@@ -209,6 +212,17 @@ public:
       const std::vector<Complex>& complete_weights, const std::vector<Complex>& coefficients,
       bool hermitian = false)
   {
+    evaluateLocalEnergyVJP(base_positions, virtual_positions, references, complete_weights, coefficients,
+        {}, {}, LocalTerms::NONLOCAL_ECP, hermitian);
+  }
+
+  /// Append kinetic and captured-grid responses before ONE finite publication in the same owner.
+  void evaluateLocalEnergyVJP(const std::vector<double>& base_positions,
+      const std::vector<double>& virtual_positions, const std::vector<std::size_t>& references,
+      const std::vector<Complex>& complete_weights, const std::vector<Complex>& coefficients,
+      const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
+      LocalTerms terms, bool hermitian = false)
+  {
     ready_ = jvp_ready_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
@@ -216,10 +230,12 @@ public:
     image_->validateCurrentDevice();
     const auto stride = 3 * cost_.electrons;
     const auto b = base_positions.size() / stride, q = virtual_positions.size() / stride;
-    if (!cost_.channels || !b || b > cost_.maximum_samples || q > cost_.maximum_samples - b ||
+    const bool kinetic = hasKinetic(terms), nonlocal = hasNonlocal(terms);
+    if (!cost_.channels || !b || b > cost_.maximum_samples || (nonlocal && q > cost_.maximum_samples - b) ||
         base_positions.size() % stride || virtual_positions.size() % stride ||
         coefficients.size() != b || references.size() != q || complete_weights.size() != q)
       throw std::invalid_argument("Complex nonlocal C1 packed grid/request extent mismatch");
+    if (kinetic) validateKinetic(inverse_masses, kappa, b);
     const auto finite = [](Complex value) {
       return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
     };
@@ -231,7 +247,7 @@ public:
       if (!finite(value)) throw std::invalid_argument("Complex nonlocal nonfinite sample coefficient");
     // Revoke JVP views before reusing their bounded O(B) storage for base weights.
     std::fill_n(sample_products_.begin(), b, Complex{});
-    for (std::size_t point = 0; point < q; ++point)
+    for (std::size_t point = 0; nonlocal && point < q; ++point)
     {
       const auto reference = references[point];
       if (reference >= b || !finite(complete_weights[point]))
@@ -245,7 +261,7 @@ public:
     }
     checkRuntime(launchDerivativeZero(queue_.getNative(), {2 * accumulated_.capacity(), 0, 0, 0, 1},
         reinterpret_cast<double*>(accumulated_.data())), "complex nonlocal zero");
-    for (std::size_t point = 0; point < q; ++point)
+    for (std::size_t point = 0; nonlocal && point < q; ++point)
     {
       const auto weighted = coefficients[references[point]] *
           (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
@@ -253,7 +269,20 @@ public:
     }
     // Evaluate even zero-weight references/virtuals: undefined node scores are not zero.
     for (std::size_t sample = 0; sample < b; ++sample)
-      accumulateNonlocalScore(base_positions.data() + sample * stride, sample_products_[sample], hermitian);
+    {
+      if (nonlocal)
+        accumulateNonlocalScore(base_positions.data() + sample * stride, sample_products_[sample], hermitian);
+      if (kinetic)
+      {
+        std::copy_n(base_positions.data() + sample * stride, stride, positions_.data());
+        std::copy_n(inverse_masses.data() + sample * cost_.electrons, cost_.electrons, masses_.data());
+        kinetic_->evaluate(positions_, masses_, kappa);
+        const auto response = kinetic_->resultView();
+        if (response.image != image_.get() || response.count != cost_.parameters)
+          throw std::logic_error("Complex local-energy kinetic binding changed");
+        accumulateResponse(response.data, coefficients[sample], hermitian);
+      }
+    }
     publishCompleted();
   }
 
@@ -265,6 +294,7 @@ public:
   {
     ready_ = jvp_ready_ = false;
     nonlocal_jvp_ = false;
+    local_jvp_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
     ++generation_;
@@ -275,13 +305,7 @@ public:
     for (double value : positions)
       if (!device_math::isFiniteBinary64(value))
         throw std::invalid_argument("Complex score JVP nonfinite coordinate");
-    for (std::size_t i = 0; i < p; ++i)
-    {
-      if (!device_math::isFiniteBinary64(direction[i].real()) || direction[i].imag() != 0)
-        throw std::invalid_argument("Complex score JVP requires a finite REAL canonical direction");
-      direction_host_[i] = direction[i].real();
-    }
-    direction_.upload(direction_host_.data(), p);
+    prepareDirection(direction, count);
     for (std::size_t sample = 0; sample < b; ++sample)
     {
       std::copy_n(positions.data() + 3 * sample * n, 3 * n, positions_.data());
@@ -289,21 +313,7 @@ public:
       const auto score = score_->resultView();
       if (score.image != image_.get() || score.count != p)
         throw std::logic_error("Complex score JVP numerical binding changed");
-      for (std::size_t component = 0; component < 2; ++component)
-      {
-        const ResponseDotLayout layout{p, 4096, cost_.dot_partials, component, 2, 0, 1};
-        checkRuntime(launchResponseDotDirection(queue_.getNative(), layout,
-            reinterpret_cast<const double*>(score.data), direction_.data(), dot_workspace_.data(), dot_status_.data(),
-            dot_workspace_.data() + cost_.dot_partials + component, dot_status_.data() + cost_.dot_partials),
-            "complex full-score directional dot");
-        queue_.sync();
-        dot_status_.download(dot_host_status_.data(), 1, cost_.dot_partials);
-        if (dot_host_status_[0].nonfinite_count)
-          throw std::runtime_error("Complex score JVP complete directional dot is nonfinite");
-      }
-      std::array<double, 2> result;
-      dot_workspace_.download(result.data(), 2, cost_.dot_partials);
-      sample_products_[sample] = Complex(result[0], result[1]);
+      sample_products_[sample] = dotResponse(score.data);
     }
     jvp_samples_ = b;
     jvp_ready_ = true;
@@ -356,11 +366,81 @@ public:
     }
   }
 
+  /// Borrow [B base,Q virtual] packing; charge B extra dots when kinetic and ECP are combined.
+  void evaluateLocalEnergyJVP(const std::vector<double>& positions, std::size_t bases,
+      const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
+      LocalTerms terms, const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
+    const bool kinetic = hasKinetic(terms), nonlocal = hasNonlocal(terms);
+    const auto stride = 3 * cost_.electrons, total = positions.size() / stride;
+    if (!bases || bases > total || bases > cost_.maximum_samples || positions.size() % stride ||
+        (nonlocal && total > cost_.maximum_samples) ||
+        (kinetic && nonlocal && bases > cost_.maximum_samples - total))
+      throw std::invalid_argument("Complex local-energy JVP request work exceeds preparation");
+    if (kinetic) validateKinetic(inverse_masses, kappa, bases);
+    try
+    {
+      if (nonlocal)
+        evaluateNonlocalJVP(positions, bases, references, complete_weights, direction, count);
+      else
+      {
+        if (generation_ == std::numeric_limits<std::size_t>::max())
+          throw std::overflow_error("Complex products generation exhausted");
+        ++generation_;
+        image_->validateCurrentDevice();
+        for (double value : positions)
+          if (!device_math::isFiniteBinary64(value))
+            throw std::invalid_argument("Complex local-energy JVP nonfinite coordinate");
+        prepareDirection(direction, count);
+        std::fill_n(sample_products_.begin(), bases, Complex{});
+      }
+      jvp_ready_ = false;
+      for (std::size_t sample = 0; kinetic && sample < bases; ++sample)
+      {
+        std::copy_n(positions.data() + sample * stride, stride, positions_.data());
+        std::copy_n(inverse_masses.data() + sample * cost_.electrons, cost_.electrons, masses_.data());
+        kinetic_->evaluate(positions_, masses_, kappa);
+        const auto response = kinetic_->resultView();
+        if (response.image != image_.get() || response.count != cost_.parameters)
+          throw std::logic_error("Complex local-energy JVP kinetic binding changed");
+        sample_products_[sample] += dotResponse(response.data);
+        if (!finiteComplex(sample_products_[sample]))
+          throw std::overflow_error("Complex local-energy JVP accumulation overflow");
+      }
+      jvp_samples_ = bases;
+      local_terms_ = terms;
+      local_jvp_ = jvp_ready_ = true;
+    }
+    catch (...)
+    {
+      ready_ = jvp_ready_ = false;
+      throw;
+    }
+  }
+
+  LocalEnergyJvpView localEnergyJvpView() const
+  {
+    image_->validateCurrentDevice();
+    if (!jvp_ready_ || !local_jvp_)
+      throw std::logic_error("Complex local-energy JVP response unavailable");
+    return {this, image_.get(), generation_, jvp_samples_, sample_products_.data(), local_terms_};
+  }
+
+  void validate(const LocalEnergyJvpView& view) const
+  {
+    const auto current = localEnergyJvpView();
+    if (view.owner != current.owner || view.image != current.image || view.generation != current.generation ||
+        view.samples != current.samples || view.data != current.data || view.terms != current.terms)
+      throw std::invalid_argument("Complex local-energy JVP stale/foreign result receipt");
+  }
+
   /// Publish only the complete finite physical response with its distinct mathematical receipt.
   NonlocalJvpView nonlocalJvpView() const
   {
     image_->validateCurrentDevice();
-    if (!jvp_ready_ || !nonlocal_jvp_) throw std::logic_error("Complex nonlocal JVP response unavailable");
+    if (!jvp_ready_ || !nonlocal_jvp_ || local_jvp_) throw std::logic_error("Complex nonlocal JVP response unavailable");
     return {this, image_.get(), generation_, jvp_samples_, sample_products_.data()};
   }
 
@@ -377,7 +457,7 @@ public:
   ScoreJvpView scoreJvpView() const
   {
     image_->validateCurrentDevice();
-    if (!jvp_ready_ || nonlocal_jvp_)
+    if (!jvp_ready_ || nonlocal_jvp_ || local_jvp_)
       throw std::logic_error("Complex score JVP response unavailable");
     return {this, image_.get(), generation_, jvp_samples_, sample_products_.data()};
   }
@@ -449,6 +529,77 @@ public:
   }
 
 private:
+  static bool finiteComplex(Complex value)
+  {
+    return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
+  }
+
+  static bool hasKinetic(LocalTerms terms)
+  {
+    if (terms != LocalTerms::KINETIC && terms != LocalTerms::NONLOCAL_ECP && terms != LocalTerms::COMPLETE)
+      throw std::invalid_argument("Complex local-energy term mask unsupported");
+    return terms != LocalTerms::NONLOCAL_ECP;
+  }
+
+  static bool hasNonlocal(LocalTerms terms) { return terms != LocalTerms::KINETIC; }
+
+  void validateKinetic(const std::vector<double>& masses, const std::array<double, 3>& kappa, std::size_t samples) const
+  {
+    if (masses.size() != samples * cost_.electrons)
+      throw std::invalid_argument("Complex local-energy inverse-mass extent mismatch");
+    for (double value : masses)
+      if (!device_math::isFiniteBinary64(value) || value <= 0)
+        throw std::invalid_argument("Complex local-energy inverse masses must be positive finite");
+    for (double value : kappa)
+      if (!device_math::isFiniteBinary64(value)) throw std::invalid_argument("Complex local-energy kappa nonfinite");
+  }
+
+  void prepareDirection(const Complex* direction, std::size_t count)
+  {
+    if (!direction || count != cost_.parameters)
+      throw std::invalid_argument("Complex directional response extent mismatch");
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      if (!device_math::isFiniteBinary64(direction[i].real()) || direction[i].imag() != 0)
+        throw std::invalid_argument("Complex score JVP requires a finite REAL canonical direction");
+      direction_host_[i] = direction[i].real();
+    }
+    direction_.upload(direction_host_.data(), count);
+  }
+
+  Complex dotResponse(const cuDoubleComplex* response)
+  {
+    for (std::size_t component = 0; component < 2; ++component)
+    {
+      const ResponseDotLayout layout{cost_.parameters, 4096, cost_.dot_partials, component, 2, 0, 1};
+      checkRuntime(launchResponseDotDirection(queue_.getNative(), layout,
+          reinterpret_cast<const double*>(response), direction_.data(), dot_workspace_.data(), dot_status_.data(),
+          dot_workspace_.data() + cost_.dot_partials + component, dot_status_.data() + cost_.dot_partials),
+          "complex response directional dot");
+      queue_.sync();
+      dot_status_.download(dot_host_status_.data(), 1, cost_.dot_partials);
+      if (dot_host_status_[0].nonfinite_count) throw std::runtime_error("Complex directional dot is nonfinite");
+    }
+    std::array<double, 2> result;
+    dot_workspace_.download(result.data(), 2, cost_.dot_partials);
+    return {result[0], result[1]};
+  }
+
+  void accumulateResponse(const cuDoubleComplex* response, Complex coefficient, bool hermitian,
+      std::size_t channel = 0)
+  {
+    static_assert(sizeof(cuDoubleComplex) == 2 * sizeof(double));
+    for (std::size_t component = 0; component < 2; ++component)
+    {
+      const double sign = hermitian && component ? -1 : 1;
+      checkRuntime(launchRealToComplexAxpy(queue_.getNative(),
+          {cost_.parameters, component, 2, 2 * channel * cost_.parameters, 2},
+          sign * (component ? -coefficient.imag() : coefficient.real()),
+          sign * (component ? coefficient.real() : coefficient.imag()), reinterpret_cast<const double*>(response),
+          reinterpret_cast<double*>(accumulated_.data())), "complex response AXPY");
+    }
+  }
+
   /// Accumulate one admitted B1 score with the same TRANSPOSE/HERMITIAN algebra as ordinary products.
   void accumulateNonlocalScore(const double* positions, Complex coefficient, bool hermitian)
   {
@@ -457,14 +608,7 @@ private:
     const auto score = score_->resultView();
     if (score.image != image_.get() || score.count != cost_.parameters)
       throw std::logic_error("Complex nonlocal score binding changed");
-    for (std::size_t component = 0; component < 2; ++component)
-    {
-      const double sign = hermitian && component ? -1 : 1;
-      checkRuntime(launchRealToComplexAxpy(queue_.getNative(), {cost_.parameters, component, 2, 0, 2},
-          sign * (component ? -coefficient.imag() : coefficient.real()),
-          sign * (component ? coefficient.real() : coefficient.imag()), reinterpret_cast<const double*>(score.data),
-          reinterpret_cast<double*>(accumulated_.data())), "complex nonlocal score AXPY");
-    }
+    accumulateResponse(score.data, coefficient, hermitian);
   }
 
   /// Publish only a complete finite contraction; both product routes share the same receipt protocol.
@@ -530,6 +674,8 @@ private:
   std::size_t jvp_samples_ = 0;
   std::size_t generation_ = 0;
   bool ready_ = false, jvp_ready_ = false, nonlocal_jvp_ = false;
+  bool local_jvp_ = false;
+  LocalTerms local_terms_ = LocalTerms::NONLOCAL_ECP;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif

@@ -554,8 +554,8 @@ struct PsiFormerComplexWF::Impl
       if (replay_bound.load(std::memory_order_acquire))
       {
         c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
-        c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
-        c.maximum_vjp_channels = 1; // Bound replay is deliberately ECP-only C1, not a mixed T+ECP producer.
+        c.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+        c.maximum_vjp_channels = 1; // One complete local-energy response in the existing C3 owner.
       }
       return c;
     }
@@ -786,7 +786,18 @@ struct PsiFormerComplexWF::Impl
       }
     }
 
-    /// The bound profile exposes only captured-grid ECP; no mixed kinetic response is implied.
+    static GpuDerivativeLane::Products::LocalTerms localTerms(std::uint32_t mask)
+    {
+      using namespace wftrain;
+      using Terms = GpuDerivativeLane::Products::LocalTerms;
+      if (mask == localEnergyTermBit(LocalEnergyTerm::KINETIC)) return Terms::KINETIC;
+      if (mask == localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)) return Terms::NONLOCAL_ECP;
+      if (mask == (localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)))
+        return Terms::COMPLETE;
+      throw std::invalid_argument("Complex captured response has unsupported local-energy terms");
+    }
+
+    /// The same immutable captured grid supplies complete kinetic/ECP directional responses.
     void evaluateLocalEnergyJVP(const wftrain::StructuredParameterVectorConstView& direction,
         std::uint32_t mask, wftrain::SampleProductSink& sink) const override
     {
@@ -796,12 +807,12 @@ struct PsiFormerComplexWF::Impl
       {
         std::shared_lock read(lane->state->mutex);
         requireCurrent();
-        if (!replay || mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP))
-          throw std::invalid_argument("Complex captured response requires ECP-only C1");
+        if (!replay) throw std::invalid_argument("Complex local-energy JVP requires bound replay");
+        const auto terms = localTerms(mask);
         std::unique_lock gpu(lane->generation->mutex);
-        lane->products->evaluateNonlocalJVP(joined_positions, samples, references, complete_weights,
-            direction.values().data(), direction.values().size());
-        const auto result = lane->products->nonlocalJvpView(); lane->products->validate(result); output = result.data;
+        lane->products->evaluateLocalEnergyJVP(joined_positions, samples, references, complete_weights,
+            inverse_masses, lane->state->cartesian_twist, terms, direction.values().data(), direction.values().size());
+        const auto result = lane->products->localEnergyJvpView(); lane->products->validate(result); output = result.data;
       }
       for (std::size_t sample = 0; sample < samples; ++sample)
       {
@@ -822,10 +833,10 @@ struct PsiFormerComplexWF::Impl
       GpuDerivativeLane::Products::CompletedResult result;
       {
         std::shared_lock read(lane->state->mutex);
-        if (replay && (requested.size() != 1 ||
-            (requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP &&
-             requested[0].local_energy_term_mask != localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))))
-          throw std::invalid_argument("Complex bound replay requires current ECP-only C1 request admission");
+        if (replay && requested.size() != 1)
+          throw std::invalid_argument("Complex bound replay requires current C1 request admission");
+        if (replay && requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP)
+          localTerms(requested[0].local_energy_term_mask);
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
@@ -842,8 +853,9 @@ struct PsiFormerComplexWF::Impl
           if (replay && requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP)
           {
             std::copy_n(requested[0].coefficients.values.data(), samples, sample_coefficients.data());
-            lane->products->evaluateNonlocalVJP(positions, virtual_positions, references, complete_weights,
-                sample_coefficients, adjoint == DerivativeAdjoint::HERMITIAN);
+            lane->products->evaluateLocalEnergyVJP(positions, virtual_positions, references, complete_weights,
+                sample_coefficients, inverse_masses, lane->state->cartesian_twist,
+                localTerms(requested[0].local_energy_term_mask), adjoint == DerivativeAdjoint::HERMITIAN);
           }
           else
             lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,

@@ -4039,9 +4039,9 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   std::vector<C> ratios(9);
   const auto stamp = gpu.mw_evaluateVirtualRatios(components, particles, scratch, batch, ratios);
   REQUIRE(stamp.isVersioned());
-  const auto requirement = gpu.gpuDerivativeRequirements(2, 11, 3, 7);
+  const auto requirement = gpu.gpuDerivativeRequirements(2, 13, 3, 7);
   const auto make = [&](std::size_t extra = 65536) {
-    return gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 11, 3, 7,
+    return gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 13, 3, 7,
         requirement.device_bytes, requirement.host_bytes + extra, requirement.matrix_work);
   };
   auto op = make();
@@ -4092,7 +4092,8 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   CHECK(metrics.snapshot().live_bytes == device_before_bind.live_bytes);
   CHECK_THROWS(op->bindNonLocalECPJVPReplay(replayFor(*op)));
   REQUIRE(op->capabilities().maximum_vjp_channels == 1);
-  REQUIRE(op->capabilities().local_energy_term_mask == localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP));
+  REQUIRE(op->capabilities().local_energy_term_mask ==
+      (localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)));
   const auto storage = op->storageDiagnostics();
   CHECK(storage.shared_workspace_bytes == before_bind.shared_workspace_bytes);
   CHECK(storage.retained_numeric_bytes == before_bind.retained_numeric_bytes + replay_bytes + 2168);
@@ -4155,17 +4156,51 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   for (std::size_t b = 0; b < 2; ++b) dual += std::conj(coefficients[b]) * jvp.values[b];
   for (std::size_t i = 0; i < direction.size(); ++i) dot += std::conj(actual.values[0][i]) * direction[i];
   close(dual, dot, 3e-9);
+  RefVectorWithLeader<WaveFunctionComponent> base_components(cpu, {cpu, *copies[0]});
+  RefVectorWithLeader<ParticleSet> base_particles(*all[0], {*all[0], *all[1]});
+  auto base_oracle = cpu.makeBudgetedStreamingDerivativeOperator(base_components, base_particles, 7, 11, 7,
+      cpu.streamingDerivativeRequiredBytes(2));
+  auto kinetic_channel = channel;
+  kinetic_channel.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  for (const auto mask : {localEnergyTermBit(LocalEnergyTerm::KINETIC),
+      localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)})
+    for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+    {
+      ComplexStreamingSink kinetic_expected, ecp_expected, complete_actual;
+      base_oracle->applyVJPs({&kinetic_channel, 1}, adjoint, kinetic_expected);
+      op->applyVJPs({&channel, 1}, adjoint, ecp_expected);
+      auto complete_channel = channel; complete_channel.local_energy_term_mask = mask;
+      const auto warm = metrics.snapshot();
+      op->applyVJPs({&complete_channel, 1}, adjoint, complete_actual);
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+      for (std::size_t i = 0; i < direction.size(); ++i)
+        close(complete_actual.values[0][i], kinetic_expected.values[0][i] +
+            (mask == kinetic_channel.local_energy_term_mask ? C{} : ecp_expected.values[0][i]), 3e-9);
+      ComplexSampleSink complete_jvp;
+      op->applyLocalEnergyJVP({schema, 0, {direction.data(), direction.size()}}, mask, complete_jvp);
+      C lhs{}, rhs{};
+      for (std::size_t b = 0; b < 2; ++b)
+        lhs += (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(coefficients[b]) : coefficients[b]) * complete_jvp.values[b];
+      for (std::size_t i = 0; i < direction.size(); ++i)
+        rhs += (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(complete_actual.values[0][i]) :
+            complete_actual.values[0][i]) * direction[i];
+      close(lhs, rhs, 3e-9);
+    }
   actual.reset(); actual.fail_next = true;
   CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));
   actual.reset(); CHECK_NOTHROW(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));
   CHECK(op->storageDiagnostics().storage_fingerprint == storage.storage_fingerprint);
-  channel.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  channel.local_energy_term_mask = 0x80000000u;
   actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
   channel.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
   p.makeMove(0, ParticleSet::PosType{.01, 0, 0}); gpu.ratio(p, 0);
   actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
   gpu.restore(0); p.rejectMove(0);
   CHECK(gpu.snapshotParameters().values == accepted.values); CHECK(gpu.get_log_value() == accepted_log);
+  // Publication during COMPLETE response chunks must not replace the leased old generation.
+  ComplexStreamingSink kinetic_expected;
+  base_oracle->applyVJPs({&kinetic_channel, 1}, DerivativeAdjoint::HERMITIAN, kinetic_expected);
+  channel.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::KINETIC);
   bool published = false;
   actual.reset(); actual.callback = [&] {
     if (published) return;
@@ -4175,9 +4210,10 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   };
   op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual);
   CHECK(published);
-  for (std::size_t i = 0; i < direction.size(); ++i) close(actual.values[0][i], expected.values[0][i], 3e-9);
+  for (std::size_t i = 0; i < direction.size(); ++i)
+    close(actual.values[0][i], expected.values[0][i] + kinetic_expected.values[0][i], 3e-9);
   actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
-  std::printf("COMPLEX_CAPTURED_ECP PASS B=2 Q=9 C3_slot0 C1_only CPU_allP duality stamp lease retry stale\n");
+  std::printf("COMPLEX_CAPTURED_ECP PASS B=2 Q=9 C3_slot0 C1_complete CPU_allP duality stamp lease retry stale\n");
 }
 #endif
 } // namespace qmcplusplus

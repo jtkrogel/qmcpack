@@ -333,9 +333,9 @@ void validateComplexProducts()
   // Complete regular-node nonlocal ratios include learned phase, outer twist and a fixed companion.
   {
     constexpr std::size_t q = 9;
-    const auto nc = estimateComplexProductsCost(plan, targets, b + q, 3, chunk, ComplexProductsHostOutput::CHUNKED);
+    const auto nc = estimateComplexProductsCost(plan, targets, 2 * b + q, 3, chunk, ComplexProductsHostOutput::CHUNKED);
     const auto before_owner = metrics.snapshot();
-    auto nonlocal = Owner::prepare(image, targets, b + q, 3, chunk, queue, blas,
+    auto nonlocal = Owner::prepare(image, targets, 2 * b + q, 3, chunk, queue, blas,
         nc.device_bytes, nc.host_bytes, nc.matrix_work, ComplexProductsHostOutput::CHUNKED);
     require(metrics.snapshot().live_bytes == before_owner.live_bytes + nc.device_bytes, "Nonlocal owner cost mismatch");
     const auto nf = nonlocal->storageFingerprint();
@@ -511,6 +511,10 @@ void validateComplexProducts()
         score_dot_after.downloaded_bytes - score_dot_before.downloaded_bytes, "Nonlocal overflow did not follow complete inner JVP");
     fails([&] { (void)nonlocal->nonlocalJvpView(); });
     fails([&] { (void)nonlocal->scoreJvpView(); });
+    fails([&] { nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa,
+        Owner::LocalTerms::COMPLETE, tangent.data(), p); });
+    fails([&] { (void)nonlocal->localEnergyJvpView(); });
+    fails([&] { (void)nonlocal->completedResult(); });
     for (std::size_t i = 0; i < p; ++i) tangent[i] = .01 * (int(i % 13) - 6) / std::sqrt(double(p));
     physical_weights();
     std::copy_n(virtuals.data() + 3, 3, virtuals.data()); // Same-spin node in the FIRST virtual, with exactly zero weight.
@@ -530,6 +534,101 @@ void validateComplexProducts()
     nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions);
     fails([&] { nonlocal->validate(valid_nonlocal); });
     fails([&] { nonlocal->validate(jvp); });
+    // Complete responses use the SAME owner and independent CPU kinetic derivatives.
+    using Terms = Owner::LocalTerms;
+    std::array<std::vector<C>, b> kinetic_rows;
+    std::array<C, b> kinetic_dots{};
+    for (std::size_t sample = 0; sample < b; ++sample)
+    {
+      kinetic_work->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 12 * sample, 4));
+      const auto value = cpu_kinetic.evaluate(*kinetic_work, masses.data() + 4 * sample, 4);
+      kinetic_rows[sample].assign(value.parameter_response, value.parameter_response + p);
+      for (std::size_t i = 0; i < p; ++i) kinetic_dots[sample] += kinetic_rows[sample][i] * tangent[i].real();
+    }
+    for (auto terms : {Terms::KINETIC, Terms::NONLOCAL_ECP, Terms::COMPLETE})
+    {
+      nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, terms, tangent.data(), p);
+      const auto local = nonlocal->localEnergyJvpView();
+      nonlocal->validate(local);
+      fails([&] { (void)nonlocal->scoreJvpView(); });
+      fails([&] { (void)nonlocal->nonlocalJvpView(); });
+      auto foreign = local; foreign.owner = nullptr;
+      fails([&] { nonlocal->validate(foreign); });
+      auto wrong_terms = local; wrong_terms.terms = static_cast<Terms>(0);
+      fails([&] { nonlocal->validate(wrong_terms); });
+      std::array<C, b> local_dots;
+      for (std::size_t sample = 0; sample < b; ++sample)
+      {
+        local_dots[sample] = local.data[sample];
+        const C expected = (terms == Terms::KINETIC ? C{} : cpu_nonlocal_jvp[sample]) +
+            (terms == Terms::NONLOCAL_ECP ? C{} : kinetic_dots[sample]);
+        require(std::abs(local.data[sample] - expected) <= 3e-9 * (1 + std::abs(expected)),
+            "Complete local-energy per-base CPU JVP mismatch");
+      }
+      for (bool adjoint : {false, true})
+      {
+        nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa, terms, adjoint);
+        fails([&] { nonlocal->validate(local); });
+        const auto completed = nonlocal->completedResult();
+        C contracted{};
+        for (std::size_t offset = 0; offset < p; offset += chunk)
+        {
+          const auto count = std::min(chunk, p - offset);
+          const auto* result = nonlocal->downloadCompletedChunk(completed, 0, offset, count);
+          for (std::size_t i = 0; i < count; ++i)
+          {
+            C expected = terms == Terms::KINETIC ? C{} : (adjoint ? conjugate_reference : reference)[offset + i];
+            for (std::size_t sample = 0; terms != Terms::NONLOCAL_ECP && sample < b; ++sample)
+              expected += contractions[sample] * (adjoint ? std::conj(kinetic_rows[sample][offset + i]) :
+                  kinetic_rows[sample][offset + i]);
+            require(std::abs(result[i] - expected) <= 3e-9 * (1 + std::abs(expected)),
+                "Complete local-energy CPU allP adjoint mismatch");
+            contracted += (adjoint ? std::conj(result[i]) : result[i]) * tangent[offset + i].real();
+          }
+        }
+        C dual{};
+        for (std::size_t sample = 0; sample < b; ++sample)
+          dual += (adjoint ? std::conj(contractions[sample]) : contractions[sample]) * local_dots[sample];
+        require(std::abs(contracted - dual) <= 3e-9 * (1 + std::abs(dual)), "Complete local-energy duality mismatch");
+      }
+    }
+    std::array<std::array<C, b>, 2> complete_sides{};
+    for (std::size_t side = 0; side < 2; ++side)
+    {
+      auto shifted = parameters;
+      for (std::size_t i = 0; i < p; ++i) shifted[i] += (side ? -step : step) * tangent[i].real();
+      model.p.set_flat_values(shifted);
+      physical_weights();
+      for (std::size_t point = 0; point < q; ++point) complete_sides[side][refs[point]] += weights[point];
+      for (std::size_t sample = 0; sample < b; ++sample)
+      {
+        kinetic_work->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 12 * sample, 4));
+        complete_sides[side][sample] += cpu_kinetic.evaluate(*kinetic_work, masses.data() + 4 * sample, 4).kinetic;
+      }
+    }
+    model.p.set_flat_values(parameters);
+    physical_weights();
+    nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, Terms::COMPLETE, tangent.data(), p);
+    const auto complete_jvp = nonlocal->localEnergyJvpView();
+    for (std::size_t sample = 0; sample < b; ++sample)
+      require(std::abs((complete_sides[0][sample] - complete_sides[1][sample]) / (2 * step) - complete_jvp.data[sample]) <=
+          2e-8 * (1 + std::abs(complete_jvp.data[sample])), "Complete kinetic/ECP physical directional FD mismatch");
+    auto invalid_masses = masses; invalid_masses.back() = 0;
+    const auto before_invalid = metrics.snapshot();
+    auto extra_positions = joined;
+    extra_positions.insert(extra_positions.end(), virtuals.begin(), virtuals.begin() + 12);
+    auto extra_refs = refs; extra_refs.push_back(0);
+    auto extra_weights = weights; extra_weights.push_back({});
+    fails([&] { nonlocal->evaluateLocalEnergyJVP(extra_positions, b, extra_refs, extra_weights, masses, kappa,
+        Terms::COMPLETE, tangent.data(), p); }); // 2B+Q=14 exceeds prepared13, despite B+Q fitting.
+    fails([&] { nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, invalid_masses, kappa,
+        Terms::COMPLETE, tangent.data(), p); });
+    fails([&] { (void)nonlocal->localEnergyJvpView(); });
+    fails([&] { (void)nonlocal->completedResult(); });
+    require(metrics.snapshot().uploaded_bytes == before_invalid.uploaded_bytes, "Invalid complete request launched");
+    nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, Terms::COMPLETE, tangent.data(), p);
+    nonlocal->validate(nonlocal->localEnergyJvpView());
+    std::cout << "PASS complex complete response B=2 Q=9 capacity=13 K_ECP_BOTH=1 CPU_allP=1 physical_FD=1 typed=1 retry=1\n";
     require(nonlocal->storageFingerprint() == nf && metrics.snapshot().allocation_calls == nw.allocation_calls &&
         metrics.snapshot().free_calls == nw.free_calls, "Nonlocal warm request changed prepared ownership");
     std::cout << "PASS complex nonlocal C1 B=" << b << " Q=" << q << " allP=1 transpose=1 hermitian=1 physical_ratio_FD=1"
