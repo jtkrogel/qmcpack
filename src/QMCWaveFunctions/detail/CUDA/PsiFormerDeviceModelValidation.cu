@@ -270,7 +270,7 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--device-candidate-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] [--retained-energy-sr-only] "
-                                  "[--vgl-ownership FULL|K1] [--vgl-trace-bytes BYTES] [--parallel-vgl-check] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--vgl-ownership FULL|K<positive integer>] [--vgl-trace-bytes BYTES] [--parallel-vgl-check] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
@@ -332,8 +332,7 @@ int main(int argc, char** argv)
       else if (option == "--vgl-ownership" && vgl_ownership.empty() && argument + 1 < argc)
       {
         vgl_ownership = argv[++argument];
-        if (vgl_ownership != "FULL" && vgl_ownership != "K1")
-          throw std::invalid_argument("VGL ownership mode must be FULL or K1");
+        (void)parseVglOwnershipTargets(vgl_ownership); // Syntax/overflow before loading model inputs.
       }
       else if (option == "--vgl-trace-bytes" && !vgl_trace_bytes && argument + 1 < argc)
       {
@@ -420,7 +419,7 @@ int main(int argc, char** argv)
     {
       std::ofstream output(argv[3]);
       if (!output) throw std::runtime_error("Cannot open VGL ownership output");
-      measureVglOwnership(model, plan, vgl_ownership == "K1", output, vgl_trace_bytes);
+      measureVglOwnership(model, plan, vgl_ownership, output, vgl_trace_bytes);
       return 0; // Before CPU references, score/kinetic owners or any parameter trace.
     }
     if ((resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (plan.parameterCount() != 3922 || model.ne != 4 || model.cfg.nup != 2))

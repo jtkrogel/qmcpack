@@ -10,6 +10,9 @@
 #include <iomanip>
 #include <iostream>
 #include <ostream>
+#include <limits>
+#include <string>
+#include <string_view>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -24,11 +27,36 @@ inline void validateVglOwnershipAdmission()
     throw std::invalid_argument("VGL ownership requires aggregate limit <=3GiB including reserve >=256MiB");
 }
 
-/// Measure one complete B1 request, never eager co-owned reverse/score tapes.
-/// Each FULL/K1 comparison uses a fresh process; CPU oracles run separately.
-inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
-                               bool target_k1, std::ostream& output, std::size_t parallel_trace_bytes = 0)
+/// Parse utility-only target labels without a runtime call; zero denotes legacy FULL.
+inline std::size_t parseVglOwnershipTargets(std::string_view mode,
+    std::size_t electrons = std::numeric_limits<std::size_t>::max())
 {
+  if (mode == "FULL")
+    return 0;
+  if (mode.size() < 2 || mode.front() != 'K')
+    throw std::invalid_argument("VGL ownership mode must be FULL or K followed by a positive decimal integer");
+  std::size_t targets = 0;
+  for (const auto digit : mode.substr(1))
+  {
+    if (digit < '0' || digit > '9' ||
+        targets > (std::numeric_limits<std::size_t>::max() - (digit - '0')) / 10)
+      throw std::invalid_argument("VGL ownership target count must be a positive size_t decimal integer");
+    targets = 10 * targets + (digit - '0');
+  }
+  if (!targets || targets > electrons)
+    throw std::invalid_argument("VGL ownership targets must be positive and no larger than physical Ne");
+  return targets;
+}
+
+/// Measure one complete B1 request, never eager co-owned reverse/score tapes.
+/// Each FULL/K comparison uses a fresh process; CPU oracles run separately.
+inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+                               std::string_view requested_mode, std::ostream& output,
+                               std::size_t parallel_trace_bytes = 0)
+{
+  const auto ne = plan.modelShape().electrons();
+  const auto targets = parseVglOwnershipTargets(requested_mode, ne);
+  const auto mode = targets ? "K" + std::to_string(targets) : std::string("FULL");
   validateVglOwnershipAdmission();
   int ordinal = -1;
   std::size_t free_bytes = 0, total_bytes = 0;
@@ -48,14 +76,13 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
   metrics.reportAdmission(std::cout, ordinal);
   std::cout << "VGL_OWNERSHIP device=" << ordinal << " initial_free_bytes=" << free_bytes
             << " physical_total_bytes=" << total_bytes << '\n';
-  const auto ne = plan.modelShape().electrons();
   if (!ne || model.cfg.electrons.x.size() < 3 * ne)
     throw std::invalid_argument("VGL ownership requires one complete configuration");
   const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * ne);
   TargetVglPreparation preparation;
-  if (target_k1 || parallel_trace_bytes)
+  if (targets || parallel_trace_bytes)
   {
-    preparation.max_targets = target_k1 ? 1 : ne;
+    preparation.max_targets = targets ? targets : ne;
     preparation.parallel_trace_workspace_budget_bytes = parallel_trace_bytes;
     const auto cost = estimatePreparedTargetVglCost(plan, 1, preparation);
     preparation.device_workspace_budget_bytes = cost.device_workspace_bytes;
@@ -65,7 +92,7 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
   AcceleratorBlasHandle blas(queue);
   auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
   const auto image_bytes = metrics.snapshot().live_bytes;
-  std::cout << "VGL_OWNERSHIP before_scratch mode=" << (target_k1 ? "K1" : "FULL")
+  std::cout << "VGL_OWNERSHIP before_scratch mode=" << mode
             << " Ne=" << ne << " image_device_bytes=" << image_bytes
             << " parallel_trace_budget_bytes=" << parallel_trace_bytes << std::endl;
   const auto preparing = std::chrono::steady_clock::now();
@@ -110,9 +137,9 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
     for (std::size_t i = 0; i < ne; ++i) output << ' ' << jets[layout.uncheckedLaplacianOffset(0, i, 0)];
     for (const auto value : ratios) output << ' ' << value;
     output << '\n';
-    std::cout << std::setprecision(17) << "VGL_OWNERSHIP mode=" << (target_k1 ? "K1" : "FULL")
+    std::cout << std::setprecision(17) << "VGL_OWNERSHIP mode=" << mode
               << " Ne=" << ne << " P=" << plan.parameterCount() << " W=1 B=1 targets_completed=" << ne
-              << " K=" << (target_k1 ? 1 : ne) << " Nup=" << model.cfg.nup << " Ndown=" << model.cfg.ndown
+              << " K=" << (targets ? targets : ne) << " Nup=" << model.cfg.nup << " Ndown=" << model.cfg.ndown
               << " D=" << model.ndet << " width=" << model.dim << " heads=" << model.heads << " blocks=" << model.blocks
               << " image_device_bytes=" << image_bytes << " scratch_device_bytes=" << owner.deviceWorkspaceBytes()
               << " scratch_host_bytes=" << owner.hostWorkspaceBytes() << " native_live_bytes=" << after.live_bytes
