@@ -1820,7 +1820,7 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
   return prepared->commit();
 }
 
-/// Build/wait outside write, then resolve native leaves under retained final authority.
+/// Upload outside write; quiesce reused scratch and resolve native leaves under final authority.
 std::unique_ptr<PsiFormerComplexWF::PreparedGpuParameterPublication>
 PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,

@@ -1316,6 +1316,7 @@ public:
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
     validateModelRebind(successor);
+    auto retired_image = model_; // Keep ordinary callers within the adoption lifetime contract too.
     adoptPreparedModel(successor);
   }
 
