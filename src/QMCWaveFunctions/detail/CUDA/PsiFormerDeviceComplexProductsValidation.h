@@ -181,8 +181,92 @@ void validateComplexProducts()
   for (std::size_t i = 0; i < expected_hermitian.size(); ++i)
     require(std::abs(hermitian.data[i] - expected_hermitian[i]) <= 3e-9 * (1 + std::abs(expected_hermitian[i])),
         "Complex products Hermitian CPU allP mismatch");
+  // Native bounded output has identical DEVICE ownership and no retained C*P HOST array.
+  const auto chunk_cost = estimateComplexProductsCost(plan, targets, b, c, chunk, ComplexProductsHostOutput::CHUNKED);
+  require(chunk_cost.device_bytes == cost.device_bytes && cost.host_bytes - chunk_cost.host_bytes == 16 * (c*p-chunk),
+      "Complex products bounded HOST cost did not remove exactly C*P minus one chunk");
+  const auto before_chunk_owner = metrics.snapshot();
+  fails([&] { Owner::prepare(image, targets, b, c, chunk, queue, blas, chunk_cost.device_bytes,
+      chunk_cost.host_bytes-1, chunk_cost.matrix_work, ComplexProductsHostOutput::CHUNKED); });
+  require(metrics.snapshot().allocation_calls == before_chunk_owner.allocation_calls,
+      "Complex products bounded HOST denial allocated DEVICE storage");
+  auto bounded = Owner::prepare(image, targets, b, c, chunk, queue, blas, chunk_cost.device_bytes,
+      chunk_cost.host_bytes, chunk_cost.matrix_work, ComplexProductsHostOutput::CHUNKED);
+  require(metrics.snapshot().live_bytes-before_chunk_owner.live_bytes == cost.device_bytes,
+      "Complex products bounded output changed DEVICE bytes");
+  const auto bounded_fingerprint = bounded->storageFingerprint();
+  const auto bounded_warm = metrics.snapshot();
+  for (bool conjugate : {false, true})
+  {
+    const auto before_action = metrics.snapshot();
+    bounded->evaluate(positions, masses, kappa, channels, conjugate);
+    fails([&] { (void)bounded->resultView(); });
+    const auto receipt = bounded->completedResult();
+    const auto no_transfer = metrics.snapshot();
+    fails([&] { bounded->downloadCompletedChunk(Owner::CompletedResult{}, 0, 0, 1); });
+    auto invalid_receipt = receipt; invalid_receipt.owner = owner.get();
+    fails([&] { bounded->downloadCompletedChunk(invalid_receipt, 0, 0, 1); });
+    invalid_receipt = receipt; invalid_receipt.image.reset();
+    fails([&] { bounded->downloadCompletedChunk(invalid_receipt, 0, 0, 1); });
+    invalid_receipt = receipt; ++invalid_receipt.generation;
+    fails([&] { bounded->downloadCompletedChunk(invalid_receipt, 0, 0, 1); });
+    fails([&] { bounded->downloadCompletedChunk(receipt, c, 0, 1); });
+    fails([&] { bounded->downloadCompletedChunk(receipt, 0, p, 1); });
+    fails([&] { bounded->downloadCompletedChunk(receipt, 0, 0, chunk+1); });
+    fails([&] { bounded->downloadCompletedChunk(receipt, 0, 0, 0); });
+    require(metrics.snapshot().downloaded_bytes == no_transfer.downloaded_bytes,
+        "Complex products invalid bounded receipt transferred data");
+    for (std::size_t channel = 0; channel < c; ++channel)
+      for (std::size_t offset = 0; offset < p; offset += chunk)
+      {
+        const auto count = std::min(chunk, p-offset);
+        const auto* output = bounded->downloadCompletedChunk(receipt, channel, offset, count);
+        const auto& oracle = conjugate ? expected_hermitian : expected;
+        for (std::size_t i = 0; i < count; ++i)
+          require(std::abs(output[i]-oracle[channel*p+offset+i]) <= 3e-9 * (1+std::abs(oracle[channel*p+offset+i])),
+              "Complex products bounded output differs from retained/CPU result");
+      }
+    require(metrics.snapshot().downloaded_bytes-before_action.downloaded_bytes ==
+        baseline_download + 16*c*p + sizeof(DerivativeFiniteStatus)*cost.statuses,
+        "Complex products bounded output changed total completed-channel D2H traffic");
+    bounded->evaluate(positions, masses, kappa, channels, conjugate);
+    fails([&] { bounded->downloadCompletedChunk(receipt, 0, 0, 1); });
+    const auto valid = bounded->completedResult();
+    const auto saved = coefficients[2].back();
+    coefficients[2].back() = {std::numeric_limits<double>::quiet_NaN(), 0};
+    fails([&] { bounded->evaluate(positions, masses, kappa, channels); });
+    fails([&] { bounded->downloadCompletedChunk(valid, 0, 0, 1); });
+    coefficients[2].back() = saved;
+  }
+  require(metrics.snapshot().allocation_calls == bounded_warm.allocation_calls &&
+      metrics.snapshot().free_calls == bounded_warm.free_calls && bounded->storageFingerprint() == bounded_fingerprint,
+      "Complex products bounded warm allocation/address drift");
   std::vector<C> direction(p), expected_jvp(b);
+  const auto dot_warm = metrics.snapshot();
   for (std::size_t i = 0; i < p; ++i) direction[i] = .005 * std::sin(double(i + 1));
+  for (std::size_t requested : {std::size_t{1}, std::size_t{2}})
+  {
+    const auto before_subset = metrics.snapshot();
+    bounded->evaluate(positions, masses, kappa, channels);
+    const auto receipt = bounded->completedResult();
+    for (std::size_t channel = 0; channel < requested; ++channel)
+      for (std::size_t offset = 0; offset < p; offset += chunk)
+      {
+        const auto count = std::min(chunk, p-offset);
+        const auto* output = bounded->downloadCompletedChunk(receipt, channel, offset, count);
+        for (std::size_t i = 0; i < count; ++i)
+          require(std::abs(output[i]-expected[channel*p+offset+i]) <= 3e-9*(1+std::abs(expected[channel*p+offset+i])),
+              "Complex products requested subset differs from CPU");
+      }
+    require(metrics.snapshot().downloaded_bytes-before_subset.downloaded_bytes ==
+        baseline_download + 16*requested*p + sizeof(DerivativeFiniteStatus)*cost.statuses,
+        "Complex products subset transferred an unrequested HOST channel");
+  }
+  bounded->evaluate(positions, masses, kappa, channels);
+  const auto before_jvp = bounded->completedResult();
+  bounded->evaluateScoreJVP(positions, direction.data(), direction.size());
+  fails([&] { bounded->downloadCompletedChunk(before_jvp, 0, 0, 1); });
+  const auto bounded_jvp = bounded->scoreJvpView();
   for (std::size_t attempt = 0; attempt < 3; ++attempt)
   {
     if (attempt == 1) direction.back() += .017;
@@ -203,6 +287,10 @@ void validateComplexProducts()
     for (std::size_t sample = 0; sample < b; ++sample)
       require(std::abs(result.data[sample] - expected_jvp[sample]) <= 3e-9 * (1 + std::abs(expected_jvp[sample])),
           "Complex full-score/device-dot JVP differs from CPU score dot");
+    if (!attempt)
+      for (std::size_t sample = 0; sample < b; ++sample)
+        require(std::abs(result.data[sample]-bounded_jvp.data[sample]) <= 3e-9 * (1+std::abs(result.data[sample])),
+            "Complex output-storage policy changed score JVP");
     require(metrics.snapshot().uploaded_bytes - dot_before.uploaded_bytes == score_uploads + 8 * p,
         "Complex JVP did not upload exactly one realP direction per request");
     require(metrics.snapshot().downloaded_bytes - dot_before.downloaded_bytes ==
@@ -225,8 +313,8 @@ void validateComplexProducts()
   require(metrics.snapshot().uploaded_bytes == bad_direction.uploaded_bytes &&
       metrics.snapshot().downloaded_bytes == bad_direction.downloaded_bytes, "Complex JVP invalid final direction launched");
   direction.back() = C{};
-  require(owner->storageFingerprint() == fingerprint && metrics.snapshot().allocation_calls == warm.allocation_calls &&
-      metrics.snapshot().free_calls == warm.free_calls, "Complex JVP warm owner allocated or changed storage");
+  require(owner->storageFingerprint() == fingerprint && metrics.snapshot().allocation_calls == dot_warm.allocation_calls &&
+      metrics.snapshot().free_calls == dot_warm.free_calls, "Complex JVP warm owner allocated or changed storage");
   // Required inverse admission cannot be bypassed by all-zero coefficients.
   auto nodal = parameters;
   for (auto part : {HeadTensorComponent::REAL, HeadTensorComponent::IMAG})

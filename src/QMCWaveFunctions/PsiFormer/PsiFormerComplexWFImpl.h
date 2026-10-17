@@ -480,7 +480,8 @@ struct PsiFormerComplexWF::Impl
     static PsiFormerComplexWF::GpuDerivativeRequirements required(const Model& state, std::size_t samples,
         std::size_t maximum_samples, std::size_t targets, std::size_t chunk)
     {
-      const auto cost = psiformer::device::estimateComplexProductsCost(state.plan, targets, maximum_samples, 3, chunk);
+      const auto cost = psiformer::device::estimateComplexProductsCost(state.plan, targets, maximum_samples, 3, chunk,
+          psiformer::device::ComplexProductsHostOutput::CHUNKED);
       const char* message = "Complex GPU derivative bytes overflow";
       std::size_t host = cost.host_bytes;
       pf::addStorageBytes(host, pf::checkedStorageBytes<C>(maximum_samples, message), message);
@@ -497,7 +498,8 @@ struct PsiFormerComplexWF::Impl
         : state(std::move(model)), generation(state->gpu), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
           products(Products::prepare(generation->image, targets, maximum_samples, 3, chunk,
               generation->queue, generation->blas, budget.device_bytes,
-              budget.host_bytes - maximum_samples * sizeof(C), budget.matrix_work)),
+              budget.host_bytes - maximum_samples * sizeof(C), budget.matrix_work,
+              psiformer::device::ComplexProductsHostOutput::CHUNKED)),
           zeros(maximum_samples), channels(3)
     {}
 
@@ -534,7 +536,7 @@ struct PsiFormerComplexWF::Impl
       c.maximum_vjp_channels = 3;
       c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
       c.maximum_sample_tile_size = 1;
-      c.fixed_parameter_scratch_vectors = 13; // 4 real P + 8 complex P + bounded conversion chunk.
+      c.fixed_parameter_scratch_vectors = 10; // Three retained complex-P HOST outputs became bounded chunks.
       c.block_streaming = true;
       return c;
     }
@@ -565,8 +567,8 @@ struct PsiFormerComplexWF::Impl
       d.parameter_count = cost.parameters;
       d.sample_count = samples;
       d.real_parameter_vectors = 4;
-      d.complex_parameter_vectors = 8;
-      d.parameter_scratch_bytes = 160 * cost.parameters + 16 * cost.chunk;
+      d.complex_parameter_vectors = 5;
+      d.parameter_scratch_bytes = 112 * cost.parameters + 32 * cost.chunk;
       d.shared_workspace_bytes = cost.device_bytes + cost.host_bytes + lane->zeros.capacity() * sizeof(C);
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
@@ -619,7 +621,7 @@ struct PsiFormerComplexWF::Impl
       NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
       std::unique_lock execution(lane->execution_mutex);
-      const C* output;
+      GpuDerivativeLane::Products::CompletedResult result;
       {
         std::shared_lock read(lane->state->mutex);
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
@@ -638,13 +640,21 @@ struct PsiFormerComplexWF::Impl
           lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,
               adjoint == DerivativeAdjoint::HERMITIAN);
         }
-        const auto result = lane->products->resultView();
-        lane->products->validate(result);
-        output = result.data;
+        result = lane->products->completedResult();
       }
+      // All DEVICE channels were finite-admitted; only requested outputs cross D2H.
       for (const auto& chunk : chunks.chunks())
         for (std::size_t c = 0; c < requested.size(); ++c)
-          sink.add(c, {chunk, {output + c * parameterSchema().parameterCount() + chunk.parameter_offset, chunk.count}});
+        {
+          const C* output;
+          {
+            // The leased old owner/image remain valid even if a prior callback published.
+            // Never acquire Model authority here, or hold this lane lock through a callback.
+            std::unique_lock gpu(lane->generation->mutex);
+            output = lane->products->downloadCompletedChunk(result, c, chunk.parameter_offset, chunk.count);
+          }
+          sink.add(c, {chunk, {output, chunk.count}});
+        }
     }
 
     psiformer::PsiFormerTimers phase_timers;

@@ -29,6 +29,7 @@
 #include "psiformer_test_utils.h"
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexProducts.h"
 #endif
 #include <algorithm>
 #include <chrono>
@@ -2103,7 +2104,14 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
       r2.device_bytes, r2.host_bytes, r2.matrix_work);
   const auto diagnostic = stream->storageDiagnostics();
   CHECK(diagnostic.retained_numeric_bytes == r2.device_bytes + r2.host_bytes);
-  CHECK(diagnostic.parameter_scratch_bytes == 160 * component.parameterSchema().parameterCount() + 16 * 7);
+  CHECK(diagnostic.parameter_scratch_bytes == 112 * component.parameterSchema().parameterCount() + 32 * 7);
+  CHECK(diagnostic.complex_parameter_vectors == 5);
+  const auto* admitted_image = static_cast<const dev::PreparedDeviceModel*>(component.numericStorage().shared_image_identity);
+  const auto retained_cost = dev::estimateComplexProductsCost(admitted_image->plan(), 3, samples, 3, 7);
+  const auto chunked_cost = dev::estimateComplexProductsCost(admitted_image->plan(), 3, samples, 3, 7,
+      dev::ComplexProductsHostOutput::CHUNKED);
+  CHECK(chunked_cost.device_bytes == retained_cost.device_bytes);
+  CHECK(retained_cost.host_bytes - chunked_cost.host_bytes == 48 * component.parameterSchema().parameterCount() - 16 * 7);
   CHECK(diagnostic.evaluator_workspace_bytes + diagnostic.parameter_scratch_bytes == diagnostic.shared_workspace_bytes);
   CHECK(diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes);
   CHECK(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
@@ -2363,14 +2371,40 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   p.rejectMove(0);
   actual.reset();
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  const auto publication = component.gpuParameterPublicationRequirements();
+  // Publication on the FIRST bounded output chunk must leave all remaining
+  // old-image chunks valid, with no model/lane lock held through this callback.
+  bool callback_published = false;
+  actual.reset();
+  actual.callback = [&] {
+    if (callback_published) return;
+    callback_published = true;
+    CHECK(component.publishBudgetedGpuParameters(gpu_sr, snapshot.version, publication.device_bytes, publication.host_bytes)
+        == snapshot.version + 1);
+    CHECK(cpu.publishParameters(cpu_sr, snapshot.version) == snapshot.version + 1);
+  };
+  stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::HERMITIAN, actual);
+  CHECK(callback_published);
+  for (std::size_t c = 0; c < 3; ++c)
+    for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+      close(actual.values[c][i], expected_hermitian.values[c][i], 3e-9);
+  check_dense_full();
+  auto current = component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work);
+  auto current_cpu = cpu.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 7,
+      cpu.streamingDerivativeRequiredBytes(samples));
+  for (auto& channel : channels) channel.coefficients.parameter_version = snapshot.version + 1;
+  actual.reset(); expected.reset();
+  actual.callback = {};
+  current->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  current_cpu->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  for (std::size_t c = 0; c < 3; ++c)
+    for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+      close(actual.values[c][i], expected.values[c][i], 3e-9);
+  for (auto& channel : channels) channel.coefficients.parameter_version = snapshot.version;
   trial.addComponent(component.makeClone(p));
   CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
-  const auto publication = component.gpuParameterPublicationRequirements();
-  CHECK(component.publishBudgetedGpuParameters(gpu_sr, snapshot.version, publication.device_bytes, publication.host_bytes)
-      == snapshot.version + 1);
-  CHECK(cpu.publishParameters(cpu_sr, snapshot.version) == snapshot.version + 1);
-  check_dense_full();
   gpu_update.proposalAccepted(schema, snapshot, gpu_objective);
   cpu_update.proposalAccepted(schema, snapshot, cpu_objective);
   CHECK_FALSE(gpu_update.hasLiveProposal());
