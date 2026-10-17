@@ -35,6 +35,9 @@
 #include "QMCHamiltonians/CoulombPBCAA.h"
 #include "QMCHamiltonians/CoulombPotential.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
+#include "QMCWaveFunctions/BsplineFactory/SplineR2R.h"
+#include "QMCWaveFunctions/BsplineFactory/EinsplineSetBuilder.h"
+#include "Message/CommOperators.h"
 #include "ResourceCollection.h"
 #include "Utilities/StdRandom.h"
 #include "Utilities/FakeRandom.h"
@@ -5722,6 +5725,301 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   TrainingWaveFunctionBinding unrelated(*source, particles, adapterOptions(), *OHMMS::Controller);
   unrelated.setHamiltonian(ham);
   CHECK_THROWS_WITH(unrelated.modelIdentity(), Catch::Matchers::ContainsSubstring("external"));
+}
+#endif
+
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION) && !defined(ENABLE_OFFLOAD)
+TEST_CASE("Diamond Gamma spline Jastrow products preserve the captured physical model",
+          "[legacy_adapter][periodic_spline]")
+{
+  const bool cache_only = GENERATE(false, true);
+  struct RestoreBreakup
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) energy = std::move(LRCoulombSingleton::CoulombHandler);
+    decltype(LRCoulombSingleton::CoulombDerivHandler) derivative = std::move(LRCoulombSingleton::CoulombDerivHandler);
+    LRCoulombSingleton::lr_type kind = LRCoulombSingleton::this_lr_type;
+    ~RestoreBreakup()
+    {
+      LRCoulombSingleton::CoulombHandler = std::move(energy);
+      LRCoulombSingleton::CoulombDerivHandler = std::move(derivative);
+      LRCoulombSingleton::this_lr_type = kind;
+    }
+  } restore_breakup;
+  const auto directory = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/solids/diamondC_1x1x1_pp";
+  Libxml2Document input;
+  REQUIRE(input.parse((directory / "qmc_short_vmcbatch.in.xml").string()));
+  const auto child = [](xmlNodePtr parent, const char* name) {
+    auto* node = xmlFirstElementChild(parent);
+    while (node && !xmlStrEqual(node->name, BAD_CAST name)) node = xmlNextElementSibling(node);
+    return node;
+  };
+  auto* system = child(input.getRoot(), "qmcsystem");
+  auto* cell = child(system, "simulationcell");
+  auto* policy = xmlNewChild(cell, nullptr, BAD_CAST "parameter", BAD_CAST "ewald");
+  xmlSetProp(policy, BAD_CAST "name", BAD_CAST "LR_handler");
+  ParticleSetPool pool(OHMMS::Controller);
+  REQUIRE(pool.readSimulationCellXML(cell));
+  for (auto* node = xmlFirstElementChild(system); node; node = xmlNextElementSibling(node))
+    if (xmlStrEqual(node->name, BAD_CAST "particleset")) REQUIRE(pool.put(node));
+  auto& particles = *pool.getParticleSet("e");
+  auto& ions = *pool.getParticleSet("ion0");
+  REQUIRE(particles.getTotalNum() == 8);
+  REQUIRE(ions.getTotalNum() == 2);
+  StdRandom<QMCTraits::FullPrecRealType> rng(1931);
+  for (int i = 0; i < 8; ++i)
+    particles.R[i] = particles.getLattice().toCart(ParticleSet::PosType{rng(), rng(), rng()});
+  if (!particles.hasSK()) particles.createSK();
+  if (!ions.hasSK()) ions.createSK();
+  ions.update(); particles.update();
+  auto* definition = child(system, "wavefunction");
+  auto* collection = child(definition, "sposet_collection");
+  xmlSetProp(collection, BAD_CAST "href", BAD_CAST (directory / "pwscf.pwscf.h5").c_str());
+  xmlSetProp(collection, BAD_CAST "gpu", BAD_CAST "no");
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(definition, RuntimeOptions{});
+  REQUIRE(source);
+  source->evaluateLog(particles);
+  auto& spline = dynamic_cast<SplineR2R<double>&>(source->findSD()[0].get().getPhi(0));
+  REQUIRE(!spline.isOMPoffload());
+  REQUIRE(spline.sourceIdentity());
+  const auto identity = spline.sourceIdentity();
+  REQUIRE(identity->image_hex);
+  CHECK(identity->image_hex->size() == 2 * std::filesystem::file_size(directory / "pwscf.pwscf.h5"));
+  CHECK(!identity->effective_table_fingerprint.empty());
+  CHECK(identity->used_coefficient_bytes > 0);
+  if (cache_only)
+  {
+    // Only the leader touches this newly owned cache; agree failure before builders communicate.
+    auto* comm = OHMMS::Controller;
+    const auto leader_io = [&](auto action) {
+      int success = 1;
+      if (comm->rank() == 0)
+        try { success = action() ? 1 : 0; } catch (...) { success = 0; }
+      comm->bcast(success);
+      REQUIRE(success == 1);
+    };
+    std::string owned_directory;
+    leader_io([&] {
+      owned_directory = (std::filesystem::temp_directory_path() /
+          ("diamond_spline_cache_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).string();
+      return std::filesystem::create_directory(owned_directory);
+    });
+    comm->bcast(owned_directory);
+    FileCleanup cleanup_directory(owned_directory);
+    const auto build = [&] {
+      Libxml2Document document;
+      REQUIRE(document.parseFromString("<sposet_collection type='bspline' href='" +
+          (directory / "pwscf.pwscf.h5").string() + "' tilematrix='1 0 0 0 1 0 0 0 1' "
+          "twistnum='0' source='ion0' meshfactor='1.0' precision='double' gpu='no' save_coefs='yes'>"
+          "<sposet name='" + owned_directory + "/captured' size='3' spindataset='0'/></sposet_collection>"));
+      EinsplineSetBuilder builder(particles, pool.getPool(), comm, document.getRoot());
+      auto result = builder.createSPOSetFromXML(xmlFirstElementChild(document.getRoot()));
+      REQUIRE(result);
+      return result;
+    };
+    auto original = build();
+    const auto original_identity = dynamic_cast<BsplineSet&>(*original).sourceIdentity();
+    REQUIRE(original_identity);
+    std::string cache_file;
+    leader_io([&] {
+      std::size_t count = 0;
+      for (const auto& entry : std::filesystem::directory_iterator(owned_directory))
+        if (entry.path().extension() == ".h5") { cache_file = entry.path().string(); ++count; }
+      return count == 1;
+    });
+    comm->bcast(cache_file);
+    FileCleanup cleanup_cache(cache_file);
+    // The existing writer exposes rank-four spline_0 with padded lanes last.
+    const auto mutate = [&](hsize_t lane) {
+      leader_io([&] {
+        const hid_t file = H5Fopen(cache_file.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+        const hid_t dataset = file >= 0 ? H5Dopen2(file, "spline_0", H5P_DEFAULT) : -1;
+        const hid_t space = dataset >= 0 ? H5Dget_space(dataset) : -1;
+        hsize_t shape[4]{}, start[4]{0, 0, 0, lane}, count[4]{1, 1, 1, 1};
+        bool good = space >= 0 && H5Sget_simple_extent_ndims(space) == 4;
+        if (good) good = H5Sget_simple_extent_dims(space, shape, nullptr) == 4 && shape[3] > 3;
+        const hid_t scalar = H5Screate(H5S_SCALAR);
+        const double value = lane == 0 ? 4321.5 : 1234.5;
+        if (good) good = scalar >= 0 && H5Sselect_hyperslab(space, H5S_SELECT_SET, start, nullptr, count, nullptr) >= 0 &&
+            H5Dwrite(dataset, H5T_NATIVE_DOUBLE, scalar, space, H5P_DEFAULT, &value) >= 0;
+        if (scalar >= 0) good = H5Sclose(scalar) >= 0 && good;
+        if (space >= 0) good = H5Sclose(space) >= 0 && good;
+        if (dataset >= 0) good = H5Dclose(dataset) >= 0 && good;
+        if (file >= 0) good = H5Fclose(file) >= 0 && good;
+        return good;
+      });
+    };
+    mutate(3);
+    auto padding = build();
+    const auto padding_identity = dynamic_cast<BsplineSet&>(*padding).sourceIdentity();
+    REQUIRE(padding_identity);
+    CHECK(padding_identity->effective_table_fingerprint == original_identity->effective_table_fingerprint);
+    mutate(0);
+    auto changed = build();
+    const auto changed_identity = dynamic_cast<BsplineSet&>(*changed).sourceIdentity();
+    REQUIRE(changed_identity);
+    CHECK(changed_identity->effective_table_fingerprint != original_identity->effective_table_fingerprint);
+    CHECK(*padding_identity->image_hex == *original_identity->image_hex);
+    CHECK(*changed_identity->image_hex == *original_identity->image_hex);
+    CHECK(changed_identity->used_coefficient_bytes == original_identity->used_coefficient_bytes);
+    auto clone = original->makeClone();
+    CHECK(dynamic_cast<BsplineSet&>(*clone).sourceIdentity() == original_identity);
+    return; // No original source, live table or ordinary-reader cache was modified.
+  }
+  QMCHamiltonian ham;
+  ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  auto ee = std::make_unique<CoulombPBCAA>(particles, true, false, false);
+  CHECK(ee->ewaldModelDefinition().find("handler=EwaldHandler3D;") != std::string::npos);
+  ham.addOperator(std::move(ee), "ElecElec");
+  ham.addOperator(std::make_unique<CoulombPBCAA>(ions, false, false, false), "IonIon");
+  auto* pp = child(child(system, "hamiltonian"), "pairpot");
+  while (pp && !child(pp, "pseudo")) pp = xmlNextElementSibling(pp);
+  REQUIRE(pp);
+  xmlSetProp(pp, BAD_CAST "algorithm", BAD_CAST "batched");
+  xmlSetProp(pp, BAD_CAST "DLA", BAD_CAST "no");
+  xmlSetProp(child(pp, "pseudo"), BAD_CAST "href", BAD_CAST (directory / "C.BFD.xml").c_str());
+  ECPotentialBuilder builder(ham, ions, particles, OHMMS::Controller);
+  REQUIRE(builder.put(pp));
+  REQUIRE(ham.ecpModelProvenance()->ordinary_locality_vp);
+  ham.addObservables(particles);
+  ham.setRandomGenerator(&rng);
+  const auto accepted_positions = particles.R, ion_positions = ions.R;
+  const auto source_log = source->evaluateLog(particles);
+  const auto source_kinetic = kineticEnergy(particles);
+  ParticleSet private_particles(particles), sibling_particles(particles);
+  auto evaluator = source->makeClone(private_particles), sibling = source->makeClone(sibling_particles);
+  private_particles.update(); sibling_particles.update(); sibling->evaluateLog(sibling_particles);
+  const auto sibling_log = sibling->getLogPsi();
+  const auto sibling_kinetic = kineticEnergy(sibling_particles);
+  CHECK(dynamic_cast<SplineR2R<double>&>(evaluator->findSD()[0].get().getPhi(0)).sourceIdentity() == identity);
+  CHECK(dynamic_cast<SplineR2R<double>&>(sibling->findSD()[0].get().getPhi(0)).sourceIdentity() == identity);
+  // Periodicity must hold for the physical SPO value, gradient and Laplacian.
+  SPOSet::ValueVector values(4), laps(4), translated_values(4), translated_laps(4);
+  SPOSet::GradVector gradients(4), translated_gradients(4);
+  spline.evaluateVGL(particles, 0, values, gradients, laps);
+  for (int d = 0; d < 3; ++d) private_particles.R[0][d] += particles.getLattice().R(0, d);
+  private_particles.update();
+  spline.evaluateVGL(private_particles, 0, translated_values, translated_gradients, translated_laps);
+  for (int orbital = 0; orbital < 4; ++orbital)
+  {
+    checkClose(values[orbital], translated_values[orbital]);
+    checkClose(laps[orbital], translated_laps[orbital]);
+    for (int d = 0; d < 3; ++d) checkClose(gradients[orbital][d], translated_gradients[orbital][d]);
+  }
+  private_particles.R = accepted_positions; private_particles.update();
+  auto options = adapterOptions(); options.maximum_parameter_count = 24;
+  LegacyWaveFunctionAdapter adapter("legacy/diamond", *source, options);
+  const auto snapshot = adapter.snapshotParameters();
+  REQUIRE(snapshot.values.size() == 24);
+  class FixedDiamondReplay final : public LegacyWaveFunctionReplay
+  {
+  public:
+    FixedDiamondReplay(TrialWaveFunction& wf, ParticleSet& p) : wf_(wf), p_(p), positions_(p.R) {}
+    std::size_t sampleCount() const noexcept override { return 1; }
+    LegacyWaveFunctionReplaySample prepareSample(std::size_t i) override
+    {
+      if (i != 0) throw std::out_of_range("diamond sample index");
+      p_.R = positions_; p_.update();
+      return {wf_, p_};
+    }
+  private:
+    TrialWaveFunction& wf_; ParticleSet& p_; ParticleSet::ParticlePos positions_;
+  };
+  auto replay = std::make_shared<FixedDiamondReplay>(*evaluator, private_particles);
+  auto frame = std::make_shared<const StructuredParameterSnapshot>(snapshot);
+  auto op = adapter.makeDerivativeOperator(replay, frame, 0, 0);
+  auto consumer = adapter.makeNonLocalECPDerivativeConsumer(replay, frame, 0, 0);
+  const std::vector<DerivativeValue> unit{1};
+  const auto kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  const auto nonlocal = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), nonlocal};
+  ResourceCollection pr("diamond_P"), wr("diamond_W"), hr("diamond_H");
+  particles.createResource(pr); source->createResource(wr); ham.createResource(hr);
+  RefVectorWithLeader<ParticleSet> ps(particles, {particles});
+  RefVectorWithLeader<TrialWaveFunction> ws(*source, {*source});
+  RefVectorWithLeader<QMCHamiltonian> hs(ham, {ham});
+  RecordingParameterSink idle;
+  double captured_energy;
+  {
+    ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+    ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, ws);
+    ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+    captured_energy = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+        hs, ws, ps, *consumer, {&capture, 1}, idle).local_energies[0];
+  }
+  auto grid = consumer->releaseJVPReplay();
+  const std::vector<NonLocalECPReplayPoint> points(grid->points().begin(), grid->points().end());
+  REQUIRE(!points.empty());
+  op->bindNonLocalECPJVPReplay(std::move(grid));
+  NonLocalECPotential* nonlocal_component = nullptr;
+  for (int i = 0; i < ham.size(); ++i)
+    if (auto* component = dynamic_cast<NonLocalECPotential*>(ham.getComponent(i))) nonlocal_component = component;
+  REQUIRE(nonlocal_component);
+  const auto quadrature = nonlocal_component->captureQuadratureState();
+  double fixed_potential = 0;
+  for (int i = 0; i < ham.size(); ++i)
+    if (!dynamic_cast<BareKineticEnergy*>(ham.getComponent(i)) && !dynamic_cast<NonLocalECPotential*>(ham.getComponent(i)))
+      fixed_potential += ham.getComponent(i)->evaluate(*source, particles);
+  const auto rng_after_capture = rng;
+  // Every probe owns its mutable Jastrow banks; the frozen spline table is shared.
+  const auto evaluate = [&](const StructuredParameterSnapshot& point) {
+    ParticleSet p(particles);
+    auto wf = source->makeClone(p);
+    p.update(); adapter.installSnapshot(*wf, p, point);
+    const auto log = wf->getLogPsi();
+    const auto k = kineticEnergy(p);
+    DerivativeValue energy = k + fixed_potential;
+    for (const auto& knot : points)
+    {
+      auto replacement = p.R[knot.electron];
+      for (int d = 0; d < 3; ++d) replacement[d] = knot.replacement_position[d];
+      p.makeMove(knot.electron, replacement - p.R[knot.electron]);
+      energy += knot.bare_weight * derivativeValue(wf->calcRatio(p, knot.electron));
+      wf->rejectMove(knot.electron); p.rejectMove(knot.electron);
+    }
+    return std::array<DerivativeValue, 3>{DerivativeValue{log}, k, energy};
+  };
+  CHECK(evaluate(snapshot)[2].real() == Catch::Approx(captured_energy).epsilon(3e-12).margin(3e-12));
+  const std::array<VJPCoefficientChannel, 3> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0},
+      {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), kinetic},
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), kinetic | nonlocal}}};
+  RecordingParameterSink rows, hermitian;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+  std::vector<DerivativeValue> direction(24);
+  for (std::size_t p = 0; p < 24; ++p) direction[p] = (p % 2 ? -.1 : .125);
+  const StructuredParameterVectorConstView tangent(adapter.parameterSchema(), op->parameterVersion(), {direction.data(), direction.size()});
+  RecordingSampleSink score_jvp, kinetic_jvp, energy_jvp;
+  op->applyScoreJVP(tangent, score_jvp);
+  op->applyLocalEnergyJVP(tangent, kinetic, kinetic_jvp);
+  op->applyLocalEnergyJVP(tangent, kinetic | nonlocal, energy_jvp);
+  std::array<DerivativeValue, 3> dual{};
+  for (std::size_t p = 0; p < 24; ++p)
+  {
+    auto plus = snapshot, minus = snapshot;
+    plus.values[p] += 1e-5; minus.values[p] -= 1e-5;
+    const auto positive = evaluate(plus), negative = evaluate(minus);
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+      checkClose(hermitian.result()[c][p], std::conj(rows.result()[c][p]));
+      CHECK(rows.result()[c][p].real() == Catch::Approx(((positive[c] - negative[c]) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
+      dual[c] += direction[p] * rows.result()[c][p];
+    }
+  }
+  checkClose(score_jvp.result()[0], dual[0]);
+  checkClose(kinetic_jvp.result()[0], dual[1]);
+  checkClose(energy_jvp.result()[0], dual[2]);
+  source->evaluateLog(particles); sibling->evaluateLog(sibling_particles);
+  CHECK(source->getLogPsi() == source_log); CHECK(kineticEnergy(particles) == source_kinetic);
+  CHECK(sibling->getLogPsi() == sibling_log); CHECK(kineticEnergy(sibling_particles) == sibling_kinetic);
+  for (int i = 0; i < 8; ++i) CHECK(particles.R[i] == accepted_positions[i]);
+  for (int i = 0; i < 2; ++i) CHECK(ions.R[i] == ion_positions[i]);
+  auto expected_rng = rng_after_capture;
+  CHECK(rng() == expected_rng());
+  CHECK(nonlocal_component->captureQuadratureState().coordinates == quadrature.coordinates);
+  CHECK(spline.sourceIdentity() == identity);
 }
 #endif
 
