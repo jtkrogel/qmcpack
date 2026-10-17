@@ -125,6 +125,26 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
   endif()
 endif()
 
+# Qualified internally initialized Gamma paired model; no external model/orbital asset.
+if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE PAIRED_PP_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
+  execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${qmcpack_SOURCE_DIR}
+                  OUTPUT_VARIABLE PAIRED_PP_SOURCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(PAIRED_PP_PYTHON_MODULES EQUAL 0 AND PAIRED_PP_SOURCE_COMMIT)
+    add_test(NAME deterministic-LiH-pp-paired-energy-restart
+             COMMAND ${QMC_GPU_TEST_LAUNCHER} ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/check_paired_ecp_training.py
+                     --binary $<TARGET_FILE:qmcpack> --source ${qmcpack_SOURCE_DIR}
+                     --output-parent ${CMAKE_CURRENT_BINARY_DIR}/paired_pp_native
+                     --source-commit ${PAIRED_PP_SOURCE_COMMIT})
+    SET_TEST_GPU_RESOURCES(deterministic-LiH-pp-paired-energy-restart)
+    set_tests_properties(deterministic-LiH-pp-paired-energy-restart PROPERTIES
+                         TIMEOUT 200 PROCESSORS 1 LABELS "deterministic;psiformer;gpu;complex;ecp;restart"
+                         PASS_REGULAR_EXPRESSION "PASS_PAIRED_PP_EXACT_RESTART")
+  endif()
+endif()
+
 # Existing internally initialized BFD model: no external trained asset or generator.
 if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
   execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
