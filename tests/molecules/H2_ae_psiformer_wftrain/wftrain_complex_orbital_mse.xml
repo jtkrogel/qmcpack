@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!-- Current paired periodic profile; fixed-gauge FreeOrbital target, not a new ansatz. -->
+<simulation>
+  <project id="complex_orbital_mse" series="0"><parameter name="driver_version">batch</parameter></project>
+  <random seed="271"/>
+  <qmcsystem>
+    <simulationcell>
+      <parameter name="lattice">8 0 0 0.8 8 0 0.4 0.6 8</parameter>
+      <parameter name="bconds">p p p</parameter>
+      <parameter name="LR_dim_cutoff">15</parameter>
+    </simulationcell>
+    <particleset name="ion0" size="2">
+      <group name="H"><parameter name="charge">1</parameter><parameter name="valence">1</parameter>
+        <parameter name="atomicnumber">1</parameter></group>
+      <attrib name="position" datatype="posArray">0 0 0 3 0 0</attrib>
+    </particleset>
+    <particleset name="e" random="no">
+      <group name="u" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+        <attrib name="position" datatype="posArray">0.2 0.3 0.4</attrib></group>
+      <group name="d" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+        <attrib name="position" datatype="posArray">2.8 -0.4 0.2</attrib></group>
+    </particleset>
+    <wavefunction name="student" target="e" print_parameters="no">
+      <psiformer name="paired" source="ion0" system="all_electron" gpu="cpu" optimize="yes"
+        initialization="psiformer_complex_periodic_v1" initialization_seed="17"
+        feature_policy="periodic_torus_v1" max_clone_numeric_bytes="16777216" twist="0.17 -0.11 0.07"/>
+    </wavefunction>
+    <wavefunction name="teacher" target="e" print_parameters="no">
+      <sposet_collection type="free"><sposet name="occupied" size="1" optimize="no" twist="0.17 -0.11 0.07"/></sposet_collection>
+      <determinantset><slaterdeterminant><determinant sposet="occupied"/><determinant sposet="occupied"/></slaterdeterminant></determinantset>
+    </wavefunction>
+    <hamiltonian name="h0" type="generic" target="e">
+      <pairpot name="ElecElec" type="coulomb" source="e" target="e" gpu="no"/>
+      <pairpot name="ElecIon" type="coulomb" source="ion0" target="e"/>
+      <pairpot name="IonIon" type="coulomb" source="ion0" target="ion0" gpu="no"/>
+    </hamiltonian>
+  </qmcsystem>
+  <qmc method="wf_train" move="pbyp" checkpoint="1">
+    <qmcsystem wavefunction="student" hamiltonian="h0" source="ion0"/>
+    <training objective="orbital_mse" optimizer="adam">
+      <parameter name="teacher">teacher</parameter>
+      <parameter name="target_provenance">inline-free-ne2-fixed-gauge-periodic-part-v1</parameter>
+      <parameter name="orbital_target">single_reference</parameter>
+      <parameter name="iterations">2</parameter><parameter name="learning_rate">1e-7</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+      <parameter name="maximum_retained_bytes">536870912</parameter>
+      <parameter name="checkpoint_interval">1</parameter><parameter name="line_search">off</parameter>
+    </training>
+    <parameter name="walkers_per_rank">1</parameter><parameter name="crowds">1</parameter>
+    <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+    <parameter name="timestep">1e-8</parameter><parameter name="usedrift">no</parameter>
+    <inference interval="1" last="yes" move="pbyp">
+      <parameter name="walkers_per_rank">1</parameter><parameter name="crowds">1</parameter>
+      <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
+      <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+      <parameter name="timestep">1e-8</parameter><parameter name="usedrift">no</parameter>
+    </inference>
+  </qmc>
+</simulation>
