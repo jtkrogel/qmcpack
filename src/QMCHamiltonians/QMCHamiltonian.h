@@ -79,6 +79,14 @@ public:
   void setECPModelProvenance(std::shared_ptr<const ECPModelProvenance> provenance)
   { ecp_model_provenance_ = std::move(provenance); }
 
+  /// Requested fresh-vector capacity, with the existing immutable PP allocation charged separately once.
+  struct NativeCaptureRequirements
+  {
+    std::size_t new_receipt_host_bytes, shared_pp_host_bytes, total_host_bytes;
+  };
+  /// Compute the same checked cold receipt allowance as capture, without allocation or numerical work.
+  NativeCaptureRequirements nativeCaptureRequirements(std::size_t samples) const;
+
   /// Result of one coherent ordinary-locality energy/ECP-response traversal.
   struct StreamingNonLocalECPResult
   {

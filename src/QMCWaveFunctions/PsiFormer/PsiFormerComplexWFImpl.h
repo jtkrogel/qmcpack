@@ -2193,6 +2193,16 @@ class PsiFormerComplexWF::FixedGridEnergyReference
   std::vector<int> groups;
   std::size_t sample = 0;
 
+  /// One checked core serves requested fresh-vector admission and actual retained-capacity verification.
+  static FixedGridEnergyReferenceRequirements requirements(std::size_t mass_capacity, std::size_t group_capacity)
+  {
+    const char* error = "Fixed-grid energy reference HOST capacity overflow";
+    auto bytes = pf::checkedStorageSum(sizeof(FixedGridEnergyReference),
+        pf::checkedStorageBytes<double>(mass_capacity, error), error);
+    pf::addStorageBytes(bytes, pf::checkedStorageBytes<int>(group_capacity, error), error);
+    return {bytes, sizeof(Impl::GpuNonLocalReplay)};
+  }
+
   /// Both callers hold Model read; require identical accepted physical reference and kinetic metadata.
   void validateParticles(const Impl& owner, const ParticleSet& p) const
   {
@@ -3653,6 +3663,18 @@ PsiFormerComplexWF::CapturedLocalEnergyObservation PsiFormerComplexWF::observeCa
 #endif
 }
 
+/// Immutable owner-local query; native PP/replay arrays remain once-per-shared-owner charges in the caller ledger.
+PsiFormerComplexWF::FixedGridEnergyReferenceRequirements PsiFormerComplexWF::fixedGridEnergyReferenceRequirements() const
+{
+#ifdef ENABLE_CUDA
+  std::shared_lock read(impl_->state->mutex);
+  if (!impl_->state->gpu) throw std::logic_error("Fixed-grid reference requirements need a GPU family");
+  return FixedGridEnergyReference::requirements(impl_->state->model.ne, impl_->state->model.ne);
+#else
+  throw std::logic_error("Fixed-grid candidate energy requires the explicit GPU component route");
+#endif
+}
+
 /// Seal only a bound, native-produced replay; copied scientific strings and synthetic grids cannot impersonate it.
 std::shared_ptr<const PsiFormerComplexWF::FixedGridEnergyReference>
 PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
@@ -3673,11 +3695,12 @@ PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
       native->scientificDefinition().empty())
     throw std::invalid_argument("Fixed-grid energy reference requires an authoritative same-traversal native receipt");
   const char* error = "Fixed-grid energy reference HOST admission overflow";
-  auto bytes = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), native->hostBytes(), error);
-  pf::addStorageBytes(bytes, sizeof(Impl::GpuNonLocalReplay), error); // Retain the descriptor as well as its arrays.
+  const auto required = FixedGridEnergyReference::requirements(impl_->state->model.ne, impl_->state->model.ne);
+  auto bytes = pf::checkedStorageSum(required.new_reference_host_bytes, native->hostBytes(), error);
+  pf::addStorageBytes(bytes, required.shared_replay_descriptor_bytes, error);
   pf::addStorageBytes(bytes, replay->storageDiagnostics().retained_numeric_bytes, error);
-  pf::addStorageBytes(bytes, pf::checkedStorageProduct(p.R.size(), sizeof(double) + sizeof(int), error), error);
-  if (bytes > host_cap) throw std::length_error("Fixed-grid energy reference exceeds HOST cap before allocation");
+  if (bytes > host_cap) throw std::length_error("Fixed-grid energy reference exceeds HOST cap before allocation: requested=" +
+      std::to_string(bytes) + ", cap=" + std::to_string(host_cap));
   impl_->observeOwnKinetic(p); // Require current accepted FULL products, not an arbitrary VALUE reference.
   auto result = std::make_shared<FixedGridEnergyReference>();
   result->source = impl_->state; result->image = impl_->state->gpu->image;
@@ -3686,11 +3709,10 @@ PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
       stream->inverse_masses.begin() + (sample + 1) * p.R.size());
   result->groups.assign(p.GroupID.begin(), p.GroupID.end());
   result->validateParticles(*impl_, p);
-  auto actual = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), result->native->hostBytes(), error);
-  pf::addStorageBytes(actual, sizeof(Impl::GpuNonLocalReplay), error);
+  const auto measured = FixedGridEnergyReference::requirements(result->inverse_masses.capacity(), result->groups.capacity());
+  auto actual = pf::checkedStorageSum(measured.new_reference_host_bytes, result->native->hostBytes(), error);
+  pf::addStorageBytes(actual, measured.shared_replay_descriptor_bytes, error);
   pf::addStorageBytes(actual, result->replay->storageDiagnostics().retained_numeric_bytes, error);
-  pf::addStorageBytes(actual, pf::checkedStorageBytes<double>(result->inverse_masses.capacity(), error), error);
-  pf::addStorageBytes(actual, pf::checkedStorageBytes<int>(result->groups.capacity(), error), error);
   if (actual > host_cap) throw std::length_error("Fixed-grid energy reference actual capacities exceed HOST cap");
   app_log() << "Complex fixed-grid reference: HOST_retained_bytes=" << actual
             << "; shared_replay_and_PP_counted_once=yes; DEVICE_additional_bytes=0" << std::endl;

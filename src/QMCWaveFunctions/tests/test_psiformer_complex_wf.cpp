@@ -4513,13 +4513,30 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
       {schema.providerId(), schema.fingerprint(), 0, 19, 23, {coefficients.data(), 2}},
       localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
   ComplexStreamingSink replay_sink;
+  const auto before_queries = metrics.snapshot();
+  const auto native_requirement = ham.nativeCaptureRequirements(particles.size());
+  const auto reference_requirement = gpu.fixedGridEnergyReferenceRequirements();
+  CHECK(native_requirement.total_host_bytes ==
+      native_requirement.new_receipt_host_bytes + native_requirement.shared_pp_host_bytes);
+  CHECK_THROWS(ham.nativeCaptureRequirements(0));
+  CHECK_THROWS(ham.nativeCaptureRequirements(std::numeric_limits<std::size_t>::max()));
+  CHECK(reference_requirement.new_reference_host_bytes > 0);
+  CHECK(reference_requirement.shared_replay_descriptor_bytes > 0);
+  CHECK(metrics.snapshot().allocation_calls == before_queries.allocation_calls);
+  CHECK(metrics.snapshot().uploaded_bytes == before_queries.uploaded_bytes);
+  // The XML text's geometric string capacity exceeds1MiB; derive authoritative finite caps, never bump a reserve.
+  CHECK(native_requirement.total_host_bytes > 1024 * 1024);
+  std::printf("COMPLEX_FIXED_GRID_METADATA native_new=%zu PP_shared=%zu native_total=%zu ref_new=%zu replay_descriptor=%zu\n",
+      native_requirement.new_receipt_host_bytes, native_requirement.shared_pp_host_bytes,
+      native_requirement.total_host_bytes, reference_requirement.new_reference_host_bytes,
+      reference_requirement.shared_replay_descriptor_bytes);
   CHECK_THROWS(QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
-      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, 1));
+      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, native_requirement.total_host_bytes - 1));
   CHECK(replay_sink.state() == DerivativeSinkState::IDLE);
   const auto actual = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
-      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, 1024 * 1024);
+      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, native_requirement.total_host_bytes);
   REQUIRE(actual.native_capture);
-  CHECK(actual.native_capture->hostBytes() <= 1024 * 1024);
+  CHECK(actual.native_capture->hostBytes() == native_requirement.total_host_bytes);
   CHECK(actual.native_capture->scientificDefinition() == provenance->scientific_definition);
   CHECK(actual.native_capture->gridFingerprint() == actual.grid_fingerprint);
   for (std::size_t b = 0; b < 2; ++b)
@@ -4531,6 +4548,9 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   const std::vector<NonLocalECPReplayPoint> grid(replay->points().begin(), replay->points().end());
   REQUIRE(grid.size() > 5); REQUIRE(grid.size() + 4 <= 128);
   CHECK(replay->tiles().size() > 1);
+  const auto reference_cap = reference_requirement.new_reference_host_bytes +
+      reference_requirement.shared_replay_descriptor_bytes + replay->storageDiagnostics().retained_numeric_bytes +
+      actual.native_capture->hostBytes(); // Shared owners ONCE, plus one new per-sample reference.
   op->bindNonLocalECPJVPReplay(std::move(replay));
   CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
   // Independent CPU amplitudes and all-P scores use precisely the accepted radial/grid data.
@@ -4602,11 +4622,11 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   }
   CHECK(gpu.snapshotParameters().values == accepted.values);
   // This explicit numerical route is NOT used by the native REAL-energy line-search selector.
-  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, {}, 1024 * 1024));
-  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, 1));
-  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 2, actual.native_capture, 1024 * 1024));
-  auto fixed_grid = gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, 1024 * 1024);
-  CHECK_THROWS(gpu1.makeBudgetedFixedGridEnergyReference(p1, *op, 0, actual.native_capture, 1024 * 1024));
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, {}, reference_cap));
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, reference_cap - 1));
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 2, actual.native_capture, reference_cap));
+  auto fixed_grid = gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, reference_cap);
+  CHECK_THROWS(gpu1.makeBudgetedFixedGridEnergyReference(p1, *op, 0, actual.native_capture, reference_cap));
   ParticleSet private_p(p), private_cpu_p(p);
   auto private_owner = gpu.makeClone(private_p);
   auto& private_gpu = dynamic_cast<PsiFormerComplexWF&>(*private_owner);

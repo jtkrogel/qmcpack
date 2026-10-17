@@ -283,6 +283,13 @@ public:
 
   /// Opaque accepted-family/grid reference; only an authoritative native traversal can create it.
   class FixedGridEnergyReference;
+  /// Incremental reference ownership and once-per-replay descriptor; replay arrays/native receipt are separate owners.
+  struct FixedGridEnergyReferenceRequirements
+  {
+    std::size_t new_reference_host_bytes, shared_replay_descriptor_bytes;
+  };
+  /// Query requested fresh mass/group capacities with the exact factory core, no allocation or GPU work.
+  FixedGridEnergyReferenceRequirements fixedGridEnergyReferenceRequirements() const;
   /// Admit cold metadata plus shared retained replay/provenance once, without another parameter image.
   std::shared_ptr<const FixedGridEnergyReference> makeBudgetedFixedGridEnergyReference(const ParticleSet&,
       const wftrain::StreamingDerivativeOperator&, std::size_t sample,

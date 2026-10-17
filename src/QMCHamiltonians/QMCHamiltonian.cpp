@@ -649,6 +649,26 @@ std::vector<QMCHamiltonian::FullPrecRealType> QMCHamiltonian::mw_evaluate(
   return local_energies;
 }
 
+/// Bound requested fresh-vector capacities; capture separately rejects any larger actual capacity.
+QMCHamiltonian::NativeCaptureRequirements QMCHamiltonian::nativeCaptureRequirements(std::size_t samples) const
+{
+  const auto& provenance = ecpModelProvenance();
+  if (!samples || !provenance || provenance->scientific_definition.empty() || !provenance->ordinary_locality_vp)
+    throw std::invalid_argument("Native fixed-grid capture requires samples and scientific PP provenance");
+  const auto add = [](std::size_t a, std::size_t b) {
+    if (b > std::numeric_limits<std::size_t>::max() - a)
+      throw std::overflow_error("Native fixed-grid capture HOST admission overflow");
+    return a + b;
+  };
+  if (samples > std::numeric_limits<std::size_t>::max() / sizeof(double))
+    throw std::overflow_error("Native fixed-grid capture sample capacity overflow");
+  auto shared = add(sizeof(ECPModelProvenance), provenance->scientific_definition.capacity());
+  shared = add(shared, provenance->source_report.capacity());
+  shared = add(shared, 2); // Both immutable string terminators; allocator/control blocks remain excluded.
+  const auto owned = add(sizeof(wftrain::NonLocalECPNativeCapture), samples * sizeof(double));
+  return {owned, shared, add(owned, shared)};
+}
+
 QMCHamiltonian::StreamingNonLocalECPResult
 QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     const RefVectorWithLeader<QMCHamiltonian>& ham_list,
@@ -679,20 +699,11 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
   {
     const auto& provenance = leader.ecpModelProvenance();
     auto identity = consumer.nativeCaptureIdentity();
-    if (!provenance || provenance->scientific_definition.empty() || !provenance->ordinary_locality_vp || !identity)
-      throw std::invalid_argument("Native fixed-grid capture requires scientific PP provenance and a replay identity");
-    const auto add = [](std::size_t a, std::size_t b) {
-      if (b > std::numeric_limits<std::size_t>::max() - a)
-        throw std::overflow_error("Native fixed-grid capture HOST admission overflow");
-      return a + b;
-    };
-    std::size_t shared_bytes = add(sizeof(ECPModelProvenance), provenance->scientific_definition.capacity());
-    shared_bytes = add(shared_bytes, provenance->source_report.capacity());
-    shared_bytes = add(shared_bytes, 2); // Include both immutable string terminators.
-    std::size_t bytes = add(sizeof(wftrain::NonLocalECPNativeCapture), shared_bytes);
-    for (std::size_t b = 0; b < ham_list.size(); ++b) bytes = add(bytes, sizeof(double));
-    if (native_capture_host_cap == std::numeric_limits<std::size_t>::max() || bytes > native_capture_host_cap)
-      throw std::length_error("Native fixed-grid capture exceeds finite HOST admission before allocation");
+    if (!identity) throw std::invalid_argument("Native fixed-grid capture requires a replay identity");
+    const auto required = leader.nativeCaptureRequirements(ham_list.size());
+    if (native_capture_host_cap == std::numeric_limits<std::size_t>::max() || required.total_host_bytes > native_capture_host_cap)
+      throw std::length_error("Native fixed-grid capture exceeds finite HOST admission before allocation: requested=" +
+          std::to_string(required.total_host_bytes) + ", cap=" + std::to_string(native_capture_host_cap));
     for (const auto& h : ham_list)
       if (!h.get().ecpModelProvenance() || !h.get().ecpModelProvenance()->ordinary_locality_vp ||
           h.get().ecpModelProvenance()->scientific_definition != provenance->scientific_definition)
@@ -702,7 +713,7 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     native_capture->scientific_definition_ = provenance->scientific_definition;
     native_capture->capture_identity_ = std::move(identity);
     native_capture->potentials_.resize(ham_list.size());
-    const auto fixed_bytes = add(sizeof(wftrain::NonLocalECPNativeCapture), shared_bytes);
+    const auto fixed_bytes = required.total_host_bytes - ham_list.size() * sizeof(double);
     if (native_capture->potentials_.capacity() > (native_capture_host_cap - fixed_bytes) / sizeof(double))
       throw std::length_error("Native fixed-grid capture actual capacity exceeds HOST admission");
     native_capture->host_bytes_ = fixed_bytes + native_capture->potentials_.capacity() * sizeof(double);
