@@ -84,5 +84,12 @@ ALM inner32/restart10. The full/import/inference/initialized-split comparisons
 remain exact. A genuine initial untrusted-root refusal is negative only, with
 no update/export/restart claim; no seed, shift or tolerance tuning is allowed.
 A same-recipe fixed-CI optimize=no negative must reach the capability guard.
-This mode awaits separate driver admission and native qualification; physical
-round123 supplies dense actions/local mixed retraction, not a converged ALM root.
+Native126 passed the full workflow at source ``1e2982b3``/app SHA256
+``0f2410fcb37d1134c4936b96e3d620d6306298db75cca9ecd680a4081566be35``;
+one guarded CPU/full-precision CTest registers this profile. Physical round123
+supplies dense actions/local mixed retraction, not a converged ALM root.
+The original124 second-step projected-overlap failure is preserved. Actual125
+pair evidence led to reusing LM's norm-product backward-error policy for ALM,
+with unchanged multiplier/controls and fail-closed material-asymmetry tests.
+Focused LM/ALM units passed 477 assertions/21cases before native126. No initial
+untrusted-root refusal was needed, and no seed, shift or tolerance was tuned.
