@@ -1327,6 +1327,32 @@ struct PsiFormerComplexWF::Impl
         accepted_version == state->model.p.version();
   }
 
+  /// Caller holds Model read authority; preserve ordinary complex squares and actual masses.
+  LogValue observeOwnKinetic(const ParticleSet& p) const
+  {
+    requireIdle(p);
+    if (!fullMatches(p)) throw std::logic_error("Complex energy observation requires current FULL own products");
+    LogValue kinetic{};
+    const auto& masses = p.get_mass_by_group();
+    if (masses.size() != static_cast<std::size_t>(p.groups()))
+      throw std::invalid_argument("Complex PsiFormer target mass extent mismatch");
+    for (int group = 0; group < p.groups(); ++group)
+    {
+      const double mass = masses[group];
+      if (!psiformer::determinant::isFiniteReal(mass) || mass <= 0)
+        throw std::invalid_argument("Complex PsiFormer target mass must be positive and finite");
+      for (int e = p.first(group); e < p.last(group); ++e)
+      {
+        LogValue ratio = own_laplacian[e];
+        for (int d = 0; d < 3; ++d)
+          ratio += LogValue(own_gradient[e][d]) * LogValue(own_gradient[e][d]);
+        kinetic -= .5 * (1.0 / mass) * ratio;
+      }
+    }
+    if (!isFiniteWavefunctionValue(kinetic)) throw std::overflow_error("Complex kinetic observation overflow");
+    return kinetic;
+  }
+
   /// Scalar-only schema: eight limb-pair integers, eleven physical scalars, G/L and checksum limbs.
   std::size_t recordScalars() const
   {
@@ -3108,33 +3134,49 @@ PsiFormerComplexWF::CoulombObservation PsiFormerComplexWF::observeCoulombEnergy(
     const ParticleSet& p, FullPrecRealType potential) const
 {
   std::shared_lock read(impl_->state->mutex);
-  impl_->requireIdle(p);
-  if (!impl_->fullMatches(p))
-    throw std::logic_error("Complex PsiFormer Coulomb observation requires current FULL own products");
   if (!psiformer::determinant::isFiniteReal(potential))
     throw std::invalid_argument("Complex PsiFormer Coulomb potential must be finite and from this sample");
-  LogValue kinetic{};
-  const auto& masses = p.get_mass_by_group();
-  if (masses.size() != static_cast<std::size_t>(p.groups()))
-    throw std::invalid_argument("Complex PsiFormer target mass extent mismatch");
-  for (int group = 0; group < p.groups(); ++group)
-  {
-    const double mass = masses[group];
-    if (!psiformer::determinant::isFiniteReal(mass) || mass <= 0)
-      throw std::invalid_argument("Complex PsiFormer target mass must be positive and finite");
-    const double inverse_mass = 1.0 / mass;
-    for (int e = p.first(group); e < p.last(group); ++e)
-    {
-      LogValue ratio = impl_->own_laplacian[e];
-      for (int d = 0; d < 3; ++d)
-        ratio += LogValue(impl_->own_gradient[e][d]) * LogValue(impl_->own_gradient[e][d]);
-      kinetic -= .5 * inverse_mass * ratio;
-    }
-  }
+  const LogValue kinetic = impl_->observeOwnKinetic(p);
   const LogValue local_energy = kinetic + potential; // caller guarantees Coulomb V belongs to this sample
   if (!isFiniteWavefunctionValue(kinetic) || !isFiniteWavefunctionValue(local_energy))
     throw std::overflow_error("Complex PsiFormer Coulomb observation overflow");
   return {kinetic, local_energy, potential};
+}
+
+/// Observe only a bound accepted grid; REAL Hamiltonian properties remain untouched.
+PsiFormerComplexWF::CapturedLocalEnergyObservation PsiFormerComplexWF::observeCapturedLocalEnergy(
+    const ParticleSet& p, const wftrain::StreamingDerivativeOperator& op, std::size_t sample,
+    FullPrecRealType potential) const
+{
+#ifdef ENABLE_CUDA
+  const auto* stream = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
+  if (!stream || stream->lane->state != impl_->state)
+    throw std::invalid_argument("Complex captured observation requires its own GPU derivative family");
+  std::unique_lock execution(stream->lane->execution_mutex);
+  std::shared_lock read(impl_->state->mutex);
+  stream->requireCurrent();
+  if (!stream->replay || sample >= stream->samples || !psiformer::determinant::isFiniteReal(potential))
+    throw std::invalid_argument("Complex captured observation requires a finite same-sample potential and bound grid");
+  impl_->requireIdle(p);
+  for (std::size_t e = 0; e < p.R.size(); ++e)
+    for (int d = 0; d < 3; ++d)
+      if (p.R[e][d] != stream->positions[3 * (sample * p.R.size() + e) + d])
+        throw std::invalid_argument("Complex captured observation reference coordinates changed");
+  const auto kinetic = impl_->observeOwnKinetic(p);
+  LogValue nonlocal{};
+  for (std::size_t q = 0; q < stream->references.size(); ++q)
+    if (stream->references[q] == sample)
+    {
+      nonlocal += stream->complete_weights[q];
+      if (!isFiniteWavefunctionValue(nonlocal)) throw std::overflow_error("Complex captured energy overflow");
+    }
+  // Re(nonlocal) is ALREADY in the native same-sample local potential.
+  const auto energy = kinetic + potential + LogValue(0, nonlocal.imag());
+  if (!isFiniteWavefunctionValue(energy)) throw std::overflow_error("Complex captured local energy overflow");
+  return {kinetic, nonlocal, energy, potential, stream->version, stream->replay->gridFingerprint()};
+#else
+  throw std::logic_error("Complex captured energy observation requires the explicit GPU component route");
+#endif
 }
 
 /// Expose the immutable fixed-source identity solely for final-system admission.

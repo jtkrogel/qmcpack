@@ -258,6 +258,18 @@ public:
    */
   CoulombObservation observeCoulombEnergy(const ParticleSet&, FullPrecRealType same_sample_potential) const;
 
+  struct CapturedLocalEnergyObservation
+  {
+    LogValue kinetic, nonlocal, local_energy;
+    FullPrecRealType reported_real_potential;
+    std::size_t parameter_version;
+    std::uint64_t grid_fingerprint;
+  };
+
+  /// Numerical-only observation: native REAL potential already contains Re(ECP) on this exact grid.
+  CapturedLocalEnergyObservation observeCapturedLocalEnergy(const ParticleSet&,
+      const wftrain::StreamingDerivativeOperator&, std::size_t sample, FullPrecRealType same_sample_real_potential) const;
+
   /// Identify the fixed ion source for final-system Coulomb admission, not a movable source API.
   const ParticleSet& sourceParticles() const;
 
