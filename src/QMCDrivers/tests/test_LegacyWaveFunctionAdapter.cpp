@@ -2459,6 +2459,25 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
             CHECK(std::real(block.getGrads()(determinant, row)[dimension]) == Catch::Approx(oracle(3)).margin(3e-13));
           CHECK(std::real(block.getLapls()(determinant, row)) == Catch::Approx(oracle(2)).margin(3e-13));
         }
+      // Also check orbital substitution against the alternate accepted {0,2}
+      // reference ordering; keep its original denominator fixed at this base.
+      virtual_positions.R[0] = {3, 0, 0};
+      Vector<QMCTraits::ValueType> ratios(4), generated(4);
+      const auto a = values(3, 0);
+      for (const auto [p, q] : {std::pair{0, 3}, std::pair{1, 2}})
+      {
+        block.evaluateOrbitalGeneratorToAcceptedReference(virtual_positions, 0, 2 * spin, p, q, ratios, generated);
+        std::array<double, 4> da{}, db{};
+        da[p] = a[q]; da[q] = -a[p]; db[p] = y[q]; db[q] = -y[p];
+        for (int term = 0; term < 4; ++term)
+        {
+          const auto& occ = block.getConfiguration(term).occup;
+          const int i = occ[0], j = occ[1];
+          CHECK(std::real(ratios[term]) == Catch::Approx((a[i] * y[j] - a[j] * y[i]) / denominator).margin(3e-13));
+          CHECK(std::real(generated[term]) == Catch::Approx(
+              (da[i] * y[j] + a[i] * db[j] - da[j] * y[i] - a[j] * db[i]) / denominator).margin(3e-13));
+        }
+      }
     }
   std::array<std::unique_ptr<MultiDiracDeterminant>, 2> spins;
   std::array<std::vector<std::size_t>, 2> mappings;
