@@ -73,7 +73,8 @@ def check_orbital_frame(group, tree, parameters, row, model):
     multideterminant = tree.find(".//multideterminant") is not None
     assert len(wrappers) == (2 if multideterminant else 1)
     many_occupied = wrappers[0].find("sposet").get("size") == "4"
-    pairs = (((0, 2), (0, 3), (1, 2), (1, 3)) if many_occupied else
+    pairs = (tuple((i, j) for i in range(4) for j in range(i + 1, 4)) if many_occupied and multideterminant else
+             ((0, 2), (0, 3), (1, 2), (1, 3)) if many_occupied else
              ((0, 1), (0, 2), (1, 2)) if multideterminant else ((0, 1), (0, 2)))
     expected = [f"{wrapper.get('name')}_orb_rot_{i:04d}_{j:04d}_r"
                 for wrapper in wrappers for i, j in pairs]
@@ -187,6 +188,8 @@ def main():
                         help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
     parser.add_argument("--many-occupied-orbital-ecp", action="store_true",
                         help="bounded neutral-C two-occupied/four-MO P8 orbital/J2 ECP Adam")
+    parser.add_argument("--md-orbital-ecp", action="store_true",
+                        help="bounded neutral-C fixed-CI two-owner MD orbital/J2 ECP Adam P16")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -216,7 +219,7 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
-    orbital_ecp_profile = args.orbital_ecp or args.many_occupied_orbital_ecp
+    orbital_ecp_profile = args.orbital_ecp or args.many_occupied_orbital_ecp or args.md_orbital_ecp
     periodic_profile = args.periodic_heg or args.complex_periodic_heg
     if args.complex_periodic_heg:
         assert args.threads == 1 and args.ranks > 0
@@ -260,7 +263,7 @@ def main():
     print(work, flush=True)
     if args.periodic_heg or args.md_orbital or args.external_lcao or orbital_ecp_profile:
         assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
-                    args.many_occupied_orbital_ecp)) == 1, "select one bounded qualification profile"
+                    args.many_occupied_orbital_ecp, args.md_orbital_ecp)) == 1, "select one bounded qualification profile"
         assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
@@ -369,14 +372,24 @@ def main():
                 pseudo.set("href", str((fixture.parent / href).resolve()))
         orbital_model = tree.find(".//rotated_sposet") is not None
         if orbital_ecp_profile:
-            assert orbital_model and tree.find(".//multideterminant") is None
+            assert orbital_model and (tree.find(".//multideterminant") is not None) == args.md_orbital_ecp
             coefficients = tree.find(".//rotated_sposet/sposet/coefficient")
-            size, occupied = (4, 2) if args.many_occupied_orbital_ecp else (3, 1)
+            size, occupied = (4, 2) if args.many_occupied_orbital_ecp or args.md_orbital_ecp else (3, 1)
             assert coefficients.get("size") == str(size) and len(coefficients.text.split()) == 4 * size
             assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == [str(occupied)] * 2
-            if args.many_occupied_orbital_ecp:
+            if args.many_occupied_orbital_ecp or args.md_orbital_ecp:
                 np.testing.assert_array_equal(np.asarray(coefficients.text.split(), dtype=float).reshape(4, 4), np.eye(4))
                 assert tree.find("hamiltonian/pairpot/pseudo").get("elementType") == "C"
+            if args.md_orbital_ecp:
+                expansion = tree.find(".//multideterminant")
+                assert expansion.get("optimize") == "no" and expansion.find("detlist").get("type") == "DETS"
+                assert [node.attrib for node in expansion.find("detlist")] == [
+                    dict(id="CI0", coeff="1", occ0="1100", occ1="1100"),
+                    dict(id="CI1", coeff="0.1", occ0="1010", occ1="1010")]
+                wrappers = tree.findall(".//rotated_sposet")
+                assert [node.get("name") for node in wrappers] == ["rot", "rot_dn"]
+                for wrapper in wrappers:
+                    np.testing.assert_array_equal(np.asarray(wrapper.find("sposet/coefficient").text.split(), dtype=float).reshape(4, 4), np.eye(4))
         if args.orbital_jastrow:
             assert orbital_model and tree.find("wavefunction/jastrow") is None, fixture
             tree.find("wavefunction").append(ET.fromstring('''
@@ -484,9 +497,9 @@ def main():
         assert len(models) == expected_rows, (directory, models)
         determinant_list = tree.find("wavefunction/determinantset/multideterminant/detlist")
         linear_nodes = [] if determinant_list is None else list(determinant_list)
-        initial = [float(node.get("coeff")) for node in linear_nodes[1:]]
+        initial = [] if args.md_orbital_ecp else [float(node.get("coeff")) for node in linear_nodes[1:]]
         if orbital_model:
-            initial += [0.0] * (4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
+            initial += [0.0] * (12 if args.md_orbital_ecp else 4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    if node.get("optimize") != "no"
                    for value in node.text.split()]
@@ -516,9 +529,19 @@ def main():
                     names = [value.decode() if isinstance(value, bytes) else str(value)
                              for value in np.asarray(group["variable_names"][()]).reshape(-1)]
                     assert linear_nodes[0].get("id") not in names, model
-                    assert all(node.get("id") in names for node in linear_nodes[1:]), model
+                    if args.md_orbital_ecp:
+                        assert all(node.get("id") not in names for node in linear_nodes), model
+                    else:
+                        assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if args.md_orbital_ecp:
+                        assert parameters.size == 16
+                        indices = np.asarray(group["active_indices"][()]).reshape(-1)
+                        for prefix, count in (("rot_orb_rot_", 6), ("rot_dn_orb_rot_", 6), ("ud_", 4)):
+                            block = [int(index) for name, index in zip(names, indices) if name.startswith(prefix)]
+                            assert len(block) == count and min(block) >= 0, (model, prefix)
+                            assert not np.array_equal(parameters[block], previous[block]), (model, prefix, "did not update")
                     if args.many_occupied_orbital_ecp:
                         assert parameters.size == 8
                         names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
@@ -603,6 +626,8 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
+                    if args.md_orbital_ecp:
+                        assert [node.attrib for node in exported_list] == [node.attrib for node in linear_nodes], model
                     if csf_ci or csf_ecp:
                         assert exported_list.get("type") == "CSF"
                         for original, retained in zip(linear_nodes, list(exported_list)):
@@ -617,7 +642,15 @@ def main():
         if len(orbital_history) == 2:
             first, second = orbital_history[0][0], orbital_history[1][0]
             delta = second - first
-            if linear_nodes:
+            if args.md_orbital_ecp:
+                def generator(values):
+                    matrix = np.zeros((4, 4))
+                    matrix[np.triu_indices(4, 1)] = values
+                    return matrix - matrix.T
+                for start in (0, 6):
+                    a, b = generator(first[start:start + 6]), generator(delta[start:start + 6])
+                    assert np.linalg.norm(a @ b - b @ a) > 0, (directory, start, "fixture updates commute")
+            elif linear_nodes:
                 def generator(values):
                     matrix = np.zeros((3, 3))
                     matrix[0, 1], matrix[0, 2], matrix[1, 2] = values
@@ -985,6 +1018,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.md_orbital_ecp:
+            print("PASS: real CPU fixed-CI distinct-spin MD orbital/J2 ordinary-locality ECP Adam P16, "
+                  "two complete 4AO/4MO frames, physical VMC model reuse and strict exact initialized restart")
         elif args.many_occupied_orbital_ecp:
             print("PASS: real CPU neutral-C two-occupied orbital/J2 ordinary-locality ECP Adam P8, 4AO/4MO full frames, "
                   "physical VMC model reuse and exact initialized restart; numerical coverage is the separate unit gate")

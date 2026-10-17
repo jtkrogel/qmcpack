@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="c_fixed_ci_orbital_ecp" series="0"><parameter name="driver_version">batch</parameter></project>
+  <random seed="81357"/>
+  <!-- P16: six actual MD rotation pairs per spin and four J2 coefficients; CI is fixed. -->
+  <particleset name="ion0" size="1">
+    <group name="C"><parameter name="charge">4</parameter><parameter name="valence">4</parameter>
+      <parameter name="atomicnumber">6</parameter></group>
+    <attrib name="position" datatype="posArray">0 0 0</attrib>
+  </particleset>
+  <particleset name="e">
+    <group name="u" size="2"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">0.2 -0.3 0.4  0.6 0.2 -0.5</attrib></group>
+    <group name="d" size="2"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">-0.5 0.1 0.7  -0.8 -0.4 -0.2</attrib></group>
+  </particleset>
+  <wavefunction name="psi0" target="e" print_parameters="no">
+    <sposet_collection type="MolecularOrbital" source="ion0">
+      <basisset keyword="STO" transform="no">
+        <atomicBasisSet type="STO" elementType="C" angular="cartesian" normalized="no">
+          <basisGroup rid="S" n="1" l="0" m="0" type="Slater"><radfunc n="1" exponent="1.2"/></basisGroup>
+          <basisGroup rid="P" n="2" l="1" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
+        </atomicBasisSet>
+      </basisset>
+      <rotated_sposet name="rot"><sposet name="base" size="4">
+        <coefficient size="4" id="accepted">1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</coefficient></sposet>
+      </rotated_sposet>
+      <rotated_sposet name="rot_dn"><sposet name="base_dn" size="4">
+        <coefficient size="4" id="accepted_dn">1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</coefficient></sposet>
+      </rotated_sposet>
+    </sposet_collection>
+    <determinantset>
+      <multideterminant optimize="no" spo_0="rot" spo_1="rot_dn" algorithm="precomputed_table_method">
+        <detlist size="2" type="DETS" nc0="0" ne0="2" nc1="0" ne1="2" nstates="4" cutoff="1e-20">
+          <ci id="CI0" coeff="1" occ0="1100" occ1="1100"/>
+          <ci id="CI1" coeff="0.1" occ0="1010" occ1="1010"/>
+        </detlist>
+      </multideterminant>
+    </determinantset>
+    <jastrow name="J2" type="Two-Body" function="Bspline">
+      <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+        <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+      </correlation>
+    </jastrow>
+  </wavefunction>
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="PseudoPot" type="pseudo" source="ion0" wavefunction="psi0"
+             format="xml" algorithm="batched" DLA="no" pbc="no">
+      <pseudo elementType="C" href="../../pseudopotentials_for_tests/C.BFD.xml" format="xml" nrule="2" l-local="1"/>
+    </pairpot>
+  </hamiltonian>
+  <qmc method="wf_train" move="pbyp" checkpoint="1">
+    <training objective="energy" optimizer="adam">
+      <parameter name="iterations">2</parameter><parameter name="learning_rate">0.0001</parameter>
+      <parameter name="parameter_chunk_size">4</parameter><parameter name="legacy_maximum_parameters">64</parameter>
+      <parameter name="legacy_derivative_scratch_bytes">65536</parameter>
+      <parameter name="checkpoint_interval">1</parameter><parameter name="line_search">off</parameter>
+    </training>
+    <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
+    <parameter name="blocks">2</parameter><parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+    <parameter name="timestep">0.0001</parameter><parameter name="usedrift">no</parameter>
+    <inference interval="1" last="yes" move="pbyp">
+      <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
+      <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
+      <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+      <parameter name="timestep">0.0001</parameter><parameter name="usedrift">no</parameter>
+    </inference>
+  </qmc>
+</simulation>
