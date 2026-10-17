@@ -25,6 +25,11 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EX
                      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
                      $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_mdj_ecp.xml" --mdj-pii)
     set_tests_properties(short-Be-pp-conventional-wftrain-mdj-pii PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    add_test(NAME short-Be-pp-conventional-wftrain-j3
+             COMMAND ${Python3_EXECUTABLE}
+                     "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_j3_ecp.xml" --restart --preflight)
+    set_tests_properties(short-Be-pp-conventional-wftrain-j3 PROPERTIES TIMEOUT 300 PROCESSORS 1)
     add_test(NAME short-Be-pp-conventional-wftrain-orbital
              COMMAND ${Python3_EXECUTABLE}
                      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
