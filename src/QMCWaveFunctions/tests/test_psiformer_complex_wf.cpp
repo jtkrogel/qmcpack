@@ -3860,7 +3860,10 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
       close(gpu_ratios[q], cpu_ratios[q]);
     CHECK(gpu.get_log_value() == gpu_log);
     CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    std::printf("COMPLEX_VIRTUAL_VALUE GPU PASS Q=3 warm_allocations=0\n");
   }
+  else
+    WARN("NOT_RUN: paired virtual VALUE GPU parity requires an available device");
 #endif
 }
 } // namespace qmcplusplus
