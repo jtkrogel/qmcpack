@@ -695,9 +695,7 @@ def main():
         elif mixed_ci:
             run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
             if md_ecp:
-                run("reject_pure_ci_ecp_lm", optimizer="lm", mutate=lambda tree: tree.find(
-                    "wavefunction/jastrow/correlation/coefficients").set("optimize", "no"),
-                    reject="Conventional LM/ALM coefficient-family qualification requires all-electron Hamiltonians")
+                run("reject_mixed_ci_ecp_alm", optimizer="alm", reject="mixed updates remain unqualified")
             if args.mdj_pii:
                 run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
                     reject="mixed updates remain unqualified")
