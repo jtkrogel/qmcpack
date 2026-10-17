@@ -2689,15 +2689,6 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
               CHECK(evaluator->findMSD()[0].get().get_C()[1] == fixed_coefficients[1]);
           }
         }
-    if (csf)
-    {
-      // This slice qualifies LM/ALM only; do not silently expand the PII family.
-      source->evaluateLog(particles);
-      CHECK(source->getLogPsi() == source_log);
-      CHECK(source->findMSD()[0].get().get_C() == fixed_coefficients);
-      CHECK(adapter.snapshotParameters().values[0] == 0);
-      continue;
-    }
     ProjectedInverseIterationFactor pii_factor(factor, kinetic);
     PIIUpdateControl control;
     control.shift_mode = PIIShiftMode::EXPLICIT;
@@ -2720,8 +2711,31 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     ProjectedInverseIterationUpdateRule pii(pii_factor, control);
     MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
     const double expected = coefficient - control.learning_rate * rhs / denominator;
-    CHECK(pii.propose(schema, parameters, objective).values[0] == Catch::Approx(expected).epsilon(2e-9).margin(2e-11));
-    CHECK(minpii.propose(schema, parameters, objective).values[0] == Catch::Approx(expected).epsilon(2e-9).margin(2e-11));
+    for (const auto& mapped : {pii.propose(schema, parameters, objective),
+                              minpii.propose(schema, parameters, objective)})
+    {
+      CHECK(mapped.values[0] == Catch::Approx(expected).epsilon(2e-9).margin(2e-11));
+      // Independent linear CSF coordinates use the additive physical map, not
+      // LM's centered Ritz-vector gauge. Test the actual expanded wavefunction.
+      for (std::size_t sample = 0; sample < 4; ++sample)
+      {
+        replay->prepareSample(sample);
+        adapter.installSnapshot(*evaluator, private_particles, mapped);
+        const double ratio = std::exp(evaluator->getLogPsi() - log[sample]) *
+            std::cos(evaluator->getPhase() - phase[sample]);
+        CHECK(ratio == Catch::Approx(1 + (mapped.values[0] - coefficient) * score[sample])
+            .epsilon(2e-10).margin(2e-10));
+        const auto& md = evaluator->findMSD()[0].get();
+        CHECK(md.fixedCoefficientReference() == 0.6);
+        CHECK(md.get_C()[0] == fixed_coefficients[0]);
+        if (csf)
+        {
+          CHECK(md.get_C()[1] == fixed_coefficients[1]);
+          CHECK(md.get_C()[2] == Catch::Approx(mapped.values[0] * std::sqrt(0.5)).epsilon(2e-15));
+          CHECK(md.get_C()[3] == md.get_C()[2]);
+        }
+      }
+    }
     pii.proposalRejected();
     minpii.proposalRejected();
     source->evaluateLog(particles);
