@@ -48,6 +48,13 @@ const PsiFormerWF* deviceSamplingComponent(const TrialWaveFunction& wavefunction
   return selected;
 }
 
+/// Requested walker logging cannot consume intentionally unmaterialized HOST state.
+void validateResidentWalkerLogs(const VMCBatchedSampling::State& state, const UPtrVector<Crowd>& crowds)
+{
+  if (state.resident_device_observation && !Crowd::getWalkerLogCollectorRefs(crowds).empty())
+    throw UniformCommunicateError("Resident device observation excludes active walker logging.");
+}
+
 /** Scale proposed coordinate displacements by the species time steps. */
 template<typename RT, CoordsType CT>
 void scaleBySqrtTau(const TauParams<RT, CT>& taus, MCCoords<CT>& coordinates)
@@ -131,6 +138,13 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 {
   if (crowd.size() == 0)
     return;
+  // Reject HOST/debug consumers before any random draws or accepted-state mutation.
+  if (sft.resident_device_observation &&
+      (!sft.resident_device_observe || sft.qmcdrv_input.get_debug_checks() != DriverDebugChecks::ALL_OFF ||
+       CT != CoordsType::POS || sft.vmcdrv_input.get_use_drift() ||
+       !deviceSamplingComponent(crowd.get_walker_twfs()[0])))
+    throw UniformCommunicateError(
+        "Resident device observation requires an explicit callback and debug-free POS/noDrift device sampling.");
   const PSdispatcher ps_dispatcher(!sft.serializing_crowd_walkers);
   const TWFdispatcher twf_dispatcher(!sft.serializing_crowd_walkers);
   const Hdispatcher ham_dispatcher(!sft.serializing_crowd_walkers);
@@ -184,7 +198,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
             sft.drift_modifier.getDrift(variance, native_gradient, drift);
             for (std::size_t d = 0; d < 3; ++d)
               result[d] = drift[d];
-          });
+          }, sft.resident_device_observation);
       for (std::size_t count = 0; count < counts.first; ++count)
         crowd.incAccept();
       for (std::size_t count = 0; count < counts.second; ++count)
@@ -418,6 +432,16 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     }
   }
 
+  if (sft.resident_device_observation)
+  {
+    if (!device_moves_completed)
+      throw UniformCommunicateError("Resident device observation did not complete device moves.");
+    // The admitted driver owns scalar properties/statistics and the later cold
+    // fence. Never invoke generic estimators, native H, FULL or logging here.
+    sft.resident_device_observe(crowd, accumulate_this_step);
+    return;
+  }
+
   {
     ScopedTimer buffer_local_timer(timers.buffer);
     if (device_moves_completed)
@@ -501,6 +525,7 @@ void VMCBatchedSampling::runVMCStep(int crowd_id,
                                     const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                     UPtrVector<Crowd>& crowds)
 {
+  validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
   crowd.setRNGForHamiltonian(random_generator);
@@ -518,6 +543,7 @@ void VMCBatchedSampling::runWarmupStep(int crowd_id,
                                        const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                        UPtrVector<Crowd>& crowds)
 {
+  validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
   if (state.population.get_golden_electrons().isSpinor())

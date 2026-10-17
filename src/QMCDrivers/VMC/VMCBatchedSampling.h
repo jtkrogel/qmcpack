@@ -49,6 +49,9 @@ public:
     IndexType global_step     = -1;
     bool is_recomputing_block = false;
     const bool serializing_crowd_walkers;
+    // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
+    bool resident_device_observation = false;
+    std::function<void(Crowd&, bool)> resident_device_observe;
 
     State(const QMCDriverInput& qmc_input,
           const VMCDriverInput& vmc_input,
