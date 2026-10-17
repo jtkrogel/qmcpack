@@ -226,6 +226,11 @@ def prepare_periodic_spline_fixture(original, destination):
     cell = root.find("simulationcell")
     cell.find("parameter[@name='LR_dim_cutoff']").text = "30"
     ET.SubElement(cell, "parameter", name="LR_handler").text = "ewald"
+    # QMCMain reads simulationcell only through processPWH(qmcsystem).
+    root.remove(cell)
+    cell_system = ET.Element("qmcsystem")
+    cell_system.append(cell)
+    root.insert(2, cell_system)
     collection = root.find("wavefunction/sposet_collection")
     collection.set("href", str((original.parent / collection.get("href")).resolve()))
     collection.set("gpu", "no")
@@ -1349,7 +1354,7 @@ def main():
                   f"immutable asset bytes={len(external_original)} (separate from derivative scratch)")
         if args.periodic_spline:
             def tighten_spline_cutoff(tree):
-                tree.find("simulationcell/parameter[@name='LR_dim_cutoff']").text = "32"
+                tree.find(".//simulationcell/parameter[@name='LR_dim_cutoff']").text = "32"
             run("reject_changed_spline_cutoff_import", vmc=True, parameter_file=exported, mutate=tighten_spline_cutoff,
                 reject=("Conventional model export identity mismatch",
                         "Conventional artifact has an invalid or oversized required field: model_identity"))
