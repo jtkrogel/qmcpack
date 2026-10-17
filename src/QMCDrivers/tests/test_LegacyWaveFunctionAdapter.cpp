@@ -2202,13 +2202,15 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   class PolynomialSPO final : public SPOSet
   {
   public:
-    PolynomialSPO() : SPOSet("accepted_reference_polynomial", 4) {}
+    explicit PolynomialSPO(bool transverse_factor = false)
+        : SPOSet("accepted_reference_polynomial", 4), transverse_factor(transverse_factor) {}
     std::string getClassName() const override { return "PolynomialSPO"; }
-    std::unique_ptr<SPOSet> makeClone() const override { return std::make_unique<PolynomialSPO>(); }
+    std::unique_ptr<SPOSet> makeClone() const override { return std::make_unique<PolynomialSPO>(transverse_factor); }
     void evaluateValue(const ParticleSet& p, int i, ValueVector& values) override
     {
       const double x = p.R[i][0];
-      values[0] = 1; values[1] = x * x; values[2] = x; values[3] = x * x * x;
+      const double factor = transverse_factor ? 1 + p.R[i][1] + p.R[i][2] : 1;
+      values[0] = factor; values[1] = factor * x * x; values[2] = factor * x; values[3] = factor * x * x * x;
     }
     void evaluateVGL(const ParticleSet& p, int i, ValueVector& values, GradVector& gradients,
                      ValueVector& laplacians) override
@@ -2217,9 +2219,19 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       gradients = GradType{};
       laplacians = ValueType{};
       const double x = p.R[i][0];
-      gradients[1][0] = 2 * x; gradients[2][0] = 1; gradients[3][0] = 3 * x * x;
-      laplacians[1] = 2; laplacians[3] = 6 * x;
+      const double factor = transverse_factor ? 1 + p.R[i][1] + p.R[i][2] : 1;
+      gradients[1][0] = factor * 2 * x; gradients[2][0] = factor; gradients[3][0] = factor * 3 * x * x;
+      // The common factor is linear in y/z and independent of x: its
+      // Laplacian and grad(factor).grad(polynomial) product term both vanish.
+      laplacians[1] = factor * 2; laplacians[3] = factor * 6 * x;
+      if (transverse_factor)
+      {
+        const double base[] = {1, x * x, x, x * x * x};
+        for (int orbital = 0; orbital < 4; ++orbital)
+          gradients[orbital][1] = gradients[orbital][2] = base[orbital];
+      }
     }
+    bool transverse_factor;
     void evaluate_notranspose(const ParticleSet& p, int first, int last, ValueMatrix& values,
                                GradMatrix& gradients, ValueMatrix& laplacians) override
     {
@@ -2475,8 +2487,21 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   auto& live_msd = wf->findMSD().front().get();
   live_msd.isolateOptimizationState();
   live_msd.enableAcceptedReferenceVirtualRatios();
+  for (int spin = 0; spin < 2; ++spin)
+    dynamic_cast<PolynomialSPO&>(*live_msd.getDet(spin).getPhi()).transverse_factor = true;
   p.update(); // J2 construction added its AA distance table after the ion table.
   wf->evaluateLog(p);
+  // The legacy VGL implementation inverse-updates derivative reference rows;
+  // this ECP fixture must not use a zero reference gradient or Laplacian.
+  for (int spin = 0; spin < 2; ++spin)
+    for (int electron = 0; electron < 2; ++electron)
+    {
+      const auto& block = live_msd.getDet(spin);
+      CHECK(std::real(block.getGrads()(0, electron)[0]) == Catch::Approx(electron == 0 ? -2. / 3 : 4. / 3));
+      for (int dim = 1; dim < 3; ++dim)
+        CHECK(std::real(block.getGrads()(0, electron)[dim]) == Catch::Approx(spin == 0 ? 1 : 2. / 3));
+      CHECK(std::real(block.getLapls()(0, electron)) == Catch::Approx(electron == 0 ? -2. / 3 : 2. / 3));
+    }
   const auto live_log = wf->getLogPsi();
   const auto live_energy = kineticEnergy(p);
   const auto positions = p.R;
@@ -2599,7 +2624,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
         const double x = r[2 * spin][0], y = r[2 * spin + 1][0];
         return alt ? y - x : y * y - x * x;
       };
-      const double ratio = (determinant(0, false) * determinant(1, false) +
+      const double common_ratio = (1 + r[q.electron][1] + r[q.electron][2]) /
+          (1 + positions[q.electron][1] + positions[q.electron][2]);
+      const double ratio = common_ratio * (determinant(0, false) * determinant(1, false) +
           c * determinant(0, true) * determinant(1, true)) / (9 + c);
       trial.R = r; trial.update();
       energy += q.bare_weight * ratio * std::exp(jlog(*twf, trial) - accepted_j);
