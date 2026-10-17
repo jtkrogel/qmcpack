@@ -3173,7 +3173,8 @@ TEST_CASE("PsiFormer paired inference crowds own independent leased lanes",
     const auto before_resources = metrics.snapshot();
     ResourceCollectionTeamLock<WaveFunctionComponent> loan0(resource0, team0), loan1(resource1, team1);
     CHECK(metrics.snapshot().live_bytes - before_resources.live_bytes == 2 * owner_bytes);
-    CHECK(metrics.snapshot().uploaded_bytes == before_resources.uploaded_bytes); // No second P image.
+    // Two lanes * two trunks upload only their initial active-electron index arrays.
+    CHECK(metrics.snapshot().uploaded_bytes - before_resources.uploaded_bytes == 4 * capacity * sizeof(std::size_t));
     auto extra = gpu.makeClone(extra_p);
     RefVectorWithLeader<WaveFunctionComponent> third(*extra, {*extra});
     ResourceCollection resource2(prototype);
