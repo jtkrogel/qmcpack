@@ -1339,6 +1339,8 @@ TEST_CASE("PsiFormer paired CPU trial isolation preserves the shared source fami
   evaluate(trial, trial_p);
   trial_p.makeMove(0, ParticleSet::PosType{.005, -.004, .003});
   trial.ratio(trial_p, 0); // Warm the proposal VALUE lane independently of FULL and score.
+  CHECK_THROWS(trial.isolateParameterState());
+  CHECK_THROWS(component.isolateParameterState());
   trial.restore(0);
   trial_p.rejectMove(0);
   auto retained = prepare(component, p);
