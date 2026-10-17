@@ -142,6 +142,16 @@ if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND QMC_COMPLEX AND NOT MIXED_PRECISION AND 
     set_tests_properties(deterministic-LiH-pp-paired-energy-restart PROPERTIES
                          TIMEOUT 200 PROCESSORS 1 LABELS "deterministic;psiformer;gpu;complex;ecp;restart"
                          PASS_REGULAR_EXPRESSION "PASS_PAIRED_PP_EXACT_RESTART")
+    add_test(NAME deterministic-LiH-pp-paired-reference-restart
+             COMMAND ${QMC_GPU_TEST_LAUNCHER} ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/check_paired_ecp_training.py
+                     --binary $<TARGET_FILE:qmcpack> --source ${qmcpack_SOURCE_DIR}
+                     --output-parent ${CMAKE_CURRENT_BINARY_DIR}/paired_pp_reference
+                     --source-commit ${PAIRED_PP_SOURCE_COMMIT} --reference)
+    SET_TEST_GPU_RESOURCES(deterministic-LiH-pp-paired-reference-restart)
+    set_tests_properties(deterministic-LiH-pp-paired-reference-restart PROPERTIES
+                         TIMEOUT 200 PROCESSORS 1 LABELS "deterministic;psiformer;gpu;complex;ecp;reference;restart"
+                         PASS_REGULAR_EXPRESSION "PASS_PAIRED_PP_REFERENCE_EXACT_RESTART")
   endif()
 endif()
 

@@ -51,3 +51,18 @@ without a scientific rerun or overwrite.  The fixed optional helper itself was
 not rerun.  See Task43 validation_A_paired_pp_model_f7619051a and its separate
 native89 qualification.  The registered test above still covers the original
 internally initialized checkpoint-restart workflow only.
+W2 fixed-grid REFERENCE regression
+----------------------------------
+
+``deterministic-LiH-pp-paired-reference-restart`` uses the same guarded CUDA
+complex FP64 wrapper with ``--reference``. It preserves each invocation in a
+unique directory, uses the existing five nonzero scales, and accepts natural
+commit or rejection decisions. No external model or new fixture generator.
+
+Actual case94 passed at sourced838fc526/appc5d7a54f: two natural alpha1 updates,
+finite complete complex candidate energies on the same accepted Q24 grids,
+source-alpha0/native objective consistency and exact initialized split/restart.
+Pilot4.924s/RSS756132KiB; split/resume2.970/3.020s. Natural alpha0 was not
+exercised; no convergence claim. Task43
+``validation_A_paired_reference_d838fc526/qualification_A.rst`` preserves full
+pins/evidence and prior component failures. Registration checks do not rerun94.

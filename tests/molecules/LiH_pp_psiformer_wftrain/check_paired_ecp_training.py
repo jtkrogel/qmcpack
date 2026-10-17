@@ -23,6 +23,7 @@ def main():
     for name in ("binary", "source", "output-parent"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--reference", action="store_true", help="Use the qualified W2 fixed-grid reference profile")
     args = parser.parse_args()
     assert (
         subprocess.check_output(
@@ -86,6 +87,7 @@ def main():
         root / "pilot",
         "--source-commit",
         args.source_commit,
+        *(["--reference"] if args.reference else []),
     )
     run(
         "check_paired_ecp_restart.py",
@@ -102,7 +104,8 @@ def main():
     )
     report = json.loads((root / "restart/report.json").read_text())
     assert report["status"] == "PASS_EXACT_INITIALIZED_RESTART"
-    print("PASS_PAIRED_PP_EXACT_RESTART evidence=" + str(root), flush=True)
+    marker = "PASS_PAIRED_PP_REFERENCE_EXACT_RESTART" if args.reference else "PASS_PAIRED_PP_EXACT_RESTART"
+    print(marker + " evidence=" + str(root), flush=True)
 
 
 if __name__ == "__main__":
