@@ -138,16 +138,18 @@ public:
                                               const ValueVector& replacement,
                                               const OptVariables& active,
                                               ValueVector& output) const;
-  /** Private real CPU 2-occupied/4-MO OV tangents, including virtual nodes.
-   * The caller supplies the fresh accepted inverse transpose, with no pending
-   * delayed updates. Accepted values/inverse remain unchanged; scratch is 2 values.
+  /** Private real CPU OV tangents, including virtual nodes. The caller owns
+   * accepted-node rejection and supplies its fresh matching inverse transpose,
+   * with no pending delayed updates. Inputs stay unchanged; reusable scratch O(n).
    */
-  ValueType evaluateTwoOccupiedRatioDerivatives(const ValueMatrix& accepted,
-                                              const ValueMatrix& inverse_transpose,
-                                              const ValueVector& replacement,
-                                              std::size_t electron,
-                                              const OptVariables& active,
-                                              ValueVector& output) const;
+  ValueType evaluateAcceptedReferenceOVRatioDerivatives(const ValueMatrix& accepted,
+                                                       const ValueMatrix& inverse_transpose,
+                                                       const ValueVector& replacement,
+                                                       std::size_t electron,
+                                                       const OptVariables& active,
+                                                       ValueVector& output) const;
+  /// Private-evaluator projection cache, independent of samples, Q and parameters.
+  mutable ValueVector accepted_ratio_projection_;
   /// Private evaluator only; install complete history and matching active values without a delta.
   void restoreFullRotationState(const std::vector<ValueType>& full, const OptVariables& expected_active);
 

@@ -4069,7 +4069,7 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
       auto& moved_rot = dynamic_cast<RotatedSPOs&>(moved_wf->findSD()[0].get().getPhi(spin));
       moved_rot.Phi_->evaluateValue(moved, first + electron, replacement);
       output = 0;
-      const auto ratio = rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, electron, active, output);
+      const auto ratio = rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, electron, active, output);
       Matrix virtual_matrix = accepted;
       for (int q = 0; q < 4; ++q) virtual_matrix(electron, q) = replacement[q];
       CHECK(ratio == Catch::Approx(determinant(virtual_matrix) / determinant(accepted)).epsilon(2e-12).margin(2e-12));
@@ -4104,7 +4104,7 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
   Vector replacement(4), output(4);
   replacement[0] = 0; replacement[1] = -2; replacement[2] = 13; replacement[3] = 17;
   output = 0;
-  CHECK(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output) == 0);
+  CHECK(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, 0, active, output) == 0);
   CHECK(output[0] == 6); CHECK(output[1] == 6);
   CHECK(output[2] == 0); CHECK(output[3] == 0);
   for (int parameter = 0; parameter < 4; ++parameter)
@@ -4128,15 +4128,54 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
   {
     for (int q = 0; q < 4; ++q) replacement[q] = accepted(electron, q);
     output = 0;
-    CHECK(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, electron, active, output) == 1);
+    CHECK(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, electron, active, output) == 1);
     for (int parameter = 0; parameter < 4; ++parameter) CHECK(output[parameter] == 0);
   }
-  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 2, active, output));
+  CHECK_THROWS(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, 2, active, output));
   replacement[3] = std::numeric_limits<double>::quiet_NaN();
-  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  CHECK_THROWS(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, 0, active, output));
   replacement[3] = 17;
-  accepted(0, 0) = 0;
-  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  accepted(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  accepted(0, 0) = 1;
+  inverse(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(rotated.evaluateAcceptedReferenceOVRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  // Independent signed 3x3 oracle: accepted inverse is analytic, while virtual
+  // matrices are evaluated by the explicit determinant polynomial, never inverted.
+  RotatedSPOs three("three", rotated.Phi_->makeClone());
+  three.buildOptVariables(3);
+  optimize::VariableSet three_active;
+  three.checkInVariablesExclusive(three_active); three_active.resetIndex(); three.checkOutVariables(three_active);
+  Matrix a3(3, 4), b3(3, 3);
+  const double a_values[]{1, 2, 0, 3, 0, 1, 1, 5, 0, 0, -2, 7};
+  const double b_values[]{1, 0, 0, -2, 1, 0, -1, .5, -.5};
+  std::copy(std::begin(a_values), std::end(a_values), a3.data());
+  std::copy(std::begin(b_values), std::end(b_values), b3.data());
+  const auto det3 = [](const Matrix& a) {
+    return a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) -
+        a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) +
+        a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+  };
+  Vector d3(3);
+  for (int electron = 0; electron < 3; ++electron)
+  {
+    for (int orbital = 0; orbital < 4; ++orbital) replacement[orbital] = a3((electron + 1) % 3, orbital);
+    replacement[3] = 13; d3 = 0;
+    CHECK(three.evaluateAcceptedReferenceOVRatioDerivatives(a3, b3, replacement, electron, three_active, d3) == 0);
+    for (int occupied = 0; occupied < 3; ++occupied)
+    {
+      const auto ratio3 = [&](double angle) {
+        Matrix a = a3, q = a3;
+        for (int row = 0; row < 3; ++row)
+          a(row, occupied) = std::cos(angle) * a3(row, occupied) + std::sin(angle) * a3(row, 3);
+        q = a;
+        for (int orbital = 0; orbital < 4; ++orbital) q(electron, orbital) = replacement[orbital];
+        q(electron, occupied) = std::cos(angle) * replacement[occupied] + std::sin(angle) * replacement[3];
+        return det3(q) / det3(a);
+      };
+      CHECK(d3[occupied] == Catch::Approx((ratio3(1e-6) - ratio3(-1e-6)) / 2e-6).epsilon(2e-9).margin(2e-9));
+    }
+  }
   const auto& current_coefficients = *dynamic_cast<LCAOrbitalSet&>(*rotated.Phi_).C;
   for (std::size_t i = 0; i < source_coefficients.size(); ++i)
     CHECK(current_coefficients.data()[i] == source_coefficients.data()[i]);

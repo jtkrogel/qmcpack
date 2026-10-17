@@ -1649,21 +1649,22 @@ RotatedSPOs::ValueType RotatedSPOs::evaluateOneOccupiedRatioDerivatives(
   return ratio;
 }
 
-RotatedSPOs::ValueType RotatedSPOs::evaluateTwoOccupiedRatioDerivatives(
+RotatedSPOs::ValueType RotatedSPOs::evaluateAcceptedReferenceOVRatioDerivatives(
     const ValueMatrix& accepted, const ValueMatrix& inverse_transpose,
     const ValueVector& replacement, std::size_t electron,
     const OptVariables& active, ValueVector& output) const
 {
 #ifdef QMC_COMPLEX
-  throw std::invalid_argument("Two-occupied orbital ratio derivatives require real CPU orbitals");
+  throw std::invalid_argument("Accepted-reference orbital ratio derivatives require real CPU orbitals");
 #endif
   const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(Phi_.get());
-  if (!lcao || lcao->isOMPoffload() || lcao->fileImageIdentity() || nel_major_ != 2 ||
-      OrbitalSetSize != 4 || accepted.rows() != 2 || accepted.cols() != 4 ||
-      inverse_transpose.rows() != 2 || inverse_transpose.cols() != 2 ||
-      replacement.size() != 4 || electron >= 2 || output.size() < active.size_of_active() ||
-      m_act_rot_inds_.size() != 4 || myVars.size() != 4)
-    throw std::invalid_argument("Two-occupied orbital ratio derivative layout is unsupported");
+  const std::size_t n = accepted.rows(), m = OrbitalSetSize;
+  if (!lcao || lcao->isOMPoffload() || lcao->fileImageIdentity() || !n || n != nel_major_ || m <= n ||
+      accepted.cols() != m || inverse_transpose.rows() != n || inverse_transpose.cols() != n ||
+      replacement.size() != m || electron >= n || output.size() < active.size_of_active() ||
+      n > std::numeric_limits<std::size_t>::max() / (m - n) ||
+      m_act_rot_inds_.size() != n * (m - n) || myVars.size() != m_act_rot_inds_.size())
+    throw std::invalid_argument("Accepted-reference orbital ratio derivative layout is unsupported");
   for (std::size_t i = 0; i < accepted.size(); ++i)
     if (!finiteRotationCoordinate(accepted.data()[i]))
       throw std::invalid_argument("Accepted orbital values must be finite");
@@ -1673,37 +1674,39 @@ RotatedSPOs::ValueType RotatedSPOs::evaluateTwoOccupiedRatioDerivatives(
   for (std::size_t i = 0; i < replacement.size(); ++i)
     if (!finiteRotationCoordinate(replacement[i]))
       throw std::invalid_argument("Replacement orbital values must be finite");
-  const ValueType determinant = accepted(0, 0) * accepted(1, 1) - accepted(0, 1) * accepted(1, 0);
-  if (!finiteRotationCoordinate(determinant) || determinant == ValueType{})
-    throw std::invalid_argument("Two-occupied accepted orbital determinant is nodal or nonfinite");
   for (std::size_t i = 0; i < myVars.size(); ++i)
   {
     const int location = active.getLoc(myVars.name(i)), index = myVars.where(i);
-    if (m_act_rot_inds_[i] != std::make_pair(static_cast<int>(i / 2), static_cast<int>(2 + i % 2)) ||
+    if (m_act_rot_inds_[i] != std::make_pair(static_cast<int>(i / (m - n)), static_cast<int>(n + i % (m - n))) ||
         location < 0 || active.where(location) != index || (index >= 0 && index >= output.size()))
-      throw std::invalid_argument("Two-occupied orbitals require registered OV tangents");
+      throw std::invalid_argument("Accepted-reference orbitals require registered OV tangents");
   }
   // B is the accepted inverse transpose. Reuse Q_occ*B^T for every OV pair;
   // no virtual determinant inverse or division by its possibly zero ratio.
-  ValueType projection[2]{};
-  for (int row = 0; row < 2; ++row)
-    for (int occupied = 0; occupied < 2; ++occupied)
+  if (accepted_ratio_projection_.size() != n) accepted_ratio_projection_.resize(n);
+  auto& projection = accepted_ratio_projection_;
+  projection = ValueType{};
+  for (std::size_t row = 0; row < n; ++row)
+    for (std::size_t occupied = 0; occupied < n; ++occupied)
       projection[row] += replacement[occupied] * inverse_transpose(row, occupied);
+  for (std::size_t row = 0; row < n; ++row)
+    if (!finiteRotationCoordinate(projection[row]))
+      throw std::invalid_argument("Accepted-reference orbital projection is nonfinite");
   const ValueType ratio = projection[electron];
   if (!finiteRotationCoordinate(ratio))
-    throw std::invalid_argument("Two-occupied orbital ratio is nonfinite");
+    throw std::invalid_argument("Accepted-reference orbital ratio is nonfinite");
   for (std::size_t i = 0; i < myVars.size(); ++i)
   {
     const auto [p, q] = m_act_rot_inds_[i];
     const int index = myVars.where(i);
     if (index >= 0)
     {
-      const ValueType residual = replacement[q] - projection[0] * accepted(0, q) -
-          projection[1] * accepted(1, q);
+      ValueType residual = replacement[q];
+      for (std::size_t row = 0; row < n; ++row) residual -= projection[row] * accepted(row, q);
       const ValueType derivative = inverse_transpose(electron, p) * residual;
       const ValueType accumulated = output[index] + derivative;
       if (!finiteRotationCoordinate(derivative) || !finiteRotationCoordinate(accumulated))
-        throw std::invalid_argument("Two-occupied orbital ratio derivative is nonfinite");
+        throw std::invalid_argument("Accepted-reference orbital ratio derivative is nonfinite");
       output[index] = accumulated;
     }
   }
