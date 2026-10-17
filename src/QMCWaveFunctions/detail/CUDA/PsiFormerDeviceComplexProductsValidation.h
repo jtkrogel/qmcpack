@@ -373,6 +373,9 @@ void validateComplexProducts()
     };
     physical_weights();
     std::vector<std::vector<C>> base_scores(b);
+    std::vector<C> tangent(p);
+    for (std::size_t i = 0; i < p; ++i) tangent[i] = .01 * (int(i % 13) - 6) / std::sqrt(double(p));
+    std::array<C, b> cpu_nonlocal_jvp{};
     for (std::size_t sample = 0; sample < b; ++sample)
     {
       score_work->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 12 * sample, 4));
@@ -388,6 +391,7 @@ void validateComplexProducts()
         const auto physical = weights[point] * (score[i] - base_scores[refs[point]][i]);
         reference[i] += contractions[refs[point]] * physical;
         conjugate_reference[i] += contractions[refs[point]] * std::conj(physical);
+        cpu_nonlocal_jvp[refs[point]] += physical * tangent[i].real();
       }
     }
     const auto nw = metrics.snapshot();
@@ -407,24 +411,53 @@ void validateComplexProducts()
         }
       }
     }
-    std::vector<C> tangent(p);
     C dot{};
     for (std::size_t i = 0; i < p; ++i)
-    {
-      tangent[i] = .01 * (int(i % 13) - 6) / std::sqrt(double(p));
       dot += gpu[i] * tangent[i];
-    }
     auto joined = positions;
     joined.insert(joined.end(), virtuals.begin(), virtuals.end());
     const auto revoked = nonlocal->completedResult();
+    const auto score_dot_before = metrics.snapshot();
     nonlocal->evaluateScoreJVP(joined, tangent.data(), p);
+    const auto score_dot_after = metrics.snapshot();
     fails([&] { (void)nonlocal->downloadCompletedChunk(revoked, 0, 0, 1); });
     const auto jvp = nonlocal->scoreJvpView();
     C dual{};
     for (std::size_t point = 0; point < q; ++point)
       dual += contractions[refs[point]] * weights[point] * (jvp.data[b + point] - jvp.data[refs[point]]);
     require(std::abs(dot - dual) <= 3e-9 * (1 + std::abs(dot)), "Nonlocal real-direction duality mismatch");
+    double maximum_difference = 0;
+    std::size_t overflow_point = 0;
+    for (std::size_t point = 0; point < q; ++point)
+    {
+      const auto difference = jvp.data[b + point] - jvp.data[refs[point]];
+      const auto largest = std::max(std::abs(difference.real()), std::abs(difference.imag()));
+      if (largest > maximum_difference) { maximum_difference = largest; overflow_point = point; }
+    }
+    const auto nonlocal_dot_before = metrics.snapshot();
+    nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p);
+    const auto response = nonlocal->nonlocalJvpView();
+    nonlocal->validate(response);
+    require(response.samples == b, "Nonlocal JVP per-base response extent mismatch");
+    fails([&] { nonlocal->validate(jvp); });
+    fails([&] { (void)nonlocal->scoreJvpView(); });
+    auto foreign_response = response;
+    foreign_response.owner = nullptr;
+    fails([&] { nonlocal->validate(foreign_response); });
+    require(metrics.snapshot().uploaded_bytes - nonlocal_dot_before.uploaded_bytes ==
+        score_dot_after.uploaded_bytes - score_dot_before.uploaded_bytes &&
+        metrics.snapshot().downloaded_bytes - nonlocal_dot_before.downloaded_bytes ==
+        score_dot_after.downloaded_bytes - score_dot_before.downloaded_bytes, "Nonlocal JVP added parameter transfers");
+    C contracted{};
+    for (std::size_t sample = 0; sample < b; ++sample)
+    {
+      require(std::abs(response.data[sample] - cpu_nonlocal_jvp[sample]) <=
+          3e-9 * (1 + std::abs(cpu_nonlocal_jvp[sample])), "Nonlocal JVP per-base CPU score mismatch");
+      contracted += contractions[sample] * response.data[sample];
+    }
+    require(std::abs(contracted - dot) <= 3e-9 * (1 + std::abs(dot)), "Nonlocal JVP/VJP duality mismatch");
     C sides[2]{};
+    std::array<std::array<C, b>, 2> base_sides{};
     constexpr double step = 1e-4;
     for (std::size_t side = 0; side < 2; ++side)
     {
@@ -432,36 +465,71 @@ void validateComplexProducts()
       for (std::size_t i = 0; i < p; ++i) shifted[i] += (side ? -step : step) * tangent[i].real();
       model.p.set_flat_values(shifted);
       physical_weights();
-      for (std::size_t point = 0; point < q; ++point) sides[side] += contractions[refs[point]] * weights[point];
+      for (std::size_t point = 0; point < q; ++point)
+      {
+        sides[side] += contractions[refs[point]] * weights[point];
+        base_sides[side][refs[point]] += weights[point];
+      }
     }
     model.p.set_flat_values(parameters);
     physical_weights();
     require(std::abs((sides[0] - sides[1]) / (2 * step) - dot) <= 2e-8 * (1 + std::abs(dot)),
         "Nonlocal complete physical-ratio directional FD mismatch");
+    for (std::size_t sample = 0; sample < b; ++sample)
+      require(std::abs((base_sides[0][sample] - base_sides[1][sample]) / (2 * step) - response.data[sample]) <=
+          2e-8 * (1 + std::abs(response.data[sample])), "Nonlocal JVP per-base physical FD mismatch");
     const auto untouched = metrics.snapshot();
     refs.back() = b;
     fails([&] { nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions); });
+    fails([&] { nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p); });
     refs.back() = 1;
     weights.back() = {std::numeric_limits<double>::quiet_NaN(), 0};
     fails([&] { nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions); });
+    fails([&] { nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p); });
     physical_weights();
+    tangent.back() = C{0, .01};
+    fails([&] { nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p); });
+    tangent.back() = .01 * (int((p - 1) % 13) - 6) / std::sqrt(double(p));
     auto too_many = virtuals;
     too_many.insert(too_many.end(), virtuals.begin(), virtuals.begin() + 12);
     fails([&] { nonlocal->evaluateNonlocalVJP(positions, too_many, refs, weights, contractions); });
     require(metrics.snapshot().uploaded_bytes == untouched.uploaded_bytes &&
         metrics.snapshot().downloaded_bytes == untouched.downloaded_bytes, "Nonlocal late preflight launched");
+    require(maximum_difference > 0, "Nonlocal overflow fixture needs a nonconstant directional response");
+    const double scale = 8 / maximum_difference;
+    for (auto& value : tangent) value *= scale;
+    weights[overflow_point] = std::numeric_limits<double>::max();
+    const auto before_overflow = metrics.snapshot();
+    fails([&] { nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p); });
+    require(metrics.snapshot().downloaded_bytes - before_overflow.downloaded_bytes ==
+        score_dot_after.downloaded_bytes - score_dot_before.downloaded_bytes, "Nonlocal overflow did not follow complete inner JVP");
+    fails([&] { (void)nonlocal->nonlocalJvpView(); });
+    fails([&] { (void)nonlocal->scoreJvpView(); });
+    for (std::size_t i = 0; i < p; ++i) tangent[i] = .01 * (int(i % 13) - 6) / std::sqrt(double(p));
+    physical_weights();
     std::copy_n(virtuals.data() + 3, 3, virtuals.data()); // Same-spin node in the FIRST virtual, with exactly zero weight.
     weights[0] = C{};
     fails([&] { nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions); });
+    auto nodal_joined = positions;
+    nodal_joined.insert(nodal_joined.end(), virtuals.begin(), virtuals.end());
+    fails([&] { nonlocal->evaluateNonlocalJVP(nodal_joined, b, refs, weights, tangent.data(), p); });
+    fails([&] { (void)nonlocal->nonlocalJvpView(); });
     fails([&] { (void)nonlocal->completedResult(); });
     std::copy_n(joined.data() + 12 * b, 12, virtuals.data());
     physical_weights();
+    nonlocal->evaluateNonlocalJVP(joined, b, refs, weights, tangent.data(), p);
+    nonlocal->validate(nonlocal->nonlocalJvpView());
+    fails([&] { nonlocal->validate(response); });
+    const auto valid_nonlocal = nonlocal->nonlocalJvpView();
     nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions);
+    fails([&] { nonlocal->validate(valid_nonlocal); });
     fails([&] { nonlocal->validate(jvp); });
     require(nonlocal->storageFingerprint() == nf && metrics.snapshot().allocation_calls == nw.allocation_calls &&
         metrics.snapshot().free_calls == nw.free_calls, "Nonlocal warm request changed prepared ownership");
     std::cout << "PASS complex nonlocal C1 B=" << b << " Q=" << q << " allP=1 transpose=1 hermitian=1 physical_ratio_FD=1"
               << " real_direction_duality=1 zero_weight_node_rejected=1 retry=1 warm_allocations=0\n";
+    std::cout << "PASS complex nonlocal JVP B=" << b << " Q=" << q
+              << " per_base_CPU=1 physical_ratio_FD=1 VJP_duality=1 typed_receipts=1 overflow_revoked=1 same_transfers=1\n";
   }
   std::cout << "PASS complex products B=" << b << " channels=" << c << " P=" << p
             << " K=" << targets << " chunk=" << chunk << " max_cpu_allP=" << maximum

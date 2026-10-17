@@ -98,6 +98,15 @@ public:
     const Complex* data;
   };
 
+  /// Borrow per-reference complete nonlocal JVPs, not plain score directional products.
+  struct NonlocalJvpView
+  {
+    const PreparedDeviceComplexProducts* owner = nullptr;
+    const PreparedDeviceModel* image = nullptr;
+    std::size_t generation = 0, samples = 0;
+    const Complex* data = nullptr;
+  };
+
   /// Reject checked combined device/host/work caps before either numerical owner allocates.
   static std::unique_ptr<PreparedDeviceComplexProducts> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
@@ -254,6 +263,7 @@ public:
   void evaluateScoreJVP(const std::vector<double>& positions, const Complex* direction, std::size_t count)
   {
     ready_ = jvp_ready_ = false;
+    nonlocal_jvp_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
     ++generation_;
@@ -298,11 +308,75 @@ public:
     jvp_ready_ = true;
   }
 
+  /** Borrow combined [B base, Q virtual] packing and produce one complete response per base.
+   * Existing full-score/device-dot work uploads one REAL direction; Wq includes
+   * all fixed component and outer-phase ratios. No coordinate/scalar array is allocated.
+   */
+  void evaluateNonlocalJVP(const std::vector<double>& positions, std::size_t bases,
+      const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
+      const Complex* direction, std::size_t count)
+  {
+    ready_ = jvp_ready_ = false;
+    const auto stride = 3 * cost_.electrons, total = positions.size() / stride;
+    if (cost_.channels != 1 || !bases || bases > total || total > cost_.maximum_samples ||
+        positions.size() % stride || references.size() != total - bases || complete_weights.size() != references.size())
+      throw std::invalid_argument("Complex nonlocal JVP C1 packed grid/request extent mismatch");
+    const auto finite = [](Complex value) {
+      return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
+    };
+    for (std::size_t point = 0; point < references.size(); ++point)
+      if (references[point] >= bases || !finite(complete_weights[point]))
+        throw std::invalid_argument("Complex nonlocal JVP invalid reference/complete weight");
+    try
+    {
+      evaluateScoreJVP(positions, direction, count); // Checks every coordinate/direction and regular node.
+      jvp_ready_ = false; // Internal score completion must never escape a later reduction failure.
+      for (std::size_t point = 0; point < references.size(); ++point)
+      {
+        auto& term = sample_products_[bases + point];
+        term = complete_weights[point] * (term - sample_products_[references[point]]);
+        if (!finite(term)) throw std::overflow_error("Complex nonlocal JVP virtual product overflow");
+      }
+      // Every virtual difference is formed before any original base value is overwritten.
+      std::fill_n(sample_products_.begin(), bases, Complex{});
+      for (std::size_t point = 0; point < references.size(); ++point)
+      {
+        auto& sum = sample_products_[references[point]];
+        sum += sample_products_[bases + point];
+        if (!finite(sum)) throw std::overflow_error("Complex nonlocal JVP base accumulation overflow");
+      }
+      jvp_samples_ = bases;
+      nonlocal_jvp_ = jvp_ready_ = true;
+    }
+    catch (...)
+    {
+      ready_ = jvp_ready_ = false;
+      throw;
+    }
+  }
+
+  /// Publish only the complete finite physical response with its distinct mathematical receipt.
+  NonlocalJvpView nonlocalJvpView() const
+  {
+    image_->validateCurrentDevice();
+    if (!jvp_ready_ || !nonlocal_jvp_) throw std::logic_error("Complex nonlocal JVP response unavailable");
+    return {this, image_.get(), generation_, jvp_samples_, sample_products_.data()};
+  }
+
+  /// Reject a foreign/stale receipt, including replacement by a plain score-JVP request.
+  void validate(const NonlocalJvpView& view) const
+  {
+    const auto current = nonlocalJvpView();
+    if (view.owner != current.owner || view.image != current.image || view.generation != current.generation ||
+        view.samples != current.samples || view.data != current.data)
+      throw std::invalid_argument("Complex nonlocal JVP stale/foreign result receipt");
+  }
+
   /// Publish only a complete finite JVP request at this image and generation.
   ScoreJvpView scoreJvpView() const
   {
     image_->validateCurrentDevice();
-    if (!jvp_ready_)
+    if (!jvp_ready_ || nonlocal_jvp_)
       throw std::logic_error("Complex score JVP response unavailable");
     return {this, image_.get(), generation_, jvp_samples_, sample_products_.data()};
   }
@@ -454,7 +528,7 @@ private:
   std::vector<DerivativeFiniteStatus> dot_host_status_;
   std::size_t jvp_samples_ = 0;
   std::size_t generation_ = 0;
-  bool ready_ = false, jvp_ready_ = false;
+  bool ready_ = false, jvp_ready_ = false, nonlocal_jvp_ = false;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif
