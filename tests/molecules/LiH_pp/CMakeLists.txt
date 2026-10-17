@@ -8,6 +8,11 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EX
                      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
                      $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_external_ecp.xml" --external-lcao)
     set_tests_properties(short-LiH-pp-conventional-external-lcao-ecp PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    add_test(NAME short-LiH-pp-conventional-external-orbital-ecp
+             COMMAND ${Python3_EXECUTABLE}
+                     "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_external_ecp.xml" --external-orbital-ecp)
+    set_tests_properties(short-LiH-pp-conventional-external-orbital-ecp PROPERTIES TIMEOUT 300 PROCESSORS 1)
   endif()
 endif()
 

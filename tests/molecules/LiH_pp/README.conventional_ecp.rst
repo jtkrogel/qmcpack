@@ -41,4 +41,14 @@ Only this exp(log-history) scientific VMC comparison uses rtol=atol=3e-12;
 weights/counts and all accepted-C/artifact/optimizer/sampler restart payloads
 remain exact. The VP is never a restart initializer. One protected HDF copy
 is reused/restored for identity negatives; tracked assets stay untouched.
-Native qualification and registration of this active mode are pending.
+Native round 106 passed with application source ``1d4c6e758`` and SHA256
+``bec4f57553bdb671174a93bff2197bd463fd43a70779c320f8f209add8592e61``;
+the separately corrected helper is ``918ce130b`` (checker SHA256
+``6e8486c182163a7c209bfdb56db8e54b2675eac152f64e0b25a9b56c620b03ff``).
+Both VP scientific comparisons had maximum absolute difference zero, and
+the initialized split restart was bitwise exact. One active-mode CTest is
+registered under the same real/full-precision/nonoffload/Python guard and
+300-second limit. The original round 103 VP charset failure and round 105
+negative-label failure remain preserved; neither changed scientific tolerances.
+This adds only shared three-MO single-Slater orbital/J2 locality ECP coverage,
+not MD, larger determinants, other external loaders or non-CPU profiles.
