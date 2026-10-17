@@ -584,22 +584,29 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
           twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
           maximum_parameter_chunk_size);
-  bool bounded_cpu_replay = false;
+  bool bounded_replay = false;
   for (const auto& component : twfs[0].get().getOrbitals())
     if (const auto* psiformer = dynamic_cast<const PsiFormerWF*>(component.get()))
       if (psiformer->parameterSchema().providerId() == provider_id)
-        bounded_cpu_replay = !psiformer->usesAcceleratorParameterProducts();
+      {
+        bounded_replay = !psiformer->usesAcceleratorParameterProducts();
+#ifndef QMC_COMPLEX
+        // Real GPU replay contracts accepted virtual/reference scores in shared
+        // DEVICE scratch; complex-build aggregate compatibility is unchanged.
+        bounded_replay = true;
+#endif
+      }
   logTrainingAllocation("accepted_ecp_grid_consumer", walkers.size(),
       batch.derivative_operator->parameterSchema().parameterCount());
   app_log() << "WFTrain ECP capture batch=" << batch_ordinal << " sample_offset=" << sample_offset
-            << " replay_only=" << bounded_cpu_replay
-            << " planned_parameter_workspace_bytes=" << (bounded_cpu_replay ? "0" : "provider_defined")
+            << " replay_only=" << bounded_replay
+            << " planned_parameter_workspace_bytes=" << (bounded_replay ? "0" : "provider_defined")
             << " planned_grid_bytes=unknown_until_accepted_traversal" << std::endl;
   auto ecp_consumer =
       TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
           twf_batch, electron_batch, provider_id,
-          maximum_parameter_chunk_size, capture_ecp_jvp_replay || bounded_cpu_replay,
-          bounded_cpu_replay);
+          maximum_parameter_chunk_size, capture_ecp_jvp_replay || bounded_replay,
+          bounded_replay);
 
   const wftrain::StructuredParameterSchema& schema =
       batch.derivative_operator->parameterSchema();
@@ -616,15 +623,15 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   const wftrain::VJPCoefficientChannel ecp_channel{
       wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
       wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficient_view, ecp_mask};
-  // CPU preparation retains accepted grids, never one P-vector per snapshot.
+  // Bounded preparation retains accepted grids, never one P-vector per snapshot.
   // Arbitrary weighted/clipped VJPs and JVPs later reuse the streaming owner's
-  // shared scratch on this same grid. Existing accelerator behavior is unchanged.
+  // shared scratch on this same grid. Complex-build GPU compatibility is unchanged.
   std::unique_ptr<wftrain::PreparedLocalEnergyVJPCapture> ecp_capture;
   ReplayOnlyECPSink replay_sink;
-  if (!bounded_cpu_replay)
+  if (!bounded_replay)
     ecp_capture = std::make_unique<wftrain::PreparedLocalEnergyVJPCapture>(
         schema, parameter_version, ecp_mask);
-  wftrain::ParameterReductionSink& ecp_sink = bounded_cpu_replay
+  wftrain::ParameterReductionSink& ecp_sink = bounded_replay
       ? static_cast<wftrain::ParameterReductionSink&>(replay_sink) : *ecp_capture;
 
   const auto ecp_result =
@@ -637,14 +644,14 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   if (ecp_capture)
     batch.additive_local_energy_vjp.emplace(ecp_capture->release());
 
-  if (capture_ecp_jvp_replay || bounded_cpu_replay)
+  if (capture_ecp_jvp_replay || bounded_replay)
   {
     auto replay = ecp_consumer->releaseJVPReplay();
     if (replay->gridFingerprint() != ecp_result.grid_fingerprint)
       throw std::logic_error(
           "WFTrainBatched: accepted ECP replay grid identity changed before binding");
     batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
-    if (bounded_cpu_replay)
+    if (bounded_replay)
       batch.local_energy_term_mask |= ecp_mask;
   }
   return batch;

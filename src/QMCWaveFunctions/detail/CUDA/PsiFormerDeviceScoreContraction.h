@@ -120,6 +120,17 @@ public:
     sums_.download(reinterpret_cast<double*>(destination), 2 * count, 2 * channel * parameters_);
   }
 
+  /// Transfer a checked canonical range without a P-sized HOST staging vector.
+  void downloadChunk(std::size_t channel, std::size_t offset, std::complex<double>* destination,
+                     std::size_t count) const
+  {
+    if (!ready_)
+      throw std::logic_error("Device score contraction has no completed result");
+    if (!destination || count == 0 || offset > parameters_ || count > parameters_ - offset || channel >= channels_)
+      throw std::invalid_argument("Device score contraction chunk extent mismatch");
+    sums_.download(reinterpret_cast<double*>(destination), 2 * count, 2 * (channel * parameters_ + offset));
+  }
+
   std::size_t deviceWorkspaceBytes() const
   {
     return spatial_detail::checkedAdd(checkedDeviceBytes<double>(sums_.capacity()),

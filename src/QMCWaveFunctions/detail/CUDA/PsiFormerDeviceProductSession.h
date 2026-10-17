@@ -423,6 +423,32 @@ public:
     return contraction_capacity_.load(std::memory_order_acquire);
   }
 
+  /// Expose only a completed, versioned canonical range to bounded HOST scratch.
+  void downloadScoreContractionChunk(std::size_t channel, std::size_t offset,
+      std::complex<double>* destination, std::size_t count, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    try
+    {
+      validateContractionControl(version);
+      if (!score_contraction_)
+        throw std::logic_error("Device score contraction was not prepared");
+      score_contraction_->downloadChunk(channel, offset, destination, count);
+    }
+    catch (...)
+    {
+      invalidateScoreContraction();
+      throw;
+    }
+  }
+
+  /// Revoke queued/partial sums; the next begin clears them in the same stream.
+  void abortScoreContraction() noexcept
+  {
+    std::lock_guard lock(mutex_);
+    invalidateScoreContraction();
+  }
+
   std::size_t scoreContractionGeneration() const noexcept
   {
     return contraction_generation_.load(std::memory_order_acquire);

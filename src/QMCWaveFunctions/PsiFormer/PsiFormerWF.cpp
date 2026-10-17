@@ -2009,6 +2009,7 @@ struct PsiFormerDerivativeScratch
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products;
   std::vector<double> device_positions;
   std::vector<double> device_direction;
+  std::vector<wftrain::DerivativeValue> device_ecp_chunk;
   bool reported_device_products = false;
   bool reported_device_score_contraction = false;
   bool reported_device_score_tiles = false;
@@ -2272,6 +2273,24 @@ public:
         throw std::invalid_argument(
             "PsiFormer ECP JVP replay lacks bound value-evaluation provenance");
     }
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    if (hasDeviceProducts())
+    {
+      PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
+      std::shared_lock state_lock(model_state_->mutex);
+      requireBoundVersion();
+      const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
+          schema_->parameterCount(), MAXIMUM_VJP_CHANNELS);
+      const auto chunk = std::min(schema_->parameterCount(), chunk_plan_.maximumChunkSize());
+      app_log() << "  PsiFormer regular-node real GPU ECP replay before allocation: DEVICE_channels="
+                << MAXIMUM_VJP_CHANNELS << ", DEVICE_bytes=" << bytes
+                << ", HOST_chunk_bytes=" << chunk * sizeof(wftrain::DerivativeValue)
+                << "; native aggregate DEVICE admission applies; metadata/vendor excluded" << std::endl;
+      shared_scratch_->device_products->prepareScoreContractions(MAXIMUM_VJP_CHANNELS, parameter_version_, bytes);
+      if (shared_scratch_->device_ecp_chunk.size() < chunk)
+        shared_scratch_->device_ecp_chunk.resize(chunk);
+    }
+#endif
     ecp_replay_ = std::move(replay);
     storage_diagnostics_ = measureStorageDiagnostics();
   }
@@ -3072,6 +3091,79 @@ private:
       throw std::logic_error("PsiFormer ECP VJP replay is not bound");
     std::fill(replay_weight_sums_.begin(), replay_weight_sums_.end(),
               wftrain::DerivativeValue{});
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    if (hasDeviceProducts())
+    {
+      std::array<std::size_t, MAXIMUM_VJP_CHANNELS> active{};
+      std::size_t count = 0;
+      for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        if (channels[channel].product == wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+            (channels[channel].local_energy_term_mask & ecp_replay_->localEnergyTermMask()) != 0)
+          active[count++] = channel;
+      if (count == 0 || sample_count_ == 0)
+        return;
+      auto& session = *shared_scratch_->device_products;
+      const auto transfer_before = session.transferSnapshot();
+      try
+      {
+        session.beginScoreContraction(count, parameter_version_);
+        std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
+        for (const auto& point : ecp_replay_->points())
+        {
+          const auto weight = point.bare_weight * point.complete_ratio;
+          requireFinite(weight, "accepted-grid VJP weight");
+          replay_weight_sums_[point.sample] += weight;
+          requireFinite(replay_weight_sums_[point.sample], "accepted-grid sample weight sum");
+          for (std::size_t slot = 0; slot < count; ++slot)
+            coefficients[slot] = channels[active[slot]].coefficients.values[point.sample] * weight;
+          setReplayPointPositions(point);
+          // Even zero coefficients must validate the virtual score's regular node.
+          session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
+                                             count, parameter_version_);
+        }
+        for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        {
+          setScoreWorkspacePositions(sample);
+          for (std::size_t slot = 0; slot < count; ++slot)
+            coefficients[slot] = -channels[active[slot]].coefficients.values[sample] * replay_weight_sums_[sample];
+          session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
+                                             count, parameter_version_);
+        }
+        session.finishScoreContraction(parameter_version_);
+        auto& output = shared_scratch_->device_ecp_chunk;
+        for (const auto& chunk : chunk_plan_.chunks())
+          for (std::size_t slot = 0; slot < count; ++slot)
+          {
+            if (chunk.count > output.size())
+              throw std::logic_error("GPU ECP replay chunk exceeds cold preparation");
+            session.downloadScoreContractionChunk(slot, chunk.parameter_offset, output.data(), chunk.count,
+                                                  parameter_version_);
+            auto* destination = channel_accumulators_[active[slot]].data() + chunk.parameter_offset;
+            for (std::size_t i = 0; i < chunk.count; ++i)
+            {
+              destination[i] += output[i]; // Preserve existing kinetic/score contributions.
+              requireFinite(destination[i], "complete ECP VJP");
+            }
+          }
+        const auto after = session.transferSnapshot();
+        app_log() << "  PsiFormer regular-node real GPU accepted-grid ECP replay: points="
+                  << ecp_replay_->points().size() << ", channels=" << count
+                  << ", full_parameter_downloads_per_point=0, final_channel_parameter_bytes="
+                  << count * schema_->parameterCount() * sizeof(wftrain::DerivativeValue)
+                  << ", measured_downloaded_bytes=" << after.downloaded_bytes - transfer_before.downloaded_bytes
+                  << "; status/factor transfers included, CPU derivative fallback=no" << std::endl;
+        reportDeviceProducts();
+        // HOST channels now own the result; revoke DEVICE readiness before any sink callback can fail.
+        session.abortScoreContraction();
+      }
+      catch (...)
+      {
+        session.abortScoreContraction();
+        throw;
+      }
+      return;
+    }
+#endif
     for (const auto& point : ecp_replay_->points())
     {
       setReplayPointPositions(point);
@@ -3268,6 +3360,9 @@ private:
           checkedBatchMemoryMultiply(shared_scratch_->device_direction.capacity(), sizeof(double),
                                       "PsiFormer device provider direction staging"),
           "PsiFormer device provider scratch");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(shared_scratch_->device_ecp_chunk.capacity(), sizeof(wftrain::DerivativeValue),
+                                      "PsiFormer shared ECP chunk bytes"), "PsiFormer device provider scratch");
     }
     else
 #endif
@@ -3308,6 +3403,7 @@ private:
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_products.get()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_positions.data()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_direction.data()));
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_ecp_chunk.data()));
     }
 #endif
     mixFingerprint(fingerprint,

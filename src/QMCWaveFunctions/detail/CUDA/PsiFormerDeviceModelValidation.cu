@@ -2753,6 +2753,32 @@ int main(int argc, char** argv)
           product_session->deviceWorkspaceBytes() != prepared_bytes)
         throw std::runtime_error("Resident score contraction warmed allocation/download contract failed");
 
+      // Bounded canonical ranges preserve the completed whole-vector result.
+      const auto chunk_capacity = plan.parameterCount() / 3 + 1;
+      std::vector<Complex> chunk_output(chunk_capacity);
+      for (std::size_t offset = 0; offset < plan.parameterCount(); offset += chunk_capacity)
+      {
+        const auto count = std::min(chunk_capacity, plan.parameterCount() - offset);
+        product_session->downloadScoreContractionChunk(1, offset, chunk_output.data(), count, contraction_version);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          near(chunk_output[i].real(), contracted[1][offset + i].real(), "score chunk real parity");
+          near(chunk_output[i].imag(), contracted[1][offset + i].imag(), "score chunk imaginary parity");
+        }
+      }
+      bool invalid_chunk_rejected = false;
+      try { product_session->downloadScoreContractionChunk(0, plan.parameterCount(), chunk_output.data(), 1,
+                                                           contraction_version); }
+      catch (const std::invalid_argument&) { invalid_chunk_rejected = true; }
+      if (!invalid_chunk_rejected)
+        throw std::runtime_error("Score contraction accepted an out-of-range chunk");
+      run_contraction();
+      bool stale_chunk_rejected = false;
+      try { product_session->downloadScoreContractionChunk(0, 0, chunk_output.data(), 1, contraction_version + 1); }
+      catch (const std::invalid_argument&) { stale_chunk_rejected = true; }
+      if (!stale_chunk_rejected)
+        throw std::runtime_error("Score contraction accepted a stale chunk");
+
       auto expect_no_contraction = [&]() {
         bool rejected = false;
         try { product_session->downloadScoreContraction(0, contracted[0].data(), contracted[0].size(), model.p.version()); }
@@ -2762,6 +2788,11 @@ int main(int argc, char** argv)
       };
       product_session->beginScoreContraction(2, contraction_version);
       expect_no_contraction();
+      bool unfinished_chunk_rejected = false;
+      try { product_session->downloadScoreContractionChunk(0, 0, chunk_output.data(), 1, contraction_version); }
+      catch (const std::logic_error&) { unfinished_chunk_rejected = true; }
+      if (!unfinished_chunk_rejected)
+        throw std::runtime_error("Score contraction exposed an unfinished chunk");
       run_contraction();
       bool stale_finish_rejected = false;
       try { product_session->finishScoreContraction(contraction_version + 1); }
