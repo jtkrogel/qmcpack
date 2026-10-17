@@ -3773,9 +3773,9 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 #ifndef QMC_COMPLEX
 TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapter][ci_family_oracle]")
 {
-  // Preserve the existing AE DETS/CSF cases, then exercise pure DETS ECP.
-  const int model = GENERATE(0, 1, 2, 3);
-  const bool csf = model == 1, mixed_ecp = model == 3, ecp = model >= 2;
+  // Preserve the existing cases, adding fixed-SPO CSF/J2 ordinary-ECP coverage.
+  const int model = GENERATE(0, 1, 2, 3, 4);
+  const bool csf = model == 1 || model == 4, mixed_ecp = model >= 3, ecp = model >= 2;
   CAPTURE(model);
   ParticleSetPool pool(OHMMS::Controller);
   Libxml2Document definition;
@@ -3792,10 +3792,17 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
   REQUIRE(wavefunction);
   if (csf)
   {
-    // Two open-shell CSFs, each with two spin-interchanged determinants. The
-    // frozen CSF coefficient is .6, not its first expanded determinant weight.
+    // H4 has two open-shell CSFs. Be instead needs Ne2/two-MO occupations;
+    // its frozen outer .6 coefficient is distinct from the .6*.8 expanded weight.
     Libxml2Document csf_xml;
-    REQUIRE(csf_xml.parseFromString(R"(<detlist size="2" type="CSF" nca="0" ncb="0" nea="2" neb="2" nstates="3" cutoff="0">
+    const std::string csf_definition = model == 4 ? R"(<detlist size="2" type="CSF" nca="0" ncb="0" nea="1" neb="1" nstates="2" cutoff="0">
+      <csf id="CI0" coeff="0.6" occ="20" exctLvl="0">
+        <det coeff="0.8" alpha="10" beta="10"/>
+      </csf>
+      <csf id="CI1" coeff="0.05" occ="11" exctLvl="1">
+        <det coeff="0.7071067811865475244" alpha="10" beta="01"/>
+        <det coeff="-0.7071067811865475244" alpha="01" beta="10"/>
+      </csf></detlist>)" : R"(<detlist size="2" type="CSF" nca="0" ncb="0" nea="2" neb="2" nstates="3" cutoff="0">
       <csf id="CI0" coeff="0.6" occ="211" exctLvl="1">
         <det coeff="0.7071067811865475244" alpha="110" beta="101"/>
         <det coeff="0.7071067811865475244" alpha="101" beta="110"/>
@@ -3803,7 +3810,8 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
       <csf id="CI1" coeff="0" occ="121" exctLvl="1">
         <det coeff="0.7071067811865475244" alpha="110" beta="011"/>
         <det coeff="0.7071067811865475244" alpha="011" beta="110"/>
-      </csf></detlist>)"));
+      </csf></detlist>)";
+    REQUIRE(csf_xml.parseFromString(csf_definition));
     auto* determinantset = xmlFirstElementChild(wavefunction);
     while (determinantset && !xmlStrEqual(determinantset->name, BAD_CAST "determinantset"))
       determinantset = xmlNextElementSibling(determinantset);
@@ -3831,12 +3839,21 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
   CHECK(source->findMSD()[0].get().fixedCoefficientReference() == 0.6);
   if (csf)
   {
-    REQUIRE(fixed_coefficients.size() == 4);
+    REQUIRE(fixed_coefficients.size() == (model == 4 ? 3 : 4));
     CHECK(std::abs(fixed_coefficients[0] - 0.6) > 0.1);
+    if (model == 4)
+    {
+      CHECK(fixed_coefficients[0] == Catch::Approx(0.48).margin(1e-15));
+      CHECK(fixed_coefficients[1] == Catch::Approx(0.05 * std::sqrt(0.5)).margin(1e-15));
+      CHECK(fixed_coefficients[2] == Catch::Approx(-0.05 * std::sqrt(0.5)).margin(1e-15));
+      REQUIRE(source->findMSD()[0].get().hasCSFExpansion());
+    }
   }
   LegacyWaveFunctionAdapter adapter("ci/family-oracle", *source, adapterOptions());
   REQUIRE(adapter.parameterSchema().parameterCount() == (mixed_ecp ? 5 : 1));
   REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
+  if (model == 4)
+    CHECK(adapter.snapshotParameters().values[0] == 0.05);
   ParticleSet private_particles(particles);
   auto evaluator = source->makeClone(private_particles);
   private_particles.update();
