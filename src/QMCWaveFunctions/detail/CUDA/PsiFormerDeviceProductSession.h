@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -109,6 +110,9 @@ public:
   {
     std::lock_guard lock(mutex_);
     validateContractionControl(active_image_->version());
+    if (!device_cap || !host_cap || device_cap == std::numeric_limits<std::size_t>::max() ||
+        host_cap == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Resident open energy requires finite positive numeric caps");
     if (resident_open_ || !kinetic_ || target_kinetic_ || image_->periodicCell() ||
         image_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL ||
         inverse_masses.size() != image_->plan().modelShape().electrons() ||
@@ -121,7 +125,9 @@ public:
       if (!device_math::isFiniteBinary64(value)) throw std::invalid_argument("Resident ion charge is nonfinite");
     const auto cost = estimateResidentOpenEnergyCost(inverse_masses.size(), charges.size());
     if (cost.device_bytes > device_cap || cost.host_bytes > host_cap)
-      throw std::length_error("Resident open energy cold numeric capacity exceeded");
+      throw std::length_error("Resident open energy cold numeric bytes DEVICE=" + std::to_string(cost.device_bytes) +
+          " HOST=" + std::to_string(cost.host_bytes) + " exceed caps DEVICE=" + std::to_string(device_cap) +
+          " HOST=" + std::to_string(host_cap));
     auto prepared = std::make_unique<ResidentOpenWorkspace>(inverse_masses, charges);
     const auto actual_host = estimateResidentOpenEnergyCost(
         prepared->masses.capacity(), prepared->charges.capacity()).host_bytes;
