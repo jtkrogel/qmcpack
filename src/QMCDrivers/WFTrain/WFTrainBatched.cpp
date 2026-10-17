@@ -3121,8 +3121,20 @@ void WFTrainBatched::run()
               result = wftrain::solveSymmetrizedMatrixFreeLinearMethod(h, s, preconditioner,
                   {initial.data(), initial.size()}, lm_control);
             if (!result.converged)
-              throw UniformCommunicateError(std::string("Live LM solve failed: ") +
-                  wftrain::linearMethodStopReasonName(result.stop_reason));
+            {
+              std::string failure = std::string("Live LM solve failed: ") +
+                  wftrain::linearMethodStopReasonName(result.stop_reason);
+              const auto& roots = result.ritz_rejections;
+              if (accelerated && roots.projected_solves > 0)
+                failure += "; ALM Ritz filters: projected_solves=" + std::to_string(roots.projected_solves) +
+                    " last_dimension=" + std::to_string(roots.last_dimension) +
+                    " last_examined=" + std::to_string(roots.last_examined) +
+                    " last_rejected_spectrum=" + std::to_string(roots.last_rejected_spectrum) +
+                    " last_rejected_overlap=" + std::to_string(roots.last_rejected_overlap) +
+                    " last_rejected_reference=" + std::to_string(roots.last_rejected_reference) +
+                    " last_accepted=" + std::to_string(roots.last_accepted);
+              throw UniformCommunicateError(failure);
+            }
             krylov_iterations = result.iterations;
             krylov_operator_applications = result.operator_applications;
             applied_scale = training_input_.getLearningRate();
