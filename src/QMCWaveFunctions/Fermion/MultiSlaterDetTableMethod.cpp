@@ -799,12 +799,29 @@ void MultiSlaterDetTableMethod::enableAcceptedReferenceVirtualRatios()
 #ifdef QMC_COMPLEX
   throw std::invalid_argument("Private accepted-reference VP requires a real CPU build");
 #endif
-  if (csf_data_ || Dets.size() != 2 || Last.size() != 2 ||
+  if (Dets.size() != 2 || Last.size() != 2 ||
       std::any_of(Dets.begin(), Dets.end(), [](const auto& det) {
         return det->isSpinor() || det->getPhi()->isOMPoffload();
       }))
-    throw std::invalid_argument("Private accepted-reference VP requires two fixed CPU DETS spin components");
+    throw std::invalid_argument("Private accepted-reference VP requires two fixed CPU coefficient spin components");
   validatePreparedCoefficientState(*this);
+  if (csf_data_)
+  {
+    if (csf_data_->coeffs.size() != myVars->size() + 1 ||
+        csf_data_->dets_per_csf.size() != csf_data_->coeffs.size() ||
+        csf_data_->expansion.size() != C->size())
+      throw std::invalid_argument("Private accepted-reference VP has an inconsistent CSF map");
+    std::size_t remaining = C->size();
+    for (const auto count : csf_data_->dets_per_csf)
+    {
+      if (count > remaining)
+        throw std::invalid_argument("Private accepted-reference VP has an inconsistent CSF extent");
+      remaining -= count;
+    }
+    if (remaining || std::any_of(csf_data_->expansion.begin(), csf_data_->expansion.end(),
+          [](RealType value) { return !finiteAcceptedRatio(ValueType(value)); }))
+      throw std::invalid_argument("Private accepted-reference VP has an incomplete or nonfinite CSF map");
+  }
   accepted_reference_virtual_mode_ = true;
 }
 
@@ -840,19 +857,32 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
       throw std::invalid_argument("Private physical CI ratio derivative index is out of range");
   const auto ratio = acceptedReferenceVirtualRatio(P, iat, refPtcl);
   const int moved = getDetID(refPtcl);
+  // CSF0 is frozen. Each later coordinate differentiates its immutable signed
+  // determinant expansion, not one expanded determinant coefficient.
+  std::size_t term_offset = csf_data_ ? csf_data_->dets_per_csf[0] : 1;
   for (int variable = 0; variable < myVars->size(); ++variable)
   {
     const int index = myVars->where(variable);
+    const std::size_t count = csf_data_ ? csf_data_->dets_per_csf[variable + 1] : 1;
+    const std::size_t first_term = term_offset;
+    term_offset += count;
     if (index < 0) continue;
-    const std::size_t term = variable + 1;
-    ValueType old_term{1}, new_term = accepted_reference_virtual_terms_[(*C2node)[moved][term]];
-    for (std::size_t spin = 0; spin < Dets.size(); ++spin)
+    ValueType old_coefficient{}, new_coefficient{};
+    for (std::size_t term = first_term; term < term_offset; ++term)
     {
-      const auto value = Dets[spin]->getRatiosToRefDet()[(*C2node)[spin][term]];
-      old_term *= value;
-      if (spin != moved) new_term *= value;
+      const ValueType weight = csf_data_ ? ValueType(csf_data_->expansion[term]) : ValueType{1};
+      ValueType old_term = weight, new_term = weight * accepted_reference_virtual_terms_[(*C2node)[moved][term]];
+      for (std::size_t spin = 0; spin < Dets.size(); ++spin)
+      {
+        const auto value = Dets[spin]->getRatiosToRefDet()[(*C2node)[spin][term]];
+        old_term *= value;
+        if (spin != moved) new_term *= value;
+      }
+      old_coefficient += old_term;
+      new_coefficient += new_term;
     }
-    const ValueType value = static_cast<ValueType>(PsiValue(new_term - ratio * old_term) / psi_ratio_to_ref_det_);
+    const ValueType value = static_cast<ValueType>(PsiValue(new_coefficient - ratio * old_coefficient) /
+                                                  psi_ratio_to_ref_det_);
     if (!finiteAcceptedRatio(value) || !finiteAcceptedRatio(derivatives[index] + value))
       throw std::domain_error("Private physical CI ratio derivative is nonfinite");
     derivatives[index] += value;

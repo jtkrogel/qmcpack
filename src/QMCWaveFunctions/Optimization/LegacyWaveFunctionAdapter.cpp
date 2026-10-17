@@ -268,13 +268,13 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
     {
       ++slaters;
       dets = true;
-      if (msd->hasCSFExpansion() || msd->getDetSize() != 2 || sample.particles.groups() != 2 ||
+      if (msd->getDetSize() != 2 || sample.particles.groups() != 2 ||
           sample.particles.getLattice().SuperCellEnum != SUPERCELL_OPEN)
-        throw std::invalid_argument("Legacy DETS ECP products require open fixed-orbital two-spin DETS");
+        throw std::invalid_argument("Legacy coefficient ECP products require open fixed-orbital two-spin DETS/CSF");
       msd->validatePreparedCoefficientState(*msd);
       for (int spin = 0; spin < msd->getDetSize(); ++spin)
         if (msd->getDet(spin).getPhi()->isOMPoffload() || msd->getDet(spin).getPhi()->isOptimizable())
-          throw std::invalid_argument("Legacy DETS ECP products require fixed CPU orbitals");
+          throw std::invalid_argument("Legacy coefficient ECP products require fixed CPU orbitals");
     }
     else if (const auto* slater = dynamic_cast<const SlaterDet*>(component.get()))
     {
@@ -717,7 +717,7 @@ public:
       ecp_profile_ = profile;
       if (profile == LegacyECPProfile::DETS &&
           !state.wavefunction.findMSD().front().get().usesAcceptedReferenceVirtualRatios())
-        throw std::invalid_argument("Legacy DETS ECP replay requires an enabled private evaluator");
+        throw std::invalid_argument("Legacy coefficient ECP replay requires an enabled private evaluator");
       if (replay->electronCount() != state.particles.getTotalNum())
         throw std::invalid_argument("Legacy ECP replay electron extent differs from private evaluator");
       for (std::size_t electron = 0; electron < replay->electronCount(); ++electron)
@@ -1204,7 +1204,7 @@ std::unique_ptr<NonLocalECPDerivativeConsumer> LegacyWaveFunctionAdapter::makeNo
     auto state = replay->prepareSample(sample);
     if (validateECPProfile(state) == LegacyECPProfile::DETS &&
         !state.wavefunction.findMSD().front().get().usesAcceptedReferenceVirtualRatios())
-      throw std::invalid_argument("Legacy DETS ECP capture requires an enabled private evaluator");
+      throw std::invalid_argument("Legacy coefficient ECP capture requires an enabled private evaluator");
     validateMasses(state.particles);
     if (sample == 0)
     {

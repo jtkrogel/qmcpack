@@ -196,11 +196,11 @@ public:
 
   void evaluateRatios(const VirtualParticleSet& VP, std::vector<ValueType>& ratios) override;
 
-  /// Opt in only on an owned private fixed-DETS evaluator; ordinary VP stays legacy.
+  /// Opt in only on an owned private fixed-orbital DETS/CSF evaluator; ordinary VP stays legacy.
   void enableAcceptedReferenceVirtualRatios();
   /// Report the private mode, including propagation to descendants of that evaluator.
   bool usesAcceptedReferenceVirtualRatios() const noexcept { return accepted_reference_virtual_mode_; }
-  /// Add physical dCI ratios to caller storage, using initialized accepted caches.
+  /// Add physical DETS/CSF coefficient ratio derivatives using initialized accepted caches.
   ValueType evaluateAcceptedReferenceRatioDerivatives(const ParticleSet& P, int iat, int refPtcl,
       const OptVariables& active, ParameterDerivativeView derivatives);
 

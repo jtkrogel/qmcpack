@@ -2646,7 +2646,73 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   source.evaluateRatios(ordinary, ordinary_after);
   CHECK(ordinary_before == ordinary_after);
 
-  // Actual Be BFD capture on the polynomial DETS model: octahedral knots
+  // Two signed, nontrivial CSFs represent the same physical nodal polynomial:
+  // 6.5*(Dref-Dalt) - 5.5*(Dref+Dalt) = Dref-12*Dalt.
+  // Accepted x={1,3} gives binary-exact alt/ref=1/4 in each spin.
+  ParticleSet csf_accepted(accepted);
+  csf_accepted.R[1][0] = csf_accepted.R[3][0] = 3;
+  csf_accepted.update();
+  std::vector<std::unique_ptr<MultiDiracDeterminant>> csf_dets;
+  for (int spin = 0; spin < 2; ++spin)
+    csf_dets.push_back(std::make_unique<MultiDiracDeterminant>(source.getDet(spin)));
+  MultiSlaterDetTableMethod csf_source(accepted, std::move(csf_dets), false);
+  auto csf_maps = std::make_unique<std::vector<std::vector<std::size_t>>>(2);
+  for (int spin = 0; spin < 2; ++spin)
+    (*csf_maps)[spin] = {mappings[spin][0], mappings[spin][1], mappings[spin][0], mappings[spin][1]};
+  auto csf_data = std::make_unique<CSFData>();
+  csf_data->coeffs = {6.5, -5.5}; csf_data->dets_per_csf = {2, 2};
+  csf_data->expansion = {1, -1, 1, 1};
+  auto csf_variables = std::make_unique<optimize::VariableSet>();
+  csf_variables->insert("CSF1", -5.5, true, optimize::LINEAR_P);
+  csf_variables->resetIndex();
+  auto csf_active = *csf_variables;
+  csf_source.initialize(std::move(csf_maps),
+      std::make_unique<std::vector<QMCTraits::ValueType>>(
+          std::initializer_list<QMCTraits::ValueType>{6.5, -6.5, -5.5, -5.5}),
+      std::move(csf_variables), std::move(csf_data), true, true);
+  csf_source.checkOutVariables(csf_active);
+  const auto csf_source_log = evaluate(csf_source, csf_accepted);
+  ParticleSet csf_private_p(csf_accepted);
+  auto csf_private_owner = csf_source.makeClone(csf_private_p);
+  auto& csf_private = dynamic_cast<MultiSlaterDetTableMethod&>(*csf_private_owner);
+  csf_private.isolateOptimizationState(); csf_private.enableAcceptedReferenceVirtualRatios();
+  evaluate(csf_private, csf_private_p);
+  VirtualParticleSet csf_vp(csf_private_p);
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    csf_vp.makeMoves(csf_private_p, 2 * spin, {{-4, 0, 0}, {-1, 0, 0}, {0, 0, 0}, {2, 0, 0}});
+    std::vector<QMCTraits::ValueType> ratios(4);
+    csf_private.evaluateRatios(csf_vp, ratios);
+    for (int point = 0; point < 4; ++point)
+    {
+      std::array<QMCTraits::ValueType, 1> derivative{};
+      const auto actual = csf_private.evaluateAcceptedReferenceRatioDerivatives(csf_vp, point, 2 * spin,
+          csf_active, {derivative.data(), 1});
+      const double x = csf_vp.R[point][0];
+      const auto dense_ratio = [=](double c) {
+        // Independently occupied 2x2 polynomials, including both spin blocks.
+        const double ref = 8 * (9 - x * x), alt = 2 * (3 - x);
+        return ((6.5 + c) * ref + (-6.5 + c) * alt) / (64 * (6.5 + c) + 4 * (-6.5 + c));
+      };
+      CHECK(std::real(actual) == Catch::Approx(dense_ratio(-5.5)).margin(2e-13));
+      CHECK(actual == ratios[point]);
+      CHECK(std::real(derivative[0]) == Catch::Approx(
+          (dense_ratio(-5.5 + 1e-6) - dense_ratio(-5.5 - 1e-6)) / 2e-6).epsilon(2e-8).margin(2e-9));
+      if (point == 0) CHECK(std::real(actual) == Catch::Approx(-9).margin(2e-13));
+      if (point == 1)
+      {
+        CHECK(actual == QMCTraits::ValueType{});
+        CHECK(std::real(derivative[0]) == Catch::Approx(39. / 8).epsilon(2e-13));
+      }
+    }
+  }
+  CHECK_FALSE(csf_source.usesAcceptedReferenceVirtualRatios());
+  CHECK(evaluate(csf_source, csf_accepted) == csf_source_log);
+  CHECK(csf_source.fixedCoefficientReference() == QMCTraits::ValueType{6.5});
+
+  const bool csf = GENERATE(false, true);
+  INFO("CSF expansion=" << csf);
+  // Actual Be BFD capture on the polynomial DETS/CSF model: octahedral knots
   // include virtual-reference nodes and CI cancellation, with finite dCI.
   ParticleSet p(cell), ions(cell);
   ions.setName("ion0"); ions.create({1}); ions.R[0] = {0, 0, 0};
@@ -2654,13 +2720,14 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   const int be = isp.addSpecies("Be"), z = isp.addAttribute("charge");
   isp(z, be) = 2; ions.resetGroups(); ions.update();
   p.setName("e"); p.create({2, 2}); p.R = accepted.R;
+  if (csf) p.R[1][0] = p.R[3][0] = 3;
   p.R[2][2] = p.R[3][2] = 0.5; // avoid opposite-spin electron coincidence
   auto& esp = p.getSpeciesSet();
   const int u = esp.addSpecies("u"), d = esp.addSpecies("d"), mass = esp.addAttribute("mass");
   esp(mass, u) = esp(mass, d) = 1;
   p.resetGroups(); p.addTable(ions); p.update();
   auto wf = makeBsplineJ2WaveFunction(p, {0.12, -0.08, 0.04, -0.01});
-  wf->addComponent(source.makeClone(p));
+  wf->addComponent((csf ? csf_source : source).makeClone(p));
   auto& live_msd = wf->findMSD().front().get();
   live_msd.isolateOptimizationState();
   live_msd.enableAcceptedReferenceVirtualRatios();
@@ -2674,10 +2741,12 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     for (int electron = 0; electron < 2; ++electron)
     {
       const auto& block = live_msd.getDet(spin);
-      CHECK(std::real(block.getGrads()(0, electron)[0]) == Catch::Approx(electron == 0 ? -2. / 3 : 4. / 3));
+      CHECK(std::real(block.getGrads()(0, electron)[0]) == Catch::Approx(
+          csf ? (electron == 0 ? -0.25 : 0.75) : (electron == 0 ? -2. / 3 : 4. / 3)));
       for (int dim = 1; dim < 3; ++dim)
         CHECK(std::real(block.getGrads()(0, electron)[dim]) == Catch::Approx(spin == 0 ? 1 : 2. / 3));
-      CHECK(std::real(block.getLapls()(0, electron)) == Catch::Approx(electron == 0 ? -2. / 3 : 2. / 3));
+      CHECK(std::real(block.getLapls()(0, electron)) == Catch::Approx(
+          csf ? (electron == 0 ? -0.25 : 0.25) : (electron == 0 ? -2. / 3 : 2. / 3)));
     }
   const auto live_log = wf->getLogPsi();
   const auto live_energy = kineticEnergy(p);
@@ -2777,7 +2846,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     auto twf = wf->makeClone(trial);
     twf->findMSD().front().get().isolateOptimizationState();
     trial.update(); adapter.installSnapshot(*twf, trial, candidate);
-    const double c = std::real(twf->findMSD().front().get().get_C()[1]);
+    const auto& expanded = twf->findMSD().front().get().get_C();
+    const double ref_coefficient = std::real(expanded[0] + (csf ? expanded[2] : QMCTraits::ValueType{}));
+    const double alt_coefficient = std::real(expanded[1] + (csf ? expanded[3] : QMCTraits::ValueType{}));
     const auto jlog = [&](TrialWaveFunction& state, ParticleSet& particles) {
       double value = 0;
       particles.G = QMCTraits::GradType{}; particles.L = QMCTraits::ValueType{};
@@ -2798,8 +2869,10 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       };
       const double common_ratio = (1 + r[q.electron][1] + r[q.electron][2]) /
           (1 + positions[q.electron][1] + positions[q.electron][2]);
-      const double ratio = common_ratio * (determinant(0, false) * determinant(1, false) +
-          c * determinant(0, true) * determinant(1, true)) / (9 + c);
+      const double accepted_reference = csf ? 64 : 9, accepted_alternative = csf ? 4 : 1;
+      const double ratio = common_ratio * (ref_coefficient * determinant(0, false) * determinant(1, false) +
+          alt_coefficient * determinant(0, true) * determinant(1, true)) /
+          (accepted_reference * ref_coefficient + accepted_alternative * alt_coefficient);
       trial.R = r; trial.update();
       energy += q.bare_weight * ratio * std::exp(jlog(*twf, trial) - accepted_j);
     }
@@ -2834,12 +2907,15 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   CHECK(wf->getLogPsi() == live_log);
   checkClose(kineticEnergy(p), live_energy);
   CHECK_FALSE(source.usesAcceptedReferenceVirtualRatios());
+  CHECK_FALSE(csf_source.usesAcceptedReferenceVirtualRatios());
+  CHECK(evaluate(csf_source, csf_accepted) == csf_source_log);
 
-  // The physical octahedral grid cannot hit q_x=+-2 for the radius-1 first
+  // The physical octahedral grid cannot hit q_x=+-2 (DETS) or +-3 (CSF) for the radius-1 first
   // electron. Exercise that exact reference node in a separately labeled
   // synthetic replay, not by changing or relabeling the accepted PP grid.
   NonLocalECPReplayPoint node{};
-  node.sample = 0; node.electron = 0; node.replacement_position = {-2, 0, 0}; node.bare_weight = 1;
+  const double reference_node = csf ? -3 : -2;
+  node.sample = 0; node.electron = 0; node.replacement_position = {reference_node, 0, 0}; node.bare_weight = 1;
   oracle_points = {node};
   node.complete_ratio = fixed_energy(*snapshot) - live_energy - local_value;
   REQUIRE(node.complete_ratio != DerivativeValue{});
@@ -2853,7 +2929,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   node_capture->begin(context, {&node_channel, 1}, idle);
   const std::vector<std::size_t> offsets{0, 1};
   const std::vector<VirtualParticleBatch::Segment> segments{{0, 0, true, 0}};
-  const std::vector<ParticleSet::PosType> replacements{{-2, 0, 0}};
+  const std::vector<ParticleSet::PosType> replacements{{reference_node, 0, 0}};
   VirtualParticleBatch tile(1, offsets, segments, replacements);
   const QMCTraits::ValueType bare{1}, ratio{node.complete_ratio.real()};
   node_capture->consume({tile, {&bare, 1}, {&ratio, 1}, {}, 0, 456});
