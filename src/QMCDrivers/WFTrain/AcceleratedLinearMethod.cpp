@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -153,7 +154,16 @@ public:
         if (std::abs(sp[i + stride * j] - sp[j + stride * i]) >
             c_.outer.hermitian_tolerance * std::numeric_limits<double>::epsilon() * n_ *
                 std::max({1.0, std::abs(sp[i + stride * j]), std::abs(sp[j + stride * i])}))
+        {
+          // Temporary native124 failure evidence only; acceptance is unchanged.
+          const double left = sp[i + stride * j], right = sp[j + stride * i];
+          const double old_bound = c_.outer.hermitian_tolerance * std::numeric_limits<double>::epsilon() * n_ *
+              std::max({1.0, std::abs(left), std::abs(right)});
+          const double left_scale = norm(b.v[i]) * norm(b.s[j]), right_scale = norm(b.v[j]) * norm(b.s[i]);
+          std::fprintf(stderr, "ALM124_PAIR n=%zu m=%d i=%d j=%d left=%a right=%a old_bound=%a left_norm_product=%a right_norm_product=%a\n",
+                       n_, m, i, j, left, right, old_bound, left_scale, right_scale);
           throw Stop{LinearMethodStopReason::NON_HERMITIAN_ACTION};
+        }
     char no = 'N', yes = 'V';
     int lwork = std::max(1, 8 * m);
     std::vector<double> work(lwork);
