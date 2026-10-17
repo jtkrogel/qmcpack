@@ -66,6 +66,12 @@ TEST_CASE("Accelerated LM matches a nonsymmetric generalized dense oracle", "[dr
   CHECK(std::hypot(2*x - 2*y - result.eigenvalue*x,
                    -x + 8*y - 2*result.eigenvalue*y) < 1.e-10);
   CHECK(result.operator_applications <= c.outer.maximum_operator_applications);
+  const auto& counts = result.ritz_rejections;
+  CHECK(counts.projected_solves == result.iterations);
+  CHECK(counts.last_dimension == 2);
+  CHECK(counts.last_examined == counts.last_dimension);
+  CHECK(counts.last_accepted == 2);
+  CHECK(counts.last_rejected_spectrum + counts.last_rejected_overlap + counts.last_rejected_reference == 0);
 }
 
 TEST_CASE("Accelerated LM follows reference energy rather than the lowest root", "[drivers][wftrain][linear_method]")
@@ -89,6 +95,18 @@ TEST_CASE("Accelerated LM rejects complex roots and tiny reference amplitudes", 
     auto result = solve(h, s);
     CHECK_FALSE(result.converged);
     CHECK(result.stop_reason == LinearMethodStopReason::UNTRUSTED_ROOT);
+    const auto& counts = result.ritz_rejections;
+    CHECK(counts.projected_solves == 2);
+    CHECK(counts.last_dimension == 2);
+    CHECK(counts.last_examined == 2);
+    CHECK(counts.last_rejected_spectrum == 2);
+    CHECK(counts.last_rejected_overlap + counts.last_rejected_reference + counts.last_accepted == 0);
+    // The failed extraction must not replace the earlier accepted result.
+    CHECK(result.iterations == 1);
+    CHECK(result.eigenvalue == 0);
+    REQUIRE(result.eigenvector.size() == 2);
+    CHECK(std::abs(result.eigenvector[0].real()) == 1);
+    CHECK(result.eigenvector[1] == DerivativeValue{});
   }
   SECTION("reference cutoff excludes every full-space root")
   {
@@ -98,6 +116,31 @@ TEST_CASE("Accelerated LM rejects complex roots and tiny reference amplitudes", 
     auto result = solve(h, s, c);
     CHECK_FALSE(result.converged);
     CHECK(result.stop_reason == LinearMethodStopReason::UNTRUSTED_ROOT);
+    const auto& counts = result.ritz_rejections;
+    CHECK(counts.projected_solves == 2);
+    CHECK(counts.last_dimension == 2);
+    CHECK(counts.last_examined == 2);
+    CHECK(counts.last_rejected_reference == 2);
+    CHECK(counts.last_rejected_spectrum + counts.last_rejected_overlap + counts.last_accepted == 0);
+  }
+  SECTION("normalized projected root below the existing overlap threshold")
+  {
+    Dense h(model, {4, 0, 0, 8}, false);
+    Dense scaled_s(model, {4, 0, 0, 4}, true);
+    AcceleratedLinearMethodControl c;
+    // Initial S-norm 2 passes add(); the normalized one-root S-norm 1 is rejected.
+    c.outer.minimum_overlap_norm = 1.1;
+    auto result = solve(h, scaled_s, c);
+    CHECK_FALSE(result.converged);
+    CHECK(result.stop_reason == LinearMethodStopReason::UNTRUSTED_ROOT);
+    const auto& counts = result.ritz_rejections;
+    CHECK(counts.projected_solves == 1);
+    CHECK(counts.last_dimension == 1);
+    CHECK(counts.last_examined == 1);
+    CHECK(counts.last_rejected_overlap == 1);
+    CHECK(counts.last_rejected_spectrum + counts.last_rejected_reference + counts.last_accepted == 0);
+    CHECK(result.iterations == 0);
+    CHECK(result.eigenvector.empty());
   }
 }
 
@@ -114,6 +157,8 @@ TEST_CASE("Accelerated LM shares bounded work between outer and inner solves", "
     CHECK_FALSE(result.converged);
     CHECK(result.stop_reason == LinearMethodStopReason::OPERATOR_APPLICATION_LIMIT);
     CHECK(result.operator_applications == 3);
+    CHECK(result.ritz_rejections.projected_solves == 1);
+    CHECK(result.ritz_rejections.last_accepted == 1);
   }
   SECTION("outer iteration limit")
   {
@@ -131,6 +176,8 @@ TEST_CASE("Accelerated LM shares bounded work between outer and inner solves", "
     auto result = solve(h, s, c);
     CHECK(result.stop_reason == LinearMethodStopReason::TIME_LIMIT);
     CHECK(result.operator_applications == 0);
+    CHECK(result.ritz_rejections.projected_solves == 0);
+    CHECK(result.ritz_rejections.last_examined == 0);
   }
 }
 

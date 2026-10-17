@@ -166,17 +166,30 @@ public:
     double unused;
     dggev(&no, &yes, &m, hp.data(), &m, sp.data(), &m, ar.data(), ai.data(), beta.data(),
           &unused, &one, vr.data(), &m, work.data(), &lwork, &info);
+    if (info == 0)
+    {
+      // Last-call counts are not cumulative; retain only the total successful solves.
+      const auto projected_solves = result.ritz_rejections.projected_solves + 1;
+      result.ritz_rejections = {};
+      result.ritz_rejections.projected_solves = projected_solves;
+      result.ritz_rejections.last_dimension = stride;
+    }
     checkTime();
     if (info != 0)
       throw Stop{LinearMethodStopReason::PROJECTED_SOLVE_FAILURE};
     std::vector<Ritz> candidates;
     for (int root = 0; root < m; ++root)
     {
+      auto& counts = result.ritz_rejections;
+      ++counts.last_examined;
       // DGGEV stores a complex pair in adjacent columns; neither is a real vector.
       if (!isFiniteTrainingReal(ai[root]) || !isFiniteTrainingReal(ar[root]) ||
           !isFiniteTrainingReal(beta[root]) || ai[root] != 0 || beta[root] == 0 ||
           !isFiniteTrainingReal(ar[root] / beta[root]))
+      {
+        ++counts.last_rejected_spectrum;
         continue;
+      }
       Ritz pair{ar[root] / beta[root], Vector(n_), Vector(n_), Vector(n_)};
       for (int j = 0; j < m; ++j)
       {
@@ -186,15 +199,22 @@ public:
       }
       const double snorm2 = dot(pair.x, pair.s);
       if (!isFiniteTrainingReal(snorm2) || snorm2 <= c_.outer.minimum_overlap_norm * c_.outer.minimum_overlap_norm)
+      {
+        ++counts.last_rejected_overlap;
         continue;
+      }
       const double snorm = std::sqrt(snorm2);
       if (std::abs(pair.x[0].real()) / snorm < c_.outer.minimum_reference_overlap ||
           std::abs(pair.x[0].real()) <= std::numeric_limits<double>::epsilon() * norm(pair.x))
+      {
+        ++counts.last_rejected_reference;
         continue;
+      }
       scale(1 / snorm, pair.x);
       scale(1 / snorm, pair.h);
       scale(1 / snorm, pair.s);
       candidates.push_back(std::move(pair));
+      ++counts.last_accepted;
     }
     std::stable_sort(candidates.begin(), candidates.end(), [target](const Ritz& a, const Ritz& b) {
       return std::abs(a.energy - target) < std::abs(b.energy - target);

@@ -130,6 +130,20 @@ struct MatrixFreeLinearMethodResult
   std::string schema_fingerprint;
   std::size_t parameter_version = 0;
   std::vector<DerivativeValue> eigenvector;
+  /** ALM-only successful DGGEV calls and the latest call's actual root filters.
+   * Other solvers leave these zero; this metadata is not checkpoint/CSV state.
+   * Interrupted filtering may leave an examined root without a classified bucket.
+   */
+  struct RitzRejectionDiagnostics
+  {
+    std::size_t projected_solves = 0;
+    std::size_t last_dimension = 0;
+    std::size_t last_examined = 0;
+    std::size_t last_rejected_spectrum = 0;
+    std::size_t last_rejected_overlap = 0;
+    std::size_t last_rejected_reference = 0;
+    std::size_t last_accepted = 0;
+  } ritz_rejections;
 };
 
 /** Find the lowest generalized Ritz pair H*x=lambda*S*x.
