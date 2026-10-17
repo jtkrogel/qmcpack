@@ -72,7 +72,7 @@ public:
     const auto preparation = resolveDeviceTargetSelection(image_->plan(), preparation_, capacity);
     if (preparation_.select_vgl_targets)
       reportDeviceTargetSelection(std::cout, "VGL_actual_owner", image_->plan(), capacity,
-          preparation.vgl.max_targets, estimateTargetVglCost(image_->plan(), capacity, preparation.vgl.max_targets),
+          preparation.vgl.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation.vgl),
           preparation.vgl.device_workspace_budget_bytes, preparation.vgl.scalar_work_budget);
     return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation.vgl);
   }

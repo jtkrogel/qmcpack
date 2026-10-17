@@ -1041,7 +1041,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
   if (select_vgl)
     psiformer::device::reportDeviceTargetSelection(app_log(), "VGL_B1_preflight", plan, 1,
-        preparation.vgl.max_targets, psiformer::device::estimateTargetVglCost(plan, 1, preparation.vgl.max_targets),
+        preparation.vgl.max_targets, psiformer::device::estimatePreparedTargetVglCost(plan, 1, preparation.vgl),
         bytes, work);
   if (select_kinetic)
     psiformer::device::reportDeviceTargetSelection(app_log(), "KINETIC", plan, 1,
