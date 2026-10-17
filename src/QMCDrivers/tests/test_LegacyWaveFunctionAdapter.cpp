@@ -4391,10 +4391,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 5; ++model)
+  for (int model = 0; model < 7; ++model)
   {
     CAPTURE(model);
-    const bool md = model >= 3, node = model == 1 || model == 4;
+    const bool joint = model >= 5;
+    const bool md = model >= 3, node = model == 1 || model == 4 || model == 6;
     const bool many = model >= 2;
     ParticleSetPool pool(OHMMS::Controller);
     Libxml2Document particle_xml;
@@ -4434,7 +4435,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       particles.R[0] = {1, 0, 0};
       particles.R[1] = {-2, 0, 0};
     }
-    if (model == 4)
+    if (model == 4 || model == 6)
     {
       particles.R[0] = {1, 1, 0}; particles.R[1] = {0, 0, 1};
       particles.R[2] = {-1, 1, 0}; particles.R[3] = {0, 0, 2};
@@ -4482,6 +4483,13 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
           <ci id="CI0" coeff="1" occ0="1100" occ1="1100"/>
           <ci id="CI1" coeff="0.1" occ0="1010" occ1="1010"/>
         </detlist></multideterminant>)");
+      if (joint)
+      {
+        const auto flag = wavefunction_xml.find("multideterminant optimize=\"no\"");
+        REQUIRE(flag != std::string::npos);
+        wavefunction_xml.replace(flag, std::string("multideterminant optimize=\"no\"").size(),
+                                "multideterminant optimize=\"yes\"");
+      }
     }
     REQUIRE(definition.parseFromString(wavefunction_xml));
     WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
@@ -4522,7 +4530,12 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     }
     source->evaluateLog(particles);
     LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
-    REQUIRE(adapter.snapshotParameters().values.size() == (md ? 16 : many ? 8 : 6));
+    REQUIRE(adapter.snapshotParameters().values.size() == (joint ? 17 : md ? 16 : many ? 8 : 6));
+    if (joint)
+    {
+      REQUIRE(adapter.registrationVariables().name(0) == "CI1");
+      REQUIRE(adapter.snapshotParameters().values[0] == 0.1);
+    }
     ParticleSet unsupported_j3_particles(particles);
     auto unsupported_j3 = source->makeClone(unsupported_j3_particles);
     addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
@@ -4558,19 +4571,21 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     ham.createResource(ham_resources);
     const auto positions = particles.R;
     const auto ion_positions = ions.R;
-    for (int step = 0; step < (model == 0 || model == 3 ? 3 : 1); ++step)
+    for (int step = 0; step < (model == 0 || model == 3 || model == 5 ? 3 : 1); ++step)
     {
       CAPTURE(step);
       if (step > 0)
       {
         auto candidate = adapter.snapshotParameters();
-        candidate.values[0] += step == 1 ? 0.03 : -0.02;
-        candidate.values[1] += step == 1 ? -0.01 : 0.04;
-        candidate.values[2] += 0.002;
+        const int offset = joint ? 1 : 0;
+        if (joint) candidate.values[0] += 0.002;
+        candidate.values[offset] += step == 1 ? 0.03 : -0.02;
+        candidate.values[offset + 1] += step == 1 ? -0.01 : 0.04;
+        candidate.values[offset + 2] += 0.002;
         if (md)
         {
-          candidate.values[6] += step == 1 ? -0.025 : 0.015;
-          candidate.values[7] += step == 1 ? 0.01 : -0.035;
+          candidate.values[offset + 6] += step == 1 ? -0.025 : 0.015;
+          candidate.values[offset + 7] += step == 1 ? 0.01 : -0.035;
         }
         adapter.installSnapshot(*source, particles, candidate);
         adapter.publishParameters(candidate, candidate.version);
@@ -4589,6 +4604,26 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       const auto down_coefficients = md ? *dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).C : source_coefficients;
       const auto down_reference = md ? dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).originalRotationCoefficients() : source_reference;
       const auto down_full = md ? rotated(*source, 1).fullRotationCoordinates() : source_full;
+      const auto source_ci = md ? source->findMSD().front().get().get_C() : std::vector<QMCTraits::ValueType>{};
+      if (joint)
+      {
+        // One candidate jointly changes CI and BOTH frames on detached banks.
+        ParticleSet candidate_particles(particles);
+        auto candidate = source->makeClone(candidate_particles);
+        isolate(*candidate);
+        auto point = *snapshot;
+        point.values[0] += .003; point.values[1] += .01; point.values[7] -= .02;
+        candidate_particles.update(); adapter.installSnapshot(*candidate, candidate_particles, point);
+        const auto& ci = candidate->findMSD().front().get().get_C();
+        CHECK(ci[0] == QMCTraits::ValueType{1});
+        CHECK(std::real(ci[1]) == point.values[0]);
+        CHECK(candidate->findMSD().front().get().get_C().data() != source->findMSD().front().get().get_C().data());
+        CHECK(rotated(*candidate).fullRotationCoordinates() != source_full);
+        CHECK(rotated(*candidate, 1).fullRotationCoordinates() != down_full);
+        CHECK(source->findMSD().front().get().get_C() == source_ci);
+        CHECK(*source_lcao.C == source_coefficients);
+        CHECK(*dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).C == down_coefficients);
+      }
       ParticleSet private_particles(particles), sibling_particles(particles);
       auto evaluator = source->makeClone(private_particles), sibling = source->makeClone(sibling_particles);
       private_particles.update();
@@ -4887,6 +4922,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       CHECK(rotated(*source).fullRotationCoordinates() == source_full);
       if (md)
       {
+        CHECK(source->findMSD().front().get().get_C() == source_ci);
+        CHECK(source_ci[0] == QMCTraits::ValueType{1});
+        CHECK(sibling->findMSD().front().get().get_C() == source_ci);
+        CHECK((ordinary->findMSD().front().get().get_C() == std::vector<QMCTraits::ValueType>{1, .1}));
+        CHECK(ordinary_sibling->findMSD().front().get().get_C() == ordinary->findMSD().front().get().get_C());
         auto& down = dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_);
         CHECK(*down.C == down_coefficients);
         CHECK(down.originalRotationCoefficients() == down_reference);
