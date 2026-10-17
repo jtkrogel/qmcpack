@@ -76,6 +76,8 @@ public:
   void prepareOrbitalMSE(std::size_t maximum_bytes);
   /// Return the immutable common boundary twist for matching a frozen target convention.
   std::array<double, 3> reducedTwist() const;
+  /// Return the immutable raw-orbital channel count without preparing determinant products.
+  std::size_t orbitalMSEChannelCount() const noexcept;
   /// Evaluate a prepared CPU raw-orbital loss without changing accepted state or caller output on failure.
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
       std::vector<double>& gradient, std::size_t expected_version) const;

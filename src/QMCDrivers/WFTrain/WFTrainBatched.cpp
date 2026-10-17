@@ -152,11 +152,12 @@ RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool ov
 
 /** Stream raw-orbital targets and VJPs without retaining a samples-by-parameters matrix.
  * Frozen CPU SPO targets and the student's selected CPU/GPU backend share only positions. */
+template<class Student, class Target>
 class SampledOrbitalPretrainingProducer final : public wftrain::OrbitalPretrainingProducer
 {
 public:
-  SampledOrbitalPretrainingProducer(PsiFormerWF& student,
-                                    psiformer::OrbitalTargetEvaluator& target,
+  SampledOrbitalPretrainingProducer(Student& student,
+                                    Target& target,
                                     const std::vector<RetainedCrowdSamples>& samples)
       : student_(student), target_(target), samples_(samples),
         gradient_(student.parameterSchema().parameterCount())
@@ -185,8 +186,8 @@ public:
   std::size_t retainedBytes() const noexcept { return gradient_.capacity() * sizeof(double); }
 
 private:
-  PsiFormerWF& student_;
-  psiformer::OrbitalTargetEvaluator& target_;
+  Student& student_;
+  Target& target_;
   const std::vector<RetainedCrowdSamples>& samples_;
   std::vector<double> gradient_;
 };
@@ -1393,6 +1394,10 @@ void WFTrainBatched::process(xmlNodePtr node)
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
         const auto optimizer = training_input_.getOptimizer();
+        const bool cpu_orbital_mse = !complex->gpuInferenceEnabled() &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
+            training_input_.getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE &&
+            (optimizer == O::ADAM || optimizer == O::SGD);
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
@@ -1404,7 +1409,7 @@ void WFTrainBatched::process(xmlNodePtr node)
               "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY host first-order "
               "or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
-            training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+            (!cpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
             !supported_optimizer ||
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
@@ -1416,7 +1421,7 @@ void WFTrainBatched::process(xmlNodePtr node)
           throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
               "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
-              "and positive finite maximum_retained_bytes");
+              "and positive finite maximum_retained_bytes; CPU single-reference orbital_mse admits Adam/plainSGD");
         if (complex->gpuInferenceEnabled() && training_input_.getWeightDecay() != 0 &&
             complex->neuralWeightBlocks().empty())
           throw UniformCommunicateError("WFTrainBatched: paired GPU shrinkage requires typed nn_weights metadata");
@@ -1735,9 +1740,12 @@ void WFTrainBatched::run()
                   << "; successor HOST includes one native candidate vector; excludes prepared inference generation, "
                      "native/image model HOST and vendor storage" << std::endl;
       }
+      else if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+        derivative_bytes = complex->orbitalMSEStorage().prepared_bytes;
       else
         derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
       complex_expected_prepared_bytes = checkedMemoryAdd(derivative_bytes,
+          training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE ? 0 :
           checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
       const auto configuration_bytes = checkedMemoryMultiply(samples, checkedMemoryAdd(sizeof(double),
           checkedMemoryMultiply(n, sizeof(target.R[0]) + sizeof(target.G[0]) + sizeof(target.L[0]))));
@@ -1773,6 +1781,8 @@ void WFTrainBatched::run()
       prospective = checkedMemoryAdd(checkedMemoryAdd(complex_expected_prepared_bytes, configuration_bytes),
           checkedMemoryAdd(covariance_bytes, checkedMemoryAdd(optimizer_bytes, allowance)));
       prospective = checkedMemoryAdd(prospective, successor_bytes);
+      if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+        prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
       complex_physical_identity = complex->trainingConfigurationFingerprint();
     }
     catch (...) { budget_failure = std::current_exception(); }
@@ -1871,14 +1881,18 @@ void WFTrainBatched::run()
       training_input_.getObjective() ==
       WFTrainDriverInput::Objective::DETERMINANT_OVERLAP;
   const bool orbital_mse = training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE;
-  if (orbital_mse && !orbital_target_)
+  bool has_orbital_target = orbital_target_ != nullptr;
+#ifdef QMC_COMPLEX
+  has_orbital_target = has_orbital_target || complex_orbital_target_ != nullptr;
+#endif
+  if (orbital_mse && !has_orbital_target)
     throw UniformCommunicateError("WFTrainBatched: orbital target was not initialized by process()");
   if (determinant_overlap && !determinant_overlap_objective_)
     throw UniformCommunicateError(
         "WFTrainBatched: determinant-overlap state was not initialized by process()");
   const std::uint64_t overlap_fingerprint = determinant_overlap
       ? determinant_overlap_objective_->configurationFingerprint()
-      : (orbital_mse ? orbital_target_->descriptor().fingerprint() : 0);
+      : (orbital_mse ? orbital_target_fingerprint_ : 0);
   const bool has_nonlocal_ecp =
       population_.get_golden_hamiltonian().hasPhysicalNLPP();
   wftrain::TrainingStageState stage_state{
@@ -2262,10 +2276,8 @@ void WFTrainBatched::run()
     {
       if (orbital_mse)
       {
-        auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-        if (!student)
-          throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
-        std::unique_ptr<SampledOrbitalPretrainingProducer> producer;
+        std::unique_ptr<wftrain::OrbitalPretrainingProducer> producer;
+        std::size_t producer_retained_bytes = 0;
         std::unique_ptr<wftrain::OrbitalPretrainingCoordinator> coordinator;
         std::unique_ptr<wftrain::SelectedUpdateRule> update;
         std::optional<wftrain::TrainingStageState> coordinator_stage;
@@ -2275,10 +2287,27 @@ void WFTrainBatched::run()
         {
           NativeTimerScope preparation_timer(phase_timers_.preparation);
           parameters.emplace(selected_provider_->snapshotParameters());
-          producer = std::make_unique<SampledOrbitalPretrainingProducer>(
-              *student, *orbital_target_, retained_samples);
+#ifdef QMC_COMPLEX
+          if (complex_orbital_target_)
+          {
+            auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerComplexWF,
+                psiformer::ComplexOrbitalTargetEvaluator>>(*complex_training_component_, *complex_orbital_target_, retained_samples);
+            producer_retained_bytes = typed->retainedBytes();
+            producer = std::move(typed);
+          }
+          else
+#endif
+          {
+            auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+            if (!student)
+              throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+            auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerWF,
+                psiformer::OrbitalTargetEvaluator>>(*student, *orbital_target_, retained_samples);
+            producer_retained_bytes = typed->retainedBytes();
+            producer = std::move(typed);
+          }
           coordinator = std::make_unique<wftrain::OrbitalPretrainingCoordinator>(
-              orbital_target_->descriptor().fingerprint(), reduction);
+              orbital_target_fingerprint_, reduction);
           coordinator_stage.emplace(coordinator->makeStageState(stage_state.stage_ordinal));
           coordinator_stage->completed_stage_iterations = stage_state.completed_stage_iterations;
           update = decorate(*first_order_optimizer);
@@ -2288,12 +2317,13 @@ void WFTrainBatched::run()
           preparation_failure = std::current_exception();
         }
         reduction.preflightOrbital(selected_provider_->parameterSchema(),
-            parameters ? &*parameters : nullptr, orbital_target_->descriptor().fingerprint(),
+            parameters ? &*parameters : nullptr, orbital_target_fingerprint_,
             wftrain::OrbitalPretrainingCoordinator::LOSS_FINGERPRINT, preparation_failure);
         // The outer checkpoint binds all driver controls; the coordinator independently
         // validates its exact target/loss identity and owns failure-atomic publication.
         retained_numeric_bytes = checkedMemoryAdd(first_order_optimizer->retainedBytes(),
-            checkedMemoryAdd(producer->retainedBytes(), orbital_target_->retainedScalarBytes()));
+            checkedMemoryAdd(producer_retained_bytes,
+                checkedMemoryAdd(orbital_target_bytes_, complex_orbital_score_bytes_)));
         retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
             checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 4 * sizeof(double)));
         enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
@@ -3308,19 +3338,32 @@ void WFTrainBatched::initializeOrbitalPretraining()
     return;
   if (&student_prototype_ == &population_.get_golden_twf())
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a distinct frozen teacher");
-  if (!dynamic_cast<PsiFormerWF*>(selected_provider_))
+  bool paired = false;
+#ifdef QMC_COMPLEX
+  auto* complex = dynamic_cast<PsiFormerComplexWF*>(selected_provider_);
+  paired = complex != nullptr;
+#endif
+  if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_))
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
 
   // Query channel count through the existing determinant-channel seam, without
   // opening native tensor metadata or depending on an imported parameter file.
   ParticleSet& electrons = population_.get_golden_electrons();
-  auto probe = student_prototype_.makeClone(electrons);
-  RefVectorWithLeader<TrialWaveFunction> wavefunctions(*probe);
-  wavefunctions.push_back(*probe);
-  RefVectorWithLeader<ParticleSet> particles(electrons);
-  particles.push_back(electrons);
-  const std::size_t count = TrialWaveFunction::makeStructuredDeterminantChannelBatch(
-      wavefunctions, particles, selected_provider_id_)->channelCount();
+  std::size_t count = 0;
+#ifdef QMC_COMPLEX
+  if (complex)
+    count = complex->orbitalMSEChannelCount();
+  else
+#endif
+  {
+    auto probe = student_prototype_.makeClone(electrons);
+    RefVectorWithLeader<TrialWaveFunction> wavefunctions(*probe);
+    wavefunctions.push_back(*probe);
+    RefVectorWithLeader<ParticleSet> particles(electrons);
+    particles.push_back(electrons);
+    count = TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+        wavefunctions, particles, selected_provider_id_)->channelCount();
+  }
 
   const SlaterDet* single = nullptr;
   const MultiSlaterDetTableMethod* multi = nullptr;
@@ -3343,6 +3386,29 @@ void WFTrainBatched::initializeOrbitalPretraining()
         "WFTrainBatched: orbital_mse teacher must contain exactly one conventional determinant component");
   const bool top = training_input_.getOrbitalTarget() ==
       WFTrainDriverInput::OrbitalTarget::TOP_COEFFICIENT_MULTIDETERMINANT;
+#ifdef QMC_COMPLEX
+  if (complex)
+  {
+    // Only the fixed-gauge single-reference CPU target is qualified, never a GPU fallback.
+    if (top || !single || complex->gpuInferenceEnabled())
+      throw UniformCommunicateError("Paired orbital_mse requires a CPU single-reference FreeOrbital teacher");
+    complex_orbital_target_ = std::make_unique<psiformer::ComplexOrbitalTargetEvaluator>(
+        psiformer::ComplexOrbitalTargetEvaluator::fromSingleReference(*single, electrons, complex->reducedTwist(), count));
+    orbital_target_fingerprint_ = complex_orbital_target_->descriptor().fingerprint();
+    orbital_target_bytes_ = complex_orbital_target_->retainedScalarBytes();
+    const auto caller_bytes = checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double));
+    const auto required = checkedMemoryAdd(complex->orbitalMSEStorage().required_bytes,
+        checkedMemoryAdd(orbital_target_bytes_, caller_bytes));
+    if (required > training_input_.getMaximumRetainedBytes())
+      throw std::length_error("Paired orbital-MSE score/target/caller-gradient cap exceeded before preparation");
+    complex->prepareOrbitalMSE(training_input_.getMaximumRetainedBytes() - orbital_target_bytes_ - caller_bytes);
+    complex_orbital_score_bytes_ = complex->orbitalMSEStorage().prepared_bytes;
+    app_log() << "WFTrain paired CPU orbital-MSE score owner=" << complex_orbital_score_bytes_
+              << " target/scratch=" << orbital_target_bytes_ << " caller gradient=" << caller_bytes
+              << "; excludes inference/model/SPO metadata and allocator/RSS" << std::endl;
+    return;
+  }
+#endif
   if (top && multi)
     orbital_target_ = std::make_unique<psiformer::OrbitalTargetEvaluator>(
         psiformer::OrbitalTargetEvaluator::fromMultideterminant(
@@ -3354,6 +3420,8 @@ void WFTrainBatched::initializeOrbitalPretraining()
   else
     throw UniformCommunicateError(
         "WFTrainBatched: single_reference requires SlaterDet; top_coefficients requires MultiSlaterDetTableMethod");
+  orbital_target_fingerprint_ = orbital_target_->descriptor().fingerprint();
+  orbital_target_bytes_ = orbital_target_->retainedScalarBytes();
 }
 
 void WFTrainBatched::validateHamiltonianForTraining()

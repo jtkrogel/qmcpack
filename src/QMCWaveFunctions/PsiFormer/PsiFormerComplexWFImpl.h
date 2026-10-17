@@ -1579,6 +1579,9 @@ PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
 /// Share the immutable boundary convention without exposing model or numerical storage.
 std::array<double, 3> PsiFormerComplexWF::reducedTwist() const { return impl_->state->reduced_twist; }
 
+/// Channel metadata is immutable throughout the model family's lifetime.
+std::size_t PsiFormerComplexWF::orbitalMSEChannelCount() const noexcept { return impl_->state->model.ndet; }
+
 /// This explicit owner excludes target/caller P output and all ordinary inference owners.
 PsiFormerComplexWF::OrbitalMSEStorage PsiFormerComplexWF::orbitalMSEStorage() const
 {

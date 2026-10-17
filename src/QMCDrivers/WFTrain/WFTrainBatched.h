@@ -35,6 +35,7 @@ class PsiFormerComplexWF;
 namespace psiformer
 {
 class OrbitalTargetEvaluator;
+class ComplexOrbitalTargetEvaluator;
 }
 
 /** Batched high-parameter wavefunction-training driver. */
@@ -94,6 +95,12 @@ private:
 
   /// Frozen conventional SPO targets, evaluated without the teacher's Jastrow factors.
   std::unique_ptr<psiformer::OrbitalTargetEvaluator> orbital_target_;
+#ifdef QMC_COMPLEX
+  std::unique_ptr<psiformer::ComplexOrbitalTargetEvaluator> complex_orbital_target_;
+#endif
+  /// Frozen target metadata and separately charged explicit score-only CPU owner.
+  std::uint64_t orbital_target_fingerprint_ = 0;
+  std::size_t orbital_target_bytes_ = 0, complex_orbital_score_bytes_ = 0;
 
   /// Per-crowd RNG contexts used by full initialization and post-update refreshes.
   UPtrVector<ContextForSteps> step_contexts_;
