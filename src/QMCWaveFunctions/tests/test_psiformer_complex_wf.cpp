@@ -4479,6 +4479,7 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   const auto export_log = evaluate(exported, gamma_p);
   const auto export_g = gamma_p.G; const auto export_l = gamma_p.L;
   const auto path = "psiformer_pp_direct." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  REQUIRE_FALSE(std::filesystem::exists(path)); // Keep evidence from a failed prior attempt.
   exported.exportModel(path);
   WaveFunctionComponentBuilder::PSetMap import_sources;
   import_sources.emplace("ion0", std::make_unique<ParticleSet>(source));
@@ -4514,9 +4515,9 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
       {
         auto& target = owner ? loaded_p : gamma_p;
         VirtualParticleSet vp(target);
-        ParticleSet::PosType delta;
-        for (int d = 0; d < 3; ++d) delta[d] = point.replacement_position[d] - target.R[point.electron][d];
-        vp.makeMoves(target, point.electron, std::vector<ParticleSet::PosType>{delta});
+        ParticleSet::PosType replacement;
+        for (int d = 0; d < 3; ++d) replacement[d] = point.replacement_position[d];
+        vp.makeMovesAbsolute(target, point.electron, {&replacement, 1});
         std::vector<WaveFunctionComponent::ValueType> ratios(1);
         (owner ? *loaded : exported).evaluateRatios(vp, ratios);
         imported_energy[owner] += point.bare_weight * ratios[0];
