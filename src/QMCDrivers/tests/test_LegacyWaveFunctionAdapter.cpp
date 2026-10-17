@@ -4041,6 +4041,8 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
   auto& slater = source->findSD().front().get();
   auto& rotated = dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
   REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
+  const auto source_coefficients = *dynamic_cast<LCAOrbitalSet&>(*rotated.Phi_).C;
+  const double source_log = source->getLogPsi();
   LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
   const auto active = adapter.registrationVariables();
   REQUIRE(active.size_of_active() == 4);
@@ -4076,6 +4078,9 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
         const auto physical_ratio = [&](double displacement) {
           ParticleSet p(particles);
           auto wf = source->makeClone(p);
+          // Normal orbital clones share coefficients; detach this fresh FD bank
+          // explicitly. Both spin determinants share this one rotated wrapper.
+          dynamic_cast<RotatedSPOs&>(wf->findSD()[0].get().getPhi(0)).isolateOptimizationState();
           p.update();
           auto point = initial; point.values[parameter] += displacement;
           adapter.installSnapshot(*wf, p, point);
@@ -4132,6 +4137,11 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
   replacement[3] = 17;
   accepted(0, 0) = 0;
   CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  const auto& current_coefficients = *dynamic_cast<LCAOrbitalSet&>(*rotated.Phi_).C;
+  for (std::size_t i = 0; i < source_coefficients.size(); ++i)
+    CHECK(current_coefficients.data()[i] == source_coefficients.data()[i]);
+  source->evaluateLog(particles);
+  CHECK(source->getLogPsi() == source_log);
 }
 
 TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
