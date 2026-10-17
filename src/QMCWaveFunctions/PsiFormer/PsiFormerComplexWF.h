@@ -82,6 +82,9 @@ public:
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
       std::vector<double>& gradient, std::size_t expected_version) const;
 
+  /// Detach an idle CPU trial clone into owning parameter leaves and fresh numerical caches.
+  void isolateParameterState() override;
+
   /// Atomically replace same-sized real parameters after schema/version/finite/idle admission.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;

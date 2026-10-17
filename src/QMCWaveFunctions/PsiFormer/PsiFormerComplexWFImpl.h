@@ -1941,6 +1941,43 @@ wftrain::StructuredParameterSnapshot PsiFormerComplexWF::snapshotParameters() co
   return {parameterSchema().fingerprint(), parameters.version(), parameters.flat_values()};
 }
 
+/// Prepare independent CPU ownership completely before replacing this clone's state.
+void PsiFormerComplexWF::isolateParameterState()
+{
+  // A GPU clone requires a separately admitted private image/workspace contract.
+  // Never hide a CPU fallback behind the original immutable GPU profile.
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex GPU candidate isolation is not qualified");
+  const auto original = impl_->state;
+  std::unique_ptr<Impl> independent;
+  {
+    std::shared_lock read(original->mutex);
+    impl_->requireNoCollective();
+    impl_->requireIdle(*impl_->particles);
+    if (impl_->acquired_leader || impl_->multiwalker ||
+        original->acquired_teams.load(std::memory_order_relaxed) != 0)
+      throw std::logic_error("Complex candidate isolation requires no acquired resource team");
+    if (original->pending_proposals.load(std::memory_order_relaxed) != 0)
+      throw std::logic_error("Complex candidate isolation requires no family pending proposals");
+    Impl::validateDerivativeSource(*original);
+
+    // Copying Parameters itself would share graph NodePtrs with the live family.
+    // Reconstruct leaves, preserving the exact current canonical version instead.
+    const auto& model = original->model;
+    pf::Parameters parameters(model.p.flat_values(), model.p.layouts);
+    parameters.parameter_version = model.p.version();
+    pf::PsiFormer detached(std::move(parameters), model.cfg, model.ndet,
+                           model.dim, model.heads, model.blocks);
+    auto state = std::make_shared<Impl::Model>(getName(),
+        InitializedNativeModel{std::move(detached), original->profile, original->seed},
+        *impl_->particles, *original->source, original->reduced_twist, 0);
+    independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
+  }
+  // Fresh executors/workspaces bind only detached leaves; accepted state and weak
+  // derivative lanes start empty. Retire this clone's old owners after unlocking.
+  impl_.swap(independent);
+}
+
 /// Validate every candidate invariant before the same-size native copy synchronizes graph leaves.
 std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                                 std::size_t expected_version)
