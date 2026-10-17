@@ -2,17 +2,33 @@
 # Homogeneous electron gas (HEG) tests
 #
 
-# One qualified real CPU Gamma model, including immutable Ewald identity and
-# complete model reuse; no external orbital asset or optimizer/backend matrix.
-if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
+# Fixed Gamma HEG14 CPU profiles; no external assets or optimizer/backend matrix.
+if(NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
   execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
                   RESULT_VARIABLE CONVENTIONAL_HEG_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
   if(CONVENTIONAL_HEG_PYTHON_MODULES EQUAL 0)
+    if(NOT QMC_COMPLEX)
     add_test(NAME short-heg14-gamma-conventional-wftrain
              COMMAND ${Python3_EXECUTABLE}
                      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
                      $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml" --periodic-heg)
     set_tests_properties(short-heg14-gamma-conventional-wftrain PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    else()
+      set(CONVENTIONAL_COMPLEX_HEG_MPI_ARGS)
+      set(CONVENTIONAL_COMPLEX_HEG_RANKS 1)
+      if(QMC_MPI)
+        set(CONVENTIONAL_COMPLEX_HEG_RANKS 2)
+        set(CONVENTIONAL_COMPLEX_HEG_MPI_ARGS --mpiexec "${MPIEXEC_EXECUTABLE}")
+      endif()
+      add_test(NAME short-heg14-gamma-complex-conventional-wftrain
+               COMMAND ${Python3_EXECUTABLE}
+                       "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                       $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml"
+                       --complex-periodic-heg --ranks ${CONVENTIONAL_COMPLEX_HEG_RANKS}
+                       ${CONVENTIONAL_COMPLEX_HEG_MPI_ARGS})
+      set_tests_properties(short-heg14-gamma-complex-conventional-wftrain
+                           PROPERTIES TIMEOUT 300 PROCESSORS ${CONVENTIONAL_COMPLEX_HEG_RANKS})
+    endif()
   endif()
 endif()
 
