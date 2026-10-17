@@ -296,5 +296,20 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
   endif()
 endif()
 
+if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION AND Python3_EXECUTABLE)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE COMPLEX_ORBITAL_MSE_PYTHON_MODULES
+                  OUTPUT_QUIET ERROR_QUIET)
+  if(COMPLEX_ORBITAL_MSE_PYTHON_MODULES EQUAL 0)
+    add_test(NAME deterministic-H2-psiformer-complex-cpu-orbital-mse-restart
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_complex_orbital_mse.py"
+                     --qmcpack $<TARGET_FILE:qmcpack>)
+    set_tests_properties(deterministic-H2-psiformer-complex-cpu-orbital-mse-restart PROPERTIES
+                         TIMEOUT 150 PROCESSORS 1
+                         ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1"
+                         LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
+  endif()
+endif()
+
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")
