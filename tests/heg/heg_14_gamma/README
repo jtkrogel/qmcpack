@@ -140,13 +140,15 @@ heg-short-SJ.out:      Total Execution time = 4.4773e+00 secs
 heg-short-SJ-new.out:  Total Execution time = 3.4323e+00 secs
 heg-short-SJB.out:     Total Execution time = 3.3870e+01 secs
 heg-short-SJ-dmc.out:  Total Execution time = 4.2180e+01 secs
-CPU complex conventional ENERGY candidate
+CPU complex conventional ENERGY profile
 ----------------------------------------
 The unchanged wftrain_heg.xml also supplies the bounded complex-build candidate:
 Gamma HEG14, one shared fixed FreeOrbital SPO, ten real J2 coordinates and actual
 CPU Ewald. It is not a GPU, twist, complex-parameter or phase-optimization mode.
-The numerical adapter oracle passed 371 assertions; extended Binding and native
-qualification are pending. Registration is staged for promotion after that gate.
+The numerical adapter oracle passed 371 assertions, and the extended Binding
+oracle passed 405 assertions. The native MPI2/OMP1 profile passed two Adam updates,
+inference isolation, complete exact split restart and preflight rejection checks
+at source cf96eadf0ad746fae082c6e9a3ca9b9d81c745d2.
 
   python3 ../../molecules/H2_ae_conventional_wftrain/check_sj_training.py /absolute/complex/qmcpack wftrain_heg.xml --complex-periodic-heg --ranks 2
 
@@ -159,5 +161,4 @@ representation, actual fixed k-vectors and built Ewald data. SGD, line search,
 twist and changed cell/cutoff continuation are rejected. No CI, orbital rotations,
 ECP, backflow, arbitrary periodic models or performance claim follows.
 Binding-level cold import is covered separately; public parameter_file routing
-remains real-only in this candidate. Default real workflows are unchanged.
-
+remains real-only in this profile. Default real workflows are unchanged.

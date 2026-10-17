@@ -8,11 +8,11 @@ if(NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
                   RESULT_VARIABLE CONVENTIONAL_HEG_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
   if(CONVENTIONAL_HEG_PYTHON_MODULES EQUAL 0)
     if(NOT QMC_COMPLEX)
-    add_test(NAME short-heg14-gamma-conventional-wftrain
-             COMMAND ${Python3_EXECUTABLE}
-                     "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
-                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml" --periodic-heg)
-    set_tests_properties(short-heg14-gamma-conventional-wftrain PROPERTIES TIMEOUT 300 PROCESSORS 1)
+      add_test(NAME short-heg14-gamma-conventional-wftrain
+               COMMAND ${Python3_EXECUTABLE}
+                       "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                       $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml" --periodic-heg)
+      set_tests_properties(short-heg14-gamma-conventional-wftrain PROPERTIES TIMEOUT 300 PROCESSORS 1)
     else()
       set(CONVENTIONAL_COMPLEX_HEG_MPI_ARGS)
       set(CONVENTIONAL_COMPLEX_HEG_RANKS 1)
