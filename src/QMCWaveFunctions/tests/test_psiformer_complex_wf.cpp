@@ -12,6 +12,7 @@
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
@@ -524,6 +525,32 @@ TEST_CASE("PsiFormer standalone paired model preserves complex inference without
       "' parameter_checkpoint='missing.root.h5' source='ion0' system='all_electron' "
       "feature_policy='periodic_torus_v1' twist='0.125 -0.25 0.0625' max_clone_numeric_bytes='8388608'/>"));
   CHECK_THROWS_AS(builder.buildComponent(conflicting_sources.getRoot()), std::invalid_argument);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("PsiFormer paired system metadata survives private ownership",
+          "[wavefunction][psiformer][complex_wf][complex_system_kind]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto particles = electrons(simulation_cell), clone_particles = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF implicit_ae("psiformer", parameters(), particles, source, clone_cap);
+  PsiFormerComplexWF explicit_ae("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "all_electron");
+  CHECK(explicit_ae.trainingConfigurationFingerprint() == implicit_ae.trainingConfigurationFingerprint());
+  CHECK_THROWS_AS(PsiFormerComplexWF("psiformer", parameters(), particles, source, clone_cap,
+      {}, 0, {}, "invalid"), std::invalid_argument);
+  // Metadata-only roundtrip: this does not admit a native pseudopotential Hamiltonian/profile.
+  PsiFormerComplexWF pp("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "pseudopotential");
+  const auto fingerprint = pp.trainingConfigurationFingerprint();
+  CHECK(fingerprint != explicit_ae.trainingConfigurationFingerprint());
+  auto clone = pp.makeClone(clone_particles);
+  auto* private_pp = dynamic_cast<PsiFormerComplexWF*>(clone.get());
+  REQUIRE(private_pp != nullptr);
+  private_pp->isolateParameterState();
+  CHECK(private_pp->trainingConfigurationFingerprint() == fingerprint);
+  const auto path = "psiformer_paired_kind." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  private_pp->exportModel(path);
+  CHECK(psiformer::readPsiFormerModelFile(path).system == "pseudopotential");
   std::filesystem::remove(path);
 }
 

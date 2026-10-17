@@ -36,7 +36,7 @@ public:
                      const ParticleSet& electrons, const ParticleSet& ions,
                      std::size_t maximum_clone_numeric_bytes,
                      std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0,
-                     const std::string& parameter_checkpoint = {});
+                     const std::string& parameter_checkpoint = {}, const std::string& system_kind = "all_electron");
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
   ~PsiFormerComplexWF() override;

@@ -261,21 +261,31 @@ struct PsiFormerComplexWF::Impl
       return environment;
     }
 
+    /// Preserve existing AE identities exactly; only explicit PP metadata adds a new distinction.
+    static std::uint64_t identityFor(const pf::PsiFormer& model, const std::string& profile, std::uint64_t seed,
+        const psiformer::ExecutionEnvironment& environment, const std::array<double, 3>& reduced,
+        const std::array<double, 3>& cartesian, const std::string& kind)
+    {
+      auto identity = persistentModelIdentity(model, "internal", profile, seed, environment, reduced, cartesian);
+      if (kind != "all_electron") mixPersistentString(identity, kind);
+      return identity;
+    }
+
     /// Retain initializer provenance and construct only qualified complex inference owners.
     Model(const std::string& component_name, InitializedNativeModel initialized,
-          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit
+          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit,
+          const std::string& kind = "all_electron"
 #ifdef ENABLE_CUDA
           , std::shared_ptr<GpuLane> prepared = {}
 #endif
           )
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
-          environment(environmentFor(electrons)), reduced_twist(reduced),
+          system_kind(kind), environment(environmentFor(electrons)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
           plan(psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
               {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
-          identity(persistentModelIdentity(model, "internal", profile, seed, environment,
-                                           reduced_twist, cartesian_twist)), source(&ions),
+          identity(identityFor(model, profile, seed, environment, reduced_twist, cartesian_twist, system_kind)), source(&ions),
           schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit),
           gpu_capacity(
 #ifdef ENABLE_CUDA
@@ -307,6 +317,7 @@ struct PsiFormerComplexWF::Impl
     pf::PsiFormer model;
     const std::string profile;
     const std::uint64_t seed;
+    const std::string system_kind;
     const psiformer::ExecutionEnvironment environment;
     const std::array<double, 3> reduced_twist, cartesian_twist;
     const psiformer::PsiFormerExecutionPlan plan;
@@ -1441,8 +1452,10 @@ struct PsiFormerComplexWF::Impl
   /// Override initializer values before parameter-dependent identity or device image construction.
   static InitializedNativeModel materialize(psiformer::InitializedPsiFormerParameters initialized,
       const ParticleSet& electrons, const ParticleSet& ions, const std::string& component_name,
-      const std::string& parameter_checkpoint)
+      const std::string& parameter_checkpoint, const std::string& system_kind)
   {
+    if (system_kind != "all_electron" && system_kind != "pseudopotential")
+      throw std::invalid_argument("Complex PsiFormer requires an explicit AE or pseudopotential system kind");
     if (initialized.profile != psiformer::PSIFORMER_COMPLEX_PERIODIC_V1)
       throw std::invalid_argument("Complex PsiFormer inference requires explicit paired initialization");
     validateMatchingLattices(electrons, ions);
@@ -1478,10 +1491,10 @@ struct PsiFormerComplexWF::Impl
   /// Prepare only the selected CPU or GPU numerical profile.
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
        const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-       std::size_t gpu_limit, const std::string& parameter_checkpoint)
+       std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind)
       : Impl(std::make_shared<Model>(component_name,
-                                   materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint),
-                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit)),
+                                   materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint, system_kind),
+                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind),
              electrons, limit)
   {}
 
@@ -2129,10 +2142,10 @@ struct PsiFormerComplexWF::Impl
 /// Construct the explicit paired CPU or strictly capped shared-GPU inference profile.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-    std::size_t gpu_limit, const std::string& parameter_checkpoint)
+    std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind)
     : WaveFunctionComponent(name),
       impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced,
-                                 gpu_limit, parameter_checkpoint))
+                                 gpu_limit, parameter_checkpoint, system_kind))
 {
   if (!parameter_checkpoint.empty())
     app_log() << "Complex PsiFormer imported model identity=" << impl_->state->identity << std::endl;
@@ -2240,6 +2253,7 @@ std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 #endif
     mixPersistentString(hash, "cpu_complex_pathwise_coulomb_v1");
   mixPersistentString(hash, s.profile);
+  if (s.system_kind != "all_electron") mixPersistentString(hash, s.system_kind);
   mixPersistentInteger(hash, s.seed);
   mixPersistentString(hash, s.schema->fingerprint());
   mixPersistentInteger(hash, static_cast<std::uint64_t>(s.environment.geometry_feature_policy));
@@ -2538,7 +2552,7 @@ void PsiFormerComplexWF::exportModel(const std::string& path) const
   std::shared_lock lock(impl_->state->mutex);
   const auto& state = *impl_->state;
   writeStandaloneModel(path, state.model, state.environment, state.profile, state.seed,
-                       "all_electron", state.reduced_twist);
+                       state.system_kind, state.reduced_twist);
 }
 
 bool PsiFormerComplexWF::isMultiDet() const
@@ -2617,7 +2631,7 @@ void PsiFormerComplexWF::isolateParameterState()
                            model.dim, model.heads, model.blocks);
     auto state = std::make_shared<Impl::Model>(getName(),
         InitializedNativeModel{std::move(detached), original->profile, original->seed},
-        *impl_->particles, *original->source, original->reduced_twist, 0);
+        *impl_->particles, *original->source, original->reduced_twist, 0, original->system_kind);
     independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   }
   // Fresh executors/workspaces bind only detached leaves; accepted state and weak
@@ -2678,7 +2692,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
       InitializedNativeModel{std::move(model), original->profile, original->seed},
-      *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, std::move(lane));
+      *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind, std::move(lane));
   auto independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   {
     std::shared_lock read(original->mutex);
