@@ -11,7 +11,13 @@ arbitrary determinant sizes, DLA or a general nodal admission policy.
 The shared ``check_sj_training.py --md-orbital-ecp`` route prepares one
 bounded Adam round trip, scheduled inference, complete two-owner frames,
 direct parameter_file VMC/model reuse and strict initialized split restart.
-No moment-only ULP exception applies. Its runtime qualification is pending;
-the independent physical numerical gate passed separately. No convergence
-or timing claim is intended, and the original neutral-C single-Slater
-strict-reproducibility failure remains separate and open.
+No moment-only ULP exception applies. Native round 93 passed at source
+``9fcb356b9`` with app SHA256
+``4ee23548d5a4218094d07621f8c8846f27bc4d6613a68e705b956e692e2e9ff7``:
+full two-update training/inference/export, direct parameter_file VMC,
+fresh import/re-export and strict exact initialized split restart. The
+independent physical numerical gate passed separately (2,370 assertions).
+Only this narrow profile is registered, on real full-precision CPU builds
+without offload and with Python h5py/numpy. No convergence or timing claim
+is intended. The original neutral-C single-Slater strict-reproducibility
+failure remains separate and open.
