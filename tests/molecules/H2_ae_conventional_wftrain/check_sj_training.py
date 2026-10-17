@@ -260,6 +260,8 @@ def main():
                         help="export/import ordinary VMC, fresh training, re-export and exact restart")
     parser.add_argument("--old-new", action="store_true",
                         help="bounded original batched OneShiftOnly versus new Adam integration comparison")
+    parser.add_argument("--ci-old-new", action="store_true",
+                        help="one H4 pure-CI OneShiftOnly/full-LM candidate pair; no equal-update claim")
     parser.add_argument("--periodic-heg", action="store_true",
                         help="bounded HEG14 Gamma Adam/SR, full model import/restart and periodic identity negatives")
     parser.add_argument("--md-orbital", action="store_true",
@@ -327,6 +329,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.ci_old_new:
+        if args.old_new or args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or args.orbital_jastrow:
+            parser.error("--ci-old-new selects its own one-rank pure-DETS candidate comparison")
+        args.old_new = True  # Reuse only existing bounded process/resource bookkeeping.
     if args.csf_orbital_ecp_alm:
         if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
                 args.csf_orbital_ecp, args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_alm,
@@ -460,6 +466,24 @@ def main():
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
     fixture_tree = ET.parse(fixture)
+    if args.ci_old_new:
+        assert not fixture_tree.findall(".//pseudo") and not fixture_tree.findall(".//rotated_sposet")
+        expansion = fixture_tree.find(".//multideterminant/detlist")
+        assert expansion is not None and expansion.get("type") == "DETS" and expansion.get("nstates") == "3"
+        assert [node.attrib for node in expansion] == [dict(id="CI0", coeff="0.6", occ0="110", occ1="110"),
+                                                       dict(id="CI1", coeff="0", occ0="101", occ1="101")]
+        for node in fixture_tree.findall("wavefunction/jastrow/correlation/coefficients"):
+            node.set("optimize", "no")
+        qmc = fixture_tree.find("qmc")
+        for name, value in (("walkers_per_rank", "4"), ("blocks", "8"),
+                            ("warmupsteps", "2"), ("timestep", "0.05")):
+            qmc.find(f"parameter[@name='{name}']").text = value
+        for name, value in (("damping", "0.01"), ("krylov_maximum_iterations", "64"),
+                            ("krylov_maximum_operator_applications", "256"), ("krylov_maximum_seconds", "15"),
+                            ("krylov_relative_tolerance", "1e-6"), ("lm_maximum_subspace_dimension", "2")):
+            ET.SubElement(qmc.find("training"), "parameter", name=name).text = value
+        fixture = work / "h4-pure-ci.xml"
+        fixture_tree.write(fixture)
     if args.sj_reference_line_search:
         assert not fixture_tree.findall(".//multideterminant") and not fixture_tree.findall(".//pseudo")
         assert not fixture_tree.findall(".//rotated_sposet")
@@ -856,6 +880,8 @@ def main():
                       f"{detail}, natural decision", flush=True)
             assert cursor == len(receipts), (directory, receipts)
         for row in rows:
+            if args.ci_old_new:
+                assert row["optimizer"] == "lm", row
             if require_committed:
                 assert row["committed"] == "1", (directory, row)
             assert row["committed"] in ("0", "1"), (directory, row)
@@ -919,7 +945,7 @@ def main():
                         assert not np.array_equal(parameters[j3_indices], previous[j3_indices]), (model, "J3 did not update")
                 if linear_nodes:
                     assert parameters.size == len(initial)
-                    if pure_ci:
+                    if pure_ci or args.ci_old_new:
                         assert parameters.size == 1
                     else:
                         assert parameters.size > len(linear_nodes) - 1
@@ -941,7 +967,7 @@ def main():
                             expected = previous_optimizer[key] if previous_optimizer is not None else np.zeros_like(optimizer_state[key])
                             np.testing.assert_array_equal(optimizer_state[key], expected, err_msg=f"rejected search: {key}")
                     previous_optimizer = optimizer_state
-                if row["committed"] == "1":
+                if row["committed"] == "1" and not args.ci_old_new:
                     assert not np.array_equal(parameters, previous), model
                     if args.periodic_spline:
                         assert parameters.size == 24
@@ -1078,7 +1104,7 @@ def main():
                         for original, retained in zip(linear_nodes, list(exported_list)):
                             assert len(original) == len(retained) == (2 if csf_ci else 1)
                             assert [det.attrib for det in original] == [det.attrib for det in retained], model
-                if pure_ci:
+                if pure_ci or args.ci_old_new:
                     original_j2 = tree.findall("wavefunction/jastrow/correlation/coefficients")
                     retained_j2 = exported.findall("jastrow/correlation/coefficients")
                     assert len(original_j2) == len(retained_j2) == (1 if md_ecp else 2)
@@ -1239,8 +1265,74 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("lm" if args.csf_j2_ecp_lm else "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+    adam = run("lm" if args.csf_j2_ecp_lm or args.ci_old_new else "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+               optimizer="lm" if args.ci_old_new else None, iterations=1 if args.ci_old_new else 2,
+               require_committed=not args.ci_old_new,
                samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
+    if args.ci_old_new:
+        # Derive the original driver from the SAME fixed scientific definition,
+        # retaining its distinct OneShiftOnly shift/rescale policy unchanged.
+        old_tree = ET.parse(fixture)
+        old_tree.find("project").set("id", "sj")
+        old_tree.getroot().remove(old_tree.find("qmc"))
+        template = ET.parse(Path(__file__).with_name("linear_sj.xml")).find("loop/qmc")
+        old_tree.getroot().append(ET.fromstring(ET.tostring(template)))
+        for tag in ("random", "wavefunction", "hamiltonian"):
+            assert ET.tostring(old_tree.find(tag)) == ET.tostring(fixture_tree.find(tag)), tag
+        assert [ET.tostring(node) for node in old_tree.findall("particleset")] == [
+            ET.tostring(node) for node in fixture_tree.findall("particleset")]
+        original = work / "original_linear"
+        original.mkdir()
+        old_tree.write(original / "run.xml")
+        result, text = launch(original)
+        assert result.returncode == 0, (original, text[-6000:])
+        observed = [int(value) for value in re.findall(r"samples per rank\s*=\s*(\d+)", text)]
+        assert observed and all(value == 32 for value in observed), (original, observed)
+        optimized = sorted(original.glob("sj.s*.opt.xml"))
+        assert len(optimized) == 1, (original, optimized)
+        old_vp = optimized[0].with_name(optimized[0].name.replace(".opt.xml", ".vp.h5"))
+        values = datasets(old_vp)
+        names = [text_value(value) for value in values["name_value_lists/parameter_names"].reshape(-1)]
+        old_parameters = values["name_value_lists/parameter_values"].reshape(-1)
+        assert names == ["CI1"] and old_parameters.shape == (1,) and np.isfinite(old_parameters).all()
+        serialized = ET.parse(optimized[0])
+        original_ci = serialized.find(".//detlist")
+        assert original_ci[0].get("id") == "CI0" and float(original_ci[0].get("coeff")) == 0.6
+        assert original_ci[1].get("id") == "CI1"
+        np.testing.assert_allclose(float(original_ci[1].get("coeff")), old_parameters[0],
+                                   rtol=5e-9, atol=5e-10, err_msg="legacy printed XML precision only")
+        for path in ("wavefunction/sposet_collection", "wavefunction/jastrow"):
+            before, after = fixture_tree.find(path), serialized.find(path)
+            assert after is not None
+            if path.endswith("sposet_collection"):
+                before, after = before.find("sposet/coefficient"), after.find("sposet/coefficient")
+                np.testing.assert_array_equal(np.fromstring(before.text, sep=" "), np.fromstring(after.text, sep=" "))
+            else:
+                initial_j2, retained_j2 = before.findall("correlation/coefficients"), after.findall("correlation/coefficients")
+                assert len(initial_j2) == len(retained_j2) == 2
+                for a, b in zip(initial_j2, retained_j2):
+                    np.testing.assert_array_equal(np.fromstring(a.text, sep=" "), np.fromstring(b.text, sep=" "))
+        scalar = optimized[0].with_name(optimized[0].name.replace(".opt.xml", ".scalar.dat"))
+        header = next(line.split()[1:] for line in scalar.read_text().splitlines() if line.startswith("#"))
+        old_data = np.loadtxt(scalar, ndmin=2)
+        assert old_data.shape[0] == 8 and np.isfinite(old_data).all()
+        assert int(old_data[:, header.index("BlockWeight")].sum()) == 32
+        model = next((adam / "sj.s000.training").rglob("*.parameters.h5"))
+        new_values = datasets(model)
+        new_names = [text_value(value) for value in new_values["conventional_wavefunction/variable_names"].reshape(-1)]
+        new_parameters = new_values["conventional_wavefunction/parameters"].reshape(-1)
+        assert new_names == ["CI1"] and new_parameters.shape == (1,) and np.isfinite(new_parameters).all()
+        candidates = dict(old_one_shift=float(old_parameters[0]), new_full_lm=float(new_parameters[0]))
+        (work / "candidate_c1.txt").write_text("".join(f"{value:.17g}\n" for value in candidates.values()))
+        (work / "candidate_comparison.json").write_text(json.dumps(dict(
+            candidates=candidates, frozen_C0=0.6, fixed_J2=True, samples_per_rank=32,
+            old_vp=str(old_vp), old_vp_sha256=hashlib.sha256(old_vp.read_bytes()).hexdigest(),
+            new_model=str(model), new_model_sha256=hashlib.sha256(model.read_bytes()).hexdigest(),
+            old_policy="OneShiftOnly shift_i=1 shift_s=1", new_policy="full LM damping=.01",
+            scope="independent native sampling; candidate plumbing only; same-config physical/Rayleigh check pending; no equal/improving update claim"
+        ), indent=2) + "\n")
+        print("PASS candidate plumbing only: actual pure-CI OneShiftOnly/LM scalars mapped by CI1; physical oracle pending")
+        return
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
             limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
