@@ -4298,6 +4298,115 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
     close(actual.values[0][i], expected.values[0][i] + kinetic_expected.values[0][i], 3e-9);
   actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
   std::printf("COMPLEX_CAPTURED_ECP PASS B=2 Q=9 C3_slot0 C1_complete CPU_allP duality stamp lease retry stale\n");
+  // A new current-generation selective lane must actually omit the kinetic owner.
+  op.reset();
+  evaluate(gpu, p); evaluate(gpu1, p1);
+  const auto current = gpu.snapshotParameters();
+  const auto current_stamp = gpu.mw_evaluateVirtualRatios(components, particles, scratch, batch, ratios);
+  constexpr auto selective_scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+  const auto selective_requirement = gpu.gpuDerivativeRequirements(2, 13, 3, 7, selective_scope);
+  CHECK(selective_requirement.matrix_work == 0);
+  CHECK(selective_requirement.device_bytes < requirement.device_bytes);
+  CHECK(selective_requirement.host_bytes < requirement.host_bytes);
+  CHECK_THROWS(gpu.gpuDerivativeRequirements(2, 13, 3, 7,
+      static_cast<PsiFormerComplexWF::GpuDerivativeScope>(9)));
+  const auto selective_make = [&](std::size_t device_cap, std::size_t host_cap) {
+    return gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 13, 3, 7,
+        device_cap, host_cap, 1, selective_scope);
+  };
+  const auto selective_cold = metrics.snapshot();
+  CHECK_THROWS(selective_make(selective_requirement.device_bytes - 1, selective_requirement.host_bytes));
+  CHECK_THROWS(selective_make(selective_requirement.device_bytes, selective_requirement.host_bytes - 1));
+  CHECK(metrics.snapshot().allocation_calls == selective_cold.allocation_calls);
+  auto selective = selective_make(selective_requirement.device_bytes, selective_requirement.host_bytes + 65536);
+  CHECK(metrics.snapshot().live_bytes - selective_cold.live_bytes == selective_requirement.device_bytes);
+  const auto selective_storage = selective->storageDiagnostics();
+  CHECK(selective_storage.real_parameter_vectors == 3);
+  CHECK(selective_storage.complex_parameter_vectors == 4);
+  CHECK(selective_storage.parameter_scratch_bytes == 88 * schema.parameterCount() + 32 * 7);
+  CHECK(selective_storage.retained_numeric_bytes == selective_requirement.device_bytes + selective_requirement.host_bytes);
+  CHECK(selective->capabilities().supports(DerivativeProduct::SCORE_VJP));
+  CHECK(selective->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK_FALSE(selective->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  CHECK_FALSE(selective->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_JVP));
+  CHECK(selective->capabilities().local_energy_term_mask == 0);
+  const auto before_mismatch = metrics.snapshot();
+  CHECK_THROWS(make()); // Same family, different live preparation scope: no implicit larger owner.
+  CHECK(metrics.snapshot().allocation_calls == before_mismatch.allocation_calls);
+  auto bound_selective = selective_make(selective_requirement.device_bytes, selective_requirement.host_bytes + 65536);
+  CHECK(bound_selective->storageDiagnostics().shared_workspace_identity == selective_storage.shared_workspace_identity);
+  auto selective_channel = channel;
+  selective_channel.product = DerivativeProduct::SCORE_VJP; selective_channel.local_energy_term_mask = 0;
+  selective_channel.coefficients.parameter_version = current.version;
+  auto cpu_score_channel = selective_channel; cpu_score_channel.coefficients.parameter_version = 0;
+  ComplexStreamingSink selective_expected, selective_actual;
+  for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    selective_expected.reset(); selective_actual.reset();
+    base_oracle->applyVJPs({&cpu_score_channel, 1}, adjoint, selective_expected);
+    selective->applyVJPs({&selective_channel, 1}, adjoint, selective_actual);
+    for (std::size_t i = 0; i < direction.size(); ++i)
+      close(selective_actual.values[0][i], selective_expected.values[0][i], 3e-9);
+  }
+  ComplexSampleSink selective_score_jvp, cpu_score_jvp;
+  base_oracle->applyScoreJVP({cs, 0, {direction.data(), direction.size()}}, cpu_score_jvp);
+  selective->applyScoreJVP({schema, current.version, {direction.data(), direction.size()}}, selective_score_jvp);
+  for (std::size_t b = 0; b < 2; ++b) close(selective_score_jvp.values[b], cpu_score_jvp.values[b], 3e-9);
+  auto selective_replay = replayFor(*bound_selective); selective_replay->stamps[0] = current_stamp;
+  const auto selective_warm = metrics.snapshot();
+  bound_selective->bindNonLocalECPJVPReplay(std::move(selective_replay));
+  CHECK(bound_selective->capabilities().local_energy_term_mask == localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP));
+  CHECK(bound_selective->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  CHECK(bound_selective->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_JVP));
+  selective_channel.product = DerivativeProduct::LOCAL_ENERGY_VJP;
+  selective_channel.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    std::fill(folded.begin(), folded.end(), C{});
+    for (std::size_t q = 0; q < grid.size(); ++q)
+    {
+      const auto w = grid[q].bare_weight * grid[q].complete_ratio;
+      folded[q + 2] = coefficients[grid[q].sample] * (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(w) : w);
+      folded[grid[q].sample] -= folded[q + 2];
+    }
+    selective_expected.reset(); selective_actual.reset();
+    oracle->applyVJPs({&score, 1}, adjoint, selective_expected);
+    bound_selective->applyVJPs({&selective_channel, 1}, adjoint, selective_actual);
+    for (std::size_t i = 0; i < direction.size(); ++i)
+      close(selective_actual.values[0][i], selective_expected.values[0][i], 3e-9);
+  }
+  ComplexSampleSink selective_ecp_jvp;
+  bound_selective->applyLocalEnergyJVP({schema, current.version, {direction.data(), direction.size()}},
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP), selective_ecp_jvp);
+  for (std::size_t b = 0; b < 2; ++b) close(selective_ecp_jvp.values[b], jvp.values[b], 3e-9);
+  const auto before_unsupported = metrics.snapshot();
+  for (const auto mask : {localEnergyTermBit(LocalEnergyTerm::KINETIC),
+      localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)})
+  {
+    selective_channel.local_energy_term_mask = mask; selective_actual.reset();
+    CHECK_THROWS(bound_selective->applyVJPs({&selective_channel, 1}, DerivativeAdjoint::TRANSPOSE, selective_actual));
+    ComplexSampleSink refused;
+    CHECK_THROWS(bound_selective->applyLocalEnergyJVP({schema, current.version, {direction.data(), direction.size()}}, mask, refused));
+  }
+  CHECK(metrics.snapshot().uploaded_bytes == before_unsupported.uploaded_bytes);
+  CHECK(metrics.snapshot().downloaded_bytes == before_unsupported.downloaded_bytes);
+  CHECK(metrics.snapshot().allocation_calls == selective_warm.allocation_calls);
+  CHECK(selective->storageDiagnostics().storage_fingerprint == selective_storage.storage_fingerprint);
+  selective_channel.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  bool selective_published = false;
+  selective_actual.reset(); selective_actual.callback = [&] {
+    if (selective_published) return;
+    selective_published = true;
+    const auto budget = gpu.gpuParameterPublicationRequirements();
+    CHECK(gpu.publishBudgetedGpuParameters(current, current.version, budget.device_bytes, budget.host_bytes) == current.version + 1);
+  };
+  bound_selective->applyVJPs({&selective_channel, 1}, DerivativeAdjoint::HERMITIAN, selective_actual);
+  CHECK(selective_published);
+  for (std::size_t i = 0; i < direction.size(); ++i)
+    close(selective_actual.values[0][i], selective_expected.values[0][i], 3e-9);
+  selective_actual.reset(); CHECK_THROWS(bound_selective->applyVJPs({&selective_channel, 1}, DerivativeAdjoint::TRANSPOSE, selective_actual));
+  CHECK(gpu.snapshotParameters().values == accepted.values);
+  std::printf("COMPLEX_SELECTIVE_RESPONSE PASS SCORE_allP=1 JVP=1 bound_ECP_bothadjoints=1 noKINETIC=1 exactbytes=1 caps_scope=1 callback_stale=1\n");
 }
 TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and complex energy",
           "[wavefunction][psiformer][complex_actual_ecp]")
