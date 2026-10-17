@@ -12758,10 +12758,11 @@ void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons, c
     throw std::invalid_argument("Resident open ion source extent differs from its immutable model");
   for (int ion = 0; ion < ions.getTotalNum(); ++ion)
   {
-    if (ions.Z[ion] != model.cfg.charges.x[ion])
+    if (!wftrain::isFiniteTrainingReal(ions.Z[ion]) || ions.Z[ion] != model.cfg.charges.x[ion])
       throw std::invalid_argument("Resident open actual ion charge differs from its immutable model");
     for (std::size_t d = 0; d < 3; ++d)
-      if (ions.R[ion][d] != model.cfg.nuclei.x[3 * ion + d])
+      if (!wftrain::isFiniteTrainingReal(ions.R[ion][d]) ||
+          ions.R[ion][d] != model.cfg.nuclei.x[3 * ion + d])
         throw std::invalid_argument("Resident open actual ion position differs from its immutable model");
   }
   std::vector<double> inverse_masses(ne);

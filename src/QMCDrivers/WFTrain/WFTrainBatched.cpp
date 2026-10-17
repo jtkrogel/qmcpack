@@ -887,7 +887,7 @@ std::array<int, 4> residentOpenScalarSlots(QMCHamiltonian& h, ParticleSet& elect
       electrons.getLattice().SuperCellEnum != SUPERCELL_OPEN)
     throw UniformCommunicateError("Resident open observation requires the actual Ne4(2/2) four-term molecular Hamiltonian");
   for (int e = 0; e < electrons.getTotalNum(); ++e)
-    if (electrons.Z[e] != -1.0)
+    if (!wftrain::isFiniteTrainingReal(electrons.Z[e]) || electrons.Z[e] != -1.0)
       throw UniformCommunicateError("Resident molecular Coulomb requires actual unit negative electron charges");
   std::array<int, 4> slots{{-1, -1, -1, -1}};
   const ParticleSet* ions = nullptr;
