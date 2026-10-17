@@ -12731,13 +12731,17 @@ PsiFormerWF::ResidentOpenObservationRequirements PsiFormerWF::residentOpenObserv
   const auto receipts = checkedBatchMemoryAdd(sizeof(ResidentOpenBatch), checkedBatchMemoryMultiply(samples,
       sizeof(psiformer::device::PreparedDeviceProductSession::ResidentOpenEnergyObservation),
       "Resident observation receipts"), "Resident observation owner");
-  return {cost.device_bytes, cost.host_bytes, receipts};
+  // Cold preparation temporarily holds the caller's mass vector alongside the
+  // retained session copy. This is a cold HOST peak, not retained inventory.
+  return {cost.device_bytes, checkedBatchMemoryAdd(cost.host_bytes,
+      checkedBatchMemoryMultiply(shape.electrons(), sizeof(double), "Resident cold masses"),
+      "Resident cold HOST peak"), receipts};
 #else
   throw std::invalid_argument("Resident open observation requires a real GPU build");
 #endif
 }
 
-void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons,
+void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons, const ParticleSet& ions,
     std::size_t device_cap, std::size_t host_cap) const
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
@@ -12749,11 +12753,33 @@ void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons,
   const auto ne = read.state().execution_plan.modelShape().electrons();
   if (electrons.getTotalNum() != ne || electrons.isSpinor() || electrons.getActivePtcl() != -1)
     throw std::invalid_argument("Resident open observation particle shape is incompatible");
+  const auto& model = read.state().model;
+  if (ions.getTotalNum() != model.cfg.charges.x.size())
+    throw std::invalid_argument("Resident open ion source extent differs from its immutable model");
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+  {
+    if (ions.Z[ion] != model.cfg.charges.x[ion])
+      throw std::invalid_argument("Resident open actual ion charge differs from its immutable model");
+    for (std::size_t d = 0; d < 3; ++d)
+      if (ions.R[ion][d] != model.cfg.nuclei.x[3 * ion + d])
+        throw std::invalid_argument("Resident open actual ion position differs from its immutable model");
+  }
   std::vector<double> inverse_masses(ne);
   for (std::size_t e = 0; e < ne; ++e)
-    inverse_masses[e] = 1.0 / electrons.get_mass_by_group()[electrons.getGroupID(e)];
+  {
+    const auto group = electrons.getGroupID(e);
+    const auto& masses = electrons.get_mass_by_group();
+    if (group < 0 || static_cast<std::size_t>(group) >= masses.size() ||
+        !wftrain::isFiniteTrainingReal(masses[group]) || masses[group] <= 0)
+      throw std::invalid_argument("Resident open observation mass group is invalid");
+    inverse_masses[e] = 1.0 / masses[group];
+  }
+  const auto temporary_bytes = checkedBatchMemoryMultiply(inverse_masses.capacity(), sizeof(double),
+      "Resident temporary masses");
+  if (host_cap <= temporary_bytes)
+    throw std::length_error("Resident open cold HOST cap does not cover temporary mass staging");
   scratch->device_products->prepareResidentOpenEnergy(inverse_masses,
-      read.state().model.cfg.charges.x, device_cap, host_cap);
+      read.state().model.cfg.charges.x, device_cap, host_cap - temporary_bytes);
 #else
   throw std::invalid_argument("Resident open observation requires a real GPU build");
 #endif
@@ -12764,7 +12790,7 @@ std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> PsiFormerWF::observeR
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   const auto scratch = model_state_->resident_energy_scratch;
-  if (!scratch || !model_state_->resident_device_authority_enabled || components.empty() ||
+  if (!scratch || !model_state_->resident_device_authority_enabled || components.size() != 2 ||
       system_kind_ != "all_electron")
     throw std::invalid_argument("Resident observation requires active sole AE DEVICE authority");
   auto& resource = requireMultiWalkerResource(components);
@@ -12777,6 +12803,8 @@ std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> PsiFormerWF::observeR
   result->version = read.parameterVersion();
   const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(*result->backend);
   result->observations.reserve(components.size());
+  if (result->observations.capacity() != components.size())
+    throw std::length_error("Resident observation receipt capacity exceeds its admitted W2 elements");
   for (std::size_t sample = 0; sample < components.size(); ++sample)
   {
     const auto& component = components.getCastedElement<PsiFormerWF>(sample);

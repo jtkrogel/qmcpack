@@ -16,6 +16,7 @@
 #include "QMCDrivers/WFTrain/TrainingTimers.h"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -84,6 +85,10 @@ private:
   /// Resolved once during pre-draw process admission, never re-read mid-run.
   std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
   bool resident_device_authority_ = false;
+  /// Complete resident observation is a separate sole-AE W2 opt-in, not implied by parameter authority.
+  bool resident_open_observation_ = false;
+  std::array<int, 4> resident_open_scalar_slots_{}; // K, ee, ei, ii native observable columns
+  const ParticleSet* resident_open_ions_ = nullptr; // immutable selected Hamiltonian source, owned by the pool
   std::size_t resident_snapshot_cap_ = 0, resident_successor_cap_ = 0, resident_authority_extra_bytes_ = 0;
   /// Complete SR cap pair and incremental peak, resolved before sampling.
   std::pair<std::size_t, std::size_t> resident_sr_budget_{0, 0};

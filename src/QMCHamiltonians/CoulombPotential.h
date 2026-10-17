@@ -87,6 +87,7 @@ public:
   const ParticleSet& getTargetPSet() const noexcept { return Pb; }
   bool isSameParticleSet() const noexcept { return is_AA; }
   bool computesForces() const noexcept { return ComputeForces; }
+  bool evaluatesCurrentTarget() const noexcept { return is_active; }
 
 #if !defined(REMOVE_TRACEMANAGER)
   void contributeParticleQuantities() override;

@@ -39,6 +39,9 @@
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
+#include "QMCHamiltonians/CoulombPotential.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "Estimators/LocalEnergyEstimator.h"
 #ifdef QMC_COMPLEX
 #include "QMCHamiltonians/CoulombPBCAA.h"
 #include "QMCHamiltonians/CoulombPBCAB.h"
@@ -872,6 +875,66 @@ void validateResidentCoulomb(QMCHamiltonian& hamiltonian, bool device_ecp = fals
       (local_ecp_count && nonlocal_count != 1) ||
       (device_ecp && hamiltonian.hasPhysicalNLPP() != (nonlocal_count == 1)))
     throw UniformCommunicateError("Resident DEVICE ECP requires one consistently registered ordinary nonlocal operator");
+}
+
+/// Identify the exact molecular operator/source identities, not merely Coulomb class names.
+std::array<int, 4> residentOpenScalarSlots(QMCHamiltonian& h, ParticleSet& electrons,
+    PsiFormerWF& provider, const ParticleSet*& selected_ions)
+{
+  if (h.size() != 4 || h.sizeOfObservables() != 4 || h.sizeOfCollectables() != 0 ||
+      electrons.getTotalNum() != 4 || electrons.groups() != 2 ||
+      electrons.groupsize(0) != 2 || electrons.groupsize(1) != 2 ||
+      electrons.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+    throw UniformCommunicateError("Resident open observation requires the actual Ne4(2/2) four-term molecular Hamiltonian");
+  for (int e = 0; e < electrons.getTotalNum(); ++e)
+    if (electrons.Z[e] != -1.0)
+      throw UniformCommunicateError("Resident molecular Coulomb requires actual unit negative electron charges");
+  std::array<int, 4> slots{{-1, -1, -1, -1}};
+  const ParticleSet* ions = nullptr;
+  const ParticleSet* ion_pair = nullptr;
+  for (int term = 0; term < h.size(); ++term)
+  {
+    auto* op = h.getComponent(term);
+    int kind = -1;
+    if (const auto* kinetic = dynamic_cast<const BareKineticEnergy*>(op))
+    {
+      if (&kinetic->getTargetPSet() != &electrons)
+        throw UniformCommunicateError("Resident kinetic target differs from the sampled electrons");
+      kind = 0;
+    }
+    else if (const auto* coulomb = dynamic_cast<const CoulombPotential*>(op))
+    {
+      if (coulomb->computesForces())
+        throw UniformCommunicateError("Resident molecular observation excludes force consumers");
+      const auto* source = &coulomb->getSourcePSet();
+      const auto* target = &coulomb->getTargetPSet();
+      if (coulomb->isSameParticleSet() && source == &electrons && target == &electrons)
+      {
+        if (!coulomb->evaluatesCurrentTarget())
+          throw UniformCommunicateError("Resident electron Coulomb must evaluate the current target");
+        kind = 1;
+      }
+      else if (!coulomb->isSameParticleSet() && target == &electrons && source != &electrons)
+      {
+        if (!coulomb->evaluatesCurrentTarget())
+          throw UniformCommunicateError("Resident electron/ion Coulomb must evaluate the current target");
+        kind = 2; ions = source;
+      }
+      else if (coulomb->isSameParticleSet() && source == target && source != &electrons)
+      { kind = 3; ion_pair = source; }
+    }
+    const auto column = h.getObservable(op->getName());
+    if (kind < 0 || slots[kind] != -1 || column < 0)
+      throw UniformCommunicateError("Resident molecular observation has an unsupported, duplicate or unmapped operator");
+    slots[kind] = column;
+  }
+  if (!ions || ions != ion_pair || ions->getTotalNum() != 2 ||
+      ions->getLattice().SuperCellEnum != SUPERCELL_OPEN)
+    throw UniformCommunicateError("Resident molecular electron/ion and ion/ion operators must share the actual two-ion source");
+  // Reuse the existing exact ordered positions/charges/lattice check against the immutable model.
+  provider.validateSystem(electrons, *ions, "all_electron");
+  selected_ions = ions;
+  return slots;
 }
 
 /// Compare the same undamped host/resident diagnostics without changing the CSV schema.
@@ -1733,6 +1796,24 @@ void WFTrainBatched::process(xmlNodePtr node)
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
     resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
+    if (const auto* optin = std::getenv("PSIFORMER_GPU_RESIDENT_OPEN_OBSERVATION"))
+    {
+      if (std::string(optin) != "1")
+        throw UniformCommunicateError("PSIFORMER_GPU_RESIDENT_OPEN_OBSERVATION requires explicit 1 or must be absent");
+      resident_open_observation_ = true;
+      if (!resident_device_authority_ || !resident_adam_budget_ || resident_sr_budget_.first ||
+          crowds_.size() != 1 || crowds_.front()->size() != 2 ||
+          population_.get_golden_hamiltonian().hasPhysicalNLPP() || walker_logs_input.present ||
+          qmcdriver_input_.get_estimator_measurement_period() != 1)
+        throw UniformCommunicateError("Resident open observation requires sole AE W2 DEVICE-authority Adam and no walker logs");
+      auto* provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
+      resident_open_scalar_slots_ = residentOpenScalarSlots(population_.get_golden_hamiltonian(),
+          population_.get_golden_electrons(), *provider, resident_open_ions_);
+      auto& estimators = crowds_.front()->get_estimator_manager_crowd();
+      if (!dynamic_cast<LocalEnergyEstimator*>(&estimators.get_main_estimator()) ||
+          !estimators.get_scalar_estimators().empty() || !estimators.get_operator_estimators().empty())
+        throw UniformCommunicateError("Resident open observation admits only the standard local-energy scalar estimator");
+    }
     if (resident_device_authority_ &&
         ((!resident_adam_budget_ && !resident_sr_budget_.first) || !device_provider->deviceSamplingEnabled() ||
          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
@@ -1775,13 +1856,23 @@ void WFTrainBatched::process(xmlNodePtr node)
       // Authority activation borrows the admitted C3 lane; it allocates no new image.
       if (resident_device_authority_)
       {
+        std::size_t resident_open_bytes = 0;
+        if (resident_open_observation_)
+        {
+          const auto cost = device_provider->residentOpenObservationRequirements(2);
+          resident_open_bytes = checkedMemoryAdd(cost.device_bytes,
+              checkedMemoryAdd(cost.host_bytes, cost.receipt_host_bytes));
+          enforceMemoryBudget(*myComm, resident_open_bytes, training_input_.getMaximumRetainedBytes());
+          device_provider->prepareResidentOpenObservation(population_.get_golden_electrons(), *resident_open_ions_,
+              cost.device_bytes, cost.host_bytes);
+        }
         const auto bytes = device_provider->prepareResidentDeviceAuthority();
         resident_snapshot_cap_ = bytes.snapshot_device_bytes;
         resident_successor_cap_ = bytes.successor_device_bytes;
         const auto cold_moments = resident_adam_budget_ ? checkedMemoryMultiply(
             selected_provider_->parameterSchema().parameterCount(), 2 * sizeof(double)) : 0;
-        resident_authority_extra_bytes_ = checkedMemoryAdd(bytes.cold_host_bytes,
-            checkedMemoryAdd(cold_moments, checkedMemoryAdd(resident_snapshot_cap_, resident_successor_cap_)));
+        resident_authority_extra_bytes_ = checkedMemoryAdd(resident_open_bytes, checkedMemoryAdd(bytes.cold_host_bytes,
+            checkedMemoryAdd(cold_moments, checkedMemoryAdd(resident_snapshot_cap_, resident_successor_cap_))));
         enforceMemoryBudget(*myComm, checkedMemoryAdd(resident_authority_extra_bytes_, resident_sr_incremental_bytes_),
             training_input_.getMaximumRetainedBytes());
         app_log() << "Resident DEVICE authority additional admitted bytes: snapshot DEVICE=" << resident_snapshot_cap_
@@ -2029,6 +2120,42 @@ void WFTrainBatched::run()
 
   VMCBatchedSampling::State sampling_state(qmcdriver_input_, vmcdriver_input_, *drift_modifier_, population_,
                                             steps_per_block_, serializing_crowd_walkers_);
+  std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> resident_observations;
+  bool resident_host_dirty = false;
+  if (resident_open_observation_)
+  {
+    sampling_state.resident_device_observation = true;
+    sampling_state.resident_device_observe = [&](Crowd& crowd, bool accumulate) {
+      resident_host_dirty = true; // Native R/G/L, walker geometry and H are not published here.
+      if (!accumulate)
+        return;
+      RefVector<WaveFunctionComponent> components;
+      for (TrialWaveFunction& wf : crowd.get_walker_twfs())
+        components.push_back(*wf.getOrbitals()[0]);
+      const auto& leader = dynamic_cast<const PsiFormerWF&>(components[0].get());
+      resident_observations = leader.observeResidentOpenAccepted({components[0], components});
+      const auto precision = app_log().precision();
+      app_log() << std::setprecision(std::numeric_limits<double>::max_digits10);
+      for (std::size_t sample = 0; sample < resident_observations->sampleCount(); ++sample)
+      {
+        const auto& energy = resident_observations->energy(sample);
+        auto* properties = crowd.get_walkers()[sample].get().getPropertyBase();
+        properties[WP::LOCALENERGY] = energy[4];
+        properties[WP::LOCALPOTENTIAL] = energy[1] + energy[2] + energy[3];
+        const auto& h = crowd.get_walker_hamiltonians()[sample].get();
+        for (std::size_t term = 0; term < 4; ++term)
+          properties[h.startIndex() + resident_open_scalar_slots_[term]] = energy[term];
+        app_log() << "Resident open native observation: parameter_version=" << resident_observations->sourceVersion()
+                  << ", sample=" << sample << ", samples=2, K=" << energy[0] << ", ee=" << energy[1]
+                  << ", ei=" << energy[2] << ", ii=" << energy[3] << ", total=" << energy[4]
+                  << ", host_spatial_cache=dirty, complete_H=yes, coordinate_ingress=DEVICE" << std::endl;
+      }
+      app_log().precision(precision);
+      // Pre-draw admission established exactly one LocalEnergyEstimator and no
+      // other scalar/operator/listener consumers. It reads ONLY these properties.
+      crowd.accumulate(rngs_[0]);
+    };
+  }
   VMCBatchedSampling::Timers sampling_timers{
       timers_.resource_timer, timers_.movepbyp_timer, timers_.buffer_timer,
       timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
@@ -2342,7 +2469,7 @@ void WFTrainBatched::run()
         std::exception_ptr retention_failure;
         try
         {
-          for (std::size_t crowd_index = 0; crowd_index < crowds_.size(); ++crowd_index)
+          for (std::size_t crowd_index = 0; !resident_open_observation_ && crowd_index < crowds_.size(); ++crowd_index)
             if (crowds_[crowd_index]->size())
             {
               retained_samples.push_back(retainCrowdSamples(
@@ -2506,7 +2633,66 @@ void WFTrainBatched::run()
           });
     };
     {
-      if (orbital_mse)
+      if (resident_open_observation_)
+      {
+        if (!resident_observations || resident_observations->sourceVersion() != training_state.parameter_version ||
+            resident_observations->sampleCount() != 2)
+          throw UniformCommunicateError("Resident open iteration has no current W2 complete observations");
+        const auto source_version = training_state.parameter_version;
+        auto pending = training_state;
+        if (pending.completed_iterations == std::numeric_limits<std::size_t>::max())
+          throw UniformCommunicateError("Resident open completed iteration count overflow");
+        ++pending.completed_iterations;
+        const double e0 = resident_observations->energy(0)[4], e1 = resident_observations->energy(1)[4];
+        const double mean = (e0 + e1) / 2.0;
+        const double variance = ((e0 - mean) * (e0 - mean) + (e1 - mean) * (e1 - mean)) / 2.0;
+        if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance))
+          throw std::invalid_argument("Resident open iteration energy moments are nonfinite");
+        resident_diagnostics.emplace(ResidentEnergyDiagnostics{2, mean, variance, 0.0});
+        std::unique_ptr<PsiFormerWF::PreparedResidentDeviceAdamPublication> publication;
+        std::exception_ptr failure;
+        try
+        {
+          std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> candidate;
+          first_order_optimizer->proposeResidentDeviceAdam(selected_provider_->parameterSchema(), source_version,
+              [&](const auto& adam, double b1, double b2, double c1, double c2, double epsilon) {
+                candidate = device_provider->consumeResidentOpenAdamDevice(*resident_observations, adam,
+                    b1, b2, c1, c2, epsilon, resident_snapshot_cap_);
+                if (!candidate || candidate->sourceVersion() != source_version)
+                  throw std::invalid_argument("Resident open Adam candidate is foreign or stale");
+                return candidate->gradientNorm();
+              }, resident_diagnostics->gradient_norm);
+          selected_displacement_norm = candidate->displacementNorm();
+          if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance) ||
+              !wftrain::isFiniteTrainingReal(selected_displacement_norm) || selected_displacement_norm < 0)
+            throw std::invalid_argument("Resident open iteration scalar result is nonfinite");
+          publication = device_provider->prepareResidentDeviceAdamPublication(
+              std::move(candidate), source_version, resident_successor_cap_);
+          if (!publication)
+            throw std::logic_error("Resident open Adam publication returned no owning action");
+        }
+        catch (...) { failure = std::current_exception(); }
+        try
+        {
+          reduction.validatePublicationReadiness(source_version, true, failure);
+          const auto version = publication->commit();
+          first_order_optimizer->acceptResidentDeviceAdam(version);
+          pending.parameter_version = reduction.completePublication(version);
+        }
+        catch (...)
+        {
+          first_order_optimizer->proposalRejected();
+          throw;
+        }
+        training_state.completed_iterations = pending.completed_iterations;
+        training_state.parameter_version = pending.parameter_version;
+        training_state.schema_fingerprint.swap(pending.schema_fingerprint);
+        cache_observer.parametersPublished(training_state.parameter_version);
+        iteration_result.completed_iteration = training_state.completed_iterations;
+        iteration_result.parameter_version = training_state.parameter_version;
+        resident_observations.reset(); // Retire old sample/image receipts before the next accepted epoch.
+      }
+      else if (orbital_mse)
       {
         std::unique_ptr<wftrain::OrbitalPretrainingProducer> producer;
         std::size_t producer_retained_bytes = 0;
@@ -3339,7 +3525,8 @@ void WFTrainBatched::run()
           "WFTrainBatched: parameter publication did not arm the cache-refresh barrier");
     if (selected_alpha != 0.0)
     {
-      refreshPublishedParameters(iteration_result.parameter_version);
+      if (!resident_open_observation_)
+        refreshPublishedParameters(iteration_result.parameter_version);
       ++accepted_updates;
     }
     if (resident_device_authority_)
@@ -3484,6 +3671,46 @@ void WFTrainBatched::run()
     if (periodic_checkpoint || final_block || stop_requested)
     {
       ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
+      if (resident_open_observation_ && resident_host_dirty)
+      {
+        // Explicit cold boundary: coordinates first, then complete native tables,
+        // FULL, physical H and walker properties before any checkpoint/export reader.
+        auto& crowd = *crowds_.front();
+        const auto& particles = crowd.get_walker_elecs();
+        const auto& wavefunctions = crowd.get_walker_twfs();
+        const auto& hamiltonians = crowd.get_walker_hamiltonians();
+        RefVectorWithLeader<ParticleSet> p_list(particles[0], particles);
+        RefVectorWithLeader<TrialWaveFunction> wf_list(wavefunctions[0], wavefunctions);
+        RefVectorWithLeader<QMCHamiltonian> h_list(hamiltonians[0], hamiltonians);
+        RefVector<WaveFunctionComponent> components;
+        for (TrialWaveFunction& wf : wavefunctions)
+          components.push_back(*wf.getOrbitals()[0]);
+        ResourceCollectionTeamLock<ParticleSet> p_lock(crowd.getSharedResource().pset_res, p_list);
+        ResourceCollectionTeamLock<TrialWaveFunction> wf_lock(crowd.getSharedResource().twf_res, wf_list);
+        ResourceCollectionTeamLock<QMCHamiltonian> h_lock(crowd.getSharedResource().ham_res, h_list);
+        const auto& leader = dynamic_cast<const PsiFormerWF&>(components[0].get());
+        leader.materializeResidentOpenAccepted({components[0], components}, p_list);
+        app_log() << "Resident open cold fence: parameter_version=" << training_state.parameter_version
+                  << ", samples=2, coordinates=HOST, full_and_hamiltonian_refresh=required" << std::endl;
+        for (std::size_t sample = 0; sample < particles.size(); ++sample)
+        {
+          auto& p = particles[sample].get();
+          auto& wf = wavefunctions[sample].get();
+          auto& h = hamiltonians[sample].get();
+          auto& walker = crowd.get_walkers()[sample].get();
+          p.update();
+          wf.evaluateLog(p);
+          const double energy = h.evaluate(wf, p);
+          p.saveWalker(walker);
+          walker.resetProperty(wf.getLogPsi(), wf.getPhase(), energy);
+          h.saveProperty(walker.getPropertyBase());
+          walker.Weight = 1.0;
+          walker.wasTouched = false;
+        }
+        resident_host_dirty = false;
+        app_log() << "Resident open cold refresh complete: parameter_version="
+                  << training_state.parameter_version << std::endl;
+      }
       const wftrain::StructuredParameterProvider* artifact_provider = selected_provider_;
 #ifdef QMC_COMPLEX
       // The wrapper delegates the same canonical schema/state/version. Only CONST

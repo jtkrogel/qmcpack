@@ -605,7 +605,7 @@ public:
   ResidentOpenObservationRequirements residentOpenObservationRequirements(std::size_t samples) const;
 
   /// Cold constants only; requires the already admitted sole real/open AE C3 lane.
-  void prepareResidentOpenObservation(const ParticleSet& electrons,
+  void prepareResidentOpenObservation(const ParticleSet& electrons, const ParticleSet& ions,
       std::size_t device_cap, std::size_t host_cap) const;
 
   /// Borrow each accepted sampler row under its actual crowd resource, never HOST R/G/L.
@@ -630,7 +630,8 @@ public:
       double weight, double energy, double beta1, double beta2, double correction1, double correction2,
       double epsilon, std::vector<double>& candidate) const;
 
-  /// Advance injected native-engine substeps; host full VGL must follow before use.
+  /// Advance native-engine substeps; default exports R for immediate HOST FULL,
+  /// while the explicit resident mode defers native FULL/H to its cold fence.
   std::pair<std::size_t, std::size_t> mw_advanceDeviceSampling(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
