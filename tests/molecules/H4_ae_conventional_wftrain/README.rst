@@ -144,3 +144,9 @@ native LM, CSF, orbital or ECP extension is implied by this ALM result.
 Historical AE mixed-LM guard-rejection statements above describe their original
 sources; the new numerical policy is separately reviewed, while ECP/orbital
 mixed LM rejection remains in force. No old default or strict comparison changes.
+
+The same ``--mdj-alm`` helper accepts ``--ranks 2 --mpiexec mpirun`` for a
+separately reviewed two-rank consumer gate (qualification pending). Physics and
+solver caps stay unchanged: training W4/blocks8 gives 32 samples per rank,
+64 global, with existing inference W2 and strict full/import/initialized restart.
+No one-rank versus two-rank trajectory equality or additional CTest is implied.

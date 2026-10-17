@@ -335,7 +335,7 @@ def main():
             parser.error("--sj-reference-line-search selects one single-rank H2 SJ AE workflow")
         args.model_import = True
     if args.mdj_alm:
-        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+        if args.ranks not in (1, 2) or args.threads != 1 or args.ci_representation != "dets" or any((
                 args.restart, args.preflight, args.model_import, args.old_new, args.family_screen,
                 args.family_method, args.profile_only, args.optimizer_screen, args.ci_pii, args.ci_lm,
                 args.csf_lm, args.csf_pii, args.mdj_pii, args.csf_j2_pii, args.periodic_heg,
@@ -343,7 +343,7 @@ def main():
                 args.orbital_ecp, args.many_occupied_orbital_ecp, args.md_orbital_ecp,
                 args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_minpii,
                 args.unequal_spin_orbital_ecp, args.csf_orbital_ecp, args.orbital_jastrow)):
-            parser.error("--mdj-alm selects one single-rank fixed-orbital DETS/J2 AE workflow")
+            parser.error("--mdj-alm selects one 1/2-rank fixed-orbital DETS/J2 AE workflow")
         args.model_import = True
     if args.joint_ci_orbital_ecp_minpii:
         if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
