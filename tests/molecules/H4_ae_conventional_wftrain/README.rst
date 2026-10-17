@@ -26,3 +26,19 @@ Krylov caps32iterations,128operator applications,10seconds, one damping attempt.
 CSFs; ``--profile-only`` can select one bounded Adam case for that representation.
 No external orbital data or trained model is used, and no convergence or orbital
 rotation/advanced-linear-optimizer qualification is implied.
+
+Pure-CI PII/minPII regression
+---------------------------
+
+``--ci-pii`` generates private copies of this two-DETS fixture with both J2
+arrays frozen, leaving only CI1 active (P1). The real CPU regression runs
+two updates for each method, with 32 samples per update, and requires finite
+committed CI changes. Fixed CI0, SPO and J2 are checked, followed by exact
+seeded VMC comparisons of each final exported model against explicit accepted
+CI coefficients. Existing Krylov limits and a 300 second whole-checker cap
+apply. No controls are tuned to force acceptance.
+
+This profile passed on source ``5f0460dc8``, alongside a separate 65-assertion
+dense centered CI oracle. It qualifies pure DETS CI only. Mixed active
+CI/Jastrow, CI/orbital, CSF and LM/ALM remain gated; no convergence-quality,
+equal-update or GPU claim is made.
