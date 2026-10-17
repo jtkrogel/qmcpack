@@ -64,9 +64,12 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <memory>
 #include <stdexcept>
@@ -4213,6 +4216,27 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     qmcplusplus::testing::LegacyP1Matrices legacy{};
     if (compare_legacy)
     {
+      const char* candidate_path = coefficient == 0 ? std::getenv("TASK46_CI_CANDIDATE_FILE") : nullptr;
+      std::array<double, 2> candidates{}, physical_numerator{}, physical_denominator{}, physical_rayleigh{};
+      std::array<double, 4> uncentered_h{}, uncentered_s{};
+      std::unique_ptr<ParticleSet> sibling_particles;
+      std::unique_ptr<TrialWaveFunction> sibling;
+      ParticleSet::ParticlePos source_positions;
+      double sibling_log = 0;
+      auto saved_rng = rng;
+      if (candidate_path)
+      {
+        std::ifstream input(candidate_path);
+        REQUIRE(static_cast<bool>(input >> candidates[0] >> candidates[1]));
+        REQUIRE((isFiniteTrainingReal(candidates[0]) && isFiniteTrainingReal(candidates[1])));
+        input >> std::ws;
+        REQUIRE(input.eof()); // Exactly two scalar candidates, not a new model format.
+        source_positions = particles.R;
+        sibling_particles = std::make_unique<ParticleSet>(particles);
+        sibling = source->makeClone(*sibling_particles);
+        sibling_particles->update(); sibling->evaluateLog(*sibling_particles);
+        sibling_log = sibling->getLogPsi();
+      }
       std::array<qmcplusplus::testing::LegacyP1Sample, 4> records;
       for (int sample = 0; sample < 4; ++sample)
       {
@@ -4235,6 +4259,64 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
         CHECK((plus[0] - minus[0]) / .25 == Catch::Approx(score[sample]).epsilon(2e-10).margin(2e-10));
         CHECK((plus[1] - minus[1]) / .25 - energies[sample].real() * score[sample] ==
               Catch::Approx(del[sample]).epsilon(2e-10).margin(2e-10));
+        if (candidate_path)
+        {
+          const double basis[] = {1, score[sample]};
+          const double action[] = {energies[sample].real(),
+                                   energies[sample].real() * score[sample] + del[sample]};
+          for (int row = 0; row < 2; ++row)
+            for (int column = 0; column < 2; ++column)
+            {
+              uncentered_h[2 * row + column] += basis[row] * action[column] / 4;
+              uncentered_s[2 * row + column] += basis[row] * basis[column] / 4;
+            }
+          for (int candidate = 0; candidate < 2; ++candidate)
+          {
+            const double delta = candidates[candidate] - parameters.values[0];
+            const auto evaluated = physical(delta); // Fresh isolated clone, signed phase-aware amplitude.
+            const double ratio = 1 + delta * score[sample];
+            REQUIRE(evaluated[0] == Catch::Approx(ratio).epsilon(2e-10).margin(2e-10));
+            REQUIRE(evaluated[1] == Catch::Approx(action[0] + delta * action[1]).epsilon(2e-10).margin(2e-10));
+            physical_numerator[candidate] += evaluated[0] * evaluated[1] / 4;
+            physical_denominator[candidate] += evaluated[0] * evaluated[0] / 4;
+          }
+        }
+      }
+      if (candidate_path)
+      {
+        const auto quadratic = [](const std::array<double, 4>& matrix, double a, double b) {
+          return a * a * matrix[0] + a * b * (matrix[1] + matrix[2]) + b * b * matrix[3];
+        };
+        for (int candidate = 0; candidate < 2; ++candidate)
+        {
+          CAPTURE(candidate, candidates[candidate]);
+          const double delta = candidates[candidate] - parameters.values[0];
+          const double denominator = quadratic(uncentered_s, 1, delta);
+          REQUIRE((isFiniteTrainingReal(denominator) && denominator > 0));
+          REQUIRE((isFiniteTrainingReal(physical_denominator[candidate]) && physical_denominator[candidate] > 0));
+          const double rayleigh = quadratic(uncentered_h, 1, delta) / denominator;
+          REQUIRE((isFiniteTrainingReal(physical_numerator[candidate]) && isFiniteTrainingReal(rayleigh)));
+          physical_rayleigh[candidate] = physical_numerator[candidate] / physical_denominator[candidate];
+          REQUIRE(physical_rayleigh[candidate] ==
+                Catch::Approx(rayleigh).epsilon(2e-10).margin(2e-10));
+          REQUIRE(quadratic(dense_raw, 1 + delta * mean, delta) /
+                quadratic(dense_s, 1 + delta * mean, delta) == Catch::Approx(rayleigh).epsilon(2e-10).margin(2e-10));
+        }
+        source->evaluateLog(particles);
+        sibling->evaluateLog(*sibling_particles);
+        REQUIRE(source->findMSD()[0].get().get_C() == fixed_coefficients);
+        REQUIRE(source->findMSD()[0].get().fixedCoefficientReference() == 0.6);
+        REQUIRE(source->getLogPsi() == source_log);
+        REQUIRE(sibling->getLogPsi() == sibling_log);
+        REQUIRE(sibling->findMSD()[0].get().get_C() == fixed_coefficients);
+        for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+          REQUIRE(particles.R[electron] == source_positions[electron]);
+        auto actual_rng = rng;
+        REQUIRE(actual_rng() == saved_rng());
+        std::ostringstream receipt;
+        receipt << std::setprecision(17) << "TASK46_NATIVE_CI_CANDIDATES_PASS C1=" << candidates[0] << ',' << candidates[1]
+                << " physical_Rayleigh=" << physical_rayleigh[0] << ',' << physical_rayleigh[1] << '\n';
+        std::cout << receipt.str();
       }
       legacy = qmcplusplus::testing::legacyP1Matrices(records);
       // Old fill uses RAW centered H. New LM symmetrizes it; neither policy
