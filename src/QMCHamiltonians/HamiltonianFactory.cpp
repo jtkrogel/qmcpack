@@ -124,7 +124,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
       const auto type = getXMLAttributeValue(element, "type");
       const bool pseudo = type == "pseudo";
       if (kind != "pairpot" || (type != "coulomb" && !(pp && pseudo)))
-        throw std::invalid_argument("Complex PsiFormer admits only three physical periodic Coulomb pair terms");
+        throw std::invalid_argument("Complex PsiFormer admits only three physical periodic pair terms");
       // Mirror CoulombPotentialFactory defaults, including e/e when source/target are omitted.
       std::string from = targetPtcl.getName(), to = targetPtcl.getName();
       std::string pbc = "yes", forces = "no", gpu = "no";
@@ -138,7 +138,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
       pair.add(gpu, "gpu");
       pair.put(element);
       if (!physical || pbc != "yes" || forces != "no" || (gpu != "no" && gpu != "cpu"))
-        throw std::invalid_argument("Complex PsiFormer requires physical periodic CPU Coulomb without forces");
+        throw std::invalid_argument("Complex PsiFormer requires physical periodic CPU pair terms without forces");
       std::size_t term = 3;
       if (!pseudo && from == targetPtcl.getName() && to == targetPtcl.getName())
         term = 0;
@@ -146,16 +146,16 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
       {
         const auto found = ptclPool.find(from);
         if (found == ptclPool.end() || found->second.get() != &source)
-          throw std::invalid_argument("Complex PsiFormer Coulomb source differs from its fixed ion source");
+          throw std::invalid_argument("Complex PsiFormer periodic pair source differs from its fixed ion source");
         term = to == targetPtcl.getName() ? 1 : 2;
       }
       // A PP pair replaces, never supplements, bare electron-ion Coulomb.
       if ((pseudo && term != 1) || (pp && !pseudo && term == 1) || term == 3 || seen[term])
-        throw std::invalid_argument("Complex PsiFormer Coulomb source pair is unqualified or duplicated");
+        throw std::invalid_argument("Complex PsiFormer periodic source pair is unqualified or duplicated");
       seen[term] = true;
     });
     if (!std::all_of(seen.begin(), seen.end(), [](bool present) { return present; }))
-      throw std::invalid_argument("Complex PsiFormer requires e/e, ion/e and ion/ion periodic Coulomb terms");
+      throw std::invalid_argument("Complex PsiFormer requires e/e and ion/ion Coulomb plus the selected ion/e Coulomb or PP term");
   }
 #endif
   // KineticEnergy must be the first element in the hamiltonian array.
