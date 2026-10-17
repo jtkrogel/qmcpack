@@ -262,24 +262,31 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
   {
     // Only actual selected CPU LCAO handles can authorize removal of a routing
     // href. All other external attributes retain the existing fail-closed gate.
-    std::set<std::string> source_spos;
+    std::map<std::string, std::string> source_spos;
     for (auto& slater : prototype.findSD())
       for (int spin = 0; spin < slater.get().getNumDets(); ++spin)
-        if (const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(&slater.get().getPhi(spin));
-            lcao && lcao->fileImageIdentity())
+      {
+        const auto& selected = slater.get().getPhi(spin);
+        const auto* rotated = dynamic_cast<const RotatedSPOs*>(&selected);
+        const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(rotated ? rotated->Phi_.get() : &selected);
+        if (lcao && lcao->fileImageIdentity())
         {
           if (lcao->isOMPoffload() || lcao->isOptimizable() ||
-              (lcao_source_ && lcao_source_ != lcao->fileImageIdentity()))
+              (lcao_source_ && lcao_source_ != lcao->fileImageIdentity()) ||
+              (rotated && (rotations.unique.size() != 1 || rotations.aliases != std::vector<int>{0, 0} ||
+                  particles.groups() != 2 || particles.groupsize(0) != 1 || particles.groupsize(1) != 1 ||
+                  selected.getOrbitalSetSize() != 3)))
             throw std::runtime_error("Conventional external LCAO requires one immutable CPU source record");
           lcao_source_ = lcao->fileImageIdentity();
-          source_spos.insert(lcao->getName());
+          source_spos.emplace(selected.getName(), lcao->getName());
         }
+      }
     std::unique_ptr<xmlNode, decltype(&xmlFreeNode)> copied(xmlCopyNode(node, 1), xmlFreeNode);
     if (!copied) throw std::bad_alloc();
     node = copied.get();
     if (lcao_source_)
     {
-      std::set<std::string> captured;
+      std::map<std::string, std::string> captured;
       for (auto* collection = node->children; collection; collection = collection->next)
         if (xmlStrEqual(collection->name, BAD_CAST "sposet_collection") &&
             attributeText(collection, "type") == "MolecularOrbital" &&
@@ -288,7 +295,12 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
         {
           for (auto* spo = collection->children; spo; spo = spo->next)
             if (xmlStrEqual(spo->name, BAD_CAST "sposet"))
-              captured.insert(attributeText(spo, "name"));
+              captured.emplace(attributeText(spo, "name"), attributeText(spo, "name"));
+            else if (xmlStrEqual(spo->name, BAD_CAST "rotated_sposet"))
+              for (auto* leaf = spo->children; leaf; leaf = leaf->next)
+                if (xmlStrEqual(leaf->name, BAD_CAST "sposet") &&
+                    !captured.emplace(attributeText(spo, "name"), attributeText(leaf, "name")).second)
+                  throw std::runtime_error("Conventional external LCAO wrapper has multiple source leaves");
           if (captured != source_spos)
             throw std::runtime_error("Conventional external LCAO source does not match selected SPO definitions");
           xmlUnsetProp(collection, BAD_CAST "href");
@@ -338,8 +350,8 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
 #ifdef QMC_COMPLEX
     throw std::runtime_error("Conventional external LCAO requires a real CPU build");
 #endif
-    if (periodic || multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1)
-      throw std::runtime_error("Conventional external LCAO requires open fixed single Slater");
+    if (periodic || multideterminant_ || prototype_.findSD().size() != 1 || (orbital_rotations_ && !nonlocal_ecp))
+      throw std::runtime_error("Conventional external LCAO requires open fixed Slater or qualified orbital ECP Slater");
     for (const auto& component : prototype_.getOrbitals())
       if (component->getClassName() != "SlaterDet" && component->getClassName() != "J1OrbitalSoA" &&
           component->getClassName() != "TwoBodyJastrow")
@@ -347,7 +359,9 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     const auto& slater = prototype_.findSD().front().get();
     for (int spin = 0; spin < slater.getNumDets(); ++spin)
     {
-      const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(&slater.getPhi(spin));
+      const auto& selected = slater.getPhi(spin);
+      const auto* rotated = dynamic_cast<const RotatedSPOs*>(&selected);
+      const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(rotated ? rotated->Phi_.get() : &selected);
       if (!lcao || lcao->fileImageIdentity() != lcao_source_)
         throw std::runtime_error("Conventional external LCAO requires all determinants from its captured source");
     }

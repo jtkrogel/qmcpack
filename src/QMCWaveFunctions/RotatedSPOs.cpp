@@ -1624,7 +1624,7 @@ RotatedSPOs::ValueType RotatedSPOs::evaluateOneOccupiedRatioDerivatives(
   throw std::invalid_argument("One-occupied orbital ratio derivatives require real CPU orbitals");
 #endif
   const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(Phi_.get());
-  if (!lcao || lcao->isOMPoffload() || lcao->fileImageIdentity() || nel_major_ != 1 ||
+  if (!lcao || lcao->isOMPoffload() || (lcao->fileImageIdentity() && OrbitalSetSize != 3) || nel_major_ != 1 ||
       reference.size() != OrbitalSetSize || replacement.size() != reference.size() ||
       output.size() < active.size_of_active() || myVars.size() != m_act_rot_inds_.size())
     throw std::invalid_argument("One-occupied orbital ratio derivative layout is unsupported");

@@ -303,7 +303,8 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
         const auto* lcao = rotated ? dynamic_cast<const LCAOrbitalSet*>(rotated->Phi_.get()) : nullptr;
         const std::size_t n = sample.particles.groupsize(determinant), m = phi.getOrbitalSetSize();
         if (phi.isOMPoffload() || (!orbital && phi.isOptimizable()) || (orbital && (!phi.isOptimizable() || !lcao || lcao->isOMPoffload() ||
-            lcao->fileImageIdentity() || rotated->nel_major_ != n || m <= n || (n == 1 && m != 3) ||
+            (lcao->fileImageIdentity() && (n != 1 || m != 3 || &slater->getPhi(0) != &slater->getPhi(1))) ||
+            rotated->nel_major_ != n || m <= n || (n == 1 && m != 3) ||
             !dynamic_cast<const DiracDeterminant<>*>(&slater->getDet(determinant)) ||
             rotated->m_act_rot_inds_.size() != n * (m - n))))
           throw std::invalid_argument("Legacy orbital ECP products require CPU inline complete-OV owners");

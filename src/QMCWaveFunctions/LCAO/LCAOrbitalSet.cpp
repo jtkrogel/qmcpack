@@ -206,7 +206,7 @@ const LCAOrbitalSet::OffloadValueMatrix& LCAOrbitalSet::originalRotationCoeffici
 void LCAOrbitalSet::validatePreparedRotationState(const LCAOrbitalSet& prepared) const
 {
   if (useOMPoffload_ || prepared.useOMPoffload_ || Identity || prepared.Identity ||
-      !C || !C_copy || !prepared.C || !prepared.C_copy ||
+      !C || !C_copy || !prepared.C || !prepared.C_copy || file_identity_ != prepared.file_identity_ ||
       BasisSetSize != prepared.BasisSetSize || OrbitalSetSize != prepared.OrbitalSetSize ||
       C->rows() != OrbitalSetSize || C->cols() != BasisSetSize ||
       prepared.C->rows() != C->rows() || prepared.C->cols() != C->cols() ||
