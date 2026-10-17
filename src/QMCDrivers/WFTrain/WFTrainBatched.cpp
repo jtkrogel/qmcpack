@@ -1414,6 +1414,11 @@ void WFTrainBatched::process(xmlNodePtr node)
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
+        // CPU candidates own isolated parameter state; only fixed-reference
+        // physical ENERGY selection is admitted, not MSE/GPU/endpoints.
+        const bool cpu_energy_reference = !complex->gpuInferenceEnabled() &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE;
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
@@ -1426,13 +1431,14 @@ void WFTrainBatched::process(xmlNodePtr node)
             !supported_optimizer ||
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
-            training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+            (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF && !cpu_energy_reference) ||
             (!complex->gpuInferenceEnabled() &&
              (training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
               training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
           throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
-              "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls, "
+              "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls "
+              "except CPU ENERGY reference search, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
               "and positive finite maximum_retained_bytes; CPU single-reference orbital_mse admits Adam/plainSGD");
         if (complex->gpuInferenceEnabled() && training_input_.getWeightDecay() != 0 &&
