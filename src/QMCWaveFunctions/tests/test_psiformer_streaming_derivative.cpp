@@ -1809,7 +1809,9 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
       context.provider_id = op->parameterSchema().providerId(); context.schema_fingerprint = op->parameterSchema().fingerprint();
       context.parameter_version = op->parameterVersion(); context.batch_ordinal = version;
       context.sample_count = 2; context.expected_point_count = 18; context.grid_fingerprint = 0x731934d2;
-      auto channels = channels_for(*op); SelectedParameterSink unused(selected);
+      const std::vector<VJPCoefficientChannel> channels{{"capture_ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+          coefficientsFor(*op, w), ecp}}; // Capture is isolated ECP; bound consumption below is complete C3.
+      SelectedParameterSink unused(selected);
       consumer->begin(context, {channels.data(), channels.size()}, unused);
       std::vector<ParticleSet::PosType> grid; std::vector<QMCTraits::ValueType> factors;
       for (std::size_t s = 0; s < 2; ++s)
