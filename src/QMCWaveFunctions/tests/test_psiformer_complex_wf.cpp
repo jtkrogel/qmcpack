@@ -2657,6 +2657,142 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   CHECK_THROWS(stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::HERMITIAN, actual));
 }
 
+TEST_CASE("PsiFormer private GPU candidates isolate mutable lanes and preserve source products",
+          "[wavefunction][psiformer][complex_gpu_candidate_isolation]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices) { WARN("NOT_RUN: GPU isolation needs HIP"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) { WARN("NOT_RUN: GPU isolation needs CUDA"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  controls.target(3, 64 * 1024 * 1024, 1000000000);
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  {
+    const SimulationCell simulation_cell(cell());
+    auto p = electrons(simulation_cell), sibling_p = electrons(simulation_cell);
+    auto private_p = electrons(simulation_cell), cpu_p = electrons(simulation_cell), source = ions(simulation_cell);
+    const auto initialized = parameters();
+    const std::array<double, 3> twist{.17, -.11, .07};
+    RuntimeOptions options;
+    TrialWaveFunction wavefunction(options);
+    auto owner = std::make_unique<PsiFormerComplexWF>("private_gpu", initialized, p, source, clone_cap,
+                                                     twist, 64 * 1024 * 1024);
+    auto& gpu = *owner;
+    wavefunction.addComponent(std::move(owner));
+    auto sibling_owner = gpu.makeClone(sibling_p), private_owner = gpu.makeClone(private_p);
+    auto& sibling = dynamic_cast<PsiFormerComplexWF&>(*sibling_owner);
+    auto& candidate_wf = dynamic_cast<PsiFormerComplexWF&>(*private_owner);
+    PsiFormerComplexWF cpu("private_gpu", initialized, cpu_p, source, clone_cap, twist);
+    const auto original = gpu.snapshotParameters();
+    const auto original_log = evaluate(gpu, p);
+    const auto original_g = p.G;
+    const auto original_l = p.L;
+    evaluate(sibling, sibling_p);
+    evaluate(candidate_wf, private_p);
+    RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+    RefVectorWithLeader<ParticleSet> particles(p, {p});
+    const auto derivative = gpu.gpuDerivativeRequirements(1, 1, 3, 7);
+    auto retained = gpu.makeBudgetedGpuDerivativeOperator(wavefunctions, particles, 0, 0, 1, 3, 7,
+        derivative.device_bytes, derivative.host_bytes, derivative.matrix_work);
+    const auto score = [&](StreamingDerivativeOperator& stream) {
+      const C one{1};
+      const auto& schema = stream.parameterSchema();
+      const VJPCoefficientChannel channel{"score", DerivativeProduct::SCORE_VJP,
+          {schema.providerId(), schema.fingerprint(), stream.parameterVersion(), 0, 0, {&one, 1}}, 0};
+      ComplexStreamingSink sink;
+      stream.applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, sink);
+      return sink.values[0];
+    };
+    const auto original_score = score(*retained);
+    const auto storage = gpu.numericStorage();
+    const auto isolation = candidate_wf.gpuCandidateIsolationRequirements();
+    REQUIRE(isolation.device_bytes > 0);
+    REQUIRE(isolation.host_bytes > 0);
+    const auto before = metrics.snapshot();
+    CHECK_THROWS(candidate_wf.isolateBudgetedGpuParameterState(isolation.device_bytes - 1, isolation.host_bytes));
+    CHECK_THROWS(candidate_wf.isolateBudgetedGpuParameterState(isolation.device_bytes, isolation.host_bytes - 1));
+    CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+    CHECK(metrics.snapshot().uploaded_bytes == before.uploaded_bytes);
+    CHECK(metrics.snapshot().device_copied_bytes == before.device_copied_bytes);
+    CHECK(candidate_wf.numericStorage().shared_image_identity == storage.shared_image_identity);
+    CHECK(candidate_wf.snapshotParameters().values == original.values);
+    CHECK(candidate_wf.snapshotParameters().version == original.version);
+    CHECK(gpu.snapshotParameters().values == original.values);
+    CHECK(sibling.snapshotParameters().values == original.values);
+    // Frozen preparation must survive later invalid process controls; no initial P image is copied.
+    controls.set("PSIFORMER_GPU_VGL_TARGETS", "not-a-number");
+    controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "not-a-number");
+    candidate_wf.isolateBudgetedGpuParameterState(isolation.device_bytes, isolation.host_bytes);
+    CHECK(candidate_wf.gpuInferenceEnabled());
+    CHECK(candidate_wf.numericStorage().shared_gpu_bytes == storage.shared_gpu_bytes);
+    CHECK(candidate_wf.numericStorage().shared_image_identity == storage.shared_image_identity);
+    CHECK(metrics.snapshot().live_bytes == before.live_bytes + isolation.device_bytes);
+    // Scratch preparation may transfer small descriptors; shared image identity and
+    // the exact additional live bytes, not zero traffic, establish no initial P copy.
+    const auto publication = candidate_wf.gpuParameterPublicationRequirements();
+    const auto private_live = metrics.snapshot().live_bytes;
+    const auto imaginary = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+        [](const auto& leaf) { return leaf.name == "w_imag"; });
+    const auto real = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+        [](const auto& leaf) { return leaf.name == "w"; });
+    REQUIRE(imaginary != initialized.layouts.end());
+    REQUIRE(real != initialized.layouts.end());
+    for (std::size_t step = 0; step < 2; ++step)
+    {
+      auto candidate = candidate_wf.snapshotParameters();
+      candidate.values[real->begin] += .001 * (step + 1);
+      candidate.values[imaginary->begin] += .002 * (step + 1);
+      const auto before_prepare = metrics.snapshot();
+      {
+        auto discarded = candidate_wf.prepareBudgetedGpuParameterPublication(candidate, candidate.version,
+            publication.device_bytes, publication.host_bytes);
+        CHECK(metrics.snapshot().live_bytes == before_prepare.live_bytes + publication.device_bytes);
+        CHECK(metrics.snapshot().allocation_calls == before_prepare.allocation_calls + 1);
+        CHECK(metrics.snapshot().uploaded_bytes == before_prepare.uploaded_bytes + publication.device_bytes);
+      }
+      CHECK(metrics.snapshot().live_bytes == before_prepare.live_bytes);
+      CHECK(candidate_wf.snapshotParameters().version == candidate.version);
+      CHECK(candidate_wf.publishBudgetedGpuParameters(candidate, candidate.version,
+          publication.device_bytes, publication.host_bytes) == candidate.version + 1);
+      CHECK(cpu.publishParameters(candidate, candidate.version) == candidate.version + 1);
+      CHECK(metrics.snapshot().live_bytes == private_live + publication.device_bytes);
+      close(evaluate(candidate_wf, private_p), evaluate(cpu, cpu_p));
+      for (int electron = 0; electron < p.getTotalNum(); ++electron)
+      {
+        close(private_p.L[electron], cpu_p.L[electron]);
+        for (int d = 0; d < 3; ++d) close(private_p.G[electron][d], cpu_p.G[electron][d]);
+      }
+      close(candidate_wf.observeCoulombEnergy(private_p, -2.7).kinetic, cpu.observeCoulombEnergy(cpu_p, -2.7).kinetic);
+      CHECK(score(*retained) == original_score);
+      CHECK(gpu.snapshotParameters().values == original.values);
+      CHECK(sibling.snapshotParameters().values == original.values);
+      CHECK(gpu.snapshotParameters().version == original.version);
+      CHECK(sibling.snapshotParameters().version == original.version);
+      CHECK(evaluate(gpu, p) == original_log);
+      CHECK(p.G == original_g); CHECK(p.L == original_l);
+      CHECK(evaluate(sibling, sibling_p) == original_log);
+      CHECK(sibling_p.G == original_g); CHECK(sibling_p.L == original_l);
+      CHECK_THROWS(candidate_wf.publishBudgetedGpuParameters(candidate, candidate.version,
+          publication.device_bytes, publication.host_bytes));
+      auto invalid = candidate_wf.snapshotParameters();
+      invalid.values[0] = std::numeric_limits<double>::quiet_NaN();
+      CHECK_THROWS(candidate_wf.publishBudgetedGpuParameters(invalid, invalid.version,
+          publication.device_bytes, publication.host_bytes));
+      CHECK(candidate_wf.snapshotParameters().version == candidate.version + 1);
+      CHECK(candidate_wf.snapshotParameters().values == cpu.snapshotParameters().values);
+    }
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+}
+
 TEST_CASE("PsiFormer explicit GPU parameter publication reuses inference storage atomically",
           "[wavefunction][psiformer][complex_gpu_publication]")
 {
