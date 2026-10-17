@@ -21,7 +21,7 @@
         <attrib name="position" datatype="posArray">2.8 -0.4 0.2</attrib></group>
     </particleset>
     <wavefunction name="student" target="e" print_parameters="no">
-      <psiformer name="paired" source="ion0" system="all_electron" gpu="cpu" optimize="yes"
+      <psiformer name="paired" source="ion0" system="all_electron" gpu="cpu" optimize="no" precision="fp64_reference"
         initialization="psiformer_complex_periodic_v1" initialization_seed="17"
         feature_policy="periodic_torus_v1" max_clone_numeric_bytes="16777216" twist="0.17 -0.11 0.07"/>
     </wavefunction>
