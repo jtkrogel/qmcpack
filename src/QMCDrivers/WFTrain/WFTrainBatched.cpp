@@ -1530,15 +1530,20 @@ void WFTrainBatched::process(xmlNodePtr node)
                 [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
         if (joint_ci_orbital_ecp)
           multideterminants[0].get().validateAcceptedReferenceOrbitalProfile();
-        if ((active_linear != active_variables && !joint_ci_j2 && !mixed_lm_ae) ||
+        const bool mixed_lm_ecp = linear_method && ci_j2_layout && !conventional_binding_->hasOrbitalRotations() &&
+            population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+            population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+            population_.get_golden_hamiltonian().ecpModelProvenance() &&
+            !multideterminants[0].get().hasCSFExpansion();
+        if ((active_linear != active_variables && !joint_ci_j2 && !mixed_lm_ae && !mixed_lm_ecp) ||
             (conventional_binding_->hasOrbitalRotations() && !joint_ci_orbital_ecp) ||
             multideterminants.size() != 1)
-          throw UniformCommunicateError("Conventional LM/ALM admit pure coefficients or fixed-orbital CI/J2 all-electron updates; other mixed updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM admit pure coefficients, fixed-orbital CI/J2 AE or DETS/J2 locality-ECP; other mixed updates remain unqualified");
         // Keep this locality-ECP boundary explicit beside the general mixed guard.
         if (!inverse_iteration &&
             (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()) &&
-            (active_linear != active_variables || conventional_binding_->hasOrbitalRotations() || multideterminants.size() != 1))
-          throw UniformCommunicateError("Conventional locality-ECP LM/ALM require pure coefficients with one fixed-orbital MSD");
+            ((active_linear != active_variables && !mixed_lm_ecp) || conventional_binding_->hasOrbitalRotations() || multideterminants.size() != 1))
+          throw UniformCommunicateError("Conventional locality-ECP LM/ALM require pure coefficients or qualified fixed-orbital DETS/J2");
         // The frozen CSF reference precedes its fixed determinant expansion.
         const auto reference = multideterminants[0].get().fixedCoefficientReference();
         if (reference == QMCTraits::ValueType{} || !wftrain::isFiniteTrainingReal(std::real(reference)) ||
