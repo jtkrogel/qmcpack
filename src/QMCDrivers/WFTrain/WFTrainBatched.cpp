@@ -39,6 +39,10 @@
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
+#ifdef QMC_COMPLEX
+#include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCHamiltonians/CoulombPBCAB.h"
+#endif
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -455,6 +459,9 @@ private:
 #endif
 
 /** Replay capture must never publish a parameter response. */
+std::size_t checkedMemoryAdd(std::size_t lhs, std::size_t rhs);
+std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs);
+
 class ReplayOnlyECPSink final : public wftrain::ParameterReductionSink
 {
   void consume(std::size_t, const wftrain::ParameterChunkConstView&) override
@@ -462,6 +469,28 @@ class ReplayOnlyECPSink final : public wftrain::ParameterReductionSink
     throw std::logic_error("WFTrainBatched: replay-only ECP capture emitted a derivative");
   }
 };
+
+#ifdef QMC_COMPLEX
+/// Conservative pre-cutoff bound from the actual ionic species and built PP grids.
+std::size_t pairedECPPointCapacity(const QMCHamiltonian& ham, const ParticleSet& electrons, std::size_t samples)
+{
+  std::size_t points = 0;
+  for (int i = 0; i < ham.size(); ++i)
+    if (const auto* nl = dynamic_cast<const NonLocalECPotential*>(ham.getComponent(i)))
+    {
+      const auto state = nl->captureQuadratureState();
+      const auto& ions = nl->sourceParticles();
+      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+      {
+        const auto species = static_cast<std::size_t>(ions.GroupID[ion]);
+        if (species >= state.knots_per_species.size())
+          throw std::invalid_argument("Paired ECP ionic species has no built quadrature metadata");
+        points = checkedMemoryAdd(points, state.knots_per_species[species]);
+      }
+    }
+  return checkedMemoryMultiply(samples, checkedMemoryMultiply(electrons.getTotalNum(), points));
+}
+#endif
 
 /** Flush allocation intent before entering an owner/factory; no MPI here. */
 void logTrainingAllocation(const char* owner, std::size_t samples, std::size_t parameters,
@@ -520,6 +549,49 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     };
     auto& leader = componentAt(0);
     RefVectorWithLeader<WaveFunctionComponent> component_batch(leader);
+    if (gpu_training && has_nonlocal_ecp)
+    {
+      const auto samples = walkers.size();
+      const auto points = pairedECPPointCapacity(hamiltonians[0], electrons[0], samples);
+      const auto capacity = checkedMemoryAdd(samples, points); // Adam/VJP: B accepted plus Q virtual.
+      const auto chunk = std::min(maximum_parameter_chunk_size, leader.parameterSchema().parameterCount());
+      const auto required = leader.gpuDerivativeRequirements(samples, capacity, gpu_training->kinetic_targets, chunk);
+      const auto replay_bytes = leader.gpuNonLocalReplayRequirements(samples, points);
+      batch.derivative_operator = leader.makeBudgetedGpuDerivativeOperator(twf_batch, electron_batch,
+          batch_ordinal, sample_offset, capacity, gpu_training->kinetic_targets, chunk, required.device_bytes,
+          checkedMemoryAdd(required.host_bytes, replay_bytes.bound_host_extra_bytes), gpu_training->maximum_matrix_work);
+      auto consumer = leader.makeBudgetedGpuNonLocalReplayConsumer(twf_batch, electron_batch,
+          *batch.derivative_operator, replay_bytes.capture_host_bytes);
+      const auto& schema = batch.derivative_operator->parameterSchema();
+      std::vector<wftrain::DerivativeValue> ones(samples, {1.0, 0.0});
+      const wftrain::CoefficientView coefficients{schema.providerId(), schema.fingerprint(),
+          batch.derivative_operator->parameterVersion(), batch_ordinal, sample_offset, {ones.data(), ones.size()}};
+      const auto ecp_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+      const wftrain::VJPCoefficientChannel channel{wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+          wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficients, ecp_mask};
+      ReplayOnlyECPSink sink;
+      const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+          hamiltonian_batch, twf_batch, electron_batch, *consumer, {&channel, 1}, sink);
+      auto replay = consumer->releaseJVPReplay();
+      if (replay->gridFingerprint() != result.grid_fingerprint)
+        throw std::logic_error("Paired ECP accepted-grid identity changed before binding");
+      const auto actual_points = replay->points().size();
+      batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
+      batch.local_energy_term_mask |= ecp_mask;
+      double maximum_imaginary_nonlocal = 0;
+      for (std::size_t sample = 0; sample < samples; ++sample)
+      {
+        // Native REAL potential already contains Re(Vnl): restore ONLY its imaginary part.
+        const auto observation = componentAt(sample).observeCapturedLocalEnergy(electrons[sample],
+            *batch.derivative_operator, sample, hamiltonians[sample].get().getLocalPotential());
+        batch.local_energies.push_back(observation.local_energy);
+        maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(observation.nonlocal.imag()));
+      }
+      app_log() << std::setprecision(17) << "WFTrain paired accepted-grid ECP: Q=" << actual_points
+                << " grid=" << result.grid_fingerprint << " version=" << batch.derivative_operator->parameterVersion()
+                << " samples=" << samples << " max_abs_ImVnl=" << maximum_imaginary_nonlocal << std::endl;
+      return batch;
+    }
     batch.local_energies.reserve(walkers.size());
     for (std::size_t sample = 0; sample < walkers.size(); ++sample)
     {
@@ -1414,6 +1486,14 @@ void WFTrainBatched::process(xmlNodePtr node)
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+            (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
+             training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+             inference_input_.enabled ||
+             training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
+             training_input_.getMaximumUpdateNorm() != 0))
+          throw UniformCommunicateError("Paired ECP training requires GPU ENERGY Adam/OFF with default update controls");
         // GPU reference candidates require the separate budgeted private lane/image route.
         const bool energy_reference =
             training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
@@ -1624,6 +1704,9 @@ void WFTrainBatched::process(xmlNodePtr node)
     // lane is shared across those snapshots under the checked S=W*blocks preflight.
     if (complex_gpu_provider_ && (crowds_.size() != 1 || steps_per_block_ != 1))
       throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/steps1 before sampling");
+    if (complex_gpu_provider_ && population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        qmcdriver_input_.get_max_blocks() != 1)
+      throw UniformCommunicateError("WFTrainBatched: paired ECP requires one block before sampling");
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
@@ -1790,8 +1873,11 @@ void WFTrainBatched::run()
       if (complex_gpu_provider_)
       {
         const auto& limits = training_input_.getComplexGpuTraining();
-        const auto r = complex->gpuDerivativeRequirements(samples, largest_batch, limits.kinetic_targets,
+        const bool ecp = population_.get_golden_hamiltonian().hasPhysicalNLPP();
+        const auto points = ecp ? pairedECPPointCapacity(population_.get_golden_hamiltonian(), target, largest_batch) : 0;
+        const auto r = complex->gpuDerivativeRequirements(samples, checkedMemoryAdd(largest_batch, points), limits.kinetic_targets,
             std::min(p, training_input_.getParameterChunkSize()));
+        const auto replay_bytes = ecp ? complex->gpuNonLocalReplayRequirements(largest_batch, points).bound_host_extra_bytes : 0;
         const auto q = complex->gpuParameterPublicationRequirements();
         auto generation_device = q.device_bytes, generation_host = q.host_bytes;
         if (training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
@@ -1803,11 +1889,11 @@ void WFTrainBatched::run()
           generation_host = checkedMemoryAdd(isolation.host_bytes, checkedMemoryMultiply(2, q.host_bytes));
         }
         const auto device = checkedMemoryAdd(r.device_bytes, generation_device);
-        const auto host = checkedMemoryAdd(r.host_bytes, generation_host);
+        const auto host = checkedMemoryAdd(checkedMemoryAdd(r.host_bytes, replay_bytes), generation_host);
         if (device > limits.device_bytes || host > limits.host_bytes || r.matrix_work > limits.maximum_matrix_work)
           throw std::length_error(
               "WFTrainBatched: paired GPU derivative+successor device/HOST/work cap exceeded before sampling");
-        derivative_bytes = checkedMemoryAdd(r.device_bytes, r.host_bytes);
+        derivative_bytes = checkedMemoryAdd(checkedMemoryAdd(r.device_bytes, r.host_bytes), replay_bytes);
         successor_bytes = checkedMemoryAdd(generation_device, generation_host);
         app_log() << "WFTrain paired GPU admitted additional device=" << device << " HOST=" << host
                   << " derivative=" << derivative_bytes << " successor_or_private_selector=" << successor_bytes
@@ -1860,6 +1946,18 @@ void WFTrainBatched::run()
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
         prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
       complex_physical_identity = complex->trainingConfigurationFingerprint();
+      if (const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance())
+      {
+        complex_physical_identity += provenance->scientific_definition;
+        for (int i = 0; i < population_.get_golden_hamiltonian().size(); ++i)
+        {
+          const auto* term = population_.get_golden_hamiltonian().getComponent(i);
+          if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(term))
+            complex_physical_identity += aa->ewaldModelDefinition();
+          else if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(term))
+            complex_physical_identity += ab->ewaldModelDefinition();
+        }
+      }
     }
     catch (...) { budget_failure = std::current_exception(); }
     int failed = budget_failure ? 1 : 0;
@@ -2597,7 +2695,11 @@ void WFTrainBatched::run()
             // charge it once alongside other retained outer-owner allocations.
             retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes, snapshot_bytes);
           }
-          if (complex_training && storage_diagnostics.retained_numeric_bytes != complex_expected_prepared_bytes)
+          // PP capture owns variable actual Q within the explicit worst-case bound;
+          // the unchanged AE path still requires exact realized preflight equality.
+          if (complex_training && (has_nonlocal_ecp
+                  ? storage_diagnostics.retained_numeric_bytes > complex_expected_prepared_bytes
+                  : storage_diagnostics.retained_numeric_bytes != complex_expected_prepared_bytes))
             throw std::logic_error("WFTrainBatched: paired prepared capacity differs from exact preallocation admission");
           // RSS covers ParticleSet/teacher caches that numeric diagnostics omit.
         }

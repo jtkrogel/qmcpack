@@ -220,6 +220,10 @@ public:
   /// Report whether the bounded virtual-particle execution path is available.
   bool usesVirtualParticles() const noexcept { return static_cast<bool>(vp_); }
 
+  /// Read-only physical bindings for selected-system validation; no ownership transfer.
+  const ParticleSet& sourceParticles() const noexcept { return IonConfig; }
+  const ParticleSet* virtualTargetParticles() const noexcept;
+
   /** Do nothing */
   bool put(xmlNodePtr cur) override { return true; }
 

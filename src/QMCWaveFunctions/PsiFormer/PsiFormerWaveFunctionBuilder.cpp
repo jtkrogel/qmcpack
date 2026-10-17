@@ -144,24 +144,29 @@ std::size_t parseCloneNumericLimit(const std::string& text, const char* name = "
   return bytes;
 }
 
-/// Reject effective ECP charges presented as physically all-electron source metadata.
-void validateComplexCoulombSource(const ParticleSet& ions)
+/// Distinguish true atomic charges from explicit PP effective-valence metadata.
+void validateComplexCoulombSource(const ParticleSet& ions, bool pseudopotential = false)
 {
   const auto& species = ions.getSpeciesSet();
   const int charge = species.findAttribute("charge");
   if (charge < 0)
-    throw std::invalid_argument("Complex PsiFormer all-electron source requires ionic charges");
+    throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP source requires ionic charges"
+                                             : "Complex PsiFormer all-electron source requires ionic charges");
   for (int group = 0; group < species.size(); ++group)
   {
     const double z = species(charge, group);
     if (!psiformer::determinant::isFiniteReal(z) || z <= 0 || z != std::floor(z))
-      throw std::invalid_argument("Complex PsiFormer all-electron charges must be positive atomic numbers");
+      throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP charges must be positive integers"
+                                               : "Complex PsiFormer all-electron charges must be positive atomic numbers");
     for (const char* name : {"atomicnumber", "valence"})
     {
       const int attribute = species.findAttribute(name);
+      const bool atomic = std::string_view(name) == "atomicnumber";
       if (attribute >= 0 && (!psiformer::determinant::isFiniteReal(species(attribute, group)) ||
-                            species(attribute, group) != z))
-        throw std::invalid_argument("Complex PsiFormer all-electron charge/atomicnumber/valence mismatch");
+          (pseudopotential && atomic ? species(attribute, group) < z ||
+              species(attribute, group) != std::floor(species(attribute, group)) : species(attribute, group) != z)))
+        throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP charge/atomicnumber/valence mismatch"
+                                                 : "Complex PsiFormer all-electron charge/atomicnumber/valence mismatch");
     }
   }
 }
@@ -271,11 +276,13 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
     const auto request = normalizedAcceleratorRequest(gpu);
     const bool explicit_gpu = request == "cuda" || request == "hip";
+    const bool internal_gpu_ecp = explicit_gpu && system == "pseudopotential" &&
+        initialization == "psiformer_complex_periodic_v1" && parameters.empty() && parameter_checkpoint.empty();
     if ((!explicit_gpu && request != "no" && request != "cpu") || optimization_enabled ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Complex PsiFormer requires CPU or strict cuda/hip, optimize=no and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
-        feature_policy != "periodic_torus_v1" || system != "all_electron" ||
+        feature_policy != "periodic_torus_v1" || (system != "all_electron" && !internal_gpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
       throw std::invalid_argument("Complex PsiFormer requires explicit periodic all-electron native inference metadata");
@@ -343,6 +350,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   if (nonzero_twist && !periodic)
     throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
+  if (complex_profile && system == "pseudopotential" && (nonzero_twist || !particle_twist_is_zero))
+    throw std::invalid_argument("Native paired pseudopotential initialization requires Gamma twist");
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
        accelerator_resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
@@ -418,7 +427,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     source_particles = source_particle_set->second.get();
   }
   if (complex_profile)
-    validateComplexCoulombSource(*source_particles);
+    validateComplexCoulombSource(*source_particles, system == "pseudopotential");
 
   std::unique_ptr<PsiFormerWF> component;
   const std::array<double, 3> twist_array{
@@ -477,7 +486,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     {
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
                                                          *source_particles, clone_numeric_limit, twist_array,
-                                                         gpu_numeric_limit, parameter_checkpoint);
+                                                         gpu_numeric_limit, parameter_checkpoint, system);
       const auto storage = complex->numericStorage();
       app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
                                      : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes

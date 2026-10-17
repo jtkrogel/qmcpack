@@ -179,6 +179,13 @@ NonLocalECPotential::NonLocalECPotential(const NonLocalECPotential& nlpp, Partic
 
 NonLocalECPotential::~NonLocalECPotential() = default;
 
+const ParticleSet* NonLocalECPotential::virtualTargetParticles() const noexcept
+{
+  // Both constructors create vp_ against Peln. Its transient getRefPS() is
+  // unset until makeMoves and cannot establish pre-traversal target identity.
+  return vp_ ? &Peln : nullptr;
+}
+
 NonLocalECPotential::MultiWalkerResourceSchema NonLocalECPotential::multiWalkerResourceSchema() const noexcept
 {
   return {bool(vp_), vp_ ? static_cast<std::size_t>(vp_->getNumDistTables()) : 0,

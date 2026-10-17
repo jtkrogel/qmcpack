@@ -58,6 +58,7 @@
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/CoulombPBCAA.h"
 #include "QMCHamiltonians/CoulombPBCAB.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
 #include <array>
 #include <typeinfo>
 #endif
@@ -78,7 +79,7 @@ const PsiFormerComplexWF* selectedComplexProfile(const TrialWaveFunction& psi)
 
 /// Validate concrete selected objects before estimators/drivers/clones; store no admission pointer/token.
 void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMCHamiltonian& ham,
-                                        const ParticleSet& target)
+                                        const ParticleSet& target, bool wftrain)
 {
   const auto* complex = selectedComplexProfile(psi);
   if (!complex)
@@ -86,19 +87,25 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
   auto reject = []() { throw UniformCommunicateError(
       "Complex PsiFormer selected-system admission requires a sole component, CPU bare kinetic and "
       "three physical periodic Coulomb terms bound to its actual target/source"); };
-  if (psi.getOrbitals().size() != 1 || &complex->targetParticles() != &target ||
-      ham.size() != 4 || ham.total_size() != 4)
+  const bool ecp = wftrain && complex->gpuInferenceEnabled() && ham.hasPhysicalNLPP();
+  const auto& provenance = ham.ecpModelProvenance();
+  if ((ecp && (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())) ||
+      psi.getOrbitals().size() != 1 || &complex->targetParticles() != &target ||
+      ham.size() != (ecp ? 5 : 4) || ham.total_size() != ham.size())
     reject();
   const auto* kinetic = dynamic_cast<const BareKineticEnergy*>(ham.getComponent(0));
   if (!kinetic || typeid(*kinetic) != typeid(BareKineticEnergy) || &kinetic->getTargetPSet() != &target)
     reject();
   std::array<int, 3> counts{};
+  int nonlocal_count = 0;
   for (int i = 1; i < ham.size(); ++i)
   {
     const auto* op = ham.getComponent(i);
     if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(op))
     {
       if (typeid(*aa) != typeid(CoulombPBCAA) || aa->ComputeForces || aa->quasi2d || aa->usesOffload())
+        reject();
+      if (ecp && aa->ewaldModelDefinition().empty())
         reject();
       if (&aa->Ps == &target && aa->is_active)
         ++counts[0];
@@ -112,12 +119,23 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
       if (typeid(*ab) != typeid(CoulombPBCAB) || ab->ComputeForces || &ab->Peln != &target ||
           &ab->getSourcePSet() != &complex->sourceParticles())
         reject();
+      // This is the built Ewald/local-PP definition; parsed PP bytes are separately bound above.
+      if (ecp && ab->ewaldModelDefinition().empty())
+        reject();
       ++counts[2];
+    }
+    else if (const auto* nl = dynamic_cast<const NonLocalECPotential*>(op))
+    {
+      if (!ecp || typeid(*nl) != typeid(NonLocalECPotential) || nl->usesDLA() ||
+          !nl->usesVirtualParticles() || &nl->sourceParticles() != &complex->sourceParticles() ||
+          nl->virtualTargetParticles() != &target)
+        reject();
+      ++nonlocal_count;
     }
     else
       reject();
   }
-  if (counts != std::array<int, 3>{1, 1, 1})
+  if (counts != std::array<int, 3>{1, 1, 1} || nonlocal_count != (ecp ? 1 : 0))
     reject();
 }
 } // namespace
@@ -338,7 +356,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       }
     }
 #ifdef QMC_COMPLEX
-    requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system);
+    requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system, das.new_run_type == QMCRunType::WF_TRAIN_BATCH);
     if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
         das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
       throw UniformCommunicateError("Complex GPU requires PBYP VMC_BATCH or explicitly admitted WF_TRAIN_BATCH");
