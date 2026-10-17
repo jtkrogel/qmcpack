@@ -18,7 +18,11 @@
 // Input data and gold data for fillFromText test
 #include "diamond_fill_data.h"
 #include "Utilities/RuntimeOptions.h"
+#include "LegacyP1MatrixTest.h"
+#include "Message/CommOperators.h"
+#include "QMCDrivers/WFOpt/LinearMethod.h"
 
+#include <algorithm>
 #include <limits>
 
 namespace qmcplusplus
@@ -117,7 +121,47 @@ public:
 
   std::size_t getStoredParameterCount() const { return costFn.opt_vars.size(); }
   int getActiveParameterCount() const { return costFn.opt_vars.size_of_active(); }
+
+  /// Select the old optimizer's pure-linear, energy-only matrix policy.
+  void setPureLinear()
+  {
+    costFn.opt_vars.setParameterType(optimize::LINEAR_P);
+    costFn.w_beta = 0;
+  }
 };
+
+/// Reuse the existing friend fixture to exercise production old H/S assembly.
+LegacyP1Matrices legacyP1Matrices(const std::array<LegacyP1Sample, 4>& records)
+{
+  LinearMethodTestSupport support({1}, OHMMS::Controller);
+  support.set_samples_and_param(4, 1);
+  support.setPureLinear();
+  auto& sums = support.getSumValue();
+  std::fill(sums.begin(), sums.end(), 0);
+  support.getRecordsOnNode() = 0;
+  for (int sample = 0; sample < 4; ++sample)
+  {
+    const auto& point = records[sample];
+    support.getRecordsOnNode()(sample, QMCCostFunctionBase::REWEIGHT) = point.weight;
+    support.getRecordsOnNode()(sample, QMCCostFunctionBase::ENERGY_NEW) = point.energy;
+    support.getDerivRecords()(sample, 0) = point.score;
+    support.getHDerivRecords()(sample, 0) = point.energy_derivative;
+    sums[QMCCostFunctionBase::SUM_WGT] += point.weight;
+    sums[QMCCostFunctionBase::SUM_E_WGT] += point.weight * point.energy;
+    sums[QMCCostFunctionBase::SUM_ESQ_WGT] += point.weight * point.energy * point.energy;
+  }
+  // The old builder reduces its matrix contributions and score mean itself;
+  // scalar normalizers must be global too, including replicated MPI fixtures.
+  OHMMS::Controller->allreduce(sums);
+  Matrix<QMCTraits::RealType> hamiltonian(2, 2), overlap(2, 2);
+  support.costFn.fillOverlapHamiltonianMatrices(hamiltonian, overlap);
+  std::vector<QMCTraits::RealType> direction{1, 0.2};
+  LegacyP1Matrices result;
+  std::copy_n(hamiltonian.data(), 4, result.hamiltonian.begin());
+  std::copy_n(overlap.data(), 4, result.overlap.begin());
+  result.linear_rescale = LinearMethod::getNonLinearRescale(direction, overlap, support.costFn);
+  return result;
+}
 
 } // namespace testing
 
