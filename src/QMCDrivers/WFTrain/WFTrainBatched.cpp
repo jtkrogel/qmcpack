@@ -1504,24 +1504,30 @@ void WFTrainBatched::process(xmlNodePtr node)
         }
       if (active_linear && (linear_method || inverse_iteration))
       {
-        // PII/minPII form additive local-chart steps, not mixed Ritz-state retractions.
-        const bool joint_ci_j2 = inverse_iteration && active_linear != active_variables &&
+        const bool ci_j2_layout = active_linear != active_variables &&
             multideterminants.size() == 1 &&
             std::all_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
                 [](const auto& component) {
                   return component->getClassName() == "MultiSlaterDetTableMethod" ||
                       component->getClassName() == "TwoBodyJastrow";
                 });
+        const bool joint_ci_j2 = inverse_iteration && ci_j2_layout;
+        const bool mixed_lm_ae = linear_method && ci_j2_layout && !conventional_binding_->hasOrbitalRotations() &&
+            population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+            !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+            !population_.get_golden_hamiltonian().ecpModelProvenance() &&
+            std::any_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
+                [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
         const bool joint_ci_orbital_ecp = joint_ci_j2 && conventional_binding_->hasOrbitalRotations() &&
             population_.get_golden_hamiltonian().hasPhysicalNLPP() && !multideterminants[0].get().hasCSFExpansion() &&
             std::any_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
                 [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
         if (joint_ci_orbital_ecp)
           multideterminants[0].get().validateAcceptedReferenceOrbitalProfile();
-        if ((active_linear != active_variables && !joint_ci_j2) ||
+        if ((active_linear != active_variables && !joint_ci_j2 && !mixed_lm_ae) ||
             (conventional_binding_->hasOrbitalRotations() && !joint_ci_orbital_ecp) ||
             multideterminants.size() != 1)
-          throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit CI/J2 and qualified DETS orbital/J2 locality-ECP; other mixed updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM admit pure coefficients or fixed-orbital CI/J2 all-electron updates; other mixed updates remain unqualified");
         // Keep this locality-ECP boundary explicit beside the general mixed guard.
         if (!inverse_iteration &&
             (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()) &&
@@ -2888,8 +2894,21 @@ void WFTrainBatched::run()
                 checkedMemoryAdd(h.retainedBytes(), s.retainedBytes()));
             const auto vectors = checkedMemoryAdd(checkedMemoryMultiply(9, lm_control.maximum_subspace_dimension),
                 checkedMemoryAdd(30, checkedMemoryMultiply(2, training_input_.getLMInnerRestartLength())));
+            const bool fixed_ci = conventional_binding_ && !schema.blocks().empty() &&
+                std::all_of(schema.blocks().begin(), schema.blocks().end(),
+                    [](const auto& block) { return block.update_group == "legacy_linear"; });
+            const bool mixed_ci = conventional_binding_ &&
+                std::any_of(schema.blocks().begin(), schema.blocks().end(),
+                    [](const auto& block) { return block.trainable && block.update_group == "legacy_linear"; }) &&
+                std::any_of(schema.blocks().begin(), schema.blocks().end(),
+                    [](const auto& block) { return block.trainable && block.update_group != "legacy_linear"; });
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                 checkedMemoryMultiply(checkedMemoryMultiply(vectors, initial.size()), sizeof(wftrain::DerivativeValue)));
+            // Explicit conservative reservation beyond the existing generous LM vector estimate.
+            if (mixed_ci)
+              retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                  checkedMemoryMultiply(checkedMemoryAdd(schema.parameterCount(), factor.localSampleVectorSize()),
+                                        sizeof(wftrain::DerivativeValue)));
             enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
             wftrain::MatrixFreeLinearMethodResult result;
             if (accelerated)
@@ -2911,15 +2930,12 @@ void WFTrainBatched::run()
             krylov_iterations = result.iterations;
             krylov_operator_applications = result.operator_applications;
             applied_scale = training_input_.getLearningRate();
-            // The process gate admits legacy_linear only for pure fixed-reference CI.
-            const bool fixed_ci = conventional_binding_ && !schema.blocks().empty() &&
-                std::all_of(schema.blocks().begin(), schema.blocks().end(),
-                    [](const auto& block) { return block.update_group == "legacy_linear"; });
             wftrain::LinearMethodUpdateRule update_rule(factor, std::move(result),
                 training_input_.getLearningRate(), training_input_.getLMNormalizationXi(),
-                fixed_ci ? wftrain::LinearMethodNormalization::FIXED_REFERENCE_LINEAR
-                         : wftrain::LinearMethodNormalization::NONLINEAR,
-                fixed_ci ? wftrain::DerivativeArrayView<const wftrain::ScoreCovarianceBatch>{score_batches.data(), score_batches.size()}
+                mixed_ci ? wftrain::LinearMethodNormalization::MIXED_FIXED_REFERENCE
+                         : fixed_ci ? wftrain::LinearMethodNormalization::FIXED_REFERENCE_LINEAR
+                                    : wftrain::LinearMethodNormalization::NONLINEAR,
+                fixed_ci || mixed_ci ? wftrain::DerivativeArrayView<const wftrain::ScoreCovarianceBatch>{score_batches.data(), score_batches.size()}
                          : wftrain::DerivativeArrayView<const wftrain::ScoreCovarianceBatch>{});
             iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
                 *decorate(update_rule), training_state, reduction, cache_observer,
