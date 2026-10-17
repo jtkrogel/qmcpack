@@ -13,8 +13,10 @@
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include <array>
+#include <complex>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -65,6 +67,14 @@ public:
 
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
+
+  /// Explicit score-only CPU owner; excludes caller gradient/target, SPO and inference owners.
+  struct OrbitalMSEStorage { std::size_t required_bytes, prepared_bytes, storage_fingerprint; };
+  OrbitalMSEStorage orbitalMSEStorage() const;
+  void prepareOrbitalMSE(std::size_t maximum_bytes);
+  std::array<double, 3> reducedTwist() const;
+  double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
+      std::vector<double>& gradient, std::size_t expected_version) const;
 
   /// Atomically replace same-sized real parameters after schema/version/finite/idle admission.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,

@@ -21,6 +21,8 @@
 #include "QMCWaveFunctions/SPOSet.h"
 
 #include <cstddef>
+#include <array>
+#include <complex>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -169,6 +171,31 @@ private:
   std::vector<double> coefficient_roots_;
   std::vector<double> target_matrices_;
 };
+
+#ifdef QMC_COMPLEX
+/** Frozen FreeOrbital single-reference targets in fixed-gauge periodic-part form. */
+class ComplexOrbitalTargetEvaluator
+{
+public:
+  static ComplexOrbitalTargetEvaluator fromSingleReference(const SlaterDet& source,
+      const ParticleSet& electrons, std::array<double, 3> expected_reduced_twist, std::size_t channels);
+  const std::vector<std::complex<double>>& evaluate(const ParticleSet& electrons);
+  const OrbitalTargetDescriptor& descriptor() const noexcept { return descriptor_; }
+  /// Explicit target/scratch only; cloned SPO and immutable descriptor metadata are excluded.
+  std::size_t retainedScalarBytes() const noexcept;
+
+private:
+  ComplexOrbitalTargetEvaluator(OrbitalTargetDescriptor descriptor,
+      std::array<std::unique_ptr<SPOSet>, 2>&& orbitals, std::array<double, 9> lattice,
+      std::array<double, 3> reduced, std::array<double, 3> cartesian);
+  OrbitalTargetDescriptor descriptor_;
+  std::array<std::unique_ptr<SPOSet>, 2> orbitals_;
+  std::array<SPOSet::ValueVector, 2> scratch_;
+  const std::array<double, 9> lattice_;
+  const std::array<double, 3> reduced_twist_, cartesian_twist_;
+  std::vector<std::complex<double>> target_;
+};
+#endif
 
 /// Select whether overlap channels repeat a teacher or pair with selected CI terms.
 enum class DeterminantOverlapTargetMode

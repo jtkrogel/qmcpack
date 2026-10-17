@@ -16,6 +16,7 @@
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 
 #include <algorithm>
 #include <cmath>
@@ -26,6 +27,134 @@
 
 namespace qmcplusplus::psiformer
 {
+namespace
+{
+bool isFiniteDouble(double value) noexcept;
+}
+#ifdef QMC_COMPLEX
+/// Freeze the actual occupied plane waves and fixed periodic-part gauge, not parsed names.
+ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference(const SlaterDet& source,
+    const ParticleSet& electrons, std::array<double, 3> reduced, std::size_t channels)
+{
+  const auto n = static_cast<std::size_t>(electrons.getTotalNum());
+  if (!channels || !n || n > std::numeric_limits<std::size_t>::max() / n ||
+      channels > std::numeric_limits<std::size_t>::max() / sizeof(std::complex<double>) / (n * n))
+    throw std::invalid_argument("Complex orbital target extent is zero or overflows");
+  if (electrons.isSpinor() || electrons.groups() != 2 || !electrons.groupsize(0) || !electrons.groupsize(1) ||
+      electrons.getLattice().SuperCellEnum != SUPERCELL_BULK || source.getNumDets() != 2)
+    throw std::invalid_argument("Complex orbital target requires two-spin bulk single Slater");
+  std::array<double, 9> lattice;
+  ParticleSet::PosType reduced_vector;
+  std::string identity = "complex-free-orbital-fixed-gauge-periodic-part-v1;";
+  auto append = [&](double value) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000))
+      throw std::invalid_argument("Complex orbital target metadata is nonfinite");
+    identity += std::to_string(bits) + ",";
+  };
+  for (int d = 0; d < 3; ++d)
+  {
+    if (electrons.getTwist()[d] != reduced[d])
+      throw std::invalid_argument("Complex orbital target twist mismatch");
+    append(reduced[d]);
+    reduced_vector[d] = reduced[d];
+    for (int e = 0; e < 3; ++e)
+      append(lattice[3 * d + e] = electrons.getLattice().R(d, e));
+  }
+  const auto twist = electrons.getLattice().k_cart(reduced_vector);
+  std::array<double, 3> cartesian{twist[0], twist[1], twist[2]};
+  for (double value : cartesian)
+    append(value);
+  std::array<std::unique_ptr<SPOSet>, 2> orbitals;
+  int first = 0;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& determinant = source.getDet(spin);
+    const auto* free = dynamic_cast<const FreeOrbital*>(&determinant.getPhi());
+    const auto count = electrons.groupsize(spin);
+    if (!free || determinant.getFirstIndex() != first || determinant.getLastIndex() != first + count ||
+        free->kVectors().size() < static_cast<std::size_t>(count))
+      throw std::invalid_argument("Complex orbital target requires occupied FreeOrbital spin blocks");
+    for (int column = 0; column < count; ++column)
+    {
+      const auto& k = free->kVectors()[column];
+      for (int d = 0; d < 3; ++d)
+      {
+        append(k[d]);
+        double reciprocal = 0;
+        for (int e = 0; e < 3; ++e)
+          reciprocal += (k[e] - twist[e]) * lattice[3 * d + e] / (2 * std::acos(-1.0));
+        if (!isFiniteDouble(reciprocal) || std::abs(reciprocal - std::round(reciprocal)) > 1e-10)
+          throw std::invalid_argument("Complex orbital target momentum/twist is not reciprocal");
+      }
+    }
+    orbitals[spin] = free->makeClone();
+    first += count;
+  }
+  return {OrbitalTargetDescriptor::makeSingleReference(identity, electrons.groupsize(0),
+      electrons.groupsize(1), channels), std::move(orbitals), lattice, reduced, cartesian};
+}
+
+/// Allocate only the frozen target and per-spin value scratch; SPO clone storage is separate.
+ComplexOrbitalTargetEvaluator::ComplexOrbitalTargetEvaluator(OrbitalTargetDescriptor descriptor,
+    std::array<std::unique_ptr<SPOSet>, 2>&& orbitals, std::array<double, 9> lattice,
+    std::array<double, 3> reduced, std::array<double, 3> cartesian)
+    : descriptor_(std::move(descriptor)), orbitals_(std::move(orbitals)), lattice_(lattice),
+      reduced_twist_(reduced), cartesian_twist_(cartesian),
+      target_(descriptor_.terms().size() * descriptor_.electronCount() * descriptor_.electronCount())
+{
+  for (int spin = 0; spin < 2; ++spin)
+    scratch_[spin].resize(orbitals_[spin]->getOrbitalSetSize());
+}
+
+/// Validate all sample metadata/coordinates before filling one reusable target matrix.
+const std::vector<std::complex<double>>& ComplexOrbitalTargetEvaluator::evaluate(const ParticleSet& electrons)
+{
+  const auto n = descriptor_.electronCount(), up = descriptor_.spinUpElectrons();
+  if (electrons.isSpinor() || electrons.getActivePtcl() >= 0 || electrons.getTotalNum() != n ||
+      electrons.groups() != 2 || electrons.groupsize(0) != up || electrons.groupsize(1) != n - up ||
+      electrons.getLattice().SuperCellEnum != SUPERCELL_BULK || electrons.R.size() != n || electrons.GroupID.size() != n)
+    throw std::invalid_argument("Complex orbital target sample/spin mismatch");
+  for (std::size_t row = 0; row < n; ++row)
+    for (int d = 0; d < 3; ++d)
+      if (electrons.GroupID[row] != (row < up ? 0 : 1) || !isFiniteDouble(electrons.R[row][d]))
+        throw std::invalid_argument("Complex orbital target sample coordinates/spin order invalid");
+  for (int d = 0; d < 3; ++d)
+  {
+    if (electrons.getTwist()[d] != reduced_twist_[d])
+      throw std::invalid_argument("Complex orbital target sample twist changed");
+    for (int e = 0; e < 3; ++e)
+      if (electrons.getLattice().R(d, e) != lattice_[3 * d + e])
+        throw std::invalid_argument("Complex orbital target lattice changed");
+  }
+  std::fill(target_.begin(), target_.end(), std::complex<double>{});
+  for (std::size_t row = 0; row < n; ++row)
+  {
+    const int spin = row < up ? 0 : 1;
+    double phase = 0;
+    for (int d = 0; d < 3; ++d)
+      phase -= cartesian_twist_[d] * electrons.R[row][d];
+    orbitals_[spin]->evaluateValue(electrons, row, scratch_[spin]);
+    // Remove the common row twist exactly once; reciprocal orbital phases remain.
+    const std::complex<double> detwist{std::cos(phase), std::sin(phase)};
+    for (std::size_t column = 0; column < (spin ? n - up : up); ++column)
+      for (std::size_t channel = 0; channel < descriptor_.terms().size(); ++channel)
+        target_[(channel * n + row) * n + column + (spin ? up : 0)] = detwist * scratch_[spin][column];
+  }
+  for (auto value : target_)
+    if (!isFiniteDouble(value.real()) || !isFiniteDouble(value.imag()))
+      throw std::overflow_error("Complex orbital target value is nonfinite");
+  return target_;
+}
+
+/// Excludes opaque SPO clone storage and descriptor metadata, as documented by the API.
+std::size_t ComplexOrbitalTargetEvaluator::retainedScalarBytes() const noexcept
+{
+  return (target_.capacity() + scratch_[0].capacity() + scratch_[1].capacity()) * sizeof(std::complex<double>);
+}
+#endif
+
 namespace
 {
 

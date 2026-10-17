@@ -733,6 +733,24 @@ struct PsiFormerComplexWF::Impl
     std::mutex execution_mutex;
   };
 
+  /// Orbital pretraining needs no kinetic workspace or three derivative-channel P buffers.
+  struct OrbitalMSELane
+  {
+    static std::size_t required(const Model& s)
+    {
+      auto bytes = pf::DirectComplexScoreWorkspace::storageRequirement(DerivativeLane::shape(s));
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(
+          3, s.model.cfg.nuclei.shape[0], "orbital metadata overflow"), "orbital metadata overflow"),
+          "orbital owner overflow");
+      return bytes;
+    }
+    explicit OrbitalMSELane(const Model& s) : score(s.model, s.plan), work(score.makeWorkspace()) {}
+    std::size_t bytes() const { return work->vectorStorageBytes() + score.numericMetadataStorageBytes(); }
+    const pf::DirectComplexScoreExecutor score;
+    std::unique_ptr<pf::DirectComplexScoreWorkspace> work;
+    std::mutex execution_mutex;
+  };
+
   /// Immutable sample snapshot; operators in one model family lease a single numerical lane.
   struct DerivativeStream final : wftrain::StreamingDerivativeOperator
   {
@@ -1514,6 +1532,7 @@ struct PsiFormerComplexWF::Impl
 
   psiformer::PsiFormerTimers phase_timers;
   std::shared_ptr<Model> state;
+  std::shared_ptr<OrbitalMSELane> orbital_mse;
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
@@ -1555,6 +1574,77 @@ PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
 {
   std::shared_lock read(impl_->state->mutex);
   return impl_->numericStorage();
+}
+
+/// Share the immutable boundary convention without exposing model or numerical storage.
+std::array<double, 3> PsiFormerComplexWF::reducedTwist() const { return impl_->state->reduced_twist; }
+
+/// This explicit owner excludes target/caller P output and all ordinary inference owners.
+PsiFormerComplexWF::OrbitalMSEStorage PsiFormerComplexWF::orbitalMSEStorage() const
+{
+  auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex orbital-MSE is CPU-only");
+  std::lock_guard factory(state->derivative_factory_mutex);
+  const auto& lane = impl_->orbital_mse;
+  return {Impl::OrbitalMSELane::required(*state), lane ? lane->bytes() : 0,
+      lane ? lane->work->storageFingerprint() ^ lane->score.numericMetadataStorageFingerprint() : 0};
+}
+
+/// Admit the exact score-only allocation before construction; repeat preparation is a no-op.
+void PsiFormerComplexWF::prepareOrbitalMSE(std::size_t maximum_bytes)
+{
+  auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex orbital-MSE is CPU-only");
+  impl_->requireIdle(*impl_->particles);
+  Impl::validateDerivativeSource(*state);
+  const auto required = Impl::OrbitalMSELane::required(*state);
+  if (!maximum_bytes || maximum_bytes == std::numeric_limits<std::size_t>::max() || required > maximum_bytes)
+    throw std::length_error("Complex orbital-MSE numeric cap exceeded before preparation");
+  if (state->pending_proposals.load(std::memory_order_relaxed))
+    throw std::logic_error("Complex orbital-MSE requires an idle model family");
+  std::lock_guard factory(state->derivative_factory_mutex);
+  if (!impl_->orbital_mse)
+    impl_->orbital_mse = std::make_shared<Impl::OrbitalMSELane>(*state);
+}
+
+/// Read one stable model version and use only prepared scratch, never accepted caches.
+double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
+    const std::vector<std::complex<double>>& target, std::vector<double>& gradient,
+    std::size_t expected_version) const
+{
+  auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex orbital-MSE is CPU-only");
+  if (state->model.p.version() != expected_version)
+    throw std::runtime_error("Complex orbital-MSE parameter version is stale");
+  impl_->requireIdle(*impl_->particles);
+  Impl::validateDerivativeSource(*state);
+  const auto n = state->model.ne, up = state->model.cfg.nup;
+  if (state->pending_proposals.load(std::memory_order_relaxed) || particles.getActivePtcl() >= 0 ||
+      particles.isSpinor() || particles.getTotalNum() != n || particles.groups() != 2 ||
+      particles.groupsize(0) != up || particles.groupsize(1) != n - up || particles.R.size() != n || particles.GroupID.size() != n)
+    throw std::invalid_argument("Complex orbital-MSE sample/proposal/spin mismatch");
+  validateRuntimeLattice(particles, state->environment, "Complex orbital-MSE sample");
+  for (std::size_t row = 0; row < n; ++row)
+    for (int d = 0; d < 3; ++d)
+      if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
+        throw std::invalid_argument("Complex orbital-MSE coordinates/spin order invalid");
+  std::shared_ptr<Impl::OrbitalMSELane> lane;
+  {
+    std::lock_guard factory(state->derivative_factory_mutex);
+    lane = impl_->orbital_mse;
+  }
+  if (!lane)
+    throw std::logic_error("Complex orbital-MSE must be explicitly prepared");
+  std::lock_guard execution(lane->execution_mutex);
+  impl_->positions(*lane->work, particles);
+  return lane->score.evaluateOrbitalMSE(*lane->work,
+      {target.data(), target.size(), gradient.data(), gradient.size()}).loss;
 }
 
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.

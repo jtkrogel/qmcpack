@@ -20,6 +20,10 @@
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
+#include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "Utilities/RuntimeOptions.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
@@ -245,6 +249,140 @@ WaveFunctionComponent::LogValue evaluate(WaveFunctionComponent& component, Parti
   return component.evaluateLog(p, p.G, p.L);
 }
 } // namespace
+
+TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed gauge and ownership",
+          "[wavefunction][psiformer][complex_wf][complex_orbital_adapter]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const ParticleSet::PosType reduced{.17, -.11, .07};
+  p.setTwist(reduced);
+  clone_p.setTwist(reduced);
+  const std::array<double, 3> twist{reduced[0], reduced[1], reduced[2]};
+  const auto cartesian = p.getLattice().k_cart(reduced);
+  std::array<ParticleSet::PosType, 2> reciprocal{
+      p.getLattice().k_cart(ParticleSet::PosType{1, 0, 0}),
+      p.getLattice().k_cart(ParticleSet::PosType{0, 1, 0})};
+  std::vector<std::unique_ptr<SPOSet>> spos;
+  std::vector<std::unique_ptr<DiracDeterminantBase>> dets;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    spos.push_back(std::make_unique<FreeOrbital>("target" + std::to_string(spin),
+        std::vector<ParticleSet::PosType>{cartesian, cartesian + reciprocal[spin]}));
+    dets.push_back(std::make_unique<DiracDeterminant<>>(*spos.back(), 2 * spin, 2 * spin + 2));
+  }
+  SlaterDet teacher(p, std::move(spos), std::move(dets));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 0));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, p, twist, std::numeric_limits<std::size_t>::max()));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, {}, 2));
+  auto target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2);
+  const auto original_positions = p.R;
+  const auto fixed = target.evaluate(p);
+  REQUIRE(fixed.size() == 32);
+  for (std::size_t d = 0; d < 2; ++d)
+    for (std::size_t row = 0; row < 4; ++row)
+      for (std::size_t column = 0; column < 4; ++column)
+      {
+        const auto index = (d * 4 + row) * 4 + column;
+        if ((row < 2) != (column < 2))
+          CHECK(fixed[index] == C{});
+        else
+        {
+          double phase = 0;
+          if (column % 2)
+            for (int dim = 0; dim < 3; ++dim)
+              phase += reciprocal[row < 2 ? 0 : 1][dim] * p.R[row][dim];
+          close(fixed[index], std::exp(C{0, phase}));
+        }
+      }
+  const auto retained = target.retainedScalarBytes();
+  const auto fingerprint = target.descriptor().fingerprint();
+  for (int dim = 0; dim < 3; ++dim)
+    p.R[0][dim] += p.getLattice().R(0, dim);
+  const auto translated = target.evaluate(p);
+  for (std::size_t index = 0; index < fixed.size(); ++index)
+    close(translated[index], fixed[index]);
+  p.R = original_positions;
+  CHECK(target.retainedScalarBytes() == retained);
+  CHECK(target.descriptor().fingerprint() == fingerprint);
+  auto twin_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2);
+  CHECK(twin_target.descriptor().fingerprint() == fingerprint);
+  // Changing the occupied reciprocal label changes immutable target identity.
+  std::vector<std::unique_ptr<SPOSet>> changed_spos;
+  std::vector<std::unique_ptr<DiracDeterminantBase>> changed_dets;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    changed_spos.push_back(std::make_unique<FreeOrbital>("changed" + std::to_string(spin),
+        std::vector<ParticleSet::PosType>{cartesian, cartesian + 2.0 * reciprocal[spin]}));
+    changed_dets.push_back(std::make_unique<DiracDeterminant<>>(*changed_spos.back(), 2 * spin, 2 * spin + 2));
+  }
+  SlaterDet changed_teacher(p, std::move(changed_spos), std::move(changed_dets));
+  auto changed_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(changed_teacher, p, twist, 2);
+  CHECK(changed_target.descriptor().fingerprint() != fingerprint);
+  p.setTwist(ParticleSet::PosType{});
+  CHECK_THROWS(target.evaluate(p));
+  p.setTwist(reduced);
+  auto altered_lattice = cell();
+  altered_lattice.R(0, 0) += .1;
+  altered_lattice.reset();
+  const SimulationCell altered_cell(altered_lattice);
+  auto altered_p = electrons(altered_cell);
+  altered_p.setTwist(reduced);
+  CHECK_THROWS(target.evaluate(altered_p));
+
+  PsiFormerComplexWF component("orbital", parameters(), p, source, clone_cap, twist);
+  CHECK(component.reducedTwist() == twist);
+  evaluate(component, p);
+  const auto accepted = component.get_log_value();
+  const auto snapshot = component.snapshotParameters();
+  std::vector<double> gradient(snapshot.values.size(), 123);
+  CHECK_THROWS(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version));
+  auto owner = component.orbitalMSEStorage();
+  REQUIRE(owner.required_bytes > 0);
+  CHECK(owner.prepared_bytes == 0);
+  CHECK_THROWS(component.prepareOrbitalMSE(0));
+  CHECK_THROWS(component.prepareOrbitalMSE(owner.required_bytes - 1));
+  CHECK(component.orbitalMSEStorage().prepared_bytes == 0);
+  component.prepareOrbitalMSE(owner.required_bytes);
+  owner = component.orbitalMSEStorage();
+  CHECK(owner.prepared_bytes == owner.required_bytes);
+  const double loss = component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version);
+  CHECK(std::isfinite(loss));
+  CHECK(std::any_of(gradient.begin(), gradient.end(), [](double value) { return std::abs(value) > 1e-8; }));
+  const auto analytic = gradient;
+  CHECK(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version) == loss);
+  CHECK(gradient == analytic);
+  CHECK(component.orbitalMSEStorage().storage_fingerprint == owner.storage_fingerprint);
+  CHECK(component.get_log_value() == accepted);
+  for (int row = 0; row < 4; ++row)
+    CHECK(p.R[row] == original_positions[row]);
+  auto clone = component.makeClone(clone_p);
+  auto& cloned = dynamic_cast<PsiFormerComplexWF&>(*clone);
+  CHECK(cloned.orbitalMSEStorage().prepared_bytes == 0);
+  cloned.prepareOrbitalMSE(owner.required_bytes);
+  CHECK(cloned.orbitalMSEStorage().storage_fingerprint != owner.storage_fingerprint);
+  std::fill(gradient.begin(), gradient.end(), 123);
+  CHECK_THROWS(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version + 1));
+  CHECK(std::all_of(gradient.begin(), gradient.end(), [](double value) { return value == 123; }));
+  p.makeMove(0, ParticleSet::PosType{.01, 0, 0});
+  CHECK_THROWS(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version));
+  p.rejectMove(0);
+  CHECK_THROWS(component.evaluateOrbitalMSE(altered_p, fixed, gradient, snapshot.version));
+  auto malformed = fixed;
+  malformed.pop_back();
+  CHECK_THROWS(component.evaluateOrbitalMSE(p, malformed, gradient, snapshot.version));
+  CHECK(std::all_of(gradient.begin(), gradient.end(), [](double value) { return value == 123; }));
+  CHECK(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version) == loss);
+  CHECK(component.snapshotParameters().values == snapshot.values);
+  auto candidate = snapshot;
+  candidate.values[1] += .01;
+  const auto version = component.publishParameters(candidate, snapshot.version);
+  CHECK_THROWS(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version));
+  CHECK(std::isfinite(component.evaluateOrbitalMSE(p, fixed, gradient, version)));
+  CHECK(component.orbitalMSEStorage().storage_fingerprint == owner.storage_fingerprint);
+}
 
 TEST_CASE("PsiFormer paired neural weights preserve phase head roles and exclude nonweights",
           "[wavefunction][psiformer][complex_wf][complex_weight_blocks]")
