@@ -1738,26 +1738,40 @@ TEST_CASE("Legacy distinct-spin MD orbital products include CI Jastrow and full 
   CHECK(bank(*cold, 1).C.get() == before_down);
   check_frame();
 
-  // The legacy MD derivative implementation requires both spin owners to be
-  // optimizable. Reject a one-active-spin model before any attempted update.
-  Libxml2Document incomplete;
-  incomplete.newDoc("test");
-  auto* incomplete_node = xmlDocCopyNode(definition.getRoot(), incomplete.getDocument(), 1);
-  REQUIRE(incomplete_node);
-  incomplete.addChild(incomplete_node);
-  auto* collection = xmlFirstElementChild(incomplete_node);
-  auto* down_wrapper = xmlLastElementChild(collection);
-  REQUIRE(std::string(reinterpret_cast<const char*>(down_wrapper->name)) == "rotated_sposet");
-  auto* down_spo = xmlFirstElementChild(down_wrapper);
-  xmlUnlinkNode(down_spo);
-  xmlSetProp(down_spo, BAD_CAST "name", BAD_CAST "rot_dn");
-  xmlReplaceNode(down_wrapper, down_spo);
-  xmlFreeNode(down_wrapper);
-  WaveFunctionFactory incomplete_factory(particles, pool.getPool(), OHMMS::Controller);
-  auto incomplete_wf = incomplete_factory.buildTWF(incomplete_node, RuntimeOptions{});
-  REQUIRE(incomplete_wf);
-  CHECK_THROWS_WITH(TrainingWaveFunctionBinding(*incomplete_wf, particles, adapterOptions(), *OHMMS::Controller),
-                    Catch::Matchers::ContainsSubstring("two distinct active MD spin owners"));
+  // One-active-spin input already APP_ABORTs in SlaterDetBuilder; exercise that
+  // early input rejection in a native subprocess, never inside this unit test.
+  // A constructible BOTH-fixed model checks the validator's source/prepared
+  // participant contract without weakening the existing builder guard.
+  Libxml2Document fixed_definition;
+  fixed_definition.newDoc("test");
+  auto* fixed_node = xmlDocCopyNode(definition.getRoot(), fixed_definition.getDocument(), 1);
+  REQUIRE(fixed_node);
+  fixed_definition.addChild(fixed_node);
+  auto* collection = xmlFirstElementChild(fixed_node);
+  for (auto* wrapper = xmlFirstElementChild(collection); wrapper;)
+  {
+    auto* next = xmlNextElementSibling(wrapper);
+    if (std::string(reinterpret_cast<const char*>(wrapper->name)) == "rotated_sposet")
+    {
+      auto* spo = xmlFirstElementChild(wrapper);
+      auto* name = xmlGetProp(wrapper, BAD_CAST "name");
+      REQUIRE(name);
+      xmlUnlinkNode(spo);
+      xmlSetProp(spo, BAD_CAST "name", name);
+      xmlFree(name);
+      xmlReplaceNode(wrapper, spo);
+      xmlFreeNode(wrapper);
+    }
+    wrapper = next;
+  }
+  WaveFunctionFactory fixed_factory(particles, pool.getPool(), OHMMS::Controller);
+  auto fixed_wf = fixed_factory.buildTWF(fixed_node, RuntimeOptions{});
+  REQUIRE(fixed_wf);
+  auto& fixed_md = fixed_wf->findMSD().front().get();
+  CHECK_THROWS_WITH(md.validatePreparedRotatedCoefficientState(fixed_md),
+                    Catch::Matchers::ContainsSubstring("two distinct active spin owners"));
+  CHECK_THROWS_WITH(fixed_md.validatePreparedRotatedCoefficientState(md),
+                    Catch::Matchers::ContainsSubstring("two distinct active spin owners"));
   CHECK(binding.snapshotParameters().values == accepted.values);
 }
 
