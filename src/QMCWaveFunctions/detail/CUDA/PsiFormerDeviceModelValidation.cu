@@ -123,10 +123,13 @@ void writeReferences(const std::string& filename, const std::vector<Reference>& 
   }
   if (!output) throw std::runtime_error("Reference output write failed");
 }
+
 /// Exercise composite ownership independently of unrelated reverse/score graphs.
 void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
-                         const Reference& reference)
+                         const std::vector<Reference>& references, std::size_t batch)
 {
+  if (model.cfg.nconfig < 3 || references.size() != 3)
+    throw std::invalid_argument("Parallel batched VGL requires three independent fixture configurations");
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   AcceleratorBlasHandle handle(queue);
   const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
@@ -137,13 +140,15 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
   checkRuntime(cudaGetDevice(&ordinal), "parallel VGL test device");
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
-  const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+  // Preserve each fixture configuration; B is independent of the target count K.
+  const std::vector<double> positions(model.cfg.electrons.x.begin(),
+      model.cfg.electrons.x.begin() + batch * 3 * model.ne);
   for (const auto k : {std::size_t(1), std::min<std::size_t>(3, model.ne), model.ne})
   {
     TargetVglPreparation request{k, 0, 0, 1024 * 1024};
-    const auto base = estimateTargetVglCost(plan, 1, k);
-    const auto cost = estimatePreparedTargetVglCost(plan, 1, request);
-    const auto leaf = planSpatialTraceWorkspace({1, model.ndet, model.ne, 3 * k, k},
+    const auto base = estimateTargetVglCost(plan, batch, k);
+    const auto cost = estimatePreparedTargetVglCost(plan, batch, request);
+    const auto leaf = planSpatialTraceWorkspace({batch, model.ndet, model.ne, 3 * k, k},
         request.parallel_trace_workspace_budget_bytes);
     if (cost.device_workspace_bytes != base.device_workspace_bytes + leaf.total_device_bytes ||
         cost.host_workspace_bytes != base.host_workspace_bytes)
@@ -161,12 +166,16 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     prepared.select_vgl_targets = false;
     PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, prepared);
     const auto before_context = metrics.snapshot();
-    bool batch_denied = false;
-    try { (void)backend.prepare(2); }
-    catch (const std::invalid_argument&) { batch_denied = true; }
-    if (!batch_denied || metrics.snapshot().allocation_calls != before_context.allocation_calls)
-      throw std::runtime_error("Parallel VGL actual B2 owner allocated before rejection");
-    const auto reject = [&](TargetVglPreparation bad, bool retained = false, std::size_t batch = 1) {
+    bool larger_denied = false;
+    try { (void)backend.prepare(batch + 1); }
+    catch (const std::length_error&) { larger_denied = true; }
+    if (!larger_denied || metrics.snapshot().allocation_calls != before_context.allocation_calls)
+      throw std::runtime_error("Parallel VGL over-budget actual capacity allocated before rejection");
+    // Admit the matching actual backend owner, then release it before the direct graph.
+    {
+      const auto admitted_owner = backend.prepare(batch);
+    }
+    const auto reject = [&](TargetVglPreparation bad, bool retained = false) {
       const auto before = metrics.snapshot();
       bool denied = false;
       try { PreparedDeviceInference graph(image, batch, queue, handle, SpatialJetMode::FULL_VGL,
@@ -182,9 +191,11 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     bad = request;
     bad.parallel_trace_workspace_budget_bytes = 1;
     reject(bad);
+    bad = request;
+    --bad.scalar_work_budget;
+    reject(bad);
     reject(request, true);
-    reject(request, false, 2);
-    PreparedDeviceInference graph(image, 1, queue, handle, SpatialJetMode::FULL_VGL,
+    PreparedDeviceInference graph(image, batch, queue, handle, SpatialJetMode::FULL_VGL,
                                  false, false, InferenceStatusPolicy::DEFERRED_NEURAL, request);
     if (graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
         graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
@@ -193,20 +204,25 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
       const auto before = metrics.snapshot();
       graph.evaluate(positions);
       const auto& layout = graph.resultLayout();
-      std::vector<double> phase(1), jets(spatialJetSpanElements(layout)), ratios(model.ne);
+      std::vector<double> phase(batch), jets(spatialJetSpanElements(layout)), ratios(batch * model.ne);
       graph.downloadResults(phase, jets, ratios);
-      near(phase[0], reference.sign, "parallel complete phase");
-      near(jets[layout.uncheckedValueOffset(0, 0)], reference.logabs, "parallel complete logabs");
-      for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
-        near(jets[layout.uncheckedGradientOffset(0, lane, 0)], reference.gradient[lane], "parallel complete G");
-      double kinetic = 0;
-      for (std::size_t electron = 0; electron < model.ne; ++electron)
+      // Leaf outputs are packed per configuration even when input jet planes have gaps.
+      for (std::size_t configuration = 0; configuration < batch; ++configuration)
       {
-        near(jets[layout.uncheckedLaplacianOffset(0, electron, 0)], reference.lap_log[electron], "parallel complete Llog");
-        near(ratios[electron], reference.lap_ratio[electron], "parallel complete Lratio");
-        kinetic -= .5 * ratios[electron];
+        const auto& reference = references[configuration];
+        near(phase[configuration], reference.sign, "parallel complete phase");
+        near(jets[layout.uncheckedValueOffset(configuration, 0)], reference.logabs, "parallel complete logabs");
+        for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+          near(jets[layout.uncheckedGradientOffset(configuration, lane, 0)], reference.gradient[lane], "parallel complete G");
+        double kinetic = 0;
+        for (std::size_t electron = 0; electron < model.ne; ++electron)
+        {
+          near(jets[layout.uncheckedLaplacianOffset(configuration, electron, 0)], reference.lap_log[electron], "parallel complete Llog");
+          near(ratios[configuration * model.ne + electron], reference.lap_ratio[electron], "parallel complete Lratio");
+          kinetic -= .5 * ratios[configuration * model.ne + electron];
+        }
+        near(kinetic, reference.kinetic, "parallel complete kinetic");
       }
-      near(kinetic, reference.kinetic, "parallel complete kinetic");
       const auto after = metrics.snapshot();
       if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
           after.live_bytes != before.live_bytes || graph.admittedTargetTiles() != cost.tile_count)
@@ -220,7 +236,7 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     if (!failed) throw std::runtime_error("Parallel VGL admitted nonfinite coordinates");
     bool revoked = false;
     try {
-      std::vector<double> phase(1), jets(spatialJetSpanElements(graph.resultLayout())), ratios(model.ne);
+      std::vector<double> phase(batch), jets(spatialJetSpanElements(graph.resultLayout())), ratios(batch * model.ne);
       graph.downloadResults(phase, jets, ratios);
     } catch (const std::logic_error&) { revoked = true; }
     if (!revoked) throw std::runtime_error("Parallel VGL exposed failed results");
@@ -229,7 +245,8 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     graph.rebindModel(successor);
     check();
   }
-  std::cout << "PASS parallel complete VGL FULL/K1/K3-tail, exact composite cost, denial, warm reuse, failure/retry and rebind\n";
+  std::cout << "PASS parallel complete VGL B" << batch
+            << " FULL/K1/K3-tail, exact composite cost, denial, warm reuse, failure/retry and rebind\n";
 }
 
 } // namespace
@@ -394,7 +411,9 @@ int main(int argc, char** argv)
     {
       if (argc != 10 || !shape_supplied || model.ne != 4)
         throw std::invalid_argument("Parallel VGL check requires only --shape D W H B and --parallel-vgl-check on Ne4");
-      validateParallelVgl(model, plan, cpuReferences(model, plan, 1).front());
+      const auto references = cpuReferences(model, plan, 3);
+      for (const auto batch : {std::size_t(1), std::size_t(2), std::size_t(3)})
+        validateParallelVgl(model, plan, references, batch);
       return 0;
     }
     if (!vgl_ownership.empty())

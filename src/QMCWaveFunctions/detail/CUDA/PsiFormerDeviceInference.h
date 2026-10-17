@@ -60,7 +60,7 @@ struct TargetVglPreparation
   std::size_t max_targets = 0;
   std::size_t device_workspace_budget_bytes = 0;
   std::size_t scalar_work_budget = 0;
-  /// Default zero preserves scalar traces; positive cap admits an additional real/open B1 leaf.
+  /// Default zero preserves scalar traces; positive cap admits an additional bounded real/open leaf.
   std::size_t parallel_trace_workspace_budget_bytes = 0;
 };
 
@@ -156,11 +156,11 @@ inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan&
   if (preparation.parallel_trace_workspace_budget_bytes)
   {
     const auto& environment = plan.environment();
-    if (batch != 1 || environment.boundary != BoundaryCondition::OPEN ||
+    if (environment.boundary != BoundaryCondition::OPEN ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-      throw std::invalid_argument("Parallel VGL traces require fixed-ion real/open B1 FP64");
+      throw std::invalid_argument("Parallel VGL traces require fixed-ion real/open FP64");
     const auto& shape = plan.modelShape();
     const auto k = preparation.max_targets;
     const auto trace = planSpatialTraceWorkspace({batch, shape.determinants, shape.electrons(),
