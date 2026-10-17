@@ -2705,7 +2705,8 @@ protected:
       if (hasDeviceProducts())
       {
         // Upload each real direction once for the whole retained population.
-        // A real model still supports algebraically complex optimizer vectors.
+        // Numerical staging separates real/imaginary components; the public
+        // REAL64 facade currently admits real tangent directions only.
         std::fill(sample_products_.begin(), sample_products_.end(), wftrain::DerivativeValue{});
         const auto capacity = deviceScoreCapacity();
         std::size_t completed_tiles = 0, components = 0, final_count = 0;
