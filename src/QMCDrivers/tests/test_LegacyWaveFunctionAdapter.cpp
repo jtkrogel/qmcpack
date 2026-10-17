@@ -38,6 +38,7 @@
 #include "ResourceCollection.h"
 #include "Utilities/StdRandom.h"
 #include "Utilities/FakeRandom.h"
+#include "LegacyP1MatrixTest.h"
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
@@ -3867,6 +3868,44 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
         }
     }
     REQUIRE(dense_s[3] > 1e-10);
+    const bool compare_legacy = !csf && !ecp;
+    qmcplusplus::testing::LegacyP1Matrices legacy{};
+    if (compare_legacy)
+    {
+      std::array<qmcplusplus::testing::LegacyP1Sample, 4> records;
+      for (int sample = 0; sample < 4; ++sample)
+      {
+        records[sample] = {weights[sample], energies[sample].real(), score[sample], del[sample]};
+        replay->prepareSample(sample);
+        // Psi and H*Psi are exactly linear in C1. Independent signed secants
+        // validate the physical records shared by old/new matrix assembly.
+        const auto physical = [&](double displacement) {
+          ParticleSet p(private_particles);
+          auto wf = source->makeClone(p);
+          wf->findMSD()[0].get().isolateOptimizationState();
+          p.update();
+          auto point = parameters; point.values[0] += displacement;
+          adapter.installSnapshot(*wf, p, point);
+          const double ratio = std::exp(wf->getLogPsi() - log[sample]) *
+              std::cos(wf->getPhase() - phase[sample]);
+          return std::array<double, 2>{ratio, (kineticEnergy(p).real() + coulomb(p)) * ratio};
+        };
+        const auto plus = physical(.125), minus = physical(-.125);
+        CHECK((plus[0] - minus[0]) / .25 == Catch::Approx(score[sample]).epsilon(2e-10).margin(2e-10));
+        CHECK((plus[1] - minus[1]) / .25 - energies[sample].real() * score[sample] ==
+              Catch::Approx(del[sample]).epsilon(2e-10).margin(2e-10));
+      }
+      legacy = qmcplusplus::testing::legacyP1Matrices(records);
+      // Old fill uses RAW centered H. New LM symmetrizes it; neither policy
+      // implies equal updates. Old all-LINEAR rescale=1 omits the fixed-C0
+      // projective denominator already checked physically below for new LM.
+      CHECK(legacy.linear_rescale == 1.0);
+      for (int entry = 0; entry < 4; ++entry)
+      {
+        CHECK(legacy.hamiltonian[entry] == Catch::Approx(dense_raw[entry]).epsilon(2e-10).margin(2e-10));
+        CHECK(legacy.overlap[entry] == Catch::Approx(dense_s[entry]).epsilon(2e-10).margin(2e-10));
+      }
+    }
     if (!ecp) batches.push_back({op.get(), {weights.data(), 4}, {energies.data(), 4}});
     const DerivativeArrayView<const ScoreCovarianceBatch> views{batches.data(), batches.size()};
     ScoreCovarianceFactor factor(schema, parameters.version, views);
@@ -3886,6 +3925,13 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
         CHECK(h_action[row].real() == Catch::Approx(dense_h[2 * row + column]).epsilon(2e-10).margin(2e-10));
         CHECK(s_action[row].real() == Catch::Approx(dense_s[2 * row + column]).epsilon(2e-10).margin(2e-10));
         CHECK(raw_action[row].real() == Catch::Approx(dense_raw[2 * row + column]).epsilon(2e-10).margin(2e-10));
+        if (compare_legacy)
+        {
+          CHECK(raw_action[row].real() == Catch::Approx(legacy.hamiltonian[2 * row + column]).epsilon(2e-10).margin(2e-10));
+          CHECK(s_action[row].real() == Catch::Approx(legacy.overlap[2 * row + column]).epsilon(2e-10).margin(2e-10));
+          CHECK(h_action[row].real() == Catch::Approx(0.5 * (legacy.hamiltonian[2 * row + column] + legacy.hamiltonian[2 * column + row]))
+                .epsilon(2e-10).margin(2e-10));
+        }
       }
     }
     MatrixFreeLinearMethodControl lm;
