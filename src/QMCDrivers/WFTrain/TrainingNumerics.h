@@ -12,6 +12,9 @@
 #ifndef QMCPLUSPLUS_TRAINING_NUMERICS_H
 #define QMCPLUSPLUS_TRAINING_NUMERICS_H
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -28,6 +31,29 @@ inline bool isFiniteTrainingReal(double value) noexcept
   std::memcpy(&bits, &value, sizeof(bits));
   return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
+
+namespace detail
+{
+/// Bound projected transposed dot products by their actual vector/action norms.
+inline bool projectedPairIsHermitian(double left, double right,
+                                    double left_action_scale, double right_action_scale,
+                                    double tolerance_multiplier, std::size_t parameter_count) noexcept
+{
+  // S-normalized vectors can have large Euclidean norms near weak overlap
+  // directions, even when their projected entries nearly cancel.
+  const double action_scale = left_action_scale + right_action_scale;
+  if (!isFiniteTrainingReal(left) || !isFiniteTrainingReal(right) ||
+      !isFiniteTrainingReal(action_scale) || action_scale < 0.0)
+    return false;
+  const double accumulated_roundoff = static_cast<double>(parameter_count) * std::numeric_limits<double>::epsilon();
+  const double gamma = accumulated_roundoff < 0.5 ? accumulated_roundoff / (1.0 - accumulated_roundoff) : 1.0;
+  const double tolerance = tolerance_multiplier * gamma *
+      std::max({1.0, std::abs(left), std::abs(right), action_scale});
+  if (!isFiniteTrainingReal(tolerance))
+    return false;
+  return std::abs(left - right) <= tolerance;
+}
+} // namespace detail
 
 } // namespace qmcplusplus::wftrain
 

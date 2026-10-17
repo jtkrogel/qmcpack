@@ -209,32 +209,6 @@ bool contractionIsReal(DerivativeValue value,
   return std::abs(value.imag()) <= tolerance;
 }
 
-/// Compare projected transposed entries with a scale-aware floating-point bound.
-bool projectedPairIsHermitian(DerivativeReal left,
-                              DerivativeReal right,
-                              DerivativeReal left_action_scale,
-                              DerivativeReal right_action_scale,
-                              DerivativeReal tolerance_multiplier,
-                              std::size_t parameter_count) noexcept
-{
-  // Each projected entry is a dot product v_i^dagger A v_j. Its roundoff
-  // depends on the vector/action norms, even when the resulting entry nearly
-  // cancels. S-normalized vectors can have large Euclidean norms near weak
-  // overlap directions; scaling only by the final entries rejects valid actions.
-  const DerivativeReal action_scale = left_action_scale + right_action_scale;
-  if (!isFiniteTrainingReal(action_scale) || action_scale < 0.0)
-    return false;
-  const DerivativeReal accumulated_roundoff =
-      static_cast<DerivativeReal>(parameter_count) *
-      std::numeric_limits<DerivativeReal>::epsilon();
-  const DerivativeReal gamma = accumulated_roundoff < 0.5
-      ? accumulated_roundoff / (1.0 - accumulated_roundoff)
-      : 1.0;
-  const DerivativeReal tolerance = tolerance_multiplier * gamma *
-      std::max({DerivativeReal{1}, std::abs(left), std::abs(right), action_scale});
-  return std::abs(left - right) <= tolerance;
-}
-
 /// Diagonalize one small real symmetric matrix with bounded Jacobi sweeps.
 bool smallestSymmetricEigenpair(std::vector<DerivativeReal> matrix,
                                 std::size_t dimension,
@@ -685,12 +659,12 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
       for (std::size_t row = 0; row < dimension; ++row)
         for (std::size_t column = row + 1; column < dimension; ++column)
         {
-          if (!projectedPairIsHermitian(projected_h[row * dimension + column],
+          if (!detail::projectedPairIsHermitian(projected_h[row * dimension + column],
                                         projected_h[column * dimension + row],
                                         basis_norms[row] * h_norms[column],
                                         basis_norms[column] * h_norms[row],
                                         control.hermitian_tolerance, augmented_size) ||
-              !projectedPairIsHermitian(projected_s[row * dimension + column],
+              !detail::projectedPairIsHermitian(projected_s[row * dimension + column],
                                         projected_s[column * dimension + row],
                                         basis_norms[row] * s_norms[column],
                                         basis_norms[column] * s_norms[row],

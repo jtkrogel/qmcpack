@@ -141,6 +141,12 @@ public:
     // LAPACK dimensions are int; matrix indexing must remain size_t to avoid m*m overflow.
     const std::size_t stride = b.v.size();
     std::vector<double> hp(stride * stride), sp(stride * stride), ar(m), ai(m), beta(m), vr(stride * stride);
+    std::vector<double> basis_norms(stride), overlap_norms(stride);
+    for (std::size_t i = 0; i < stride; ++i)
+    {
+      basis_norms[i] = norm(b.v[i]);
+      overlap_norms[i] = norm(b.s[i]);
+    }
     for (int j = 0; j < m; ++j)
       for (int i = 0; i < m; ++i)
       {
@@ -150,9 +156,9 @@ public:
     // Do not silently symmetrize a provider that violates its S promise.
     for (int j = 0; j < m; ++j)
       for (int i = 0; i < j; ++i)
-        if (std::abs(sp[i + stride * j] - sp[j + stride * i]) >
-            c_.outer.hermitian_tolerance * std::numeric_limits<double>::epsilon() * n_ *
-                std::max({1.0, std::abs(sp[i + stride * j]), std::abs(sp[j + stride * i])}))
+        if (!detail::projectedPairIsHermitian(sp[i + stride * j], sp[j + stride * i],
+                basis_norms[i] * overlap_norms[j], basis_norms[j] * overlap_norms[i],
+                c_.outer.hermitian_tolerance, n_))
           throw Stop{LinearMethodStopReason::NON_HERMITIAN_ACTION};
     char no = 'N', yes = 'V';
     int lwork = std::max(1, 8 * m);

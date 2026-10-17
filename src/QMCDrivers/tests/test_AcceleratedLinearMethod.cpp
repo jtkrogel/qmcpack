@@ -4,6 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "Utilities/for_testing/Catch2Approx.h"
 #include <catch2/catch_test_macros.hpp>
 #include <cmath>
@@ -174,5 +175,31 @@ TEST_CASE("Accelerated LM restarts with bounded retained storage", "[drivers][wf
   CHECK(result.peak_subspace_dimension <= 2);
   CHECK(result.peak_parameter_vectors <= 9 * 2 + 18 + 2 * 1 + 4);
   CHECK(result.operator_applications <= c.outer.maximum_operator_applications);
+}
+
+TEST_CASE("Accelerated LM projected overlap distinguishes cancellation from material asymmetry",
+          "[drivers][wftrain][linear_method][alm_roundoff]")
+{
+  // Exact native125 pair: cancellation in an S-normalized basis with actual
+  // Euclidean vector/action scales. The old entry-only test rejected this pair.
+  constexpr double left = 0x1.490c2a18bf61cp-57, right = -0x1.5bc21a653482dp-40;
+  constexpr double left_scale = 0x1.11c908d9f05a6p-1, right_scale = 0x1.54366a822e4f9p+2;
+  const double old_bound = 256 * std::numeric_limits<double>::epsilon() * 18;
+  CHECK(std::abs(left - right) > old_bound);
+  CHECK(detail::projectedPairIsHermitian(left, right, left_scale, right_scale, 256, 18));
+  CHECK_FALSE(detail::projectedPairIsHermitian(left, right + 1e-5, left_scale, right_scale, 256, 18));
+  const double infinity = std::numeric_limits<double>::infinity(), maximum = std::numeric_limits<double>::max();
+  CHECK_FALSE(detail::projectedPairIsHermitian(left, right, infinity, right_scale, 256, 18));
+  CHECK_FALSE(detail::projectedPairIsHermitian(left, right, maximum, maximum, 256, 18));
+  CHECK_FALSE(detail::projectedPairIsHermitian(left, right, maximum / 8, maximum / 8, maximum, 18));
+  CHECK_FALSE(detail::projectedPairIsHermitian(infinity, right, left_scale, right_scale, 256, 18));
+  // A true numerical S asymmetry must still fail in the actual solver, even
+  // when the provider claims its descriptor is Hermitian.
+  auto model = schema(1);
+  Dense h(model, {2, -2, -1, 8}, false);
+  Dense asymmetric_s(model, {1, 1e-3, 0, 1}, true);
+  const auto result = solve(h, asymmetric_s);
+  CHECK_FALSE(result.converged);
+  CHECK(result.stop_reason == LinearMethodStopReason::NON_HERMITIAN_ACTION);
 }
 } // namespace qmcplusplus::wftrain
