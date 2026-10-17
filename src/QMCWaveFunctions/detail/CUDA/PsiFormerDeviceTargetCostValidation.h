@@ -200,6 +200,40 @@ inline void validateTargetSelectionCosts()
       if (resolveDeviceTargetSelection(plan, request, 0).vgl.max_targets != 3)
         throw std::runtime_error("Unset selector changed an explicit noncandidate K");
     }
+  // The same whole-owner budget selects K2 at B1 but only K1 at actual B2.
+  const auto plan = makeTargetCostPlan(100, false);
+  DeviceExecutionPreparation parallel;
+  parallel.select_vgl_targets = true;
+  parallel.vgl = {1, 0, 0, 1024 * 1024};
+  const auto minimum_b2 = estimatePreparedTargetVglCost(plan, 2, parallel.vgl);
+  parallel.vgl = {0, minimum_b2.device_workspace_bytes, minimum_b2.charged_scalar_work_units,
+                  parallel.vgl.parallel_trace_workspace_budget_bytes};
+  const auto b1 = resolveDeviceTargetSelection(plan, parallel, 1);
+  const auto b2 = resolveDeviceTargetSelection(plan, parallel, 2);
+  if (b1.vgl.max_targets != 2 || b2.vgl.max_targets != 1 ||
+      resolveDeviceTargetSelection(plan, b2, 2).vgl.max_targets != 1)
+    throw std::runtime_error("Parallel selection leaked its B1 capacity or was nondeterministic");
+  validateDeviceExecutionPreparation(plan, b1, 1);
+  validateDeviceExecutionPreparation(plan, b2, 2);
+  infeasible([&] { validateDeviceExecutionPreparation(plan, b1, 2); });
+  auto denied = parallel;
+  --denied.vgl.device_workspace_budget_bytes;
+  infeasible([&] { (void)resolveDeviceTargetSelection(plan, denied, 2); });
+  denied = parallel;
+  denied.select_kinetic_targets = true;
+  invalid([&] { (void)resolveDeviceTargetSelection(plan, denied); });
+  invalid([&] { validateDeviceExecutionPreparation(plan, denied); });
+  denied.select_vgl_targets = false;
+  denied.vgl.max_targets = 1;
+  invalid([&] { (void)resolveDeviceTargetSelection(plan, denied); });
+  invalid([&] { validateDeviceExecutionPreparation(plan, denied); });
+  denied = parallel;
+  denied.active_inference_crowds = 2;
+  invalid([&] { (void)resolveDeviceTargetSelection(plan, denied); });
+  invalid([&] { validateDeviceExecutionPreparation(plan, denied); });
+  invalid([&] { (void)resolveDeviceTargetSelection(makeTargetCostPlan(100, true), parallel); });
+  invalid([&] { (void)resolveDeviceTargetSelection(makeTargetCostPlan(100, false, true), parallel); });
+  std::cout << "# PASS parallel_composite_selection exact_B2_budget B1K2_B2K1 capacity_denial profiles\n";
   const auto after = deviceMemoryMetrics(0).snapshot();
   if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
       after.live_bytes != before.live_bytes || after.upload_calls != before.upload_calls ||

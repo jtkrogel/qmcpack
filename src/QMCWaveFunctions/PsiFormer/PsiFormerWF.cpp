@@ -1017,8 +1017,8 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   }();
   if ((select_vgl && vgl) || (select_kinetic && kinetic))
     throw std::invalid_argument("GPU target selection cannot override explicit targets for the same family");
-  if (parallel_trace_bytes && (!vgl || select_vgl || select_kinetic || active_inference_crowds > 1))
-    throw std::invalid_argument("Parallel GPU VGL traces require explicit VGL targets, no automatic selection and one crowd");
+  if (parallel_trace_bytes && ((!vgl && !select_vgl) || select_kinetic || active_inference_crowds > 1))
+    throw std::invalid_argument("Parallel GPU VGL traces require VGL-only targets/selection and one active inference crowd");
   if (lifted && !kinetic && !select_kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic || select_vgl || select_kinetic) ? (!bytes || !work) : (bytes || work))

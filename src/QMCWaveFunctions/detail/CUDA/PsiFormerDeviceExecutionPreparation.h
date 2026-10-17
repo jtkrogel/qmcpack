@@ -98,8 +98,9 @@ inline std::size_t selectDeviceTargetCapacity(std::size_t electrons, std::size_t
 inline DeviceExecutionPreparation resolveDeviceTargetSelection(const PsiFormerExecutionPlan& plan,
     DeviceExecutionPreparation preparation, std::size_t vgl_capacity = 1)
 {
-  if (preparation.vgl.parallel_trace_workspace_budget_bytes && preparation.select_vgl_targets)
-    throw std::invalid_argument("Parallel VGL traces require an explicit target capacity");
+  if (preparation.vgl.parallel_trace_workspace_budget_bytes &&
+      (preparation.select_kinetic_targets || preparation.active_inference_crowds != 1))
+    throw std::invalid_argument("Parallel VGL selection admits only VGL and one active inference crowd");
   if (!preparation.select_vgl_targets && !preparation.select_kinetic_targets)
     return preparation;
   const auto& environment = plan.environment();
@@ -113,7 +114,11 @@ inline DeviceExecutionPreparation resolveDeviceTargetSelection(const PsiFormerEx
   const auto ne = plan.modelShape().electrons();
   if (preparation.select_vgl_targets)
     preparation.vgl.max_targets = selectDeviceTargetCapacity(ne, preparation.vgl.device_workspace_budget_bytes,
-        preparation.vgl.scalar_work_budget, [&](std::size_t k) { return estimateTargetVglCost(plan, vgl_capacity, k); });
+        preparation.vgl.scalar_work_budget, [&](std::size_t k) {
+          auto candidate = preparation.vgl;
+          candidate.max_targets = k;
+          return estimatePreparedTargetVglCost(plan, vgl_capacity, candidate);
+        });
   if (preparation.select_kinetic_targets)
     preparation.kinetic.max_targets = selectDeviceTargetCapacity(ne, preparation.kinetic.device_workspace_budget_bytes,
         preparation.kinetic.scalar_work_budget, [&](std::size_t k) {
@@ -151,6 +156,9 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
   if (!preparation.active_inference_crowds ||
       preparation.active_inference_crowds == std::numeric_limits<std::size_t>::max())
     throw std::invalid_argument("Active GPU inference crowds must be positive and finite");
+  if (preparation.vgl.parallel_trace_workspace_budget_bytes &&
+      (preparation.select_kinetic_targets || preparation.active_inference_crowds != 1))
+    throw std::invalid_argument("Parallel VGL admits no selected kinetic family or concurrent inference");
   const auto validate = [](std::size_t targets, std::size_t bytes, std::size_t work) {
     if (targets == 0 ? (bytes != 0 || work != 0) : (bytes == 0 || work == 0))
       throw std::invalid_argument("Device target preparation requires positive targets and both per-owner budgets");

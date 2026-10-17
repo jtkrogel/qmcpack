@@ -159,10 +159,9 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     prepared.vgl = request;
     validateDeviceExecutionPreparation(plan, prepared);
     prepared.select_vgl_targets = true;
-    bool auto_denied = false;
-    try { (void)resolveDeviceTargetSelection(plan, prepared); }
-    catch (const std::invalid_argument&) { auto_denied = true; }
-    if (!auto_denied) throw std::runtime_error("Parallel VGL admitted implicit target selection");
+    const auto selected = resolveDeviceTargetSelection(plan, prepared, batch);
+    const auto selected_cost = estimatePreparedTargetVglCost(plan, batch, selected.vgl);
+    validateDeviceExecutionPreparation(plan, selected, batch);
     prepared.select_vgl_targets = false;
     PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, prepared);
     const auto before_context = metrics.snapshot();
@@ -200,16 +199,18 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
     if (graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
         graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
       throw std::runtime_error("Parallel VGL actual composite charge disagrees");
-    const auto check = [&](std::size_t live = 0) {
+    const auto check = [&](std::size_t live = 0, PreparedDeviceInference* selected_graph = nullptr) {
+      auto& subject = selected_graph ? *selected_graph : graph;
+      const auto& expected_cost = selected_graph ? selected_cost : cost;
       live = live ? live : batch;
       const std::vector<double> prefix(positions.begin(), positions.begin() + live * 3 * model.ne);
       const auto before = metrics.snapshot();
-      graph.evaluate(prefix);
-      const auto& layout = graph.resultLayout();
+      subject.evaluate(prefix);
+      const auto& layout = subject.resultLayout();
       if (layout.configuration_count != live)
         throw std::runtime_error("Parallel VGL live prefix retained a stale result shape");
       std::vector<double> phase(live), jets(spatialJetSpanElements(layout)), ratios(live * model.ne);
-      graph.downloadResults(phase, jets, ratios);
+      subject.downloadResults(phase, jets, ratios);
       // Leaf outputs are packed per configuration even when input jet planes have gaps.
       for (std::size_t configuration = 0; configuration < live; ++configuration)
       {
@@ -229,12 +230,18 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
       }
       const auto after = metrics.snapshot();
       if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
-          after.live_bytes != before.live_bytes || graph.admittedTargetTiles() != cost.tile_count ||
-          graph.deviceWorkspaceBytes() != cost.device_workspace_bytes ||
-          graph.hostWorkspaceBytes() != cost.host_workspace_bytes)
+          after.live_bytes != before.live_bytes || subject.admittedTargetTiles() != expected_cost.tile_count ||
+          subject.deviceWorkspaceBytes() != expected_cost.device_workspace_bytes ||
+          subject.hostWorkspaceBytes() != expected_cost.host_workspace_bytes)
         throw std::runtime_error("Parallel VGL warm request changed ownership or coverage");
     };
     check(); check();
+    {
+      PreparedDeviceInference automatic(image, batch, queue, handle, SpatialJetMode::FULL_VGL,
+          false, false, InferenceStatusPolicy::DEFERRED_NEURAL, selected.vgl);
+      check(0, &automatic);
+      check(0, &automatic);
+    }
     // A rejected full or short replacement must revoke every previously borrowed result.
     const auto reject_nonfinite = [&](std::vector<double> invalid) {
       invalid.back() = std::numeric_limits<double>::quiet_NaN();
@@ -268,6 +275,7 @@ void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& pla
   }
   std::cout << "PASS parallel complete VGL B" << batch
             << " FULL/K1/K3-tail, exact composite cost, denial, warm reuse, failure/retry and rebind\n";
+  std::cout << "PASS parallel selected VGL B" << batch << " composite actual-capacity CPU oracle and warm reuse\n";
 }
 
 } // namespace
