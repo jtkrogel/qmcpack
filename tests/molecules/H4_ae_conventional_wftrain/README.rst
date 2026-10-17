@@ -40,7 +40,7 @@ apply. No controls are tuned to force acceptance.
 
 This profile passed on source ``5f0460dc8``, alongside a separate 65-assertion
 dense centered CI oracle. It qualifies pure DETS CI only. Mixed active
-CI/Jastrow, CI/orbital and CSF remain gated; no convergence-quality,
+CI/Jastrow, CI/orbital and CSF are not qualified by that DETS result; no convergence-quality,
 equal-update or GPU claim is made.
 
 Pure-DETS CI LM/ALM regression
@@ -58,3 +58,22 @@ This bounded real CPU profile passed on source ``dd9ee31a8``, following a
 574-assertion numerical gate including physical zero/nonzero-CI ratio checks for
 both solvers. It does not qualify mixed CI/Jastrow/orbital, CSF, ECP or GPU CI.
 Use the shared checker with ``--ci-lm`` instead of ``--ci-pii`` to reproduce it.
+
+Nontrivial pure-CSF LM positive and ALM refusal
+---------------------------------------------
+
+``--csf-lm`` privately generates two open-shell CSFs, each containing two fixed
+determinants with expansion coefficients 1/sqrt(2), and freezes J2. The actual
+reference CSF0=.6 is preserved, rather than treating flattened C0 as CSF0.
+The mathematical oracle validates both LM/ALM physical projective maps and
+score/local-energy derivatives at zero/nonzero CSF1.
+
+The native regression passed on source ``79392c99c`` with checker ``46851f887``:
+LM commits two 32-sample updates, preserves CSF0/expansion/SPO/J2, and passes
+exact exported inference and full/split restart. The same protected sample's
+raw nonsymmetric ALM pencil has eigenvalues 2.662880510452576 +/-
+1.503921983474190 i. ALM must refuse with ``untrusted_root`` before any history
+row, HDF checkpoint/model output or publication. This correct refusal is not an
+ALM convergence positive; seeds, controls and tolerances are not tuned to force
+a real root. Mixed active CI/J2 remains rejected. This is a real CPU,
+all-electron fixed-orbital profile, not ECP, orbital or GPU qualification.
