@@ -263,7 +263,11 @@ struct PsiFormerComplexWF::Impl
 
     /// Retain initializer provenance and construct only qualified complex inference owners.
     Model(const std::string& component_name, InitializedNativeModel initialized,
-          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit)
+          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit
+#ifdef ENABLE_CUDA
+          , std::shared_ptr<GpuLane> prepared = {}
+#endif
+          )
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           environment(environmentFor(electrons)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -273,8 +277,16 @@ struct PsiFormerComplexWF::Impl
           identity(persistentModelIdentity(model, "internal", profile, seed, environment,
                                            reduced_twist, cartesian_twist)), source(&ions),
           schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit),
-          gpu_capacity(requestedCapacity(gpu_limit)),
-          gpu_crowds(requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS"))
+          gpu_capacity(
+#ifdef ENABLE_CUDA
+              prepared ? prepared->capacity :
+#endif
+              requestedCapacity(gpu_limit)),
+          gpu_crowds(
+#ifdef ENABLE_CUDA
+              prepared ? 1 :
+#endif
+              requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS"))
 #ifdef ENABLE_CUDA
           , inference_concurrency(gpu_crowds)
 #endif
@@ -284,7 +296,8 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
         if (gpu_crowds > 1 && !psiformer::device::configuredDeviceMemoryAdmission().limit_bytes)
           throw std::invalid_argument("Concurrent complex inference requires native aggregate device admission");
-        gpu = GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit, gpu_capacity);
+        gpu = prepared ? std::move(prepared) :
+            GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit, gpu_capacity);
 #else
         throw std::invalid_argument("Complex GPU inference is not compiled");
 #endif
@@ -1251,6 +1264,32 @@ struct PsiFormerComplexWF::Impl
       throw std::logic_error("Complex crowd current image/native parameter version differs");
     lane.catchUp(current);
   }
+
+  /// The caller holds Model read; charge dynamic numeric copies, not shared image or descriptor metadata.
+  PsiFormerComplexWF::GpuParameterPublicationRequirements candidateIsolationRequirements() const
+  {
+    if (!state->gpu || state->gpu_crowds != 1)
+      throw std::logic_error("Private complex GPU isolation requires a one-lane GPU family");
+    requireNoCollective();
+    requireIdle(*particles);
+    if (acquired_leader || multiwalker || state->acquired_teams.load() || state->pending_proposals.load())
+      throw std::logic_error("Private complex GPU isolation requires an idle unacquired family");
+    validateDerivativeSource(*state);
+    state->gpu->image->validateCurrentDevice();
+    if (state->gpu->image->version() != state->model.p.version())
+      throw std::logic_error("Private complex GPU isolation image/native version mismatch");
+    const char* message = "Private complex GPU HOST ownership overflow";
+    const auto& cfg = state->model.cfg;
+    auto host = pf::checkedStorageBytes<double>(pf::checkedStorageProduct(2, state->model.p.size(), message), message);
+    for (const auto* values : {&cfg.electrons.x, &cfg.nuclei.x, &cfg.charges.x})
+      pf::addStorageBytes(host, pf::checkedStorageBytes<double>(values->size(), message), message);
+    // VALUE trunk plus spatial metadata/trunk each own one immutable nucleus vector.
+    pf::addStorageBytes(host, pf::checkedStorageBytes<double>(
+        pf::checkedStorageProduct(3, cfg.nuclei.x.size(), message), message), message);
+    pf::addStorageBytes(host, numeric_required, message); // GPU clone's G/L only, never CPU workspace.
+    pf::addStorageBytes(host, state->gpu->host_bytes, message);
+    return {state->gpu->device_bytes, host};
+  }
 #endif
 
   /// Match the exact native loan before reading or mutating transaction scratch.
@@ -1976,6 +2015,75 @@ void PsiFormerComplexWF::isolateParameterState()
   // Fresh executors/workspaces bind only detached leaves; accepted state and weak
   // derivative lanes start empty. Retire this clone's old owners after unlocking.
   impl_.swap(independent);
+}
+
+/// Report the complete additional private numeric peak before any canonical/configuration copy.
+PsiFormerComplexWF::GpuParameterPublicationRequirements
+PsiFormerComplexWF::gpuCandidateIsolationRequirements() const
+{
+#ifdef ENABLE_CUDA
+  std::shared_lock read(impl_->state->mutex);
+  return impl_->candidateIsolationRequirements();
+#else
+  throw std::logic_error("Private complex GPU isolation is not compiled");
+#endif
+}
+
+/// Prepare private GPU scratch outside source authority, then adopt only an exact still-current capture.
+void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap, std::size_t host_cap)
+{
+#ifdef ENABLE_CUDA
+  for (auto cap : {device_cap, host_cap})
+    if (!cap || cap == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Private complex GPU isolation requires positive finite additional caps");
+  const auto original = impl_->state;
+  std::shared_ptr<Impl::GpuLane> source_lane;
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+  std::vector<double> values;
+  std::vector<pf::Layout> layouts;
+  std::optional<pf::ConfigData> configuration;
+  GpuParameterPublicationRequirements required{};
+  std::size_t version;
+  {
+    std::shared_lock read(original->mutex);
+    required = impl_->candidateIsolationRequirements();
+    if (required.device_bytes > device_cap || required.host_bytes > host_cap)
+      throw std::length_error("Private complex GPU isolation exceeds additional owner caps before allocation");
+    app_log() << "  Complex private GPU isolation: attempted_device_bytes=" << required.device_bytes
+              << ", attempted_host_numeric_bytes=" << required.host_bytes
+              << "; before_allocation=yes; shared_image_counted_once=yes; excludes_metadata_vendor_caller=yes"
+              << "; later_successor_publication_separately_admitted=yes" << std::endl;
+    source_lane = original->gpu;
+    image = source_lane->image;
+    version = original->model.p.version();
+    values = original->model.p.flat_values();
+    layouts = original->model.p.layouts;
+    configuration.emplace(original->model.cfg);
+  }
+  // Moves retain one canonical vector; fresh named leaves add exactly one P copy.
+  pf::Parameters parameters(std::move(values), std::move(layouts));
+  parameters.parameter_version = version;
+  auto lane = std::shared_ptr<Impl::GpuLane>(Impl::GpuLane::prepareFrozen(original->plan,
+      parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
+      source_lane->preparation, source_lane->capacity, image));
+  pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
+                      original->model.dim, original->model.heads, original->model.blocks);
+  auto state = std::make_shared<Impl::Model>(getName(),
+      InitializedNativeModel{std::move(model), original->profile, original->seed},
+      *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, std::move(lane));
+  auto independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
+  {
+    std::shared_lock read(original->mutex);
+    if (impl_->state != original || original->gpu != source_lane || source_lane->image != image ||
+        original->model.p.version() != version)
+      throw std::runtime_error("Private complex GPU isolation lost its exact source generation");
+    impl_->candidateIsolationRequirements(); // Recheck current device, fixed ions and idle ownership.
+    impl_.swap(independent); // No runtime, allocation, validation or retirement in adoption.
+  }
+  // Both failed preparation and retired clone owners are destroyed outside Model read.
+#else
+  throw std::logic_error("Private complex GPU isolation is not compiled");
+#endif
 }
 
 /// Validate every candidate invariant before the same-size native copy synchronizes graph leaves.

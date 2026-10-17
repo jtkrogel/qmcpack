@@ -95,6 +95,12 @@ public:
     std::size_t device_bytes, host_bytes;
   };
 
+  /// Additional private scratch/native/configuration/staging peak; excludes shared image and vendor metadata.
+  GpuParameterPublicationRequirements gpuCandidateIsolationRequirements() const;
+
+  /// Detach idle one-lane GPU ownership under explicit additional numeric caps, without CPU fallback.
+  void isolateBudgetedGpuParameterState(std::size_t additional_device_cap, std::size_t additional_host_cap);
+
   /// Exact image/frozen owners/HOST staging plus native candidate; excludes O(tensor) leaf/lock metadata.
   GpuParameterPublicationRequirements gpuParameterPublicationRequirements() const;
 
