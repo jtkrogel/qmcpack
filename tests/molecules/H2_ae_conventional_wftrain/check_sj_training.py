@@ -336,7 +336,9 @@ def main():
         args.csf_orbital_ecp = True
     orbital_alm = args.joint_ci_orbital_ecp_alm or args.csf_orbital_ecp_alm
     if args.csf_j2_ecp_lm:
-        if args.ranks != 1 or args.threads != 1 or args.mdj_alm or args.mdj_ecp_alm:
+        if args.ranks != 1 or args.threads != 1 or args.ci_representation != "dets" or any((
+                args.mdj_alm, args.mdj_ecp_alm, args.joint_ci_orbital_ecp_alm,
+                args.csf_orbital_ecp_alm)):
             parser.error("--csf-j2-ecp-lm selects one single-rank Be CSF/J2 LM recipe")
         args.mdj_ecp_alm = True  # Reuse strict P5 model/import/restart checks, not its optimizer.
     if args.mdj_ecp_alm:
