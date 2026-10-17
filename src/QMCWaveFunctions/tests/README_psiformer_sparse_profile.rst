@@ -1,5 +1,5 @@
 Sparse CPU memory/request profiling
-==================================
+===================================
 
 These developer benchmarks are not performance CTests. Build only the existing
 ``benchmark_psiformer_native_memory`` target with micro-benchmarks enabled.
@@ -50,6 +50,12 @@ Whole-process wall time includes loading and
 I/O and is reported independently by the controller. Snapshot categories name
 only listed owners, not a complete resident-memory model; outputs, allocator,
 libraries and vendor storage remain visible in RSS/cgroup evidence.
+
+The diagnostic follow-up (integrated as ``8e9241ccd``) persists the current
+JSON report after each complete-request snapshot and logs attempted owner
+bytes before allocation. A later timeout can therefore retain prepared-owner
+categories. Earlier frozen profiles are unchanged and are not rerun; a partial
+prepared report is not evidence that the full numerical request completed.
 
 The controller is inert without ``--execute-case ID`` and root-approved manifest
 status ``ready_to_execute``. Root must provide immutable benchmark/application
