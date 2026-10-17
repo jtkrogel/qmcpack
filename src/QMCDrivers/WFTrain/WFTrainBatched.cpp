@@ -2017,6 +2017,8 @@ void WFTrainBatched::run()
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
     Timer iteration_wall;
     const auto sample_version = training_state.parameter_version;
+    if (resident_device_authority_)
+      device_provider->residentDeviceAuthorityTransferWindow("sampling_through_refresh", true);
     logTrainingMemoryPhase(*myComm, iteration, "before_sampling");
     app_log() << "WFTrain allocation before owner=retained_sample_snapshots iteration=" << iteration
               << " scope=rank0_local blocks=" << num_blocks << " steps_per_block=" << steps_per_block_
@@ -2959,6 +2961,8 @@ void WFTrainBatched::run()
       refreshPublishedParameters(iteration_result.parameter_version);
       ++accepted_updates;
     }
+    if (resident_device_authority_)
+      device_provider->residentDeviceAuthorityTransferWindow("sampling_through_refresh", false);
     // Rejection leaves every live parameter/cache valid. In particular, avoid
     // consuming production quadrature RNG merely to refresh the unchanged ECP state.
     cache_observer.clear();
