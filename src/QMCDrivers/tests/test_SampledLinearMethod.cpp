@@ -350,4 +350,72 @@ TEST_CASE("Sampled LM real tangent projection rejects imaginary nonfinite data a
   CHECK_THROWS(SampledLinearMethodOperator(f.factor, {batches.data(), batches.size()}, kinetic, false, true, 0.0));
 }
 
+TEST_CASE("Fixed-reference linear LM retraction is projective and rejects unusable gauges",
+          "[drivers][wftrain][linear_method][linear_retraction]")
+{
+  Fixture f;
+  StructuredParameterSnapshot parameters{f.schema.fingerprint(), 7, {0.3, -0.2}};
+  const auto gradient = f.factor.scoreCovarianceGradient();
+  const ParameterGradientView objective{f.schema.fingerprint(), 7, ReductionDomain::GLOBAL,
+                                       {gradient.data(), gradient.size()}};
+  MatrixFreeLinearMethodResult solved;
+  solved.provider_id = f.schema.providerId();
+  solved.schema_fingerprint = f.schema.fingerprint();
+  solved.parameter_version = 7;
+  solved.converged = true;
+  solved.stop_reason = LinearMethodStopReason::CONVERGED;
+  const std::array<double, 2> mean{{14.0 / 6.0, 0.5}};
+  const auto propose = [&](MatrixFreeLinearMethodResult result, double rate = 1, double xi = 0.5) {
+    LinearMethodUpdateRule rule(f.factor, std::move(result), rate, xi,
+        LinearMethodNormalization::FIXED_REFERENCE_LINEAR, {f.batches.data(), f.batches.size()});
+    return rule.propose(f.schema, parameters, objective);
+  };
+  for (double reference : {1.0, 0.0}) // A nonzero physical gauge need not have nonzero centered v0.
+  {
+    solved.eigenvector = {reference, 0.2, -0.1};
+    const double gauge = reference - mean[0] * 0.2 + mean[1] * 0.1;
+    for (double scale : {1.0, -3.0, 1e-8})
+      for (double rate : {1.0, 0.25})
+      {
+        auto rescaled = solved;
+        for (auto& v : rescaled.eigenvector) v *= scale;
+        for (double xi : {0.0, 0.8})
+        {
+          const auto actual = propose(rescaled, rate, xi);
+          CHECK(actual.values[0] == Catch::Approx(parameters.values[0] + rate * 0.2 / gauge).margin(1e-12));
+          CHECK(actual.values[1] == Catch::Approx(parameters.values[1] - rate * 0.1 / gauge).margin(1e-12));
+        }
+      }
+  }
+  solved.eigenvector = {mean[0] * 0.2 - mean[1] * 0.1, 0.2, -0.1};
+  CHECK_THROWS_AS(propose(solved), std::invalid_argument);
+  solved.eigenvector[0] += 1e-12;
+  CHECK_THROWS_AS(propose(solved), std::invalid_argument);
+  solved.eigenvector = {1, DerivativeValue{0.2, 0.1}, -0.1};
+  CHECK_THROWS_AS(propose(solved), std::invalid_argument);
+  solved.eigenvector[1] = {std::numeric_limits<double>::quiet_NaN(), 0};
+  CHECK_THROWS(propose(solved));
+  solved.eigenvector = {1, 0.2, -0.1};
+  auto stale = solved;
+  stale.parameter_version = 6;
+  CHECK_THROWS_AS(propose(stale), std::invalid_argument);
+  stale = solved;
+  stale.schema_fingerprint = "wrong";
+  CHECK_THROWS_AS(propose(stale), std::invalid_argument);
+
+  // Default nonlinear xi normalization still uses vi/v0 and the centered metric norm.
+  LinearMethodUpdateRule nonlinear(f.factor, solved, 0.25, 0.5);
+  const auto actual = nonlinear.propose(f.schema, parameters, objective);
+  double q = 0;
+  for (std::size_t i = 0; i < weights.size(); ++i)
+  {
+    const double d = (scores[i][0] - mean[0]) * 0.2 - (scores[i][1] - mean[1]) * 0.1;
+    q += weights[i] * d * d / 6;
+  }
+  const double denominator = 1 + q / (1 + std::sqrt(1 + q));
+  CHECK(actual.values[0] == Catch::Approx(parameters.values[0] + 0.25 * 0.2 / denominator).margin(1e-12));
+  CHECK(actual.values[1] == Catch::Approx(parameters.values[1] - 0.25 * 0.1 / denominator).margin(1e-12));
+  CHECK(parameters.values == std::vector<double>{0.3, -0.2});
+}
+
 } // namespace qmcplusplus::wftrain

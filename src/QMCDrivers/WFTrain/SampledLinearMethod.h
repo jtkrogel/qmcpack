@@ -42,14 +42,22 @@ private:
   mutable std::vector<DerivativeValue> d_, l_, adjoint_, coefficients_, local_gradient_;
 };
 
-/** Stateless live LM update with nonlinear normalization and no implicit publication. */
+enum class LinearMethodNormalization
+{
+  NONLINEAR,
+  FIXED_REFERENCE_LINEAR
+};
+
+/** Stateless live LM update with explicit coordinate normalization, never publication. */
 class LinearMethodUpdateRule final : public TrainingUpdateRule
 {
 public:
   /// Bind a converged eigensolve to its immutable sampled metric and step controls.
   LinearMethodUpdateRule(const ScoreCovarianceFactor& factor,
                         MatrixFreeLinearMethodResult result, double learning_rate,
-                        double normalization_xi);
+                        double normalization_xi,
+                        LinearMethodNormalization normalization = LinearMethodNormalization::NONLINEAR,
+                        DerivativeArrayView<const ScoreCovarianceBatch> linear_batches = {});
   StructuredParameterSnapshot propose(const StructuredParameterSchema& schema,
       const StructuredParameterSnapshot& parameters, ParameterGradientView objective) override;
 
@@ -57,6 +65,8 @@ private:
   const ScoreCovarianceFactor& factor_;
   MatrixFreeLinearMethodResult result_;
   double learning_rate_, xi_;
+  LinearMethodNormalization normalization_;
+  std::vector<ScoreCovarianceBatch> linear_batches_;
 };
 }
 #endif

@@ -22,6 +22,7 @@
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCDrivers/WFTrain/SampledLinearMethod.h"
+#include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/ECPComponentBuilder.h"
@@ -2605,26 +2606,39 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     const auto result = solveSymmetrizedMatrixFreeLinearMethod(h, s, preconditioner, {initial.data(), 2}, lm);
     INFO(linearMethodStopReasonName(result.stop_reason));
     REQUIRE(result.converged);
-    const double v0 = result.eigenvector[0].real(), v1 = result.eigenvector[1].real();
-    const double gauge = v0 - mean * v1;
-    REQUIRE(std::abs(gauge) > 1e-10);
-    auto mapped = parameters;
-    mapped.values[0] += v1 / gauge;
-    // This explicit test-only projective map does not qualify the generic
-    // nonlinear LM update or lift any native family guard.
-    for (std::size_t sample = 0; sample < 4; ++sample)
-    {
-      replay->prepareSample(sample);
-      adapter.installSnapshot(*evaluator, private_particles, mapped);
-      const double ratio = std::exp(evaluator->getLogPsi() - log[sample]) *
-          std::cos(evaluator->getPhase() - phase[sample]);
-      CHECK(ratio == Catch::Approx((v0 + v1 * (score[sample] - mean)) / gauge).epsilon(2e-10).margin(2e-10));
-      CHECK(evaluator->findMSD()[0].get().get_C()[0] == fixed_coefficients[0]);
-    }
-    ProjectedInverseIterationFactor pii_factor(factor, kinetic);
+    SampledLinearMethodOperator raw_h(factor, {&batch, 1}, kinetic, false, false, 0);
+    AcceleratedLinearMethodControl alm;
+    alm.outer = lm;
+    const auto accelerated = solveAcceleratedMatrixFreeLinearMethod(raw_h, s, preconditioner,
+        {initial.data(), 2}, alm);
+    INFO(linearMethodStopReasonName(accelerated.stop_reason));
+    REQUIRE(accelerated.converged);
     const auto gradient = factor.scoreCovarianceGradient();
     const ParameterGradientView objective{schema.fingerprint(), parameters.version, ReductionDomain::GLOBAL,
                                          {gradient.data(), gradient.size()}};
+    for (const auto& solved : {result, accelerated})
+      for (double rate : {1.0, 0.25})
+        for (double xi : {0.0, 0.8})
+        {
+          const double v0 = solved.eigenvector[0].real(), v1 = solved.eigenvector[1].real();
+          const double gauge = v0 - mean * v1;
+          REQUIRE(std::abs(gauge) > 1e-10);
+          LinearMethodUpdateRule update(factor, solved, rate, xi,
+              LinearMethodNormalization::FIXED_REFERENCE_LINEAR, {&batch, 1});
+          const auto mapped = update.propose(schema, parameters, objective);
+          CHECK(mapped.values[0] == Catch::Approx(coefficient + rate * v1 / gauge).epsilon(2e-10).margin(2e-10));
+          for (std::size_t sample = 0; sample < 4; ++sample)
+          {
+            replay->prepareSample(sample);
+            adapter.installSnapshot(*evaluator, private_particles, mapped);
+            const double ratio = std::exp(evaluator->getLogPsi() - log[sample]) *
+                std::cos(evaluator->getPhase() - phase[sample]);
+            CHECK(ratio == Catch::Approx(1 + rate * ((v0 + v1 * (score[sample] - mean)) / gauge - 1))
+                .epsilon(2e-10).margin(2e-10));
+            CHECK(evaluator->findMSD()[0].get().get_C()[0] == fixed_coefficients[0]);
+          }
+        }
+    ProjectedInverseIterationFactor pii_factor(factor, kinetic);
     PIIUpdateControl control;
     control.shift_mode = PIIShiftMode::EXPLICIT;
     control.explicit_shift = mean_energy - 1;
