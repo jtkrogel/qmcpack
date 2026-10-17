@@ -307,7 +307,7 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
             rotated->nel_major_ != n || m <= n || (n == 1 && m != 3) ||
             !dynamic_cast<const DiracDeterminant<>*>(&slater->getDet(determinant)) ||
             rotated->m_act_rot_inds_.size() != n * (m - n))))
-          throw std::invalid_argument("Legacy orbital ECP products require CPU inline complete-OV owners");
+          throw std::invalid_argument("Legacy orbital ECP products require qualified CPU inline or captured complete-OV owners");
         if (orbital)
           for (std::size_t i = 0; i < rotated->m_act_rot_inds_.size(); ++i)
             if (rotated->m_act_rot_inds_[i] != std::make_pair(static_cast<int>(i / (m - n)), static_cast<int>(n + i % (m - n))))
