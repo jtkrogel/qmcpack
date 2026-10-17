@@ -4648,7 +4648,11 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     CHECK(private_gpu.publishBudgetedGpuParameters(candidate, candidate.version,
         private_publication.device_bytes, private_publication.host_bytes) == candidate.version + 1);
     CHECK(private_cpu.publishParameters(candidate, candidate.version) == candidate.version + 1);
-    if (step) CHECK_THROWS(gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu));
+    if (step)
+    {
+      CHECK_THROWS(gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu));
+      candidate_energy = {}; // Retire its pinned old image BEFORE measuring this generation's warm work.
+    }
     evaluate(private_gpu, private_p); evaluate(private_cpu, private_cpu_p);
     C expected_nonlocal{};
     for (const auto& point : grid)
