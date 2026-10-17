@@ -2672,7 +2672,8 @@ TEST_CASE("PsiFormer private GPU candidates isolate mutable lanes and preserve s
 #endif
   ScopedComplexGpuControls controls;
   controls.target(3, 64 * 1024 * 1024, 1000000000);
-  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  // Target-K uses the existing B1 lane, not the separately admitted dense profile.
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "1");
   auto& metrics = dev::deviceMemoryMetrics(ordinal);
   const auto outside = metrics.snapshot();
   {
