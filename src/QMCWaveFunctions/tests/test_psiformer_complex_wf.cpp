@@ -1310,6 +1310,9 @@ TEST_CASE("PsiFormer paired CPU trial isolation preserves the shared source fami
   auto source = ions(simulation_cell);
   auto initialized = parameters();
   PsiFormerComplexWF component("isolation", initialized, p, source, clone_cap, {.17, -.11, .07});
+  const auto initial = component.snapshotParameters();
+  component.publishParameters(initial, initial.version);
+  REQUIRE(component.snapshotParameters().version > 0);
   auto sibling_base = component.makeClone(sibling_p), trial_base = component.makeClone(trial_p);
   auto& sibling = dynamic_cast<PsiFormerComplexWF&>(*sibling_base);
   auto& trial = dynamic_cast<PsiFormerComplexWF&>(*trial_base);
