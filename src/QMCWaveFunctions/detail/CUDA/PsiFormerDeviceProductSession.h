@@ -30,7 +30,7 @@
 
 namespace qmcplusplus::psiformer::device
 {
-/// Ordered ENERGY channels: kinetic response, energy-times-score, then score.
+/// Ordered ENERGY channels: local-energy response, energy-times-score, then score.
 enum class ScoreContractionRole { GENERIC, ENERGY_T_EO_O };
 
 
