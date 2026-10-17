@@ -196,7 +196,17 @@ def main():
     parser.add_argument("--family-screen", action="store_true", help="bounded LM/ALM/PII/minPII cases; report rejection honestly")
     parser.add_argument("--family-method", choices=("lm", "alm", "pii", "minpii"), action="append",
                         help="restrict a family screen to selected methods, e.g. one corrected fixture")
+    parser.add_argument("--ci-pii", action="store_true",
+                        help="bounded pure-CI H4 PII/minPII updates and exported inference; freeze J2")
     args = parser.parse_args()
+    if args.ci_pii:
+        if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
+                args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
+                args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
+                args.orbital_jastrow)) or args.ci_representation != "dets":
+            parser.error("--ci-pii selects its own single-rank pure-DETS bounded workflow")
+        args.family_screen = True
+        args.family_method = ("pii", "minpii")
     if args.threads <= 0 or args.ranks <= 0:
         parser.error("--threads and --ranks must be positive")
     if (args.profile_only or args.optimizer_screen or args.family_screen) and (args.restart or args.preflight):
@@ -221,7 +231,7 @@ def main():
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp else None
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or args.ci_pii else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -278,6 +288,13 @@ def main():
         if args.periodic_heg:
             samples_per_rank = 8
         tree = ET.parse(fixture)
+        if args.ci_pii:
+            expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
+            assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
+            assert float(expansion[0].get("coeff")) != 0 and float(expansion[1].get("coeff")) == 0
+            assert tree.find(".//rotated_sposet") is None
+            for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
+                node.set("optimize", "no")
         if args.external_lcao:
             tree.find("wavefunction/sposet_collection").set("href", str(external_asset))
         # Recipes run in fresh evidence directories, not beside their PP asset.
@@ -400,6 +417,7 @@ def main():
         if orbital_model:
             initial += [0.0] * (6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
+                   if node.get("optimize") != "no"
                    for value in node.text.split()]
         previous = (np.asarray(initial) if parameter_file is None else
                     datasets(parameter_file)["conventional_wavefunction/parameters"].reshape(-1))
@@ -411,7 +429,11 @@ def main():
                 parameters = np.asarray(group["parameters"][()]).reshape(-1)
                 assert parameters.size == len(initial) and np.isfinite(parameters).all(), model
                 if linear_nodes:
-                    assert parameters.size == len(initial) and parameters.size > len(linear_nodes) - 1
+                    assert parameters.size == len(initial)
+                    if args.ci_pii:
+                        assert parameters.size == 1
+                    else:
+                        assert parameters.size > len(linear_nodes) - 1
                     names = [value.decode() if isinstance(value, bytes) else str(value)
                              for value in np.asarray(group["variable_names"][()]).reshape(-1)]
                     assert linear_nodes[0].get("id") not in names, model
@@ -467,6 +489,12 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
+                if args.ci_pii:
+                    original_j2 = tree.findall("wavefunction/jastrow/correlation/coefficients")
+                    retained_j2 = exported.findall("jastrow/correlation/coefficients")
+                    assert len(original_j2) == len(retained_j2) == 2
+                    for original, retained in zip(original_j2, retained_j2):
+                        assert retained.attrib == original.attrib and retained.text.split() == original.text.split(), model
         if len(orbital_history) == 2:
             first, second = orbital_history[0][0], orbital_history[1][0]
             delta = second - first
@@ -506,7 +534,12 @@ def main():
                     ET.SubElement(training, "parameter", name=name).text = value
             try:
                 directory = run(optimizer, optimizer=optimizer, mutate=controls,
-                                samples_per_rank=32, require_committed=False)
+                                samples_per_rank=32, require_committed=args.ci_pii)
+                if args.ci_pii:
+                    final = sorted((directory / "sj.s000.training").rglob("*.parameters.h5"))[-1]
+                    loaded = run(f"{optimizer}_export_vmc", vmc=True, parameter_file=final)
+                    reference = run(f"{optimizer}_explicit_vmc", vmc=True, reference_file=final)
+                    np.testing.assert_array_equal(vmc_physical_trace(loaded), vmc_physical_trace(reference))
                 rows = history(directory)
                 decisions = ",".join(row["committed"] for row in rows)
                 reports.append((optimizer, "complete", decisions))
@@ -519,7 +552,10 @@ def main():
             writer.writerow(("optimizer", "status", "committed"))
             writer.writerows(reports)
         assert all(status == "complete" for _, status, _ in reports), work
-        print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
+        if args.ci_pii:
+            print("PASS: pure-CI PII/minPII committed updates, fixed C0/SPO/J2 and exact exported inference; not mixed CI/Jastrow qualification")
+        else:
+            print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
 
     if args.optimizer_screen:
