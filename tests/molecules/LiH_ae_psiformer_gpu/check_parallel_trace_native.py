@@ -57,7 +57,7 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith('PSIFORMER_GPU_')}
         env.update(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', OMPI_MCA_memory='^patcher',
             OMPI_MCA_pml='ob1', OMPI_MCA_btl='self,tcp', PSIFORMER_GPU_STATUS_CHECKS='synchronous',
-            PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES=str(3 * 1024**3),
+            PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES=str(2 * 1024**3),
             PSIFORMER_GPU_EXTERNAL_RESERVE_BYTES=str(256 * 1024**2),
             PSIFORMER_GPU_VGL_TARGETS=str(targets), PSIFORMER_GPU_TARGET_WORKSPACE_BYTES=str(256 * 1024**2),
             PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET=str(10**9))
@@ -87,7 +87,8 @@ def main():
             assert any('complete yes' in line for line in lines), path
             header = next(line.split()[1:] for line in lines if line.startswith('#') and 'BlockWeight' in line)
             values, = [line.split() for line in lines if line.strip() and not line.startswith('#')]
-            row = {k: float(v) for k, v in zip(header, values) if k not in {'BlockCPU', 'BlockTime', 'Time'}}
+            assert len(values) == len(header), path
+            row = {k: float(v) for k, v in zip(header, values) if k != 'BlockCPU'}
             assert row['BlockWeight'] == 1 and all(map(math.isfinite, row.values()))
             physical.append(row)
         latest, = directory.glob('*.last_checkpoint.h5')
