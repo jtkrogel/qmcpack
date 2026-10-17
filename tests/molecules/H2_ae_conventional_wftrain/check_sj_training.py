@@ -1154,7 +1154,10 @@ def main():
                     run(f"reject_changed_{label}_import", vmc=True, parameter_file=exported,
                         mutate=route_lcao(changed), reject="Conventional model export identity mismatch")
                     run(f"reject_changed_{label}_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
-                        mutate=route_lcao(changed), reject="Training checkpoint stage identity or configuration mismatch")
+                        mutate=route_lcao(changed),
+                        reject=("Conventional orbital frame shape or reference identity mismatch"
+                                if args.external_orbital_ecp and label == "coefficients" else
+                                "Training checkpoint stage identity or configuration mismatch"))
                 finally:
                     if args.external_orbital_ecp:
                         external_asset.write_bytes(external_original)
