@@ -1673,8 +1673,10 @@ PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeR
   if (gpuInferenceEnabled())
   {
     std::shared_lock read(impl_->state->mutex);
-    if (impl_->state->gpu->capacity != 1 || impl_->state->gpu_crowds > 1)
-      throw std::logic_error("Dense or concurrent complex inference does not support GPU derivatives or training");
+    // Dense inference owns separate graphs; reverse products remain B1 per sample.
+    // Multiple inference crowds still cannot share the serialized training lane.
+    if (impl_->state->gpu_crowds > 1)
+      throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
     return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk);
   }
 #endif
@@ -1695,8 +1697,9 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     const auto state = impl_->state;
     {
       std::shared_lock read(state->mutex);
-      if (state->gpu->capacity != 1 || state->gpu_crowds > 1)
-        throw std::logic_error("Dense or concurrent complex inference does not support GPU derivatives or training");
+      // Product capacity is independent of the dense inference graph capacity.
+      if (state->gpu_crowds > 1)
+        throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
     }
     const auto samples = particles.size(), n = state->model.ne;
     const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk);

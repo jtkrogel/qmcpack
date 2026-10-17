@@ -2008,10 +2008,18 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
 #endif
   ScopedComplexGpuControls controls;
+  std::size_t samples = 2;
+  SECTION("default T1 inference and B1 products") {}
+  SECTION("dense T2 inference W3 tail with serialized B1 products")
+  {
+    samples = 3;
+    controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  }
   const SimulationCell simulation_cell(cell());
-  auto p = electrons(simulation_cell, 3, 1), clone_p = electrons(simulation_cell, 3, 1);
+  auto p = electrons(simulation_cell, 3, 1), clone_p = electrons(simulation_cell, 3, 1),
+       tail_p = electrons(simulation_cell, 3, 1);
   auto source = ions(simulation_cell);
-  for (auto* target : {&p, &clone_p})
+  for (auto* target : {&p, &clone_p, &tail_p})
   {
     const int mass = target->getSpeciesSet().findAttribute("mass");
     target->getSpeciesSet()(mass, 0) = .7;
@@ -2020,6 +2028,8 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   }
   clone_p.R[1][2] += .037;
   clone_p.update();
+  tail_p.R[2][0] -= .043;
+  tail_p.update();
   RuntimeOptions options;
   TrialWaveFunction trial(options);
   const std::array<double, 3> twist{.17, -.11, .07};
@@ -2031,47 +2041,50 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   auto& component = *owner;
   trial.addComponent(std::move(owner));
   auto clone_trial = trial.makeClone(clone_p);
+  auto tail_trial = trial.makeClone(tail_p);
   RefVectorWithLeader<TrialWaveFunction> trials(trial);
   trials.push_back(trial);
   trials.push_back(*clone_trial);
+  if (samples == 3) trials.push_back(*tail_trial);
   RefVectorWithLeader<ParticleSet> particles(p);
   particles.push_back(p);
   particles.push_back(clone_p);
-  const auto r0 = component.gpuDerivativeRequirements(0, 2, 3, 7);
-  const auto r2 = component.gpuDerivativeRequirements(2, 2, 3, 7);
+  if (samples == 3) particles.push_back(tail_p);
+  const auto r0 = component.gpuDerivativeRequirements(0, samples, 3, 7);
+  const auto r2 = component.gpuDerivativeRequirements(samples, samples, 3, 7);
   std::printf("GPU derivative admission R0_device=%zu R0_host=%zu R2_device=%zu R2_host=%zu matrix_work=%zu\n",
       r0.device_bytes, r0.host_bytes, r2.device_bytes, r2.host_bytes, r2.matrix_work);
   CHECK(r2.device_bytes == r0.device_bytes);
-  CHECK(r2.host_bytes == r0.host_bytes + 32 * 2 * 4);
+  CHECK(r2.host_bytes == r0.host_bytes + 32 * samples * 4);
   CHECK(component.gpuDerivativeRequirements(4, 2, 3, 7).host_bytes == r0.host_bytes + 32 * 4 * 4);
   auto& metrics = dev::deviceMemoryMetrics(ordinal);
   const auto before = metrics.snapshot();
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes - 1, r2.host_bytes, r2.matrix_work));
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes - 1, r2.matrix_work));
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work - 1));
   const auto mass = p.getSpeciesSet().findAttribute("mass");
   p.getSpeciesSet()(mass, 0) = 0;
   p.resetGroups();
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   p.getSpeciesSet()(mass, 0) = .7;
   p.resetGroups();
   p.setSpinor(true);
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   p.setSpinor(false);
   const auto last_spin = p.spins[3];
   p.spins.resize(3);
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   p.spins.resize(4);
   p.spins[3] = last_spin;
   const auto spin = p.spins[0];
   p.spins[0] = std::numeric_limits<double>::quiet_NaN();
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   p.spins[0] = spin;
   const int charge = source.getSpeciesSet().findAttribute("charge");
@@ -2081,12 +2094,12 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   {
     auto& scalar = field ? source.R[0][0] : source.getSpeciesSet()(charge, 0);
     scalar = std::numeric_limits<double>::quiet_NaN();
-    CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+    CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
         r2.device_bytes, r2.host_bytes, r2.matrix_work));
     scalar = field ? source_coordinate : source_charge;
   }
   CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
-  auto stream = component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  auto stream = component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work);
   const auto diagnostic = stream->storageDiagnostics();
   CHECK(diagnostic.retained_numeric_bytes == r2.device_bytes + r2.host_bytes);
@@ -2103,19 +2116,57 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   PsiFormerComplexWF cpu("analysis", initialized, p, source, clone_cap, twist);
   CHECK(component.neuralWeightBlocks() == cpu.neuralWeightBlocks());
   auto cpu_clone = cpu.makeClone(clone_p);
+  auto cpu_tail = cpu.makeClone(tail_p);
   RefVectorWithLeader<WaveFunctionComponent> components(cpu);
   components.push_back(cpu);
   components.push_back(*cpu_clone);
+  if (samples == 3) components.push_back(*cpu_tail);
+  // The sampler's numerical graph really runs T2 plus tail1 before and after
+  // publication; Products below independently keeps its existing B1 owners.
+  const auto check_dense_full = [&] {
+    if (samples != 3) return;
+    RefVectorWithLeader<WaveFunctionComponent> gpu_components(component);
+    RefVector<ParticleSet::ParticleGradient> gradients;
+    RefVector<ParticleSet::ParticleLaplacian> laplacians;
+    for (std::size_t i = 0; i < samples; ++i)
+    {
+      gpu_components.push_back(*trials[i].getOrbitals()[0]);
+      particles[i].G = 0; particles[i].L = 0;
+      gradients.push_back(particles[i].G); laplacians.push_back(particles[i].L);
+    }
+    ResourceCollection resources("dense inference in serialized training");
+    component.createResource(resources);
+    ResourceCollectionTeamLock<WaveFunctionComponent> loan(resources, gpu_components);
+    component.mw_evaluateLog(gpu_components, particles, gradients, laplacians);
+    for (std::size_t i = 0; i < samples; ++i)
+    {
+      const auto gradient = particles[i].G;
+      const auto laplacian = particles[i].L;
+      close(gpu_components[i].get_log_value(), evaluate(components[i], particles[i]));
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d) close(gradient[e][d], particles[i].G[e][d]);
+        close(laplacian[e], particles[i].L[e]);
+      }
+    }
+  };
+  check_dense_full();
   auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 7,
-      cpu.streamingDerivativeRequiredBytes(2));
+      cpu.streamingDerivativeRequiredBytes(samples));
   CHECK_THROWS(cpu.gpuDerivativeRequirements(2, 2, 3, 7));
   const auto& schema = stream->parameterSchema();
-  const std::array<double, 2> weights{.4, 1.3};
-  std::array<C, 2> energies;
+  std::vector<double> weights{.4, 1.3};
+  if (samples == 3) weights.push_back(.7);
+  std::vector<C> energies(samples);
   evaluate(cpu, p);
   evaluate(*cpu_clone, clone_p);
   energies[0] = cpu.observeCoulombEnergy(p, -1.3).local_energy;
   energies[1] = static_cast<PsiFormerComplexWF&>(*cpu_clone).observeCoulombEnergy(clone_p, .7).local_energy;
+  if (samples == 3)
+  {
+    evaluate(*cpu_tail, tail_p);
+    energies[2] = static_cast<PsiFormerComplexWF&>(*cpu_tail).observeCoulombEnergy(tail_p, -.4).local_energy;
+  }
   CHECK(std::abs(energies[0].imag()) + std::abs(energies[1].imag()) > 1e-8);
   // Compare the actual complete PATHWISE producer, including dEL=dK, not a score-only shortcut.
   const auto complete_force = [&](std::unique_ptr<StreamingDerivativeOperator> derivative) {
@@ -2134,8 +2185,8 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
     return accumulator.finalize().gradient;
   };
   const auto cpu_force = complete_force(cpu.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 7,
-      cpu.streamingDerivativeRequiredBytes(2)));
-  const auto gpu_force = complete_force(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      cpu.streamingDerivativeRequiredBytes(samples)));
+  const auto gpu_force = complete_force(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   for (std::size_t i = 0; i < schema.parameterCount(); ++i)
     CHECK(gpu_force[i] == Catch::Approx(cpu_force[i]).margin(3e-9));
@@ -2157,7 +2208,7 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
     const StructuredParameterVectorConstView tangent(schema, snapshot.version, {values.data(), values.size()});
     oracle->applyScoreJVP(tangent, cpu_jvp);
     stream->applyScoreJVP(tangent, gpu_jvp);
-    for (std::size_t i = 0; i < 2; ++i) close(gpu_jvp.values[i], cpu_jvp.values[i], 3e-9);
+    for (std::size_t i = 0; i < samples; ++i) close(gpu_jvp.values[i], cpu_jvp.values[i], 3e-9);
   };
   check_jvp(std::vector<C>(direction.size()));
   for (const auto value : gpu_jvp.values) CHECK(value == C{});
@@ -2214,12 +2265,14 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
     CHECK(gpu_sr.values[i] == Catch::Approx(cpu_sr.values[i]).margin(3e-9));
   std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
       {{.7, .15}, {.2, -.35}}, {{-.6, .4}, {.8, -.1}}}};
+  if (samples == 3)
+    for (auto& channel : coefficients) channel.push_back({.11, -.23});
   std::array<VJPCoefficientChannel, 3> channels;
   for (std::size_t c = 0; c < channels.size(); ++c)
     channels[c] = {c == 0 ? "score0" : c == 1 ? "kinetic" : "score2",
         c == 1 ? DerivativeProduct::LOCAL_ENERGY_VJP : DerivativeProduct::SCORE_VJP,
         {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 7, 11,
-          {coefficients[c].data(), 2}}, c == 1 ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0};
+          {coefficients[c].data(), samples}}, c == 1 ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0};
   ComplexStreamingSink expected, actual;
   oracle->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
   // Live coordinates may change after capture; callbacks may safely re-enter ordinary GPU inference.
@@ -2251,12 +2304,12 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   CHECK_THROWS(stream->applyScoreJVP({schema, snapshot.version, {direction.data(), direction.size()}}, gpu_jvp));
   CHECK(gpu_jvp.state() == DerivativeSinkState::POISONED);
   check_jvp(direction);
-  auto second = component.makeBudgetedGpuDerivativeOperator(trials, particles, 8, 13, 2, 3, 7,
+  auto second = component.makeBudgetedGpuDerivativeOperator(trials, particles, 8, 13, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work);
   CHECK(second->storageDiagnostics().shared_workspace_identity == diagnostic.shared_workspace_identity);
   CHECK(second->storageDiagnostics().retained_numeric_bytes + diagnostic.retained_numeric_bytes -
-      diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes + 32 * 4 * 4);
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 2, 7,
+      diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes + 32 * 2 * samples * 4);
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 2, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   actual.reset();
   actual.fail_next = true;
@@ -2272,7 +2325,7 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
     for (std::size_t i = 0; i < schema.parameterCount(); ++i)
       close(actual.values[c][i], expected_hermitian.values[c][i], 3e-9);
   C sample_dot{}, parameter_dot{};
-  for (std::size_t sample = 0; sample < 2; ++sample)
+  for (std::size_t sample = 0; sample < samples; ++sample)
     sample_dot += std::conj(coefficients[0][sample]) * gpu_jvp.values[sample];
   for (std::size_t i = 0; i < direction.size(); ++i)
     parameter_dot += std::conj(actual.values[0][i]) * direction[i].real();
@@ -2311,12 +2364,13 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   actual.reset();
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
   trial.addComponent(component.makeClone(p));
-  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, samples, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
   const auto publication = component.gpuParameterPublicationRequirements();
   CHECK(component.publishBudgetedGpuParameters(gpu_sr, snapshot.version, publication.device_bytes, publication.host_bytes)
       == snapshot.version + 1);
   CHECK(cpu.publishParameters(cpu_sr, snapshot.version) == snapshot.version + 1);
+  check_dense_full();
   gpu_update.proposalAccepted(schema, snapshot, gpu_objective);
   cpu_update.proposalAccepted(schema, snapshot, cpu_objective);
   CHECK_FALSE(gpu_update.hasLiveProposal());
@@ -2784,7 +2838,8 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
     const auto scalar_gradient = gpu.evalGrad(p0, 0);
     for (int d = 0; d < 3; ++d)
       close(scalar_gradient[d], p0.G[0][d], 2e-8);
-    CHECK_THROWS_AS(gpu.gpuDerivativeRequirements(1, 1, 1, 1), std::logic_error);
+    // One-crowd dense inference now admits independent serialized products.
+    CHECK_NOTHROW(gpu.gpuDerivativeRequirements(1, 1, 1, 1));
 
     auto aliases = gradients;
     aliases[2] = std::ref(p0.G);
