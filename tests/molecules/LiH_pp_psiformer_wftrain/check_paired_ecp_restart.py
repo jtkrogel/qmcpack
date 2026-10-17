@@ -126,15 +126,16 @@ def run(name, iterations, restart=None):
     rows = history(folder)
     assert len(rows) == 1
     row = rows[0]
+    reference_row = history(continuous)[iterations - 1]
     assert (
         row["objective"],
         row["optimizer"],
         int(row["committed"]),
         int(row["samples"]),
-    ) == ("energy", "adam", 1, 1)
+    ) == ("energy", "adam", int(reference_row["committed"]), int(reference_row["samples"]))
     assert (
-        int(row["parameter_version"]) == iterations
-        and int(row["sample_version"]) == iterations - 1
+        row["parameter_version"] == reference_row["parameter_version"]
+        and row["sample_version"] == reference_row["sample_version"]
     )
     assert all(
         math.isfinite(float(row[k]))
@@ -149,8 +150,8 @@ def run(name, iterations, restart=None):
     assert (
         int(q) > 0
         and int(grid) > 0
-        and int(version) == iterations - 1
-        and int(samples) == 1
+        and int(version) == int(reference_row["sample_version"])
+        and int(samples) == int(reference_row["samples"])
         and math.isfinite(float(im))
     )
     report["cases"][name].update(

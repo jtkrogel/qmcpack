@@ -11,12 +11,15 @@ p = argparse.ArgumentParser(description=__doc__)
 for name in ("binary", "input", "output"):
     p.add_argument("--" + name, type=Path, required=True)
 p.add_argument("--source-commit", required=True)
+p.add_argument("--reference", action="store_true", help="W2 same-grid reference selection; natural rejection is valid")
 p.add_argument(
     "--import-model",
     type=Path,
     help="fresh version0 training values, not a sampler/Hamiltonian restart",
 )
 a = p.parse_args()
+if a.reference and a.import_model:
+    p.error("--reference preserves the internally initialized qualified model")
 
 
 def sha(path):
@@ -78,6 +81,11 @@ def parameter(name, value):
 
 
 parameter("iterations", 2)
+if a.reference:
+    root.find("qmc/parameter[@name='walkers_per_rank']").text = "2"
+    for name, value in (("line_search", "reference"), ("line_search_maximum_weight", ".75"),
+                        ("line_search_minimum_ess_fraction", ".5"), ("line_search_confidence", "2")):
+        parameter(name, value)
 parameter(
     "checkpoint_interval", 1
 )  # Artifact observability only, no scientific-control change.
@@ -149,23 +157,30 @@ try:
         r"WFTrain paired accepted-grid ECP: Q=(\d+) grid=(\d+) version=(\d+) samples=(\d+) max_abs_ImVnl=([^\s]+)",
         log,
     )
-    assert len(receipts) == 2 and [int(r[2]) for r in receipts] == [0, 1]
+    assert len(receipts) == 2
     assert all(
         int(q) > 0
         and int(grid) > 0
-        and int(samples) == 1
+        and int(samples) == (2 if a.reference else 1)
         and math.isfinite(float(im))
         and float(im) >= 0
         for q, grid, version, samples, im in receipts
     )
     with next(a.output.glob("*.training_info.csv")).open() as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 2 and [int(r["parameter_version"]) for r in rows] == [1, 2]
+    assert len(rows) == 2
+    commits = [int(row["committed"]) for row in rows]
+    assert all(value in (0, 1) for value in commits)
+    versions = np.cumsum(commits).tolist()
+    assert [int(row["parameter_version"]) for row in rows] == versions
+    assert [int(row["sample_version"]) for row in rows] == [0, versions[0]]
+    assert [int(receipt[2]) for receipt in receipts] == [0, versions[0]]
+    if not a.reference:
+        assert commits == [1, 1]
     assert all(
         r["optimizer"] == "adam"
         and r["objective"] == "energy"
-        and int(r["committed"]) == 1
-        and int(r["samples"]) == 1
+        and int(r["samples"]) == (2 if a.reference else 1)
         and all(
             math.isfinite(float(r[k]))
             for k in ("mean_energy", "variance", "gradient_norm")
@@ -186,9 +201,59 @@ try:
             assert np.isfinite(v).all()
             values.append(v)
     delta = values[1] - values[0]
-    assert np.any(delta != 0), "No trainable bit changed between accepted versions1and2"
+    if commits[1]:
+        assert np.any(delta != 0), "No trainable bit changed on the second accepted update"
+    else:
+        np.testing.assert_array_equal(values[1], values[0])
     delta_norm = float(np.linalg.norm(delta))
     assert np.isfinite(delta).all() and math.isfinite(delta_norm)
+    if a.reference:
+        assessments = [tuple(map(float, match)) for match in re.findall(
+            r"WFTrain candidate alpha (\S+) loss (\S+) loss_difference (\S+) difference_error (\S+) "
+            r"ess (\S+) maximum_weight (\S+) valid ([01])", log)]
+        assert len(assessments) == 12
+        complete = re.findall(r"WFTrain paired fixed-grid candidate: alpha=(\S+) sample=(\d+) grid=(\d+) "
+            r"source_version=(\d+) candidate_version=(\d+) ReEL=(\S+) ImEL=(\S+) no_rng_draw=yes", log)
+        assert len(complete) == 28  # Baseline refresh plus six assessed scales, two samples/iteration.
+        states = sorted(a.output.rglob("*.state.h5"))
+        assert len(states) == 2
+        previous_state = None
+        for iteration, row in enumerate(rows):
+            candidates = assessments[6 * iteration:6 * (iteration + 1)]
+            assert [entry[0] for entry in candidates] == [0, 1, .125, .25, .5, .75]
+            assert all(math.isfinite(value) for entry in candidates for value in entry)
+            assert all(0 < entry[4] <= 2 and 0 < entry[5] <= 1 for entry in candidates)
+            alpha = float(row["selected_alpha"])
+            eligible = [entry for entry in candidates if entry[0] == alpha]
+            assert eligible and int(alpha != 0) == commits[iteration]
+            if alpha:
+                selected = eligible[0]
+                assert selected[6] == 1 and selected[1] - candidates[0][1] + 2 * selected[3] < 0
+            else:
+                assert not any(entry[0] and entry[6] and entry[1] - candidates[0][1] + 2 * entry[3] < 0
+                               for entry in candidates)
+            observed = complete[14 * iteration:14 * (iteration + 1)]
+            assert [float(entry[0]) for entry in observed[::2]] == [0, 0, 1, .125, .25, .5, .75]
+            assert [int(entry[1]) for entry in observed] == [0, 1] * 7
+            assert all(int(entry[2]) == int(receipts[iteration][1]) and int(entry[3]) == int(receipts[iteration][2])
+                       and math.isfinite(float(entry[5])) and math.isfinite(float(entry[6])) for entry in observed)
+            assert [int(entry[4]) for entry in observed] == [int(receipts[iteration][2]) + 1 + i // 2 for i in range(14)]
+            with h5py.File(states[iteration]) as archive:
+                group = archive["wftrain_checkpoint"]
+                np.testing.assert_array_equal(group["model/values"][()], values[iteration])
+                count = int(np.asarray(group["optimizer/accepted_update_count"][()]).reshape(-1)[0])
+                assert count == versions[iteration]
+                state = {name: group[f"optimizer/{name}"][()] for name in ("first_moment", "second_moment")}
+                assert all(np.isfinite(value).all() for value in state.values())
+                if not commits[iteration]:
+                    for name, value in state.items():
+                        np.testing.assert_array_equal(value, previous_state[name] if previous_state else np.zeros_like(value))
+                previous_state = state
+        report.update(selected_alphas=[float(row["selected_alpha"]) for row in rows],
+                      committed_updates=sum(commits), complete_candidates=complete,
+                      reference=True, accepted_parameter_versions=versions,
+                      scope="W2_same_grid_REFERENCE_natural_decisions_no_convergence_claim",
+                      initial_parameter_preservation="first-zero-step uses existing selector proof; adjacent native zero-step exact")
     if imported_values is not None:
         assert values[0].shape == imported_values.shape
         changed_from_import = int(np.count_nonzero(values[0] != imported_values))
@@ -199,7 +264,7 @@ try:
             imported_model_sha256=protected[str(imported_model_path)],
             fresh_initialization=True,
             first_update_changed_values=changed_from_import,
-            scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
+        scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
         )
     assert all(sha(Path(path)) == digest for path, digest in protected.items())
     rss = re.search(
