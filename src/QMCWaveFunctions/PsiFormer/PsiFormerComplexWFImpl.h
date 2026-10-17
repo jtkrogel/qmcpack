@@ -288,34 +288,43 @@ struct PsiFormerComplexWF::Impl
   };
 
 #ifdef ENABLE_CUDA
-  /** Retain final model authority and both successor owners until commit/discard.
-   * Declaration order releases the lock before any candidate/retired resources.
+  /** Retain final model/lane authority and both images until commit/discard.
+   * Declaration order releases both locks before candidate/retired resources.
    */
   struct PreparedGpuPublication final : PreparedGpuParameterPublication
   {
     /// Move fully resolved native leaves and final authority into one owning action.
-    PreparedGpuPublication(std::shared_ptr<Model> model, std::shared_ptr<GpuLane> next,
-        pf::Parameters::PreparedFlatValues native, std::unique_lock<std::shared_mutex> authority)
-        : state(std::move(model)), successor(std::move(next)), native_candidate(std::move(native)),
-          write(std::move(authority)) {}
+    PreparedGpuPublication(std::shared_ptr<Model> model, std::shared_ptr<GpuLane> lane,
+        std::shared_ptr<const psiformer::device::PreparedDeviceModel> next,
+        pf::Parameters::PreparedFlatValues native, std::unique_lock<std::shared_mutex> authority,
+        std::unique_lock<std::mutex> execution)
+        : state(std::move(model)), generation(std::move(lane)), successor(std::move(next)),
+          retired_image(generation->image), native_candidate(std::move(native)),
+          write(std::move(authority)), gpu(std::move(execution)) {}
 
     /// Fixed native copies and pointer adoption only; retirement occurs after unlock.
     std::size_t commit() noexcept override
     {
-      if (committed || !write.owns_lock())
+      if (committed || !write.owns_lock() || !gpu.owns_lock())
         std::terminate();
       const auto version = native_candidate.commit();
-      state->gpu.swap(successor);
-      state->gpu_derivative_lane.reset();
+      generation->value->adoptPreparedModel(successor);
+      generation->full->adoptPreparedModel(successor);
+      generation->image = successor;
+      retired_derivative.swap(state->gpu_derivative_lane);
       committed = true;
+      gpu.unlock();
       write.unlock();
       return version;
     }
 
     std::shared_ptr<Model> state;
-    std::shared_ptr<GpuLane> successor;
+    std::shared_ptr<GpuLane> generation;
+    std::shared_ptr<const psiformer::device::PreparedDeviceModel> successor, retired_image;
     pf::Parameters::PreparedFlatValues native_candidate;
+    std::weak_ptr<GpuDerivativeLane> retired_derivative;
     std::unique_lock<std::shared_mutex> write;
+    std::unique_lock<std::mutex> gpu;
     bool committed = false;
   };
 #endif
@@ -1785,7 +1794,7 @@ std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParam
   return parameters.version();
 }
 
-/// Admit a NEW generation plus owned native P-double candidate, excluding image HOST/leaf metadata and old owners.
+/// Admit only a new P image and native P candidate; reuse metadata/inference scratch.
 PsiFormerComplexWF::GpuParameterPublicationRequirements
 PsiFormerComplexWF::gpuParameterPublicationRequirements() const
 {
@@ -1793,13 +1802,9 @@ PsiFormerComplexWF::gpuParameterPublicationRequirements() const
   if (gpuInferenceEnabled())
   {
     std::shared_lock read(impl_->state->mutex);
-    const auto& generation = *impl_->state->gpu;
-    const auto device = psiformer::spatial_detail::checkedAdd(generation.device_bytes,
-        generation.image->deviceStorageBytes(), "Complex GPU publication device bytes overflow");
     const auto native_bytes = psiformer::spatial_detail::checkedProduct(
         sizeof(double), parameterSchema().parameterCount(), "Complex GPU native candidate bytes overflow");
-    return {device, psiformer::spatial_detail::checkedAdd(generation.host_bytes, native_bytes,
-        "Complex GPU publication HOST bytes overflow")};
+    return {native_bytes, native_bytes};
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
@@ -1838,8 +1843,9 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
       if (!psiformer::determinant::isFiniteReal(value))
         throw std::invalid_argument("Complex GPU publication values must be finite");
 
-    // Capture immutable ownership/profile under read; never wait on GPU under the later write.
+    // Capture the exact immutable image under read; prepare its upload outside write.
     std::shared_ptr<Impl::GpuLane> captured;
+    std::shared_ptr<const psiformer::device::PreparedDeviceModel> source_image;
     GpuParameterPublicationRequirements required{};
     const auto native_bytes = psiformer::spatial_detail::checkedProduct(
         sizeof(double), candidate.values.size(), "Complex GPU native candidate bytes overflow");
@@ -1851,13 +1857,11 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
         throw std::logic_error("Complex GPU publication requires no family pending proposals");
       Impl::validateDerivativeSource(*state);
       captured = state->gpu;
-      captured->image->validateCurrentDevice();
-      if (captured->image->version() != expected_version)
+      source_image = captured->image;
+      source_image->validateCurrentDevice();
+      if (source_image->version() != expected_version)
         throw std::logic_error("Complex GPU publication current image/native version mismatch");
-      required = {psiformer::spatial_detail::checkedAdd(captured->device_bytes,
-          captured->image->deviceStorageBytes(), "Complex GPU publication device bytes overflow"),
-          psiformer::spatial_detail::checkedAdd(captured->host_bytes, native_bytes,
-              "Complex GPU publication HOST bytes overflow")};
+      required = {native_bytes, native_bytes};
       if (required.device_bytes > additional_device_cap || required.host_bytes > additional_host_cap)
         throw std::length_error("Complex GPU publication exceeds new-generation caps before allocation");
     }
@@ -1865,27 +1869,27 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     app_log() << "  Complex GPU prepared publication: attempted_new_device_bytes=" << required.device_bytes
               << ", attempted_new_host_numeric_bytes=" << required.host_bytes
               << ", owned_native_candidate_bytes=" << native_bytes
-              << "; excludes caller/image HOST, resolved-leaf/lock metadata and retained old owners" << std::endl;
-    // One independent cold generation, with no old P image retained by its metadata.
+              << "; reuses immutable metadata and VALUE/FULL workspace; excludes caller/image HOST, "
+                 "resolved-leaf/lock metadata and retained owners" << std::endl;
+    // Independent canonical bytes share the immutable family, not an old P image.
     const auto next_version = expected_version + 1;
-    std::shared_ptr<Impl::GpuLane> successor = Impl::GpuLane::prepareFrozen(state->plan, candidate.values,
-        state->model.cfg.nuclei.x, next_version, state->gpu_limit, captured->preparation, captured->capacity);
-    if (successor->device_bytes + successor->image->deviceStorageBytes() != required.device_bytes ||
-        psiformer::spatial_detail::checkedAdd(successor->host_bytes, native_bytes,
-            "Complex GPU publication HOST bytes overflow") != required.host_bytes ||
-        successor->image->version() != next_version)
-      throw std::logic_error("Complex GPU successor capacities/version differ from admitted generation");
+    auto successor = source_image->makeUpdatedImage(candidate.values, next_version);
 
     std::unique_lock write(state->mutex);
-    if (state->model.p.version() != expected_version || state->gpu != captured)
+    if (state->model.p.version() != expected_version || state->gpu != captured || captured->image != source_image)
       throw std::runtime_error("Complex GPU publication lost its captured version/generation");
     if (state->pending_proposals.load(std::memory_order_relaxed))
       throw std::logic_error("Complex GPU publication requires no family pending proposals");
     Impl::validateDerivativeSource(*state);
+    std::unique_lock gpu(captured->mutex);
+    captured->image->validateCurrentDevice();
+    captured->queue.sync();
+    captured->value->validateModelRebind(successor);
+    captured->full->validateModelRebind(successor);
     auto native = state->model.p.prepare_flat_values(candidate.values, expected_version);
     // All clones, including this publisher, reject old accepted caches by version.
-    return std::make_unique<Impl::PreparedGpuPublication>(state, std::move(successor),
-        std::move(native), std::move(write));
+    return std::make_unique<Impl::PreparedGpuPublication>(state, captured, std::move(successor),
+        std::move(native), std::move(write), std::move(gpu));
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");

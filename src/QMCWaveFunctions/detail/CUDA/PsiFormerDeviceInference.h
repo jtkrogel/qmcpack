@@ -1315,15 +1315,31 @@ public:
    */
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
+    validateModelRebind(successor);
+    adoptPreparedModel(successor);
+  }
+
+  /// Validate without revoking active tapes/results; publication retains owner authority.
+  void validateModelRebind(const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
     model_->validateSuccessor(successor);
     if (mixed_dense_ && mixed_dense_->modelImage().get() != successor.get())
       throw std::invalid_argument("Rebind the prepared mixed affine cache before replacing its graph image");
-    model_ = std::move(successor);
+  }
+
+private:
+  /** Adopt only after validation, with exclusive owner authority and an external
+   * strong old-image owner. No runtime call, allocation or resource retirement.
+   */
+  void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
+  {
+    model_ = successor;
     value_tape_valid_ = false;
     result_valid_ = false;
     target_tape_valid_ = false;
   }
 
+public:
   /// Return prepared capacity independently of the most recent logical batch.
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
 

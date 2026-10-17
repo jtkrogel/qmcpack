@@ -95,6 +95,22 @@ public:
     trunk_->rebindModel(std::move(successor));
   }
 
+  /// Check a publication successor without invalidating the accepted result epoch.
+  void validateModelRebind(const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex VALUE generation exhausted");
+    trunk_->validateModelRebind(successor);
+  }
+
+  /// Caller retains exclusive authority and an old-image owner after validated preparation.
+  void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
+  {
+    valid_ = false;
+    ++generation_;
+    trunk_->adoptPreparedModel(successor);
+  }
+
   /// Complete every live configuration before publishing the sole result prefix.
   void evaluate(const std::vector<double>& positions)
   {

@@ -70,7 +70,7 @@ public:
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
 
-  /// NEW inference generation plus one owned native P-double candidate; excludes caller/image HOST and retired owners.
+  /// New canonical P image plus native P candidate; excludes existing metadata/inference owners and caller HOST P.
   struct GpuParameterPublicationRequirements
   {
     std::size_t device_bytes, host_bytes;
