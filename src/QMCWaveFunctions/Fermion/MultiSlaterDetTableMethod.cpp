@@ -894,7 +894,7 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
   return ratio;
 }
 
-void MultiSlaterDetTableMethod::enableAcceptedReferenceOrbitalVirtualRatios()
+void MultiSlaterDetTableMethod::validateAcceptedReferenceOrbitalProfile() const
 {
   if (csf_data_ || CI_Optimizable || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 ||
       Dets[0]->getNumPtcls() != Dets[1]->getNumPtcls())
@@ -907,6 +907,11 @@ void MultiSlaterDetTableMethod::enableAcceptedReferenceOrbitalVirtualRatios()
     if (det->isSpinor() || lcao.fileImageIdentity())
       throw std::invalid_argument("Private orbital ECP rows require scalar inline LCAO owners");
   }
+}
+
+void MultiSlaterDetTableMethod::enableAcceptedReferenceOrbitalVirtualRatios()
+{
+  validateAcceptedReferenceOrbitalProfile();
   for (auto& det : Dets) det->enablePrivateAcceptedReferenceOrbitalRows();
   accepted_reference_virtual_mode_ = accepted_reference_orbital_virtual_mode_ = true;
 }

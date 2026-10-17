@@ -511,13 +511,16 @@ std::unique_ptr<TrialWaveFunction> TrainingWaveFunctionBinding::makePrivateClone
   if (particles.getNumDistTables() != tables)
     throw std::logic_error("Conventional candidate changed distance-table topology");
   for (auto& determinant : candidate->findMSD())
-  {
     determinant.get().isolateOptimizationState();
-    if (nonlocal_ecp_)
-      determinant.get().enableAcceptedReferenceVirtualRatios();
-  }
   for (auto* rotated : rotationLayout(*candidate).unique)
     rotated->isolateOptimizationState();
+  // Activation follows ALL bank detachment; never flag the external prototype.
+  if (nonlocal_ecp_)
+    for (auto& determinant : candidate->findMSD())
+      if (orbital_rotations_)
+        determinant.get().enableAcceptedReferenceOrbitalVirtualRatios();
+      else
+        determinant.get().enableAcceptedReferenceVirtualRatios();
   return candidate;
 }
 std::size_t TrainingWaveFunctionBinding::publishParameters(

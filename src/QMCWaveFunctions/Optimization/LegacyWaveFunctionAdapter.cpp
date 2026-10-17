@@ -276,9 +276,10 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
       if (msd->getDetSize() != 2 || sample.particles.groups() != 2 ||
           sample.particles.getLattice().SuperCellEnum != SUPERCELL_OPEN)
         throw std::invalid_argument("Legacy coefficient ECP products require open fixed-orbital two-spin DETS/CSF");
-      private_md_orbital = msd->usesAcceptedReferenceOrbitalVirtualRatios();
+      // Structural discovery never enables/evaluates the external prototype.
+      private_md_orbital = msd->getDet(0).isOptimizable();
       if (private_md_orbital)
-        msd->validatePreparedRotatedCoefficientState(*msd);
+        msd->validateAcceptedReferenceOrbitalProfile();
       else
       {
         msd->validatePreparedCoefficientState(*msd);

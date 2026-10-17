@@ -50,7 +50,8 @@ public:
              MCPopulation&& pop,
              const RefVector<RandomBase<FullPrecRealType>>& rng_refs,
              SampleStack& samples_,
-             Communicate* comm);
+             Communicate* comm,
+             bool imported_md_orbital_ecp = false);
   /// Copy constructor
   VMCBatched(const VMCBatched&) = delete;
   /// Copy operator (disabled).
@@ -75,6 +76,8 @@ public:
 
 private:
   VMCDriverInput vmcdriver_input_;
+  /// Internal selected-pair import opt-in, never enabled by ordinary VMC XML.
+  bool imported_md_orbital_ecp_;
   /// Per crowd, driver-specific move contexts
   UPtrVector<ContextForSteps> step_contexts_;
 

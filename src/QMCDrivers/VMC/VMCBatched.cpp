@@ -16,6 +16,7 @@
 #include "Message/UniformCommunicateError.h"
 #include "Message/CommOperators.h"
 #include "TrialWaveFunction.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
 #include "Particle/MCSample.h"
 #include "MemoryUsage.h"
@@ -33,7 +34,8 @@ VMCBatched::VMCBatched(const ProjectData& project_data,
                        MCPopulation&& pop,
                        const RefVector<RandomBase<FullPrecRealType>>& rng_refs,
                        SampleStack& samples,
-                       Communicate* comm)
+                       Communicate* comm,
+                       bool imported_md_orbital_ecp)
     : QMCDriverNew(project_data,
                    std::move(qmcdriver_input),
                    std::move(estimator_manager),
@@ -44,6 +46,7 @@ VMCBatched::VMCBatched(const ProjectData& project_data,
                    comm,
                    "VMCBatched"),
       vmcdriver_input_(input),
+      imported_md_orbital_ecp_(imported_md_orbital_ecp),
       samples_(samples),
       collect_samples_(false)
 {}
@@ -69,6 +72,14 @@ void VMCBatched::process(xmlNodePtr node)
                                qmcdriver_input_.get_requested_steps(), qmcdriver_input_.get_max_blocks());
 
     initPopulationAndCrowds(awc);
+    if (imported_md_orbital_ecp_)
+      for (auto& wavefunction : population_.get_twfs())
+      {
+        if (wavefunction.get() == &population_.get_golden_twf())
+          throw std::logic_error("Imported orbital ECP population aliases its external golden wavefunction");
+        for (auto& determinant : wavefunction->findMSD())
+          determinant.get().enableAcceptedReferenceOrbitalVirtualRatios();
+      }
     createStepContexts(crowds_.size());
   }
   catch (const UniformCommunicateError& ue)

@@ -1658,7 +1658,10 @@ void WFTrainBatched::process(xmlNodePtr node)
           throw std::logic_error("Conventional population unexpectedly aliases its external prototype");
         if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
           for (auto& determinant : walker_wf.findMSD())
-            determinant.get().enableAcceptedReferenceVirtualRatios();
+            if (conventional_binding_->hasOrbitalRotations())
+              determinant.get().enableAcceptedReferenceOrbitalVirtualRatios();
+            else
+              determinant.get().enableAcceptedReferenceVirtualRatios();
         conventional_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i],
                                           population_.get_hamiltonians()[i].get());
       }
@@ -3262,7 +3265,10 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
     throw UniformCommunicateError("WFTrain inference: conflicting or inaccessible scalar output");
 
   auto electrons = std::make_unique<ParticleSet>(population_.get_golden_electrons());
-  auto wavefunction = student_prototype_.makeClone(*electrons);
+  const bool private_md_orbital_ecp = conventional_binding_ && conventional_binding_->hasOrbitalRotations() &&
+      !student_prototype_.findMSD().empty() && population_.get_golden_hamiltonian().hasPhysicalNLPP();
+  auto wavefunction = private_md_orbital_ecp ? conventional_binding_->makePrivateClone(*electrons)
+                                          : student_prototype_.makeClone(*electrons);
   auto hamiltonian = population_.get_golden_hamiltonian().makeClone(*electrons, *wavefunction);
   WalkerConfigurations configurations;
   MCPopulation population(myComm->size(), myComm->rank(), *electrons, *wavefunction, *hamiltonian);

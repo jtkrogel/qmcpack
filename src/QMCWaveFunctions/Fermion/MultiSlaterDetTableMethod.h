@@ -200,6 +200,8 @@ public:
   void enableAcceptedReferenceVirtualRatios();
   /// Report the private mode, including propagation to descendants of that evaluator.
   bool usesAcceptedReferenceVirtualRatios() const noexcept { return accepted_reference_virtual_mode_; }
+  /// Validate structure only, without evaluating or enabling the external prototype.
+  void validateAcceptedReferenceOrbitalProfile() const;
   /// Separate private numerical mode; ordinary source/prototype flags remain false.
   void enableAcceptedReferenceOrbitalVirtualRatios();
   bool usesAcceptedReferenceOrbitalVirtualRatios() const noexcept { return accepted_reference_orbital_virtual_mode_; }

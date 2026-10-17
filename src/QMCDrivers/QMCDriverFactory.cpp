@@ -30,6 +30,7 @@
 #include "QMCWaveFunctions/WaveFunctionPool.h"
 #include "QMCHamiltonians/HamiltonianPool.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "PsiHamNamePairReader.h"
 #include "QMCDrivers/VMC/VMC.h"
 #include "QMCDrivers/CorrelatedSampling/CSVMC.h"
@@ -263,6 +264,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
+    bool imported_md_orbital_ecp = false;
     if (const auto* request = wavefunction_pool.getParameterFileRequest(primaryPsi.getName()))
     {
       // Defer loading until physical/PP identity exists, but finish before any
@@ -317,6 +319,22 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
         }
         binding->importModel(request->path);
         wavefunction_pool.markParameterFileImported(primaryPsi.getName(), primaryH);
+      }
+      const auto determinants = primaryPsi.findMSD();
+      if (primaryH.hasPhysicalNLPP() && !determinants.empty() && determinants.front().get().getDet(0).isOptimizable())
+      {
+        // Revalidate this exact imported subset on later sections too; never flag the pool-owned model.
+        std::exception_ptr failure;
+        try { determinants.front().get().validateAcceptedReferenceOrbitalProfile(); }
+        catch (...) { failure = std::current_exception(); }
+        int failed = failure ? 1 : 0;
+        comm->allreduce(failed);
+        if (failed)
+        {
+          if (failure) std::rethrow_exception(failure);
+          throw UniformCommunicateError("Imported orbital ECP structural admission failed on another rank");
+        }
+        imported_md_orbital_ecp = true;
       }
     }
 #ifdef QMC_COMPLEX
@@ -390,7 +408,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
                                                             primaryPsi),
                                        std::move(vmcdriver_input), qmc_system,
                                        MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
-                                       RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm);
+                                       RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm,
+                                       imported_md_orbital_ecp);
 
       new_driver->setUpdateMode(is_pbyp_move);
     }
