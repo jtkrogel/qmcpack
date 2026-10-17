@@ -115,5 +115,10 @@ outer CSF0=.6 versus expanded C0=.48, child map, both frames and strict
 model/import/initialized restart checks are unchanged. Fixed-CI ALM and CSF
 minPII must reach capability rejection (no LM-only controls on minPII).
 Initial root refusal is negative only with no history/HDF; any later refusal
-is failure, never a tuned positive. Numerical127 passed15,423 assertions;
-this native CSF ALM workflow is prepared, NOT yet qualified or registered.
+is failure, never a tuned positive. Numerical127 passed15,423 assertions.
+Actual128 at source ``ee0fb76fe``/app ``224ace68...`` reached the ALM solve and
+refused its initial untrusted root: no update, history row or HDF publication.
+The helper's EXPECTED REFUSAL exit0 is negative proof, NOT full native/restart
+qualification. Fixed-CI/minPII guard calls were not reached. No rerun, tuning
+or positive registration follows; task46 ``validation/csf_orbital_alm_native128``
+retains this result separately from the passing mathematical foundation.
