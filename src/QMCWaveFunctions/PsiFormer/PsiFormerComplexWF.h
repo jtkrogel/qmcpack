@@ -258,6 +258,7 @@ public:
    */
   CoulombObservation observeCoulombEnergy(const ParticleSet&, FullPrecRealType same_sample_potential) const;
 
+  /// Preserve complex physical energies separately from native REAL Hamiltonian reporting.
   struct CapturedLocalEnergyObservation
   {
     LogValue kinetic, nonlocal, local_energy;
@@ -276,8 +277,11 @@ public:
     std::size_t capture_host_bytes;
     std::size_t bound_host_extra_bytes; // Capture plus eventual packing, NOT an additional capture copy.
   };
+  /// Pre-MC metadata query: capture is included once in the complete binding-overlap allowance.
   GpuNonLocalReplayRequirements gpuNonLocalReplayRequirements(std::size_t samples, std::size_t maximum_points) const;
+  /// Recheck the concrete unused operator and its admitted HOST cap without allocating.
   std::size_t gpuNonLocalReplayRequiredBytes(const wftrain::StreamingDerivativeOperator&) const;
+  /// Return only a replay-capture transaction; callers keep input particles alive until completion.
   std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> makeBudgetedGpuNonLocalReplayConsumer(
       const RefVectorWithLeader<TrialWaveFunction>&, const RefVectorWithLeader<ParticleSet>&,
       const wftrain::StreamingDerivativeOperator&, std::size_t maximum_host_bytes) const;
