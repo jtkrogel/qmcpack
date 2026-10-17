@@ -34,6 +34,15 @@ The independent joint physical gate passed separately (3,836 assertions).
 One joint mode is registered beside the unchanged fixed-P16 route, with
 the same real CPU guard and strict comparisons, not an optimizer ULP exception.
 
+The candidate ``--joint-ci-orbital-ecp-minpii`` mode selects the same equal-spin
+DETS P17 recipe with minPII only. It retains two updates, four samples per
+update, both frames/CI1/J2 changes, exported inference and strict initialized
+split restart. Existing bounded family controls are used (damping 0.01,
+Krylov 64 iterations/256 applications/15 seconds/relative tolerance 1e-6,
+GMRES restart 16, zero damping retries, energy undershoot 1.0). One mixed LM
+early rejection remains required. Native qualification and registration are
+pending; no other optimizer or CSF/unequal-spin profile is implied.
+
 The optional ``--unequal-spin-orbital-ecp`` mode derives one charged C^-
 3-up/2-down case from the same XML. It adds the numerical fixture's third
 up coordinate and uses up occupations 1110/1101, giving five/six orbital

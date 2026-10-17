@@ -238,6 +238,8 @@ def main():
                         help="bounded neutral-C fixed-CI two-owner MD orbital/J2 ECP Adam P16")
     parser.add_argument("--joint-ci-orbital-ecp", action="store_true",
                         help="derive joint P17 CI1/orbital/J2 ECP Adam from the fixed-CI XML")
+    parser.add_argument("--joint-ci-orbital-ecp-minpii", action="store_true",
+                        help="same joint P17 round trip with minPII only; strict initialized restart")
     parser.add_argument("--unequal-spin-orbital-ecp", action="store_true",
                         help="derive one charged C^- 3up/2down joint P16 orbital ECP case")
     parser.add_argument("--csf-orbital-ecp", action="store_true",
@@ -271,6 +273,11 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.joint_ci_orbital_ecp_minpii:
+        if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
+                args.csf_orbital_ecp)) or args.ci_representation != "dets":
+            parser.error("--joint-ci-orbital-ecp-minpii selects its own equal-spin DETS recipe")
+        args.joint_ci_orbital_ecp = True
     if args.external_orbital_ecp:
         if args.external_lcao:
             parser.error("select fixed --external-lcao or active --external-orbital-ecp")
@@ -422,11 +429,13 @@ def main():
             }, indent=2) + "\n")
         return result, text
 
-    def run(label, *, optimizer="adam", inference=True, iterations=2, restart=None, mutate=None, reject=False,
+    def run(label, *, optimizer=None, inference=True, iterations=2, restart=None, mutate=None, reject=False,
             samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None,
             legacy_vp=None, legacy_reference=None, completed_restore=False, ci_representation=None):
         directory = work / label
         directory.mkdir()
+        if optimizer is None:
+            optimizer = "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
         if periodic_profile:
             samples_per_rank = 8
         tree = ET.parse(fixture)
@@ -555,6 +564,14 @@ def main():
         qmc = tree.find("qmc")
         training = qmc.find("training")
         training.set("optimizer", optimizer)
+        if args.joint_ci_orbital_ecp_minpii and optimizer == "minpii":
+            # Reuse bounded family controls without changing the physical sampler.
+            limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
+                      "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
+                      "krylov_relative_tolerance": "1e-6", "gmres_restart_length": "16",
+                      "maximum_damping_retries": "0", "pii_energy_undershoot": "1.0"}
+            for name, value in limits.items():
+                ET.SubElement(training, "parameter", name=name).text = value
         training.find("parameter[@name='iterations']").text = str(iterations)
         if not inference:
             qmc.remove(qmc.find("inference"))
@@ -622,6 +639,9 @@ def main():
             assert all(math.isfinite(float(row[name])) for name in ("mean_energy", "variance", "gradient_norm")), row
             if require_committed:
                 assert float(row["gradient_norm"]) > 0, row
+            if args.joint_ci_orbital_ecp_minpii:
+                assert 0 < int(row["krylov_operator_applications"]) <= 256, row
+                assert 0 <= int(row["krylov_iterations"]) <= 64, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + int(row["committed"]), row
         assert (directory / "sj.s000.last_checkpoint.h5").is_file(), directory
         family = directory / "sj.s000.inference"
@@ -969,7 +989,8 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("adam", samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
+    adam = run("minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+               samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
             limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
@@ -1201,7 +1222,10 @@ def main():
             print("PASS: real CPU charged C^- 3up/2down joint CI1/orbital/J2 ECP P16, "
                   "five/six-pair frames, frozen C0/original XML and strict exact initialized restart")
         elif args.joint_ci_orbital_ecp:
-            print("PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP Adam P17, "
+            if args.joint_ci_orbital_ecp_minpii:
+                run("reject_joint_orbital_ecp_lm", optimizer="lm", reject="mixed updates remain unqualified")
+            method = "minPII" if args.joint_ci_orbital_ecp_minpii else "Adam"
+            print(f"PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP {method} P17, "
                   "frozen C0/original XML, two complete frames, physical VMC reuse and strict exact initialized restart")
         elif args.md_orbital_ecp:
             print("PASS: real CPU fixed-CI distinct-spin MD orbital/J2 ordinary-locality ECP Adam P16, "
