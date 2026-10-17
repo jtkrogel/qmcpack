@@ -208,11 +208,21 @@ def main():
         mirrors = list(re.finditer(r'cold HOST mirror refresh: attempted_bytes=(\d+), version=(\d+)', log))
         assert len(mirrors) == 1 and mirrors[0].start() > window_matches[-1].end()
         assert tuple(map(int, mirrors[0].groups())) == (8 * count, 3)
+        moment_owners = list(re.finditer(
+            r'Resident DEVICE Adam HOST moments before sampling: actual_bytes=(\d+), cold_allowance=(\d+)', log))
+        assert len(moment_owners) == 3
+        assert all(tuple(map(int, match.groups())) == (0, 16 * count) for match in moment_owners)
+        assert all(owner.start() < window.start() for owner, window in zip(moment_owners, window_matches))
+        moment_refreshes = list(re.finditer(
+            r'Resident DEVICE Adam cold HOST moments before allocation: attempted_bytes=(\d+)', log))
+        assert len(moment_refreshes) == 1 and moment_refreshes[0].start() > window_matches[-1].end()
+        assert int(moment_refreshes[0].group(1)) == 16 * count
         assert protected == {path: sha(Path(path)) for path in protected}
         report.update(status='PASS', exact_restart=True, host_oracle_rtol=args.rtol, host_oracle_atol=args.atol,
                       warm_transfer_windows=[dict(uploaded=int(u), downloaded=int(d), device_copied=int(c))
                                              for u, d, c in windows],
                       accounted_small_d2h=small_d2h, cold_mirror_bytes=8 * count,
+                      warm_host_moment_bytes=[0] * 3, cold_moment_allowance=16 * count,
                       cold_reader_gate='Separately required numerical cached-CPU-reader test',
                       profile='REAL/open AE ENERGY Adam MPI1/crowd1/W2/block1/step1 movealle/nodrift; no controls')
     finally:

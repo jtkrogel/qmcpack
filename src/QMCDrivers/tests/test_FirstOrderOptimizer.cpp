@@ -803,14 +803,21 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
           "[drivers][training][optimizer][resident_adam]")
 {
   using namespace psiformer::device;
-  int devices = 0;
+  int devices = 0, ordinal = -1;
 #ifdef QMC_CUDA2HIP
   if (hipGetDeviceCount(&devices) != success || !devices)
     SKIP("No usable HIP device for resident Adam callback");
+  checkRuntime(hipGetDevice(&ordinal), "resident mirror device");
 #else
   if (cudaGetDeviceCount(&devices) != success || !devices)
     SKIP("No usable CUDA device for resident Adam callback");
+  checkRuntime(cudaGetDevice(&ordinal), "resident mirror device");
 #endif
+  bool vacant = false;
+  SECTION("default seed retains HOST compatibility mirrors") {}
+  SECTION("admitted DEVICE authority vacates HOST mirrors") { vacant = true; }
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  constexpr std::size_t cold_pair = 2*4*sizeof(double);
   OptimizerToyProvider provider;
   const auto& schema = provider.parameterSchema();
   const auto parameters = provider.snapshotParameters();
@@ -821,7 +828,28 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
   CHECK(optimizer.retainedBytes() == base);
   optimizer.prepareResidentAdamNorm(norm_bytes);
   CHECK(optimizer.retainedBytes() == base + 2 * norm_bytes);
-  optimizer.seedResidentDeviceAdam(); // Explicit cold initial moments; no parameter snapshot callback.
+  CHECK(optimizer.hostMomentMirrorBytes() == cold_pair);
+  const auto before_denial = metrics.snapshot();
+  CHECK_THROWS_AS(optimizer.seedResidentDeviceAdam(cold_pair-1), std::length_error);
+  CHECK(optimizer.hostMomentMirrorBytes() == cold_pair);
+  CHECK(metrics.snapshot().uploaded_bytes == before_denial.uploaded_bytes);
+  optimizer.seedResidentDeviceAdam(vacant ? cold_pair : 0);
+  CHECK(optimizer.hostMomentMirrorBytes() == (vacant ? 0 : cold_pair));
+  CHECK(optimizer.retainedBytes() == base + 2*norm_bytes - (vacant ? cold_pair : 0));
+  if (vacant)
+  {
+    CHECK_THROWS_AS(optimizer.seedResidentDeviceAdam(cold_pair+1), std::invalid_argument);
+    const auto before_get = metrics.snapshot();
+    CHECK(optimizer.firstMoment() == std::vector<double>(4));
+    CHECK(optimizer.secondMoment() == std::vector<double>(4));
+    CHECK(metrics.snapshot().downloaded_bytes-before_get.downloaded_bytes == cold_pair);
+    const auto coherent = metrics.snapshot();
+    optimizer.firstMoment(); optimizer.secondMoment();
+    CHECK(metrics.snapshot().downloaded_bytes == coherent.downloaded_bytes);
+    optimizer.seedResidentDeviceAdam(cold_pair);
+    CHECK(optimizer.hostMomentMirrorBytes() == 0);
+    CHECK(metrics.snapshot().uploaded_bytes == coherent.uploaded_bytes);
+  }
   const auto before_metadata_proposals = optimizer.checkpointMetadata().state_fingerprint;
   double metadata_norm = -1;
   bool called = false;
@@ -829,6 +857,11 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
       [&](const auto& owner, double, double, double, double, double) {
         called = true;
         CHECK(owner);
+        if (vacant)
+        {
+          CHECK(optimizer.hostMomentMirrorBytes() == 0);
+          CHECK_THROWS_AS(optimizer.firstMoment(), std::logic_error);
+        }
         return 2.5;
       };
   CHECK_THROWS_AS(optimizer.proposeResidentDeviceAdam(schema, std::numeric_limits<std::size_t>::max(),
@@ -851,6 +884,11 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
   double norm = -1;
   bool fail_after_numeric = false;
   const auto consume = [&](auto& adam, double b1, double b2, double c1, double c2, double eps, auto& candidate) {
+    if (vacant)
+    {
+      CHECK(optimizer.hostMomentMirrorBytes() == 0);
+      CHECK_THROWS_AS(optimizer.secondMoment(), std::logic_error);
+    }
     adam.propose(parameters.values, gradient.data(), b1, b2, c1, c2, eps, candidate);
     if (fail_after_numeric)
       throw std::runtime_error("Injected completed numeric producer failure");
@@ -886,11 +924,51 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
   candidate = optimizer.proposeResidentAdam(schema, parameters, consume, norm);
   validateTrainingCandidate(schema, parameters, candidate);
   provider.publishParameters(candidate, parameters.version);
+  const auto before_accept = metrics.snapshot();
   optimizer.acceptResidentAdam();
+  CHECK(metrics.snapshot().allocation_calls == before_accept.allocation_calls);
+  CHECK(metrics.snapshot().free_calls == before_accept.free_calls);
+  CHECK(metrics.snapshot().uploaded_bytes == before_accept.uploaded_bytes);
+  CHECK(metrics.snapshot().downloaded_bytes == before_accept.downloaded_bytes);
+  CHECK(optimizer.hostMomentMirrorBytes() == (vacant ? 0 : cold_pair));
   CHECK(optimizer.acceptedUpdateCount() == 1);
   CHECK(optimizer.firstMoment().back() == 0);
   CHECK(optimizer.secondMoment().back() == 0);
   CHECK_FALSE(optimizer.checkpointMetadata().state_fingerprint.empty());
+  if (vacant)
+  {
+    const auto first = optimizer.firstMoment(), second = optimizer.secondMoment();
+    const std::filesystem::path path = "wftrain_vacant_moment_restart.h5";
+    OptimizerCheckpointCleanup cleanup(path);
+    TrainingIterationState state{1, provider.snapshotParameters().version, schema.fingerprint()};
+    TrainingStageState stage{"optimization", 1, 1, "vacant-moment-stage"};
+    TrainingCheckpoint::saveAtomic(path, provider, state, stage, &optimizer);
+    OptimizerToyProvider restored_provider;
+    FirstOrderOptimizer restored(restored_provider.parameterSchema(), makeOptions(FirstOrderMethod::ADAM));
+    restored.prepareDeviceAdam(estimateAdamBytes(4, 3));
+    restored.seedResidentDeviceAdam(cold_pair);
+    REQUIRE(restored.hostMomentMirrorBytes() == 0);
+    TrainingIterationState restored_state{0, 0, schema.fingerprint()};
+    TrainingStageState restored_stage{"optimization", 1, 0, "vacant-moment-stage"};
+    std::array<double, 4> corrupted;
+    std::copy(first.begin(), first.end(), corrupted.begin());
+    corrupted[0] += 1;
+    overwriteFirstMoment(path, corrupted);
+    CHECK_THROWS(TrainingCheckpoint::restore(path, restored_provider, restored_state, restored_stage, &restored));
+    CHECK(restored.acceptedUpdateCount() == 0);
+    CHECK(restored.hostMomentMirrorBytes() == 0);
+    std::copy(first.begin(), first.end(), corrupted.begin());
+    overwriteFirstMoment(path, corrupted);
+    TrainingCheckpoint::restore(path, restored_provider, restored_state, restored_stage, &restored);
+    CHECK(restored.acceptedUpdateCount() == 1);
+    CHECK(restored.hostMomentMirrorBytes() == cold_pair);
+    CHECK(restored.firstMoment() == first);
+    CHECK(restored.secondMoment() == second);
+    restored.seedResidentDeviceAdam(cold_pair);
+    CHECK(restored.hostMomentMirrorBytes() == 0);
+    CHECK(restored.firstMoment() == first);
+    CHECK(restored.secondMoment() == second);
+  }
 }
 #endif
 

@@ -299,7 +299,21 @@ void FirstOrderOptimizer::synchronizeMoments() const
 #ifdef ENABLE_CUDA
   if (device_adam_ && moment_mirrors_stale_)
   {
-    device_adam_->download(first_moment_, second_moment_);
+    if (cold_moment_host_allowance_)
+    {
+      if (proposal_live_ || hostMomentMirrorBytes() != 0)
+        throw std::logic_error("Vacant Adam mirrors require idle absent HOST owners before cold refresh");
+      const auto required = parameter_count_ * (2 * sizeof(double)); // Checked when the allowance was frozen.
+      if (required > cold_moment_host_allowance_)
+        throw std::length_error("Adam cold moment refresh exceeds its admitted HOST allowance");
+      std::clog << "Resident DEVICE Adam cold HOST moments before allocation: attempted_bytes=" << required << '\n';
+      std::vector<double> first(parameter_count_), second(parameter_count_);
+      device_adam_->download(first, second);
+      first_moment_.swap(first);
+      second_moment_.swap(second); // Neither member is published until BOTH copies succeed.
+    }
+    else
+      device_adam_->download(first_moment_, second_moment_);
     moment_mirrors_stale_ = false;
   }
 #endif
@@ -379,6 +393,11 @@ StructuredParameterSnapshot FirstOrderOptimizer::proposeResidentAdam(const Struc
   auto candidate = parameters;
   try
   {
+    if (cold_moment_host_allowance_)
+    {
+      seedResidentDeviceAdam(cold_moment_host_allowance_);
+      proposal_live_ = true; // Block cold inspection during a caller-controlled numeric callback.
+    }
     if (!device_adam_->seeded())
       device_adam_->seed(first_moment_, second_moment_);
     norm = consume(*device_adam_, options_.adam_beta1, options_.adam_beta2,
@@ -411,13 +430,33 @@ void FirstOrderOptimizer::acceptResidentAdam() noexcept
 #endif
 }
 
-void FirstOrderOptimizer::seedResidentDeviceAdam()
+/// Seed before sampling; never discard the only accepted copy or retire HOST owners at commit.
+void FirstOrderOptimizer::seedResidentDeviceAdam(std::size_t cold_host_allowance)
 {
 #ifdef ENABLE_CUDA
   if (!device_adam_ || proposal_live_ || options_.method != FirstOrderMethod::ADAM)
     throw std::invalid_argument("DEVICE authority requires prepared idle Adam");
+  if (cold_host_allowance)
+  {
+    if (parameter_count_ > std::numeric_limits<std::size_t>::max() / (2 * sizeof(double)) ||
+        cold_host_allowance == std::numeric_limits<std::size_t>::max() ||
+        cold_host_allowance < parameter_count_ * (2 * sizeof(double)))
+      throw std::length_error("DEVICE Adam needs an admitted finite cold HOST moment allowance");
+    if (cold_moment_host_allowance_ && cold_moment_host_allowance_ != cold_host_allowance)
+      throw std::invalid_argument("DEVICE Adam cold HOST allowance is frozen");
+  }
   if (!device_adam_->seeded())
     device_adam_->seed(first_moment_, second_moment_);
+  if (cold_host_allowance) cold_moment_host_allowance_ = cold_host_allowance;
+  if (cold_moment_host_allowance_)
+  {
+    if (const auto bytes = hostMomentMirrorBytes())
+      std::clog << "Resident DEVICE Adam vacating HOST moments: released_numeric_bytes=" << bytes
+                << ", cold_allowance=" << cold_moment_host_allowance_ << '\n';
+    std::vector<double>().swap(first_moment_);
+    std::vector<double>().swap(second_moment_);
+    moment_mirrors_stale_ = true;
+  }
 #else
   throw std::invalid_argument("Resident DEVICE Adam is not compiled");
 #endif
@@ -437,6 +476,11 @@ void FirstOrderOptimizer::proposeResidentDeviceAdam(const StructuredParameterSch
     throw std::invalid_argument("Resident DEVICE Adam moments must be seeded at the cold boundary");
   try
   {
+    if (cold_moment_host_allowance_)
+    {
+      seedResidentDeviceAdam(cold_moment_host_allowance_);
+      proposal_live_ = true; // No materialized pair may become stale at the eventual no-fail commit.
+    }
     norm = consume(device_adam_, options_.adam_beta1, options_.adam_beta2,
         oneMinusPower(options_.adam_beta1, accepted_update_count_ + 1),
         oneMinusPower(options_.adam_beta2, accepted_update_count_ + 1), options_.epsilon);
@@ -481,6 +525,8 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
 #ifdef ENABLE_CUDA
   if (device_adam_)
   {
+    if (cold_moment_host_allowance_)
+      seedResidentDeviceAdam(cold_moment_host_allowance_);
     if (!device_adam_->seeded())
       device_adam_->seed(first_moment_, second_moment_);
     device_adam_->propose(parameters.values, objective.gradient.data(), options_.adam_beta1,
@@ -614,6 +660,12 @@ void FirstOrderOptimizer::proposalRejected() noexcept
   resident_device_proposal_ = false;
 }
 
+/// Capacity, not logical freshness; no HOST read transaction or DEVICE query is needed.
+std::size_t FirstOrderOptimizer::hostMomentMirrorBytes() const noexcept
+{
+  return (first_moment_.capacity() + second_moment_.capacity()) * sizeof(double);
+}
+
 std::size_t FirstOrderOptimizer::retainedBytes() const noexcept
 {
   const auto host = (first_moment_.capacity() + second_moment_.capacity() +
@@ -745,11 +797,13 @@ FirstOrderOptimizer::prepareCheckpointRestore(
   std::vector<double> second_moment;
   std::vector<double> maximum_second_moment;
   archive.read(update_count, "accepted_update_count");
-  if (!first_moment_.empty())
+  if (options_.method == FirstOrderMethod::MOMENTUM_SGD || options_.method == FirstOrderMethod::ADAM ||
+      options_.method == FirstOrderMethod::AMSGRAD)
     archive.read(first_moment, "first_moment");
-  if (!second_moment_.empty())
+  if (options_.method == FirstOrderMethod::RMSPROP || options_.method == FirstOrderMethod::ADAM ||
+      options_.method == FirstOrderMethod::AMSGRAD)
     archive.read(second_moment, "second_moment");
-  if (!maximum_second_moment_.empty())
+  if (options_.method == FirstOrderMethod::AMSGRAD)
     archive.read(maximum_second_moment, "maximum_second_moment");
   validateRestoredState(update_count, first_moment, second_moment, maximum_second_moment);
   if (saved_metadata.state_fingerprint !=

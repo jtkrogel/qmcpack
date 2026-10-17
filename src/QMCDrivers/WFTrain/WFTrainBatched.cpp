@@ -1599,11 +1599,14 @@ void WFTrainBatched::process(xmlNodePtr node)
         const auto bytes = device_provider->prepareResidentDeviceAuthority();
         resident_snapshot_cap_ = bytes.snapshot_device_bytes;
         resident_successor_cap_ = bytes.successor_device_bytes;
+        const auto cold_moments = checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(),
+            2 * sizeof(double));
         resident_authority_extra_bytes_ = checkedMemoryAdd(bytes.cold_host_bytes,
-            checkedMemoryAdd(resident_snapshot_cap_, resident_successor_cap_));
+            checkedMemoryAdd(cold_moments, checkedMemoryAdd(resident_snapshot_cap_, resident_successor_cap_)));
         enforceMemoryBudget(*myComm, resident_authority_extra_bytes_, training_input_.getMaximumRetainedBytes());
         app_log() << "Resident DEVICE authority additional admitted bytes: snapshot DEVICE=" << resident_snapshot_cap_
                   << ", successor DEVICE=" << resident_successor_cap_ << ", cold HOST mirror=" << bytes.cold_host_bytes
+                  << ", cold HOST moments=" << cold_moments
                   << "; default HOST path unchanged; warm publication uses metadata only" << std::endl;
       }
     }
@@ -1654,6 +1657,8 @@ void WFTrainBatched::run()
 
   auto* device_provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
+  const auto cold_moment_allowance = resident_device_authority_
+      ? checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 2 * sizeof(double)) : 0;
   const auto resident_sr_budget = resident_sr_budget_;
   /// Destroy after iteration sources/leases, on normal and exceptional run exit.
   struct ResidentSRRelease
@@ -1913,7 +1918,7 @@ void WFTrainBatched::run()
   }
 
   if (resident_device_authority_)
-    first_order_optimizer->seedResidentDeviceAdam(); // Explicit initial/restart cold moment upload.
+    first_order_optimizer->seedResidentDeviceAdam(cold_moment_allowance); // Seed BEFORE vacating initial/restart HOST state.
 
   // Validate the entire existing output family before sampling or opening files.
   // An older checkpoint may branch under a new root, but cannot replace future data.
@@ -2020,7 +2025,12 @@ void WFTrainBatched::run()
     Timer iteration_wall;
     const auto sample_version = training_state.parameter_version;
     if (resident_device_authority_)
+    {
+      first_order_optimizer->seedResidentDeviceAdam(cold_moment_allowance);
+      app_log() << "Resident DEVICE Adam HOST moments before sampling: actual_bytes="
+                << first_order_optimizer->hostMomentMirrorBytes() << ", cold_allowance=" << cold_moment_allowance << std::endl;
       device_provider->residentDeviceAuthorityTransferWindow("sampling_through_refresh", true);
+    }
     logTrainingMemoryPhase(*myComm, iteration, "before_sampling");
     app_log() << "WFTrain allocation before owner=retained_sample_snapshots iteration=" << iteration
               << " scope=rank0_local blocks=" << num_blocks << " steps_per_block=" << steps_per_block_
@@ -2529,8 +2539,12 @@ void WFTrainBatched::run()
               !wftrain::isFiniteTrainingReal(resident_diagnostics->variance))
             throw std::invalid_argument("Resident ENERGY scalar diagnostics are nonfinite");
           storage_diagnostics = preparedStorageDiagnostics(batches);
+          // The mandatory cold allowance counts the HOST pair once whether it
+          // is currently present or vacant; actual retainedBytes stays truthful.
+          const auto optimizer_bytes = resident_adam_budget ? first_order_optimizer->retainedBytes() : 0;
+          const auto cold_covered_mirrors = resident_device_authority_ ? first_order_optimizer->hostMomentMirrorBytes() : 0;
           retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
-              resident_adam_budget ? first_order_optimizer->retainedBytes() : resident_sr_incremental_bytes_);
+              resident_adam_budget ? optimizer_bytes - cold_covered_mirrors : resident_sr_incremental_bytes_);
           enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
           bool resident_committed = false;
           try
