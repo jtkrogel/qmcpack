@@ -130,6 +130,7 @@ struct MatrixFreeLinearMethodResult
   std::string schema_fingerprint;
   std::size_t parameter_version = 0;
   std::vector<DerivativeValue> eigenvector;
+
   /** ALM-only successful DGGEV calls and the latest call's actual root filters.
    * Other solvers leave these zero; this metadata is not checkpoint/CSV state.
    * Interrupted filtering may leave an examined root without a classified bucket.
