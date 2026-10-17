@@ -411,6 +411,56 @@ void FirstOrderOptimizer::acceptResidentAdam() noexcept
 #endif
 }
 
+void FirstOrderOptimizer::seedResidentDeviceAdam()
+{
+#ifdef ENABLE_CUDA
+  if (!device_adam_ || proposal_live_ || options_.method != FirstOrderMethod::ADAM)
+    throw std::invalid_argument("DEVICE authority requires prepared idle Adam");
+  if (!device_adam_->seeded())
+    device_adam_->seed(first_moment_, second_moment_);
+#else
+  throw std::invalid_argument("Resident DEVICE Adam is not compiled");
+#endif
+}
+
+void FirstOrderOptimizer::proposeResidentDeviceAdam(const StructuredParameterSchema& schema,
+    std::size_t source_version, const ResidentDeviceAdamConsumer& consume, double& norm)
+{
+  if (proposal_live_ || schema.providerId() != provider_id_ || schema.fingerprint() != schema_fingerprint_ ||
+      schema.parameterCount() != parameter_count_ || options_.method != FirstOrderMethod::ADAM || !consume)
+    throw std::invalid_argument("Resident DEVICE Adam requires a matching idle optimizer and producer");
+  if (accepted_update_count_ == std::numeric_limits<std::uint64_t>::max() ||
+      source_version == std::numeric_limits<std::size_t>::max())
+    throw std::overflow_error("Resident DEVICE Adam count/version exhausted");
+#ifdef ENABLE_CUDA
+  if (!device_adam_ || !device_adam_->seeded())
+    throw std::invalid_argument("Resident DEVICE Adam moments must be seeded at the cold boundary");
+  try
+  {
+    norm = consume(device_adam_, options_.adam_beta1, options_.adam_beta2,
+        oneMinusPower(options_.adam_beta1, accepted_update_count_ + 1),
+        oneMinusPower(options_.adam_beta2, accepted_update_count_ + 1), options_.epsilon);
+    if (!isFiniteDouble(norm) || norm < 0)
+      throw std::invalid_argument("Resident DEVICE Adam gradient norm is invalid");
+    resident_source_version_ = source_version;
+    resident_device_proposal_ = proposal_live_ = true;
+  }
+  catch (...) { proposalRejected(); throw; }
+#else
+  throw std::invalid_argument("Resident DEVICE Adam is not compiled");
+#endif
+}
+
+void FirstOrderOptimizer::acceptResidentDeviceAdam(std::size_t published_version) noexcept
+{
+  if (!proposal_live_ || !resident_device_proposal_ || published_version != resident_source_version_ + 1)
+    std::terminate();
+  // The owning component action already adopted numerical moments without runtime calls.
+  moment_mirrors_stale_ = true;
+  ++accepted_update_count_;
+  resident_device_proposal_ = proposal_live_ = false;
+}
+
 StructuredParameterSnapshot FirstOrderOptimizer::propose(
     const StructuredParameterSchema& schema,
     const StructuredParameterSnapshot& parameters,
@@ -561,6 +611,7 @@ void FirstOrderOptimizer::proposalRejected() noexcept
     device_adam_->reject();
 #endif
   proposal_live_ = false;
+  resident_device_proposal_ = false;
 }
 
 std::size_t FirstOrderOptimizer::retainedBytes() const noexcept

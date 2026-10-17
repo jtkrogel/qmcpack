@@ -1537,6 +1537,13 @@ void WFTrainBatched::process(xmlNodePtr node)
       throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/blocks1/steps1 before sampling");
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
+    resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
+    if (resident_device_authority_ &&
+        (!resident_adam_budget_ || !device_provider->deviceSamplingEnabled() ||
+         vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
+         vmcdriver_input_.get_use_drift() || serializing_crowd_walkers_ || inference_input_.enabled ||
+         qmcdriver_input_.get_debug_checks() != DriverDebugChecks::ALL_OFF))
+      throw UniformCommunicateError("DEVICE authority requires explicit resident Adam, DEVICE move=alle, no drift, batched refresh and no debug GL/inference");
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
     if (resident_sr_budget_.first)
     {
@@ -1550,7 +1557,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     if (resident_adam_budget_ || resident_sr_budget_.first)
     {
-      if (myComm->size() != 1 || crowds_.size() != 1 || crowds_.front()->size() < 7 ||
+      if (myComm->size() != 1 || crowds_.size() != 1 || crowds_.front()->size() < (resident_device_authority_ ? 1 : 7) ||
           qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1 ||
           student_prototype_.getOrbitals().size() != 1 ||
           training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
@@ -1559,8 +1566,20 @@ void WFTrainBatched::process(xmlNodePtr node)
           training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
           training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
           (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
-        throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7, fixed unmodified step and explicit caps");
+        throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7 (DEVICE authority B>0), fixed unmodified step and explicit caps");
       validateResidentCoulomb(population_.get_golden_hamiltonian());
+      if (resident_device_authority_)
+      {
+        const auto bytes = device_provider->prepareResidentDeviceAuthority();
+        resident_snapshot_cap_ = bytes.snapshot_device_bytes;
+        resident_successor_cap_ = bytes.successor_device_bytes;
+        resident_authority_extra_bytes_ = checkedMemoryAdd(bytes.cold_host_bytes,
+            checkedMemoryAdd(resident_snapshot_cap_, resident_successor_cap_));
+        enforceMemoryBudget(*myComm, resident_authority_extra_bytes_, training_input_.getMaximumRetainedBytes());
+        app_log() << "Resident DEVICE authority additional admitted bytes: snapshot DEVICE=" << resident_snapshot_cap_
+                  << ", successor DEVICE=" << resident_successor_cap_ << ", cold HOST mirror=" << bytes.cold_host_bytes
+                  << "; default HOST path unchanged; warm publication uses metadata only" << std::endl;
+      }
       if (resident_adam_budget_)
         resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
       else
@@ -1611,7 +1630,7 @@ void WFTrainBatched::run()
   if (selected_provider_ == nullptr)
     throw UniformCommunicateError("WFTrainBatched: process() must select a provider before run()");
 
-  const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+  auto* device_provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
   const auto resident_sr_budget = resident_sr_budget_;
   /// Destroy after iteration sources/leases, on normal and exceptional run exit.
@@ -1754,11 +1773,14 @@ void WFTrainBatched::run()
       reduction);
   logTrainingAllocation("initial_parameter_snapshot", 0, selected_provider_->parameterSchema().parameterCount(),
       checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double)));
-  const auto initial_parameters = selected_provider_->snapshotParameters();
-  if (initial_parameters.schema_fingerprint != selected_provider_->parameterSchema().fingerprint() ||
-      initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
-    throw UniformCommunicateError(
-        "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
+  const auto initial_version = [&] {
+    const auto initial_parameters = selected_provider_->snapshotParameters();
+    if (initial_parameters.schema_fingerprint != selected_provider_->parameterSchema().fingerprint() ||
+        initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
+      throw UniformCommunicateError(
+          "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
+    return initial_parameters.version;
+  }(); // Release the cold P vector before warm iterations.
   std::unique_ptr<wftrain::FirstOrderOptimizer> first_order_optimizer;
   if (!device_provider && selected_provider_->usesAcceleratorParameterProducts())
     if (const char* value = std::getenv("PSIFORMER_GPU_ADAM_BYTES"))
@@ -1800,7 +1822,7 @@ void WFTrainBatched::run()
     optimizer_checkpoint = spring_optimizer.get();
 
   wftrain::TrainingIterationState training_state{
-      0, initial_parameters.version, selected_provider_->parameterSchema().fingerprint()};
+      0, initial_version, selected_provider_->parameterSchema().fingerprint()};
   const bool determinant_overlap =
       training_input_.getObjective() ==
       WFTrainDriverInput::Objective::DETERMINANT_OVERLAP;
@@ -1825,6 +1847,8 @@ void WFTrainBatched::run()
                                     overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0, resident_sr_budget.first != 0)};
   if (conventional_binding_)
     stage_state.configuration_fingerprint += ":" + conventional_binding_->modelIdentity();
+  if (resident_device_authority_)
+    stage_state.configuration_fingerprint += ":resident-device-authority-v1";
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
@@ -1865,6 +1889,9 @@ void WFTrainBatched::run()
                 << "; runtime parameter generation " << training_state.parameter_version
                 << " (checkpoint source generations are rebased to this process)" << std::endl;
   }
+
+  if (resident_device_authority_)
+    first_order_optimizer->seedResidentDeviceAdam(); // Explicit initial/restart cold moment upload.
 
   // Validate the entire existing output family before sampling or opening files.
   // An older checkpoint may branch under a new root, but cannot replace future data.
@@ -1999,7 +2026,7 @@ void WFTrainBatched::run()
     }
 
     std::vector<RetainedCrowdSamples> retained_samples;
-    std::size_t retained_configuration_bytes = 0;
+    std::size_t retained_configuration_bytes = resident_authority_extra_bytes_;
     for (int block = 0; block < num_blocks; ++block)
     {
       const int statistical_block = iteration * num_blocks + block;
@@ -2445,12 +2472,16 @@ void WFTrainBatched::run()
         if (resident_adam_budget || resident_sr_budget.first)
         {
           validateResidentCoulomb(population_.get_golden_hamiltonian());
-          const auto parameters = selected_provider_->snapshotParameters();
+          std::optional<wftrain::StructuredParameterSnapshot> parameters;
+          if (!resident_device_authority_)
+            parameters = selected_provider_->snapshotParameters();
+          const auto source_version = resident_device_authority_ ? device_provider->parameterVersion() : parameters->version;
           const auto& schema = selected_provider_->parameterSchema();
-          if (student_prototype_.getOrbitals().size() != 1 || batches.size() != 1 || batches[0].weights.size() < 7 ||
+          if (student_prototype_.getOrbitals().size() != 1 || batches.size() != 1 ||
+              batches[0].weights.size() < (resident_device_authority_ ? 1 : 7) ||
               (resident_sr_budget.first && batches[0].weights.size() != crowds_.front()->size()) || batches[0].additive_local_energy_vjp ||
               batches[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
-              training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != parameters.version ||
+              training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != source_version ||
               training_state.completed_iterations == std::numeric_limits<std::size_t>::max())
             throw std::invalid_argument("Resident ENERGY requires one current complete physical kinetic batch/state");
           const auto& batch = batches.front();
@@ -2477,49 +2508,85 @@ void WFTrainBatched::run()
           retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
               resident_adam_budget ? first_order_optimizer->retainedBytes() : resident_sr_incremental_bytes_);
           enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
+          bool resident_committed = false;
           try
           {
             NativeTimerScope proposal_timer(phase_timers_.proposal);
-            wftrain::StructuredParameterSnapshot candidate;
-            if (resident_sr_budget.first)
+            if (resident_device_authority_)
             {
-              candidate = parameters;
-              const auto diagnostics = device_provider->consumeResidentEnergySR(*batch.derivative_operator,
-                  {channels.data(), channels.size()}, batch.weights, parameters.values, coefficients.weight_sum,
-                  resident_diagnostics->mean, training_input_.getDamping(), training_input_.getLearningRate(),
-                  makeKrylovControl(training_input_), resident_sr_budget, candidate.values);
-              resident_diagnostics->gradient_norm = diagnostics.gradient_norm;
-              krylov_iterations = diagnostics.solve.iterations;
-              krylov_operator_applications = diagnostics.solve.operator_applications;
-              applied_scale = 1.0;
-              logSRDiagnostics("resident", diagnostics.solve, diagnostics.direction_norm,
-                  diagnostics.metric_norm, training_input_.getDamping(), 1.0);
+              std::unique_ptr<PsiFormerWF::PreparedResidentDeviceAdamPublication> publication;
+              std::exception_ptr failure;
+              try
+              {
+                std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> candidate;
+                first_order_optimizer->proposeResidentDeviceAdam(schema, source_version,
+                  [&](const auto& adam, double b1, double b2, double c1, double c2, double epsilon) {
+                    candidate = device_provider->consumeResidentEnergyAdamDevice(*batch.derivative_operator,
+                        {channels.data(), channels.size()}, adam, coefficients.weight_sum,
+                        resident_diagnostics->mean, b1, b2, c1, c2, epsilon, resident_snapshot_cap_);
+                    if (!candidate || candidate->sourceVersion() != source_version)
+                      throw std::invalid_argument("Resident DEVICE candidate source is incompatible");
+                    return candidate->gradientNorm();
+                  }, resident_diagnostics->gradient_norm);
+                selected_displacement_norm = candidate->displacementNorm();
+                if (!wftrain::isFiniteTrainingReal(selected_displacement_norm) || selected_displacement_norm < 0)
+                  throw std::invalid_argument("Resident DEVICE displacement norm is invalid");
+                publication = device_provider->prepareResidentDeviceAdamPublication(
+                    std::move(candidate), source_version, resident_successor_cap_);
+                if (!publication)
+                  throw std::logic_error("Resident DEVICE publication returned no owning action");
+              }
+              catch (...) { failure = std::current_exception(); }
+              reduction.validatePublicationReadiness(source_version, true, failure);
+              NativeTimerScope publication_timer(phase_timers_.publication);
+              const auto version = publication->commit();
+              resident_committed = true;
+              first_order_optimizer->acceptResidentDeviceAdam(version);
+              pending.parameter_version = reduction.completePublication(version);
             }
             else
-              candidate = first_order_optimizer->proposeResidentAdam(schema, parameters,
-                [&](auto& adam, double b1, double b2, double c1, double c2, double epsilon, auto& values) {
-                  return device_provider->consumeResidentEnergyAdam(*batch.derivative_operator,
-                      {channels.data(), channels.size()}, adam, parameters.values, coefficients.weight_sum,
-                      resident_diagnostics->mean, b1, b2, c1, c2, epsilon, values);
-                }, resident_diagnostics->gradient_norm);
-            // Both producer leases have ended; only an owning host candidate remains.
-            wftrain::validateTrainingCandidate(schema, parameters, candidate);
-            for (std::size_t p = 0; p < candidate.values.size(); ++p)
-              selected_displacement_norm = std::hypot(selected_displacement_norm, candidate.values[p] - parameters.values[p]);
-            if (!wftrain::isFiniteTrainingReal(selected_displacement_norm))
-              throw std::overflow_error("Resident ENERGY candidate displacement norm is nonfinite");
             {
-              NativeTimerScope publication_timer(phase_timers_.publication);
-              pending.parameter_version = selected_provider_->publishParameters(candidate, parameters.version);
+              wftrain::StructuredParameterSnapshot candidate;
+              if (resident_sr_budget.first)
+              {
+                candidate = *parameters;
+                const auto diagnostics = device_provider->consumeResidentEnergySR(*batch.derivative_operator,
+                    {channels.data(), channels.size()}, batch.weights, parameters->values, coefficients.weight_sum,
+                    resident_diagnostics->mean, training_input_.getDamping(), training_input_.getLearningRate(),
+                    makeKrylovControl(training_input_), resident_sr_budget, candidate.values);
+                resident_diagnostics->gradient_norm = diagnostics.gradient_norm;
+                krylov_iterations = diagnostics.solve.iterations;
+                krylov_operator_applications = diagnostics.solve.operator_applications;
+                applied_scale = 1.0;
+                logSRDiagnostics("resident", diagnostics.solve, diagnostics.direction_norm,
+                    diagnostics.metric_norm, training_input_.getDamping(), 1.0);
+              }
+              else
+                candidate = first_order_optimizer->proposeResidentAdam(schema, *parameters,
+                  [&](auto& adam, double b1, double b2, double c1, double c2, double epsilon, auto& values) {
+                    return device_provider->consumeResidentEnergyAdam(*batch.derivative_operator,
+                        {channels.data(), channels.size()}, adam, parameters->values, coefficients.weight_sum,
+                        resident_diagnostics->mean, b1, b2, c1, c2, epsilon, values);
+                  }, resident_diagnostics->gradient_norm);
+              // Legacy routes retain their owning HOST candidate and full validation.
+              wftrain::validateTrainingCandidate(schema, *parameters, candidate);
+              for (std::size_t p = 0; p < candidate.values.size(); ++p)
+                selected_displacement_norm = std::hypot(selected_displacement_norm, candidate.values[p] - parameters->values[p]);
+              if (!wftrain::isFiniteTrainingReal(selected_displacement_norm))
+                throw std::overflow_error("Resident ENERGY candidate displacement norm is nonfinite");
+              {
+                NativeTimerScope publication_timer(phase_timers_.publication);
+                pending.parameter_version = selected_provider_->publishParameters(candidate, parameters->version);
+              }
             }
           }
           catch (...)
           {
-            if (resident_adam_budget)
+            if (resident_adam_budget && !resident_committed)
               first_order_optimizer->proposalRejected();
             throw;
           }
-          if (resident_adam_budget)
+          if (resident_adam_budget && !resident_device_authority_)
             first_order_optimizer->acceptResidentAdam();
           training_state.completed_iterations = pending.completed_iterations;
           training_state.parameter_version = pending.parameter_version;

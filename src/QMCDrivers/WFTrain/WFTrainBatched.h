@@ -82,6 +82,8 @@ private:
   PsiFormerComplexWF* complex_training_component_ = nullptr;
   /// Resolved once during pre-draw process admission, never re-read mid-run.
   std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
+  bool resident_device_authority_ = false;
+  std::size_t resident_snapshot_cap_ = 0, resident_successor_cap_ = 0, resident_authority_extra_bytes_ = 0;
   /// Complete SR cap pair and incremental peak, resolved before sampling.
   std::pair<std::size_t, std::size_t> resident_sr_budget_{0, 0};
   std::size_t resident_sr_incremental_bytes_ = 0;

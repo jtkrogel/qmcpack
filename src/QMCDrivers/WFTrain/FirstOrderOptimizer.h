@@ -85,6 +85,16 @@ public:
   /// Commit only after successful atomic provider publication.
   void acceptResidentAdam() noexcept;
 
+  using ResidentDeviceAdamConsumer = std::function<double(
+      const std::shared_ptr<psiformer::device::PreparedDeviceAdam>&, double, double, double, double, double)>;
+  /// Explicit initial/restart moment upload, before the warm DEVICE-only window.
+  void seedResidentDeviceAdam();
+  /// Metadata-only proposal; the callback owns its DEVICE candidate and moment owner.
+  void proposeResidentDeviceAdam(const StructuredParameterSchema& schema, std::size_t source_version,
+                                const ResidentDeviceAdamConsumer& consume, double& norm);
+  /// Numerical moments/model were committed together; only scalar bookkeeping remains.
+  void acceptResidentDeviceAdam(std::size_t published_version) noexcept;
+
   FirstOrderOptimizer(const StructuredParameterSchema& schema,
                       FirstOrderOptimizerOptions options);
 
@@ -191,9 +201,11 @@ private:
   std::vector<double> maximum_second_moment_;
   std::uint64_t accepted_update_count_ = 0;
   bool proposal_live_ = false;
+  bool resident_device_proposal_ = false;
+  std::size_t resident_source_version_ = 0;
   mutable bool moment_mirrors_stale_ = false;
 #ifdef ENABLE_CUDA
-  std::unique_ptr<psiformer::device::PreparedDeviceAdam> device_adam_;
+  std::shared_ptr<psiformer::device::PreparedDeviceAdam> device_adam_;
 #endif
 };
 

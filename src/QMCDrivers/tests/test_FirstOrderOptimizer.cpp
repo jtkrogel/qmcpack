@@ -821,6 +821,30 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
   CHECK(optimizer.retainedBytes() == base);
   optimizer.prepareResidentAdamNorm(norm_bytes);
   CHECK(optimizer.retainedBytes() == base + 2 * norm_bytes);
+  optimizer.seedResidentDeviceAdam(); // Explicit cold initial moments; no parameter snapshot callback.
+  const auto before_metadata_proposals = optimizer.checkpointMetadata().state_fingerprint;
+  double metadata_norm = -1;
+  bool called = false;
+  FirstOrderOptimizer::ResidentDeviceAdamConsumer metadata_consume =
+      [&](const auto& owner, double, double, double, double, double) {
+        called = true;
+        CHECK(owner);
+        return 2.5;
+      };
+  CHECK_THROWS_AS(optimizer.proposeResidentDeviceAdam(schema, std::numeric_limits<std::size_t>::max(),
+      metadata_consume, metadata_norm), std::overflow_error);
+  CHECK_FALSE(called);
+  CHECK_THROWS_AS(optimizer.proposeResidentDeviceAdam(schema, 0,
+      [](const auto&, double, double, double, double, double) -> double {
+        throw std::runtime_error("Injected metadata-only producer failure");
+      }, metadata_norm), std::runtime_error);
+  CHECK_FALSE(optimizer.hasLiveProposal());
+  optimizer.proposeResidentDeviceAdam(schema, 0, metadata_consume, metadata_norm);
+  CHECK(metadata_norm == 2.5);
+  CHECK(optimizer.hasLiveProposal());
+  optimizer.proposalRejected(); // Only the metadata contract is injected; no numerical adoption claimed.
+  CHECK(optimizer.acceptedUpdateCount() == 0);
+  CHECK(optimizer.checkpointMetadata().state_fingerprint == before_metadata_proposals);
   // Inject only the numeric callback boundary; physical no-gradient transfers are
   // independently covered by the actual ProductSession/XML route, not this toy.
   const std::vector<double> gradient{1, -2, .5, 9};
