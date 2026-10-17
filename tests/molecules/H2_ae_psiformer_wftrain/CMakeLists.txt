@@ -308,6 +308,13 @@ if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION AND Python3_EXECUTABLE)
                          TIMEOUT 150 PROCESSORS 1
                          ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1"
                          LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
+    add_test(NAME deterministic-H2-psiformer-complex-cpu-reference-restart
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_complex_orbital_mse.py"
+                     --qmcpack $<TARGET_FILE:qmcpack> --energy-reference-restart)
+    set_tests_properties(deterministic-H2-psiformer-complex-cpu-reference-restart PROPERTIES
+                         TIMEOUT 150 PROCESSORS 1
+                         ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1"
+                         LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
   endif()
 endif()
 
