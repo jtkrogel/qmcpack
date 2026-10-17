@@ -1615,6 +1615,129 @@ TEST_CASE("Legacy distinct-spin MD orbital products include CI Jastrow and full 
   CHECK(&md.get_C2node() == fixed_map);
   CHECK(binding.snapshotParameters().values == snapshot.values);
 
+  // Two independent, noncommuting rotation histories must publish alongside
+  // CI/J2 without replacing determinant/SPO identities or either reference C.
+  std::array<SPOSet*, 2> fixed_owners{&owner(*source, 0), &owner(*source, 1)};
+  std::array<std::vector<QMCTraits::ValueType>, 2> references;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& original = bank(*source, spin).originalRotationCoefficients();
+    references[spin].assign(original.data(), original.data() + original.size());
+  }
+  const auto set_delta = [&](StructuredParameterSnapshot& point, const std::string& name, double delta) {
+    const auto& variables = adapter.registrationVariables();
+    for (std::size_t i = 0; i < variables.size(); ++i)
+      if (variables.name(i) == name && variables.where(i) >= 0)
+      {
+        point.values[variables.where(i)] += delta;
+        return;
+      }
+    FAIL("Required MD fixture coordinate missing: " + name);
+  };
+  for (int step = 0; step < 2; ++step)
+  {
+    auto next = binding.snapshotParameters();
+    set_delta(next, step == 0 ? "rot_up_orb_rot_0000_0001_r" : "rot_up_orb_rot_0000_0002_r",
+              step == 0 ? 0.025 : -0.035);
+    set_delta(next, step == 0 ? "rot_dn_orb_rot_0000_0002_r" : "rot_dn_orb_rot_0000_0001_r",
+              step == 0 ? -0.017 : 0.021);
+    set_delta(next, "CI1", 0.002);
+    set_delta(next, "ud_0", 0.0001);
+    REQUIRE(binding.publishParameters(next, next.version) == next.version + 1);
+    CHECK(md.get_C()[0] == source_ci[0]);
+    CHECK(&md.get_C2node() == fixed_map);
+    for (int spin = 0; spin < 2; ++spin)
+    {
+      CHECK(&owner(*source, spin) == fixed_owners[spin]);
+      CHECK(bank(*source, spin).C == bank(*sibling, spin).C);
+      CHECK(owner(*source, spin).fullRotationCoordinates() == owner(*sibling, spin).fullRotationCoordinates());
+      const auto& original = bank(*source, spin).originalRotationCoefficients();
+      for (std::size_t i = 0; i < original.size(); ++i)
+        CHECK(original.data()[i] == references[spin][i]);
+    }
+    CHECK(bank(*source, 0).C != bank(*source, 1).C);
+    source->evaluateLog(particles);
+    sibling->evaluateLog(sibling_particles);
+    CHECK(source->getLogPsi() == Catch::Approx(sibling->getLogPsi()).margin(1e-12));
+    checkClose(kineticEnergy(particles), kineticEnergy(sibling_particles));
+  }
+  const auto accepted = binding.snapshotParameters();
+  std::array<std::vector<QMCTraits::ValueType>, 2> accepted_banks, accepted_full;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& coefficients = *bank(*source, spin).C;
+    accepted_banks[spin].assign(coefficients.data(), coefficients.data() + coefficients.size());
+    accepted_full[spin] = owner(*source, spin).fullRotationCoordinates();
+    REQUIRE(accepted_full[spin].size() == 3);
+    CHECK(accepted_full[spin][2] != makeValue(0));
+  }
+  const auto checkpoint = std::filesystem::temp_directory_path() /
+      ("legacy_md_orbital_" + std::to_string(OHMMS::Controller->rank()) + "_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
+  const auto model = std::filesystem::path(checkpoint.string() + ".parameters.h5");
+  FileCleanup checkpoint_cleanup(checkpoint), model_cleanup(model);
+  TrainingIterationState coordinator{2, accepted.version, binding.parameterSchema().fingerprint()};
+  TrainingStageState stage{"md_orbital", 0, 2, binding.modelIdentity()};
+  TrainingCheckpoint::saveAtomic(checkpoint, binding, coordinator, stage);
+  binding.exportModel(model);
+  {
+    hdf_archive archive;
+    REQUIRE(archive.open(model, H5F_ACC_RDONLY));
+    archive.push("conventional_wavefunction", false);
+    std::string cookie;
+    REQUIRE(archive.readEntry(cookie, "completion_cookie"));
+    CHECK(cookie == "conventional-rotated-lcao-mdj-v1");
+    archive.push("orbital_frame", false);
+    std::vector<int> aliases;
+    REQUIRE(archive.readEntry(aliases, "determinant_aliases"));
+    CHECK(aliases == std::vector<int>{0, 1});
+  }
+  ParticleSet cold_particles(particles);
+  WaveFunctionFactory cold_factory(cold_particles, pool.getPool(), OHMMS::Controller);
+  auto cold = cold_factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+  REQUIRE(cold);
+  cold->storeXMLNode(definition.getRoot());
+  cold_particles.update();
+  TrainingWaveFunctionBinding cold_binding(*cold, cold_particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian cold_hamiltonian;
+  cold_hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(cold_particles), "Kinetic");
+  cold_binding.setHamiltonian(cold_hamiltonian);
+  REQUIRE(cold_binding.modelIdentity() == binding.modelIdentity());
+  const auto check_frame = [&]() {
+    CHECK(cold_binding.snapshotParameters().values == accepted.values);
+    for (int spin = 0; spin < 2; ++spin)
+    {
+      CHECK(owner(*cold, spin).fullRotationCoordinates() == accepted_full[spin]);
+      for (std::size_t i = 0; i < accepted_banks[spin].size(); ++i)
+        CHECK(bank(*cold, spin).C->data()[i] == accepted_banks[spin][i]);
+    }
+    cold->evaluateLog(cold_particles);
+    CHECK(cold->getLogPsi() == Catch::Approx(source->getLogPsi()).margin(1e-12));
+    checkClose(kineticEnergy(cold_particles), kineticEnergy(particles));
+  };
+  cold_binding.importModel(model);
+  check_frame();
+  TrainingIterationState restored_coordinator;
+  TrainingStageState restored_stage{"md_orbital", 0, 0, stage.configuration_fingerprint};
+  TrainingCheckpoint::restore(checkpoint, cold_binding, restored_coordinator, restored_stage);
+  check_frame();
+  CHECK(restored_coordinator.completed_iterations == 2);
+  const auto before_failure = cold_binding.snapshotParameters();
+  const auto* before_up = bank(*cold, 0).C.get();
+  const auto* before_down = bank(*cold, 1).C.get();
+  {
+    hdf_archive archive;
+    REQUIRE(archive.open(model, H5F_ACC_RDWR));
+    REQUIRE(H5Ldelete(archive.getFileID(), "/conventional_wavefunction/orbital_frame/spo_1/full_rotation",
+                     H5P_DEFAULT) >= 0);
+  }
+  CHECK_THROWS(cold_binding.importModel(model));
+  CHECK(cold_binding.snapshotParameters().values == before_failure.values);
+  CHECK(cold_binding.snapshotParameters().version == before_failure.version);
+  CHECK(bank(*cold, 0).C.get() == before_up);
+  CHECK(bank(*cold, 1).C.get() == before_down);
+  check_frame();
+
   // The legacy MD derivative implementation requires both spin owners to be
   // optimizable. Reject a one-active-spin model before any attempted update.
   Libxml2Document incomplete;
@@ -1635,7 +1758,7 @@ TEST_CASE("Legacy distinct-spin MD orbital products include CI Jastrow and full 
   REQUIRE(incomplete_wf);
   CHECK_THROWS_WITH(TrainingWaveFunctionBinding(*incomplete_wf, particles, adapterOptions(), *OHMMS::Controller),
                     Catch::Matchers::ContainsSubstring("two distinct active MD spin owners"));
-  CHECK(binding.snapshotParameters().values == snapshot.values);
+  CHECK(binding.snapshotParameters().values == accepted.values);
 }
 
 TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejection",
