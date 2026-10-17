@@ -1882,12 +1882,9 @@ TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejec
   CHECK(banks(*source) == banks(*sibling));
 }
 
-TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald energy derivatives",
+TEST_CASE("Legacy Gamma HEG products preserve scalar domains, periodicity and full Ewald derivatives",
           "[drivers][training][legacy_adapter][periodic_heg]")
 {
-#ifdef QMC_COMPLEX
-  SKIP("This gate qualifies only real Gamma FreeOrbital/J2");
-#endif
   // Isolate test-global breakup selection without changing production singleton
   // semantics. Existing operators retain their own immutable built handlers.
   struct RestoreBreakup
@@ -1970,14 +1967,34 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
   } model("5", "6");
   auto& particles = *model.particles;
   auto& source = *model.wavefunction;
+#ifndef QMC_COMPLEX
   TrainingWaveFunctionBinding binding(source, particles, adapterOptions(), *OHMMS::Controller);
   binding.setHamiltonian(model.hamiltonian);
   const auto identity = binding.modelIdentity();
-  const auto snapshot = binding.snapshotParameters();
+  auto& adapter = binding.adapter();
+#else
+  // Numerical proof precedes complex Binding/driver admission. The active
+  // coordinates are real J2 values, not complex orbital/phase parameters.
+  LegacyWaveFunctionAdapter adapter("conventional", source, adapterOptions());
+#endif
+  const auto snapshot = adapter.snapshotParameters();
   REQUIRE(snapshot.values.size() == 10);
   const auto original_positions = particles.R;
   const auto original_log = source.getLogPsi();
   const auto original_kinetic = kineticEnergy(particles);
+  const auto original_phase = source.getPhase();
+  ParticleSet sibling_particles(particles);
+  auto sibling = source.makeClone(sibling_particles);
+  sibling_particles.update(); sibling->evaluateLog(sibling_particles);
+  const auto sibling_log = sibling->getLogPsi(), sibling_phase = sibling->getPhase();
+  const auto sibling_kinetic = kineticEnergy(sibling_particles);
+  class CountEwaldRandom final : public FakeRandom<QMCTraits::FullPrecRealType>
+  {
+  public:
+    QMCTraits::FullPrecRealType operator()() override { ++draws; return 0.5; }
+    std::size_t draws = 0;
+  } rng;
+  model.hamiltonian.setRandomGenerator(&rng);
   const auto original_potential = model.coulomb->evaluate(particles);
   const auto definition = model.coulomb->ewaldModelDefinition();
   CHECK(definition.find("handler=EwaldHandler3D;") != std::string::npos);
@@ -1992,6 +2009,9 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
   SPOSet::GradVector gradients(7), shifted_gradients(7);
   spo.evaluateVGL(particles, 0, values, gradients, laplacians);
   CHECK(std::abs(values[1] - values[2]) > 1e-4);
+#ifdef QMC_COMPLEX
+  REQUIRE(std::any_of(values.begin(), values.end(), [](auto value) { return std::abs(value.imag()) > 0.1; }));
+#endif
   for (int axis = 0; axis < OHMMS_DIM; ++axis)
   {
     for (int d = 0; d < OHMMS_DIM; ++d)
@@ -2014,11 +2034,18 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
   }
   source.evaluateLog(particles);
   ParticleSet private_particles(particles);
-  auto evaluator = binding.makePrivateClone(private_particles);
+  auto evaluator = source.makeClone(private_particles);
   private_particles.update();
-  auto& adapter = binding.adapter();
   auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*evaluator},
                                             RefVector<ParticleSet>{private_particles}, 0, 0);
+  CHECK(op->capabilities().parameter_scalar_domain == ParameterScalarDomain::REAL64);
+  CHECK(op->capabilities().result_scalar_domain == ParameterScalarDomain::COMPLEX128);
+  for (const auto& block : adapter.parameterSchema().blocks())
+    CHECK(block.scalar_domain == ParameterScalarDomain::REAL64);
+#ifdef QMC_COMPLEX
+  CHECK(op->storageDiagnostics().real_parameter_vectors == 0);
+  CHECK(op->storageDiagnostics().complex_parameter_vectors == 5);
+#endif
   const std::vector<DerivativeValue> coefficient{{0.7, -0.2}};
   const std::array<VJPCoefficientChannel, 2> channels{{
       {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, coefficient), 0},
@@ -2046,7 +2073,7 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
   }
   const auto probe = [&](const StructuredParameterSnapshot& point) {
     ParticleSet probe_particles(particles);
-    auto probe_wavefunction = binding.makePrivateClone(probe_particles);
+    auto probe_wavefunction = source.makeClone(probe_particles);
     probe_particles.update();
     adapter.installSnapshot(*probe_wavefunction, probe_particles, point);
     return std::array<DerivativeValue, 2>{DerivativeValue{probe_wavefunction->getLogPsi()},
@@ -2069,13 +2096,26 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
       checkClose(hermitian.result()[channel][p], std::conj(actual) * coefficient[0]);
     }
   }
-  CHECK(binding.snapshotParameters().values == snapshot.values);
+  CHECK(adapter.snapshotParameters().values == snapshot.values);
   source.evaluateLog(particles);
   CHECK(source.getLogPsi() == original_log);
+  CHECK(source.getPhase() == original_phase);
+  checkClose(kineticEnergy(particles), original_kinetic);
+  sibling->evaluateLog(sibling_particles);
+  CHECK(sibling->getLogPsi() == sibling_log);
+  CHECK(sibling->getPhase() == sibling_phase);
+  checkClose(kineticEnergy(sibling_particles), sibling_kinetic);
+  CHECK(rng.draws == 0);
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    CHECK(particles.R[electron] == original_positions[electron]);
+    CHECK(sibling_particles.R[electron] == original_positions[electron]);
+  }
   CHECK(&source.findSD().front().get().getPhi() == &spo);
   CHECK(op->storageDiagnostics().shared_workspace_bytes <= adapterOptions().maximum_derivative_scratch_bytes);
 
   HEG changed_cutoff("5", "7"), changed_cell("5.1", "6");
+#ifndef QMC_COMPLEX
   TrainingWaveFunctionBinding cutoff_binding(*changed_cutoff.wavefunction, *changed_cutoff.particles,
                                                adapterOptions(), *OHMMS::Controller);
   cutoff_binding.setHamiltonian(changed_cutoff.hamiltonian);
@@ -2084,6 +2124,10 @@ TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald en
   cell_binding.setHamiltonian(changed_cell.hamiltonian);
   CHECK(cutoff_binding.modelIdentity() != identity);
   CHECK(cell_binding.modelIdentity() != identity);
+#else
+  CHECK(changed_cutoff.coulomb->ewaldModelDefinition() != definition);
+  CHECK(changed_cell.coulomb->ewaldModelDefinition() != definition);
+#endif
 }
 
 TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and isolated aliases",
