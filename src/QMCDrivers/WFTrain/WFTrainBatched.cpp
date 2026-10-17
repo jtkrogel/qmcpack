@@ -1458,7 +1458,13 @@ void WFTrainBatched::process(xmlNodePtr node)
       if (population_.get_golden_electrons().getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
         throw UniformCommunicateError("Conventional training currently requires CPU particle coordinates");
 #ifdef QMC_COMPLEX
-      throw UniformCommunicateError("Conventional training currently requires a real CPU build");
+      // Binding admits only fixed Gamma HEG14/FreeOrbital/J2 with real
+      // coordinates; this does not enable complex or phase parameters.
+      if (optimizer != O::ADAM || training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+          training_input_.getUpdateScale() != 1 || training_input_.getMaximumUpdateNorm() != 0 ||
+          training_input_.getMaximumMetricNorm() != 0)
+        throw UniformCommunicateError("Conventional complex training requires Gamma HEG14 ENERGY Adam "
+                                      "with line_search off and default update controls");
 #endif
       const auto single_determinants = student_prototype_.findSD();
       const auto multideterminants = student_prototype_.findMSD();
