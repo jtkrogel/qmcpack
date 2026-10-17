@@ -16,6 +16,7 @@
 #include "MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Fermion/MultiDiracDeterminant.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "CPU/VectorOps.h"
 #include "Platforms/OMPTarget/ompReductionComplex.hpp"
 #include <cstdint>
@@ -137,6 +138,15 @@ void MultiSlaterDetTableMethod::validatePreparedRotatedCoefficientState(
     throw std::invalid_argument("Multideterminant orbital activation requires two distinct active spin owners");
   const RotatedSPOs* previous = nullptr;
   const RotatedSPOs* previous_prepared = nullptr;
+  const LCAOrbitalSet* previous_lcao = nullptr;
+  const LCAOrbitalSet* previous_prepared_lcao = nullptr;
+  // Distinct wrapper names do not prove distinct physical/reference banks.
+  const auto overlaps = [](const LCAOrbitalSet& first, const LCAOrbitalSet& second) {
+    const auto* first_original = &first.originalRotationCoefficients();
+    const auto* second_original = &second.originalRotationCoefficients();
+    return first.C.get() == second.C.get() || first_original == second_original ||
+        first.C.get() == second_original || second.C.get() == first_original;
+  };
   for (int spin = 0; spin < 2; ++spin)
   {
     const auto* rotation = dynamic_cast<const RotatedSPOs*>(Dets[spin]->getPhi());
@@ -147,8 +157,15 @@ void MultiSlaterDetTableMethod::validatePreparedRotatedCoefficientState(
                               previous_prepared->SPOSet::getName() == replacement->SPOSet::getName())))
       throw std::invalid_argument("Multideterminant orbital activation requires two distinct active spin owners");
     rotation->validatePreparedRotationState(*replacement);
+    const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*rotation->Phi_);
+    const auto& prepared_lcao = dynamic_cast<const LCAOrbitalSet&>(*replacement->Phi_);
+    if ((previous_lcao && overlaps(*previous_lcao, lcao)) ||
+        (previous_prepared_lcao && overlaps(*previous_prepared_lcao, prepared_lcao)))
+      throw std::invalid_argument("Multideterminant orbital activation requires independent per-spin physical/reference banks");
     previous = rotation;
     previous_prepared = replacement;
+    previous_lcao = &lcao;
+    previous_prepared_lcao = &prepared_lcao;
   }
   validatePreparedCoefficientLayout(prepared);
 }

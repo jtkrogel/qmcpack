@@ -1536,6 +1536,11 @@ TEST_CASE("Legacy distinct-spin MD orbital products include CI Jastrow and full 
   CHECK(&owner(*source, 0) != &owner(*source, 1));
   CHECK(bank(*source, 0).C != bank(*source, 1).C);
   CHECK_THROWS(md.validatePreparedCoefficientState(md));
+  const auto independent_down = bank(*source, 1).C;
+  bank(*source, 1).C = bank(*source, 0).C;
+  CHECK_THROWS_WITH(md.validatePreparedRotatedCoefficientState(md),
+                    Catch::Matchers::ContainsSubstring("independent per-spin physical/reference banks"));
+  bank(*source, 1).C = independent_down;
   TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
   QMCHamiltonian hamiltonian;
   hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");

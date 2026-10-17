@@ -225,6 +225,11 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
         rotations.unique.size() == 2 && rotations.aliases == std::vector<int>{0, 1};
     if (!single && !multi)
       throw std::invalid_argument("Conventional orbital training requires single Slater or two distinct active MD spin owners");
+    if (multi)
+      for (const auto& component : prototype.getOrbitals())
+        if (component->getClassName() != "MultiSlaterDetTableMethod" &&
+            component->getClassName() != "J1OrbitalSoA" && component->getClassName() != "TwoBodyJastrow")
+          throw std::invalid_argument("Conventional MD orbital training currently admits only CI and J1/J2");
   }
   for (const auto* rotated : rotations.unique)
     rotated->validatePreparedRotationState(*rotated);
