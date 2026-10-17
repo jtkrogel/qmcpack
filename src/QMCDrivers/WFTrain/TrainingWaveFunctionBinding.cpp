@@ -338,8 +338,8 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
 #ifdef QMC_COMPLEX
     throw std::runtime_error("Conventional external LCAO requires a real CPU build");
 #endif
-    if (periodic || nonlocal_ecp || multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1)
-      throw std::runtime_error("Conventional external LCAO requires open fixed single Slater without ECP");
+    if (periodic || multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1)
+      throw std::runtime_error("Conventional external LCAO requires open fixed single Slater");
     for (const auto& component : prototype_.getOrbitals())
       if (component->getClassName() != "SlaterDet" && component->getClassName() != "J1OrbitalSoA" &&
           component->getClassName() != "TwoBodyJastrow")
