@@ -293,6 +293,7 @@ StructuredParameterSnapshot LinearMethodUpdateRule::propose(const StructuredPara
     if (!linear_fallback)
     {
       const double reference = result_.eigenvector[0].real();
+      // L pass: raw scores recover the fixed-coefficient reference projection.
       for (const auto& block : schema.blocks())
         if (block.trainable && block.update_group == "legacy_linear")
           for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
@@ -319,6 +320,7 @@ StructuredParameterSnapshot LinearMethodUpdateRule::propose(const StructuredPara
       if (!(total_weight > 0) || !isFiniteTrainingReal(total_weight) ||
           !isFiniteTrainingReal(mean) || !isFiniteTrainingReal(absolute_mean))
         throw std::invalid_argument("Mixed LM linear score mean is invalid");
+      // N pass: reuse the P mask; the centered factor supplies only the NN norm.
       std::fill(masked.begin(), masked.end(), DerivativeValue{});
       for (const auto& block : schema.blocks())
         if (block.trainable && block.update_group != "legacy_linear")
