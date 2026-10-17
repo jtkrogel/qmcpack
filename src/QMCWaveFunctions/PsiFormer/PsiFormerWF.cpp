@@ -1301,6 +1301,16 @@ public:
 #endif
   }
 
+  /// Only direct GPU VALUE dispatch may use stale native leaves as metadata.
+  bool deviceOnlyValueReads() const noexcept
+  {
+    return resident_device_authority_enabled && numerical_tile_backend &&
+        precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+        direct_value_mode == DirectBackendMode::DIRECT &&
+        execution_plan.environment().boundary == psiformer::BoundaryCondition::OPEN &&
+        execution_plan.environment().amplitude_scalar_domain == psiformer::ScalarDomain::REAL;
+  }
+
   /// Partial HOST writers must reacquire and recheck after the cold fence.
   std::unique_lock<std::shared_mutex> acquireHostWrite()
   {
@@ -2363,7 +2373,7 @@ public:
     if (hasDeviceProducts())
     {
       PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
-      PsiFormerReadTransaction state_lock(*model_state_);
+      PsiFormerReadTransaction state_lock(*model_state_, model_state_->deviceOnlyValueReads());
       requireBoundVersion();
       const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
           schema_->parameterCount(), MAXIMUM_VJP_CHANNELS);
@@ -3806,7 +3816,7 @@ public:
           "PsiFormer ECP consumer requires an idle parameter sink");
 
     {
-      PsiFormerReadTransaction state_lock(*model_state_);
+      PsiFormerReadTransaction state_lock(*model_state_, replay_only_ && model_state_->deviceOnlyValueReads());
       requireBoundVersion();
     }
     for (const auto& input : channels)
@@ -3940,7 +3950,7 @@ public:
                                          tile.evaluation_stamps.begin(),
                                          tile.evaluation_stamps.end());
 
-      PsiFormerReadTransaction state_lock(*model_state_);
+      PsiFormerReadTransaction state_lock(*model_state_, replay_only_ && model_state_->deviceOnlyValueReads());
       requireBoundVersion();
       for (std::size_t segment_index = 0;
            segment_index < tile.virtual_particles.segmentCount(); ++segment_index)
@@ -4041,7 +4051,7 @@ public:
         throw std::logic_error(
             "PsiFormer ECP replay did not capture the complete traversal");
       {
-        PsiFormerReadTransaction state_lock(*model_state_);
+        PsiFormerReadTransaction state_lock(*model_state_, replay_only_ && model_state_->deviceOnlyValueReads());
         requireBoundVersion();
         for (std::size_t sample = 0; !replay_only_ && sample < sample_count_; ++sample)
         {
@@ -7116,8 +7126,8 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
     throw std::invalid_argument(
         "PsiFormer ECP consumer requires a positive parameter chunk size");
 
-  // Publication cannot race the reference snapshot or score-tape construction.
-  PsiFormerReadTransaction state_lock(*model_state_);
+  // Replay-only capture copies coordinates/metadata; CPU score consumers still fence.
+  PsiFormerReadTransaction state_lock(*model_state_, replay_only && model_state_->deviceOnlyValueReads());
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer ECP consumer requires the direct score backend");
@@ -17561,7 +17571,7 @@ void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, st
     throw std::invalid_argument(
         "PsiFormer virtual-particle ratio output has the wrong size");
   requireNoPlannedEcpScalarDispatch("scalar virtual-ratio evaluation");
-  PsiFormerReadTransaction transaction(*model_state_);
+  PsiFormerReadTransaction transaction(*model_state_, model_state_->deviceOnlyValueReads());
   synchronizeParameterVersion(transaction.parameterVersion());
   evaluateRatiosUnderRead(transaction, virtual_particles, ratios);
 }
@@ -17720,7 +17730,7 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
   }
 
   resource.flat_virtual_ratios.resize(virtual_batch.size());
-  PsiFormerReadTransaction transaction(*leader.model_state_);
+  PsiFormerReadTransaction transaction(*leader.model_state_, leader.model_state_->deviceOnlyValueReads());
   const std::size_t parameter_version = transaction.parameterVersion();
   for (std::size_t walker = 0; walker < virtual_batch.walkerCount(); ++walker)
     wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
@@ -17915,7 +17925,7 @@ void PsiFormerWF::mw_evaluateRatios(
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     resource.virtual_offsets[walker + 1] = resource.virtual_offsets[walker] + ratios[walker].size() + 1;
 
-  PsiFormerReadTransaction transaction(*leader.model_state_);
+  PsiFormerReadTransaction transaction(*leader.model_state_, leader.model_state_->deviceOnlyValueReads());
   const std::size_t parameter_version = transaction.parameterVersion();
   std::vector<std::vector<ValueType>> staged_ratios(wfc_list.size());
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)

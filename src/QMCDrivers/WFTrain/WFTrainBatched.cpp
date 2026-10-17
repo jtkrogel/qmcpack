@@ -750,21 +750,34 @@ struct ResidentEnergyDiagnostics
 };
 
 /// Check the actual selected operators both before sampling and before a resident update.
-void validateResidentCoulomb(QMCHamiltonian& hamiltonian)
+void validateResidentCoulomb(QMCHamiltonian& hamiltonian, bool device_ecp = false)
 {
   if (hamiltonian.size() < 2)
     throw UniformCommunicateError("Resident ENERGY requires an actual Coulomb Hamiltonian");
-  std::size_t kinetic_count = 0;
+  std::size_t kinetic_count = 0, nonlocal_count = 0, local_ecp_count = 0;
   for (int term = 0; term < hamiltonian.size(); ++term)
   {
     const auto name = hamiltonian.getComponent(term)->getClassName();
     if (name == "BareKineticEnergy")
       ++kinetic_count;
+    else if (device_ecp && name == "LocalECPotential")
+      ++local_ecp_count;
+    else if (device_ecp && dynamic_cast<NonLocalECPotential*>(hamiltonian.getComponent(term)))
+    {
+      const auto& potential = *static_cast<NonLocalECPotential*>(hamiltonian.getComponent(term));
+      if (potential.usesDLA() || !potential.usesVirtualParticles())
+        throw UniformCommunicateError("Resident DEVICE ECP requires ordinary locality and virtual particles");
+      ++nonlocal_count;
+    }
     else if (name != "CoulombPotential")
       throw UniformCommunicateError("Resident ENERGY supports only the actual selected open Coulomb Hamiltonian");
   }
   if (kinetic_count != 1)
     throw UniformCommunicateError("Resident ENERGY requires exactly one physical kinetic operator");
+  if (nonlocal_count > 1 || local_ecp_count > 1 ||
+      (local_ecp_count && nonlocal_count != 1) ||
+      (device_ecp && hamiltonian.hasPhysicalNLPP() != (nonlocal_count == 1)))
+    throw UniformCommunicateError("Resident DEVICE ECP requires one consistently registered ordinary nonlocal operator");
 }
 
 /// Compare the same undamped host/resident diagnostics without changing the CSV schema.
@@ -1608,7 +1621,7 @@ void WFTrainBatched::process(xmlNodePtr node)
           training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
           (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
         throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7 (DEVICE authority B>0), fixed unmodified step and explicit caps");
-      validateResidentCoulomb(population_.get_golden_hamiltonian());
+      validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
       if (resident_adam_budget_)
         resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
       else
@@ -2497,7 +2510,8 @@ void WFTrainBatched::run()
             }
             Crowd& crowd = *crowds_[samples.crowd_index];
             const bool resident_single_snapshot = (resident_adam_budget || resident_sr_budget.first) &&
-                !complex_training && !has_nonlocal_ecp && retained_samples.size() == 1 && crowds_.size() == 1 &&
+                !complex_training && (!has_nonlocal_ecp || resident_device_authority_) &&
+                retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
             replayCrowdSamples(crowd, samples, resident_single_snapshot
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
@@ -2560,7 +2574,10 @@ void WFTrainBatched::run()
         }
         if (resident_adam_budget || resident_sr_budget.first)
         {
-          validateResidentCoulomb(population_.get_golden_hamiltonian());
+          validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
+          const auto resident_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+              (resident_device_authority_ && has_nonlocal_ecp
+                  ? wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) : 0);
           std::optional<wftrain::StructuredParameterSnapshot> parameters;
           if (!resident_device_authority_)
             parameters = selected_provider_->snapshotParameters();
@@ -2569,7 +2586,7 @@ void WFTrainBatched::run()
           if (student_prototype_.getOrbitals().size() != 1 || batches.size() != 1 ||
               batches[0].weights.size() < (resident_device_authority_ ? 1 : 7) ||
               (resident_sr_budget.first && batches[0].weights.size() != crowds_.front()->size()) || batches[0].additive_local_energy_vjp ||
-              batches[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+              batches[0].local_energy_term_mask != resident_mask ||
               training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != source_version ||
               training_state.completed_iterations == std::numeric_limits<std::size_t>::max())
             throw std::invalid_argument("Resident ENERGY requires one current complete physical kinetic batch/state");

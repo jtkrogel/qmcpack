@@ -1440,7 +1440,8 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
   std::size_t aggregate_downloads = 0;
   const auto capture = [&](PsiFormerWF& component, std::size_t ordinal, std::size_t chunk, bool replay_only,
-                           bool empty_grid = false, bool zero_weight_node = false) {
+                           bool empty_grid = false, bool zero_weight_node = false,
+                           std::vector<QMCTraits::ValueType>* recorded_ratios = nullptr) {
     RefVectorWithLeader<WaveFunctionComponent> components(component, {component});
     RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
     auto op = component.makeStreamingDerivativeOperator(components, particles, ordinal, 0, chunk);
@@ -1473,6 +1474,7 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     const auto stamp = component.mw_evaluateVirtualRatios(components, particles, virtuals, current_batch, ratios);
     for (std::size_t i = 0; i < ratios.size(); ++i)
       ratios[i] *= std::exp(.23 * (grid_points[i][0] - electrons.R[i < 5 ? 0 : 1][0]));
+    if (recorded_ratios) *recorded_ratios = ratios;
     const std::vector<WaveFunctionComponent::EvaluationStamp> stamps{stamp};
     const auto before = metrics.snapshot();
     consumer->consume({current_batch, {grid_bare.data(), grid_bare.size()}, {ratios.data(), ratios.size()},
@@ -1712,7 +1714,45 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     auto publication = authority.prepareResidentDeviceAdamPublication(std::move(proposal), 0, 0);
     CHECK(publication->commit() == 1);
     publication.reset();
+    // Current GPU accepted-grid capture must not refresh stale native weights.
+    PsiFormerWF coherent("ecp_grid", initialized, electrons, ions);
+    coherent.publishParameters(expected_parameters, 0);
+    std::vector<QMCTraits::ValueType> current_ratios, reference_ratios;
+    const auto capture_before = metrics.snapshot();
+    auto next_grid = capture(authority, 97, 5, true, false, false, &current_ratios);
+    auto coherent_grid = capture(coherent, 97, 5, true, false, false, &reference_ratios);
+    REQUIRE(current_ratios.size() == reference_ratios.size());
+    for (std::size_t i = 0; i < current_ratios.size(); ++i)
+      checkClose(current_ratios[i], reference_ratios[i]);
+    // Also qualify direct scalar and ragged dispatch, not just sparse descriptors.
+    VirtualParticleSet current_virtual(electrons), reference_virtual(electrons);
+    std::vector<ParticleSet::PosType> displacements{{.013, -.017, .009}, {-.021, .004, .012}};
+    current_virtual.makeMoves(electrons, 0, displacements);
+    reference_virtual.makeMoves(electrons, 0, displacements);
+    std::vector<QMCTraits::ValueType> current_scalar(2), reference_scalar(2);
+    authority.evaluateRatios(current_virtual, current_scalar);
+    coherent.evaluateRatios(reference_virtual, reference_scalar);
+    for (std::size_t i = 0; i < 2; ++i) checkClose(current_scalar[i], reference_scalar[i]);
+    RefVectorWithLeader<WaveFunctionComponent> current_components(authority, {authority});
+    RefVectorWithLeader<const VirtualParticleSet> current_virtuals(current_virtual, {current_virtual});
+    ResourceCollection prototype("stale_ecp_values"); authority.createResource(prototype);
+    ResourceCollection resources(prototype);
+    std::vector<std::vector<QMCTraits::ValueType>> ragged{{0, 0}};
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, current_components);
+      authority.mw_evaluateRatios(current_components, current_virtuals, ragged);
+    }
+    for (std::size_t i = 0; i < 2; ++i) checkClose(ragged[0][i], reference_scalar[i]);
+    CHECK(metrics.snapshot().downloaded_bytes - capture_before.downloaded_bytes < 8 * p);
+    CHECK(next_grid->parameterVersion() == 1);
+    CHECK(coherent_grid->parameterVersion() == 1);
+    const auto before_cold_inspection = metrics.snapshot();
     const auto actual_parameters = authority.snapshotParameters(); // Explicit cold inspection.
+    CHECK(metrics.snapshot().downloaded_bytes - before_cold_inspection.downloaded_bytes == 8 * p);
+    app_log() << "Resident ECP stale-HOST VALUE capture: sparse=yes, scalar=yes, ragged=yes, version="
+              << next_grid->parameterVersion() << ", warm_downloaded_bytes="
+              << before_cold_inspection.downloaded_bytes - capture_before.downloaded_bytes
+              << ", cold_mirror_bytes=" << 8 * p << "; independent CPU ratios matched" << std::endl;
     for (std::size_t i = 0; i < p; ++i)
       CHECK(actual_parameters.values[i] == Catch::Approx(expected_parameters.values[i]).epsilon(2e-8).margin(2e-10));
     std::vector<double> actual_first(p), actual_second(p);
