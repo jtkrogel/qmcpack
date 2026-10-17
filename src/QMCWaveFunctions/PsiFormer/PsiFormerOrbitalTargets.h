@@ -178,8 +178,10 @@ class ComplexOrbitalTargetEvaluator
 {
 public:
   /// Freeze actual occupied FreeOrbital momenta, spin ranges and the matching Bloch convention.
+  /// The cap covers target/SPO-value scratch, not cloned SPO storage or identity metadata.
   static ComplexOrbitalTargetEvaluator fromSingleReference(const SlaterDet& source,
-      const ParticleSet& electrons, std::array<double, 3> expected_reduced_twist, std::size_t channels);
+      const ParticleSet& electrons, std::array<double, 3> expected_reduced_twist, std::size_t channels,
+      std::size_t maximum_numeric_bytes);
   /// Fill one reusable periodic-part target after validating the current sample metadata.
   const std::vector<std::complex<double>>& evaluate(const ParticleSet& electrons);
   /// Return immutable occupation/channel and exact scientific identity metadata.

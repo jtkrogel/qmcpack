@@ -3393,7 +3393,8 @@ void WFTrainBatched::initializeOrbitalPretraining()
     if (top || !single || complex->gpuInferenceEnabled())
       throw UniformCommunicateError("Paired orbital_mse requires a CPU single-reference FreeOrbital teacher");
     complex_orbital_target_ = std::make_unique<psiformer::ComplexOrbitalTargetEvaluator>(
-        psiformer::ComplexOrbitalTargetEvaluator::fromSingleReference(*single, electrons, complex->reducedTwist(), count));
+        psiformer::ComplexOrbitalTargetEvaluator::fromSingleReference(*single, electrons, complex->reducedTwist(),
+            count, training_input_.getMaximumRetainedBytes()));
     orbital_target_fingerprint_ = complex_orbital_target_->descriptor().fingerprint();
     orbital_target_bytes_ = complex_orbital_target_->retainedScalarBytes();
     const auto caller_bytes = checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double));

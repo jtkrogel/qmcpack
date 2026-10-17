@@ -273,11 +273,16 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
     dets.push_back(std::make_unique<DiracDeterminant<>>(*spos.back(), 2 * spin, 2 * spin + 2));
   }
   SlaterDet teacher(p, std::move(spos), std::move(dets));
-  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 0));
+  constexpr auto target_cap = 36 * sizeof(C); // D*N*N plus both occupied SPO scratch vectors.
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 0, target_cap));
   CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(
-      teacher, p, twist, std::numeric_limits<std::size_t>::max()));
-  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, {}, 2));
-  auto target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2);
+      teacher, p, twist, std::numeric_limits<std::size_t>::max(), target_cap));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, {}, 2, target_cap));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2, target_cap - 1));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2, 0));
+  CHECK_THROWS(ps::ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, p, twist, 2, std::numeric_limits<std::size_t>::max()));
+  auto target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2, target_cap);
   const auto original_positions = p.R;
   const auto fixed = target.evaluate(p);
   REQUIRE(fixed.size() == 32);
@@ -298,6 +303,7 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
         }
       }
   const auto retained = target.retainedScalarBytes();
+  CHECK(retained == target_cap);
   const auto fingerprint = target.descriptor().fingerprint();
   for (int dim = 0; dim < 3; ++dim)
     p.R[0][dim] += p.getLattice().R(0, dim);
@@ -307,7 +313,7 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
   p.R = original_positions;
   CHECK(target.retainedScalarBytes() == retained);
   CHECK(target.descriptor().fingerprint() == fingerprint);
-  auto twin_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2);
+  auto twin_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(teacher, p, twist, 2, target_cap);
   CHECK(twin_target.descriptor().fingerprint() == fingerprint);
   // Changing the occupied reciprocal label changes immutable target identity.
   std::vector<std::unique_ptr<SPOSet>> changed_spos;
@@ -319,7 +325,7 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
     changed_dets.push_back(std::make_unique<DiracDeterminant<>>(*changed_spos.back(), 2 * spin, 2 * spin + 2));
   }
   SlaterDet changed_teacher(p, std::move(changed_spos), std::move(changed_dets));
-  auto changed_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(changed_teacher, p, twist, 2);
+  auto changed_target = ps::ComplexOrbitalTargetEvaluator::fromSingleReference(changed_teacher, p, twist, 2, target_cap);
   CHECK(changed_target.descriptor().fingerprint() != fingerprint);
   p.setTwist(ParticleSet::PosType{});
   CHECK_THROWS(target.evaluate(p));

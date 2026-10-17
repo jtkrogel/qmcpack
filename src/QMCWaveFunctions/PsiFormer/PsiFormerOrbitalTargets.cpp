@@ -34,12 +34,14 @@ bool isFiniteDouble(double value) noexcept;
 #ifdef QMC_COMPLEX
 /// Freeze the actual occupied plane waves and fixed periodic-part gauge, not parsed names.
 ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference(const SlaterDet& source,
-    const ParticleSet& electrons, std::array<double, 3> reduced, std::size_t channels)
+    const ParticleSet& electrons, std::array<double, 3> reduced, std::size_t channels, std::size_t maximum_numeric_bytes)
 {
   const auto n = static_cast<std::size_t>(electrons.getTotalNum());
   if (!channels || !n || n > std::numeric_limits<std::size_t>::max() / n ||
       channels > std::numeric_limits<std::size_t>::max() / sizeof(std::complex<double>) / (n * n))
     throw std::invalid_argument("Complex orbital target extent is zero or overflows");
+  if (!maximum_numeric_bytes || maximum_numeric_bytes == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Complex orbital target requires a positive finite numeric cap");
   if (electrons.isSpinor() || electrons.groups() != 2 || !electrons.groupsize(0) || !electrons.groupsize(1) ||
       electrons.getLattice().SuperCellEnum != SUPERCELL_BULK || source.getNumDets() != 2)
     throw std::invalid_argument("Complex orbital target requires two-spin bulk single Slater");
@@ -67,6 +69,8 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
   for (double value : cartesian)
     append(value);
   std::array<std::unique_ptr<SPOSet>, 2> orbitals;
+  std::array<const FreeOrbital*, 2> sources;
+  std::size_t numeric_elements = channels * n * n;
   int first = 0;
   for (int spin = 0; spin < 2; ++spin)
   {
@@ -89,9 +93,18 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
           throw std::invalid_argument("Complex orbital target momentum/twist is not reciprocal");
       }
     }
-    orbitals[spin] = free->makeClone();
+    const auto scratch = static_cast<std::size_t>(free->getOrbitalSetSize());
+    if (scratch > std::numeric_limits<std::size_t>::max() - numeric_elements)
+      throw std::length_error("Complex orbital target numeric extent overflow");
+    numeric_elements += scratch;
+    sources[spin] = free;
     first += count;
   }
+  // Admit target plus per-spin scratch before cloning or allocating either numeric buffer.
+  if (numeric_elements > maximum_numeric_bytes / sizeof(std::complex<double>))
+    throw std::length_error("Complex orbital target numeric cap exceeded before allocation");
+  for (int spin = 0; spin < 2; ++spin)
+    orbitals[spin] = sources[spin]->makeClone();
   return {OrbitalTargetDescriptor::makeSingleReference(identity, electrons.groupsize(0),
       electrons.groupsize(1), channels), std::move(orbitals), lattice, reduced, cartesian};
 }
