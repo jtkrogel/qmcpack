@@ -182,6 +182,8 @@ def main():
                         help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
     parser.add_argument("--orbital-ecp", action="store_true",
                         help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
+    parser.add_argument("--complex-periodic-heg", action="store_true",
+                        help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -209,6 +211,15 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    periodic_profile = args.periodic_heg or args.complex_periodic_heg
+    if args.complex_periodic_heg:
+        assert args.threads == 1 and args.ranks > 0
+        assert args.ci_representation == "dets"
+        assert not any((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
+                        args.orbital_jastrow, args.model_import, args.old_new, args.optimizer_screen,
+                        args.family_screen, args.profile_only, args.ci_pii, args.ci_lm, args.csf_lm,
+                        args.csf_pii, args.mdj_pii, args.csf_j2_pii))
+        args.restart = args.preflight = True
     linear_ci = args.ci_lm or args.csf_lm
     csf_ci = args.csf_lm or args.csf_pii or args.csf_j2_pii
     pure_ci = args.ci_pii or args.csf_pii or linear_ci
@@ -249,7 +260,7 @@ def main():
     fixture_tree = ET.parse(fixture)
     md_ecp = (fixture_tree.find("wavefunction/determinantset/multideterminant") is not None and
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp else None
+    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -303,7 +314,7 @@ def main():
             legacy_vp=None, legacy_reference=None, completed_restore=False, ci_representation=None):
         directory = work / label
         directory.mkdir()
-        if args.periodic_heg:
+        if periodic_profile:
             samples_per_rank = 8
         tree = ET.parse(fixture)
         if ci_workflow:
@@ -483,11 +494,15 @@ def main():
                     assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
                     assert "rule=2;local_channel=1;" in physical and "knots=4;" in physical, model
                     assert pseudo.get("href") in text_value(group["ecp_source_report"][()]), model
-                if args.periodic_heg:
+                if periodic_profile:
                     physical = text_value(group["physical_definition"][()])
                     assert "handler=EwaldHandler3D;" in physical, model
                     assert "3d-uniform-neutralizing-background+self-v1" in physical, model
                     assert parameters.size == 10
+                    if args.complex_periodic_heg:
+                        assert parameters.dtype == np.dtype("float64"), model
+                        assert "parameter=REAL64;wavefunction=COMPLEX128;" in physical, model
+                        assert "complex_Gamma_FreeOrbital_kvectors_v1:" in physical, model
                 if args.external_lcao:
                     image = external_asset.read_bytes()
                     physical = text_value(group["physical_definition"][()])
@@ -502,7 +517,7 @@ def main():
                 exported = ET.fromstring(serialized)
                 coefficients = exported.find(".//sposet/coefficient")
                 if fixed is None:
-                    assert args.periodic_heg and coefficients is None, model
+                    assert periodic_profile and coefficients is None, model
                     def fixed_spo_definition(node):
                         return [(child.tag, child.attrib, (child.text or "").split()) for child in node.iter()]
                     assert fixed_spo_definition(exported.find("sposet_collection")) == fixed_spo_definition(
@@ -898,7 +913,8 @@ def main():
                       "krylov_relative_tolerance": "1e-8", "maximum_damping_attempts": "1"}
             for name, value in limits.items():
                 ET.SubElement(tree.find("qmc/training"), "parameter", name=name).text = value
-    run(args.companion_optimizer, optimizer=args.companion_optimizer, mutate=companion_controls)
+    if not args.complex_periodic_heg:
+        run(args.companion_optimizer, optimizer=args.companion_optimizer, mutate=companion_controls)
     for lhs, rhs in zip(history(adam), history(off)):
         for name in ("iteration", "samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert lhs[name] == rhs[name], (name, lhs[name], rhs[name])
@@ -916,7 +932,7 @@ def main():
         assert lhs.keys() == rhs.keys()
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"restart model: {name}")
-        if md_ecp:
+        if md_ecp or args.complex_periodic_heg:
             final_bundle = final.parent / (final.name[:-len(".parameters.h5")] + ".checkpoint")
             restored_bundle = restored.parent / (restored.name[:-len(".parameters.h5")] + ".checkpoint")
             for pattern in ("*.state.h5", "*.rank_*.h5"):
@@ -933,6 +949,19 @@ def main():
         def neural_decay(tree):
             ET.SubElement(tree.find("qmc/training"), "parameter", name="weight_decay").text = "0.01"
         run("reject_neural_decay", reject="weight_decay must be zero", mutate=neural_decay)
+        if args.complex_periodic_heg:
+            reason = "Conventional complex training requires Gamma HEG14 ENERGY Adam"
+            run("reject_complex_sgd", optimizer="sgd", reject=reason)
+            run("reject_complex_line_search", reject=reason, mutate=lambda tree: setattr(
+                tree.find("qmc/training/parameter[@name='line_search']"), "text", "reference"))
+            run("reject_complex_twist", reject="does not admit twist", mutate=lambda tree: tree.find(
+                "wavefunction/sposet_collection/sposet").set("twist", "0.1 0 0"))
+            mismatch = "Training checkpoint stage identity or configuration mismatch"
+            for label, parameter, value in (("cell", "rs", "5.1"), ("cutoff", "LR_dim_cutoff", "7")):
+                run(f"reject_complex_changed_{label}", iterations=3,
+                    restart=adam / "sj.s000.last_checkpoint.h5", reject=mismatch,
+                    mutate=lambda tree, key=parameter, number=value: setattr(
+                        tree.find(f"qmcsystem/simulationcell/parameter[@name='{key}']"), "text", number))
         if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
             ordinary_vp_reason = "ECP training requires ordinary locality with virtual-particle batching"
             run("reject_dla", reject=ordinary_vp_reason, mutate=lambda tree: tree.find(
@@ -951,7 +980,8 @@ def main():
                 reject="Training checkpoint stage identity or configuration mismatch",
                 mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)))
             assert source.read_bytes() == original
-    completed = f"Adam/{args.companion_optimizer} conventional updates, interval inference, immutable model reference, exact inference isolation"
+    methods = "CPU complex Gamma HEG14 Adam" if args.complex_periodic_heg else f"Adam/{args.companion_optimizer}"
+    completed = f"{methods} conventional updates, interval inference, immutable model reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"
     if args.preflight:
