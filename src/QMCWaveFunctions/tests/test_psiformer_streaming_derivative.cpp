@@ -1608,7 +1608,7 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
 #endif
   resolution.reason = ps::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
   resolution.readiness_records_consulted = 1;
-  resolution.validated_operations = ps::psiFormerAcceleratorInferenceOperations();
+  resolution.validated_operations = ps::allPsiFormerAcceleratorOperations();
   PsiFormerWF cpu("authority", initialized, electrons, ions, true, {0, 5, 10});
   PsiFormerWF gpu("authority", initialized, electrons, ions, true, {0, 5, 10}, false, {}, {}, resolution);
   cpu.validateSystem(electrons, ions, "all_electron");
