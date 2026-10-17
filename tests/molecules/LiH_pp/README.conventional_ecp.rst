@@ -32,3 +32,13 @@ it adds no extra optimizer matrix or scientific rerun.
 
 Active orbitals, MD, J3, cusp, periodic, complex, conventional GPU/offload and
 DLA/TMDLA remain outside this fixture's profile.
+
+The optional ``--external-orbital-ecp`` mode derives a shared spo-ud
+rotation wrapper over the first three HDF MOs (base, 3x72 reference C),
+giving P6 with J2. Its independent ordinary-VMC reference uses a tiny
+legacy VP file with full history, not ineffective inline coefficient text.
+Only this exp(log-history) scientific VMC comparison uses rtol=atol=3e-12;
+weights/counts and all accepted-C/artifact/optimizer/sampler restart payloads
+remain exact. The VP is never a restart initializer. One protected HDF copy
+is reused/restored for identity negatives; tracked assets stay untouched.
+Native qualification and registration of this active mode are pending.

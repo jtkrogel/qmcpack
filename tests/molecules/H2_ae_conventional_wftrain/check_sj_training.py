@@ -84,8 +84,8 @@ def four_mo_md_pairs(tree):
     return result
 
 
-def check_orbital_frame(group, tree, parameters, row, model):
-    """Check qualified frames against each explicit inline AO definition."""
+def check_orbital_frame(group, tree, parameters, row, model, external_reference=None):
+    """Check qualified frames against explicit inline or captured HDF references."""
     wrappers = tree.findall(".//rotated_sposet")
     multideterminant = tree.find(".//multideterminant") is not None
     assert len(wrappers) == (2 if multideterminant else 1)
@@ -110,8 +110,10 @@ def check_orbital_frame(group, tree, parameters, row, model):
         assert size == (4 if many_occupied else 3)
         orbital = frame[f"spo_{ordinal}"]
         assert text_value(orbital["name"][()]) == wrapper.get("name")
-        initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
-        assert (initial.size == 16 if many_occupied else initial.size in (9, 12))
+        initial = (external_reference.reshape(-1) if external_reference is not None else
+                   np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()]))
+        assert (initial.size == 216 if external_reference is not None else
+                initial.size == 16 if many_occupied else initial.size in (9, 12))
         np.testing.assert_array_equal(orbital["shape"][()], [size, initial.size // size])
         reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
         accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
@@ -163,6 +165,30 @@ def apply_model_reference(tree, model):
             collection.append(spo)
 
 
+def apply_external_orbital_reference(tree, model, vp):
+    """Use existing full-history VP restore, never inline-C text over an HDF reader."""
+    with h5py.File(model, "r") as handle, h5py.File(vp, "w") as output:
+        group = handle["conventional_wavefunction"]
+        names = [text_value(value) for value in group["variable_names"][()].reshape(-1)]
+        indices = np.asarray(group["active_indices"][()]).reshape(-1)
+        parameters = np.asarray(group["parameters"][()]).reshape(-1)
+        assert parameters.size == len(names) == 6 and sorted(indices) == list(range(6)) and np.isfinite(parameters).all()
+        values = parameters[indices.astype(int)]
+        active = dict(zip(names, values))
+        name = tree.find(".//rotated_sposet").get("name")
+        full = np.asarray(group["orbital_frame/spo_0/full_rotation"][()]).reshape(-1)
+        assert full.size == 3 and np.isfinite(full).all()
+        output["version"] = np.asarray([1, 1, 0], dtype=np.int32)
+        lists = output.create_group("name_value_lists")
+        lists.create_dataset("parameter_names", data=names, dtype=h5py.string_dtype("utf-8"))
+        lists["parameter_values"] = values
+        rotation = output.create_group("RotatedSPOs")
+        rotation.create_group("rotation_global")[f"rotation_global_{name}"] = full
+        rotation.create_group("rotation_params")[f"rotation_params_{name}"] = [
+            active[f"{name}_orb_rot_0000_{q:04d}_r"] for q in (1, 2)]
+    ET.SubElement(tree.find("wavefunction"), "override_variational_parameters", href=str(vp))
+
+
 def apply_legacy_reference(tree, vp_file):
     """Map legacy full-precision VP coordinates into a separate XML oracle."""
     saved = datasets(vp_file)
@@ -201,6 +227,8 @@ def main():
                         help="bounded distinct-spin MD orbital/CI/J2 Adam/SR and complete-frame model reuse")
     parser.add_argument("--external-lcao", action="store_true",
                         help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
+    parser.add_argument("--external-orbital-ecp", action="store_true",
+                        help="derive shared three-MO external orbital/J2 ECP P6 with a full-history VP reference")
     parser.add_argument("--orbital-ecp", action="store_true",
                         help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
     parser.add_argument("--many-occupied-orbital-ecp", action="store_true",
@@ -242,6 +270,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.external_orbital_ecp:
+        if args.external_lcao:
+            parser.error("select fixed --external-lcao or active --external-orbital-ecp")
+        args.external_lcao = True
     if args.csf_orbital_ecp:
         if args.md_orbital_ecp or args.joint_ci_orbital_ecp or args.unequal_spin_orbital_ecp or args.ci_representation != "dets":
             parser.error("--csf-orbital-ecp generates its own single CSF recipe; omit other representation modes")
@@ -318,6 +350,7 @@ def main():
         assert not md_ecp and fixture_tree.find(".//rotated_sposet") is None
     deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
     external_asset = None
+    external_reference = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
         assert collection.get("source_identity") == "file_image"
@@ -325,6 +358,29 @@ def main():
         external_original = external_source.read_bytes()
         external_asset = work / "original-lcao.h5"
         shutil.copyfile(external_source, external_asset)
+        if args.external_orbital_ecp:
+            assert external_ecp
+            with h5py.File(external_asset, "r") as source:
+                assert source["Super_Twist/eigenset_0"].shape == (62, 72)
+                external_reference = source["Super_Twist/eigenset_0"][:3, :]
+
+    def compare_vmc_reference(imported, reference):
+        """Tolerate only VP exp(log) scientific values, never discrete counts or restart state."""
+        actual, expected = vmc_physical_trace(imported), vmc_physical_trace(reference)
+        if not args.external_orbital_ecp:
+            np.testing.assert_array_equal(actual, expected)
+            return
+        headers = [next(line.split()[1:] for line in (directory / "sj.s000.scalar.dat").read_text().splitlines()
+                        if line.startswith("#")) for directory in (imported, reference)]
+        assert headers[0] == headers[1] and actual.shape == expected.shape
+        columns = [name for name in headers[0] if name not in ("BlockCPU", "index")]
+        exact = [i for i, name in enumerate(columns) if name in ("BlockWeight", "AcceptRatio") or "Count" in name]
+        assert "BlockWeight" in columns
+        np.testing.assert_array_equal(actual[:, exact], expected[:, exact])
+        np.testing.assert_allclose(actual, expected, rtol=3e-12, atol=3e-12,
+                                   err_msg="full-history VP exp(log) physical reference ONLY")
+        print(f"VP physical reference max_abs_difference={np.max(np.abs(actual - expected)):.17g}; "
+              "rtol=atol=3e-12; discrete fields exact", flush=True)
 
     def launch(directory):
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
@@ -425,6 +481,13 @@ def main():
                         ET.SubElement(csf, "det", coeff="0.7071067811865475244", alpha=alpha, beta=beta)
         if args.external_lcao:
             tree.find("wavefunction/sposet_collection").set("href", str(external_asset))
+        if args.external_orbital_ecp:
+            collection = tree.find("wavefunction/sposet_collection")
+            spo = collection.find("sposet")
+            assert spo.get("name") == "spo-ud" and spo.get("size") == "1"
+            collection.remove(spo)
+            spo.set("name", "base"); spo.set("size", "3")
+            ET.SubElement(collection, "rotated_sposet", name="spo-ud").append(spo)
         # Recipes run in fresh evidence directories, not beside their PP asset.
         # Keep the tracked source untouched; scientific identity uses its bytes.
         for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
@@ -499,7 +562,11 @@ def main():
         if parameter_file is not None:
             tree.find("wavefunction").set("parameter_file", str(parameter_file.resolve()))
         if reference_file is not None:
-            apply_model_reference(tree, reference_file)
+            if args.external_orbital_ecp:
+                assert vmc and parameter_file is None and restart is None
+                apply_external_orbital_reference(tree, reference_file, directory / "reference.vp.h5")
+            else:
+                apply_model_reference(tree, reference_file)
         if legacy_vp is not None:
             ET.SubElement(tree.find("wavefunction"), "override_variational_parameters", href=str(legacy_vp))
         if legacy_reference is not None:
@@ -612,6 +679,13 @@ def main():
                         assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if args.external_orbital_ecp:
+                        names = [text_value(value) for value in group["variable_names"][()].reshape(-1)]
+                        indices = group["active_indices"][()].reshape(-1)
+                        for prefix, count in (("spo-ud_orb_rot_", 2), ("ud_", 4)):
+                            block = [int(index) for name, index in zip(names, indices) if name.startswith(prefix)]
+                            assert len(block) == count and min(block) >= 0
+                            assert not np.array_equal(parameters[block], previous[block]), (model, prefix)
                     if args.md_orbital_ecp:
                         assert parameters.size == (17 if args.joint_ci_orbital_ecp and not args.unequal_spin_orbital_ecp else 16)
                         indices = np.asarray(group["active_indices"][()]).reshape(-1)
@@ -643,7 +717,7 @@ def main():
                     np.testing.assert_array_equal(parameters, previous, err_msg=f"rejected model: {model}")
                 previous = parameters
                 if orbital_model:
-                    orbital_history.append(check_orbital_frame(group, tree, parameters, row, model))
+                    orbital_history.append(check_orbital_frame(group, tree, parameters, row, model, external_reference))
                 for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
                     physical = text_value(group["physical_definition"][()])
                     assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
@@ -667,7 +741,8 @@ def main():
                         assert "complex_Gamma_FreeOrbital_kvectors_v1:" in physical, model
                 if args.external_lcao:
                     if external_ecp:
-                        assert parameters.size == 4 and not orbital_model and not linear_nodes, model
+                        assert parameters.size == (6 if args.external_orbital_ecp else 4) and not linear_nodes, model
+                        assert orbital_model == args.external_orbital_ecp, model
                     image = external_asset.read_bytes()
                     physical = text_value(group["physical_definition"][()])
                     assert f"lcao_file_image_v1:{len(image)}:{image.hex()};" in physical, model
@@ -976,7 +1051,7 @@ def main():
         exported = sorted((adam / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         imported_vmc = run("imported_vmc", vmc=True, parameter_file=exported)
         explicit_vmc = run("explicit_vmc", vmc=True, reference_file=exported)
-        np.testing.assert_array_equal(vmc_physical_trace(imported_vmc), vmc_physical_trace(explicit_vmc))
+        compare_vmc_reference(imported_vmc, explicit_vmc)
         trained = run("imported_training", parameter_file=exported)
         split = run("imported_split", iterations=1, parameter_file=exported)
         resumed = run("imported_resumed", parameter_file=exported,
@@ -1010,7 +1085,7 @@ def main():
         # identity, rather than a rewritten XML whose baseline masks a loader bug.
         second_vmc = run("reimported_vmc", vmc=True, parameter_file=final)
         second_reference = run("reexport_reference_vmc", vmc=True, reference_file=final)
-        np.testing.assert_array_equal(vmc_physical_trace(second_vmc), vmc_physical_trace(second_reference))
+        compare_vmc_reference(second_vmc, second_reference)
         for name in ("model_identity", "registration_values", "wavefunction_xml", "physical_definition"):
             np.testing.assert_array_equal(datasets(exported)["conventional_wavefunction/" + name],
                                           lhs["conventional_wavefunction/" + name])
@@ -1048,8 +1123,9 @@ def main():
         if args.external_lcao:
             def route_lcao(path):
                 return lambda tree: tree.find("wavefunction/sposet_collection").set("href", str(path))
-            relocated = work / "relocated-lcao.h5"
-            shutil.copyfile(external_asset, relocated)
+            relocated = external_source if args.external_orbital_ecp else work / "relocated-lcao.h5"
+            if not args.external_orbital_ecp:
+                shutil.copyfile(external_asset, relocated)
             relocated_vmc = run("relocated_import_vmc", vmc=True, parameter_file=exported,
                                 mutate=route_lcao(relocated))
             np.testing.assert_array_equal(vmc_physical_trace(imported_vmc), vmc_physical_trace(relocated_vmc))
@@ -1057,8 +1133,9 @@ def main():
             # values must participate in physical identity, not just a filename.
             for label, dataset in (("basis", "basisset/atomicBasisSet0/basisGroup0/radfunctions/DataRad0/exponent"),
                                    ("coefficients", "Super_Twist/eigenset_0")):
-                changed = work / f"changed-{label}.h5"
-                shutil.copyfile(external_asset, changed)
+                changed = external_asset if args.external_orbital_ecp else work / f"changed-{label}.h5"
+                if not args.external_orbital_ecp:
+                    shutil.copyfile(external_asset, changed)
                 with h5py.File(changed, "r+") as handle:
                     if label == "basis":
                         candidates = []
@@ -1070,10 +1147,16 @@ def main():
                     value = np.asarray(node[()])
                     value.flat[0] += 0.001
                     node[...] = value
-                run(f"reject_changed_{label}_import", vmc=True, parameter_file=exported,
-                    mutate=route_lcao(changed), reject="Conventional model export identity mismatch")
-                run(f"reject_changed_{label}_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
-                    mutate=route_lcao(changed), reject="Training checkpoint stage identity or configuration mismatch")
+                try:
+                    if args.external_orbital_ecp:
+                        (work / f"changed-{label}.sha256").write_text(hashlib.sha256(changed.read_bytes()).hexdigest() + "\n")
+                    run(f"reject_changed_{label}_import", vmc=True, parameter_file=exported,
+                        mutate=route_lcao(changed), reject="Conventional model export identity mismatch")
+                    run(f"reject_changed_{label}_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
+                        mutate=route_lcao(changed), reject="Training checkpoint stage identity or configuration mismatch")
+                finally:
+                    if args.external_orbital_ecp:
+                        external_asset.write_bytes(external_original)
             def remove_capture(tree):
                 collection = tree.find("wavefunction/sposet_collection")
                 del collection.attrib["source_identity"]
@@ -1081,7 +1164,8 @@ def main():
             run("reject_uncaptured_lcao", mutate=remove_capture, reject="external")
             assert external_source.read_bytes() == external_original
             assert external_asset.read_bytes() == external_original
-            print(f"PASS: external CPU LCAO{' plus ordinary-locality ECP' if external_ecp else ''} Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
+            print(f"PASS: external CPU LCAO{' active P6/full-history VP physical reference tol=3e-12 ONLY; bitwise accepted-C restart;' if args.external_orbital_ecp else ''}"
+                  f"{' plus ordinary-locality ECP' if external_ecp else ''} Adam/model reuse, exact restart and relocation, basis/coefficient mutation rejection; "
                   f"immutable asset bytes={len(external_original)} (separate from derivative scratch)")
         pseudos = ET.parse(fixture).findall("hamiltonian/pairpot/pseudo")
         for pseudo in pseudos:
