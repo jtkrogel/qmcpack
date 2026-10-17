@@ -131,6 +131,9 @@ public:
 
   std::string getClassName() const override { return "CoulombPBCAB"; }
 
+  /// Built 3D Ewald/local-PP definition, unaffected by later singleton policy.
+  const std::string& ewaldModelDefinition() const noexcept { return ewald_model_definition_; }
+
 #if !defined(REMOVE_TRACEMANAGER)
   void contributeParticleQuantities() override;
   void checkoutParticleQuantities(TraceManager& tm) override;
@@ -223,6 +226,7 @@ protected:
   void initBreakup(ParticleSet& P);
 
 private:
+  std::string ewald_model_definition_;
   ///source particle set
   ParticleSet& pset_ions_;
 

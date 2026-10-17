@@ -19,6 +19,8 @@
 #include "Particle/DistanceTable.h"
 #include "Message/Communicate.h"
 #include "Utilities/ProgressReportEngine.h"
+#include "LongRange/EwaldHandler3D.h"
+#include <iomanip>
 
 namespace qmcplusplus
 {
@@ -502,6 +504,20 @@ void CoulombPBCAB::initBreakup(ParticleSet& P)
   app_log() << "    CoulombPBCAB::initBreakup\n  Setting a linear grid=[0," << myRcut
             << ") number of grid points =" << ng << std::endl;
   myGrid.set(0, myRcut, ng);
+  ewald_model_definition_.clear();
+  if (const auto* ewald = dynamic_cast<const EwaldHandler3D*>(AB.get()))
+  {
+    const auto& lattice = P.getLattice();
+    std::ostringstream definition;
+    definition << std::hexfloat << "CoulombPBCAB:3d-background-v1;source=" << pset_ions_.getName()
+               << ";target=" << P.getName() << ";forces=" << ComputeForces
+               << ";handler=EwaldHandler3D;sigma=" << ewald->Sigma << ";volume=" << ewald->Volume
+               << ";rc=" << ewald->get_rc() << ";kc=" << ewald->get_kc() << ";shells=" << ewald->MaxKshell
+               << ";lr_dim_cutoff=" << lattice.LR_dim_cutoff << ";lr_rc=" << lattice.LR_rc
+               << ";lr_kc=" << lattice.LR_kc << ";lr_tol=" << lattice.LR_tol << ";ndim=" << lattice.ndim
+               << ";grid=" << ng << ";background_kernel=" << ewald->evaluateSR_k0() << ";constant=" << myConst;
+    ewald_model_definition_ = definition.str();
+  }
   if (V0 == nullptr)
   {
     V0 = LRCoulombSingleton::createSpline4RbyVs(AB.get(), myRcut, myGrid);
@@ -571,6 +587,15 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
         Vat[iat] = rfunc.get();
     }
     Vspec[groupID] = std::move(rfunc);
+    // Construction/grid provenance only: exact parsed PP content is captured
+    // separately by QMCHamiltonian::ecpModelProvenance(), not hashed here.
+    if (!ewald_model_definition_.empty())
+    {
+      std::ostringstream definition;
+      definition << std::hexfloat << ";local_pp_v1:species=" << groupID << ";grid=" << ng
+                 << ";start=0;end=" << myRcut << ";dr=" << dr << ";origin=2v1-v2;tail=zero2";
+      ewald_model_definition_ += definition.str();
+    }
   }
 
   if (ComputeForces && fVspec[groupID] == nullptr)

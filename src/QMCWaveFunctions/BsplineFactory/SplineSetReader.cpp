@@ -269,7 +269,7 @@ std::unique_ptr<SPOSet> SplineSetReader<ST>::create_spline_set(const std::string
       std::ostringstream fingerprint;
       fingerprint << metadata.str() << std::hex << table_hash;
       identity = std::make_shared<BsplineSourceIdentity>(BsplineSourceIdentity{
-          mybuilder->H5FileName.string() + (foundspline ? ";restored=" + getSplineDumpFileName(bandgroup) : ";fft"),
+          mybuilder->H5FileName.string(),
           fingerprint.str(), mybuilder->source_image, used_bytes});
     }
     catch (...) { ready = 0; }

@@ -15,9 +15,14 @@
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
+#include "QMCWaveFunctions/BsplineFactory/BsplineSet.h"
+#if defined(HAVE_EINSPLINE) && !defined(QMC_COMPLEX)
+#include "QMCWaveFunctions/BsplineFactory/SplineR2R.h"
+#endif
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCHamiltonians/CoulombPBCAB.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
 #include <algorithm>
@@ -269,6 +274,15 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
         const auto& selected = slater.get().getPhi(spin);
         const auto* rotated = dynamic_cast<const RotatedSPOs*>(&selected);
         const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(rotated ? rotated->Phi_.get() : &selected);
+#if defined(HAVE_EINSPLINE) && !defined(QMC_COMPLEX)
+        if (const auto* spline = dynamic_cast<const SplineR2R<double>*>(&selected); spline && spline->sourceIdentity())
+        {
+          if (spline_source_ && spline_source_ != spline->sourceIdentity())
+            throw std::runtime_error("Conventional spline requires one shared immutable source/table record");
+          spline_source_ = spline->sourceIdentity();
+          source_spos.emplace(selected.getName(), selected.getName());
+        }
+#endif
         if (lcao && lcao->fileImageIdentity())
         {
           if (lcao->isOMPoffload() || lcao->isOptimizable() ||
@@ -307,6 +321,23 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
         }
       if (captured != source_spos)
         throw std::runtime_error("Conventional external LCAO lacks its captured collection");
+    }
+    if (spline_source_)
+    {
+      std::map<std::string, std::string> captured;
+      for (auto* collection = node->children; collection; collection = collection->next)
+        if (xmlStrEqual(collection->name, BAD_CAST "sposet_collection") &&
+            (attributeText(collection, "type") == "bspline" || attributeText(collection, "type") == "einspline") &&
+            attributeText(collection, "href") == spline_source_->source_report)
+        {
+          for (auto* spo = collection->children; spo; spo = spo->next)
+            if (xmlStrEqual(spo->name, BAD_CAST "sposet"))
+              captured.emplace(attributeText(spo, "name"), attributeText(spo, "name"));
+          if (captured != source_spos) throw std::runtime_error("Conventional spline source SPO definitions mismatch");
+          xmlUnsetProp(collection, BAD_CAST "href");
+        }
+      if (captured != source_spos || lcao_source_)
+        throw std::runtime_error("Conventional spline lacks its unique captured collection");
     }
     external_assets_ = hasExternalAssets(node);
     std::set<std::string> definitions, references;
@@ -366,7 +397,36 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
         throw std::runtime_error("Conventional external LCAO requires all determinants from its captured source");
     }
   }
-  if (periodic)
+  if (spline_source_)
+  {
+#if defined(QMC_COMPLEX) || !defined(HAVE_EINSPLINE)
+    throw std::runtime_error("Conventional Gamma spline requires a real CPU B-spline build");
+#else
+    if (sizeof(QMCTraits::ValueType) != sizeof(double) || !periodic || lattice.ndim != 3 ||
+        !lattice.BoxBConds[0] || !lattice.BoxBConds[1] || !lattice.BoxBConds[2] || !nonlocal_ecp ||
+        external_assets_ || !inline_spos_ ||
+        multideterminant_ || orbital_rotations_ || prototype_particles_.isSpinor() ||
+        prototype_particles_.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS ||
+        prototype_.findSD().size() != 1 || prototype_particles_.groups() != 2 ||
+        prototype_particles_.groupsize(0) != 4 || prototype_particles_.groupsize(1) != 4)
+      throw std::runtime_error("Conventional Gamma spline requires Ne8 fixed CPU Slater/J1/J2 with ordinary ECP");
+    const auto& slater = prototype_.findSD().front().get();
+    if (slater.getNumDets() != 2 || &slater.getPhi(0) != &slater.getPhi(1))
+      throw std::runtime_error("Conventional Gamma spline requires one shared fixed orbital owner");
+    for (int dimension = 0; dimension < 3; ++dimension)
+      if (prototype_particles_.getTwist()[dimension] != 0) throw std::runtime_error("Conventional spline requires Gamma");
+    for (const auto& component : prototype_.getOrbitals())
+      if (component->getClassName() != "SlaterDet" && component->getClassName() != "J1OrbitalSoA" &&
+          component->getClassName() != "TwoBodyJastrow")
+        throw std::runtime_error("Conventional Gamma spline admits only fixed Slater and J1/J2");
+    const auto* spline = dynamic_cast<const SplineR2R<double>*>(&slater.getPhi(0));
+    if (!spline || spline->isOptimizable() || spline->isOMPoffload() || spline->getOrbitalSetSize() != 4 ||
+        spline->sourceIdentity() != spline_source_ || !spline_source_->image_hex ||
+        spline_source_->image_hex->empty() || spline_source_->effective_table_fingerprint.empty())
+      throw std::runtime_error("Conventional Gamma spline lacks its immutable double CPU source/table");
+#endif
+  }
+  if (periodic && !spline_source_)
   {
     // This first periodic slice is the existing closed-shell HEG14 model,
     // not blanket admission of arbitrary periodic wavefunctions/operators.
@@ -419,8 +479,9 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     if (!inserted && entry->second != identity)
       throw std::runtime_error("Conventional physical identity has ambiguous particle-set names");
   }
-  if (periodic && particles.size() != 1)
-    throw std::runtime_error("Conventional periodic HEG profile cannot contain ionic sources");
+  if (periodic && particles.size() != (spline_source_ ? 2 : 1))
+    throw std::runtime_error(spline_source_ ? "Conventional Gamma spline requires exactly one ionic source"
+                                          : "Conventional periodic HEG profile cannot contain ionic sources");
   std::ostringstream identity;
 #ifdef QMC_COMPLEX
   // Distinguish physical scalar representation at the cold identity boundary;
@@ -434,6 +495,8 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   identity << ';' << std::defaultfloat;
 #endif
   int periodic_coulomb = 0, periodic_kinetic = 0;
+  int periodic_ions = 0, periodic_ab = 0, periodic_nonlocal = 0;
+  const ParticleSet* ion_source = nullptr;
   for (const auto& [name, definition] : particles)
     identity << name.size() << ':' << name << ':' << definition.size() << ':' << definition << ';';
   for (int i = 0; i < hamiltonian.size(); ++i)
@@ -444,16 +507,35 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     {
       if (const auto* ewald = dynamic_cast<const CoulombPBCAA*>(component))
       {
-        if (ewald->usesOffload() || ewald->ewaldModelDefinition().empty() || !ewald->is_active ||
-            ewald->ComputeForces || &ewald->Ps != &prototype_particles_)
-          throw std::runtime_error("Conventional periodic training requires CPU active 3D Ewald CoulombPBCAA");
+        const bool electron = &ewald->Ps == &prototype_particles_;
+        if (ewald->usesOffload() || ewald->ewaldModelDefinition().empty() || ewald->ComputeForces ||
+            ewald->is_active != electron || (!electron && (!spline_source_ || ewald->NumCenters != 2 ||
+                ewald->Zat[0] != 4 || ewald->Zat[1] != 4 || !particles.count(ewald->Ps.getName()) ||
+                (ion_source && ion_source != &ewald->Ps))))
+          throw std::runtime_error(spline_source_ ? "Conventional Gamma spline requires matched active-electron/inactive-ion CPU Ewald"
+                                                : "Conventional periodic training requires CPU active 3D Ewald CoulombPBCAA");
+        if (!electron) ion_source = &ewald->Ps;
         identity << "periodic_ewald:" << component->getName() << ':' << ewald->ewaldModelDefinition() << ';';
-        ++periodic_coulomb;
+        electron ? ++periodic_coulomb : ++periodic_ions;
         continue;
       }
-      if (kind != "BareKineticEnergy")
-        throw std::runtime_error("Conventional periodic training requires kinetic plus 3D Ewald CoulombPBCAA only");
-      ++periodic_kinetic;
+      if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(component); spline_source_ && ab)
+      {
+        const auto& source = ab->getSourcePSet();
+        if (typeid(*ab) != typeid(CoulombPBCAB) || ab->ComputeForces || ab->kcdifferent ||
+            ab->ewaldModelDefinition().empty() || &ab->Peln != &prototype_particles_ ||
+            !particles.count(source.getName()) || (ion_source && ion_source != &source) || source.getTotalNum() != 2)
+          throw std::runtime_error("Conventional spline requires matched CPU 3D ionic/local-PP Ewald operators");
+        ion_source = &source;
+        identity << "periodic_local_pp:" << component->getName() << ':' << ab->ewaldModelDefinition() << ';';
+        ++periodic_ab;
+        continue;
+      }
+      if (spline_source_ && kind == "NonLocalECPotential") ++periodic_nonlocal;
+      else if (kind != "BareKineticEnergy")
+        throw std::runtime_error(spline_source_ ? "Conventional Gamma spline admits only kinetic, Ewald EE/II and ordinary local/nonlocal PP"
+                                              : "Conventional periodic training requires kinetic plus 3D Ewald CoulombPBCAA only");
+      else ++periodic_kinetic;
     }
     if (kind != "BareKineticEnergy" && kind != "CoulombPotential" &&
         !(nonlocal_ecp && (kind == "LocalECPotential" || kind == "NonLocalECPotential")))
@@ -476,8 +558,10 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     }
     identity << kind << ':' << component->getName() << ':' << description.str() << ';';
   }
-  if (periodic && (periodic_coulomb != 1 || periodic_kinetic != 1))
-    throw std::runtime_error("Conventional periodic training requires exactly one kinetic and one Ewald operator");
+  if (periodic && (periodic_coulomb != 1 || periodic_kinetic != 1 ||
+      (spline_source_ && (periodic_ions != 1 || periodic_ab != 1 || periodic_nonlocal != 1))))
+    throw std::runtime_error(spline_source_ ? "Conventional Gamma spline requires one kinetic, EE, II, local PP and nonlocal PP operator"
+                                          : "Conventional periodic training requires exactly one kinetic and one Ewald operator");
   if (nonlocal_ecp)
   {
     const auto& scientific = hamiltonian.ecpModelProvenance()->scientific_definition;
@@ -485,6 +569,9 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   }
   if (lcao_source_)
     identity << "lcao_file_image_v1:" << lcao_source_->byteCount() << ':' << lcao_source_->image_hex << ';';
+  if (spline_source_)
+    identity << "spline_source_v1:" << spline_source_->image_hex->size() / 2 << ':' << *spline_source_->image_hex
+             << ";used_table:" << spline_source_->effective_table_fingerprint << ';';
   physical_definition_ = identity.str();
   hamiltonian_ = &hamiltonian;
   nonlocal_ecp_ = nonlocal_ecp;
@@ -689,6 +776,7 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
     output.write(lcao_source_->source_report, "lcao_source_report");
     output.write(lcao_source_->byteCount(), "immutable_asset_bytes");
   }
+  if (spline_source_) output.write(spline_source_->image_hex->size() / 2, "immutable_asset_bytes");
   if (nonlocal_ecp_)
     output.write(hamiltonian_->ecpModelProvenance()->source_report, "ecp_source_report");
   std::vector<std::string> names;
