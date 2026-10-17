@@ -21,6 +21,7 @@
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
+#include "QMCDrivers/WFTrain/SampledLinearMethod.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/ECPComponentBuilder.h"
@@ -2489,6 +2490,173 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 }
 
 #ifndef QMC_COMPLEX
+TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapter][ci_family_oracle]")
+{
+  ParticleSetPool pool(OHMMS::Controller);
+  Libxml2Document definition;
+  const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/molecules/H4_ae_conventional_wftrain/wftrain_mdj.xml";
+  REQUIRE(definition.parse(fixture.string()));
+  xmlNodePtr wavefunction = nullptr;
+  for (auto* node = xmlFirstElementChild(definition.getRoot()); node; node = xmlNextElementSibling(node))
+  {
+    if (xmlStrEqual(node->name, BAD_CAST "particleset")) REQUIRE(pool.put(node));
+    if (xmlStrEqual(node->name, BAD_CAST "wavefunction")) wavefunction = node;
+  }
+  REQUIRE(wavefunction);
+  for (auto* j = xmlFirstElementChild(wavefunction); j; j = xmlNextElementSibling(j))
+    if (xmlStrEqual(j->name, BAD_CAST "jastrow"))
+      for (auto* correlation = xmlFirstElementChild(j); correlation; correlation = xmlNextElementSibling(correlation))
+        for (auto* coefficient = xmlFirstElementChild(correlation); coefficient; coefficient = xmlNextElementSibling(coefficient))
+          xmlSetProp(coefficient, BAD_CAST "optimize", BAD_CAST "no");
+  auto& particles = *pool.getParticleSet("e");
+  auto& ions = *pool.getParticleSet("ion0");
+  ions.update();
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(wavefunction, RuntimeOptions{});
+  REQUIRE(source);
+  particles.update();
+  source->evaluateLog(particles);
+  const auto source_log = source->getLogPsi();
+  const auto fixed_coefficients = source->findMSD()[0].get().get_C();
+  LegacyWaveFunctionAdapter adapter("ci/family-oracle", *source, adapterOptions());
+  REQUIRE(adapter.parameterSchema().parameterCount() == 1);
+  REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
+  ParticleSet private_particles(particles);
+  auto evaluator = source->makeClone(private_particles);
+  private_particles.update();
+  evaluator->findMSD()[0].get().isolateOptimizationState();
+  auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
+      std::vector<double>{-0.12, -0.03, 0.07, 0.18});
+  const auto coulomb = [&](const ParticleSet& p) {
+    double energy = 0;
+    for (int i = 0; i < p.getTotalNum(); ++i)
+    {
+      for (int j = 0; j < i; ++j) energy += 1.0 / std::sqrt(dot(p.R[i] - p.R[j], p.R[i] - p.R[j]));
+      for (const auto& ion : ions.R) energy -= 1.0 / std::sqrt(dot(p.R[i] - ion, p.R[i] - ion));
+    }
+    for (int i = 0; i < ions.getTotalNum(); ++i)
+      for (int j = 0; j < i; ++j) energy += 1.0 / std::sqrt(dot(ions.R[i] - ions.R[j], ions.R[i] - ions.R[j]));
+    return energy;
+  };
+  for (double coefficient : {0.0, 0.1})
+  {
+    CAPTURE(coefficient);
+    auto parameters = adapter.snapshotParameters();
+    parameters.values[0] = coefficient;
+    auto op = adapter.makeDerivativeOperator(replay, std::make_shared<const StructuredParameterSnapshot>(parameters), 0, 0);
+    const auto& schema = adapter.parameterSchema();
+    std::array<double, 4> score{}, del{}, log{}, phase{}, weights{1, 1, 1, 1};
+    std::array<DerivativeValue, 4> energies{};
+    auto active = adapter.registrationVariables();
+    active[0] = coefficient;
+    for (std::size_t sample = 0; sample < 4; ++sample)
+    {
+      replay->prepareSample(sample);
+      adapter.installSnapshot(*evaluator, private_particles, parameters);
+      log[sample] = evaluator->getLogPsi();
+      phase[sample] = evaluator->getPhase();
+      REQUIRE(std::isfinite(log[sample]));
+      energies[sample] = kineticEnergy(private_particles) + coulomb(private_particles);
+      Vector<QMCTraits::ValueType> scores(1), local_energy(1);
+      scores = local_energy = 0;
+      evaluator->evaluateDerivatives(private_particles, active, scores, local_energy);
+      score[sample] = scores[0];
+      del[sample] = local_energy[0];
+    }
+    double mean = 0, mean_energy = 0;
+    for (int i = 0; i < 4; ++i) { mean += score[i] / 4; mean_energy += energies[i].real() / 4; }
+    std::array<double, 4> dense_s{}, dense_h{};
+    for (int i = 0; i < 4; ++i)
+    {
+      const double d[] = {1, score[i] - mean}, l[] = {energies[i].real(), del[i] + energies[i].real() * d[1]};
+      for (int row = 0; row < 2; ++row)
+        for (int column = 0; column < 2; ++column)
+        {
+          dense_s[2 * row + column] += d[row] * d[column] / 4;
+          dense_h[2 * row + column] += (d[row] * l[column] + l[row] * d[column]) / 8;
+        }
+    }
+    REQUIRE(dense_s[3] > 1e-10);
+    const ScoreCovarianceBatch batch{op.get(), {weights.data(), 4}, {energies.data(), 4}};
+    ScoreCovarianceFactor factor(schema, parameters.version, {&batch, 1});
+    const auto kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+    SampledLinearMethodOperator h(factor, {&batch, 1}, kinetic, false, true, 0);
+    SampledLinearMethodOperator s(factor, {&batch, 1}, kinetic, true, false, 0);
+    for (int column = 0; column < 2; ++column)
+    {
+      std::array<DerivativeValue, 2> direction{}, h_action{}, s_action{};
+      direction[column] = 1;
+      h.apply({direction.data(), 2}, {h_action.data(), 2});
+      s.apply({direction.data(), 2}, {s_action.data(), 2});
+      for (int row = 0; row < 2; ++row)
+      {
+        CHECK(h_action[row].real() == Catch::Approx(dense_h[2 * row + column]).epsilon(2e-10).margin(2e-10));
+        CHECK(s_action[row].real() == Catch::Approx(dense_s[2 * row + column]).epsilon(2e-10).margin(2e-10));
+      }
+    }
+    MatrixFreeLinearMethodControl lm;
+    lm.maximum_subspace_dimension = 2;
+    lm.maximum_iterations = 16;
+    lm.maximum_operator_applications = 64;
+    lm.maximum_seconds = 5;
+    const std::array<DerivativeValue, 2> initial{1, 0};
+    IdentityPreconditioner preconditioner(schema, parameters.version);
+    const auto result = solveSymmetrizedMatrixFreeLinearMethod(h, s, preconditioner, {initial.data(), 2}, lm);
+    INFO(linearMethodStopReasonName(result.stop_reason));
+    REQUIRE(result.converged);
+    const double v0 = result.eigenvector[0].real(), v1 = result.eigenvector[1].real();
+    const double gauge = v0 - mean * v1;
+    REQUIRE(std::abs(gauge) > 1e-10);
+    auto mapped = parameters;
+    mapped.values[0] += v1 / gauge;
+    // This explicit test-only projective map does not qualify the generic
+    // nonlinear LM update or lift any native family guard.
+    for (std::size_t sample = 0; sample < 4; ++sample)
+    {
+      replay->prepareSample(sample);
+      adapter.installSnapshot(*evaluator, private_particles, mapped);
+      const double ratio = std::exp(evaluator->getLogPsi() - log[sample]) *
+          std::cos(evaluator->getPhase() - phase[sample]);
+      CHECK(ratio == Catch::Approx((v0 + v1 * (score[sample] - mean)) / gauge).epsilon(2e-10).margin(2e-10));
+      CHECK(evaluator->findMSD()[0].get().get_C()[0] == fixed_coefficients[0]);
+    }
+    ProjectedInverseIterationFactor pii_factor(factor, kinetic);
+    const auto gradient = factor.scoreCovarianceGradient();
+    const ParameterGradientView objective{schema.fingerprint(), parameters.version, ReductionDomain::GLOBAL,
+                                         {gradient.data(), gradient.size()}};
+    PIIUpdateControl control;
+    control.shift_mode = PIIShiftMode::EXPLICIT;
+    control.explicit_shift = mean_energy - 1;
+    control.damping = 0.3;
+    control.learning_rate = 0.01;
+    control.maximum_damping_retries = 0;
+    control.gmres.restart_length = 4;
+    control.gmres.krylov.maximum_iterations = 16;
+    control.gmres.krylov.maximum_operator_applications = 64;
+    control.gmres.krylov.maximum_seconds = 5;
+    double rhs = 0, denominator = control.damping;
+    for (int i = 0; i < 4; ++i)
+    {
+      const double centered = score[i] - mean;
+      rhs += centered * (energies[i].real() - mean_energy) / 4;
+      denominator += centered * (del[i] + (energies[i].real() - control.explicit_shift) * centered) / 4;
+    }
+    REQUIRE(std::abs(denominator) > 1e-10);
+    ProjectedInverseIterationUpdateRule pii(pii_factor, control);
+    MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
+    const double expected = coefficient - control.learning_rate * rhs / denominator;
+    CHECK(pii.propose(schema, parameters, objective).values[0] == Catch::Approx(expected).epsilon(2e-9).margin(2e-11));
+    CHECK(minpii.propose(schema, parameters, objective).values[0] == Catch::Approx(expected).epsilon(2e-9).margin(2e-11));
+    pii.proposalRejected();
+    minpii.proposalRejected();
+    source->evaluateLog(particles);
+    CHECK(source->getLogPsi() == source_log);
+    CHECK(source->findMSD()[0].get().get_C() == fixed_coefficients);
+    CHECK(adapter.snapshotParameters().values[0] == 0);
+  }
+}
+
 TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
 {
   // The nodal model uses the supported octahedral BFD rule and a counting
