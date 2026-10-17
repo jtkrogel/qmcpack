@@ -270,6 +270,18 @@ public:
   CapturedLocalEnergyObservation observeCapturedLocalEnergy(const ParticleSet&,
       const wftrain::StreamingDerivativeOperator&, std::size_t sample, FullPrecRealType same_sample_real_potential) const;
 
+  /// Explicit numerical route only; generic GPU provider discovery remains closed.
+  struct GpuNonLocalReplayRequirements
+  {
+    std::size_t capture_host_bytes;
+    std::size_t bound_host_extra_bytes; // Capture plus eventual packing, NOT an additional capture copy.
+  };
+  GpuNonLocalReplayRequirements gpuNonLocalReplayRequirements(std::size_t samples, std::size_t maximum_points) const;
+  std::size_t gpuNonLocalReplayRequiredBytes(const wftrain::StreamingDerivativeOperator&) const;
+  std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> makeBudgetedGpuNonLocalReplayConsumer(
+      const RefVectorWithLeader<TrialWaveFunction>&, const RefVectorWithLeader<ParticleSet>&,
+      const wftrain::StreamingDerivativeOperator&, std::size_t maximum_host_bytes) const;
+
   /// Identify the fixed ion source for final-system Coulomb admission, not a movable source API.
   const ParticleSet& sourceParticles() const;
 

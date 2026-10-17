@@ -905,6 +905,281 @@ struct PsiFormerComplexWF::Impl
     mutable std::vector<C> sample_coefficients;
     mutable bool has_evaluated = false;
   };
+
+  /// One immutable O(B+Q) record; keeping the family alive also protects stamp identity reuse.
+  struct GpuNonLocalReplay final : wftrain::NonLocalECPJVPReplay
+  {
+    const std::shared_ptr<Model> state;
+    const std::size_t version, ordinal, offset, samples;
+    std::uint64_t grid = 0;
+    std::vector<double> reference_positions;
+    std::vector<wftrain::NonLocalECPReplayPoint> point_records;
+    std::vector<wftrain::NonLocalECPReplaySegment> segment_records;
+    std::vector<wftrain::NonLocalECPReplayTile> tile_records;
+    std::vector<WaveFunctionComponent::EvaluationStamp> stamp_records;
+    wftrain::NonLocalECPReplayStorageDiagnostics admitted_storage;
+
+    explicit GpuNonLocalReplay(const GpuDerivativeStream& s)
+        : state(s.lane->state), version(s.version), ordinal(s.ordinal), offset(s.offset), samples(s.samples),
+          reference_positions(s.positions) {}
+
+    std::string_view providerId() const noexcept override { return state->schema->providerId(); }
+    std::string_view schemaFingerprint() const noexcept override { return state->schema->fingerprint(); }
+    std::size_t parameterVersion() const noexcept override { return version; }
+    std::size_t batchOrdinal() const noexcept override { return ordinal; }
+    std::size_t sampleOffset() const noexcept override { return offset; }
+    std::size_t sampleCount() const noexcept override { return samples; }
+    std::size_t electronCount() const noexcept override { return state->model.ne; }
+    std::uint32_t localEnergyTermMask() const noexcept override
+    { return wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP); }
+    std::uint64_t gridFingerprint() const noexcept override { return grid; }
+    wftrain::DerivativeArrayView<const double> referencePositions() const noexcept override
+    { return {reference_positions.data(), reference_positions.size()}; }
+    wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayPoint> points() const noexcept override
+    { return {point_records.data(), point_records.size()}; }
+    wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplaySegment> segments() const noexcept override
+    { return {segment_records.data(), segment_records.size()}; }
+    wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayTile> tiles() const noexcept override
+    { return {tile_records.data(), tile_records.size()}; }
+    wftrain::DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
+    { return {stamp_records.data(), stamp_records.size()}; }
+
+    /// Count capacities rather than filled extents, including worst-case provenance reserved before RNG.
+    wftrain::NonLocalECPReplayStorageDiagnostics measureStorageDiagnostics() const
+    {
+      const char* error = "Complex ECP replay storage overflow";
+      wftrain::NonLocalECPReplayStorageDiagnostics d;
+      d.point_count = point_records.size(); d.segment_count = segment_records.size();
+      d.tile_count = tile_records.size(); d.evaluation_stamp_count = stamp_records.size();
+      d.reference_position_bytes = pf::checkedStorageBytes<double>(reference_positions.capacity(), error);
+      d.point_bytes = pf::checkedStorageBytes<wftrain::NonLocalECPReplayPoint>(point_records.capacity(), error);
+      d.provenance_bytes = pf::checkedStorageBytes<wftrain::NonLocalECPReplaySegment>(segment_records.capacity(), error);
+      pf::addStorageBytes(d.provenance_bytes,
+          pf::checkedStorageBytes<wftrain::NonLocalECPReplayTile>(tile_records.capacity(), error), error);
+      pf::addStorageBytes(d.provenance_bytes,
+          pf::checkedStorageBytes<WaveFunctionComponent::EvaluationStamp>(stamp_records.capacity(), error), error);
+      d.retained_numeric_bytes = d.reference_position_bytes;
+      pf::addStorageBytes(d.retained_numeric_bytes, d.point_bytes, error);
+      pf::addStorageBytes(d.retained_numeric_bytes, d.provenance_bytes, error);
+      d.storage_fingerprint = 1469598103934665603ULL;
+      for (const void* pointer : {static_cast<const void*>(reference_positions.data()),
+          static_cast<const void*>(point_records.data()), static_cast<const void*>(segment_records.data()),
+          static_cast<const void*>(tile_records.data()), static_cast<const void*>(stamp_records.data())})
+        d.storage_fingerprint = (d.storage_fingerprint ^ reinterpret_cast<std::uintptr_t>(pointer)) * 1099511628211ULL;
+      return d;
+    }
+
+    /// Capacities never grow after admission; the interface's noexcept query only updates filled extents.
+    wftrain::NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept override
+    {
+      auto d = admitted_storage;
+      d.point_count = point_records.size(); d.segment_count = segment_records.size();
+      d.tile_count = tile_records.size(); d.evaluation_stamp_count = stamp_records.size();
+      return d;
+    }
+  };
+
+  /// Replay-only ordinary-locality capture; caller keeps its ParticleSets alive through end/abort.
+  struct GpuNonLocalCapture final : wftrain::NonLocalECPDerivativeConsumer
+  {
+    const std::shared_ptr<GpuDerivativeLane> lane;
+    std::unique_lock<std::mutex> execution;
+    std::unique_ptr<GpuNonLocalReplay> record;
+    std::vector<const ParticleSet*> particles;
+    std::size_t expected = 0;
+    enum class State { IDLE, ACTIVE, COMPLETE, POISONED } state = State::IDLE;
+
+    /// One exact shape core serves both pre-MC metadata admission and the concrete operator factory.
+    static GpuNonLocalReplayRequirements requiredShape(std::size_t samples, std::size_t electrons, std::size_t q)
+    {
+      const char* error = "Complex ECP capture admission overflow";
+      if (!samples || !electrons) throw std::invalid_argument("Complex ECP capture shape is empty");
+      const auto stride = pf::checkedStorageProduct(3, electrons, error);
+      std::size_t bytes = pf::checkedStorageBytes<double>(pf::checkedStorageProduct(samples, stride, error), error);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<const ParticleSet*>(samples, error), error);
+      for (auto size : {sizeof(wftrain::NonLocalECPReplayPoint), sizeof(wftrain::NonLocalECPReplaySegment),
+          sizeof(wftrain::NonLocalECPReplayTile), sizeof(WaveFunctionComponent::EvaluationStamp)})
+        pf::addStorageBytes(bytes, pf::checkedStorageProduct(q, size, error), error);
+      std::size_t extra = bytes;
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(
+          pf::checkedStorageProduct(pf::checkedStorageSum(samples,
+              pf::checkedStorageProduct(2, q, error), error), stride, error), error), error);
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<std::size_t>(q, error), error);
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<C>(pf::checkedStorageSum(samples, q, error), error), error);
+      return {bytes, extra};
+    }
+
+    /// Admit capture AND its eventual bind packing, without allocating any storage.
+    static std::size_t required(const GpuDerivativeStream& s)
+    {
+      const auto r = requiredShape(s.samples, s.lane->state->model.ne, s.lane->maximum_samples - s.samples);
+      const auto current = s.storageDiagnostics().retained_numeric_bytes - s.lane->products->cost().device_bytes;
+      if (r.bound_host_extra_bytes > s.host_cap || current > s.host_cap - r.bound_host_extra_bytes)
+        throw std::length_error("Complex ECP capture plus eventual binding exceeds operator HOST admission");
+      return r.capture_host_bytes;
+    }
+
+    GpuNonLocalCapture(const GpuDerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
+        std::unique_lock<std::mutex>&& lease, std::size_t cap)
+        : lane(s.lane), execution(std::move(lease)), record(std::make_unique<GpuNonLocalReplay>(s))
+    {
+      const auto q = lane->maximum_samples - s.samples;
+      record->point_records.reserve(q); record->segment_records.reserve(q);
+      record->tile_records.reserve(q); record->stamp_records.reserve(q);
+      record->admitted_storage = record->measureStorageDiagnostics();
+      particles.reserve(s.samples);
+      for (auto& p : targets) particles.push_back(&p.get());
+      if (storageDiagnostics().retained_numeric_bytes > cap)
+        throw std::length_error("Complex ECP actual capture capacities exceed admission");
+    }
+
+    /// Every phase rechecks version, pending moves, fixed source and exact accepted references.
+    void requireCurrent() const
+    {
+      std::shared_lock read(lane->state->mutex);
+      if (!record || lane->state->model.p.version() != record->version || lane->state->gpu != lane->generation ||
+          lane->state->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex ECP capture source is stale/pending");
+      validateDerivativeSource(*lane->state);
+      for (std::size_t b = 0; b < particles.size(); ++b)
+      {
+        const auto& p = *particles[b];
+        if (p.getActivePtcl() >= 0 || p.R.size() != lane->state->model.ne)
+          throw std::logic_error("Complex ECP capture reference is pending/invalid");
+        for (std::size_t e = 0; e < p.R.size(); ++e)
+          for (int d = 0; d < 3; ++d)
+            if (p.R[e][d] != record->reference_positions[3 * (b * p.R.size() + e) + d])
+              throw std::logic_error("Complex ECP capture reference coordinates changed");
+      }
+    }
+
+    void preflight(const wftrain::NonLocalECPDerivativeContext& c,
+        wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+        const wftrain::ParameterReductionSink& sink) const override
+    {
+      if (state != State::IDLE || !record || channels.size() != 1 ||
+          sink.state() != wftrain::DerivativeSinkState::IDLE || c.provider_id != record->providerId() ||
+          c.schema_fingerprint != record->schemaFingerprint() || c.parameter_version != record->version ||
+          c.batch_ordinal != record->ordinal || c.sample_offset != record->offset || c.sample_count != record->samples ||
+          c.localization != wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY || !c.uses_virtual_particles ||
+          !c.scalar_relativistic || c.used_dense_derivative_fallback)
+        throw std::invalid_argument("Complex ECP capture requires current scalar ordinary-locality replay-only C1");
+      const auto& channel = channels[0]; const auto& v = channel.coefficients;
+      if (channel.id.empty() || channel.product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+          channel.local_energy_term_mask != record->localEnergyTermMask() || v.provider_id != c.provider_id ||
+          v.schema_fingerprint != c.schema_fingerprint || v.parameter_version != c.parameter_version ||
+          v.batch_ordinal != c.batch_ordinal || v.sample_offset != c.sample_offset ||
+          v.values.size() != c.sample_count || !v.values.data())
+        throw std::invalid_argument("Complex ECP capture coefficient identity mismatch");
+      for (auto value : v.values)
+        if (!isFiniteWavefunctionValue(value)) throw std::invalid_argument("Complex ECP capture nonfinite coefficient");
+      requireCurrent();
+    }
+
+    void begin(const wftrain::NonLocalECPDerivativeContext& c,
+        wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+        wftrain::ParameterReductionSink& sink) override
+    {
+      preflight(c, channels, sink);
+      if (!c.grid_fingerprint || c.expected_point_count > record->point_records.capacity())
+        throw std::length_error("Complex ECP traversal exceeds prepared capture capacity");
+      expected = c.expected_point_count; record->grid = c.grid_fingerprint; state = State::ACTIVE;
+    }
+
+    /// Copy transient tile data only after its exact source stamp and bounds are admitted.
+    void consume(const wftrain::NonLocalECPDerivativeTile& tile) override
+    {
+      try
+      {
+        requireCurrent();
+        const auto& batch = tile.virtual_particles;
+        if (state != State::ACTIVE || tile.grid_fingerprint != record->grid ||
+            tile.tile_ordinal != record->tile_records.size() || batch.empty() || !batch.fingerprint() ||
+            batch.walkerCount() != record->samples ||
+            batch.size() > expected - record->point_records.size() || tile.bare_weights.size() != batch.size() ||
+            tile.complete_ratios.size() != batch.size() || !tile.bare_weights.data() || !tile.complete_ratios.data() ||
+            tile.evaluation_stamps.size() != 1 || !tile.evaluation_stamps.data() ||
+            !tile.evaluation_stamps[0].matches(lane->state.get(), record->version))
+          throw std::invalid_argument("Complex ECP tile lacks exact traversal/stamp coverage");
+        const auto start = record->point_records.size(), segments = record->segment_records.size();
+        for (std::size_t s = 0; s < batch.segmentCount(); ++s)
+        {
+          const auto slice = batch.slice(s);
+          if (slice.empty() || slice.walkerId() < 0 || slice.electronId() < 0 ||
+              std::size_t(slice.walkerId()) >= record->samples || std::size_t(slice.electronId()) >= record->electronCount())
+            throw std::invalid_argument("Complex ECP tile reference is invalid");
+          record->segment_records.push_back({start + slice.flatOffset(), slice.size(), std::size_t(slice.walkerId()),
+              std::size_t(slice.electronId()), slice.isOnSphere(), std::size_t(slice.sourceCenterId())});
+          for (std::size_t i = 0; i < slice.size(); ++i)
+          {
+            const auto q = slice.flatOffset() + i;
+            const C bare = tile.bare_weights[q], ratio = tile.complete_ratios[q];
+            const auto& p = slice.absolutePosition(i);
+            if (bare.imag() != 0 || !isFiniteWavefunctionValue(bare) || !isFiniteWavefunctionValue(ratio) ||
+                !isFiniteWavefunctionValue(bare * ratio))
+              throw std::invalid_argument("Complex ECP tile weight/ratio is invalid");
+            for (int d = 0; d < 3; ++d)
+              if (!psiformer::determinant::isFiniteReal(p[d])) throw std::invalid_argument("Complex ECP point nonfinite");
+            record->point_records.push_back({std::size_t(slice.walkerId()), std::size_t(slice.electronId()),
+                {p[0], p[1], p[2]}, bare, ratio});
+          }
+        }
+        record->tile_records.push_back({tile.tile_ordinal, start, batch.size(), segments,
+            record->segment_records.size() - segments, record->stamp_records.size(), 1, batch.fingerprint()});
+        record->stamp_records.push_back(tile.evaluation_stamps[0]);
+      }
+      catch (...) { abort(); throw; }
+    }
+
+    /// Only a complete current record can escape; release the execution lease before binding it.
+    void end() override
+    {
+      try
+      {
+        requireCurrent();
+        if (state != State::ACTIVE || record->point_records.size() != expected)
+          throw std::logic_error("Complex ECP capture ended with incomplete coverage");
+        for (std::size_t sample = 0; sample < record->samples; ++sample)
+        {
+          C sum{};
+          for (const auto& point : record->point_records)
+            if (point.sample == sample) sum += point.bare_weight * point.complete_ratio;
+          if (!isFiniteWavefunctionValue(sum)) throw std::overflow_error("Complex captured ECP sum overflow");
+        }
+        state = State::COMPLETE; execution.unlock();
+      }
+      catch (...) { abort(); throw; }
+    }
+
+    void abort() noexcept override
+    { state = State::POISONED; if (execution.owns_lock()) execution.unlock(); }
+
+    std::unique_ptr<wftrain::NonLocalECPJVPReplay> releaseJVPReplay() override
+    {
+      if (state != State::COMPLETE || !record) throw std::logic_error("Complex ECP replay is incomplete/already released");
+      return std::move(record);
+    }
+
+    wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
+    {
+      wftrain::StreamingDerivativeStorageDiagnostics d;
+      const auto pointer_bytes = pf::checkedStorageBytes<const ParticleSet*>(particles.capacity(),
+          "Complex ECP capture pointer storage overflow");
+      d.sample_auxiliary_bytes = d.retained_numeric_bytes = pointer_bytes;
+      d.storage_fingerprint = reinterpret_cast<std::uintptr_t>(particles.data());
+      d.allocation_generation = 1;
+      if (!record) return d;
+      const auto r = record->storageDiagnostics();
+      d.parameter_count = lane->state->schema->parameterCount(); d.sample_count = record->samples;
+      d.sample_position_bytes = r.reference_position_bytes;
+      pf::addStorageBytes(d.sample_auxiliary_bytes, r.point_bytes, "Complex ECP capture storage overflow");
+      pf::addStorageBytes(d.sample_auxiliary_bytes, r.provenance_bytes, "Complex ECP capture storage overflow");
+      d.retained_numeric_bytes = r.retained_numeric_bytes;
+      pf::addStorageBytes(d.retained_numeric_bytes, pointer_bytes, "Complex ECP capture storage overflow");
+      d.storage_fingerprint = r.storage_fingerprint ^ reinterpret_cast<std::uintptr_t>(particles.data());
+      d.allocation_generation = 1; return d;
+    }
+  };
 #endif
 
   /// One leased score tape, one complete kinetic tape, and three fixed complex contractions.
@@ -2067,6 +2342,79 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   return result;
 }
 
+/// Metadata-only pre-MC ledger query; no dummy operator, allocation or GPU call.
+PsiFormerComplexWF::GpuNonLocalReplayRequirements PsiFormerComplexWF::gpuNonLocalReplayRequirements(
+    std::size_t samples, std::size_t maximum_points) const
+{
+#ifdef ENABLE_CUDA
+  std::shared_lock read(impl_->state->mutex);
+  if (!impl_->state->gpu || impl_->state->gpu_crowds != 1)
+    throw std::logic_error("Complex ECP capture requires one active GPU inference owner");
+  Impl::validateDerivativeSource(*impl_->state);
+  return Impl::GpuNonLocalCapture::requiredShape(samples, impl_->state->model.ne, maximum_points);
+#else
+  throw std::logic_error("Complex ECP capture requires the explicit GPU component route");
+#endif
+}
+
+/// Explicit HOST capture admission includes the eventual bound operator's worst-case packing.
+std::size_t PsiFormerComplexWF::gpuNonLocalReplayRequiredBytes(const wftrain::StreamingDerivativeOperator& op) const
+{
+#ifdef ENABLE_CUDA
+  const auto* s = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
+  if (!s || s->lane->state != impl_->state) throw std::invalid_argument("Complex ECP capture requires its own GPU operator");
+  std::unique_lock execution(s->lane->execution_mutex);
+  std::shared_lock read(impl_->state->mutex);
+  s->requireCurrent();
+  if (s->replay || s->has_evaluated) throw std::logic_error("Complex ECP capture requires an unused unbound operator");
+  return Impl::GpuNonLocalCapture::required(*s);
+#else
+  throw std::logic_error("Complex ECP capture requires the explicit GPU component route");
+#endif
+}
+
+/// Prepare a replay-only transaction without exposing generic/unbudgeted GPU discovery.
+std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::makeBudgetedGpuNonLocalReplayConsumer(
+    const RefVectorWithLeader<TrialWaveFunction>& wavefunctions, const RefVectorWithLeader<ParticleSet>& particles,
+    const wftrain::StreamingDerivativeOperator& op, std::size_t host_cap) const
+{
+#ifdef ENABLE_CUDA
+  const auto* s = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
+  if (!s || s->lane->state != impl_->state || !host_cap || host_cap == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Complex ECP capture requires its own operator and finite HOST cap");
+  std::unique_lock execution(s->lane->execution_mutex);
+  std::shared_lock read(impl_->state->mutex);
+  s->requireCurrent();
+  if (s->replay || s->has_evaluated) throw std::logic_error("Complex ECP capture requires an unused unbound operator");
+  const auto bytes = Impl::GpuNonLocalCapture::required(*s);
+  if (bytes > host_cap) throw std::length_error("Complex ECP capture exceeds HOST admission before allocation");
+  if (particles.size() != s->samples || wavefunctions.size() != s->samples ||
+      &particles.getLeader() != impl_->particles || &particles[0] != &particles.getLeader() ||
+      &wavefunctions[0] != &wavefunctions.getLeader())
+    throw std::invalid_argument("Complex ECP capture leader/batch mismatch");
+  for (std::size_t b = 0; b < particles.size(); ++b)
+  {
+    const auto& orbitals = wavefunctions[b].getOrbitals();
+    const auto* c = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+    if (!c || c->impl_->state != impl_->state || particles[b].isSpinor())
+      throw std::invalid_argument("Complex ECP capture requires sole same-family nonspinor clones");
+    c->impl_->requireIdle(particles[b]);
+    for (std::size_t previous = 0; previous < b; ++previous)
+      if (&particles[previous] == &particles[b] || &wavefunctions[previous] == &wavefunctions[b])
+        throw std::invalid_argument("Complex ECP capture clone scratch aliases");
+    for (std::size_t e = 0; e < particles[b].R.size(); ++e)
+      for (int d = 0; d < 3; ++d)
+        if (particles[b].R[e][d] != s->positions[3 * (b * particles[b].R.size() + e) + d])
+          throw std::invalid_argument("Complex ECP capture reference changed before preparation");
+  }
+  app_log() << "Complex ECP replay-only preallocation HOST=" << bytes
+            << " maximum_points=" << s->lane->maximum_samples - s->samples << " parameter_workspace=0" << std::endl;
+  return std::make_unique<Impl::GpuNonLocalCapture>(*s, particles, std::move(execution), bytes);
+#else
+  throw std::logic_error("Complex ECP capture requires the explicit GPU component route");
+#endif
+}
+
 /// Checked additional two-domain ownership; generic GPU discovery stays closed.
 PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeRequirements(
     std::size_t samples, std::size_t maximum_samples, std::size_t targets, std::size_t chunk) const
@@ -3158,6 +3506,14 @@ PsiFormerComplexWF::CapturedLocalEnergyObservation PsiFormerComplexWF::observeCa
   if (!stream->replay || sample >= stream->samples || !psiformer::determinant::isFiniteReal(potential))
     throw std::invalid_argument("Complex captured observation requires a finite same-sample potential and bound grid");
   impl_->requireIdle(p);
+  const auto& masses = p.get_mass_by_group();
+  if (masses.size() != static_cast<std::size_t>(p.groups()))
+    throw std::invalid_argument("Complex captured observation mass extent changed");
+  for (int group = 0; group < p.groups(); ++group)
+    for (int e = p.first(group); e < p.last(group); ++e)
+      if (!psiformer::determinant::isFiniteReal(masses[group]) || masses[group] <= 0 ||
+          1.0 / masses[group] != stream->inverse_masses[sample * p.R.size() + e])
+        throw std::invalid_argument("Complex captured observation kinetic masses changed");
   for (std::size_t e = 0; e < p.R.size(); ++e)
     for (int d = 0; d < 3; ++d)
       if (p.R[e][d] != stream->positions[3 * (sample * p.R.size() + e) + d])

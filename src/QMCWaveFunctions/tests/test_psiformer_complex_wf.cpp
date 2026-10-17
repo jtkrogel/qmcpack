@@ -15,6 +15,9 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCHamiltonians/ECPComponentBuilder.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
+#include "Utilities/FakeRandom.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
@@ -55,6 +58,16 @@
 
 namespace qmcplusplus
 {
+namespace testing
+{
+/// Reuse the existing NLPP test friend without exposing a new production control.
+class TestNonLocalECPotential
+{
+public:
+  static void setTileCapacity(NonLocalECPotential& potential, std::size_t capacity)
+  { potential.setOuterTileCapacityForTesting(capacity); }
+};
+}
 namespace
 {
 namespace ps = psiformer;
@@ -4252,6 +4265,175 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
     close(actual.values[0][i], expected.values[0][i] + kinetic_expected.values[0][i], 3e-9);
   actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
   std::printf("COMPLEX_CAPTURED_ECP PASS B=2 Q=9 C3_slot0 C1_complete CPU_allP duality stamp lease retry stale\n");
+}
+TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and complex energy",
+          "[wavefunction][psiformer][complex_actual_ecp]")
+{
+  using namespace wftrain;
+  int count = 0, device = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&count) != hipSuccess || !count) { WARN("NOT_RUN: actual paired ECP requires GPU"); return; }
+  REQUIRE(hipGetDevice(&device) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&count) != cudaSuccess || !count) { WARN("NOT_RUN: actual paired ECP requires GPU"); return; }
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  const SimulationCell simulation_cell(cell());
+  auto source = ions(simulation_cell), p = electrons(simulation_cell, 3, 1);
+  // An existing radial operator on the periodic numerical fixture, NOT a new native PP profile.
+  auto nonlocal = std::make_unique<NonLocalECPotential>(source, p, false, true);
+  auto* nl0 = nonlocal.get();
+  const auto pp_path = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/molecules/LiH_pp/Li.BFD.xml";
+  ECPComponentBuilder builder("paired_component_ecp", OHMMS::Controller, 4, 1);
+  REQUIRE(builder.read_pp_file(pp_path.string()));
+  REQUIRE(builder.pp_nonloc != nullptr);
+  nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+  testing::TestNonLocalECPotential::setTileCapacity(*nonlocal, 5);
+  p.update();
+  ParticleSet p1(p); p1.R[1][2] += .037; p1.update();
+  auto initialized = parameters();
+  initialized.model_shape.spin_up_electrons = 3; initialized.model_shape.spin_down_electrons = 1;
+  const std::array<double, 3> twist{.17, -.11, .07};
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("actual_ecp", initialized, p, source, clone_cap, twist, 64 * 1024 * 1024);
+  auto& gpu = *owner; trial.addComponent(std::move(owner));
+  auto trial1 = trial.makeClone(p1);
+  auto& gpu1 = dynamic_cast<PsiFormerComplexWF&>(*trial1->getOrbitals()[0]);
+  QMCHamiltonian ham("paired_operator_observation");
+  ham.addOperator(std::make_unique<BareKineticEnergy>(p), "Kinetic", true);
+  ham.addOperator(std::move(nonlocal), "NonLocalECP", true);
+  ham.addObservables(p);
+  auto ham1 = ham.makeClone(p1, *trial1);
+  auto& nl1 = dynamic_cast<NonLocalECPotential&>(*ham1->getComponent(1));
+  FakeRandom<QMCTraits::FullPrecRealType> rng0, rng1; rng0.set_value(.371); rng1.set_value(.371);
+  nl0->setRandomGenerator(&rng0); nl1.setRandomGenerator(&rng1);
+  RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial, *trial1});
+  RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
+  RefVectorWithLeader<QMCHamiltonian> hamiltonians(ham, {ham, *ham1});
+  ResourceCollection pr("paired actual ECP particles"), wr("paired actual ECP wavefunctions"), hr("paired actual ECP H");
+  p.createResource(pr); trial.createResource(wr); ham.createResource(hr);
+  ResourceCollectionTeamLock<ParticleSet> pl(pr, particles);
+  ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, trials);
+  ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hamiltonians);
+  trial.evaluateLog(p); trial1->evaluateLog(p1);
+  const auto accepted = gpu.snapshotParameters();
+  const auto required = gpu.gpuDerivativeRequirements(2, 128, 3, 7);
+  auto op = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 19, 23, 128, 3, 7,
+      required.device_bytes, required.host_bytes + 1024 * 1024, required.matrix_work);
+  const auto capture_bytes = gpu.gpuNonLocalReplayRequiredBytes(*op);
+  const auto shape_bytes = gpu.gpuNonLocalReplayRequirements(2, 126);
+  CHECK(shape_bytes.capture_host_bytes == capture_bytes);
+  CHECK(shape_bytes.bound_host_extra_bytes > capture_bytes);
+  CHECK_THROWS(gpu.gpuNonLocalReplayRequirements(0, 126));
+  CHECK_THROWS(gpu.gpuNonLocalReplayRequirements(2, std::numeric_limits<std::size_t>::max()));
+  auto& metrics = ps::device::deviceMemoryMetrics(device);
+  const auto before = metrics.snapshot();
+  CHECK_THROWS(gpu.makeBudgetedGpuNonLocalReplayConsumer(trials, particles, *op, capture_bytes - 1));
+  CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+  CHECK(metrics.snapshot().uploaded_bytes == before.uploaded_bytes);
+  auto consumer = gpu.makeBudgetedGpuNonLocalReplayConsumer(trials, particles, *op, capture_bytes);
+  CHECK(consumer->storageDiagnostics().retained_numeric_bytes <= capture_bytes);
+  CHECK(consumer->storageDiagnostics().complex_parameter_vectors == 0);
+  consumer->abort(); CHECK_THROWS(consumer->releaseJVPReplay()); consumer.reset();
+  consumer = gpu.makeBudgetedGpuNonLocalReplayConsumer(trials, particles, *op, capture_bytes);
+  const auto& schema = gpu.parameterSchema();
+  std::vector<C> coefficients{{.7, -.2}, {-.4, .3}}, direction(schema.parameterCount());
+  for (std::size_t i = 0; i < direction.size(); ++i) direction[i] = .003 * std::sin(double(i + 1));
+  VJPCoefficientChannel channel{"actual_nonlocal", DerivativeProduct::LOCAL_ENERGY_VJP,
+      {schema.providerId(), schema.fingerprint(), 0, 19, 23, {coefficients.data(), 2}},
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+  ComplexStreamingSink replay_sink;
+  const auto actual = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink);
+  CHECK(replay_sink.state() == DerivativeSinkState::IDLE);
+  auto replay = consumer->releaseJVPReplay();
+  CHECK_THROWS(consumer->releaseJVPReplay());
+  REQUIRE(replay->gridFingerprint() == actual.grid_fingerprint);
+  const std::vector<NonLocalECPReplayPoint> grid(replay->points().begin(), replay->points().end());
+  REQUIRE(grid.size() > 5); REQUIRE(grid.size() + 4 <= 128);
+  CHECK(replay->tiles().size() > 1);
+  op->bindNonLocalECPJVPReplay(std::move(replay));
+  CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+  // Independent CPU amplitudes and all-P scores use precisely the accepted radial/grid data.
+  std::vector<std::unique_ptr<ParticleSet>> cp;
+  for (std::size_t b = 0; b < 2 + grid.size(); ++b)
+  {
+    cp.push_back(std::make_unique<ParticleSet>(particles[b < 2 ? b : grid[b - 2].sample]));
+    if (b >= 2)
+      for (int d = 0; d < 3; ++d) cp.back()->R[grid[b - 2].electron][d] = grid[b - 2].replacement_position[d];
+    cp.back()->update();
+  }
+  PsiFormerComplexWF cpu("actual_ecp", initialized, *cp[0], source, clone_cap, twist);
+  std::vector<std::unique_ptr<WaveFunctionComponent>> copies;
+  RefVectorWithLeader<WaveFunctionComponent> components(cpu, {cpu});
+  RefVectorWithLeader<ParticleSet> cpu_particles(*cp[0], {*cp[0]});
+  for (std::size_t b = 1; b < cp.size(); ++b)
+  {
+    copies.push_back(cpu.makeClone(*cp[b])); components.push_back(*copies.back()); cpu_particles.push_back(*cp[b]);
+  }
+  evaluate(cpu, *cp[0]); evaluate(*copies[0], *cp[1]);
+  std::array<C, 2> nonlocal_energy{};
+  std::vector<C> weights(grid.size()), folded(cp.size());
+  for (std::size_t q = 0; q < grid.size(); ++q)
+  {
+    const auto& point = grid[q];
+    VirtualParticleSet vp(*cp[point.sample]);
+    ParticleSet::PosType delta;
+    for (int d = 0; d < 3; ++d) delta[d] = point.replacement_position[d] - cp[point.sample]->R[point.electron][d];
+    vp.makeMoves(*cp[point.sample], point.electron, std::vector<ParticleSet::PosType>{delta});
+    std::vector<WaveFunctionComponent::ValueType> ratio(1);
+    components[point.sample].evaluateRatios(vp, ratio);
+    close(ratio[0], point.complete_ratio, 3e-9);
+    weights[q] = point.bare_weight * ratio[0]; nonlocal_energy[point.sample] += weights[q];
+  }
+  for (std::size_t b = 0; b < 2; ++b)
+  {
+    const auto observed = (b ? gpu1 : gpu).observeCapturedLocalEnergy(particles[b], *op, b, hamiltonians[b].getLocalPotential());
+    const auto cpu_kinetic = dynamic_cast<PsiFormerComplexWF&>(components[b]).observeCoulombEnergy(*cp[b], 0).kinetic;
+    close(observed.nonlocal, nonlocal_energy[b], 3e-9);
+    close(observed.local_energy, cpu_kinetic + nonlocal_energy[b], 3e-9);
+    close(observed.local_energy.real(), actual.local_energies[b], 3e-9);
+    CHECK(observed.reported_real_potential == hamiltonians[b].getLocalPotential());
+    CHECK(observed.grid_fingerprint == actual.grid_fingerprint); CHECK(observed.parameter_version == 0);
+  }
+  CHECK(std::abs(nonlocal_energy[0].imag()) + std::abs(nonlocal_energy[1].imag()) > 1e-9);
+  auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(components, cpu_particles, 19, 23, 7,
+      cpu.streamingDerivativeRequiredBytes(cp.size()));
+  auto score = channel; score.product = DerivativeProduct::SCORE_VJP; score.local_energy_term_mask = 0;
+  score.coefficients.values = {folded.data(), folded.size()};
+  for (auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    std::fill(folded.begin(), folded.end(), C{});
+    for (std::size_t q = 0; q < grid.size(); ++q)
+    {
+      folded[q + 2] = coefficients[grid[q].sample] * (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(weights[q]) : weights[q]);
+      folded[grid[q].sample] -= folded[q + 2];
+    }
+    ComplexStreamingSink expected, output;
+    oracle->applyVJPs({&score, 1}, adjoint, expected); op->applyVJPs({&channel, 1}, adjoint, output);
+    for (std::size_t i = 0; i < direction.size(); ++i) close(output.values[0][i], expected.values[0][i], 3e-9);
+    ComplexSampleSink jvp;
+    op->applyLocalEnergyJVP({schema, 0, {direction.data(), direction.size()}}, channel.local_energy_term_mask, jvp);
+    C lhs{}, rhs{};
+    for (std::size_t b = 0; b < 2; ++b)
+      lhs += (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(coefficients[b]) : coefficients[b]) * jvp.values[b];
+    for (std::size_t i = 0; i < direction.size(); ++i)
+      rhs += (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(output.values[0][i]) : output.values[0][i]) * direction[i];
+    close(lhs, rhs, 3e-9);
+  }
+  CHECK(gpu.snapshotParameters().values == accepted.values);
+  const int mass_attribute = p.getSpeciesSet().addAttribute("mass");
+  p.getSpeciesSet()(mass_attribute, 0) = 2; p.resetGroups();
+  CHECK_THROWS(gpu.observeCapturedLocalEnergy(p, *op, 0, ham.getLocalPotential()));
+  p.getSpeciesSet()(mass_attribute, 0) = 1; p.resetGroups();
+  CHECK_THROWS(gpu.observeCapturedLocalEnergy(p1, *op, 1, ham1->getLocalPotential()));
+  const auto budget = gpu.gpuParameterPublicationRequirements();
+  gpu.publishBudgetedGpuParameters(accepted, 0, budget.device_bytes, budget.host_bytes);
+  CHECK_THROWS(gpu.observeCapturedLocalEnergy(p, *op, 0, ham.getLocalPotential()));
+  std::printf("COMPLEX_ACTUAL_ECP PASS actual_traversal=1 complex_energy=1 real_reporting=1 CPU_allP=1 duality=1 cap_abort_stale=1\n");
 }
 #endif
 } // namespace qmcplusplus
