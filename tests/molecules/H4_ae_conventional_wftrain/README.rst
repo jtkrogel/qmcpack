@@ -75,7 +75,7 @@ raw nonsymmetric ALM pencil has eigenvalues 2.662880510452576 +/-
 1.503921983474190 i. ALM must refuse with ``untrusted_root`` before any history
 row, HDF checkpoint/model output or publication. This correct refusal is not an
 ALM convergence positive; seeds, controls and tolerances are not tuned to force
-a real root. Mixed active CI/J2 remains rejected. This is a real CPU,
+a real root. Mixed active CI/J2 LM/ALM remains rejected. This is a real CPU,
 all-electron fixed-orbital profile, not ECP, orbital or GPU qualification.
 
 Pure-CSF PII/minPII regression
@@ -90,7 +90,7 @@ actual private wavefunction ratios and every fixed expansion term.
 The native regression passed on full built source ``27a46961f`` (conventional
 guard ``f2544a843``): both methods commit two
 32-sample updates, preserve CSF0/expansion/SPO/J2, and pass exact exported-model
-inference and full/split model/state/sampler/scientific history. Mixed CSF/J2
+inference and full/split model/state/sampler/scientific history. Mixed CSF/J2 LM
 is explicitly rejected by this profile. There is no mixed-coordinate, orbital,
 ECP, conventional GPU or convergence-quality claim.
 
@@ -105,7 +105,23 @@ log-wavefunction/kinetic directional derivatives and quadratic convergence.
 
 Native full source ``afe1d724d6ab704994157d8a729fd8d6bf5f650a`` passed two
 committed 32-sample updates per method, fixed C0/SPO, exact exported inference
-and full/split model/state/sampler/scientific history. Mixed LM and CSF/J2
-are explicitly rejected. Only real CPU all-electron fixed-orbital DETS plus
+and full/split model/state/sampler/scientific history. Mixed LM remains
+explicitly rejected; mixed CSF/J2 is separately qualified below. Only real CPU
+all-electron fixed-orbital DETS plus
 TwoBodyJastrow is qualified here; J1/J3, orbital and ECP extensions are not
 implied. No convergence-quality or timing claim is made.
+
+Nontrivial mixed CSF/J2 PII/minPII regression
+-------------------------------------------
+
+``--csf-j2-pii`` retains the same P9 layout using two nontrivial CSFs, each with
+two fixed determinant terms, and active J2. The shared physical oracle checks
+both dense solves, all score/local-energy finite differences, joint directional
+convergence, true frozen CSF0 and expanded reference terms, and source isolation.
+
+Native full source ``0acbc6b456dde9614b6a6b1b25761d2f9b51b6bc`` passed both
+methods' two 32-sample committed updates, fixed CSF0/SPO/expansion and exact
+exported inference/full-split restart. Mixed CSF/J2 LM remains rejected.
+The component whitelist is still only fixed-orbital MSD plus TwoBodyJastrow,
+real CPU and all-electron. No mixed LM/ALM, orbital, ECP or conventional GPU
+qualification follows from this result.
