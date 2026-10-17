@@ -262,7 +262,11 @@ def main():
     md_ecp = (fixture_tree.find("wavefunction/determinantset/multideterminant") is not None and
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
     csf_ecp = md_ecp and args.ci_representation == "csf"
-    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp else None
+    j3_ecp = (fixture_tree.find("wavefunction/jastrow[@type='eeI']") is not None and
+              fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
+    if j3_ecp:
+        assert not md_ecp and fixture_tree.find(".//rotated_sposet") is None
+    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp or j3_ecp else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -478,6 +482,14 @@ def main():
                 group = handle["conventional_wavefunction"]
                 parameters = np.asarray(group["parameters"][()]).reshape(-1)
                 assert parameters.size == len(initial) and np.isfinite(parameters).all(), model
+                if j3_ecp:
+                    assert parameters.size == 12, model
+                    names = [text_value(name) for name in np.asarray(group["variable_names"][()]).reshape(-1)]
+                    indices = np.asarray(group["active_indices"][()]).reshape(-1)
+                    j3_indices = [int(index) for name, index in zip(names, indices) if name.startswith("j3Be_")]
+                    assert len(j3_indices) == 8 and min(j3_indices) >= 0, model
+                    if row["committed"] == "1":
+                        assert not np.array_equal(parameters[j3_indices], previous[j3_indices]), (model, "J3 did not update")
                 if linear_nodes:
                     assert parameters.size == len(initial)
                     if pure_ci:
@@ -529,6 +541,13 @@ def main():
                 if isinstance(serialized, bytes):
                     serialized = serialized.decode()
                 exported = ET.fromstring(serialized)
+                if j3_ecp:
+                    original_j3 = list(tree.find("wavefunction/jastrow[@type='eeI']").iter())
+                    retained_j3 = list(exported.find("jastrow[@type='eeI']").iter())
+                    assert len(original_j3) == len(retained_j3)
+                    for original, retained in zip(original_j3, retained_j3):
+                        assert (original.tag, original.attrib, (original.text or "").split()) == \
+                               (retained.tag, retained.attrib, (retained.text or "").split()), model
                 coefficients = exported.find(".//sposet/coefficient")
                 if fixed is None:
                     assert periodic_profile and coefficients is None, model
@@ -939,7 +958,7 @@ def main():
                       "krylov_relative_tolerance": "1e-8", "maximum_damping_attempts": "1"}
             for name, value in limits.items():
                 ET.SubElement(tree.find("qmc/training"), "parameter", name=name).text = value
-    if not args.complex_periodic_heg and not csf_ecp:
+    if not args.complex_periodic_heg and not csf_ecp and not j3_ecp:
         run(args.companion_optimizer, optimizer=args.companion_optimizer, mutate=companion_controls)
     for lhs, rhs in zip(history(adam), history(off)):
         for name in ("iteration", "samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
@@ -958,7 +977,7 @@ def main():
         assert lhs.keys() == rhs.keys()
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"restart model: {name}")
-        if md_ecp or args.complex_periodic_heg:
+        if md_ecp or j3_ecp or args.complex_periodic_heg:
             final_bundle = final.parent / (final.name[:-len(".parameters.h5")] + ".checkpoint")
             restored_bundle = restored.parent / (restored.name[:-len(".parameters.h5")] + ".checkpoint")
             for pattern in ("*.state.h5", "*.rank_*.h5"):
@@ -1007,7 +1026,8 @@ def main():
                 mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)))
             assert source.read_bytes() == original
     methods = ("CPU complex Gamma HEG14 Adam" if args.complex_periodic_heg else
-               "CPU CSF/J2 ordinary-locality ECP Adam" if csf_ecp else f"Adam/{args.companion_optimizer}")
+               "CPU CSF/J2 ordinary-locality ECP Adam" if csf_ecp else
+               "CPU fixed-Slater J2/J3 ordinary-locality ECP Adam" if j3_ecp else f"Adam/{args.companion_optimizer}")
     completed = f"{methods} conventional updates, interval inference, immutable model reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"
