@@ -2637,7 +2637,19 @@ protected:
       if (resident_products)
       {
         auto& session = *shared_scratch_->device_products;
-        session.finishScoreContraction(parameter_version_);
+        // Append physical ECP to the tagged ENERGY sum before its single finite admission.
+        // Native DEVICE-authority ECP eligibility remains independently closed in the driver.
+        try
+        {
+          if (terminal && needs_ecp)
+            accumulateECPReplayVJPs(channels, true);
+          session.finishScoreContraction(parameter_version_);
+        }
+        catch (...)
+        {
+          session.abortScoreContraction();
+          throw;
+        }
         if (terminal)
         {
           terminal(contraction_generation);
@@ -3233,7 +3245,7 @@ private:
   /// Add replayed ECP VJPs when the combined owner advertises ECP term coverage.
   void accumulateECPReplayVJPs(
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel>
-          channels) const
+          channels, bool append_energy = false) const
   {
     if (!ecp_replay_)
       throw std::logic_error("PsiFormer ECP VJP replay is not bound");
@@ -3250,6 +3262,8 @@ private:
           active[count++] = channel;
       if (count == 0 || sample_count_ == 0)
         return;
+      if (append_energy && (count != 1 || active[0] != 0 || channels.size() != 3))
+        throw std::invalid_argument("Resident ECP append requires the first ordered ENERGY C3 channel");
       auto& session = *shared_scratch_->device_products;
       const auto transfer_before = session.transferSnapshot();
       const auto before_tiles = session.weightedScoreTiles();
@@ -3267,11 +3281,15 @@ private:
         throw std::logic_error("GPU ECP virtual tile exceeds its cold HOST preparation");
       try
       {
-        session.beginScoreContraction(count, parameter_version_);
+        if (!append_energy)
+          session.beginScoreContraction(count, parameter_version_);
         std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
+        const std::array<wftrain::DerivativeValue, 3> energy_slot{{{1, 0}, {}, {}}};
+        const auto contraction_count = append_energy ? 3 : count;
         const auto flush = [&]() {
           session.accumulateWeightedScoreTile(shared_scratch_->device_ecp_positions.data(),
-              shared_scratch_->device_ecp_weights.data(), tile_count, parameter_version_);
+              shared_scratch_->device_ecp_weights.data(), tile_count, parameter_version_,
+              append_energy ? energy_slot.data() : nullptr, append_energy ? 3 : 1);
           last_tile_count = tile_count;
           tile_count = 0;
         };
@@ -3299,7 +3317,7 @@ private:
           {
             setReplayPointPositions(point);
             session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
-                                               count, parameter_version_);
+                                               contraction_count, parameter_version_);
           }
         }
         if (tile_count)
@@ -3310,7 +3328,17 @@ private:
           for (std::size_t slot = 0; slot < count; ++slot)
             coefficients[slot] = -channels[active[slot]].coefficients.values[sample] * replay_weight_sums_[sample];
           session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
-                                             count, parameter_version_);
+                                             contraction_count, parameter_version_);
+        }
+        if (append_energy)
+        {
+          app_log() << "  Resident ENERGY accepted-grid ECP appended: points=" << ecp_replay_->points().size()
+                    << ", prepared_score_capacity=" << capacity << ", weighted_virtual_tiles="
+                    << session.weightedScoreTiles() - before_tiles << ", weighted_virtual_configurations="
+                    << session.weightedScoreConfigurations() - before_configurations
+                    << ", last_virtual_tile_count=" << last_tile_count
+                    << ", final_parameter_download_bytes=0; complete C3 finite admission pending" << std::endl;
+          return; // The outer ENERGY transaction owns finish, consumption and revocation.
         }
         session.finishScoreContraction(parameter_version_);
         auto& output = shared_scratch_->device_ecp_chunk;
@@ -3351,6 +3379,8 @@ private:
       return;
     }
 #endif
+    if (append_energy)
+      throw std::invalid_argument("Resident ECP append requires real GPU products");
     for (const auto& point : ecp_replay_->points())
     {
       setReplayPointPositions(point);
@@ -12697,7 +12727,9 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeRes
       source->model_state_.get() != model_state_.get() || derivative.sampleCount() == 0 ||
       source->shared_scratch_ != model_state_->resident_energy_scratch || channels.size() != 3 ||
       channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
-      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      (channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) &&
+       channels[0].local_energy_term_mask != (wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+                                             wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP))) ||
       channels[1].product != wftrain::DerivativeProduct::SCORE_VJP ||
       channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
     throw std::invalid_argument("DEVICE authority requires this provider's prepared T/EO/O batch");

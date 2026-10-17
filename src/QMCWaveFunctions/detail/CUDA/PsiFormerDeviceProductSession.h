@@ -311,12 +311,15 @@ public:
   }
 
   /// One batched forward/reverse contracts real sample weights directly to P.
-  /// The outer C1 transaction spans all tiles and admits the final sum together.
+  /// The outer transaction admits all tiles together; optional coefficients route
+  /// the weighted response into an already active multi-channel ENERGY sum.
   void accumulateWeightedScoreTile(const double* positions, const double* weights,
-                                    std::size_t count, std::size_t version)
+                                    std::size_t count, std::size_t version,
+                                    const std::complex<double>* channels = nullptr,
+                                    std::size_t channel_count = 1)
   {
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
-      if (!weights || !score_contraction_)
+      if (!weights || !score_contraction_ || (!channels && channel_count != 1))
         throw std::invalid_argument("Weighted score tile requires weights and a prepared contraction");
       tile_weights_.resize(count);
       std::copy_n(weights, count, tile_weights_.begin());
@@ -325,7 +328,7 @@ public:
       values_.evaluate(positions_);
       const double* response = score_.reverse(values_, tile_weights_);
       const std::complex<double> unit(1, 0);
-      score_contraction_->accumulate(response, &unit, 1);
+      score_contraction_->accumulate(response, channels ? channels : &unit, channel_count);
     }, count);
     ++weighted_score_tiles_;
     weighted_score_configurations_ += count;

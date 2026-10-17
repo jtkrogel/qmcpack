@@ -1644,6 +1644,86 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   empty->applyVJPs({empty_channels.data(), empty_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, zero);
   for (const auto& channel : zero.results())
     for (const auto value : channel) checkClose(value, {});
+  // Numerical foundation only: native ECP DEVICE-authority admission remains closed.
+  {
+    ScopedEnvironmentVariable authority_flag("PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY", "1");
+    auto authority_resolution = resolution;
+    authority_resolution.validated_operations = ps::allPsiFormerAcceleratorOperations();
+    PsiFormerWF authority("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, authority_resolution);
+    const auto norm_bytes = authority.prepareResidentEnergyAdam(48 * p + 4096);
+    const auto allowance = authority.prepareResidentDeviceAuthority();
+    std::vector<ps::device::AdamBlock> blocks;
+    for (const auto& block : authority.parameterSchema().blocks())
+      blocks.push_back({block.offset, block.count, block.trainable ? .0017 : 0, block.trainable ? 1u : 0u});
+    auto adam = std::shared_ptr<ps::device::PreparedDeviceAdam>(ps::device::PreparedDeviceAdam::prepare(
+        p, blocks, ps::device::estimateAdamBytes(p, blocks.size())));
+    std::vector<double> zero_moment(p), first_moment(p), second_moment(p);
+    adam->seed(zero_moment, zero_moment);
+    adam->prepareEnergyGradient(norm_bytes);
+    auto complete = capture(authority, 95, 5, true);
+    const auto complete_mask = ecp | wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+    const std::vector<DerivativeValue> one{{1, 0}}, eo{{-2.3, 0}};
+    const auto energy_channels = [&](const StreamingDerivativeOperator& op) {
+      return std::vector<VJPCoefficientChannel>{
+        {"T", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(op, one), complete_mask},
+        {"EO", DerivativeProduct::SCORE_VJP, coefficientsFor(op, eo)},
+        {"O", DerivativeProduct::SCORE_VJP, coefficientsFor(op, one)}};
+    };
+    auto expected_channels = energy_channels(*reference), actual_channels = energy_channels(*complete);
+    SelectedParameterSink expected(selected);
+    reference->applyVJPs({expected_channels.data(), 3}, wftrain::DerivativeAdjoint::TRANSPOSE, expected);
+    auto expected_parameters = cpu.snapshotParameters();
+    double expected_norm = 0;
+    for (const auto& block : authority.parameterSchema().blocks())
+      for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+      {
+        const double gradient = 2 * (expected.results()[0][i].real() + expected.results()[1][i].real()
+            + 2.3 * expected.results()[2][i].real());
+        expected_norm = std::hypot(expected_norm, gradient);
+        if (!block.trainable) continue;
+        first_moment[i] = .1 * gradient;
+        second_moment[i] = .001 * gradient * gradient;
+        expected_parameters.values[i] -= .0017 * gradient / (std::abs(gradient) + 1e-8);
+      }
+    const auto propose = [&] {
+      return authority.consumeResidentEnergyAdamDevice(*complete, {actual_channels.data(), 3}, adam,
+          1, -2.3, .9, .999, .1, .001, 1e-8, allowance.snapshot_device_bytes);
+    };
+    { auto discarded = propose(); } // Prime the existing weighted/tile and norm workspaces.
+    const auto warm_before = metrics.snapshot();
+    auto proposal = propose();
+    const auto warm_after = metrics.snapshot();
+    CHECK(warm_after.live_bytes - warm_before.live_bytes == 8 * p);
+    CHECK(warm_after.allocation_calls - warm_before.allocation_calls == 1); // Owning candidate only.
+    CHECK(warm_after.downloaded_bytes - warm_before.downloaded_bytes < 8 * p);
+    CHECK(proposal->gradientNorm() == Catch::Approx(expected_norm).epsilon(2e-8).margin(2e-8));
+    { auto discarded = authority.prepareResidentDeviceAdamPublication(std::move(proposal), 0, 0); }
+    // A genuinely singular zero-weight point aborts the shared C3, then the good grid retries.
+    auto bad = capture(authority, 96, 5, true, false, true);
+    auto bad_channels = energy_channels(*bad);
+    CHECK_THROWS(authority.consumeResidentEnergyAdamDevice(*bad, {bad_channels.data(), 3}, adam,
+        1, -2.3, .9, .999, .1, .001, 1e-8, allowance.snapshot_device_bytes));
+    CHECK(authority.parameterVersion() == 0);
+    std::vector<double> rejected_first(p), rejected_second(p);
+    adam->download(rejected_first, rejected_second);
+    CHECK(rejected_first == zero_moment);
+    CHECK(rejected_second == zero_moment);
+    proposal = propose();
+    auto publication = authority.prepareResidentDeviceAdamPublication(std::move(proposal), 0, 0);
+    CHECK(publication->commit() == 1);
+    publication.reset();
+    const auto actual_parameters = authority.snapshotParameters(); // Explicit cold inspection.
+    for (std::size_t i = 0; i < p; ++i)
+      CHECK(actual_parameters.values[i] == Catch::Approx(expected_parameters.values[i]).epsilon(2e-8).margin(2e-10));
+    std::vector<double> actual_first(p), actual_second(p);
+    adam->download(actual_first, actual_second);
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      CHECK(actual_first[i] == Catch::Approx(first_moment[i]).epsilon(2e-8).margin(2e-8));
+      CHECK(actual_second[i] == Catch::Approx(second_moment[i]).epsilon(2e-8).margin(2e-8));
+    }
+    CHECK_THROWS(propose()); // Old accepted grid/source cannot survive publication.
+  }
   // Independent finite difference of complete ratios on the exact same frozen grid.
   const auto base = cpu.snapshotParameters();
   const auto energy = [&](double displacement) {
