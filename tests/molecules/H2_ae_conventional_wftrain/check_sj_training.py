@@ -1357,7 +1357,8 @@ def main():
                 tree.find(".//simulationcell/parameter[@name='LR_dim_cutoff']").text = "32"
             run("reject_changed_spline_cutoff_import", vmc=True, parameter_file=exported, mutate=tighten_spline_cutoff,
                 reject=("Conventional model export identity mismatch",
-                        "Conventional artifact has an invalid or oversized required field: model_identity"))
+                        "Conventional artifact has an invalid or oversized required field: model_identity",
+                        "Conventional artifact has an invalid or oversized required field: physical_definition"))
             run("reject_changed_spline_cutoff_restart", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
                 mutate=tighten_spline_cutoff, reject="Training checkpoint stage identity or configuration mismatch")
         pseudos = ET.parse(fixture).findall("hamiltonian/pairpot/pseudo")
