@@ -327,9 +327,9 @@ def main():
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
             assert float(expansion[0].get("coeff")) != 0
-            assert (md_ecp and args.mdj_pii) or float(expansion[1].get("coeff")) == 0
+            assert (md_ecp and (args.mdj_pii or args.ci_lm)) or float(expansion[1].get("coeff")) == 0
             if md_ecp:
-                assert args.mdj_pii, "the bounded ECP coefficient-family native profile is DETS/J2"
+                assert args.mdj_pii or args.ci_lm, "bounded ECP family profiles are DETS/J2 PII or pure-DETS LM/ALM"
             assert tree.find(".//rotated_sposet") is None
             if pure_ci:
                 for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
@@ -577,7 +577,7 @@ def main():
                 if pure_ci:
                     original_j2 = tree.findall("wavefunction/jastrow/correlation/coefficients")
                     retained_j2 = exported.findall("jastrow/correlation/coefficients")
-                    assert len(original_j2) == len(retained_j2) == 2
+                    assert len(original_j2) == len(retained_j2) == (1 if md_ecp else 2)
                     for original, retained in zip(original_j2, retained_j2):
                         assert retained.attrib == original.attrib and retained.text.split() == original.text.split(), model
         if len(orbital_history) == 2:
@@ -683,7 +683,9 @@ def main():
                 reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
             methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
-            print(f"PASS: {representation} {methods}, fixed reference/SPO/J2/expansion, exact positive exported inference/restart; mixed CI/J2 rejected")
+            physics = "ordinary-locality ECP" if md_ecp else "all-electron"
+            print(f"PASS: {representation} {physics} {methods}, fixed reference/SPO/J2/expansion, "
+                  "exact positive exported inference/restart; mixed CI/J2 rejected")
         elif args.ci_pii or args.csf_pii:
             if args.csf_pii:
                 def mixed_csf_j2(tree):
