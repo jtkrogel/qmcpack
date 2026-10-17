@@ -261,6 +261,7 @@ def main():
     fixture_tree = ET.parse(fixture)
     md_ecp = (fixture_tree.find("wavefunction/determinantset/multideterminant") is not None and
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
+    csf_ecp = md_ecp and args.ci_representation == "csf"
     deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp else None
     external_asset = None
     if args.external_lcao:
@@ -486,6 +487,10 @@ def main():
                     assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if csf_ecp:
+                        assert parameters.size == 5 and len(linear_nodes) == 2, model
+                        assert parameters[0] != previous[0], (model, "CSF coordinate did not update")
+                        assert not np.array_equal(parameters[1:], previous[1:]), (model, "J2 did not update")
                 elif restart is None:
                     np.testing.assert_array_equal(parameters, previous, err_msg=f"rejected model: {model}")
                 previous = parameters
@@ -539,10 +544,10 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
-                    if csf_ci:
+                    if csf_ci or csf_ecp:
                         assert exported_list.get("type") == "CSF"
                         for original, retained in zip(linear_nodes, list(exported_list)):
-                            assert len(original) == len(retained) == 2
+                            assert len(original) == len(retained) == (2 if csf_ci else 1)
                             assert [det.attrib for det in original] == [det.attrib for det in retained], model
                 if pure_ci:
                     original_j2 = tree.findall("wavefunction/jastrow/correlation/coefficients")
@@ -922,7 +927,7 @@ def main():
                       "krylov_relative_tolerance": "1e-8", "maximum_damping_attempts": "1"}
             for name, value in limits.items():
                 ET.SubElement(tree.find("qmc/training"), "parameter", name=name).text = value
-    if not args.complex_periodic_heg:
+    if not args.complex_periodic_heg and not csf_ecp:
         run(args.companion_optimizer, optimizer=args.companion_optimizer, mutate=companion_controls)
     for lhs, rhs in zip(history(adam), history(off)):
         for name in ("iteration", "samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
@@ -989,7 +994,8 @@ def main():
                 reject="Training checkpoint stage identity or configuration mismatch",
                 mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)))
             assert source.read_bytes() == original
-    methods = "CPU complex Gamma HEG14 Adam" if args.complex_periodic_heg else f"Adam/{args.companion_optimizer}"
+    methods = ("CPU complex Gamma HEG14 Adam" if args.complex_periodic_heg else
+               "CPU CSF/J2 ordinary-locality ECP Adam" if csf_ecp else f"Adam/{args.companion_optimizer}")
     completed = f"{methods} conventional updates, interval inference, immutable model reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"
