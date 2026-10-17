@@ -145,6 +145,7 @@ def compare_values(first, second):
 def execute(manifest, manifest_path, identifier):
     validate_manifest(manifest)
     assert manifest["status"] == "ready_to_execute", "Root has not authorized this immutable manifest"
+    assert identifier in manifest["approved_case_ids"], "Root has not approved this case launch"
     root = Path(manifest["runtime_root"]).resolve()
     assert manifest_path.parent.resolve() == root
     allocation = str(manifest["allocation_id"])

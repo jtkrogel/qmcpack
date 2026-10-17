@@ -54,7 +54,9 @@ libraries and vendor storage remain visible in RSS/cgroup evidence.
 The controller is inert without ``--execute-case ID`` and root-approved manifest
 status ``ready_to_execute``. Root must provide immutable benchmark/application
 source and SHA256 fields, all model paths/hashes, allocation/node verification,
-and the exact runtime root. Generated files are prepared and hashed BEFORE that
+the exact runtime root, and an explicit ``approved_case_ids`` launch allowlist.
+The first approval can allow only one case while retaining the proposed sparse
+manifest. Generated files are prepared and hashed BEFORE that
 approval, not silently regenerated in a measured case. Its one-case invocation
 uses only an existing allocation, checks a 14 GiB step-user cgroup fence before
 launch, stops at 80 percent charged usage or 90 seconds, and prevents repeats.
