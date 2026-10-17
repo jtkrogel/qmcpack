@@ -930,28 +930,43 @@ struct PsiFormerComplexWF::Impl
     std::vector<WaveFunctionComponent::EvaluationStamp> stamp_records;
     wftrain::NonLocalECPReplayStorageDiagnostics admitted_storage;
 
+    /// Pin the captured family and copy its accepted reference coordinates.
     explicit GpuNonLocalReplay(const GpuDerivativeStream& s)
         : state(s.lane->state), version(s.version), ordinal(s.ordinal), offset(s.offset), samples(s.samples),
           reference_positions(s.positions) {}
 
+    /// Identify the structured provider that owns this immutable replay.
     std::string_view providerId() const noexcept override { return state->schema->providerId(); }
+    /// Reject binding against a different canonical parameter layout.
     std::string_view schemaFingerprint() const noexcept override { return state->schema->fingerprint(); }
+    /// Report the captured accepted parameter generation.
     std::size_t parameterVersion() const noexcept override { return version; }
+    /// Preserve the producer's batch identity.
     std::size_t batchOrdinal() const noexcept override { return ordinal; }
+    /// Preserve the producer's global sample origin.
     std::size_t sampleOffset() const noexcept override { return offset; }
+    /// Report the accepted reference population.
     std::size_t sampleCount() const noexcept override { return samples; }
+    /// Report the coordinate stride's electron extent.
     std::size_t electronCount() const noexcept override { return state->model.ne; }
+    /// Advertise only the nonlocal response captured by this record.
     std::uint32_t localEnergyTermMask() const noexcept override
     { return wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP); }
+    /// Identify the actual accepted quadrature traversal.
     std::uint64_t gridFingerprint() const noexcept override { return grid; }
+    /// Borrow the immutable accepted base coordinates.
     wftrain::DerivativeArrayView<const double> referencePositions() const noexcept override
     { return {reference_positions.data(), reference_positions.size()}; }
+    /// Borrow captured weighted virtual moves in traversal order.
     wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayPoint> points() const noexcept override
     { return {point_records.data(), point_records.size()}; }
+    /// Borrow the captured reference-to-point mapping.
     wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplaySegment> segments() const noexcept override
     { return {segment_records.data(), segment_records.size()}; }
+    /// Borrow complete traversal tile and stamp ranges.
     wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayTile> tiles() const noexcept override
     { return {tile_records.data(), tile_records.size()}; }
+    /// Borrow actual versioned VALUE evaluation provenance.
     wftrain::DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
     { return {stamp_records.data(), stamp_records.size()}; }
 
@@ -1030,6 +1045,7 @@ struct PsiFormerComplexWF::Impl
       return r.capture_host_bytes;
     }
 
+    /// Allocate only preadmitted capture capacities before the Hamiltonian traversal.
     GpuNonLocalCapture(const GpuDerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
         std::unique_lock<std::mutex>&& lease, std::size_t cap)
         : lane(s.lane), execution(std::move(lease)), record(std::make_unique<GpuNonLocalReplay>(s))
@@ -1064,6 +1080,7 @@ struct PsiFormerComplexWF::Impl
       }
     }
 
+    /// Reject unsupported or stale traversal metadata before consuming any grid data.
     void preflight(const wftrain::NonLocalECPDerivativeContext& c,
         wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
         const wftrain::ParameterReductionSink& sink) const override
@@ -1087,6 +1104,7 @@ struct PsiFormerComplexWF::Impl
       requireCurrent();
     }
 
+    /// Admit the exact grid extent and enter active capture without allocating.
     void begin(const wftrain::NonLocalECPDerivativeContext& c,
         wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
         wftrain::ParameterReductionSink& sink) override
@@ -1162,15 +1180,18 @@ struct PsiFormerComplexWF::Impl
       catch (...) { abort(); throw; }
     }
 
+    /// Poison incomplete capture and release its execution lease.
     void abort() noexcept override
     { state = State::POISONED; if (execution.owns_lock()) execution.unlock(); }
 
+    /// Transfer a completed immutable record exactly once.
     std::unique_ptr<wftrain::NonLocalECPJVPReplay> releaseJVPReplay() override
     {
       if (state != State::COMPLETE || !record) throw std::logic_error("Complex ECP replay is incomplete/already released");
       return std::move(record);
     }
 
+    /// Report retained record and borrowed-target pointer capacities honestly.
     wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
     {
       wftrain::StreamingDerivativeStorageDiagnostics d;
@@ -2237,13 +2258,14 @@ double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
       {target.data(), target.size(), gradient.data(), gradient.size()}).loss;
 }
 
-/// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
+/// Report immutable system metadata without exposing a borrowed string or model.
 bool PsiFormerComplexWF::isPseudopotentialSystem() const
 {
   std::shared_lock read(impl_->state->mutex);
   return impl_->state->system_kind == "pseudopotential";
 }
 
+/// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {
   std::shared_lock read(impl_->state->mutex);
