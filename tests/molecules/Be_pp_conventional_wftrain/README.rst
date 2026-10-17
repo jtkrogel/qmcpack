@@ -85,8 +85,9 @@ Both energy VP ratios and CI derivatives use the same accepted-reference
 bordered determinant algebra. Only private evaluators and training-owned walker
 clones enable this path; ordinary VMC/pool prototypes retain their default mode.
 
-Accepted reference determinants must be invertible. The legacy VGL algorithm's
-zero derivative-reference inverse limitation is separately documented in task46;
-this qualification does not claim it fixed. CSF, orbital rotations, J3, complex,
+Accepted reference determinants must be invertible. A separate real CPU fixed-SPO
+full-VGL repair handles exact zero derivative-reference gradients/Laplacians;
+its dense-oracle gate and two-MPI native restart passed. Complex, optimized-SPO,
+spinor and offload derivative paths are unchanged. CSF, orbital rotations, J3, complex,
 offload and DLA are excluded from this fixed-DETS ECP profile. No timing or
 overall memory benchmark is claimed.
