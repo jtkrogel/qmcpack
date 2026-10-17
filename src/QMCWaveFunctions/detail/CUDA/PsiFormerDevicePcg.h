@@ -585,6 +585,8 @@ private:
     metric_->weight_ = total;
     metric_->image_ = session_.image_; // Same Session's qualified validateSuccessor proves schema/layout stability.
     binding_version_ = version;
+    // This source becomes consumed only on HOST completion or accepted DEVICE publication.
+    consumed_ = false;
   }
 
   /// Resolve only fixed canonical slots; no host view ever receives this pointer.
