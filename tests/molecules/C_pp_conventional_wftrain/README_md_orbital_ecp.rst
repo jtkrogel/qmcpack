@@ -5,7 +5,7 @@ This tiny real CPU, open-boundary fixture composes two distinct inline
 four-MO rotation owners, fixed two-DETS coefficients and four J2 variables
 with the tracked carbon pseudopotential. The actual active layout is P16:
 six local orbital pairs per spin and four J2 coefficients. It does not
-qualify other CI layouts, CSF, external orbitals, complex/GPU/periodic models,
+qualify other CI/CSF layouts, external orbitals, complex/GPU/periodic models,
 arbitrary determinant sizes, DLA or a general nodal admission policy.
 
 The shared ``check_sj_training.py --md-orbital-ecp`` route prepares one
@@ -50,5 +50,11 @@ The optional ``--csf-orbital-ecp`` mode derives the exact signed-child CSF
 recipe: frozen outer CSF0=0.6 with HF child weight 0.8 (expanded C0=0.48),
 active outer CI1=0.1 with ordered opposite-sign sqrt(0.5) cross children,
 and both six-pair frames/J2 (P17). It preserves immutable child attributes
-and original gauge. Its native qualification and registration are pending;
-the separate independent physical gate passed 7,133 assertions.
+and original gauge. Native round 100 passed on its first attempt with app
+source ``a4fcaead3`` and SHA256
+``51819c248cf6c3151d06ed03e5daf782b37bf89fa7c4df05a2ebe3ecd0962f28``;
+the newer helper-only source is ``7dcbd12fa`` (checker SHA256
+``3d2c09476dae9689bde8910f7e0ba1dca50e6b958b52062da9888b47cea28153``).
+One guarded exact-recipe CSF mode is registered with unchanged strict
+model-reuse/restart checks and no ULP exception. The separate independent
+physical gate passed 7,133 assertions; no other CSF layout is qualified here.
