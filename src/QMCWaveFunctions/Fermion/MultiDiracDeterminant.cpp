@@ -205,7 +205,8 @@ void MultiDiracDeterminant::evaluateForWalkerMove(const ParticleSet& P, bool fro
   ///Pinning ratios_to_ref_ to the device.
 
 #ifndef QMC_COMPLEX
-  const bool accepted_row_fallback = !is_spinor_ && !Phi->isOMPoffload() && !Phi->isOptimizable() &&
+  const bool accepted_row_fallback = !is_spinor_ && !Phi->isOMPoffload() &&
+      (!Phi->isOptimizable() || private_accepted_reference_orbital_) &&
       P.getCoordinates().getKind() == DynamicCoordinateKind::DC_POS;
 #else
   const bool accepted_row_fallback = false;
@@ -952,7 +953,10 @@ MultiDiracDeterminant::MultiDiracDeterminant(const MultiDiracDeterminant& s)
       uniquePairs(s.uniquePairs),
       DetSigns(s.DetSigns),
       ndets_per_excitation_level_(s.ndets_per_excitation_level_)
-{ resize(); }
+{
+  private_accepted_reference_orbital_ = s.private_accepted_reference_orbital_;
+  resize();
+}
 
 std::unique_ptr<SPOSet> MultiDiracDeterminant::clonePhi() const { return Phi->makeClone(); }
 

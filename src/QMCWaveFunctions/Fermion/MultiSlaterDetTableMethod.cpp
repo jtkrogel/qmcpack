@@ -115,6 +115,7 @@ std::unique_ptr<WaveFunctionComponent> MultiSlaterDetTableMethod::makeClone(Part
 
   clone->CI_Optimizable = CI_Optimizable;
   clone->accepted_reference_virtual_mode_ = accepted_reference_virtual_mode_;
+  clone->accepted_reference_orbital_virtual_mode_ = accepted_reference_orbital_virtual_mode_;
   clone->C2node         = C2node;
   clone->C              = C;
   clone->myVars         = myVars;
@@ -833,7 +834,10 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::acceptedReferenc
   if (psi_ratio_to_ref_det_ == PsiValue{} || !finiteAcceptedRatio(static_cast<ValueType>(psi_ratio_to_ref_det_)))
     throw std::domain_error("Private accepted-reference VP has a zero or nonfinite accepted total");
   const int moved = getDetID(refPtcl);
-  Dets[moved]->evaluateDetsToAcceptedReference(P, iat, refPtcl, accepted_reference_virtual_terms_);
+  if (accepted_reference_orbital_virtual_mode_)
+    Dets[moved]->evaluatePrivateOrbitalDetsToAcceptedReference(P, iat, refPtcl, accepted_reference_virtual_terms_);
+  else
+    Dets[moved]->evaluateDetsToAcceptedReference(P, iat, refPtcl, accepted_reference_virtual_terms_);
   PsiValue numerator{};
   for (std::size_t term = 0; term < C->size(); ++term)
   {
@@ -886,6 +890,84 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
     if (!finiteAcceptedRatio(value) || !finiteAcceptedRatio(derivatives[index] + value))
       throw std::domain_error("Private physical CI ratio derivative is nonfinite");
     derivatives[index] += value;
+  }
+  return ratio;
+}
+
+void MultiSlaterDetTableMethod::enableAcceptedReferenceOrbitalVirtualRatios()
+{
+  if (csf_data_ || CI_Optimizable || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 ||
+      Dets[0]->getNumPtcls() != Dets[1]->getNumPtcls())
+    throw std::invalid_argument("Private orbital ECP rows require fixed-CI DETS and equal multiple-occupied spins");
+  validatePreparedRotatedCoefficientState(*this);
+  for (const auto& det : Dets)
+  {
+    const auto& rotated = dynamic_cast<const RotatedSPOs&>(*det->getPhi());
+    const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*rotated.Phi_);
+    if (det->isSpinor() || lcao.fileImageIdentity())
+      throw std::invalid_argument("Private orbital ECP rows require scalar inline LCAO owners");
+  }
+  for (auto& det : Dets) det->enablePrivateAcceptedReferenceOrbitalRows();
+  accepted_reference_virtual_mode_ = accepted_reference_orbital_virtual_mode_ = true;
+}
+
+void MultiSlaterDetTableMethod::validateAcceptedOrbitalDerivativeState() const
+{
+  if (!accepted_reference_orbital_virtual_mode_ || psi_ratio_to_ref_det_ == PsiValue{} ||
+      !finiteAcceptedRatio(static_cast<ValueType>(psi_ratio_to_ref_det_)))
+    throw std::domain_error("Private orbital ECP rows require a finite nonzero accepted total");
+  // Legacy accepted parameter derivatives invert each excitation Y6. Reject its
+  // exact zeros, never near-zero values; virtual determinant zeros remain valid.
+  for (const auto& det : Dets)
+  {
+    const auto log = det->getLogValueRefDet();
+    if (!finiteAcceptedRatio(ValueType(log.real())) || !finiteAcceptedRatio(ValueType(log.imag())))
+      throw std::domain_error("Private orbital ECP rows require finite accepted references");
+    for (const auto value : det->getRatiosToRefDet())
+      if (value == ValueType{} || !finiteAcceptedRatio(value))
+        throw std::domain_error("Private orbital ECP accepted excitation matrix is singular or nonfinite");
+  }
+}
+
+MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAcceptedReferenceOrbitalRatioDerivatives(
+    const ParticleSet& P, int iat, int refPtcl, const OptVariables& active, ParameterDerivativeView derivatives)
+{
+  validateAcceptedOrbitalDerivativeState();
+  if (derivatives.size < active.size_of_active() || (derivatives.size && !derivatives.data))
+    throw std::invalid_argument("Private orbital ECP derivative row has incorrect size");
+  const auto ratio = acceptedReferenceVirtualRatio(P, iat, refPtcl);
+  const int moved = getDetID(refPtcl);
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    const auto& rotated = dynamic_cast<const RotatedSPOs&>(*Dets[spin]->getPhi());
+    const auto& variables = rotated.activeRotationVariables();
+    if (variables.size() != rotated.m_act_rot_inds_.size())
+      throw std::logic_error("Private orbital ECP registration differs from rotation pairs");
+    for (int variable = 0; variable < variables.size(); ++variable)
+    {
+      const int location = active.getLoc(variables.name(variable)), index = variables.where(variable);
+      if (location < 0 || active.where(location) != index ||
+          (index >= 0 && static_cast<std::size_t>(index) >= derivatives.size))
+        throw std::invalid_argument("Private orbital ECP row requires matching registered generator indices");
+      if (index < 0) continue;
+      const auto [p, q] = rotated.m_act_rot_inds_[variable];
+      const int reference = spin == moved ? refPtcl : Dets[spin]->getFirstIndex();
+      Dets[spin]->evaluatePrivateOrbitalGeneratorToAcceptedReference(P, spin == moved ? iat : reference,
+          reference, p, q, accepted_reference_orbital_work_, accepted_reference_orbital_old_, accepted_reference_orbital_new_);
+      PsiValue old_value{}, new_value{};
+      for (std::size_t term = 0; term < C->size(); ++term)
+      {
+        const auto own = (*C2node)[spin][term], other = (*C2node)[1 - spin][term];
+        const auto accepted_other = Dets[1 - spin]->getRatiosToRefDet()[other];
+        old_value += (*C)[term] * accepted_reference_orbital_old_[own] * accepted_other;
+        new_value += (*C)[term] * accepted_reference_orbital_new_[own] *
+            (spin == moved ? accepted_other : accepted_reference_virtual_terms_[other]);
+      }
+      const auto value = static_cast<ValueType>((new_value - ratio * old_value) / psi_ratio_to_ref_det_);
+      if (!finiteAcceptedRatio(value) || !finiteAcceptedRatio(derivatives[index] + value))
+        throw std::domain_error("Private orbital ECP physical ratio derivative is nonfinite");
+      derivatives[index] += value;
+    }
   }
   return ratio;
 }

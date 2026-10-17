@@ -18,6 +18,8 @@
  * @brief Implement build functions: Function bodies are too big to be in a header file
  */
 #include "QMCWaveFunctions/Fermion/MultiDiracDeterminant.h"
+#include "QMCWaveFunctions/RotatedSPOs.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "Numerics/MatrixOperators.h"
 #include "OMPTarget/ompBLAS.hpp"
 #include "OMPTarget/ompReductionComplex.hpp"
@@ -524,10 +526,16 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
       psiMinv.rows() != NumPtcls || psiMinv.cols() != NumPtcls ||
       psiM.rows() != NumPtcls || psiM.cols() != NumOrbitals)
     throw std::invalid_argument("Accepted-reference virtual determinants require initialized fixed CPU caches and valid indices");
+  evaluateAcceptedReferenceRow(P, iat, refPtcl, ratios);
+}
+
+void MultiDiracDeterminant::evaluateAcceptedReferenceRow(
+    const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios)
+{
   Vector<ValueType> psi_view(psiV.data(), psiV.size());
   Phi->evaluateValue(P, iat, psi_view);
   ratios.resize(getNumDets());
-  evaluateRowToAcceptedReference(row, psiV.data(), ratios.data());
+  evaluateRowToAcceptedReference(refPtcl - FirstIndex, psiV.data(), ratios.data());
 }
 
 void MultiDiracDeterminant::evaluateRowToAcceptedReference(
@@ -625,6 +633,12 @@ void MultiDiracDeterminant::evaluateOrbitalGeneratorToAcceptedReference(
     throw std::invalid_argument("Accepted-reference orbital generator has invalid indices or aliased outputs");
   // Retain the public fixed-Phi guards and the fresh accepted-cache validation.
   evaluateDetsToAcceptedReference(P, iat, refPtcl, ratios);
+  evaluateOrbitalGeneratorRowToAcceptedReference(refPtcl - FirstIndex, psiV.data(), p, q, derivatives);
+}
+
+void MultiDiracDeterminant::evaluateOrbitalGeneratorRowToAcceptedReference(
+    int row, const ValueType* values, int p, int q, Vector<ValueType>& derivatives)
+{
   derivatives.resize(getNumDets());
   derivatives = ValueType{};
   accepted_reference_occupations_.resize(NumPtcls);
@@ -633,7 +647,6 @@ void MultiDiracDeterminant::evaluateOrbitalGeneratorToAcceptedReference(
   auto& occupations = accepted_reference_occupations_;
   auto& positions = accepted_reference_positions_;
   auto& replacements = accepted_reference_replacements_;
-  const int row = refPtcl - FirstIndex;
   for (int determinant = 0; determinant < getNumDets(); ++determinant)
   {
     const auto& source = getConfiguration(determinant).occup;
@@ -662,8 +675,47 @@ void MultiDiracDeterminant::evaluateOrbitalGeneratorToAcceptedReference(
       for (int j = 0; j < k; ++j)
         table_matrix(positions[i], replacements[j]) = simd::dot(psiMinv[positions[i]], TpsiM[replacements[j]], NumPtcls);
     derivatives[determinant] = evaluateConfigurationRowToAcceptedReference(
-        row, psiV.data(), k, positions.data(), replacements.data(), sign);
+        row, values, k, positions.data(), replacements.data(), sign);
   }
+}
+
+void MultiDiracDeterminant::enablePrivateAcceptedReferenceOrbitalRows()
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("Private orbital reference rows require a real CPU build");
+#endif
+  const auto* rotated = dynamic_cast<const RotatedSPOs*>(Phi.get());
+  const auto* lcao = rotated ? dynamic_cast<const LCAOrbitalSet*>(rotated->Phi_.get()) : nullptr;
+  if (is_spinor_ || !lcao || lcao->isOMPoffload() || lcao->fileImageIdentity())
+    throw std::invalid_argument("Private orbital reference rows require CPU inline LCAO");
+  private_accepted_reference_orbital_ = true;
+}
+
+void MultiDiracDeterminant::evaluatePrivateOrbitalDetsToAcceptedReference(
+    const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios)
+{
+  const int row = refPtcl - FirstIndex;
+  if (!private_accepted_reference_orbital_ || P.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS ||
+      iat < 0 || iat >= P.getTotalNum() || row < 0 || row >= NumPtcls || NumPtcls <= 0 ||
+      psiMinv.rows() != NumPtcls || psiMinv.cols() != NumPtcls || psiM.rows() != NumPtcls || psiM.cols() != NumOrbitals)
+    throw std::invalid_argument("Private orbital reference rows require enabled initialized CPU caches");
+  evaluateAcceptedReferenceRow(P, iat, refPtcl, ratios);
+}
+
+void MultiDiracDeterminant::evaluatePrivateOrbitalGeneratorToAcceptedReference(
+    const ParticleSet& P, int iat, int refPtcl, int p, int q, Vector<ValueType>& workspace,
+    Vector<ValueType>& reference_derivatives, Vector<ValueType>& virtual_derivatives)
+{
+  if (p < 0 || p >= q || q >= NumOrbitals || &workspace == &reference_derivatives ||
+      &workspace == &virtual_derivatives || &reference_derivatives == &virtual_derivatives ||
+      workspace.isAttached() || reference_derivatives.isAttached() || virtual_derivatives.isAttached())
+    throw std::invalid_argument("Private orbital generator requires valid indices and distinct owning rows");
+  evaluatePrivateOrbitalDetsToAcceptedReference(P, iat, refPtcl, workspace);
+  const int row = refPtcl - FirstIndex;
+  evaluateOrbitalGeneratorRowToAcceptedReference(row, psiV.data(), p, q, virtual_derivatives);
+  const auto* accepted = psiM.data() + row * NumOrbitals;
+  evaluateRowToAcceptedReference(row, accepted, workspace.data());
+  evaluateOrbitalGeneratorRowToAcceptedReference(row, accepted, p, q, reference_derivatives);
 }
 
 void MultiDiracDeterminant::evaluateDetsForPtclMove(const ParticleSet& P, int iat, int refPtcl)

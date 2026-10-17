@@ -237,6 +237,14 @@ public:
   /// Returns dD(Q)/D_ref(R) in distinct owning outputs, not a canonical frame coordinate.
   void evaluateOrbitalGeneratorToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, int p, int q,
                                                   Vector<ValueType>& ratios, Vector<ValueType>& derivatives);
+
+  /// Opt in only on qualified private CPU inline-orbital evaluators, never ordinary sampling sources.
+  void enablePrivateAcceptedReferenceOrbitalRows();
+  bool usesPrivateAcceptedReferenceOrbitalRows() const noexcept { return private_accepted_reference_orbital_; }
+  void evaluatePrivateOrbitalDetsToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios);
+  /// Reuse one determinant workspace and two generator rows; all outputs are distinct owning vectors.
+  void evaluatePrivateOrbitalGeneratorToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, int p, int q,
+      Vector<ValueType>& workspace, Vector<ValueType>& reference_derivatives, Vector<ValueType>& virtual_derivatives);
   /// multi walker version of evaluateDetsForPtclMove
   void static mw_evaluateDetsForPtclMove(const RefVectorWithLeader<MultiDiracDeterminant>& det_list,
                                          const RefVectorWithLeader<ParticleSet>& P_list,
@@ -304,6 +312,9 @@ public:
 private:
   /// Replace one orbital row against accepted caches, without inverting the replacement.
   void evaluateRowToAcceptedReference(int row, const ValueType* values, ValueType* ratios);
+  void evaluateAcceptedReferenceRow(const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios);
+  void evaluateOrbitalGeneratorRowToAcceptedReference(int row, const ValueType* values, int p, int q,
+                                                     Vector<ValueType>& derivatives);
 
   /// Evaluate one signed excitation with the already prepared accepted-row projection.
   ValueType evaluateConfigurationRowToAcceptedReference(int row, const ValueType* values, int k,
@@ -571,6 +582,7 @@ private:
   std::vector<int> accepted_reference_pivots_;
   /// Reusable O(n) occupation-substitution metadata, never retained per virtual point.
   std::vector<int> accepted_reference_occupations_, accepted_reference_positions_, accepted_reference_replacements_;
+  bool private_accepted_reference_orbital_ = false;
   /// new value of the reference determinant over the old value upon a proposed move
   ValueType curRatio;
   /// log value of the reference determinant

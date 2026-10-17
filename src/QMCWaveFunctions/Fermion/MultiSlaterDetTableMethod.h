@@ -200,6 +200,12 @@ public:
   void enableAcceptedReferenceVirtualRatios();
   /// Report the private mode, including propagation to descendants of that evaluator.
   bool usesAcceptedReferenceVirtualRatios() const noexcept { return accepted_reference_virtual_mode_; }
+  /// Separate private numerical mode; ordinary source/prototype flags remain false.
+  void enableAcceptedReferenceOrbitalVirtualRatios();
+  bool usesAcceptedReferenceOrbitalVirtualRatios() const noexcept { return accepted_reference_orbital_virtual_mode_; }
+  void validateAcceptedOrbitalDerivativeState() const;
+  ValueType evaluateAcceptedReferenceOrbitalRatioDerivatives(const ParticleSet& P, int iat, int refPtcl,
+      const OptVariables& active, ParameterDerivativeView derivatives);
   /// Add physical DETS/CSF coefficient ratio derivatives using initialized accepted caches.
   ValueType evaluateAcceptedReferenceRatioDerivatives(const ParticleSet& P, int iat, int refPtcl,
       const OptVariables& active, ParameterDerivativeView derivatives);
@@ -382,7 +388,9 @@ private:
 
   /// Explicit optimizer-private mode and one quadrature-independent unique-term row.
   bool accepted_reference_virtual_mode_ = false;
+  bool accepted_reference_orbital_virtual_mode_ = false;
   Vector<ValueType> accepted_reference_virtual_terms_;
+  Vector<ValueType> accepted_reference_orbital_work_, accepted_reference_orbital_old_, accepted_reference_orbital_new_;
 
   size_t ActiveSpin;
   PsiValue curRatio;

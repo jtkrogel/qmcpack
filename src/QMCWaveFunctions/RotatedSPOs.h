@@ -132,6 +132,8 @@ public:
    */
   void adoptPreparedRotationState(RotatedSPOs& prepared, const RotatedSPOs& canonical_bank) noexcept;
   const std::vector<ValueType>& fullRotationCoordinates() const noexcept { return myVarsFull_; }
+  /// Borrow actual registered active indices without copying a parameter-sized variable set.
+  const OptVariables& activeRotationVariables() const noexcept { return myVars; }
   /// One occupied real CPU orbital: ratio derivatives use only the reference
   /// denominator, including when the replacement occupied value is exactly zero.
   ValueType evaluateOneOccupiedRatioDerivatives(const ValueVector& reference,
