@@ -22,6 +22,7 @@
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCDrivers/WFTrain/SampledLinearMethod.h"
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
@@ -2841,6 +2842,8 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   const double local_value = loc->evaluate(p);
   // Independent occupied 2x2 determinant polynomials, not the bordered helper.
   auto oracle_points = points;
+  auto oracle_positions = positions;
+  double oracle_local_value = local_value;
   const auto fixed_energy = [&](const StructuredParameterSnapshot& candidate) {
     ParticleSet trial(p);
     auto twf = wf->makeClone(trial);
@@ -2857,18 +2860,18 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
       return value;
     };
     const double accepted_j = jlog(*twf, trial);
-    trial.R = positions; trial.update(); adapter.installSnapshot(*twf, trial, candidate);
-    DerivativeValue energy = kineticEnergy(trial) + local_value;
+    trial.R = oracle_positions; trial.update(); adapter.installSnapshot(*twf, trial, candidate);
+    DerivativeValue energy = kineticEnergy(trial) + oracle_local_value;
     for (const auto& q : oracle_points)
     {
-      auto r = positions;
+      auto r = oracle_positions;
       for (int dim = 0; dim < 3; ++dim) r[q.electron][dim] = q.replacement_position[dim];
       const auto determinant = [&](int spin, bool alt) {
         const double x = r[2 * spin][0], y = r[2 * spin + 1][0];
         return alt ? y - x : y * y - x * x;
       };
       const double common_ratio = (1 + r[q.electron][1] + r[q.electron][2]) /
-          (1 + positions[q.electron][1] + positions[q.electron][2]);
+          (1 + oracle_positions[q.electron][1] + oracle_positions[q.electron][2]);
       const double accepted_reference = csf ? 64 : 9, accepted_alternative = csf ? 4 : 1;
       const double ratio = common_ratio * (ref_coefficient * determinant(0, false) * determinant(1, false) +
           alt_coefficient * determinant(0, true) * determinant(1, true)) /
@@ -2947,6 +2950,169 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     CHECK(node_rows.result()[0][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-6).margin(3e-8));
   }
   CHECK(rng.draws == draws);
+  if (!csf)
+  {
+    // Four independently captured configurations make the centered factor
+    // nontrivial. All retained operators borrow one evaluator/shared P scratch.
+    constexpr std::size_t n = 5, m = 4;
+    const std::array<double, m> shifts{-0.15, -0.05, 0.08, 0.2}, weights{1, 2, 1, 2};
+    std::array<DerivativeValue, m> energies{};
+    std::array<std::array<double, n>, m> scores{}, del{}; // tiny dense oracle only
+    std::array<double, n> mean{};
+    double mean_energy = 0;
+    std::vector<std::unique_ptr<StreamingDerivativeOperator>> operators;
+    std::vector<ScoreCovarianceBatch> batches;
+    for (std::size_t sample = 0; sample < m; ++sample)
+    {
+      p.R = positions;
+      p.R[0][0] += shifts[sample];
+      p.R[1][2] += 0.03 * sample;
+      p.update();
+      wf->evaluateLog(p);
+      auto sample_replay = std::make_shared<FixedDETSReplay>(*replay_wf, replay_p);
+      sample_replay->positions = p.R;
+      auto products = adapter.makeDerivativeOperator(sample_replay, snapshot, sample + 2, sample);
+      auto capture_consumer = adapter.makeNonLocalECPDerivativeConsumer(sample_replay, snapshot, sample + 2, sample);
+      const VJPCoefficientChannel sample_channel{"sample_capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+          coefficientsFor(*products, unit), ecp_mask};
+      {
+        ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+        ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, wfs);
+        ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+        energies[sample] = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+            hs, wfs, ps, *capture_consumer, {&sample_channel, 1}, idle).local_energies[0];
+      }
+      auto grid = capture_consumer->releaseJVPReplay();
+      oracle_points.assign(grid->points().begin(), grid->points().end());
+      oracle_positions = p.R;
+      oracle_local_value = loc->evaluate(p);
+      products->bindNonLocalECPJVPReplay(std::move(grid));
+      CHECK(products->storageDiagnostics().real_parameter_vectors == 2);
+      CHECK(products->storageDiagnostics().shared_workspace_identity == op->storageDiagnostics().shared_workspace_identity);
+      const std::array<VJPCoefficientChannel, 2> channels{{
+          {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*products, unit), 0},
+          {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*products, unit), total_mask}}};
+      RecordingParameterSink rows;
+      products->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+      // Physical FD uses the independent polynomial ratio oracle on THIS grid.
+      for (std::size_t parameter = 0; parameter < n; ++parameter)
+      {
+        scores[sample][parameter] = rows.result()[0][parameter].real();
+        del[sample][parameter] = rows.result()[1][parameter].real();
+        mean[parameter] += weights[sample] * scores[sample][parameter] / 6;
+        auto plus = *snapshot, minus = *snapshot;
+        plus.values[parameter] += 1e-5;
+        minus.values[parameter] -= 1e-5;
+        CHECK(del[sample][parameter] == Catch::Approx(
+            ((fixed_energy(plus) - fixed_energy(minus)) / 2e-5).real()).epsilon(3e-6).margin(3e-8));
+      }
+      CHECK(fixed_energy(*snapshot).real() == Catch::Approx(energies[sample].real()).epsilon(3e-12).margin(3e-12));
+      mean_energy += weights[sample] * energies[sample].real() / 6;
+      batches.push_back({products.get(), {&weights[sample], 1}, {&energies[sample], 1}});
+      operators.push_back(std::move(products));
+    }
+    const auto captured_draws = rng.draws;
+    const auto& schema = adapter.parameterSchema();
+    ScoreCovarianceFactor factor(schema, snapshot->version, {batches.data(), batches.size()});
+    ProjectedInverseIterationFactor pii_factor(factor, total_mask);
+    PIIUpdateControl control;
+    control.shift_mode = PIIShiftMode::EXPLICIT;
+    control.explicit_shift = mean_energy - 1;
+    control.damping = 0.3;
+    control.learning_rate = 0.01;
+    control.maximum_damping_retries = 0;
+    control.gmres.restart_length = 16;
+    control.gmres.krylov.maximum_iterations = 64;
+    control.gmres.krylov.maximum_operator_applications = 256;
+    control.gmres.krylov.maximum_seconds = 5;
+    std::array<std::array<double, n>, n> matrix{};
+    std::array<double, n> rhs{};
+    double metric_trace = 0, force_norm = 0;
+    for (std::size_t row = 0; row < n; ++row)
+    {
+      matrix[row][row] = control.damping;
+      for (std::size_t sample = 0; sample < m; ++sample)
+      {
+        const double centered = scores[sample][row] - mean[row];
+        const double left = weights[sample] * centered / 6;
+        metric_trace += left * centered;
+        rhs[row] += left * (energies[sample].real() - mean_energy);
+        for (std::size_t column = 0; column < n; ++column)
+          matrix[row][column] += left * (del[sample][column] +
+              (energies[sample].real() - control.explicit_shift) * (scores[sample][column] - mean[column]));
+      }
+      force_norm = std::hypot(force_norm, rhs[row]);
+    }
+    REQUIRE(metric_trace > 1e-8);
+    REQUIRE(force_norm > 1e-8);
+    ProjectedInverseIterationOperator action(pii_factor, control.explicit_shift, control.damping);
+    for (std::size_t column = 0; column < n; ++column)
+    {
+      std::array<DerivativeValue, n> basis{};
+      std::array<DerivativeValue, n> result{};
+      basis[column] = 1;
+      action.apply({schema, snapshot->version, {basis.data(), n}}, {result.data(), n});
+      for (std::size_t row = 0; row < n; ++row)
+        CHECK(result[row].real() == Catch::Approx(matrix[row][column]).epsilon(2e-10).margin(2e-10));
+    }
+    // Independent pivoted dense solve, not another call to the iterative core.
+    for (std::size_t column = 0; column < n; ++column)
+    {
+      std::size_t pivot = column;
+      for (std::size_t row = column + 1; row < n; ++row)
+        if (std::abs(matrix[row][column]) > std::abs(matrix[pivot][column])) pivot = row;
+      REQUIRE(std::abs(matrix[pivot][column]) > 1e-13);
+      std::swap(matrix[pivot], matrix[column]);
+      std::swap(rhs[pivot], rhs[column]);
+      for (std::size_t row = column + 1; row < n; ++row)
+      {
+        const double multiplier = matrix[row][column] / matrix[column][column];
+        for (std::size_t entry = column; entry < n; ++entry)
+          matrix[row][entry] -= multiplier * matrix[column][entry];
+        rhs[row] -= multiplier * rhs[column];
+      }
+    }
+    std::array<double, n> direction{};
+    for (std::size_t reverse = n; reverse > 0; --reverse)
+    {
+      const auto row = reverse - 1;
+      double value = rhs[row];
+      for (std::size_t column = row + 1; column < n; ++column) value -= matrix[row][column] * direction[column];
+      direction[row] = value / matrix[row][row];
+    }
+    const auto gradient = factor.scoreCovarianceGradient();
+    const ParameterGradientView objective{schema.fingerprint(), snapshot->version, ReductionDomain::GLOBAL,
+        {gradient.data(), gradient.size()}};
+    ProjectedInverseIterationUpdateRule pii(pii_factor, control);
+    MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
+    for (const auto& candidate : {pii.propose(schema, *snapshot, objective), minpii.propose(schema, *snapshot, objective)})
+    {
+      for (std::size_t parameter = 0; parameter < n; ++parameter)
+        CHECK(candidate.values[parameter] == Catch::Approx(snapshot->values[parameter] -
+            control.learning_rate * direction[parameter]).epsilon(2e-9).margin(2e-11));
+      CHECK(isFiniteTrainingReal(fixed_energy(candidate).real()));
+    }
+    auto plus = *snapshot, minus = *snapshot;
+    double expected_derivative = 0;
+    for (std::size_t parameter = 0; parameter < n; ++parameter)
+    {
+      plus.values[parameter] += 1e-5 * direction[parameter];
+      minus.values[parameter] -= 1e-5 * direction[parameter];
+      expected_derivative += del[m - 1][parameter] * direction[parameter];
+    }
+    CHECK(((fixed_energy(plus) - fixed_energy(minus)) / 2e-5).real() ==
+        Catch::Approx(expected_derivative).epsilon(3e-6).margin(3e-8));
+    pii.proposalRejected();
+    minpii.proposalRejected();
+    CHECK(rng.draws == captured_draws);
+    CHECK(adapter.snapshotParameters().values == snapshot->values);
+    CHECK(live_msd.fixedCoefficientReference() == QMCTraits::ValueType{1});
+    p.R = positions;
+    p.update();
+    wf->evaluateLog(p);
+    CHECK(wf->getLogPsi() == live_log);
+    checkClose(kineticEnergy(p), live_energy);
+  }
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
