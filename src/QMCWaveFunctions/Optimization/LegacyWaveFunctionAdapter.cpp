@@ -14,6 +14,7 @@
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/JeeIOrbitalSoA.h"
@@ -284,18 +285,24 @@ LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample
       ++slaters;
       orbital = slater->isOptimizable();
       if (orbital && (slater->getNumDets() != 2 || sample.particles.groups() != 2 ||
-          sample.particles.groupsize(0) != 1 || sample.particles.groupsize(1) != 1 ||
+          sample.particles.groupsize(0) <= 0 || sample.particles.groupsize(0) != sample.particles.groupsize(1) ||
           sample.particles.getLattice().SuperCellEnum != SUPERCELL_OPEN))
-        throw std::invalid_argument("Legacy orbital ECP products require open one-occupied spin determinants");
+        throw std::invalid_argument("Legacy orbital ECP products require open equal-spin determinants");
       for (int determinant = 0; determinant < slater->getNumDets(); ++determinant)
       {
         const auto& phi = slater->getPhi(determinant);
         const auto* rotated = dynamic_cast<const RotatedSPOs*>(&phi);
         const auto* lcao = rotated ? dynamic_cast<const LCAOrbitalSet*>(rotated->Phi_.get()) : nullptr;
+        const std::size_t n = sample.particles.groupsize(determinant), m = phi.getOrbitalSetSize();
         if (phi.isOMPoffload() || (!orbital && phi.isOptimizable()) || (orbital && (!phi.isOptimizable() || !lcao || lcao->isOMPoffload() ||
-            lcao->fileImageIdentity() || rotated->nel_major_ != 1 || phi.getOrbitalSetSize() != 3 ||
-            rotated->m_act_rot_inds_ != RotatedSPOs::RotationIndices{{0, 1}, {0, 2}})))
-          throw std::invalid_argument("Legacy orbital ECP products require two CPU inline three-orbital (0,q) owners");
+            lcao->fileImageIdentity() || rotated->nel_major_ != n || m <= n || (n == 1 && m != 3) ||
+            !dynamic_cast<const DiracDeterminant<>*>(&slater->getDet(determinant)) ||
+            rotated->m_act_rot_inds_.size() != n * (m - n))))
+          throw std::invalid_argument("Legacy orbital ECP products require CPU inline complete-OV owners");
+        if (orbital)
+          for (std::size_t i = 0; i < rotated->m_act_rot_inds_.size(); ++i)
+            if (rotated->m_act_rot_inds_[i] != std::make_pair(static_cast<int>(i / (m - n)), static_cast<int>(n + i % (m - n))))
+              throw std::invalid_argument("Legacy orbital ECP products require ordered complete-OV owners");
       }
     }
     else if (dynamic_cast<const JeeIOrbitalSoA<PolynomialFunctor3D>*>(component.get()))
@@ -894,7 +901,8 @@ private:
    * Baseline products have already consumed both P rows. First consume the
    * Jastrow difference, then reuse its source row for the unnormalized orbital
    * or accepted-reference CI derivative, including zero total virtual ratios.
-   * Only six stack orbital values accompany the two existing parameter rows.
+   * One-occupied uses six stack values. Larger occupied spaces reuse component
+   * O(n*m)+O(m+n) caches, explicitly outside the two-parameter-row cap.
    */
   void evaluateECPRatioRow(std::size_t sample, const NonLocalECPReplayPoint& point) const
   {
@@ -907,7 +915,26 @@ private:
               state.particles.GroupID[point.electron])) : nullptr;
     std::array<QMCTraits::ValueType, 3> reference_storage, replacement_storage;
     SPOSet::ValueVector reference(reference_storage.data(), 3), replacement(replacement_storage.data(), 3);
-    if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, reference);
+    const DiracDeterminant<>* accepted_determinant = nullptr;
+    auto* replacement_values = &replacement;
+    if (rotated && rotated->nel_major_ > 1)
+    {
+      requireFiniteECP({state.wavefunction.getLogPsi(), state.wavefunction.getPhase()});
+      // Full accepted evaluateLog above recomputes the inverse with no delayed
+      // updates. Borrow it unchanged while only Jastrows see the virtual point.
+      accepted_determinant = &dynamic_cast<const DiracDeterminant<>&>(state.wavefunction.findSD().front().get().getDet(
+          state.particles.GroupID[point.electron]));
+      const auto n = rotated->nel_major_, m = static_cast<std::size_t>(rotated->getOrbitalSetSize());
+      if (rotated->psiM_all.rows() != n || rotated->psiM_all.cols() != m) rotated->psiM_all.resize(n, m);
+      for (std::size_t row = 0; row < n; ++row)
+      {
+        SPOSet::ValueVector values(rotated->psiM_all.data() + row * m, m);
+        rotated->Phi_->evaluateValue(state.particles, accepted_determinant->getFirstIndex() + row, values);
+      }
+      if (rotated->accepted_ratio_replacement_.size() != m) rotated->accepted_ratio_replacement_.resize(m);
+      replacement_values = &rotated->accepted_ratio_replacement_;
+    }
+    else if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, reference);
     workspace_->score_row = QMCTraits::ValueType{};
     double reference_jastrow_log = 0;
     for (const auto& component : state.wavefunction.getOrbitals())
@@ -919,7 +946,7 @@ private:
     for (int dimension = 0; dimension < 3; ++dimension)
       state.particles.R[point.electron][dimension] = point.replacement_position[dimension];
     state.particles.update();
-    if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, replacement);
+    if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, *replacement_values);
     state.particles.G = QMCTraits::GradType{};
     state.particles.L = QMCTraits::ValueType{};
     workspace_->kinetic_row = QMCTraits::ValueType{};
@@ -938,7 +965,11 @@ private:
       workspace_->kinetic_row[parameter] = point.complete_ratio.real() *
           (workspace_->kinetic_row[parameter] - workspace_->score_row[parameter]);
     workspace_->score_row = QMCTraits::ValueType{};
-    if (rotated)
+    if (accepted_determinant)
+      rotated->evaluateAcceptedReferenceOVRatioDerivatives(rotated->psiM_all,
+          accepted_determinant->getAcceptedInverseTranspose(), *replacement_values,
+          point.electron - accepted_determinant->getFirstIndex(), *active_, workspace_->score_row);
+    else if (rotated)
       rotated->evaluateOneOccupiedRatioDerivatives(reference, replacement, *active_, workspace_->score_row);
     else
       state.wavefunction.findMSD().front().get().evaluateAcceptedReferenceRatioDerivatives(

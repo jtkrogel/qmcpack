@@ -4183,14 +4183,15 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
   CHECK(source->getLogPsi() == source_log);
 }
 
-TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
+TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
 {
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 2; ++model)
+  for (int model = 0; model < 3; ++model)
   {
     CAPTURE(model);
+    const bool many = model == 2;
     ParticleSetPool pool(OHMMS::Controller);
     Libxml2Document particle_xml;
     REQUIRE(particle_xml.parseFromString(R"(<qmcsystem>
@@ -4203,6 +4204,22 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
         <group name="d" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
         <attrib name="position" datatype="posArray">-0.5 0.1 0.7</attrib></group></particleset>
       </qmcsystem>)"));
+    if (many)
+    {
+      auto* ion = xmlFirstElementChild(particle_xml.getRoot());
+      auto* species = xmlFirstElementChild(ion);
+      xmlSetProp(species, BAD_CAST "name", BAD_CAST "C");
+      xmlNodeSetContent(xmlFirstElementChild(species), BAD_CAST "4");
+      xmlNodeSetContent(xmlNextElementSibling(xmlFirstElementChild(species)), BAD_CAST "6");
+      auto* spin = xmlFirstElementChild(xmlNextElementSibling(ion));
+      for (const char* positions : {".2 -.3 .4  .6 .2 -.5", "-.5 .1 .7  -.8 -.4 -.2"})
+      {
+        xmlSetProp(spin, BAD_CAST "size", BAD_CAST "2");
+        for (auto* child = xmlFirstElementChild(spin); child; child = xmlNextElementSibling(child))
+          if (xmlStrEqual(child->name, BAD_CAST "attrib")) xmlNodeSetContent(child, BAD_CAST positions);
+        spin = xmlNextElementSibling(spin);
+      }
+    }
     REQUIRE(pool.put(xmlFirstElementChild(particle_xml.getRoot())));
     REQUIRE(pool.put(xmlNextElementSibling(xmlFirstElementChild(particle_xml.getRoot()))));
     auto& ions = *pool.getParticleSet("ion0");
@@ -4213,10 +4230,11 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       particles.R[0] = {1, 0, 0};
       particles.R[1] = {-2, 0, 0};
     }
-    const std::string coefficients = model == 0 ? "1 0 0 0  0 1 0 0  0 0 1 0" : node_coefficients;
+    const std::string coefficients = many ? "1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1" :
+        model == 0 ? "1 0 0 0  0 1 0 0  0 0 1 0" : node_coefficients;
     REQUIRE(!coefficients.empty());
     Libxml2Document definition;
-    REQUIRE(definition.parseFromString(std::string{R"(<wavefunction name="psi0" target="e">
+    std::string wavefunction_xml = std::string{R"(<wavefunction name="psi0" target="e">
       <sposet_collection type="MolecularOrbital" source="ion0">
         <basisset keyword="STO" transform="no"><atomicBasisSet type="STO" elementType="Be"
             angular="cartesian" normalized="no">
@@ -4233,7 +4251,13 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
         <correlation rcut="4" size="4" speciesA="u" speciesB="d">
           <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
         </correlation>
-      </jastrow></wavefunction>)"));
+      </jastrow></wavefunction>)";
+    if (many)
+      for (const auto& [before, after] : std::array<std::pair<std::string, std::string>, 2>{{
+          {"elementType=\"Be\"", "elementType=\"C\""}, {"size=\"3\"", "size=\"4\""}}})
+        for (std::size_t position = 0; (position = wavefunction_xml.find(before, position)) != std::string::npos; position += after.size())
+          wavefunction_xml.replace(position, before.size(), after);
+    REQUIRE(definition.parseFromString(wavefunction_xml));
     WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
     auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
     REQUIRE(source);
@@ -4242,28 +4266,28 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
       return dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
     };
-    // Cartesian input expands a complete p shell. Explicit 3x4 coefficients
-    // select the orthogonal s,px,py subspace and leave pz identically unused.
+    // Cartesian input expands a complete p shell. Old models select three
+    // orbitals; neutral carbon retains the full four-orbital identity bank.
     auto& initial_lcao = dynamic_cast<LCAOrbitalSet&>(*rotated(*source).Phi_);
     REQUIRE(initial_lcao.getBasisSetSize() == 4);
-    REQUIRE(initial_lcao.C->rows() == 3);
+    REQUIRE(initial_lcao.C->rows() == (many ? 4 : 3));
     REQUIRE(initial_lcao.C->cols() == 4);
-    const int selected[] = {model == 0 ? 0 : 1, model == 0 ? 1 : 0, 2};
-    for (int row = 0; row < 3; ++row)
+    const int selected[] = {model == 1 ? 1 : 0, model == 1 ? 0 : 1, 2, 3};
+    for (int row = 0; row < (many ? 4 : 3); ++row)
       for (int column = 0; column < 4; ++column)
         CHECK((*initial_lcao.C)(row, column) == (column == selected[row] ? 1.0 : 0.0));
     particles.update();
     source->evaluateLog(particles);
     LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
-    REQUIRE(adapter.snapshotParameters().values.size() == 6);
+    REQUIRE(adapter.snapshotParameters().values.size() == (many ? 8 : 6));
     ParticleSet unsupported_j3_particles(particles);
     auto unsupported_j3 = source->makeClone(unsupported_j3_particles);
     addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
     CHECK_THROWS_WITH(adapter.validateNonLocalECPProfile(*unsupported_j3, unsupported_j3_particles),
         Catch::Matchers::ContainsSubstring("fixed single Slater without active orbitals"));
-    ECPComponentBuilder builder("Be", OHMMS::Controller, model == 0 ? 2 : 3, 1);
+    ECPComponentBuilder builder(many ? "C" : "Be", OHMMS::Controller, model == 1 ? 3 : 2, 1);
     const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
-        "tests/pseudopotentials_for_tests/Be.BFD.xml";
+        (many ? "tests/pseudopotentials_for_tests/C.BFD.xml" : "tests/pseudopotentials_for_tests/Be.BFD.xml");
     REQUIRE(builder.read_pp_file(asset.string()));
     auto nonlocal = std::make_unique<NonLocalECPotential>(ions, particles, false, true);
     auto* nl = nonlocal.get();
@@ -4284,12 +4308,13 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       QMCTraits::FullPrecRealType operator()() override { ++draws; return 0; }
       std::size_t draws = 0;
     } zero_rng;
-    nl->setRandomGenerator(model == 0 ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
+    nl->setRandomGenerator(model != 1 ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
     ResourceCollection ps_resources("orb_ecp_P"), wf_resources("orb_ecp_WF"), ham_resources("orb_ecp_H");
     particles.createResource(ps_resources);
     source->createResource(wf_resources);
     ham.createResource(ham_resources);
     const auto positions = particles.R;
+    const auto ion_positions = ions.R;
     for (int step = 0; step < (model == 0 ? 3 : 1); ++step)
     {
       CAPTURE(step);
@@ -4387,7 +4412,10 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       }
       op->bindNonLocalECPJVPReplay(std::move(record));
       CHECK(op->storageDiagnostics().real_parameter_vectors == 2);
-      const double fixed_potential = loc->evaluate(particles) + 1.0 / std::sqrt(dot(positions[0] - positions[1], positions[0] - positions[1]));
+      double fixed_potential = loc->evaluate(particles);
+      for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+        for (int other = 0; other < electron; ++other)
+          fixed_potential += 1.0 / std::sqrt(dot(positions[electron] - positions[other], positions[electron] - positions[other]));
       // Independent signed complete-ratio FD oracle uses ordinary proposed
       // moves and rejects them, never a virtual-point inverse/logarithm.
       const auto fixed_grid_energy = [&](const StructuredParameterSnapshot& candidate, bool kinetic) {
@@ -4496,8 +4524,9 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       CHECK(*source_lcao.C == source_coefficients);
       CHECK(source_lcao.originalRotationCoefficients() == source_reference);
       CHECK(rotated(*source).fullRotationCoordinates() == source_full);
-      for (int e = 0; e < 2; ++e)
+      for (int e = 0; e < particles.getTotalNum(); ++e)
         for (int d = 0; d < 3; ++d) CHECK(particles.R[e][d] == positions[e][d]);
+      for (int ion = 0; ion < ions.getTotalNum(); ++ion) CHECK(ions.R[ion] == ion_positions[ion]);
     }
   }
 }

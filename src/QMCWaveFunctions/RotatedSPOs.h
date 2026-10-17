@@ -150,6 +150,8 @@ public:
                                                        ValueVector& output) const;
   /// Private-evaluator projection cache, independent of samples, Q and parameters.
   mutable ValueVector accepted_ratio_projection_;
+  /// Reused virtual SPO values; component storage outside the adapter row cap.
+  ValueVector accepted_ratio_replacement_;
   /// Private evaluator only; install complete history and matching active values without a delta.
   void restoreFullRotationState(const std::vector<ValueType>& full, const OptVariables& expected_active);
 
