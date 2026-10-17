@@ -32,7 +32,7 @@ does not cover opaque component scratch/private clones/configurations. PP source
 content is immutable shared model metadata, not copied per walker.
 
 The fixed-Slater fixture qualifies only real CPU single-Slater J1/J2 ECP.
-The separately qualified small orbital profile is described below. No MD/J3,
+The separately qualified orbital and fixed-DETS profiles are described below. No J3,
 DLA/TMDLA, spin-orbit, periodic, complex or accelerator ECP qualification follows.
 
 One-occupied orbital/J2 profile (CPU ONLY)
@@ -65,3 +65,28 @@ bounds are not relaxed. Native completion is not a separate gradient oracle;
 the mathematical derivative claim is supported by the numerical unit gate.
 The workflow has a 300-second whole and 180-second process ceiling, with no
 optimizer/backend matrix, convergence or performance claim.
+
+Fixed-DETS/J2 profile (CPU ONLY)
+-------------------------------
+``wftrain_mdj_ecp.xml`` uses fixed inline s/px orbitals, frozen C0=.6, active
+C1=.05 and four J2 coordinates with the same ordinary-locality Be BFD operator.
+Two Adam/SGD updates, scheduled inference, exact inference isolation and complete
+ROOT/optimizer/rank-shard/non-clock-history split restart passed at source
+87e982fc07eaa260d7c9885799bf9281f65406dd::
+
+  python3 ../H2_ae_conventional_wftrain/check_sj_training.py /absolute/qmcpack wftrain_mdj_ecp.xml --restart --preflight
+
+The separate mathematical gate compares all five physical derivatives on an
+actual Be grid with an independent signed occupied-matrix oracle. It includes
+an exact zero captured total ratio with nonzero dCI. A separately labeled
+synthetic one-knot replay covers an exact virtual reference determinant node
+with nonzero total ratio; that knot is not claimed to belong to the Be grid.
+Both energy VP ratios and CI derivatives use the same accepted-reference
+bordered determinant algebra. Only private evaluators and training-owned walker
+clones enable this path; ordinary VMC/pool prototypes retain their default mode.
+
+Accepted reference determinants must be invertible. The legacy VGL algorithm's
+zero derivative-reference inverse limitation is separately documented in task46;
+this qualification does not claim it fixed. CSF, orbital rotations, J3, complex,
+offload and DLA are excluded from this fixed-DETS ECP profile. No timing or
+overall memory benchmark is claimed.
