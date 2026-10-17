@@ -7,15 +7,18 @@ comparison is tolerance-based; exact saved-state equality applies only to split
 restart on the same executable/backend. Run only on a qualified frozen binary.
 """
 import argparse
+import copy
 import csv
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 from compare_ecp_restart import envelopes
@@ -32,11 +35,22 @@ def parameter(parent, name, value):
     node.text = str(value)
 
 
+def remaining(args):
+    seconds = min(args.timeout, args.deadline - time.monotonic()) if args.deadline else args.timeout
+    if seconds <= 0:
+        raise TimeoutError("Native ECP suite deadline exceeded")
+    return seconds
+
+
 def render(template, destination, project, backend, iterations, args, restart=None):
     tree = ET.parse(template)
     root = tree.getroot()
     root.find("project").set("id", project)
     root.find("wavefunction/psiformer").set("gpu", backend)
+    if args.resident_ecp_profile:
+        head = root.find("wavefunction/psiformer")
+        head.set("optimize_scope", "all")
+        head.attrib.pop("optimize_indices", None)
     qmc = root.find("qmc")
     training = qmc.find("training")
     parameter(training, "iterations", iterations)
@@ -44,6 +58,10 @@ def render(template, destination, project, backend, iterations, args, restart=No
         parameter(training, "restart_path", restart)
     parameter(qmc, "walkers_per_rank", args.walkers)
     parameter(qmc, "blocks", args.blocks)
+    if args.resident_ecp_profile:
+        qmc.set("move", "alle")
+        parameter(qmc, "blocks_between_recompute", 100)
+        parameter(training, "maximum_retained_bytes", 1024**3)
     tree.write(destination, encoding="utf-8", xml_declaration=True)
 
 
@@ -69,16 +87,27 @@ def run(app, directory, project, backend, iterations, args, restart=None):
     environment = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
     if backend == "cuda":
         environment["PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES"] = str(args.device_bytes)
+    if args.resident_ecp_profile:
+        environment = {key: value for key, value in environment.items() if not key.startswith("PSIFORMER_GPU_")}
+        environment.update(PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES=str(args.device_bytes),
+            PSIFORMER_GPU_EXTERNAL_RESERVE_BYTES=str(256 * 1024**2),
+            PSIFORMER_GPU_STATUS_CHECKS="synchronous", PSIFORMER_GPU_METROPOLIS_BYTES=str(16 * 1024**2),
+            PSIFORMER_GPU_ADAM_BYTES=str(256 * 1024**2))
+        if args.resident_device_authority:
+            environment.update(PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY="1",
+                PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES=str(256 * 1024**2))
     with (directory / f"{project}.run.log").open("w") as output:
         subprocess.run([str(app), "run.xml"], cwd=directory, env=environment,
-                       stdout=output, stderr=subprocess.STDOUT, timeout=args.timeout, check=True)
+                       stdout=output, stderr=subprocess.STDOUT, timeout=remaining(args), check=True)
     rows = history(directory, project)
     if int(rows[-1]["parameter_version"]) != iterations:
         raise AssertionError("Native BFD model version did not advance to the requested update")
     if backend == "cuda":
         log = (directory / f"{project}.run.log").read_text()
-        for token in ("regular-node real GPU accepted-grid ECP replay", "full_parameter_downloads_per_point=0",
-                      "CPU derivative fallback=no", "replay_only=1 planned_parameter_workspace_bytes=0"):
+        tokens = ("Resident ENERGY accepted-grid ECP appended:", "final_parameter_download_bytes=0") if args.resident_device_authority else (
+            "regular-node real GPU accepted-grid ECP replay", "full_parameter_downloads_per_point=0",
+            "CPU derivative fallback=no", "replay_only=1 planned_parameter_workspace_bytes=0")
+        for token in tokens:
             if token not in log:
                 raise AssertionError("Native GPU BFD run did not exercise the new replay route: " + token)
     return directory / f"{project}.s000.last_checkpoint.h5", rows
@@ -102,7 +131,7 @@ def suite(app, backend, directory, args):
     if len(original_files) != len(restored_files) or len(original_files) != 2:
         raise AssertionError("Expected matching ROOT and rank-zero sampler envelopes")
     for original, restored in zip(original_files, restored_files):
-        subprocess.run([args.h5diff, str(original), str(restored)], check=True, timeout=args.timeout)
+        subprocess.run([args.h5diff, str(original), str(restored)], check=True, timeout=remaining(args))
     for key in ("iteration", "sample_version", "parameter_version", "samples", "mean_energy",
                 "variance", "gradient_norm", "selected_alpha", "committed"):
         if rows[-1][key] != resumed_rows[-1][key]:
@@ -142,9 +171,16 @@ def main():
     parser.add_argument("--h5dump", default=shutil.which("h5dump"))
     parser.add_argument("--profile-only", action="store_true", help="Two uninterrupted updates only, no restart claim")
     parser.add_argument("--prepare-only", action="store_true", help="Generate inputs without executing a binary")
+    parser.add_argument("--resident-device-authority", action="store_true",
+                        help="Bounded all-active DEVICE ECP Adam and same-CUDA HOST authority oracle")
     parser.add_argument("--rtol", type=float, default=2e-7)
     parser.add_argument("--atol", type=float, default=2e-8)
     args = parser.parse_args()
+    args.resident_ecp_profile = args.resident_device_authority
+    args.deadline = time.monotonic() + 285 if args.resident_ecp_profile else None
+    if args.resident_ecp_profile and (args.backend != "cuda" or args.blocks != 1 or args.walkers != 1 or
+            args.cpu_app or args.profile_only or args.timeout > 90 or args.device_bytes != 2 * 1024**3):
+        parser.error("resident ECP requires CUDA W1/blocks1, full suite, no CPU repeat, <=90s child and exact2GiB cap")
     args.app = args.app.resolve()
     args.source = args.source.resolve()
     if not math.isfinite(args.timeout) or args.timeout <= 0 or args.device_bytes <= 0:
@@ -168,6 +204,42 @@ def main():
         render(protected[0], args.output / "prepared.xml", "lih_pp_ecp_continuous", args.backend, 2, args)
         return
     result = suite(args.app, args.backend, args.output, args)
+    if args.resident_ecp_profile:
+        import h5py
+        import numpy as np
+        oracle_args = copy.copy(args)
+        oracle_args.resident_device_authority = False
+        oracle_args.profile_only = True
+        host = args.output / "host_authority"
+        host.mkdir()
+        oracle = suite(args.app, "cuda", host, oracle_args)
+        compare_cpu(result, oracle, args) # Same CUDA sampler, HOST parameter authority.
+        actual_root, _ = envelopes(result[0], args.h5dump)
+        expected_root, _ = envelopes(oracle[0], args.h5dump)
+        def state(path):
+            values = {}
+            with h5py.File(path) as archive:
+                archive.visititems(lambda key, value: values.update({key: value[()]})
+                    if isinstance(value, h5py.Dataset) else None)
+            return values
+        actual, expected = state(actual_root), state(expected_root)
+        for suffix in ("/first_moment", "/second_moment"):
+            keys = [key for key in actual if key.endswith(suffix)]
+            assert len(keys) == 1
+            np.testing.assert_allclose(actual[keys[0]], expected[keys[0]], rtol=args.rtol, atol=args.atol)
+        parameters = actual["wftrain_checkpoint/model/values"]
+        assert parameters.size == 1593857 and np.isfinite(parameters).all()
+        log = (args.output / "continuous" / "lih_pp_ecp_continuous.run.log").read_text()
+        windows = list(re.finditer(r"Resident DEVICE authority window:.*uploaded_bytes=(\d+).*downloaded_bytes=(\d+).*device_copied_bytes=(\d+)", log))
+        assert len(windows) == 2
+        assert all(int(row[2]) < 8 * parameters.size for row in windows) # No P mirror/score download.
+        mirrors = list(re.finditer(r"cold HOST mirror refresh: attempted_bytes=(\d+), version=(\d+)", log))
+        assert len(mirrors) == 1 and mirrors[0].start() > windows[-1].end()
+        assert tuple(map(int, mirrors[0].groups())) == (8 * parameters.size, 2)
+        moments = list(re.finditer(r"Resident DEVICE Adam HOST moments before sampling: actual_bytes=(\d+), cold_allowance=(\d+)", log))
+        assert len(moments) == 2 and all(tuple(map(int, row.groups())) == (0, 16 * parameters.size) for row in moments)
+        appends = list(re.finditer(r"Resident ENERGY accepted-grid ECP appended: points=12, prepared_score_capacity=4, weighted_virtual_tiles=3, weighted_virtual_configurations=12, last_virtual_tile_count=4, final_parameter_download_bytes=0", log))
+        assert len(appends) == 2
     if args.cpu_app:
         cpu = args.output / "cpu"
         cpu.mkdir()
@@ -178,6 +250,10 @@ def main():
                   walkers=args.walkers, blocks=args.blocks, updates=2,
                   device_admission_cap=args.device_bytes if args.backend == "cuda" else None,
                   exact_restart=not args.profile_only, cpu_parity=bool(args.cpu_app), protected_sha256=before)
+    if args.resident_ecp_profile:
+        report.update(device_authority=True, all_active_count=1593857, same_cuda_host_authority_oracle=True,
+                      warm_transfer_windows=[tuple(map(int, row.groups())) for row in windows],
+                      no_warm_host_mirror=True, resident_ecp_q12_cap4_tiles3=True)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS:", json.dumps(report, sort_keys=True))
 
