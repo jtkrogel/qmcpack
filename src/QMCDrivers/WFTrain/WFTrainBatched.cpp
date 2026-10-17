@@ -1624,8 +1624,18 @@ void WFTrainBatched::process(xmlNodePtr node)
       conventional_binding_->attachLive(population_.get_golden_twf(), population_.get_golden_electrons(),
                                         &population_.get_golden_hamiltonian());
       for (std::size_t i = 0; i < population_.get_twfs().size(); ++i)
+      {
+        // These TWFs belong exclusively to this driver's MCPopulation. Never
+        // enable optimizer-private VP evaluation on the external golden/pool TWF.
+        auto& walker_wf = *population_.get_twfs()[i];
+        if (&walker_wf == &student_prototype_ || &walker_wf == &population_.get_golden_twf())
+          throw std::logic_error("Conventional population unexpectedly aliases its external prototype");
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
+          for (auto& determinant : walker_wf.findMSD())
+            determinant.get().enableAcceptedReferenceVirtualRatios();
         conventional_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i],
                                           population_.get_hamiltonians()[i].get());
+      }
     }
     initializeDeterminantOverlap();
     // Target construction clones SPOs and may allocate differently on each rank.

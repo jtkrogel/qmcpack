@@ -14,6 +14,7 @@
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
@@ -247,9 +248,11 @@ void validateMasses(const ParticleSet& particles)
 
 DerivativeValue asDerivativeValue(QMCTraits::ValueType value) noexcept;
 
-/// Orbital ECP derivatives are separately qualified only for inline real CPU
-/// one-occupied Slaters. The old fixed-Slater/Jastrow profile stays unchanged.
-bool validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
+/// Distinguish nodal-safe physical-ratio rows from the fixed-Slater score path.
+enum class LegacyECPProfile { FIXED_SLATER, ORBITAL, DETS };
+
+/// Keep the independently qualified real CPU ECP component profiles explicit.
+LegacyECPProfile validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
 {
 #ifdef QMC_COMPLEX
   throw std::invalid_argument("Legacy ECP products require a real CPU build");
@@ -259,8 +262,21 @@ bool validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
     throw std::invalid_argument("Legacy ECP products require CPU scalar electron coordinates");
   std::size_t slaters = 0;
   bool orbital = false;
+  bool dets = false;
   for (const auto& component : sample.wavefunction.getOrbitals())
-    if (const auto* slater = dynamic_cast<const SlaterDet*>(component.get()))
+    if (const auto* msd = dynamic_cast<const MultiSlaterDetTableMethod*>(component.get()))
+    {
+      ++slaters;
+      dets = true;
+      if (msd->hasCSFExpansion() || msd->getDetSize() != 2 || sample.particles.groups() != 2 ||
+          sample.particles.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+        throw std::invalid_argument("Legacy DETS ECP products require open fixed-orbital two-spin DETS");
+      msd->validatePreparedCoefficientState(*msd);
+      for (int spin = 0; spin < msd->getDetSize(); ++spin)
+        if (msd->getDet(spin).getPhi()->isOMPoffload() || msd->getDet(spin).getPhi()->isOptimizable())
+          throw std::invalid_argument("Legacy DETS ECP products require fixed CPU orbitals");
+    }
+    else if (const auto* slater = dynamic_cast<const SlaterDet*>(component.get()))
     {
       ++slaters;
       orbital = slater->isOptimizable();
@@ -280,10 +296,10 @@ bool validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
       }
     }
     else if (component->getClassName() != "J1OrbitalSoA" && component->getClassName() != "TwoBodyJastrow")
-      throw std::invalid_argument("Legacy ECP products admit only fixed Slater and J1/J2 components");
+      throw std::invalid_argument("Legacy ECP products admit only qualified Slater/DETS and J1/J2 components");
   if (slaters != 1)
     throw std::invalid_argument("Legacy ECP products require exactly one fixed Slater component");
-  return orbital;
+  return dets ? LegacyECPProfile::DETS : orbital ? LegacyECPProfile::ORBITAL : LegacyECPProfile::FIXED_SLATER;
 }
 
 /// Check finite inputs without permitting fast-math to remove the check.
@@ -695,10 +711,13 @@ public:
     for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
       auto state = replay_->prepareSample(sample);
-      const bool orbital = validateECPProfile(state);
-      if (sample > 0 && orbital_ecp_ != orbital)
+      const auto profile = validateECPProfile(state);
+      if (sample > 0 && ecp_profile_ != profile)
         throw std::invalid_argument("Legacy ECP replay mixes fixed and active orbital profiles");
-      orbital_ecp_ = orbital;
+      ecp_profile_ = profile;
+      if (profile == LegacyECPProfile::DETS &&
+          !state.wavefunction.findMSD().front().get().usesAcceptedReferenceVirtualRatios())
+        throw std::invalid_argument("Legacy DETS ECP replay requires an enabled private evaluator");
       if (replay->electronCount() != state.particles.getTotalNum())
         throw std::invalid_argument("Legacy ECP replay electron extent differs from private evaluator");
       for (std::size_t electron = 0; electron < replay->electronCount(); ++electron)
@@ -775,7 +794,7 @@ protected:
         }
       if (requested_ecp)
       {
-        if (orbital_ecp_)
+        if (ecp_profile_ != LegacyECPProfile::FIXED_SLATER)
         {
           forEachECPPoint(sample, [&](const auto& point) {
             evaluateECPRatioRow(sample, point);
@@ -836,7 +855,7 @@ private:
       if (mask == 0) product = reference;
       if (mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))
         forEachECPPoint(sample, [&](const auto& point) {
-          if (orbital_ecp_)
+          if (ecp_profile_ != LegacyECPProfile::FIXED_SLATER)
           {
             evaluateECPRatioRow(sample, point);
             for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
@@ -867,7 +886,8 @@ private:
   /** Form d(Psi_q/Psi_ref) without ever evaluating a nodal full virtual TWF.
    * Baseline products have already consumed both P rows. First consume the
    * Jastrow difference, then reuse its source row for the unnormalized orbital
-   * derivative. Only six stack orbital values accompany the two existing rows.
+   * or accepted-reference CI derivative, including zero total virtual ratios.
+   * Only six stack orbital values accompany the two existing parameter rows.
    */
   void evaluateECPRatioRow(std::size_t sample, const NonLocalECPReplayPoint& point) const
   {
@@ -875,11 +895,12 @@ private:
     validateMasses(state.particles);
     resetEvaluator(state.wavefunction, *active_, snapshot_->values);
     state.wavefunction.evaluateLog(state.particles);
-    auto& slater = state.wavefunction.findSD().front().get();
-    auto& rotated = dynamic_cast<RotatedSPOs&>(slater.getPhi(state.particles.GroupID[point.electron]));
+    RotatedSPOs* rotated = ecp_profile_ == LegacyECPProfile::ORBITAL
+        ? &dynamic_cast<RotatedSPOs&>(state.wavefunction.findSD().front().get().getPhi(
+              state.particles.GroupID[point.electron])) : nullptr;
     std::array<QMCTraits::ValueType, 3> reference_storage, replacement_storage;
     SPOSet::ValueVector reference(reference_storage.data(), 3), replacement(replacement_storage.data(), 3);
-    rotated.Phi_->evaluateValue(state.particles, point.electron, reference);
+    if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, reference);
     workspace_->score_row = QMCTraits::ValueType{};
     double reference_jastrow_log = 0;
     for (const auto& component : state.wavefunction.getOrbitals())
@@ -891,7 +912,7 @@ private:
     for (int dimension = 0; dimension < 3; ++dimension)
       state.particles.R[point.electron][dimension] = point.replacement_position[dimension];
     state.particles.update();
-    rotated.Phi_->evaluateValue(state.particles, point.electron, replacement);
+    if (rotated) rotated->Phi_->evaluateValue(state.particles, point.electron, replacement);
     state.particles.G = QMCTraits::GradType{};
     state.particles.L = QMCTraits::ValueType{};
     workspace_->kinetic_row = QMCTraits::ValueType{};
@@ -910,7 +931,12 @@ private:
       workspace_->kinetic_row[parameter] = point.complete_ratio.real() *
           (workspace_->kinetic_row[parameter] - workspace_->score_row[parameter]);
     workspace_->score_row = QMCTraits::ValueType{};
-    rotated.evaluateOneOccupiedRatioDerivatives(reference, replacement, *active_, workspace_->score_row);
+    if (rotated)
+      rotated->evaluateOneOccupiedRatioDerivatives(reference, replacement, *active_, workspace_->score_row);
+    else
+      state.wavefunction.findMSD().front().get().evaluateAcceptedReferenceRatioDerivatives(
+          state.particles, point.electron, point.electron, *active_,
+          {workspace_->score_row.data(), workspace_->score_row.size()});
     for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
     {
       workspace_->score_row[parameter] = jastrow_ratio * workspace_->score_row[parameter] +
@@ -1005,7 +1031,7 @@ private:
   std::shared_ptr<const optimize::VariableSet> active_;
   std::shared_ptr<const StructuredParameterSnapshot> snapshot_;
   std::unique_ptr<NonLocalECPJVPReplay> ecp_replay_;
-  bool orbital_ecp_ = false;
+  LegacyECPProfile ecp_profile_ = LegacyECPProfile::FIXED_SLATER;
   std::vector<std::size_t> ecp_segment_offsets_, ecp_segment_indices_;
   std::size_t parameter_version_ = 0;
   std::shared_ptr<LegacyWaveFunctionReplay> replay_;
@@ -1176,7 +1202,9 @@ std::unique_ptr<NonLocalECPDerivativeConsumer> LegacyWaveFunctionAdapter::makeNo
   for (std::size_t sample = 0; sample < replay->sampleCount(); ++sample)
   {
     auto state = replay->prepareSample(sample);
-    validateECPProfile(state);
+    if (validateECPProfile(state) == LegacyECPProfile::DETS &&
+        !state.wavefunction.findMSD().front().get().usesAcceptedReferenceVirtualRatios())
+      throw std::invalid_argument("Legacy DETS ECP capture requires an enabled private evaluator");
     validateMasses(state.particles);
     if (sample == 0)
     {

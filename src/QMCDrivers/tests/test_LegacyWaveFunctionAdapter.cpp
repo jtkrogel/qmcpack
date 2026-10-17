@@ -2456,6 +2456,184 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   CHECK(evaluate(source, accepted) == source_log);
   source.evaluateRatios(ordinary, ordinary_after);
   CHECK(ordinary_before == ordinary_after);
+
+  // Actual Be BFD capture on the polynomial DETS model: octahedral knots
+  // include virtual-reference nodes and CI cancellation, with finite dCI.
+  ParticleSet p(cell), ions(cell);
+  ions.setName("ion0"); ions.create({1}); ions.R[0] = {0, 0, 0};
+  auto& isp = ions.getSpeciesSet();
+  const int be = isp.addSpecies("Be"), z = isp.addAttribute("charge");
+  isp(z, be) = 2; ions.resetGroups(); ions.update();
+  p.setName("e"); p.create({2, 2}); p.R = accepted.R;
+  p.R[2][2] = p.R[3][2] = 0.5; // avoid opposite-spin electron coincidence
+  auto& esp = p.getSpeciesSet();
+  const int u = esp.addSpecies("u"), d = esp.addSpecies("d"), mass = esp.addAttribute("mass");
+  esp(mass, u) = esp(mass, d) = 1;
+  p.resetGroups(); p.addTable(ions); p.update();
+  auto wf = makeBsplineJ2WaveFunction(p, {0.12, -0.08, 0.04, -0.01});
+  wf->addComponent(source.makeClone(p));
+  auto& live_msd = wf->findMSD().front().get();
+  live_msd.isolateOptimizationState();
+  live_msd.enableAcceptedReferenceVirtualRatios();
+  wf->evaluateLog(p);
+  const auto live_log = wf->getLogPsi();
+  const auto live_energy = kineticEnergy(p);
+  const auto positions = p.R;
+  LegacyWaveFunctionAdapter adapter("conventional", *wf, adapterOptions());
+  const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
+  REQUIRE(snapshot->values.size() == 5);
+  ParticleSet replay_p(p);
+  auto replay_wf = wf->makeClone(replay_p);
+  replay_wf->findMSD().front().get().isolateOptimizationState();
+  replay_p.update();
+  class FixedDETSReplay final : public LegacyWaveFunctionReplay
+  {
+  public:
+    FixedDETSReplay(TrialWaveFunction& wf, ParticleSet& p) : wf(wf), p(p), positions(p.R) {}
+    std::size_t sampleCount() const noexcept override { return 1; }
+    LegacyWaveFunctionReplaySample prepareSample(std::size_t index) override
+    {
+      REQUIRE(index == 0);
+      p.R = positions; p.update();
+      return {wf, p};
+    }
+    TrialWaveFunction& wf;
+    ParticleSet& p;
+    ParticleSet::ParticlePos positions;
+  };
+  auto replay = std::make_shared<FixedDETSReplay>(*replay_wf, replay_p);
+  auto op = adapter.makeDerivativeOperator(replay, snapshot, 0, 0);
+  auto consumer = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 0, 0);
+  ECPComponentBuilder builder("Be", OHMMS::Controller, 3, 1);
+  const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/pseudopotentials_for_tests/Be.BFD.xml";
+  REQUIRE(builder.read_pp_file(asset.string()));
+  auto nonlocal = std::make_unique<NonLocalECPotential>(ions, p, false, true);
+  auto* nl = nonlocal.get();
+  nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+  auto local = std::make_unique<LocalECPotential>(ions, p);
+  auto* loc = local.get();
+  local->add(0, std::move(builder.pp_loc), builder.Zeff);
+  QMCHamiltonian ham;
+  ham.addOperator(std::make_unique<BareKineticEnergy>(p), "Kinetic");
+  ham.addOperator(std::move(local), "LocalECP");
+  ham.addOperator(std::move(nonlocal), "NonLocalECP");
+  ham.addObservables(p);
+  class CountZero final : public FakeRandom<QMCTraits::FullPrecRealType>
+  {
+  public:
+    QMCTraits::FullPrecRealType operator()() override { ++draws; return 0; }
+    std::size_t draws = 0;
+  } rng;
+  nl->setRandomGenerator(&rng);
+  ResourceCollection pr("md_ecp_P"), wr("md_ecp_W"), hr("md_ecp_H");
+  p.createResource(pr); wf->createResource(wr); ham.createResource(hr);
+  RefVectorWithLeader<ParticleSet> ps(p, {p});
+  RefVectorWithLeader<TrialWaveFunction> wfs(*wf, {*wf});
+  RefVectorWithLeader<QMCHamiltonian> hs(ham, {ham});
+  const auto ecp_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  const auto total_mask = ecp_mask | localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  const std::vector<DerivativeValue> unit{1};
+  const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+      coefficientsFor(*op, unit), ecp_mask};
+  RecordingParameterSink idle;
+  QMCHamiltonian::StreamingNonLocalECPResult captured;
+  {
+    ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+    ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, wfs);
+    ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+    captured = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(hs, wfs, ps, *consumer, {&capture, 1}, idle);
+  }
+  const auto draws = rng.draws;
+  CHECK(draws > 0);
+  auto record = consumer->releaseJVPReplay();
+  const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
+  REQUIRE(!points.empty());
+  CHECK(std::any_of(points.begin(), points.end(), [](const auto& q) { return q.complete_ratio == DerivativeValue{}; }));
+  bool nonzero_ci_at_zero_ratio = false, nonzero_total_at_reference_node = false;
+  for (const auto& q : points)
+  {
+    const int first = q.electron < 2 ? 0 : 2;
+    const double other = positions[first + (q.electron == first ? 1 : 0)][0];
+    if (q.replacement_position[0] * q.replacement_position[0] == other * other &&
+        q.complete_ratio != DerivativeValue{})
+      nonzero_total_at_reference_node = true;
+    if (q.complete_ratio != DerivativeValue{}) continue;
+    replay->prepareSample(0);
+    adapter.installSnapshot(*replay_wf, replay_p, *snapshot);
+    for (int dim = 0; dim < 3; ++dim) replay_p.R[q.electron][dim] = q.replacement_position[dim];
+    replay_p.update();
+    std::array<QMCTraits::ValueType, 5> derivative{};
+    replay_wf->findMSD().front().get().evaluateAcceptedReferenceRatioDerivatives(
+        replay_p, q.electron, q.electron, adapter.registrationVariables(), {derivative.data(), derivative.size()});
+    nonzero_ci_at_zero_ratio |= std::any_of(derivative.begin(), derivative.end(),
+        [](auto value) { return std::abs(value) > 0.1; });
+  }
+  CHECK(nonzero_ci_at_zero_ratio);
+  CHECK(nonzero_total_at_reference_node);
+  op->bindNonLocalECPJVPReplay(std::move(record));
+  const double local_value = loc->evaluate(p);
+  // Independent occupied 2x2 determinant polynomials, not the bordered helper.
+  const auto fixed_energy = [&](const StructuredParameterSnapshot& candidate) {
+    ParticleSet trial(p);
+    auto twf = wf->makeClone(trial);
+    twf->findMSD().front().get().isolateOptimizationState();
+    trial.update(); adapter.installSnapshot(*twf, trial, candidate);
+    const double c = twf->findMSD().front().get().get_C()[1];
+    const auto jlog = [&](TrialWaveFunction& state, ParticleSet& particles) {
+      double value = 0;
+      particles.G = QMCTraits::GradType{}; particles.L = QMCTraits::ValueType{};
+      for (auto& component : state.getOrbitals())
+        if (!component->isFermionic()) value += component->evaluateLog(particles, particles.G, particles.L).real();
+      return value;
+    };
+    const double accepted_j = jlog(*twf, trial);
+    trial.R = positions; trial.update(); adapter.installSnapshot(*twf, trial, candidate);
+    DerivativeValue energy = kineticEnergy(trial) + local_value;
+    for (const auto& q : points)
+    {
+      auto r = positions;
+      for (int dim = 0; dim < 3; ++dim) r[q.electron][dim] = q.replacement_position[dim];
+      const auto determinant = [&](int spin, bool alt) {
+        const double x = r[2 * spin][0], y = r[2 * spin + 1][0];
+        return alt ? y - x : y * y - x * x;
+      };
+      const double ratio = (determinant(0, false) * determinant(1, false) +
+          c * determinant(0, true) * determinant(1, true)) / (9 + c);
+      trial.R = r; trial.update();
+      energy += q.bare_weight * ratio * std::exp(jlog(*twf, trial) - accepted_j);
+    }
+    return energy;
+  };
+  CHECK(fixed_energy(*snapshot).real() == Catch::Approx(captured.local_energies[0]).epsilon(3e-12).margin(3e-12));
+  const VJPCoefficientChannel total{"total", DerivativeProduct::LOCAL_ENERGY_VJP,
+      coefficientsFor(*op, unit), total_mask};
+  RecordingParameterSink transpose, hermitian;
+  op->applyVJPs({&total, 1}, DerivativeAdjoint::TRANSPOSE, transpose);
+  op->applyVJPs({&total, 1}, DerivativeAdjoint::HERMITIAN, hermitian);
+  std::vector<DerivativeValue> direction(5);
+  DerivativeValue dual{};
+  for (std::size_t parameter = 0; parameter < 5; ++parameter)
+  {
+    auto plus = *snapshot, minus = *snapshot;
+    plus.values[parameter] += 1e-5; minus.values[parameter] -= 1e-5;
+    const auto fd = (fixed_energy(plus) - fixed_energy(minus)) / 2e-5;
+    CHECK(transpose.result()[0][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-6).margin(3e-8));
+    checkClose(hermitian.result()[0][parameter], std::conj(transpose.result()[0][parameter]));
+    direction[parameter] = 0.1 * (parameter + 1);
+    dual += direction[parameter] * transpose.result()[0][parameter];
+  }
+  RecordingSampleSink jvp;
+  op->applyLocalEnergyJVP({adapter.parameterSchema(), snapshot->version, {direction.data(), direction.size()}}, total_mask, jvp);
+  checkClose(jvp.result()[0], dual);
+  CHECK(op->storageDiagnostics().real_parameter_vectors == 2);
+  CHECK(rng.draws == draws);
+  for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    CHECK(p.R[electron] == positions[electron]);
+  wf->evaluateLog(p);
+  CHECK(wf->getLogPsi() == live_log);
+  checkClose(kineticEnergy(p), live_energy);
+  CHECK_FALSE(source.usesAcceptedReferenceVirtualRatios());
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
