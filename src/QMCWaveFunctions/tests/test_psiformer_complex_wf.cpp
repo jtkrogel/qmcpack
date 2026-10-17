@@ -66,6 +66,8 @@ class TestNonLocalECPotential
 public:
   static void setTileCapacity(NonLocalECPotential& potential, std::size_t capacity)
   { potential.setOuterTileCapacityForTesting(capacity); }
+  static bool sameSchema(const NonLocalECPotential& a, const NonLocalECPotential& b)
+  { return a.multiWalkerResourceSchema() == b.multiWalkerResourceSchema(); }
 };
 }
 namespace
@@ -4281,6 +4283,8 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   ScopedComplexGpuControls controls;
   const SimulationCell simulation_cell(cell());
   auto source = ions(simulation_cell), p = electrons(simulation_cell, 3, 1);
+  // VP's zero-table limit means "all" when cloned; prepare the same ion table in both owners first.
+  p.addTable(source); p.update();
   // An existing radial operator on the periodic numerical fixture, NOT a new native PP profile.
   auto nonlocal = std::make_unique<NonLocalECPotential>(source, p, false, true);
   auto* nl0 = nonlocal.get();
@@ -4308,6 +4312,7 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   ham.addObservables(p);
   auto ham1 = ham.makeClone(p1, *trial1);
   auto& nl1 = dynamic_cast<NonLocalECPotential&>(*ham1->getComponent(1));
+  REQUIRE(testing::TestNonLocalECPotential::sameSchema(*nl0, nl1));
   FakeRandom<QMCTraits::FullPrecRealType> rng0, rng1; rng0.set_value(.371); rng1.set_value(.371);
   nl0->setRandomGenerator(&rng0); nl1.setRandomGenerator(&rng1);
   RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial, *trial1});
