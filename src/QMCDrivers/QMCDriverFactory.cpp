@@ -279,9 +279,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       if (!primaryPsi.extractStructuredParameterProviders().empty() || qmc_system.isSpinor() ||
           qmc_system.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
         throw UniformCommunicateError("wavefunction parameter_file requires a qualified conventional CPU model");
-#ifdef QMC_COMPLEX
-      throw UniformCommunicateError("wavefunction parameter_file currently requires a real CPU build");
-#endif
+      // Binding/setHamiltonian below admits the precise scalar/model profile
+      // before import; a complex build alone does not qualify an arbitrary model.
       if (particle_pool.getParticleSet(request->target) != &qmc_system)
         throw UniformCommunicateError("wavefunction parameter_file selected a different electron target");
       if (request->imported_hamiltonian && request->imported_hamiltonian != &primaryH)
