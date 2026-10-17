@@ -19,8 +19,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -513,9 +511,6 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
     ParameterGradientView objective)
 {
   validateInputs(schema, parameters, objective);
-  if (std::getenv("QMCPACK_TASK46_HEX_DIAGNOSTIC") && parameter_count_ == 8)
-    for (std::size_t i = 0; i < parameter_count_; ++i)
-      std::fprintf(stderr, "T46HEX FIRSTORDER version=%zu index=%zu gradient=%a\n", parameters.version, i, objective.gradient[i]);
   StructuredParameterSnapshot candidate = parameters;
   const std::uint64_t next_iteration = accepted_update_count_ + 1;
   const double adam_first_correction =
