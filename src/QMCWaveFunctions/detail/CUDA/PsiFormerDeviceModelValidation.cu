@@ -40,6 +40,7 @@
 #include "PsiFormerDeviceCoordinatesValidation.h"
 #include "PsiFormerDeviceMetropolisValidation.h"
 #include "PsiFormerDeviceResidentAdamValidation.h"
+#include "PsiFormerDeviceVglOwnershipValidation.h"
 #include "PsiFormerDeviceSrMetricValidation.h"
 #include "PsiFormerDevicePcgValidation.h"
 #include "PsiFormerDeviceEnergySrValidation.h"
@@ -143,7 +144,7 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--device-candidate-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] [--retained-energy-sr-only] "
-                                  "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--vgl-ownership FULL|K1] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
@@ -162,6 +163,7 @@ int main(int argc, char** argv)
     bool resident_pcg_only = false;
     bool energy_sr_only = false;
     bool retained_energy_sr_only = false;
+    std::string vgl_ownership;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -197,6 +199,12 @@ int main(int argc, char** argv)
         energy_sr_only = true;
       else if (option == "--retained-energy-sr-only" && !retained_energy_sr_only)
         retained_energy_sr_only = true;
+      else if (option == "--vgl-ownership" && vgl_ownership.empty() && argument + 1 < argc)
+      {
+        vgl_ownership = argv[++argument];
+        if (vgl_ownership != "FULL" && vgl_ownership != "K1")
+          throw std::invalid_argument("VGL ownership mode must be FULL or K1");
+      }
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -244,11 +252,27 @@ int main(int argc, char** argv)
       throw std::invalid_argument("Metropolis-only validation cannot request other modes or exports");
     if ((resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (!shape_supplied || determinants != 4 || width != 16 || heads != 4 || blocks != 2))
       throw std::invalid_argument("Resident PCG/ENERGY SR gate requires explicit tiny --shape 4 16 4 2");
+    if (!vgl_ownership.empty())
+    {
+      if (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot || kinetic_trunk_only ||
+          target_selection_spot || metropolis_only || resident_adam_only || device_candidate_only || sr_metric_only ||
+          resident_pcg_only || energy_sr_only || retained_energy_sr_only || !score_output.empty() ||
+          !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty())
+        throw std::invalid_argument("VGL ownership is a separate fresh-process request without other modes/exports");
+      validateVglOwnershipAdmission(); // Before ANY numerical DEVICE allocation.
+    }
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
+    if (!vgl_ownership.empty())
+    {
+      std::ofstream output(argv[3]);
+      if (!output) throw std::runtime_error("Cannot open VGL ownership output");
+      measureVglOwnership(model, plan, vgl_ownership == "K1", output);
+      return 0; // Before CPU references, score/kinetic owners or any parameter trace.
+    }
     if ((resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (plan.parameterCount() != 3922 || model.ne != 4 || model.cfg.nup != 2))
       throw std::invalid_argument("Resident PCG/ENERGY SR gate requires P3922/Ne4/Nup2, before GPU image preparation");
     if (target_kinetic_spot || target_selection_spot || kinetic_trunk_only)
