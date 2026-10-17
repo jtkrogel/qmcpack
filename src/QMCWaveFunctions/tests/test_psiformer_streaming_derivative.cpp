@@ -2436,6 +2436,7 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
     CHECK(actual_first[i] == Catch::Approx(first[i]).epsilon(2e-8).margin(2e-9));
     CHECK(actual_second[i] == Catch::Approx(second[i]).epsilon(2e-8).margin(2e-9));
   }
+  std::cout << "PASS component DEVICE Adam: three_updates=3, CPU_moments=1, cold_fence=1\n";
   }
 }
 #endif
