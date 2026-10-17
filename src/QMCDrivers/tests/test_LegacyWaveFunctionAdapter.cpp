@@ -2491,9 +2491,9 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 #ifndef QMC_COMPLEX
 TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
 {
-  // The nodal model uses the ordinary tetrahedral BFD rule and a counting
-  // identity-rotation RNG, making px-py cancellation exact, not tolerance-zero.
-  const std::string node_coefficients = "0 1 -1  1 0 0  0 1 1";
+  // The nodal model uses the supported octahedral BFD rule and a counting
+  // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
+  const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
   for (int model = 0; model < 2; ++model)
   {
     CAPTURE(model);
@@ -2516,19 +2516,18 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
     ions.update();
     if (model == 1)
     {
-      particles.R[0] = {0, 1, 0};
-      particles.R[1] = {1, 0, 0};
+      particles.R[0] = {1, 0, 0};
+      particles.R[1] = {-2, 0, 0};
     }
-    const std::string coefficients = model == 0 ? "1 0 0  0 1 0  0 0 1" : node_coefficients;
+    const std::string coefficients = model == 0 ? "1 0 0 0  0 1 0 0  0 0 1 0" : node_coefficients;
     REQUIRE(!coefficients.empty());
     Libxml2Document definition;
     REQUIRE(definition.parseFromString(std::string{R"(<wavefunction name="psi0" target="e">
       <sposet_collection type="MolecularOrbital" source="ion0">
         <basisset keyword="STO" transform="no"><atomicBasisSet type="STO" elementType="Be"
-            angular="cartesian" expandYlm="no" normalized="no">
+            angular="cartesian" normalized="no">
           <basisGroup rid="S" n="1" l="0" m="0" type="Slater"><radfunc n="1" exponent="1.2"/></basisGroup>
-          <basisGroup rid="X" n="2" l="1" m="-1" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
-          <basisGroup rid="Y" n="2" l="1" m="0" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
+          <basisGroup rid="P" n="2" l="1" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
         </atomicBasisSet></basisset>
         <rotated_sposet name="rot"><sposet name="base" size="3">
           <coefficient size="3" id="accepted">)"} + coefficients + R"(</coefficient>
@@ -2549,11 +2548,21 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
       return dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
     };
+    // Cartesian input expands a complete p shell. Explicit 3x4 coefficients
+    // select the orthogonal s,px,py subspace and leave pz identically unused.
+    auto& initial_lcao = dynamic_cast<LCAOrbitalSet&>(*rotated(*source).Phi_);
+    REQUIRE(initial_lcao.getBasisSetSize() == 4);
+    REQUIRE(initial_lcao.C->rows() == 3);
+    REQUIRE(initial_lcao.C->cols() == 4);
+    const int selected[] = {model == 0 ? 0 : 1, model == 0 ? 1 : 0, 2};
+    for (int row = 0; row < 3; ++row)
+      for (int column = 0; column < 4; ++column)
+        CHECK((*initial_lcao.C)(row, column) == (column == selected[row] ? 1.0 : 0.0));
     particles.update();
     source->evaluateLog(particles);
     LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
     REQUIRE(adapter.snapshotParameters().values.size() == 6);
-    ECPComponentBuilder builder("Be", OHMMS::Controller, 2, 1);
+    ECPComponentBuilder builder("Be", OHMMS::Controller, model == 0 ? 2 : 3, 1);
     const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
         "tests/pseudopotentials_for_tests/Be.BFD.xml";
     REQUIRE(builder.read_pp_file(asset.string()));
