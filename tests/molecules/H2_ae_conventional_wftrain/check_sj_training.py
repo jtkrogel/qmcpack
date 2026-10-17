@@ -180,7 +180,8 @@ def apply_external_orbital_reference(tree, model, vp):
         assert full.size == 3 and np.isfinite(full).all()
         output["version"] = np.asarray([1, 1, 0], dtype=np.int32)
         lists = output.create_group("name_value_lists")
-        lists.create_dataset("parameter_names", data=names, dtype=h5py.string_dtype("utf-8"))
+        # Match the legacy vector<string> proxy's variable-length H5T_C_S1 ASCII type.
+        lists.create_dataset("parameter_names", data=names, dtype=h5py.string_dtype("ascii"))
         lists["parameter_values"] = values
         rotation = output.create_group("RotatedSPOs")
         rotation.create_group("rotation_global")[f"rotation_global_{name}"] = full
