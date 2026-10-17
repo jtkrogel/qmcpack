@@ -411,7 +411,9 @@ def main():
         if reject:
             assert result.returncode != 0, (directory, text[-4000:])
             if isinstance(reject, tuple):
-                assert label == "reject_changed_import_pp", "alternative diagnostics are limited to PP identity rejection"
+                assert label == "reject_changed_import_pp" or (args.complex_periodic_heg and label in
+                    ("reject_changed_cell_import", "reject_changed_cutoff_import")), \
+                    "alternative diagnostics are limited to qualified PP/complex periodic identity rejection"
                 assert any(message in text for message in reject), (directory, reject, text[-4000:])
             else:
                 assert reject in text, (directory, reject, text[-4000:])
