@@ -84,9 +84,9 @@ public:
   /// The execution lease owns this nonmovable owner; the receipt retains its exact old image.
   struct CompletedResult
   {
-    const PreparedDeviceComplexProducts* owner;
+    const PreparedDeviceComplexProducts* owner = nullptr;
     std::shared_ptr<const PreparedDeviceModel> image;
-    std::size_t generation, channels, parameters;
+    std::size_t generation = 0, channels = 0, parameters = 0;
   };
 
   /// Borrow completed per-sample complex JVPs, never a sample-by-parameter table.

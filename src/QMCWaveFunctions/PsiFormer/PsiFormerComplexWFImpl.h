@@ -642,10 +642,9 @@ struct PsiFormerComplexWF::Impl
         }
         result = lane->products->completedResult();
       }
-      // Preserve the existing complete three-channel transfer inventory even
-      // when a caller requests a subset; only requested channels reach its sink.
+      // All DEVICE channels were finite-admitted; only requested outputs cross D2H.
       for (const auto& chunk : chunks.chunks())
-        for (std::size_t c = 0; c < lane->channels.size(); ++c)
+        for (std::size_t c = 0; c < requested.size(); ++c)
         {
           const C* output;
           {
@@ -654,7 +653,7 @@ struct PsiFormerComplexWF::Impl
             std::unique_lock gpu(lane->generation->mutex);
             output = lane->products->downloadCompletedChunk(result, c, chunk.parameter_offset, chunk.count);
           }
-          if (c < requested.size()) sink.add(c, {chunk, {output, chunk.count}});
+          sink.add(c, {chunk, {output, chunk.count}});
         }
     }
 

@@ -203,6 +203,7 @@ void validateComplexProducts()
     fails([&] { (void)bounded->resultView(); });
     const auto receipt = bounded->completedResult();
     const auto no_transfer = metrics.snapshot();
+    fails([&] { bounded->downloadCompletedChunk(Owner::CompletedResult{}, 0, 0, 1); });
     auto invalid_receipt = receipt; invalid_receipt.owner = owner.get();
     fails([&] { bounded->downloadCompletedChunk(invalid_receipt, 0, 0, 1); });
     invalid_receipt = receipt; invalid_receipt.image.reset();
@@ -243,6 +244,24 @@ void validateComplexProducts()
   std::vector<C> direction(p), expected_jvp(b);
   const auto dot_warm = metrics.snapshot();
   for (std::size_t i = 0; i < p; ++i) direction[i] = .005 * std::sin(double(i + 1));
+  for (std::size_t requested : {std::size_t{1}, std::size_t{2}})
+  {
+    const auto before_subset = metrics.snapshot();
+    bounded->evaluate(positions, masses, kappa, channels);
+    const auto receipt = bounded->completedResult();
+    for (std::size_t channel = 0; channel < requested; ++channel)
+      for (std::size_t offset = 0; offset < p; offset += chunk)
+      {
+        const auto count = std::min(chunk, p-offset);
+        const auto* output = bounded->downloadCompletedChunk(receipt, channel, offset, count);
+        for (std::size_t i = 0; i < count; ++i)
+          require(std::abs(output[i]-expected[channel*p+offset+i]) <= 3e-9*(1+std::abs(expected[channel*p+offset+i])),
+              "Complex products requested subset differs from CPU");
+      }
+    require(metrics.snapshot().downloaded_bytes-before_subset.downloaded_bytes ==
+        baseline_download + 16*requested*p + sizeof(DerivativeFiniteStatus)*cost.statuses,
+        "Complex products subset transferred an unrequested HOST channel");
+  }
   bounded->evaluate(positions, masses, kappa, channels);
   const auto before_jvp = bounded->completedResult();
   bounded->evaluateScoreJVP(positions, direction.data(), direction.size());
