@@ -4140,7 +4140,9 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
       (localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)));
   const auto storage = op->storageDiagnostics();
   CHECK(storage.shared_workspace_bytes == before_bind.shared_workspace_bytes);
-  CHECK(storage.retained_numeric_bytes == before_bind.retained_numeric_bytes + replay_bytes + 2168);
+  // Binding adds only references, weights and base coefficients, not full virtual coordinates.
+  CHECK(storage.retained_numeric_bytes == before_bind.retained_numeric_bytes + replay_bytes +
+      grid.size() * sizeof(std::size_t) + (op->sampleCount() + grid.size()) * sizeof(C));
   CHECK(storage.allocation_generation == 2);
   // Independent CPU score contraction uses actual complete physical ratios on the identical grid.
   std::vector<std::unique_ptr<ParticleSet>> all;
