@@ -1227,14 +1227,16 @@ struct PsiFormerComplexWF::Impl
       throw std::invalid_argument("Complex PsiFormer scalar active particle mismatch");
   }
 
-  /// Copy physical positions through checked double input setters, replacing only the active row.
+  /// Copy positions through checked setters, optionally replacing one row by an absolute virtual position.
   template<class Workspace>
-  void positions(Workspace& workspace, const ParticleSet& p, int replacement = -1) const
+  void positions(Workspace& workspace, const ParticleSet& p, int replacement = -1,
+      const ParticleSet::PosType* absolute = nullptr) const
   {
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
       for (int dimension = 0; dimension < 3; ++dimension)
         workspace.setPosition(electron, dimension,
-            replacement == electron ? p.activeR(electron)[dimension] : p.R[electron][dimension]);
+            replacement == electron ? (absolute ? (*absolute)[dimension] : p.activeR(electron)[dimension])
+                                    : p.R[electron][dimension]);
   }
 
   /// Capacity is immutable even when publication replaces the generation pointer.
@@ -1421,7 +1423,8 @@ struct PsiFormerComplexWF::Impl
   };
 
   /// Route VALUE/FULL/ACTIVE without duplicating physical twist, ratio or cache algebra.
-  CoreResult core(const ParticleSet& p, bool spatial, int replacement = -1, int electron = -1)
+  CoreResult core(const ParticleSet& p, bool spatial, int replacement = -1, int electron = -1,
+      const ParticleSet::PosType* absolute = nullptr)
   {
     NativeTimerScope timer(spatial ? (electron < 0 ? phase_timers.vgl : phase_timers.gradient) : phase_timers.value);
     CoreResult result;
@@ -1436,7 +1439,7 @@ struct PsiFormerComplexWF::Impl
       lane.resizeLive(1);
       for (int e = 0; e < p.getTotalNum(); ++e)
         for (int d = 0; d < 3; ++d)
-          lane.positions[e * 3 + d] = replacement == e ? p.activeR(e)[d] : p.R[e][d];
+          lane.positions[e * 3 + d] = replacement == e ? (absolute ? (*absolute)[d] : p.activeR(e)[d]) : p.R[e][d];
       if (spatial)
       {
         {
@@ -1474,13 +1477,13 @@ struct PsiFormerComplexWF::Impl
     {
       NativeTimerScope numerical_timer(phase_timers.cpu_spatial);
       auto& workspace = electron < 0 ? *full : *active;
-      positions(workspace, p, replacement);
+      positions(workspace, p, replacement, absolute);
       static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
           ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
     }
     else
     {
-      positions(*value, p, replacement);
+      positions(*value, p, replacement, absolute);
       const auto evaluated = state->value.evaluate(*value);
       result.amplitude = evaluated.amplitude;
       result.parameter_version = evaluated.parameter_version;
@@ -1536,7 +1539,8 @@ struct PsiFormerComplexWF::Impl
   }
 
   /// Validate the accepted reference before computing a complex ratio from unit core phases.
-  PsiValue formRatio(const Amplitude& proposed, const ParticleSet& p, int electron) const
+  PsiValue formRatio(const Amplitude& proposed, const ParticleSet& p, int electron,
+      const ParticleSet::PosType* absolute = nullptr) const
   {
     if (!accepted_valid || accepted_key != configurationIdentity(p) ||
         accepted_version != state->model.p.version() || accepted.isZero())
@@ -1546,7 +1550,8 @@ struct PsiFormerComplexWF::Impl
     {
       double delta = 0;
       for (int dimension = 0; dimension < 3; ++dimension)
-        delta += state->cartesian_twist[dimension] * (p.activeR(electron)[dimension] - p.R[electron][dimension]);
+        delta += state->cartesian_twist[dimension] *
+            ((absolute ? (*absolute)[dimension] : p.activeR(electron)[dimension]) - p.R[electron][dimension]);
       result = proposed.phase / accepted.phase * std::exp(proposed.log_abs - accepted.log_abs) *
           C{std::cos(delta), std::sin(delta)};
     }
@@ -2961,10 +2966,34 @@ void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet&, std::vector<ValueT
   rejectUnsupported("all-to-one ratios");
 }
 
-/// Virtual/ECP geometry has no public complex qualification.
-void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet&, std::vector<ValueType>&)
+/// Evaluate pure wavefunction VALUE ratios without moving or publishing the accepted walker.
+void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet& virtuals, std::vector<ValueType>& ratios)
 {
-  rejectUnsupported("virtual/ECP ratios");
+  std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
+  const auto& reference = virtuals.getRefPS();
+  impl_->requireIdle(reference);
+  impl_->validate(reference, virtuals.refPtcl);
+  if (reference.isSpinor() || virtuals.isSpinor() || virtuals.refPtcl < 0 ||
+      ratios.size() != virtuals.getTotalNum() || virtuals.R.size() != virtuals.getTotalNum())
+    throw std::invalid_argument("Complex PsiFormer virtual VALUE shape/spin/reference mismatch");
+  for (const auto& position : virtuals.R)
+    for (int d = 0; d < 3; ++d)
+      if (!psiformer::determinant::isFiniteReal(position[d]))
+        throw std::invalid_argument("Complex PsiFormer virtual VALUE position is nonfinite");
+  // Validate the current nonzero denominator before touching either numerical owner.
+  impl_->formRatio(impl_->accepted, reference, virtuals.refPtcl, &reference.R[virtuals.refPtcl]);
+  // The admitted clone budget also bounds this transient Q-vector; caller/model/shared GPU storage is excluded.
+  if (ratios.size() > (impl_->numeric_limit - impl_->numeric_required) / sizeof(ValueType))
+    throw std::length_error("Complex PsiFormer virtual VALUE staging exceeds clone numeric cap");
+  std::vector<ValueType> staged(ratios.size());
+  for (std::size_t q = 0; q < staged.size(); ++q)
+  {
+    const auto evaluated = impl_->core(reference, false, virtuals.refPtcl, -1, &virtuals.R[q]);
+    staged[q] = impl_->formRatio(evaluated.amplitude, reference, virtuals.refPtcl, &virtuals.R[q]);
+  }
+  // No partial output is visible if a later virtual evaluation fails.
+  std::copy(staged.begin(), staged.end(), ratios.begin());
 }
 
 /// Internal score does not qualify virtual parameter response.

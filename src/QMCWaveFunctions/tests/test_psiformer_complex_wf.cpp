@@ -3727,4 +3727,140 @@ TEST_CASE("PsiFormer paired inference crowds own independent leased lanes",
   CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
 }
 #endif
+TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole Bloch phase",
+          "[wavefunction][psiformer][complex_virtual_value]")
+{
+  const auto lattice = cell();
+  const SimulationCell simulation_cell(lattice);
+  auto p = electrons(simulation_cell), sibling_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF component("virtual", initialized, p, source, clone_cap, twist);
+  const auto accepted_log = evaluate(component, p);
+  const auto accepted_g = p.G;
+  const auto accepted_l = p.L;
+  const auto snapshot = component.snapshotParameters();
+  const auto storage = component.numericStorage();
+  auto sibling_base = component.makeClone(sibling_p);
+  auto& sibling = dynamic_cast<PsiFormerComplexWF&>(*sibling_base);
+  close(evaluate(sibling, sibling_p), accepted_log);
+  // Both spin rows use absolute positions, including an exact lattice translation.
+  for (int electron : {0, 2})
+  {
+    VirtualParticleSet vp(p);
+    std::vector<ParticleSet::PosType> positions{p.R[electron], p.R[electron], p.R[electron]};
+    positions[1][0] += .031;
+    positions[1][2] -= .017;
+    for (int d = 0; d < 3; ++d)
+      positions[2][d] += lattice.R(0, d);
+    vp.makeMovesAbsolute(p, electron, {positions.data(), positions.size()});
+    std::vector<C> ratios(3, C{71, -9});
+    component.evaluateRatios(vp, ratios);
+    close(ratios[0], C{1, 0});
+    close(ratios[2], std::exp(C{0, 2 * std::acos(-1.) * twist[0]}));
+    for (std::size_t q = 0; q < positions.size(); ++q)
+    {
+      auto fresh_p = electrons(simulation_cell);
+      fresh_p.R[electron] = positions[q];
+      fresh_p.update();
+      PsiFormerComplexWF fresh("independent", initialized, fresh_p, source, clone_cap, twist);
+      close(ratios[q], std::exp(evaluate(fresh, fresh_p) - accepted_log));
+    }
+    const auto expected = ratios;
+    component.evaluateRatios(vp, ratios);
+    CHECK(ratios == expected);
+    vp.R[2][0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(component.evaluateRatios(vp, ratios));
+    CHECK(ratios == expected);
+    vp.makeMovesAbsolute(p, electron, {positions.data(), positions.size()});
+    vp.refPtcl = 4;
+    CHECK_THROWS(component.evaluateRatios(vp, ratios));
+    CHECK(ratios == expected);
+    vp.refPtcl = electron;
+    std::vector<C> short_output(2, C{71, -9});
+    CHECK_THROWS(component.evaluateRatios(vp, short_output));
+    CHECK(short_output == std::vector<C>(2, C{71, -9}));
+    VirtualParticleSet foreign(sibling_p);
+    foreign.makeMovesAbsolute(sibling_p, electron, {positions.data(), positions.size()});
+    CHECK_THROWS(component.evaluateRatios(foreign, ratios));
+    p.makeMove(electron, ParticleSet::PosType{.01, 0, 0});
+    component.ratio(p, electron);
+    CHECK_THROWS(component.evaluateRatios(vp, ratios));
+    component.restore(electron);
+    p.rejectMove(electron);
+    component.evaluateRatios(vp, ratios); // rejected calls do not poison the accepted denominator
+    CHECK(ratios == expected);
+    vp.R[0] = p.R[electron + 1]; // equal same-spin rows: theoretical node, not an IEEE-zero claim
+    component.evaluateRatios(vp, ratios);
+    close(ratios[0], C{});
+    vp.R[0] = positions[0];
+    component.evaluateRatios(vp, ratios);
+    CHECK(ratios == expected);
+  }
+  CHECK(component.get_log_value() == accepted_log);
+  CHECK(p.G == accepted_g);
+  CHECK(p.L == accepted_l);
+  CHECK(p.getActivePtcl() == -1);
+  CHECK(component.snapshotParameters().values == snapshot.values);
+  CHECK(component.numericStorage().fingerprint == storage.fingerprint);
+  CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+  close(evaluate(sibling, sibling_p), accepted_log);
+  VirtualParticleSet vp(p);
+  vp.makeMoves(p, 0, {ParticleSet::PosType{.02, 0, 0}});
+  std::vector<C> sentinel(1, C{71, -9});
+  component.publishParameters(snapshot, snapshot.version);
+  CHECK_THROWS(component.evaluateRatios(vp, sentinel));
+  CHECK(sentinel == std::vector<C>(1, C{71, -9}));
+  evaluate(component, p);
+  component.evaluateRatios(vp, sentinel);
+  // A zero BASE is undefined; no determinant inverse or undefined score is needed to reject it.
+  auto zero = initialized;
+  for (const auto& leaf : zero.layouts)
+    if (leaf.module.find("Backflow") != std::string::npos)
+      std::fill(zero.values.begin() + leaf.begin, zero.values.begin() + leaf.end, 0.);
+  PsiFormerComplexWF nodal("zero", zero, p, source, clone_cap, twist);
+  CHECK_THROWS(evaluate(nodal, p)); // zero BASE cannot publish the FULL accepted reference
+  const auto saved = sentinel;
+  CHECK_THROWS(nodal.evaluateRatios(vp, sentinel));
+  CHECK(sentinel == saved);
+#ifdef ENABLE_CUDA
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  const bool available = hipGetDeviceCount(&devices) == hipSuccess && devices;
+#else
+  const bool available = cudaGetDeviceCount(&devices) == cudaSuccess && devices;
+#endif
+  if (available)
+  {
+    ScopedComplexGpuControls controls;
+    auto gpu_p = electrons(simulation_cell);
+    PsiFormerComplexWF gpu("virtual_gpu", initialized, gpu_p, source, clone_cap, twist, 64 * 1024 * 1024);
+    REQUIRE(gpu.gpuInferenceEnabled());
+    const auto gpu_log = evaluate(gpu, gpu_p);
+    VirtualParticleSet gpu_vp(gpu_p);
+    std::vector<ParticleSet::PosType> positions{p.R[0], p.R[0], p.R[1]};
+    positions[0][0] += .02;
+    for (int d = 0; d < 3; ++d)
+      positions[1][d] += lattice.R(0, d);
+    gpu_vp.makeMovesAbsolute(gpu_p, 0, {positions.data(), positions.size()});
+    vp.makeMovesAbsolute(p, 0, {positions.data(), positions.size()});
+    std::vector<C> gpu_ratios(3), cpu_ratios(3);
+    component.evaluateRatios(vp, cpu_ratios);
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+    REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+    auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+    const auto warm = metrics.snapshot();
+    gpu.evaluateRatios(gpu_vp, gpu_ratios);
+    for (std::size_t q = 0; q < gpu_ratios.size(); ++q)
+      close(gpu_ratios[q], cpu_ratios[q]);
+    CHECK(gpu.get_log_value() == gpu_log);
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+  }
+#endif
+}
 } // namespace qmcplusplus
