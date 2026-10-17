@@ -207,6 +207,8 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
       auto candidate = old;
       for (std::size_t i = 0; i < candidate.values.size(); ++i)
         candidate.values[i] = old.values[i] + alpha * (full.values[i] - old.values[i]);
+      // Candidate installation evaluates immediately; initialize the copied distance tables first.
+      particles->update();
       wavefunction = conventional->makeCandidate(*particles, candidate);
       ham = hamiltonian.makeClone(*particles, *wavefunction);
       return;
