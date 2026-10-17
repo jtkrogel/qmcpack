@@ -717,6 +717,83 @@ void validateComplexProducts()
               << " real_direction_duality=1 zero_weight_node_rejected=1 retry=1 warm_allocations=0 storage_C3_unused_zero=1\n";
     std::cout << "PASS complex nonlocal JVP B=" << b << " Q=" << q
               << " per_base_CPU=1 physical_ratio_FD=1 VJP_duality=1 typed_receipts=1 overflow_revoked=1 same_transfers=1\n";
+
+    // The numerical ECP/SCORE consumer must not own an unused kinetic tape.
+    constexpr auto scope = ComplexProductsScope::SCORE_ECP_ONLY;
+    constexpr auto output = ComplexProductsHostOutput::CHUNKED;
+    const auto selective_cost = estimateComplexProductsCost(plan, targets, 2 * b + q, 3, chunk, output, scope);
+    require(selective_cost.kinetic.device_bytes == 0 && selective_cost.kinetic.host_bytes == 0 &&
+        selective_cost.kinetic.canonical_bytes == 0 && selective_cost.matrix_work == 0 &&
+        selective_cost.score_dot_scalar_work > 0, "Selective owner omitted work/kinetic accounting is false");
+    require(nc.device_bytes - selective_cost.device_bytes == nc.kinetic.device_bytes &&
+        nc.host_bytes - selective_cost.host_bytes == nc.kinetic.host_bytes, "Selective cost saving is not exact");
+    const auto prepare_selective = [&](std::size_t dev, std::size_t host) {
+      return Owner::prepare(image, targets, 2 * b + q, 3, chunk, queue, blas, dev, host, 1, output, scope);
+    };
+    const auto selective_cold = metrics.snapshot();
+    fails([&] { prepare_selective(selective_cost.device_bytes - 1, selective_cost.host_bytes); });
+    fails([&] { prepare_selective(selective_cost.device_bytes, selective_cost.host_bytes - 1); });
+    fails([&] { estimateComplexProductsCost(plan, 0, b, 3, chunk, output, scope); });
+    fails([&] { estimateComplexProductsCost(plan, 5, b, 3, chunk, output, scope); });
+    fails([&] { estimateComplexProductsCost(plan, targets, b, 3, chunk, output, static_cast<ComplexProductsScope>(9)); });
+    require(metrics.snapshot().allocation_calls == selective_cold.allocation_calls,
+        "Selective cap/option rejection allocated DEVICE storage");
+    auto selective = prepare_selective(selective_cost.device_bytes, selective_cost.host_bytes);
+    require(metrics.snapshot().live_bytes - selective_cold.live_bytes == selective_cost.device_bytes,
+        "Selective numerical allocation still owns a hidden kinetic tape");
+    const auto selective_fingerprint = selective->storageFingerprint();
+    const auto selective_warm = metrics.snapshot();
+    std::vector<Owner::Channel> score_channels(3, {Owner::Role::SCORE, contractions.data(), b});
+    selective->evaluate(positions, masses, kappa, score_channels);
+    const auto score_receipt = selective->completedResult();
+    for (std::size_t offset = 0; offset < p; offset += chunk)
+    {
+      const auto count = std::min(chunk, p - offset);
+      const auto* values = selective->downloadCompletedChunk(score_receipt, 0, offset, count);
+      for (std::size_t i = 0; i < count; ++i)
+      {
+        C expected{};
+        for (std::size_t sample = 0; sample < b; ++sample) expected += contractions[sample] * base_scores[sample][offset + i];
+        require(std::abs(values[i] - expected) <= 3e-9 * (1 + std::abs(expected)), "Selective SCORE allP differs");
+      }
+    }
+    for (bool adjoint : {false, true})
+    {
+      selective->evaluateLocalEnergyVJPReplacements(positions, replacement, refs, weights, contractions,
+          masses, kappa, Terms::NONLOCAL_ECP, adjoint);
+      const auto receipt = selective->completedResult();
+      for (std::size_t offset = 0; offset < p; offset += chunk)
+      {
+        const auto count = std::min(chunk, p - offset);
+        const auto* values = selective->downloadCompletedChunk(receipt, 0, offset, count);
+        for (std::size_t i = 0; i < count; ++i)
+          require(std::abs(values[i] - (adjoint ? conjugate_reference : reference)[offset + i]) <=
+              3e-9 * (1 + std::abs(values[i])), "Selective ECP allP/physicalFD reference differs");
+      }
+    }
+    selective->evaluateLocalEnergyJVPReplacements(positions, replacement, refs, weights, masses, kappa,
+        Terms::NONLOCAL_ECP, tangent.data(), p);
+    const auto selective_receipt = selective->localEnergyJvpView();
+    for (std::size_t sample = 0; sample < b; ++sample)
+      require(std::abs(selective_receipt.data[sample] - cpu_nonlocal_jvp[sample]) <=
+          3e-9 * (1 + std::abs(cpu_nonlocal_jvp[sample])), "Selective per-base physicalFD/duality JVP differs");
+    const auto before_refusal = metrics.snapshot();
+    for (auto terms : {Terms::KINETIC, Terms::COMPLETE})
+    {
+      fails([&] { selective->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa, terms); });
+      fails([&] { selective->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, terms, tangent.data(), p); });
+    }
+    fails([&] { selective->evaluate(positions, masses, kappa, complete_channels); });
+    fails([&] { selective->validate(selective_receipt); });
+    fails([&] { (void)selective->completedResult(); });
+    require(metrics.snapshot().uploaded_bytes == before_refusal.uploaded_bytes &&
+        metrics.snapshot().downloaded_bytes == before_refusal.downloaded_bytes, "Selective kinetic refusal launched work");
+    selective->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions);
+    require(selective->storageFingerprint() == selective_fingerprint &&
+        metrics.snapshot().allocation_calls == selective_warm.allocation_calls &&
+        metrics.snapshot().free_calls == selective_warm.free_calls, "Selective warm refusal/retry changed ownership");
+    std::cout << "PASS complex selective SCORE_ECP_ONLY CPU_allP=1 bothadjoints=1 JVP=1 cap_preflight=1 kinetic_refused=1"
+              << " warm_allocations=0 device_saved=" << nc.kinetic.device_bytes << " host_saved=" << nc.kinetic.host_bytes << '\n';
   }
   std::cout << "PASS complex products B=" << b << " channels=" << c << " P=" << p
             << " K=" << targets << " chunk=" << chunk << " max_cpu_allP=" << maximum

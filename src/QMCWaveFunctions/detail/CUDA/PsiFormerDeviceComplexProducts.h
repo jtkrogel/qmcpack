@@ -13,6 +13,9 @@ namespace qmcplusplus::psiformer::device
 /// Direct numerical callers retain HOST results unless bounded output is explicit.
 enum class ComplexProductsHostOutput { RETAINED, CHUNKED };
 
+/// Explicitly omit the kinetic tape only when the numerical consumer needs SCORE/ECP responses.
+enum class ComplexProductsScope { COMPLETE, SCORE_ECP_ONLY };
+
 /// One domain-neutral virtual move, supplied by an immutable caller-owned accessor.
 struct ComplexVirtualReplacement
 {
@@ -29,23 +32,32 @@ struct ComplexProductsCost
   std::size_t channels, maximum_samples, chunk, statuses;
   std::size_t dot_partials, score_dot_scalar_work;
   ComplexProductsHostOutput host_output;
+  ComplexProductsScope scope;
 };
 
-/// Sum both qualified owners and every prepared mixed-type product/status plane.
+/// Sum selected qualified owners and every prepared mixed-type product/status plane.
 /// Work is maximum B times existing kinetic lifted-matrix sites, NOT score/neural FLOPs.
+/// SCORE_ECP_ONLY has zero kinetic matrix_work, not zero score/neural computational work.
 inline ComplexProductsCost estimateComplexProductsCost(const PsiFormerExecutionPlan& plan,
     std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
-    ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
+    ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED,
+    ComplexProductsScope scope = ComplexProductsScope::COMPLETE)
 {
   const auto p = plan.parameterCount(), n = plan.modelShape().electrons();
   if (!samples || !channels || channels > 3 || !chunk || chunk > p)
     throw std::invalid_argument("Complex products require bounded B,1-3 channels and canonical chunk");
   if (host_output != ComplexProductsHostOutput::RETAINED && host_output != ComplexProductsHostOutput::CHUNKED)
     throw std::invalid_argument("Complex products HOST output policy is invalid");
+  if (scope != ComplexProductsScope::COMPLETE && scope != ComplexProductsScope::SCORE_ECP_ONLY)
+    throw std::invalid_argument("Complex products preparation scope is invalid");
+  // Keep one explicit target contract even when the selective owner never executes kinetic work.
+  if (!targets || targets > n)
+    throw std::invalid_argument("Complex products require targets in [1,Ne]");
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex products extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex products bytes overflow"); };
   const auto score = estimateComplexScoreCost(plan);
-  const auto kinetic = estimateComplexKineticCost(plan, targets);
+  const auto kinetic = scope == ComplexProductsScope::COMPLETE ? estimateComplexKineticCost(plan, targets) :
+      ComplexKineticCost{};
   const auto elements = mul(channels, p), doubles = mul(2, elements);
   const auto statuses = doubles / 4096 + (doubles % 4096 != 0);
   const auto status_bytes = mul(statuses, sizeof(DerivativeFiniteStatus));
@@ -57,7 +69,7 @@ inline ComplexProductsCost estimateComplexProductsCost(const PsiFormerExecutionP
       add(add(add(mul(sizeof(std::complex<double>), host_output == ComplexProductsHostOutput::RETAINED ? elements : chunk),
           mul(16, chunk)), add(mul(32, n), status_bytes)), dot_host));
   return {score, kinetic, device, host, mul(samples, kinetic.matrix_work), p, n, channels, samples, chunk, statuses,
-      partials, mul(mul(2, p), samples), host_output};
+      partials, mul(mul(2, p), samples), host_output, scope};
 }
 
 /** TRANSPOSE/HERMITIAN complex SCORE/physical dK and full-score/device-dot REAL JVP.
@@ -131,12 +143,13 @@ public:
       std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
       std::size_t device_budget, std::size_t host_budget, std::size_t work_budget,
-      ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
+      ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED,
+      ComplexProductsScope scope = ComplexProductsScope::COMPLETE)
   {
     if (!image)
       throw std::invalid_argument("Complex products require an immutable paired image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexProductsCost(image->plan(), targets, samples, channels, chunk, host_output);
+    const auto cost = estimateComplexProductsCost(image->plan(), targets, samples, channels, chunk, host_output, scope);
     for (const auto cap : {device_budget, host_budget, work_budget})
       if (!cap || cap == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex products require positive finite numeric/work caps");
@@ -177,6 +190,8 @@ public:
         if (!finite(channel.values[sample].real()) || !finite(channel.values[sample].imag()))
           throw std::invalid_argument("Complex products nonfinite coefficient");
     }
+    if (kinetic && !kinetic_)
+      throw std::invalid_argument("SCORE/ECP-only products cannot evaluate a KINETIC channel");
     checkRuntime(launchDerivativeZero(queue_.getNative(), {2 * accumulated_.capacity(), 0, 0, 0, 1},
         reinterpret_cast<double*>(accumulated_.data())), "complex products zero");
     for (std::size_t sample = 0; sample < b; ++sample)
@@ -713,6 +728,8 @@ private:
   /// Validate all kinetic inputs before either response producer runs.
   void validateKinetic(const std::vector<double>& masses, const std::array<double, 3>& kappa, std::size_t samples) const
   {
+    if (!kinetic_)
+      throw std::invalid_argument("SCORE/ECP-only products cannot evaluate KINETIC local-energy terms");
     if (masses.size() != samples * cost_.electrons)
       throw std::invalid_argument("Complex local-energy inverse-mass extent mismatch");
     for (double value : masses)
@@ -806,17 +823,18 @@ private:
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexProductsCost cost)
       : image_(std::move(image)), queue_(queue), cost_(cost),
         score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
-        kinetic_(PreparedDeviceComplexKinetic::prepare(image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work)),
+        kinetic_(cost.scope == ComplexProductsScope::COMPLETE ? PreparedDeviceComplexKinetic::prepare(
+            image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work) : nullptr),
         accumulated_(cost.channels * cost.parameters), status_(cost.statuses), host_status_(cost.statuses),
         completed_(cost.host_output == ComplexProductsHostOutput::RETAINED ? cost.channels * cost.parameters : cost.chunk),
         staging_(cost.chunk), positions_(3 * cost.electrons), masses_(cost.electrons),
         direction_(cost.parameters), dot_workspace_(cost.dot_partials + 2), dot_status_(cost.dot_partials + 1),
         direction_host_(cost.parameters), sample_products_(cost.maximum_samples), dot_host_status_(1)
   {
-    const auto device = score_->cost().device_bytes + kinetic_->cost().device_bytes +
+    const auto device = score_->cost().device_bytes + (kinetic_ ? kinetic_->cost().device_bytes : 0) +
         16 * accumulated_.capacity() + sizeof(DerivativeFiniteStatus) * status_.capacity() +
         8 * (direction_.capacity() + dot_workspace_.capacity()) + sizeof(DerivativeFiniteStatus) * dot_status_.capacity();
-    const auto host = score_->cost().host_bytes + kinetic_->cost().host_bytes +
+    const auto host = score_->cost().host_bytes + (kinetic_ ? kinetic_->cost().host_bytes : 0) +
         sizeof(Complex) * completed_.capacity() + 16 * staging_.capacity() +
         8 * (positions_.capacity() + masses_.capacity() + direction_host_.capacity()) +
         sizeof(DerivativeFiniteStatus) * (host_status_.capacity() + dot_host_status_.capacity()) +
