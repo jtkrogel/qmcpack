@@ -1508,6 +1508,10 @@ void WFTrainBatched::process(xmlNodePtr node)
           ++active_variables;
           active_linear += variables.getType(variable) == optimize::LINEAR_P;
         }
+      // Fixed-CI MD orbital/J2 has no qualified mixed reference shear consumer.
+      if (linear_method && !active_linear && multideterminants.size() == 1 &&
+          conventional_binding_->hasOrbitalRotations() && population_.get_golden_hamiltonian().hasPhysicalNLPP())
+        throw UniformCommunicateError("Conventional fixed-CI orbital ECP LM/ALM mixed updates remain unqualified");
       if (active_linear && (linear_method || inverse_iteration))
       {
         const bool ci_j2_layout = active_linear != active_variables &&
@@ -1524,7 +1528,10 @@ void WFTrainBatched::process(xmlNodePtr node)
             !population_.get_golden_hamiltonian().ecpModelProvenance() &&
             std::any_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
                 [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
-        const bool joint_ci_orbital_ecp = joint_ci_j2 && conventional_binding_->hasOrbitalRotations() &&
+        const bool joint_ci_orbital_ecp = (joint_ci_j2 ||
+            (linear_method && ci_j2_layout &&
+             population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+             population_.get_golden_hamiltonian().ecpModelProvenance())) && conventional_binding_->hasOrbitalRotations() &&
             population_.get_golden_hamiltonian().hasPhysicalNLPP() && !multideterminants[0].get().hasCSFExpansion() &&
             std::any_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
                 [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
@@ -1535,15 +1542,16 @@ void WFTrainBatched::process(xmlNodePtr node)
             population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
             population_.get_golden_hamiltonian().ecpModelProvenance() &&
             !multideterminants[0].get().hasCSFExpansion();
-        if ((active_linear != active_variables && !joint_ci_j2 && !mixed_lm_ae && !mixed_lm_ecp) ||
+        if ((active_linear != active_variables && !joint_ci_j2 && !mixed_lm_ae && !mixed_lm_ecp && !joint_ci_orbital_ecp) ||
             (conventional_binding_->hasOrbitalRotations() && !joint_ci_orbital_ecp) ||
             multideterminants.size() != 1)
-          throw UniformCommunicateError("Conventional LM/ALM admit pure coefficients, fixed-orbital CI/J2 AE or DETS/J2 locality-ECP; other mixed updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM admit pure coefficients, fixed-orbital CI/J2 AE or qualified joint DETS/orbital/J2 locality-ECP; other mixed updates remain unqualified");
         // Keep this locality-ECP boundary explicit beside the general mixed guard.
         if (!inverse_iteration &&
             (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()) &&
-            ((active_linear != active_variables && !mixed_lm_ecp) || conventional_binding_->hasOrbitalRotations() || multideterminants.size() != 1))
-          throw UniformCommunicateError("Conventional locality-ECP LM/ALM require pure coefficients or qualified fixed-orbital DETS/J2");
+            ((active_linear != active_variables && !mixed_lm_ecp && !joint_ci_orbital_ecp) ||
+             (conventional_binding_->hasOrbitalRotations() && !joint_ci_orbital_ecp) || multideterminants.size() != 1))
+          throw UniformCommunicateError("Conventional locality-ECP LM/ALM require pure coefficients or qualified fixed/joint-orbital DETS/J2");
         // The frozen CSF reference precedes its fixed determinant expansion.
         const auto reference = multideterminants[0].get().fixedCoefficientReference();
         if (reference == QMCTraits::ValueType{} || !wftrain::isFiniteTrainingReal(std::real(reference)) ||
