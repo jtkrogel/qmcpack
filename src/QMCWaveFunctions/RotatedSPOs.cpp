@@ -903,7 +903,10 @@ void RotatedSPOs::evaluateDerivatives(ParticleSet& P,
     myL_J.resize(NP);
     myL_J            = 0.0;
     const size_t nmo = Phi_->getOrbitalSetSize();
-    const size_t nel = P.last(0) - P.first(0);
+    // Each call owns one spin's matrices; group0 need not have the same size.
+    const size_t nel = M_up.rows();
+    if (!nel || nel > nmo || M_up.cols() != nmo || Minv_up.rows() != nel || Minv_up.cols() != nel || NP1 != nel)
+      throw std::invalid_argument("Multideterminant orbital derivative own-spin matrices have incompatible shapes");
 
     const RealType* restrict C_p = Coeff.data();
     for (int i = 0; i < Coeff.size(); i++)
@@ -973,7 +976,10 @@ void RotatedSPOs::evaluateDerivativesWF(ParticleSet& P,
   if (recalculate)
   {
     const size_t nmo = Phi_->getOrbitalSetSize();
-    const size_t nel = P.last(0) - P.first(0);
+    // The score-only overload receives the same own-spin accepted matrices.
+    const size_t nel = M_up.rows();
+    if (!nel || nel > nmo || M_up.cols() != nmo || Minv_up.rows() != nel || Minv_up.cols() != nel)
+      throw std::invalid_argument("Multideterminant orbital score own-spin matrices have incompatible shapes");
 
     table_method_evalWF(dlogpsi, nel, nmo, psiCurrent, Coeff, C2node_up, C2node_dn, detValues_up, detValues_dn, M_up,
                         M_dn, Minv_up, Minv_dn, detData_up, lookup_tbl);

@@ -896,9 +896,8 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
 
 void MultiSlaterDetTableMethod::validateAcceptedReferenceOrbitalProfile() const
 {
-  if (csf_data_ || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 ||
-      Dets[0]->getNumPtcls() != Dets[1]->getNumPtcls())
-    throw std::invalid_argument("Private orbital ECP rows require DETS and equal multiple-occupied spins");
+  if (csf_data_ || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 || Dets[1]->getNumPtcls() <= 1)
+    throw std::invalid_argument("Private orbital ECP rows require DETS and two multiple-occupied spins");
   validatePreparedRotatedCoefficientState(*this);
   if (CI_Optimizable)
   {
