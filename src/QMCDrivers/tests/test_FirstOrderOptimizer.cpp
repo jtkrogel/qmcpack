@@ -956,9 +956,40 @@ TEST_CASE("Resident Adam callback preserves candidate-only transaction boundarie
     overwriteFirstMoment(path, corrupted);
     CHECK_THROWS(TrainingCheckpoint::restore(path, restored_provider, restored_state, restored_stage, &restored));
     CHECK(restored.acceptedUpdateCount() == 0);
+    CHECK(restored.hostMomentMirrorBytes() == cold_pair); // Framework metadata is a legitimate cold read.
+    CHECK(restored.firstMoment() == std::vector<double>(4));
+    CHECK(restored.secondMoment() == std::vector<double>(4));
+    CHECK(restored_provider.snapshotParameters().values == parameters.values);
+    CHECK(restored_provider.snapshotParameters().version == parameters.version);
+    restored.seedResidentDeviceAdam(cold_pair);
     CHECK(restored.hostMomentMirrorBytes() == 0);
     std::copy(first.begin(), first.end(), corrupted.begin());
     overwriteFirstMoment(path, corrupted);
+    {
+      // Bypass the framework's cold metadata read to exercise method-based
+      // payload preparation with genuinely absent current HOST mirrors.
+      hdf_archive archive;
+      REQUIRE(archive.open(path, H5F_ACC_RDONLY));
+      archive.push("wftrain_checkpoint", false);
+      archive.push("optimizer", false);
+      const auto saved = optimizer.checkpointMetadata();
+      {
+        auto discarded = restored.prepareCheckpointRestore(archive, saved);
+        REQUIRE(discarded);
+        CHECK(restored.hostMomentMirrorBytes() == 0);
+      }
+      CHECK(restored.hostMomentMirrorBytes() == 0);
+      CHECK(restored.acceptedUpdateCount() == 0);
+      auto prepared = restored.prepareCheckpointRestore(archive, saved);
+      REQUIRE(prepared);
+      CHECK(restored.hostMomentMirrorBytes() == 0);
+      prepared->commit();
+      CHECK(restored.acceptedUpdateCount() == 1);
+      CHECK(restored.firstMoment() == first);
+      CHECK(restored.secondMoment() == second);
+    }
+    restored.seedResidentDeviceAdam(cold_pair);
+    CHECK(restored.hostMomentMirrorBytes() == 0);
     TrainingCheckpoint::restore(path, restored_provider, restored_state, restored_stage, &restored);
     CHECK(restored.acceptedUpdateCount() == 1);
     CHECK(restored.hostMomentMirrorBytes() == cold_pair);
