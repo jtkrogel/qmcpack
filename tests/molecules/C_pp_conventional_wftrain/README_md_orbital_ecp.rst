@@ -34,14 +34,22 @@ The independent joint physical gate passed separately (3,836 assertions).
 One joint mode is registered beside the unchanged fixed-P16 route, with
 the same real CPU guard and strict comparisons, not an optimizer ULP exception.
 
-The candidate ``--joint-ci-orbital-ecp-minpii`` mode selects the same equal-spin
+The ``--joint-ci-orbital-ecp-minpii`` mode selects the same equal-spin
 DETS P17 recipe with minPII only. It retains two updates, four samples per
 update, both frames/CI1/J2 changes, exported inference and strict initialized
 split restart. Existing bounded family controls are used (damping 0.01,
 Krylov 64 iterations/256 applications/15 seconds/relative tolerance 1e-6,
 GMRES restart 16, zero damping retries, energy undershoot 1.0). One mixed LM
-early rejection remains required. Native qualification and registration are
-pending; no other optimizer or CSF/unequal-spin profile is implied.
+early rejection remains required. Native round 107 passed on its first attempt
+with application source ``d256fed54a750f29bb319bd5fbab3ded47c5258c`` and SHA256
+``4f2e439f62fa53d4a65b32c36e1d080b775fdebb1ce539f330872f82ab0b5355``;
+the executed checker SHA256 is
+``c712be7c4316ed4a77f3f54bedb73c3ad53affde995668d511a203eb8061c777``.
+Full/export/import/inference and initialized split restart passed unchanged
+strict comparisons, as did mixed-LM early rejection. One minPII-only CTest
+uses the same qualified CPU guard and 300-second limit. PII has separate
+numerical proof only; no native PII, LM/ALM, CSF or unequal-spin optimizer
+qualification is implied.
 
 The optional ``--unequal-spin-orbital-ecp`` mode derives one charged C^-
 3-up/2-down case from the same XML. It adds the numerical fixture's third
