@@ -619,7 +619,8 @@ def main():
                     return matrix - matrix.T
                 first_generator, delta_generator = generator(first), generator(delta)
                 assert np.linalg.norm(first_generator @ delta_generator - delta_generator @ first_generator) > 0, directory
-                assert np.any(orbital_history[-1][1][[0, 5]] != 0), (directory, "missing accumulated internal rotations")
+                # Full coordinates put four OV entries first, then OO and VV.
+                assert np.any(orbital_history[-1][1][4:] != 0), (directory, "missing accumulated internal rotations")
             else:
                 assert first[0] * delta[1] != first[1] * delta[0], (directory, "fixture updates commute")
                 assert orbital_history[-1][1][2] != 0, (directory, "missing accumulated virtual rotation")
