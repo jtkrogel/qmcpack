@@ -1949,6 +1949,13 @@ void WFTrainBatched::run()
       if (const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance())
       {
         complex_physical_identity += provenance->scientific_definition;
+        const auto& ions = complex->sourceParticles();
+        // Equal effective charges do not identify which PP species occupies each site.
+        for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+        {
+          const auto& name = ions.getSpeciesSet().speciesName.at(ions.GroupID[ion]);
+          complex_physical_identity += ";ordered_pp_species=" + std::to_string(name.size()) + ":" + name;
+        }
         for (int i = 0; i < population_.get_golden_hamiltonian().size(); ++i)
         {
           const auto* term = population_.get_golden_hamiltonian().getComponent(i);

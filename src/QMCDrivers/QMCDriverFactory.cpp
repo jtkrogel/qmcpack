@@ -89,7 +89,8 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
       "three physical periodic Coulomb terms bound to its actual target/source"); };
   const bool ecp = wftrain && complex->gpuInferenceEnabled() && ham.hasPhysicalNLPP();
   const auto& provenance = ham.ecpModelProvenance();
-  if ((ecp && (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())) ||
+  if (complex->isPseudopotentialSystem() != ecp || ham.hasPhysicalNLPP() != ecp ||
+      (ecp && (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())) ||
       psi.getOrbitals().size() != 1 || &complex->targetParticles() != &target ||
       ham.size() != (ecp ? 5 : 4) || ham.total_size() != ham.size())
     reject();
