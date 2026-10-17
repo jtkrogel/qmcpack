@@ -5054,6 +5054,154 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       CHECK(failed.state() == DerivativeSinkState::POISONED);
       op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, recovered);
       CHECK(recovered.result() == rows.result());
+      if (model == 5 && step == 2)
+      {
+        // Two independent physical captures make the joint CI/orbital centered action nontrivial.
+        constexpr std::size_t n = 17, m = 2;
+        const std::array<double, m> weights{1, 2};
+        std::array<DerivativeValue, m> energies{};
+        std::array<std::array<double, n>, m> scores{}, del{};
+        std::array<double, n> mean{};
+        std::array<StdRandom<QMCTraits::FullPrecRealType>, m> sample_rng{rng_after_capture, rng_after_capture};
+        // Keep each physical sample and Hamiltonian alive until its products are destroyed.
+        std::vector<std::unique_ptr<ParticleSet>> sample_particles;
+        std::vector<std::unique_ptr<TrialWaveFunction>> sample_wavefunctions;
+        std::vector<std::unique_ptr<QMCHamiltonian>> sample_hamiltonians;
+        std::vector<std::unique_ptr<StreamingDerivativeOperator>> products;
+        std::vector<ScoreCovarianceBatch> batches;
+        double mean_energy = 0;
+        for (std::size_t sample = 0; sample < m; ++sample)
+        {
+          auto p = std::make_unique<ParticleSet>(particles);
+          p->R[0][0] += sample == 0 ? -.08 : .13;
+          p->R[3][2] += sample == 0 ? .04 : -.06;
+          auto wf = source->makeClone(*p);
+          isolate(*wf);
+          p->update(); wf->evaluateLog(*p);
+          auto h = ham.makeClone(*p, *wf);
+          h->setRandomGenerator(&sample_rng[sample]);
+          auto sample_replay = std::make_shared<RecoverableReplay>(*evaluator, private_particles);
+          sample_replay->positions = p->R;
+          auto product = adapter.makeDerivativeOperator(sample_replay, snapshot, sample + 11, sample);
+          auto capture = adapter.makeNonLocalECPDerivativeConsumer(sample_replay, snapshot, sample + 11, sample);
+          const VJPCoefficientChannel channel{"pii_capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+              coefficientsFor(*product, unit), ecp_mask};
+          ResourceCollection pr("pii_P"), wr("pii_W"), hr("pii_H");
+          p->createResource(pr); wf->createResource(wr); h->createResource(hr);
+          RefVectorWithLeader<ParticleSet> ps(*p, {*p});
+          RefVectorWithLeader<TrialWaveFunction> ws(*wf, {*wf});
+          RefVectorWithLeader<QMCHamiltonian> hs(*h, {*h});
+          {
+            ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+            ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, ws);
+            ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+            energies[sample] = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+                hs, ws, ps, *capture, {&channel, 1}, idle).local_energies[0];
+          }
+          product->bindNonLocalECPJVPReplay(capture->releaseJVPReplay());
+          const std::array<VJPCoefficientChannel, 2> channels{{
+              {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*product, unit), 0},
+              {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*product, unit), total_mask}}};
+          RecordingParameterSink rows;
+          product->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+          for (std::size_t j = 0; j < n; ++j)
+          {
+            scores[sample][j] = rows.result()[0][j].real();
+            del[sample][j] = rows.result()[1][j].real();
+            mean[j] += weights[sample] * scores[sample][j] / 3;
+          }
+          mean_energy += weights[sample] * energies[sample].real() / 3;
+          batches.push_back({product.get(), {&weights[sample], 1}, {&energies[sample], 1}});
+          sample_particles.push_back(std::move(p)); sample_wavefunctions.push_back(std::move(wf));
+          sample_hamiltonians.push_back(std::move(h)); products.push_back(std::move(product));
+        }
+        CHECK(energies[0] != energies[1]);
+        ScoreCovarianceFactor factor(adapter.parameterSchema(), snapshot->version, {batches.data(), batches.size()});
+        ProjectedInverseIterationFactor pii_factor(factor, total_mask);
+        PIIUpdateControl control;
+        control.shift_mode = PIIShiftMode::EXPLICIT; control.explicit_shift = mean_energy - 1;
+        control.damping = .3; control.learning_rate = .01; control.maximum_damping_retries = 0;
+        control.gmres.restart_length = 17; control.gmres.krylov.maximum_iterations = 64;
+        control.gmres.krylov.maximum_operator_applications = 256; control.gmres.krylov.maximum_seconds = 5;
+        std::array<std::array<double, n>, n> matrix{};
+        std::array<double, n> rhs{};
+        for (std::size_t row = 0; row < n; ++row)
+        {
+          matrix[row][row] = control.damping;
+          for (std::size_t sample = 0; sample < m; ++sample)
+          {
+            const double left = weights[sample] * (scores[sample][row] - mean[row]) / 3;
+            rhs[row] += left * (energies[sample].real() - mean_energy);
+            for (std::size_t col = 0; col < n; ++col)
+              matrix[row][col] += left * (del[sample][col] +
+                  (energies[sample].real() - control.explicit_shift) * (scores[sample][col] - mean[col]));
+          }
+        }
+        REQUIRE(std::inner_product(rhs.begin(), rhs.end(), rhs.begin(), 0.0) > 1e-12);
+        ProjectedInverseIterationOperator action(pii_factor, control.explicit_shift, control.damping);
+        for (std::size_t col = 0; col < n; ++col)
+        {
+          std::array<DerivativeValue, n> basis{}, result{}; basis[col] = 1;
+          action.apply({adapter.parameterSchema(), snapshot->version, {basis.data(), n}}, {result.data(), n});
+          for (std::size_t row = 0; row < n; ++row)
+            CHECK(result[row].real() == Catch::Approx(matrix[row][col]).epsilon(2e-10).margin(2e-10));
+        }
+        MinimumProjectedInverseIterationOperator minimum(pii_factor, control.explicit_shift, control.damping);
+        for (std::size_t col = 0; col < m; ++col)
+        {
+          std::array<DerivativeValue, m> basis{}, result{}; basis[col] = 1;
+          minimum.apply({basis.data(), m}, {result.data(), m});
+          for (std::size_t row = 0; row < m; ++row)
+          {
+            double expected = row == col ? control.damping : 0;
+            for (std::size_t j = 0; j < n; ++j)
+              expected += std::sqrt(weights[row] * weights[col]) / 3 * (scores[col][j] - mean[j]) *
+                  (del[row][j] + (energies[row].real() - control.explicit_shift) * (scores[row][j] - mean[j]));
+            CHECK(result[row].real() == Catch::Approx(expected).epsilon(2e-10).margin(2e-10));
+          }
+        }
+        // Independent pivoted dense solve; no second call into an iterative solver.
+        for (std::size_t col = 0; col < n; ++col)
+        {
+          std::size_t pivot = col;
+          for (std::size_t row = col + 1; row < n; ++row)
+            if (std::abs(matrix[row][col]) > std::abs(matrix[pivot][col])) pivot = row;
+          REQUIRE(std::abs(matrix[pivot][col]) > 1e-13);
+          std::swap(matrix[pivot], matrix[col]); std::swap(rhs[pivot], rhs[col]);
+          for (std::size_t row = col + 1; row < n; ++row)
+          {
+            const double scale = matrix[row][col] / matrix[col][col];
+            for (std::size_t j = col; j < n; ++j) matrix[row][j] -= scale * matrix[col][j];
+            rhs[row] -= scale * rhs[col];
+          }
+        }
+        std::array<double, n> delta{};
+        for (std::size_t reverse = n; reverse > 0; --reverse)
+        {
+          const auto row = reverse - 1;
+          double value = rhs[row];
+          for (std::size_t j = row + 1; j < n; ++j) value -= matrix[row][j] * delta[j];
+          delta[row] = value / matrix[row][row];
+        }
+        const auto gradient = factor.scoreCovarianceGradient();
+        const ParameterGradientView objective{adapter.parameterSchema().fingerprint(), snapshot->version,
+            ReductionDomain::GLOBAL, {gradient.data(), gradient.size()}};
+        ProjectedInverseIterationUpdateRule pii(pii_factor, control);
+        MinimumProjectedInverseIterationUpdateRule minpii(pii_factor, control);
+        for (const auto& candidate : {pii.propose(adapter.parameterSchema(), *snapshot, objective),
+                                     minpii.propose(adapter.parameterSchema(), *snapshot, objective)})
+        {
+          for (std::size_t j = 0; j < n; ++j)
+            CHECK(candidate.values[j] == Catch::Approx(snapshot->values[j] - control.learning_rate * delta[j])
+                .epsilon(2e-9).margin(2e-11));
+          CHECK(isFiniteTrainingReal(fixed_grid_energy(candidate, true).real()));
+        }
+        pii.proposalRejected(); minpii.proposalRejected();
+        control.gmres.krylov.maximum_operator_applications = 0;
+        ProjectedInverseIterationUpdateRule refused(pii_factor, control);
+        CHECK_THROWS(refused.propose(adapter.parameterSchema(), *snapshot, objective));
+        CHECK_FALSE(refused.hasLiveProposal());
+      }
       auto expected_rng = rng_after_capture;
       CHECK(rng() == expected_rng());
       CHECK(zero_rng.draws == zero_draws_after_capture);
