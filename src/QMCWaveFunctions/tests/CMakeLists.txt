@@ -435,6 +435,11 @@ if(BUILD_MICRO_BENCHMARKS)
                  benchmark_psiformer_memory.cpp
                  ../PsiFormer/PsiFormerExecutionPlan.cpp
                  ../PsiFormer/PsiFormerGeometry.cpp)
+  # Unlike component benchmarks this target does not link qmcutil, whose
+  # dependency normally generates git-rev.h before compilation.
+  if(IS_GIT_PROJECT)
+    add_dependencies(benchmark_psiformer_native_memory gitrev)
+  endif()
   target_link_libraries(
     benchmark_psiformer_native_memory
     IO::HDF5
