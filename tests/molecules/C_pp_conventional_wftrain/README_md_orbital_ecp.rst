@@ -45,3 +45,10 @@ the newer helper-only source is ``2cd6d4fe0`` (checker SHA256
 One guarded 3/2 native case is registered with the same strict comparisons.
 The swapped 2/3 orientation is numerical-only: both passed the separate
 6,024-assertion physical gate. No arbitrary polarization/size claim is made.
+
+The optional ``--csf-orbital-ecp`` mode derives the exact signed-child CSF
+recipe: frozen outer CSF0=0.6 with HF child weight 0.8 (expanded C0=0.48),
+active outer CI1=0.1 with ordered opposite-sign sqrt(0.5) cross children,
+and both six-pair frames/J2 (P17). It preserves immutable child attributes
+and original gauge. Its native qualification and registration are pending;
+the separate independent physical gate passed 7,133 assertions.

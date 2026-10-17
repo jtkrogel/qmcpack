@@ -68,12 +68,14 @@ def text_value(value):
 
 
 def four_mo_md_pairs(tree):
-    """Derive expected local pairs from this fixture's explicit DETS occupations."""
+    """Derive expected local pairs from explicit DETS or CSF child occupations."""
     expansion = tree.find(".//multideterminant/detlist")
-    assert expansion.get("type") == "DETS"
+    csf = expansion.get("type") == "CSF"
+    assert csf or expansion.get("type") == "DETS"
+    determinants = [child for outer in expansion for child in outer] if csf else list(expansion)
     result = []
     for spin in range(2):
-        occupations = [node.get(f"occ{spin}") for node in expansion]
+        occupations = [node.get(("alpha", "beta")[spin] if csf else f"occ{spin}") for node in determinants]
         assert all(len(value) == 4 for value in occupations)
         core = {i for i in range(4) if all(value[i] == "1" for value in occupations)}
         virtual = {i for i in range(4) if all(value[i] == "0" for value in occupations)}
@@ -209,6 +211,8 @@ def main():
                         help="derive joint P17 CI1/orbital/J2 ECP Adam from the fixed-CI XML")
     parser.add_argument("--unequal-spin-orbital-ecp", action="store_true",
                         help="derive one charged C^- 3up/2down joint P16 orbital ECP case")
+    parser.add_argument("--csf-orbital-ecp", action="store_true",
+                        help="derive one signed-child CSF/orbital/J2 ECP Adam P17 case")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -238,6 +242,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.csf_orbital_ecp:
+        if args.md_orbital_ecp or args.joint_ci_orbital_ecp or args.unequal_spin_orbital_ecp or args.ci_representation != "dets":
+            parser.error("--csf-orbital-ecp generates its own single CSF recipe; omit other representation modes")
+        args.joint_ci_orbital_ecp = True
     if args.unequal_spin_orbital_ecp:
         if args.md_orbital_ecp or args.joint_ci_orbital_ecp:
             parser.error("select only one fixed, joint, or unequal-spin orbital ECP mode")
@@ -378,6 +386,19 @@ def main():
             expansion.set("ne0", "3")
             expansion[0].set("occ0", "1110")
             expansion[1].set("occ0", "1101")
+        if args.csf_orbital_ecp:
+            expansion = tree.find(".//multideterminant/detlist")
+            expansion.set("type", "CSF"); expansion.set("cutoff", "0")
+            for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
+                expansion.set(new, expansion.attrib.pop(old))
+            for node in list(expansion):
+                expansion.remove(node)
+            expansion.extend(ET.fromstring('''<recipe>
+              <csf id="CI0" coeff="0.6" occ="2200" exctLvl="0"><det coeff="0.8" alpha="1100" beta="1100"/></csf>
+              <csf id="CI1" coeff="0.1" occ="2110" exctLvl="1">
+                <det coeff="0.7071067811865475244" alpha="1100" beta="1010"/>
+                <det coeff="-0.7071067811865475244" alpha="1010" beta="1100"/>
+              </csf></recipe>'''))
         if ci_workflow:
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
@@ -424,10 +445,21 @@ def main():
             if args.md_orbital_ecp:
                 expansion = tree.find(".//multideterminant")
                 assert expansion.get("optimize") == ("yes" if args.joint_ci_orbital_ecp else "no")
-                assert expansion.find("detlist").get("type") == "DETS"
-                assert [node.attrib for node in expansion.find("detlist")] == [
-                    dict(id="CI0", coeff="1", occ0="1110" if args.unequal_spin_orbital_ecp else "1100", occ1="1100"),
-                    dict(id="CI1", coeff="0.1", occ0="1101" if args.unequal_spin_orbital_ecp else "1010", occ1="1010")]
+                if args.csf_orbital_ecp:
+                    csfs = expansion.find("detlist")
+                    assert csfs.attrib == dict(size="2", type="CSF", nca="0", ncb="0", nea="2", neb="2", nstates="4", cutoff="0")
+                    assert [node.attrib for node in csfs] == [dict(id="CI0", coeff="0.6", occ="2200", exctLvl="0"),
+                                                             dict(id="CI1", coeff="0.1", occ="2110", exctLvl="1")]
+                    assert [[child.attrib for child in outer] for outer in csfs] == [
+                        [dict(coeff="0.8", alpha="1100", beta="1100")],
+                        [dict(coeff="0.7071067811865475244", alpha="1100", beta="1010"),
+                         dict(coeff="-0.7071067811865475244", alpha="1010", beta="1100")]]
+                    assert float(csfs[0].get("coeff")) * float(csfs[0][0].get("coeff")) == 0.48
+                else:
+                    assert expansion.find("detlist").get("type") == "DETS"
+                    assert [node.attrib for node in expansion.find("detlist")] == [
+                        dict(id="CI0", coeff="1", occ0="1110" if args.unequal_spin_orbital_ecp else "1100", occ1="1100"),
+                        dict(id="CI1", coeff="0.1", occ0="1101" if args.unequal_spin_orbital_ecp else "1010", occ1="1010")]
                 assert [len(pairs) for pairs in four_mo_md_pairs(tree)] == ([5, 6] if args.unequal_spin_orbital_ecp else [6, 6])
                 wrappers = tree.findall(".//rotated_sposet")
                 assert [node.get("name") for node in wrappers] == ["rot", "rot_dn"]
@@ -677,6 +709,9 @@ def main():
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
                     if args.md_orbital_ecp:
                         assert [node.attrib for node in exported_list] == [node.attrib for node in linear_nodes], model
+                        if args.csf_orbital_ecp:
+                            assert [[child.attrib for child in outer] for outer in exported_list] == \
+                                   [[child.attrib for child in outer] for outer in linear_nodes], model
                     if csf_ci or csf_ecp:
                         assert exported_list.get("type") == "CSF"
                         for original, retained in zip(linear_nodes, list(exported_list)):
@@ -1071,6 +1106,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.csf_orbital_ecp:
+            print("PASS: real CPU signed-child CSF/orbital/J2 ECP Adam P17, frozen outer CSF0=.6/expanded C0=.48, "
+                  "immutable child gauge, both frames, physical VMC reuse and strict exact initialized restart")
         elif args.unequal_spin_orbital_ecp:
             print("PASS: real CPU charged C^- 3up/2down joint CI1/orbital/J2 ECP P16, "
                   "five/six-pair frames, frozen C0/original XML and strict exact initialized restart")
