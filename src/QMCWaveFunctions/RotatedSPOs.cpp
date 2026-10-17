@@ -1695,19 +1695,25 @@ RotatedSPOs::ValueType RotatedSPOs::evaluateAcceptedReferenceOVRatioDerivatives(
   const ValueType ratio = projection[electron];
   if (!finiteRotationCoordinate(ratio))
     throw std::invalid_argument("Accepted-reference orbital ratio is nonfinite");
-  for (std::size_t i = 0; i < myVars.size(); ++i)
+  // The virtual-orbital residual is independent of occupied p: form it once
+  // per q, then visit the prevalidated row-major OV parameter mapping.
+  for (std::size_t q = n; q < m; ++q)
   {
-    const auto [p, q] = m_act_rot_inds_[i];
-    const int index = myVars.where(i);
-    if (index >= 0)
+    ValueType residual = replacement[q];
+    for (std::size_t row = 0; row < n; ++row) residual -= projection[row] * accepted(row, q);
+    if (!finiteRotationCoordinate(residual))
+      throw std::invalid_argument("Accepted-reference orbital residual is nonfinite");
+    for (std::size_t p = 0; p < n; ++p)
     {
-      ValueType residual = replacement[q];
-      for (std::size_t row = 0; row < n; ++row) residual -= projection[row] * accepted(row, q);
-      const ValueType derivative = inverse_transpose(electron, p) * residual;
-      const ValueType accumulated = output[index] + derivative;
-      if (!finiteRotationCoordinate(derivative) || !finiteRotationCoordinate(accumulated))
-        throw std::invalid_argument("Accepted-reference orbital ratio derivative is nonfinite");
-      output[index] = accumulated;
+      const int index = myVars.where(p * (m - n) + q - n);
+      if (index >= 0)
+      {
+        const ValueType derivative = inverse_transpose(electron, p) * residual;
+        const ValueType accumulated = output[index] + derivative;
+        if (!finiteRotationCoordinate(derivative) || !finiteRotationCoordinate(accumulated))
+          throw std::invalid_argument("Accepted-reference orbital ratio derivative is nonfinite");
+        output[index] = accumulated;
+      }
     }
   }
   return ratio;
