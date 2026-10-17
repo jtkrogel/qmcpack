@@ -2553,6 +2553,9 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
   const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(source->findSD()[0].get().getPhi(0));
   REQUIRE(lcao.fileImageIdentity());
   CHECK(lcao.fileImageIdentity()->byteCount() == std::filesystem::file_size(asset));
+  // LCAO distance tables read the source's coordinate storage, not just R.
+  // Initialize it explicitly instead of depending on reused heap contents.
+  ions.update();
   particles.update();
   source->evaluateLog(particles);
   const double original_log = source->getLogPsi();
