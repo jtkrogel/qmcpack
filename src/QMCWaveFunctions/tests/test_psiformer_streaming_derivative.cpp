@@ -25,6 +25,7 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceRuntime.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceAdam.h"
+#include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
 #endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -2122,6 +2123,190 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
     gpu.exportModel(path); // Explicit test-only fixture export before any mutation.
   const auto p = gpu.parameterSchema().parameterCount();
   const auto bytes = 8 * p;
+  SECTION("DEVICE SR pins the complete resource chain")
+  {
+    ScopedEnvironmentVariable reuse("PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE", "on");
+    PsiFormerWF host("authority", initialized, electrons, ions, true, {0, 5, 10}, false, {}, {}, resolution);
+    host.validateSystem(electrons, ions, "all_electron");
+    const std::pair<std::size_t, std::size_t> budget{64 * 1024 * 1024, 1024 * 1024};
+    gpu.prepareResidentEnergySR(7, budget); host.prepareResidentEnergySR(7, budget);
+    CHECK(gpu.prepareResidentDeviceAuthority().snapshot_device_bytes == bytes);
+    std::vector<std::unique_ptr<ParticleSet>> samples;
+    std::vector<std::unique_ptr<PsiFormerWF>> gpu_copies, cpu_copies, host_copies;
+    RefVectorWithLeader<WaveFunctionComponent> gc(gpu), cc(cpu), hc(host);
+    std::vector<double> weights(7), energies(7);
+    double total_weight = 0, mean_energy = 0, group_weight[2]{};
+    for (std::size_t s = 0; s < 7; ++s)
+    {
+      samples.push_back(std::make_unique<ParticleSet>(electrons));
+      samples.back()->R[0][0] += s % 2 ? .031 : 0;
+      samples.back()->update();
+      weights[s] = s % 2 ? 2 : 1; energies[s] = s % 2 ? -1.9 : -2.3;
+      group_weight[s % 2] += weights[s]; total_weight += weights[s];
+      mean_energy += weights[s] * energies[s];
+      if (s == 0) { gc.push_back(gpu); cc.push_back(cpu); hc.push_back(host); }
+      else
+      {
+        gpu_copies.push_back(std::make_unique<PsiFormerWF>(gpu));
+        cpu_copies.push_back(std::make_unique<PsiFormerWF>(cpu));
+        host_copies.push_back(std::make_unique<PsiFormerWF>(host));
+        gc.push_back(*gpu_copies.back()); cc.push_back(*cpu_copies.back()); hc.push_back(*host_copies.back());
+      }
+    }
+    mean_energy /= total_weight;
+    RefVectorWithLeader<ParticleSet> batch(*samples.front());
+    for (auto& sample : samples) batch.push_back(*sample);
+    std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
+    const auto active = registerSelectedParameters(gpu);
+    RefVectorWithLeader<WaveFunctionComponent> single(gpu, {gpu});
+    RefVectorWithLeader<ParticleSet> one(*samples.front(), {*samples.front()});
+    RefVector<ParticleSet::ParticleGradient> gradients{samples.front()->G};
+    RefVector<ParticleSet::ParticleLaplacian> laplacians{samples.front()->L};
+    ResourceCollection prototype("resident_sr_authority"); gpu.createResource(prototype);
+    ResourceCollection resources(prototype);
+    ResourceCollectionTeamLock<WaveFunctionComponent> team(resources, single);
+    auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+    wftrain::KrylovSolverControl control;
+    control.maximum_iterations = 20; control.maximum_operator_applications = 24;
+    control.relative_tolerance = 1e-9; control.absolute_tolerance = 1e-10;
+    constexpr double damping = .3, rate = 1e-4;
+    for (std::size_t step = 0; step < 3; ++step)
+    {
+      for (auto& sample : samples)
+      {
+        sample->G = QMCTraits::GradType{}; sample->L = QMCTraits::ValueType{};
+        cpu.evaluateLog(*sample, sample->G, sample->L);
+      }
+      auto co = cpu.makeStreamingDerivativeOperator(cc, batch, step, 0, 17);
+      auto go = gpu.makeStreamingDerivativeOperator(gc, batch, step, 0, 17);
+      auto ho = host.makeStreamingDerivativeOperator(hc, batch, step, 0, 17);
+      std::vector<DerivativeValue> w(7), ew(7), first(7), second(7);
+      for (std::size_t s = 0; s < 7; ++s)
+      { w[s] = weights[s]; ew[s] = weights[s] * energies[s]; (s % 2 ? second : first)[s] = 1; }
+      const auto channelsFor = [&](const StreamingDerivativeOperator& op) {
+        return std::vector<VJPCoefficientChannel>{
+          {"T", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(op, w), wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)},
+          {"EO", DerivativeProduct::SCORE_VJP, coefficientsFor(op, ew)},
+          {"O", DerivativeProduct::SCORE_VJP, coefficientsFor(op, w)}};
+      };
+      auto c = channelsFor(*co), g = channelsFor(*go), h = channelsFor(*ho);
+      SelectedParameterSink oracle(selected), group_scores(selected);
+      co->applyVJPs({c.data(), c.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, oracle);
+      const VJPCoefficientChannel groups[] = {
+          {"first", DerivativeProduct::SCORE_VJP, coefficientsFor(*co, first)},
+          {"second", DerivativeProduct::SCORE_VJP, coefficientsFor(*co, second)}};
+      co->applyVJPs({groups, 2}, wftrain::DerivativeAdjoint::TRANSPOSE, group_scores);
+      auto expected = cpu.snapshotParameters();
+      std::vector<double> gradient(p), delta(p);
+      double squared = 0, dot = 0;
+      for (const auto& block : cpu.parameterSchema().blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          gradient[i] = block.trainable ? 2 / total_weight * (oracle.results()[0][i].real() +
+              oracle.results()[1][i].real() - mean_energy * oracle.results()[2][i].real()) : 0;
+          delta[i] = block.trainable ? group_scores.results()[0][i].real() / 4 -
+              group_scores.results()[1][i].real() / 3 : 0;
+          squared += delta[i] * delta[i]; dot += delta[i] * gradient[i];
+        }
+      const double a = group_weight[0] * group_weight[1] / (total_weight * total_weight);
+      double norm = 0;
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        const double direction = gradient[i] / damping - a * delta[i] * dot /
+            (damping * (damping + a * squared));
+        const double old = expected.values[i]; expected.values[i] -= rate * direction;
+        norm = std::hypot(norm, expected.values[i] - old);
+      }
+      // Seven numerical repeats preserve the old HOST terminal's S>=7 policy.
+      std::vector<double> host_candidate;
+      const auto host_diagnostics = host.consumeResidentEnergySR(*ho, {h.data(), h.size()}, weights,
+          host.snapshotParameters().values, total_weight, mean_energy, damping, rate, control, budget, host_candidate);
+      REQUIRE(host_diagnostics.solve.converged);
+      const auto propose = [&] {
+        return gpu.consumeResidentEnergySRDevice(*go, {g.data(), g.size()}, weights, total_weight,
+            mean_energy, damping, rate, control, budget, bytes);
+      };
+      const auto warm = metrics.snapshot();
+      auto proposal = propose();
+      if (step)
+      {
+        CHECK(metrics.snapshot().downloaded_bytes - warm.downloaded_bytes < bytes);
+        CHECK(metrics.snapshot().uploaded_bytes - warm.uploaded_bytes < bytes);
+      }
+      CHECK(proposal->diagnostics().solve.converged);
+      CHECK(proposal->displacementNorm() == Catch::Approx(norm).epsilon(2e-7).margin(2e-9));
+      CHECK_THROWS(gpu.prepareResidentDeviceSRPublication(std::move(proposal), step + 1, 0));
+      proposal = propose();
+      CHECK_THROWS(cpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0));
+      proposal = propose();
+      { auto discarded = gpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0); }
+      CHECK(gpu.parameterVersion() == step);
+      proposal = propose();
+      auto publication = gpu.prepareResidentDeviceSRPublication(std::move(proposal), step, 0);
+      const auto before = metrics.snapshot(); CHECK(publication->commit() == step + 1);
+      const auto after = metrics.snapshot();
+      CHECK(after.uploaded_bytes == before.uploaded_bytes); CHECK(after.downloaded_bytes == before.downloaded_bytes);
+      CHECK(after.device_copied_bytes == before.device_copied_bytes);
+      CHECK(after.allocation_calls == before.allocation_calls); CHECK(after.free_calls == before.free_calls);
+      publication.reset();
+      const auto warm_full = metrics.snapshot();
+      samples.front()->G = QMCTraits::GradType{}; samples.front()->L = QMCTraits::ValueType{};
+      gpu.mw_evaluateLog(single, one, gradients, laplacians);
+      CHECK(metrics.snapshot().downloaded_bytes - warm_full.downloaded_bytes < bytes);
+      const auto gpu_g = samples.front()->G; const auto gpu_l = samples.front()->L;
+      const auto cold = metrics.snapshot();
+      Vector<QMCTraits::ValueType> score(active.size()), kinetic(active.size());
+      score = QMCTraits::ValueType{}; kinetic = QMCTraits::ValueType{};
+      gpu.evaluateDerivatives(*samples.front(), active, score, kinetic); // Cached executor owner fence.
+      const auto actual = gpu.snapshotParameters();
+      CHECK(metrics.snapshot().downloaded_bytes - cold.downloaded_bytes == bytes);
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        CHECK(actual.values[i] == Catch::Approx(expected.values[i]).epsilon(2e-7).margin(2e-9));
+        CHECK(actual.values[i] == Catch::Approx(host_candidate[i]).epsilon(2e-7).margin(2e-9));
+      }
+      cpu.publishParameters(expected, step); host.publishParameters(expected, step);
+      samples.front()->G = QMCTraits::GradType{}; samples.front()->L = QMCTraits::ValueType{};
+      cpu.evaluateLog(*samples.front(), samples.front()->G, samples.front()->L);
+      for (std::size_t i = 0; i < 4; ++i)
+      {
+        for (int d = 0; d < 3; ++d) checkClose(gpu_g[i][d], samples.front()->G[i][d]);
+        checkClose(gpu_l[i], samples.front()->L[i]);
+      }
+      Vector<QMCTraits::ValueType> cpu_score(active.size()), cpu_kinetic(active.size());
+      cpu_score = QMCTraits::ValueType{}; cpu_kinetic = QMCTraits::ValueType{};
+      cpu.evaluateDerivatives(*samples.front(), active, cpu_score, cpu_kinetic);
+      for (std::size_t i = 0; i < active.size(); ++i)
+      { checkClose(score[i], cpu_score[i]); checkClose(kinetic[i], cpu_kinetic[i]); }
+      CHECK_THROWS(propose()); // Immutable old batch cannot produce the next generation.
+    }
+    for (auto& sample : samples)
+    {
+      sample->G = QMCTraits::GradType{}; sample->L = QMCTraits::ValueType{};
+      cpu.evaluateLog(*sample, sample->G, sample->L);
+    }
+    auto fresh = gpu.makeStreamingDerivativeOperator(gc, batch, 4, 0, 17);
+    std::vector<DerivativeValue> w(7), ew(7);
+    for (std::size_t s = 0; s < 7; ++s) { w[s] = weights[s]; ew[s] = weights[s] * energies[s]; }
+    const VJPCoefficientChannel fresh_channels[] = {
+        {"T", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*fresh, w), wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)},
+        {"EO", DerivativeProduct::SCORE_VJP, coefficientsFor(*fresh, ew)},
+        {"O", DerivativeProduct::SCORE_VJP, coefficientsFor(*fresh, w)}};
+    auto stopped = control; stopped.maximum_operator_applications = 0;
+    CHECK_THROWS(gpu.consumeResidentEnergySRDevice(*fresh, {fresh_channels, 3}, weights, total_weight,
+        mean_energy, damping, rate, stopped, budget, bytes));
+    CHECK(gpu.parameterVersion() == 3);
+    gpu.prepareResidentEnergySR(7, budget); // Genuine numerical failure needs an explicit new stage.
+    auto retry = gpu.consumeResidentEnergySRDevice(*fresh, {fresh_channels, 3}, weights, total_weight,
+        mean_energy, damping, rate, control, budget, bytes);
+    CHECK(retry->diagnostics().solve.converged);
+    retry.reset(); fresh.reset();
+    gpu.releaseResidentEnergySRWorkspace(); host.releaseResidentEnergySRWorkspace();
+    std::cout << "PASS component DEVICE SR: three_updates=3, samples=7/two_distinct, CPU_rank_one=1, HOST_oracle=1, cold_fence=1, public_driver=0\n";
+    return;
+  }
+  SECTION("DEVICE Adam")
+  {
   const auto norm_bytes = gpu.prepareResidentEnergyAdam(48 * p + 4096);
   const auto allowances = gpu.prepareResidentDeviceAuthority();
   CHECK(allowances.snapshot_device_bytes == bytes);
@@ -2250,6 +2435,7 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
   {
     CHECK(actual_first[i] == Catch::Approx(first[i]).epsilon(2e-8).margin(2e-9));
     CHECK(actual_second[i] == Catch::Approx(second[i]).epsilon(2e-8).margin(2e-9));
+  }
   }
 }
 #endif

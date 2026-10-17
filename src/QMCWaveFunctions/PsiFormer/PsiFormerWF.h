@@ -531,6 +531,41 @@ public:
       std::unique_ptr<ResidentDeviceAdamProposal> candidate, std::size_t expected_version,
       std::size_t successor_device_cap);
 
+  /// Own immutable SR bytes plus the complete solver/session/backend lifetime, without HOST P.
+  class ResidentDeviceSRProposal
+  {
+  public:
+    virtual ~ResidentDeviceSRProposal() = default;
+
+    virtual std::size_t sourceVersion() const noexcept = 0;
+
+    virtual const wftrain::ResidentEnergySRDiagnostics& diagnostics() const noexcept = 0;
+
+    virtual double displacementNorm() const noexcept = 0;
+  };
+
+  /// Same-thread final authority; numerical control/model acceptance is allocation/runtime-free.
+  class PreparedResidentDeviceSRPublication
+  {
+  public:
+    virtual ~PreparedResidentDeviceSRPublication() = default;
+
+    virtual std::size_t commit() noexcept = 0;
+  };
+
+  /// Hidden real/open AE terminal: exact C3, retained solver and explicit DEVICE authority only.
+  std::unique_ptr<ResidentDeviceSRProposal> consumeResidentEnergySRDevice(
+      const wftrain::StreamingDerivativeOperator& derivative,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      const std::vector<double>& weights, double weight, double energy, double damping, double learning_rate,
+      const wftrain::KrylovSolverControl& control, std::pair<std::size_t, std::size_t> budget,
+      std::size_t snapshot_device_cap) const;
+
+  /// Prevalidate exact source/solver receipts and prepare shared successor before readiness.
+  std::unique_ptr<PreparedResidentDeviceSRPublication> prepareResidentDeviceSRPublication(
+      std::unique_ptr<ResidentDeviceSRProposal> candidate, std::size_t expected_version,
+      std::size_t successor_device_cap);
+
   /// Complete named SR numeric caps (device, host); CPU never reads these controls.
   std::pair<std::size_t, std::size_t> residentEnergySRBudget() const;
 

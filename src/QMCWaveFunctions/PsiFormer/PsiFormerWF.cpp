@@ -1387,7 +1387,7 @@ public:
   psiformer::device::DeviceMemorySnapshot resident_transfer_baseline;
   bool resident_transfer_window_active = false;
   /// Optimizer workspace dies BEFORE its anchored Session; source diagnostics exclude it.
-  std::unique_ptr<psiformer::device::PreparedDevicePcg> resident_energy_sr_workspace;
+  std::shared_ptr<psiformer::device::PreparedDevicePcg> resident_energy_sr_workspace;
 #endif
   bool resident_energy_sr_reuse = false;
   bool resident_energy_sr_workspace_started = false;
@@ -12777,6 +12777,44 @@ struct ResidentAuthorityPublication final : PsiFormerWF::PreparedResidentDeviceA
     return version;
   }
 };
+
+/// The solver borrows Session: retain the complete anchored resource chain, not merely solver storage.
+struct ResidentSRAuthorityProposal final : PsiFormerWF::ResidentDeviceSRProposal
+{
+  std::shared_ptr<PsiFormerSharedState> state;
+  std::shared_ptr<const psiformer::device::PreparedDeviceBatchBackend> backend;
+  std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+  psiformer::device::PreparedDevicePcg::DeviceEnergyCandidate candidate{};
+  wftrain::ResidentEnergySRDiagnostics completed;
+
+  std::size_t sourceVersion() const noexcept override { return candidate.snapshot->sourceVersion(); }
+
+  const wftrain::ResidentEnergySRDiagnostics& diagnostics() const noexcept override { return completed; }
+
+  double displacementNorm() const noexcept override { return candidate.displacement_norm; }
+};
+
+/// Match Adam's authority/retirement order while accepting only the prevalidated SR numerical control.
+struct ResidentSRAuthorityPublication final : PsiFormerWF::PreparedResidentDeviceSRPublication
+{
+  std::unique_ptr<ResidentSRAuthorityProposal> proposal;
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> successor;
+  std::unique_ptr<psiformer::device::PreparedDeviceBatchBackend::PreparedDevicePublication> backend;
+  std::unique_lock<std::shared_mutex> authority;
+
+  std::size_t commit() noexcept override
+  {
+    if (!authority.owns_lock())
+      std::terminate();
+    backend->commit();
+    const auto version = proposal->sourceVersion() + 1;
+    proposal->state->model.p.parameter_version = version;
+    proposal->candidate.owner->acceptPreparedDeviceCandidate(*proposal->candidate.snapshot, successor);
+    backend->unlock();
+    authority.unlock();
+    return version;
+  }
+};
 }
 #endif
 
@@ -12829,7 +12867,7 @@ PsiFormerWF::ResidentDeviceAuthorityRequirements PsiFormerWF::prepareResidentDev
       model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
       environment.boundary != psiformer::BoundaryCondition::OPEN ||
       environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
-    throw std::invalid_argument("DEVICE authority requires explicitly prepared real/open resident Adam");
+    throw std::invalid_argument("DEVICE authority requires explicitly prepared real/open resident ENERGY");
   const auto bytes = checkedBatchMemoryMultiply(structured_parameter_schema_->parameterCount(),
       sizeof(double), "Resident DEVICE authority canonical image");
   model_state_->resident_device_authority_enabled = true;
@@ -12910,6 +12948,106 @@ PsiFormerWF::prepareResidentDeviceAdamPublication(std::unique_ptr<ResidentDevice
   return publication;
 #else
   throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
+#endif
+}
+
+/// Consume one admitted real/open AE C3 into owning DEVICE bytes, never a HOST candidate.
+std::unique_ptr<PsiFormerWF::ResidentDeviceSRProposal> PsiFormerWF::consumeResidentEnergySRDevice(
+    const wftrain::StreamingDerivativeOperator& derivative,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    const std::vector<double>& weights, double weight, double energy, double damping, double learning_rate,
+    const wftrain::KrylovSolverControl& control, std::pair<std::size_t, std::size_t> budget,
+    std::size_t snapshot_device_cap) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (system_kind_ != "all_electron" || !model_state_->resident_device_authority_enabled ||
+      !model_state_->resident_energy_sr_reuse || !source || source->model_state_ != model_state_ ||
+      source->shared_scratch_ != model_state_->resident_energy_scratch || source->ecp_replay_ ||
+      !derivative.sampleCount() || weights.size() != derivative.sampleCount() || channels.size() != 3 ||
+      channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      channels[1].product != wftrain::DerivativeProduct::SCORE_VJP || channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
+    throw std::invalid_argument("DEVICE SR authority requires this provider's retained real/open AE T/EO/O batch");
+  (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
+  using Owner = psiformer::device::PreparedDevicePcg;
+  std::vector<Owner::FrozenInterval> frozen;
+  for (const auto& block : structured_parameter_schema_->blocks())
+    if (!block.trainable)
+      frozen.emplace_back(block.offset, block.count);
+  auto proposal = std::make_unique<ResidentSRAuthorityProposal>();
+  proposal->state = model_state_;
+  proposal->scratch = source->shared_scratch_;
+  proposal->backend = std::dynamic_pointer_cast<const psiformer::device::PreparedDeviceBatchBackend>(
+      model_state_->numerical_tile_backend);
+  if (!proposal->backend)
+    throw std::invalid_argument("DEVICE SR authority requires the admitted GPU backend");
+  source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
+    auto& session = *proposal->scratch->device_products;
+    if (!model_state_->resident_energy_sr_workspace)
+    {
+      if (model_state_->resident_energy_sr_workspace_started)
+        throw std::logic_error("DEVICE SR failed cold preparation requires explicit stage re-preparation");
+      model_state_->resident_energy_sr_workspace_started = true;
+      model_state_->resident_energy_sr_workspace = Owner::prepareRetainedEnergy(session, source->positions_, weights,
+          frozen, derivative.parameterVersion(), damping, budget.first, budget.second);
+    }
+    const auto before = session.transferSnapshot();
+    const auto& owner = model_state_->resident_energy_sr_workspace;
+    proposal->candidate = owner->consumeRetainedEnergyDevice(owner, source->positions_, weights, frozen,
+        derivative.parameterVersion(), generation, weight, energy, damping, learning_rate, control,
+        budget.first, budget.second, snapshot_device_cap);
+    const auto& result = proposal->candidate.result;
+    proposal->completed = {result.solve, result.gradient_norm, result.direction_norm, result.metric_norm};
+    const auto after = session.transferSnapshot();
+    app_log() << "Resident DEVICE SR terminal: source_version=" << derivative.parameterVersion()
+              << ", samples=" << derivative.sampleCount() << ", snapshot_device_bytes=" << proposal->candidate.snapshot->deviceBytes()
+              << ", uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+              << ", downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
+              << ", allocation_calls=" << after.allocation_calls - before.allocation_calls
+              << "; raw_square_displacement_domain=yes; public_driver_admission=no" << std::endl;
+  }, true);
+  return proposal;
+#else
+  throw std::invalid_argument("Resident DEVICE SR authority requires a real GPU build");
+#endif
+}
+
+/// Pin and prevalidate the exact retained solver/session before final same-thread publication authority.
+std::unique_ptr<PsiFormerWF::PreparedResidentDeviceSRPublication>
+PsiFormerWF::prepareResidentDeviceSRPublication(std::unique_ptr<ResidentDeviceSRProposal> opaque,
+    std::size_t expected_version, std::size_t successor_device_cap)
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  auto* proposal = dynamic_cast<ResidentSRAuthorityProposal*>(opaque.get());
+  if (!proposal || proposal->state != model_state_ || proposal->sourceVersion() != expected_version ||
+      proposal->scratch != model_state_->resident_energy_scratch ||
+      proposal->candidate.owner != model_state_->resident_energy_sr_workspace)
+    throw std::invalid_argument("Resident DEVICE SR proposal is foreign, stale or no longer anchored");
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> source;
+  {
+    PsiFormerReadTransaction read(*model_state_, true);
+    if (read.parameterVersion() != expected_version)
+      throw std::invalid_argument("Resident DEVICE SR source version changed");
+    source = proposal->backend->currentImage();
+  }
+  if (successor_device_cap != 0)
+    throw std::invalid_argument("Shared DEVICE SR successor requires zero additional numeric allocation allowance");
+  auto successor = source->makeSharedUpdatedImage(*proposal->candidate.snapshot);
+  auto publication = std::make_unique<ResidentSRAuthorityPublication>();
+  publication->authority = std::unique_lock<std::shared_mutex>(model_state_->mutex);
+  requireNoPlannedProposalMutation("resident DEVICE SR publication");
+  if (model_state_->model.p.version() != expected_version || proposal->scratch != model_state_->resident_energy_scratch ||
+      proposal->candidate.owner != model_state_->resident_energy_sr_workspace)
+    throw std::invalid_argument("Resident DEVICE SR publication source/anchor changed");
+  proposal->candidate.owner->validateDeviceAcceptance(*proposal->candidate.snapshot, successor);
+  publication->backend = std::make_unique<psiformer::device::PreparedDeviceBatchBackend::PreparedDevicePublication>(
+      proposal->backend, source, successor);
+  publication->successor = std::move(successor);
+  publication->proposal.reset(static_cast<ResidentSRAuthorityProposal*>(opaque.release()));
+  return publication;
+#else
+  throw std::invalid_argument("Resident DEVICE SR authority requires a real GPU build");
 #endif
 }
 
