@@ -30,6 +30,7 @@
 #include "CPU/math.hpp"
 
 #include <exception>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 
@@ -700,10 +701,11 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     native_capture->provenance_owner_ = provenance;
     native_capture->scientific_definition_ = provenance->scientific_definition;
     native_capture->capture_identity_ = std::move(identity);
-    native_capture->shared_provenance_bytes_ = shared_bytes;
     native_capture->potentials_.resize(ham_list.size());
-    if (native_capture->hostBytes() > native_capture_host_cap)
+    const auto fixed_bytes = add(sizeof(wftrain::NonLocalECPNativeCapture), shared_bytes);
+    if (native_capture->potentials_.capacity() > (native_capture_host_cap - fixed_bytes) / sizeof(double))
       throw std::length_error("Native fixed-grid capture actual capacity exceeds HOST admission");
+    native_capture->host_bytes_ = fixed_bytes + native_capture->potentials_.capacity() * sizeof(double);
   }
   std::size_t nonlocal_index = leader.H.size();
   for (std::size_t operator_index = 0; operator_index < leader.H.size(); ++operator_index)
@@ -777,7 +779,12 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     if (native_capture)
     {
       const auto potential = ham_list[walker].getLocalPotential();
-      if (!std::isfinite(potential)) throw std::overflow_error("Native fixed-grid capture potential is nonfinite");
+      // Keep admission effective in normal fast-math builds, independently of arithmetic assumptions.
+      static_assert(sizeof(potential) == sizeof(std::uint64_t));
+      std::uint64_t bits;
+      std::memcpy(&bits, &potential, sizeof(bits));
+      if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000))
+        throw std::overflow_error("Native fixed-grid capture potential is nonfinite");
       native_capture->potentials_[walker] = potential;
     }
   }

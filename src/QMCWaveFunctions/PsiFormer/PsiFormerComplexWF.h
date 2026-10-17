@@ -21,6 +21,7 @@
 namespace qmcplusplus
 {
 class TrialWaveFunction;
+namespace wftrain { class NonLocalECPNativeCapture; }
 namespace psiformer
 {
 struct InitializedPsiFormerParameters;
@@ -279,6 +280,30 @@ public:
   /// Numerical-only observation: native REAL potential already contains Re(ECP) on this exact grid.
   CapturedLocalEnergyObservation observeCapturedLocalEnergy(const ParticleSet&,
       const wftrain::StreamingDerivativeOperator&, std::size_t sample, FullPrecRealType same_sample_real_potential) const;
+
+  /// Opaque accepted-family/grid reference; only an authoritative native traversal can create it.
+  class FixedGridEnergyReference;
+  /// Admit cold metadata plus shared retained replay/provenance once, without another parameter image.
+  std::shared_ptr<const FixedGridEnergyReference> makeBudgetedFixedGridEnergyReference(const ParticleSet&,
+      const wftrain::StreamingDerivativeOperator&, std::size_t sample,
+      std::shared_ptr<const wftrain::NonLocalECPNativeCapture>, std::size_t host_cap) const;
+
+  /// A complete scalar result pinned to both immutable parameter generations and the accepted grid.
+  struct FixedGridCandidateEnergy
+  {
+    LogValue kinetic{}, nonlocal{}, local_energy{};
+    std::size_t source_version = 0, candidate_version = 0;
+    std::uint64_t grid_fingerprint = 0;
+  private:
+    friend class PsiFormerComplexWF;
+    std::shared_ptr<const FixedGridEnergyReference> reference;
+    std::shared_ptr<const void> candidate_state, candidate_image;
+  };
+  /// Recompute complete candidate ratios on the sealed physical grid without RNG or source publication.
+  FixedGridCandidateEnergy evaluateFixedGridCandidateEnergy(const std::shared_ptr<const FixedGridEnergyReference>&,
+      const PsiFormerComplexWF& private_candidate, const ParticleSet& candidate_particles) const;
+  /// Reject a scalar receipt after either family, image or version has changed.
+  void validateFixedGridCandidateEnergy(const FixedGridCandidateEnergy&, const PsiFormerComplexWF& private_candidate) const;
 
   /// Explicit numerical route only; generic GPU provider discovery remains closed.
   struct GpuNonLocalReplayRequirements

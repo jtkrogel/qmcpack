@@ -925,7 +925,7 @@ struct PsiFormerComplexWF::Impl
     const std::size_t version, ordinal, offset, samples, host_cap;
     const wftrain::ParameterChunkPlan chunks;
     std::vector<double> positions, inverse_masses;
-    std::unique_ptr<wftrain::NonLocalECPJVPReplay> replay;
+    std::shared_ptr<const wftrain::NonLocalECPJVPReplay> replay;
     std::atomic<bool> replay_bound{false};
     std::vector<std::size_t> references;
     std::vector<C> complete_weights;
@@ -2178,6 +2178,59 @@ struct PsiFormerComplexWF::Impl
   int proposed_particle = -1;
   bool accepted_valid = false, pending = false, own_full_valid = false, collective_pending = false;
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
+};
+
+/// Keep the accepted traversal and both provenance owners alive without copying virtual configurations.
+class PsiFormerComplexWF::FixedGridEnergyReference
+{
+  friend class PsiFormerComplexWF;
+#ifdef ENABLE_CUDA
+  std::shared_ptr<Impl::Model> source;
+  std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+  std::shared_ptr<const Impl::GpuNonLocalReplay> replay;
+  std::shared_ptr<const wftrain::NonLocalECPNativeCapture> native;
+  std::vector<double> inverse_masses;
+  std::vector<int> groups;
+  std::size_t sample = 0;
+
+  /// Both callers hold Model read; require identical accepted physical reference and kinetic metadata.
+  void validateParticles(const Impl& owner, const ParticleSet& p) const
+  {
+    owner.requireIdle(p);
+    const auto& masses = p.get_mass_by_group();
+    if (p.R.size() != groups.size() || masses.size() != static_cast<std::size_t>(p.groups()))
+      throw std::invalid_argument("Fixed-grid candidate particle extent/masses differ");
+    for (std::size_t e = 0; e < groups.size(); ++e)
+    {
+      const auto group = p.GroupID[e];
+      if (group != groups[e] || group < 0 || static_cast<std::size_t>(group) >= masses.size() ||
+          !psiformer::determinant::isFiniteReal(masses[group]) || masses[group] <= 0 ||
+          1.0 / masses[group] != inverse_masses[e])
+        throw std::invalid_argument("Fixed-grid candidate spin/mass metadata differs");
+      for (int d = 0; d < 3; ++d)
+        if (p.R[e][d] != replay->reference_positions[3 * (sample * groups.size() + e) + d])
+          throw std::invalid_argument("Fixed-grid candidate reference coordinates differ");
+    }
+  }
+
+  /// Source publication, private re-isolation, pending moves and stale immutable images fail closed.
+  void validate(const Impl& original, const Impl& candidate) const
+  {
+    if (original.state != source || candidate.state == source || !source->gpu || !candidate.state->gpu ||
+        source->gpu->image != image || source->model.p.version() != replay->version ||
+        source->pending_proposals.load() || candidate.state->pending_proposals.load() ||
+        candidate.state->private_origin.lock() != source || candidate.state->private_origin_image.lock() != image ||
+        candidate.state->private_origin_version != replay->version ||
+        candidate.state->gpu->image->version() != candidate.state->model.p.version() ||
+        candidate.state->system_kind != source->system_kind || candidate.state->source != source->source ||
+        candidate.state->schema->fingerprint() != source->schema->fingerprint() ||
+        candidate.state->reduced_twist != source->reduced_twist)
+      throw std::logic_error("Fixed-grid candidate requires its current private GPU isolation origin");
+    Impl::validateDerivativeSource(*source); Impl::validateDerivativeSource(*candidate.state);
+    image->validateCurrentDevice(); candidate.state->gpu->image->validateCurrentDevice();
+    validateParticles(original, *original.particles);
+  }
+#endif
 };
 
 /// Construct the explicit paired CPU or strictly capped shared-GPU inference profile.
@@ -3597,6 +3650,114 @@ PsiFormerComplexWF::CapturedLocalEnergyObservation PsiFormerComplexWF::observeCa
   return {kinetic, nonlocal, energy, potential, stream->version, stream->replay->gridFingerprint()};
 #else
   throw std::logic_error("Complex captured energy observation requires the explicit GPU component route");
+#endif
+}
+
+/// Seal only a bound, native-produced replay; copied scientific strings and synthetic grids cannot impersonate it.
+std::shared_ptr<const PsiFormerComplexWF::FixedGridEnergyReference>
+PsiFormerComplexWF::makeBudgetedFixedGridEnergyReference(const ParticleSet& p,
+    const wftrain::StreamingDerivativeOperator& op, std::size_t sample,
+    std::shared_ptr<const wftrain::NonLocalECPNativeCapture> native, std::size_t host_cap) const
+{
+#ifdef ENABLE_CUDA
+  const auto* stream = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
+  if (!stream || stream->lane->state != impl_->state || !native || !host_cap ||
+      host_cap == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Fixed-grid energy reference requires its own captured GPU family and finite HOST cap");
+  std::unique_lock execution(stream->lane->execution_mutex);
+  std::shared_lock read(impl_->state->mutex);
+  stream->requireCurrent();
+  auto replay = std::dynamic_pointer_cast<const Impl::GpuNonLocalReplay>(stream->replay);
+  if (!replay || sample >= stream->samples || native->captureIdentity() != replay->capture_identity ||
+      native->gridFingerprint() != replay->grid || native->reportedPotentials().size() != stream->samples ||
+      native->scientificDefinition().empty())
+    throw std::invalid_argument("Fixed-grid energy reference requires an authoritative same-traversal native receipt");
+  const char* error = "Fixed-grid energy reference HOST admission overflow";
+  auto bytes = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), native->hostBytes(), error);
+  pf::addStorageBytes(bytes, replay->storageDiagnostics().retained_numeric_bytes, error);
+  pf::addStorageBytes(bytes, pf::checkedStorageProduct(p.R.size(), sizeof(double) + sizeof(int), error), error);
+  if (bytes > host_cap) throw std::length_error("Fixed-grid energy reference exceeds HOST cap before allocation");
+  impl_->observeOwnKinetic(p); // Require current accepted FULL products, not an arbitrary VALUE reference.
+  auto result = std::make_shared<FixedGridEnergyReference>();
+  result->source = impl_->state; result->image = impl_->state->gpu->image;
+  result->replay = std::move(replay); result->native = std::move(native); result->sample = sample;
+  result->inverse_masses.assign(stream->inverse_masses.begin() + sample * p.R.size(),
+      stream->inverse_masses.begin() + (sample + 1) * p.R.size());
+  result->groups.assign(p.GroupID.begin(), p.GroupID.end());
+  result->validateParticles(*impl_, p);
+  auto actual = pf::checkedStorageSum(sizeof(FixedGridEnergyReference), result->native->hostBytes(), error);
+  pf::addStorageBytes(actual, result->replay->storageDiagnostics().retained_numeric_bytes, error);
+  pf::addStorageBytes(actual, pf::checkedStorageBytes<double>(result->inverse_masses.capacity(), error), error);
+  pf::addStorageBytes(actual, pf::checkedStorageBytes<int>(result->groups.capacity(), error), error);
+  if (actual > host_cap) throw std::length_error("Fixed-grid energy reference actual capacities exceed HOST cap");
+  app_log() << "Complex fixed-grid reference: HOST_retained_bytes=" << actual
+            << "; shared_replay_and_PP_counted_once=yes; DEVICE_additional_bytes=0" << std::endl;
+  return result;
+#else
+  throw std::logic_error("Fixed-grid candidate energy requires the explicit GPU component route");
+#endif
+}
+
+/// Lock both authorities before the private lane; every point uses the same complete VALUE ratio as public VP.
+PsiFormerComplexWF::FixedGridCandidateEnergy PsiFormerComplexWF::evaluateFixedGridCandidateEnergy(
+    const std::shared_ptr<const FixedGridEnergyReference>& reference, const PsiFormerComplexWF& candidate,
+    const ParticleSet& p) const
+{
+#ifdef ENABLE_CUDA
+  if (!reference || candidate.impl_->state == impl_->state)
+    throw std::invalid_argument("Fixed-grid candidate energy requires a sealed reference and distinct private family");
+  std::shared_lock source_read(impl_->state->mutex, std::defer_lock);
+  std::shared_lock candidate_read(candidate.impl_->state->mutex, std::defer_lock);
+  std::lock(source_read, candidate_read);
+  reference->validate(*impl_, *candidate.impl_);
+  reference->validateParticles(*candidate.impl_, p);
+  candidate.impl_->requireNoCollective();
+  const auto kinetic = candidate.impl_->observeOwnKinetic(p);
+  candidate.impl_->formRatio(candidate.impl_->accepted, p, 0, &p.R[0]); // Zero accepted denominator always rejects.
+  LogValue source_nonlocal{}, trial_nonlocal{};
+  for (const auto& point : reference->replay->point_records)
+    if (point.sample == reference->sample)
+    {
+      ParticleSet::PosType absolute;
+      for (int d = 0; d < 3; ++d) absolute[d] = point.replacement_position[d];
+      const auto value = candidate.impl_->core(p, false, point.electron, -1, &absolute);
+      const auto ratio = candidate.impl_->formRatio(value.amplitude, p, point.electron, &absolute);
+      source_nonlocal += point.bare_weight * point.complete_ratio;
+      trial_nonlocal += point.bare_weight * ratio; // Also evaluate bare0; a zero virtual numerator is valid.
+      if (!isFiniteWavefunctionValue(source_nonlocal) || !isFiniteWavefunctionValue(trial_nonlocal))
+        throw std::overflow_error("Fixed-grid candidate nonlocal energy overflow");
+    }
+  const auto energy = kinetic + (reference->native->reportedPotentials()[reference->sample] - source_nonlocal.real()) + trial_nonlocal;
+  if (!isFiniteWavefunctionValue(energy)) throw std::overflow_error("Fixed-grid candidate complete energy overflow");
+  FixedGridCandidateEnergy result;
+  result.kinetic = kinetic; result.nonlocal = trial_nonlocal; result.local_energy = energy;
+  result.source_version = reference->replay->version; result.candidate_version = candidate.impl_->state->model.p.version();
+  result.grid_fingerprint = reference->replay->grid; result.reference = reference;
+  result.candidate_state = candidate.impl_->state; result.candidate_image = candidate.impl_->state->gpu->image;
+  return result;
+#else
+  throw std::logic_error("Fixed-grid candidate energy requires the explicit GPU component route");
+#endif
+}
+
+/// No numerical call or allocation is needed to reject stale/foreign complete-energy receipts.
+void PsiFormerComplexWF::validateFixedGridCandidateEnergy(const FixedGridCandidateEnergy& result,
+    const PsiFormerComplexWF& candidate) const
+{
+#ifdef ENABLE_CUDA
+  if (!result.reference || candidate.impl_->state == impl_->state)
+    throw std::invalid_argument("Fixed-grid candidate energy receipt is empty or foreign");
+  std::shared_lock source_read(impl_->state->mutex, std::defer_lock);
+  std::shared_lock candidate_read(candidate.impl_->state->mutex, std::defer_lock);
+  std::lock(source_read, candidate_read);
+  result.reference->validate(*impl_, *candidate.impl_);
+  result.reference->validateParticles(*candidate.impl_, *candidate.impl_->particles);
+  if (result.candidate_state != candidate.impl_->state || result.candidate_image != candidate.impl_->state->gpu->image ||
+      result.candidate_version != candidate.impl_->state->model.p.version() ||
+      result.source_version != result.reference->replay->version || result.grid_fingerprint != result.reference->replay->grid)
+    throw std::logic_error("Fixed-grid candidate energy receipt generation is stale/foreign");
+#else
+  throw std::logic_error("Fixed-grid candidate energy requires the explicit GPU component route");
 #endif
 }
 

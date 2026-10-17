@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace qmcplusplus { class QMCHamiltonian; }
 
@@ -45,8 +46,7 @@ public:
   DerivativeArrayView<const double> reportedPotentials() const noexcept
   { return {potentials_.data(), potentials_.size()}; }
   /// Account newly retained receipt storage separately from the shared immutable PP owner.
-  std::size_t hostBytes() const noexcept
-  { return sizeof(*this) + potentials_.capacity() * sizeof(double) + shared_provenance_bytes_; }
+  std::size_t hostBytes() const noexcept { return host_bytes_; }
 
 private:
   friend class qmcplusplus::QMCHamiltonian;
@@ -54,7 +54,7 @@ private:
   std::shared_ptr<const void> provenance_owner_, capture_identity_;
   std::string_view scientific_definition_;
   std::vector<double> potentials_;
-  std::size_t shared_provenance_bytes_ = 0;
+  std::size_t host_bytes_ = 0;
   std::uint64_t grid_ = 0;
 };
 

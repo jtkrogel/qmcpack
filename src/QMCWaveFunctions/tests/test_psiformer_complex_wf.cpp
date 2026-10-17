@@ -18,6 +18,7 @@
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/ECPComponentBuilder.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
+#include "QMCHamiltonians/HarmonicExternalPotential.h"
 #include "Utilities/FakeRandom.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
@@ -4458,6 +4459,15 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   ham.setECPModelProvenance(provenance);
   ham.addOperator(std::make_unique<BareKineticEnergy>(p), "Kinetic", true);
   ham.addOperator(std::move(nonlocal), "NonLocalECP", true);
+  // A real, parameter-independent native term makes source-Re(W)+trial-W accounting observable.
+  auto local = std::make_unique<HarmonicExternalPotential>(p);
+  local->mass = local->energy = local->length = 1; local->center = 0;
+  ham.addOperator(std::move(local), "LocalBaseline", true);
+  const auto local_baseline = [](const ParticleSet& target) {
+    double result = 0;
+    for (const auto& position : target.R) result += .5 * dot(position, position);
+    return result;
+  };
   ham.addObservables(p);
   auto ham1 = ham.makeClone(p1, *trial1);
   auto& nl1 = dynamic_cast<NonLocalECPotential&>(*ham1->getComponent(1));
@@ -4560,7 +4570,7 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     const auto observed = (b ? gpu1 : gpu).observeCapturedLocalEnergy(particles[b], *op, b, hamiltonians[b].getLocalPotential());
     const auto cpu_kinetic = dynamic_cast<PsiFormerComplexWF&>(components[b]).observeCoulombEnergy(*cp[b], 0).kinetic;
     close(observed.nonlocal, nonlocal_energy[b], 3e-9);
-    close(observed.local_energy, cpu_kinetic + nonlocal_energy[b], 3e-9);
+    close(observed.local_energy, cpu_kinetic + local_baseline(particles[b]) + nonlocal_energy[b], 3e-9);
     close(observed.local_energy.real(), actual.local_energies[b], 3e-9);
     CHECK(observed.reported_real_potential == hamiltonians[b].getLocalPotential());
     CHECK(observed.grid_fingerprint == actual.grid_fingerprint); CHECK(observed.parameter_version == 0);
@@ -4591,6 +4601,109 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     close(lhs, rhs, 3e-9);
   }
   CHECK(gpu.snapshotParameters().values == accepted.values);
+  // This explicit numerical route is NOT used by the native REAL-energy line-search selector.
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, {}, 1024 * 1024));
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, 1));
+  CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 2, actual.native_capture, 1024 * 1024));
+  auto fixed_grid = gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, 1024 * 1024);
+  CHECK_THROWS(gpu1.makeBudgetedFixedGridEnergyReference(p1, *op, 0, actual.native_capture, 1024 * 1024));
+  ParticleSet private_p(p), private_cpu_p(p);
+  auto private_owner = gpu.makeClone(private_p);
+  auto& private_gpu = dynamic_cast<PsiFormerComplexWF&>(*private_owner);
+  const auto isolation = private_gpu.gpuCandidateIsolationRequirements();
+  private_gpu.isolateBudgetedGpuParameterState(isolation.device_bytes, isolation.host_bytes);
+  PsiFormerComplexWF private_cpu("actual_ecp", initialized, private_cpu_p, source, clone_cap, twist);
+  const auto private_publication = private_gpu.gpuParameterPublicationRequirements();
+  const auto real_leaf = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+      [](const auto& leaf) { return leaf.name == "w"; });
+  const auto imag_leaf = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+      [](const auto& leaf) { return leaf.name == "w_imag"; });
+  REQUIRE(real_leaf != initialized.layouts.end()); REQUIRE(imag_leaf != initialized.layouts.end());
+  PsiFormerComplexWF::FixedGridCandidateEnergy candidate_energy;
+  const auto source_g = p.G; const auto source_l = p.L; const auto source_positions = p.R;
+  for (std::size_t step = 0; step < 2; ++step)
+  {
+    auto candidate = private_gpu.snapshotParameters();
+    candidate.values[real_leaf->begin] += .013 * (step + 1);
+    candidate.values[imag_leaf->begin] -= .017 * (step + 1);
+    CHECK(private_gpu.publishBudgetedGpuParameters(candidate, candidate.version,
+        private_publication.device_bytes, private_publication.host_bytes) == candidate.version + 1);
+    CHECK(private_cpu.publishParameters(candidate, candidate.version) == candidate.version + 1);
+    if (step) CHECK_THROWS(gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu));
+    evaluate(private_gpu, private_p); evaluate(private_cpu, private_cpu_p);
+    C expected_nonlocal{};
+    for (const auto& point : grid)
+      if (point.sample == 0)
+      {
+        VirtualParticleSet virtuals(private_cpu_p);
+        ParticleSet::PosType absolute;
+        for (int d = 0; d < 3; ++d) absolute[d] = point.replacement_position[d];
+        virtuals.makeMovesAbsolute(private_cpu_p, point.electron, {&absolute, 1});
+        std::vector<WaveFunctionComponent::ValueType> ratios(1);
+        private_cpu.evaluateRatios(virtuals, ratios);
+        expected_nonlocal += point.bare_weight * ratios[0];
+      }
+    const auto kinetic = private_cpu.observeCoulombEnergy(private_cpu_p, 0).kinetic;
+    const auto warm = metrics.snapshot(); const auto storage = private_gpu.numericStorage();
+    candidate_energy = gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p);
+    gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu);
+    close(candidate_energy.kinetic, kinetic, 3e-9);
+    close(candidate_energy.nonlocal, expected_nonlocal, 3e-9);
+    close(candidate_energy.local_energy, kinetic + local_baseline(private_p) + expected_nonlocal, 3e-9);
+    CHECK(candidate_energy.source_version == 0); CHECK(candidate_energy.candidate_version == step + 1);
+    CHECK(candidate_energy.grid_fingerprint == actual.grid_fingerprint);
+    close(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p).local_energy,
+          candidate_energy.local_energy, 3e-9);
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().live_bytes == warm.live_bytes);
+    CHECK(private_gpu.numericStorage().fingerprint == storage.fingerprint);
+    const auto before_refusal = metrics.snapshot();
+    CHECK_THROWS(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, gpu1, p1));
+    CHECK_THROWS(gpu1.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p));
+    private_p.R[0][0] += .01; private_p.update();
+    CHECK_THROWS(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p));
+    private_p.R = source_positions; private_p.update();
+    CHECK(metrics.snapshot().uploaded_bytes == before_refusal.uploaded_bytes);
+    CHECK(metrics.snapshot().downloaded_bytes == before_refusal.downloaded_bytes);
+    CHECK(gpu.snapshotParameters().values == accepted.values);
+    for (int e = 0; e < p.getTotalNum(); ++e)
+    {
+      close(p.L[e], source_l[e]);
+      for (int d = 0; d < 3; ++d)
+      {
+        CHECK(p.R[e][d] == source_positions[e][d]);
+        close(p.G[e][d], source_g[e][d]);
+      }
+    }
+  }
+  const int private_mass_attribute = private_p.getSpeciesSet().addAttribute("mass");
+  private_p.getSpeciesSet()(private_mass_attribute, 0) = 2; private_p.resetGroups();
+  CHECK_THROWS(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p));
+  private_p.getSpeciesSet()(private_mass_attribute, 0) = 1; private_p.resetGroups();
+  evaluate(private_gpu, private_p);
+  gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu);
+  // Preserve VALUE node semantics: coincident same-spin virtual rows are valid ratio0, not skipped work.
+  VirtualParticleSet coincident(private_p);
+  coincident.makeMovesAbsolute(private_p, 0, {&private_p.R[1], 1});
+  std::vector<WaveFunctionComponent::ValueType> zero_ratio(1);
+  private_gpu.evaluateRatios(coincident, zero_ratio);
+  close(zero_ratio[0], C{}, 3e-9);
+  const auto good_private = private_gpu.snapshotParameters();
+  auto zero_private = good_private;
+  for (const auto& leaf : initialized.layouts)
+    if (leaf.module.find("Backflow") != std::string::npos)
+      std::fill(zero_private.values.begin() + leaf.begin, zero_private.values.begin() + leaf.end, 0.);
+  private_gpu.publishBudgetedGpuParameters(zero_private, zero_private.version,
+      private_publication.device_bytes, private_publication.host_bytes);
+  CHECK_THROWS(evaluate(private_gpu, private_p)); // A zero accepted denominator cannot publish FULL state.
+  CHECK_THROWS(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p));
+  auto recovered_private = good_private; recovered_private.version = zero_private.version + 1;
+  private_gpu.publishBudgetedGpuParameters(recovered_private, recovered_private.version,
+      private_publication.device_bytes, private_publication.host_bytes);
+  evaluate(private_gpu, private_p);
+  candidate_energy = gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p);
+  gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu);
+  std::printf("COMPLEX_FIXED_GRID_CANDIDATE PASS actual_native_seal=1 private_origin=1 two_versions=1 CPU_same_grid=1 no_Re_doublecount=1 warm_allocations=0 stale_foreign=1 source_unchanged=1\n");
   // Parameters-only PP import is fresh Gamma training state, not a sampler/PP restart.
   // Reuse this mathematical fixture's ACTUAL virtual positions/bare weights, but
   // recompute Gamma ratios: its original nonzero-twist ratios are not transferable.
@@ -4663,6 +4776,8 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   CHECK_THROWS(gpu.observeCapturedLocalEnergy(p1, *op, 1, ham1->getLocalPotential()));
   const auto budget = gpu.gpuParameterPublicationRequirements();
   gpu.publishBudgetedGpuParameters(accepted, 0, budget.device_bytes, budget.host_bytes);
+  CHECK_THROWS(gpu.validateFixedGridCandidateEnergy(candidate_energy, private_gpu));
+  CHECK_THROWS(gpu.evaluateFixedGridCandidateEnergy(fixed_grid, private_gpu, private_p));
   CHECK_THROWS(gpu.observeCapturedLocalEnergy(p, *op, 0, ham.getLocalPotential()));
   std::printf("COMPLEX_ACTUAL_ECP PASS actual_traversal=1 complex_energy=1 real_reporting=1 CPU_allP=1 duality=1 cap_abort_stale=1\n");
 }
