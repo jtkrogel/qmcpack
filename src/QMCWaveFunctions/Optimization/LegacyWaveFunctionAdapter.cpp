@@ -27,6 +27,8 @@
 #include <cassert>
 #include <cmath>
 #include <complex>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -830,6 +832,9 @@ protected:
       }
     }
 
+    if (std::getenv("QMCPACK_TASK46_HEX_DIAGNOSTIC") && schema_->parameterCount() == 8)
+      for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        std::fprintf(stderr, "T46HEX ADAPTER version=%zu batch=%zu samples=%zu channel=%zu id=%.*s product=%u mask=%u value0=(%a,%a)\n", parameterVersion(), batch_ordinal_, sampleCount(), channel, static_cast<int>(channels[channel].id.size()), channels[channel].id.data(), static_cast<unsigned>(channels[channel].product), channels[channel].local_energy_term_mask, workspace_->channels[channel][0].real(), workspace_->channels[channel][0].imag());
     for (const ParameterChunkDescriptor& chunk : chunk_plan_.chunks())
       for (std::size_t channel = 0; channel < channels.size(); ++channel)
         sink.add(channel,

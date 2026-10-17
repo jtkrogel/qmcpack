@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -417,6 +419,8 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
     }
   }
 
+  if (std::getenv("QMCPACK_TASK46_HEX_DIAGNOSTIC") && result.gradient.size() == 8)
+    std::fprintf(stderr, "T46HEX FINALIZE version=%zu estimator=%u O=(%a,%a) EO=(%a,%a) dE=(%a,%a) W=%a E=(%a,%a) g0=%a\n", parameter_version_, static_cast<unsigned>(estimator_), weighted_score_sum_[0].real(), weighted_score_sum_[0].imag(), weighted_energy_score_sum_[0].real(), weighted_energy_score_sum_[0].imag(), weighted_energy_derivative_sum_[0].real(), weighted_energy_derivative_sum_[0].imag(), weight_sum_, result.mean_energy.real(), result.mean_energy.imag(), result.gradient[0]);
   finalized_ = true;
   return result;
 }
