@@ -199,7 +199,8 @@ public:
   }
 
   /** One regular-node complete nonlocal response, with caller-owned immutable grid/ratios.
-   * C1 only; B+Q counts all scalar score evaluations in the prepared request bound.
+   * C1 request only, using slot0 of any admitted channel capacity (other slots become zero).
+   * B+Q counts all scalar score evaluations in the prepared request bound.
    * W contains the COMPLETE bare*total virtual/reference ratio, including fixed
    * components/outer phase. No public Hamiltonian or quadrature construction.
    */
@@ -215,7 +216,7 @@ public:
     image_->validateCurrentDevice();
     const auto stride = 3 * cost_.electrons;
     const auto b = base_positions.size() / stride, q = virtual_positions.size() / stride;
-    if (cost_.channels != 1 || !b || b > cost_.maximum_samples || q > cost_.maximum_samples - b ||
+    if (!cost_.channels || !b || b > cost_.maximum_samples || q > cost_.maximum_samples - b ||
         base_positions.size() % stride || virtual_positions.size() % stride ||
         coefficients.size() != b || references.size() != q || complete_weights.size() != q)
       throw std::invalid_argument("Complex nonlocal C1 packed grid/request extent mismatch");
@@ -318,7 +319,7 @@ public:
   {
     ready_ = jvp_ready_ = false;
     const auto stride = 3 * cost_.electrons, total = positions.size() / stride;
-    if (cost_.channels != 1 || !bases || bases > total || total > cost_.maximum_samples ||
+    if (!cost_.channels || !bases || bases > total || total > cost_.maximum_samples ||
         positions.size() % stride || references.size() != total - bases || complete_weights.size() != references.size())
       throw std::invalid_argument("Complex nonlocal JVP C1 packed grid/request extent mismatch");
     const auto finite = [](Complex value) {

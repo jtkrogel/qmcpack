@@ -333,9 +333,9 @@ void validateComplexProducts()
   // Complete regular-node nonlocal ratios include learned phase, outer twist and a fixed companion.
   {
     constexpr std::size_t q = 9;
-    const auto nc = estimateComplexProductsCost(plan, targets, b + q, 1, chunk, ComplexProductsHostOutput::CHUNKED);
+    const auto nc = estimateComplexProductsCost(plan, targets, b + q, 3, chunk, ComplexProductsHostOutput::CHUNKED);
     const auto before_owner = metrics.snapshot();
-    auto nonlocal = Owner::prepare(image, targets, b + q, 1, chunk, queue, blas,
+    auto nonlocal = Owner::prepare(image, targets, b + q, 3, chunk, queue, blas,
         nc.device_bytes, nc.host_bytes, nc.matrix_work, ComplexProductsHostOutput::CHUNKED);
     require(metrics.snapshot().live_bytes == before_owner.live_bytes + nc.device_bytes, "Nonlocal owner cost mismatch");
     const auto nf = nonlocal->storageFingerprint();
@@ -408,6 +408,12 @@ void validateComplexProducts()
           const auto expected = adjoint ? conjugate_reference[offset + i] : reference[offset + i];
           require(std::abs(values[i] - expected) <= 3e-9 * (1 + std::abs(expected)), "Nonlocal complete CPU allP mismatch");
           if (!adjoint) gpu[offset + i] = values[i];
+        }
+        for (std::size_t channel = 1; channel < 3; ++channel)
+        {
+          const auto* unused = nonlocal->downloadCompletedChunk(receipt, channel, offset, count);
+          for (std::size_t i = 0; i < count; ++i)
+            require(unused[i] == C{}, "Nonlocal C1 left a nonzero unused C3 channel");
         }
       }
     }

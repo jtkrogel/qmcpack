@@ -531,9 +531,9 @@ struct PsiFormerComplexWF::Impl
   {
     /// Preserve captured version/schema and bounded snapshot ownership.
     GpuDerivativeStream(std::shared_ptr<GpuDerivativeLane> scratch, std::size_t ordinal,
-        std::size_t offset, std::size_t samples)
+        std::size_t offset, std::size_t samples, std::size_t host_cap)
         : lane(std::move(scratch)), version(lane->state->model.p.version()), ordinal(ordinal), offset(offset),
-          samples(samples), chunks(*lane->state->schema, version, lane->chunk),
+          samples(samples), host_cap(host_cap), chunks(*lane->state->schema, version, lane->chunk),
           positions(3 * samples * lane->state->model.ne), inverse_masses(samples * lane->state->model.ne)
     {}
 
@@ -551,6 +551,12 @@ struct PsiFormerComplexWF::Impl
       c.maximum_sample_tile_size = 1;
       c.fixed_parameter_scratch_vectors = 10; // Three retained complex-P HOST outputs became bounded chunks.
       c.block_streaming = true;
+      if (replay_bound.load(std::memory_order_acquire))
+      {
+        c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
+        c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+        c.maximum_vjp_channels = 1; // Bound replay is deliberately ECP-only C1, not a mixed T+ECP producer.
+      }
       return c;
     }
 
@@ -576,6 +582,7 @@ struct PsiFormerComplexWF::Impl
     wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
     {
       wftrain::StreamingDerivativeStorageDiagnostics d;
+      const bool bound = replay_bound.load(std::memory_order_acquire);
       const auto& cost = lane->products->cost();
       d.parameter_count = cost.parameters;
       d.sample_count = samples;
@@ -586,14 +593,162 @@ struct PsiFormerComplexWF::Impl
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
       d.sample_auxiliary_bytes = inverse_masses.capacity() * sizeof(double);
+      if (bound)
+      {
+        pf::addStorageBytes(d.sample_auxiliary_bytes, replay->storageDiagnostics().retained_numeric_bytes,
+                            "Complex replay diagnostics overflow");
+        pf::addStorageBytes(d.sample_auxiliary_bytes, replayHostBytes(), "Complex replay diagnostics overflow");
+      }
       d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes;
       d.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(lane.get());
-      d.allocation_generation = 1;
+      d.allocation_generation = bound ? 2 : 1;
       d.storage_fingerprint = lane->products->storageFingerprint();
       for (const auto* storage : {&positions, &inverse_masses})
         psiformer::determinant::detail::mixStorage(d.storage_fingerprint, *storage);
       psiformer::determinant::detail::mixStorage(d.storage_fingerprint, lane->zeros);
+      if (bound)
+      {
+        d.storage_fingerprint ^= replay->storageDiagnostics().storage_fingerprint;
+        for (const auto* storage : std::array<const std::vector<C>*, 2>{&complete_weights, &sample_coefficients})
+          psiformer::determinant::detail::mixStorage(d.storage_fingerprint, *storage);
+        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, references);
+        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, virtual_positions);
+        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, joined_positions);
+      }
       return d;
+    }
+
+    /// Validate captured VALUE provenance and complete admission before adopting any replay storage.
+    void bindNonLocalECPJVPReplay(std::unique_ptr<wftrain::NonLocalECPJVPReplay> incoming) override
+    {
+      std::unique_lock execution(lane->execution_mutex);
+      std::shared_lock read(lane->state->mutex);
+      requireCurrent();
+      if (!incoming || replay || has_evaluated)
+        throw std::logic_error("Complex replay requires a nonnull first binding before any derivative action");
+      const auto& schema = parameterSchema();
+      const auto points = incoming->points();
+      const auto source = incoming->referencePositions();
+      const auto diagnostics = incoming->storageDiagnostics();
+      if (incoming->providerId() != schema.providerId() || incoming->schemaFingerprint() != schema.fingerprint() ||
+          incoming->parameterVersion() != version || incoming->batchOrdinal() != ordinal ||
+          incoming->sampleOffset() != offset || incoming->sampleCount() != samples ||
+          incoming->electronCount() != lane->state->model.ne ||
+          incoming->localEnergyTermMask() != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) ||
+          !incoming->gridFingerprint() || source.size() != positions.size() ||
+          !std::equal(source.begin(), source.end(), positions.begin()) ||
+          diagnostics.point_count != points.size() || diagnostics.segment_count != incoming->segments().size() ||
+          diagnostics.tile_count != incoming->tiles().size() ||
+          diagnostics.evaluation_stamp_count != incoming->evaluationStamps().size() || !diagnostics.storage_fingerprint)
+        throw std::invalid_argument("Complex replay source/grid/schema/reference diagnostics mismatch");
+      if (samples > lane->maximum_samples || points.size() > lane->maximum_samples - samples)
+        throw std::length_error("Complex replay B+Q exceeds the existing numerical request capacity");
+      const auto stride = positions.size() / samples;
+      const char* message = "Complex replay HOST admission overflow";
+      const auto virtual_count = pf::checkedStorageProduct(points.size(), stride, message);
+      const auto joined_count = pf::checkedStorageProduct(samples + points.size(), stride, message);
+      std::size_t extra = diagnostics.retained_numeric_bytes;
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(virtual_count, message), message);
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<double>(joined_count, message), message);
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<std::size_t>(points.size(), message), message);
+      pf::addStorageBytes(extra, pf::checkedStorageBytes<C>(samples + points.size(), message), message);
+      const auto current_host = storageDiagnostics().retained_numeric_bytes - lane->products->cost().device_bytes;
+      if (extra > host_cap || current_host > host_cap - extra)
+        throw std::length_error("Complex replay complete HOST storage exceeds factory admission");
+      const auto finite = [](C x) { return psiformer::determinant::isFiniteReal(x.real()) &&
+                                           psiformer::determinant::isFiniteReal(x.imag()); };
+      for (const auto& point : points)
+      {
+        if (point.sample >= samples || point.electron >= lane->state->model.ne ||
+            !finite(point.bare_weight) || !finite(point.complete_ratio) || !finite(point.bare_weight * point.complete_ratio))
+          throw std::invalid_argument("Complex replay point/complete coefficient is invalid");
+        for (const auto x : point.replacement_position)
+          if (!psiformer::determinant::isFiniteReal(x))
+            throw std::invalid_argument("Complex replay replacement coordinate is nonfinite");
+      }
+      std::size_t covered_points = 0, covered_segments = 0;
+      for (const auto& segment : incoming->segments())
+      {
+        if (segment.sample >= samples || segment.electron >= lane->state->model.ne ||
+            segment.point_offset != covered_points || covered_points > points.size() ||
+            segment.point_count > points.size() - covered_points)
+          throw std::invalid_argument("Complex replay segment traversal is not exact");
+        for (std::size_t q = 0; q < segment.point_count; ++q)
+          if (points[covered_points + q].sample != segment.sample || points[covered_points + q].electron != segment.electron)
+            throw std::invalid_argument("Complex replay segment/point reference mismatch");
+        covered_points += segment.point_count;
+      }
+      if (covered_points != points.size()) throw std::invalid_argument("Complex replay segment coverage is incomplete");
+      covered_points = 0;
+      std::size_t tile_ordinal = 0;
+      for (const auto& tile : incoming->tiles())
+      {
+        const auto stamps = incoming->evaluationStamps();
+        if (tile.tile_ordinal != tile_ordinal++ || !tile.virtual_batch_fingerprint ||
+            tile.point_offset != covered_points || tile.segment_offset != covered_segments ||
+            covered_points > points.size() || tile.point_count > points.size() - covered_points ||
+            covered_segments > incoming->segments().size() || tile.segment_count > incoming->segments().size() - covered_segments ||
+            tile.stamp_offset > stamps.size() || tile.stamp_count > stamps.size() - tile.stamp_offset)
+          throw std::invalid_argument("Complex replay tile traversal/provenance range mismatch");
+        bool matching = false;
+        for (std::size_t s = 0; s < tile.stamp_count; ++s)
+          matching |= stamps[tile.stamp_offset + s].matches(lane->state.get(), version);
+        if (!matching) throw std::invalid_argument("Complex replay has no exact paired VALUE evaluation stamp");
+        std::size_t tile_points = 0;
+        for (std::size_t s = 0; s < tile.segment_count; ++s)
+          pf::addStorageBytes(tile_points, incoming->segments()[covered_segments + s].point_count, message);
+        if (tile_points != tile.point_count)
+          throw std::invalid_argument("Complex replay tile/segment point counts disagree");
+        covered_points += tile.point_count; covered_segments += tile.segment_count;
+      }
+      if (covered_points != points.size() || covered_segments != incoming->segments().size())
+        throw std::invalid_argument("Complex replay tile coverage is incomplete");
+      app_log() << "Complex replay before allocation: HOST_additional_bytes=" << extra
+                << ", bases=" << samples << ", points=" << points.size() << "; DEVICE_additional_bytes=0; C1_only=yes" << std::endl;
+      std::vector<double> virtuals(virtual_count), joined(joined_count);
+      std::vector<std::size_t> refs(points.size());
+      std::vector<C> weights(points.size()), coefficients(samples);
+      std::copy(positions.begin(), positions.end(), joined.begin());
+      for (std::size_t q = 0; q < points.size(); ++q)
+      {
+        const auto& point = points[q]; refs[q] = point.sample; weights[q] = point.bare_weight * point.complete_ratio;
+        std::copy_n(positions.data() + point.sample * stride, stride, virtuals.data() + q * stride);
+        std::copy(point.replacement_position.begin(), point.replacement_position.end(), virtuals.data() + q * stride + 3 * point.electron);
+      }
+      std::copy(virtuals.begin(), virtuals.end(), joined.begin() + positions.size());
+      std::size_t actual = diagnostics.retained_numeric_bytes;
+      for (const auto* storage : {&virtuals, &joined})
+        pf::addStorageBytes(actual, pf::checkedStorageBytes<double>(storage->capacity(), message), message);
+      for (const auto* storage : {&weights, &coefficients})
+        pf::addStorageBytes(actual, pf::checkedStorageBytes<C>(storage->capacity(), message), message);
+      pf::addStorageBytes(actual, pf::checkedStorageBytes<std::size_t>(refs.capacity(), message), message);
+      if (actual > host_cap || current_host > host_cap - actual)
+        throw std::length_error("Complex replay concrete HOST capacities exceed factory admission");
+      virtual_positions.swap(virtuals); joined_positions.swap(joined); references.swap(refs);
+      complete_weights.swap(weights); sample_coefficients.swap(coefficients); replay = std::move(incoming);
+      replay_bound.store(true, std::memory_order_release);
+    }
+
+    /// Preserve exact capacity diagnostics after cold replay adoption, with no parameter-sized storage.
+    std::size_t replayHostBytes() const
+    {
+      std::size_t bytes = 0;
+      const char* message = "Complex replay HOST capacity overflow";
+      for (const auto* storage : {&virtual_positions, &joined_positions})
+        pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(storage->capacity(), message), message);
+      for (const auto* storage : std::array<const std::vector<C>*, 2>{&complete_weights, &sample_coefficients})
+        pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(storage->capacity(), message), message);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<std::size_t>(references.capacity(), message), message);
+      return bytes;
+    }
+
+    /// Every action/binding starts under the same execution lease and exact Model read fence.
+    void requireCurrent() const
+    {
+      if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+          lane->state->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
+      validateDerivativeSource(*lane->state);
     }
 
     /// Contract the GPU canonical score with one REAL direction; only O(B) scalar products return.
@@ -602,6 +757,7 @@ struct PsiFormerComplexWF::Impl
     {
       NativeTimerScope timer(phase_timers.score_jvp);
       std::unique_lock execution(lane->execution_mutex);
+      has_evaluated = true;
       const C* output;
       {
         std::shared_lock read(lane->state->mutex);
@@ -627,6 +783,31 @@ struct PsiFormerComplexWF::Impl
       }
     }
 
+    /// The bound profile exposes only captured-grid ECP; no mixed kinetic response is implied.
+    void evaluateLocalEnergyJVP(const wftrain::StructuredParameterVectorConstView& direction,
+        std::uint32_t mask, wftrain::SampleProductSink& sink) const override
+    {
+      std::unique_lock execution(lane->execution_mutex);
+      has_evaluated = true;
+      const C* output;
+      {
+        std::shared_lock read(lane->state->mutex);
+        requireCurrent();
+        if (!replay || mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP))
+          throw std::invalid_argument("Complex captured response requires ECP-only C1");
+        std::unique_lock gpu(lane->generation->mutex);
+        lane->products->evaluateNonlocalJVP(joined_positions, samples, references, complete_weights,
+            direction.values().data(), direction.values().size());
+        const auto result = lane->products->nonlocalJvpView(); lane->products->validate(result); output = result.data;
+      }
+      for (std::size_t sample = 0; sample < samples; ++sample)
+      {
+        const wftrain::SampleProductTileDescriptor tile{lane->state->schema->providerId(), lane->state->schema->fingerprint(),
+            version, ordinal, offset + sample, 1, sample};
+        sink.add({tile, {output + sample, 1}});
+      }
+    }
+
     /// Lease execution before model read; release GPU/model locks BEFORE any caller callback.
     void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
         wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink& sink) const override
@@ -634,6 +815,7 @@ struct PsiFormerComplexWF::Impl
       NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
       std::unique_lock execution(lane->execution_mutex);
+      has_evaluated = true;
       GpuDerivativeLane::Products::CompletedResult result;
       {
         std::shared_lock read(lane->state->mutex);
@@ -650,8 +832,15 @@ struct PsiFormerComplexWF::Impl
               requested[c].coefficients.values.data(), samples};
         {
           NativeTimerScope host_timer(phase_timers.gpu_call);
-          lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,
-              adjoint == DerivativeAdjoint::HERMITIAN);
+          if (replay && requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP)
+          {
+            std::copy_n(requested[0].coefficients.values.data(), samples, sample_coefficients.data());
+            lane->products->evaluateNonlocalVJP(positions, virtual_positions, references, complete_weights,
+                sample_coefficients, adjoint == DerivativeAdjoint::HERMITIAN);
+          }
+          else
+            lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,
+                adjoint == DerivativeAdjoint::HERMITIAN);
         }
         result = lane->products->completedResult();
       }
@@ -672,9 +861,16 @@ struct PsiFormerComplexWF::Impl
 
     psiformer::PsiFormerTimers phase_timers;
     const std::shared_ptr<GpuDerivativeLane> lane;
-    const std::size_t version, ordinal, offset, samples;
+    const std::size_t version, ordinal, offset, samples, host_cap;
     const wftrain::ParameterChunkPlan chunks;
     std::vector<double> positions, inverse_masses;
+    std::unique_ptr<wftrain::NonLocalECPJVPReplay> replay;
+    std::atomic<bool> replay_bound{false};
+    std::vector<double> virtual_positions, joined_positions;
+    std::vector<std::size_t> references;
+    std::vector<C> complete_weights;
+    mutable std::vector<C> sample_coefficients;
+    mutable bool has_evaluated = false;
   };
 #endif
 
@@ -1902,7 +2098,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     if (!lane)
       lane = std::make_shared<Impl::GpuDerivativeLane>(state, maximum_samples, targets, chunk,
           Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk));
-    auto result = std::make_unique<Impl::GpuDerivativeStream>(lane, ordinal, offset, samples);
+    auto result = std::make_unique<Impl::GpuDerivativeStream>(lane, ordinal, offset, samples, host_cap);
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
       const auto& p = particles[sample];

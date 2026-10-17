@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
@@ -1299,6 +1300,73 @@ public:
     std::copy(tile.values().begin(), tile.values().end(), values.begin() + offset);
   }
 };
+
+#ifdef ENABLE_CUDA
+/// Test-only immutable accepted-grid record; stamps come from the actual paired VALUE transaction.
+struct ComplexCapturedReplay final : wftrain::NonLocalECPJVPReplay
+{
+  explicit ComplexCapturedReplay(const wftrain::StreamingDerivativeOperator& op)
+      : provider(op.parameterSchema().providerId()), schema(op.parameterSchema().fingerprint()),
+        version(op.parameterVersion()), ordinal(op.batchOrdinal()), offset(op.sampleOffset()), bases(op.sampleCount())
+  {}
+
+  std::string_view providerId() const noexcept override { return provider; }
+
+  std::string_view schemaFingerprint() const noexcept override { return schema; }
+
+  std::size_t parameterVersion() const noexcept override { return version; }
+
+  std::size_t batchOrdinal() const noexcept override { return ordinal; }
+
+  std::size_t sampleOffset() const noexcept override { return offset; }
+
+  std::size_t sampleCount() const noexcept override { return bases; }
+
+  std::size_t electronCount() const noexcept override { return 4; }
+
+  std::uint32_t localEnergyTermMask() const noexcept override
+  { return wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP); }
+
+  std::uint64_t gridFingerprint() const noexcept override { return 123; }
+
+  wftrain::DerivativeArrayView<const double> referencePositions() const noexcept override
+  { return {positions.data(), positions.size()}; }
+
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayPoint> points() const noexcept override
+  { return {grid.data(), grid.size()}; }
+
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplaySegment> segments() const noexcept override
+  { return {segments_.data(), segments_.size()}; }
+
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayTile> tiles() const noexcept override
+  { return {tiles_.data(), tiles_.size()}; }
+
+  wftrain::DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
+  { return {stamps.data(), stamps.size()}; }
+
+  wftrain::NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept override
+  {
+    wftrain::NonLocalECPReplayStorageDiagnostics d;
+    d.point_count = grid.size(); d.segment_count = segments_.size();
+    d.tile_count = tiles_.size(); d.evaluation_stamp_count = stamps.size();
+    d.reference_position_bytes = positions.capacity() * sizeof(double);
+    d.point_bytes = grid.capacity() * sizeof(grid.front());
+    d.provenance_bytes = segments_.capacity() * sizeof(segments_.front()) +
+        tiles_.capacity() * sizeof(tiles_.front()) + stamps.capacity() * sizeof(stamps.front());
+    d.retained_numeric_bytes = d.reference_position_bytes + d.point_bytes + d.provenance_bytes;
+    d.storage_fingerprint = reinterpret_cast<std::uintptr_t>(grid.data()) ^ reinterpret_cast<std::uintptr_t>(positions.data());
+    return d;
+  }
+
+  std::string provider, schema;
+  std::size_t version, ordinal, offset, bases;
+  std::vector<double> positions;
+  std::vector<wftrain::NonLocalECPReplayPoint> grid;
+  std::vector<wftrain::NonLocalECPReplaySegment> segments_;
+  std::vector<wftrain::NonLocalECPReplayTile> tiles_;
+  std::vector<WaveFunctionComponent::EvaluationStamp> stamps;
+};
+#endif
 } // namespace
 
 TEST_CASE("PsiFormer paired CPU trial isolation preserves the shared source family",
@@ -3923,4 +3991,187 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
     WARN("NOT_RUN: paired virtual VALUE GPU parity requires an available device");
 #endif
 }
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership",
+          "[wavefunction][psiformer][complex_captured_ecp]")
+{
+  using namespace wftrain;
+  int count = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&count) != hipSuccess || !count) { WARN("NOT_RUN: captured ECP requires GPU"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&count) != cudaSuccess || !count) { WARN("NOT_RUN: captured ECP requires GPU"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell, 3, 1), p1 = electrons(simulation_cell, 3, 1);
+  p1.R[1][2] += .037; p1.update();
+  auto source = ions(simulation_cell);
+  auto initialized = parameters();
+  initialized.model_shape.spin_up_electrons = 3; initialized.model_shape.spin_down_electrons = 1;
+  const std::array<double, 3> twist{.17, -.11, .07};
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("captured", initialized, p, source, clone_cap, twist, 64 * 1024 * 1024);
+  auto& gpu = *owner; trial.addComponent(std::move(owner));
+  auto trial1 = trial.makeClone(p1);
+  auto& gpu1 = dynamic_cast<PsiFormerComplexWF&>(*trial1->getOrbitals()[0]);
+  evaluate(gpu, p); evaluate(gpu1, p1);
+  const auto accepted = gpu.snapshotParameters();
+  const auto accepted_log = gpu.get_log_value();
+  RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial, *trial1});
+  RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
+  RefVectorWithLeader<WaveFunctionComponent> components(gpu, {gpu, gpu1});
+  VirtualParticleSet v0(p), v1(p1);
+  RefVectorWithLeader<VirtualParticleSet> scratch(v0, {v0, v1});
+  const std::vector<std::size_t> offsets{0, 4, 7, 9};
+  const std::vector<VirtualParticleBatch::Segment> segments{{1, 2}, {0, 0}, {1, 3}};
+  std::vector<ParticleSet::PosType> points;
+  for (std::size_t s = 0; s < segments.size(); ++s)
+    for (std::size_t q = offsets[s]; q < offsets[s + 1]; ++q)
+    {
+      points.push_back(particles[segments[s].walkerId()].R[segments[s].electronId()]);
+      points.back()[0] += .009 * (q + 1); points.back()[2] -= .003 * q;
+    }
+  const VirtualParticleBatch batch(2, offsets, segments, points);
+  std::vector<C> ratios(9);
+  const auto stamp = gpu.mw_evaluateVirtualRatios(components, particles, scratch, batch, ratios);
+  REQUIRE(stamp.isVersioned());
+  const auto requirement = gpu.gpuDerivativeRequirements(2, 11, 3, 7);
+  const auto make = [&](std::size_t extra = 65536) {
+    return gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 11, 3, 7,
+        requirement.device_bytes, requirement.host_bytes + extra, requirement.matrix_work);
+  };
+  auto op = make();
+  const auto replayFor = [&](const StreamingDerivativeOperator& target) {
+    auto replay = std::make_unique<ComplexCapturedReplay>(target);
+    replay->positions.resize(24);
+    for (std::size_t b = 0; b < 2; ++b)
+      for (std::size_t e = 0; e < 4; ++e)
+        for (int d = 0; d < 3; ++d) replay->positions[12 * b + 3 * e + d] = particles[b].R[e][d];
+    for (std::size_t s = 0; s < segments.size(); ++s)
+    {
+      replay->segments_.push_back({offsets[s], offsets[s + 1] - offsets[s],
+          std::size_t(segments[s].walkerId()), std::size_t(segments[s].electronId()), false, std::size_t(-1)});
+      for (std::size_t q = offsets[s]; q < offsets[s + 1]; ++q)
+        replay->grid.push_back({std::size_t(segments[s].walkerId()), std::size_t(segments[s].electronId()),
+            {points[q][0], points[q][1], points[q][2]}, C{(q % 2 ? -.13 : .17) * (q + 1), .02 * q}, ratios[q]});
+    }
+    replay->tiles_.push_back({0, 0, 9, 0, 3, 0, 1, batch.fingerprint()}); replay->stamps.push_back(stamp);
+    return replay;
+  };
+  const auto before_bind = op->storageDiagnostics();
+  auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+  const auto device_before_bind = metrics.snapshot();
+  auto bad = replayFor(*op); ++bad->version;
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->stamps[0] = {};
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->grid.resize(12, bad->grid.front());
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  bad = replayFor(*op); bad->grid[0].bare_weight = {std::numeric_limits<double>::infinity(), 0};
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(std::move(bad)));
+  CHECK(op->storageDiagnostics().storage_fingerprint == before_bind.storage_fingerprint);
+  auto denied = make(0);
+  CHECK_THROWS(denied->bindNonLocalECPJVPReplay(replayFor(*denied)));
+  CHECK(denied->storageDiagnostics().retained_numeric_bytes == before_bind.retained_numeric_bytes);
+  denied.reset();
+  auto replay = replayFor(*op);
+  const auto grid = replay->grid;
+  const auto replay_bytes = replay->storageDiagnostics().retained_numeric_bytes;
+  op->bindNonLocalECPJVPReplay(std::move(replay));
+  CHECK(metrics.snapshot().allocation_calls == device_before_bind.allocation_calls);
+  CHECK(metrics.snapshot().live_bytes == device_before_bind.live_bytes);
+  CHECK_THROWS(op->bindNonLocalECPJVPReplay(replayFor(*op)));
+  REQUIRE(op->capabilities().maximum_vjp_channels == 1);
+  REQUIRE(op->capabilities().local_energy_term_mask == localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP));
+  const auto storage = op->storageDiagnostics();
+  CHECK(storage.shared_workspace_bytes == before_bind.shared_workspace_bytes);
+  CHECK(storage.retained_numeric_bytes == before_bind.retained_numeric_bytes + replay_bytes + 2168);
+  CHECK(storage.allocation_generation == 2);
+  // Independent CPU score contraction uses actual complete physical ratios on the identical grid.
+  std::vector<std::unique_ptr<ParticleSet>> all;
+  for (std::size_t b = 0; b < 11; ++b)
+  {
+    const auto reference = b < 2 ? b : grid[b - 2].sample;
+    all.push_back(std::make_unique<ParticleSet>(particles[reference]));
+    if (b >= 2)
+      for (int d = 0; d < 3; ++d) all.back()->R[grid[b - 2].electron][d] = grid[b - 2].replacement_position[d];
+    all.back()->update();
+  }
+  PsiFormerComplexWF cpu("captured", initialized, *all[0], source, clone_cap, twist);
+  std::vector<std::unique_ptr<WaveFunctionComponent>> copies;
+  RefVectorWithLeader<WaveFunctionComponent> cpu_components(cpu, {cpu});
+  RefVectorWithLeader<ParticleSet> cpu_particles(*all[0], {*all[0]});
+  std::vector<C> logs{evaluate(cpu, *all[0])};
+  for (std::size_t b = 1; b < all.size(); ++b)
+  {
+    copies.push_back(cpu.makeClone(*all[b])); logs.push_back(evaluate(*copies.back(), *all[b]));
+    cpu_components.push_back(*copies.back()); cpu_particles.push_back(*all[b]);
+  }
+  auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(cpu_components, cpu_particles, 7, 11, 7,
+      cpu.streamingDerivativeRequiredBytes(11));
+  const auto& schema = gpu.parameterSchema();
+  std::vector<C> coefficients{{.7, -.2}, {-.4, .3}}, folded(11), direction(schema.parameterCount());
+  for (std::size_t i = 0; i < direction.size(); ++i) direction[i] = .003 * std::sin(double(i + 1));
+  auto used = make();
+  ComplexSampleSink used_jvp;
+  used->applyScoreJVP({schema, 0, {direction.data(), direction.size()}}, used_jvp);
+  CHECK_THROWS(used->bindNonLocalECPJVPReplay(replayFor(*used)));
+  used.reset();
+  VJPCoefficientChannel channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+      {schema.providerId(), schema.fingerprint(), 0, 7, 11, {coefficients.data(), 2}}, localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+  const auto& cs = cpu.parameterSchema();
+  VJPCoefficientChannel score{"score", DerivativeProduct::SCORE_VJP,
+      {cs.providerId(), cs.fingerprint(), 0, 7, 11, {folded.data(), folded.size()}}};
+  ComplexStreamingSink expected, actual;
+  for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    std::fill(folded.begin(), folded.end(), C{});
+    for (std::size_t q = 0; q < grid.size(); ++q)
+    {
+      const auto weight = grid[q].bare_weight * std::exp(logs[q + 2] - logs[grid[q].sample]);
+      close(weight, grid[q].bare_weight * grid[q].complete_ratio, 3e-9);
+      folded[q + 2] = coefficients[grid[q].sample] * (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(weight) : weight);
+      folded[grid[q].sample] -= folded[q + 2];
+    }
+    expected.reset(); actual.reset();
+    oracle->applyVJPs({&score, 1}, adjoint, expected);
+    const auto warm = metrics.snapshot(); op->applyVJPs({&channel, 1}, adjoint, actual);
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    for (std::size_t i = 0; i < direction.size(); ++i) close(actual.values[0][i], expected.values[0][i], 3e-9);
+  }
+  ComplexSampleSink jvp;
+  op->applyLocalEnergyJVP({schema, 0, {direction.data(), direction.size()}}, localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP), jvp);
+  C dual{}, dot{};
+  for (std::size_t b = 0; b < 2; ++b) dual += std::conj(coefficients[b]) * jvp.values[b];
+  for (std::size_t i = 0; i < direction.size(); ++i) dot += std::conj(actual.values[0][i]) * direction[i];
+  close(dual, dot, 3e-9);
+  actual.reset(); actual.fail_next = true;
+  CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));
+  actual.reset(); CHECK_NOTHROW(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));
+  CHECK(op->storageDiagnostics().storage_fingerprint == storage.storage_fingerprint);
+  channel.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
+  channel.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  p.makeMove(0, ParticleSet::PosType{.01, 0, 0}); gpu.ratio(p, 0);
+  actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
+  gpu.restore(0); p.rejectMove(0);
+  CHECK(gpu.snapshotParameters().values == accepted.values); CHECK(gpu.get_log_value() == accepted_log);
+  bool published = false;
+  actual.reset(); actual.callback = [&] {
+    if (published) return;
+    published = true;
+    const auto budget = gpu.gpuParameterPublicationRequirements();
+    CHECK(gpu.publishBudgetedGpuParameters(accepted, 0, budget.device_bytes, budget.host_bytes) == 1);
+  };
+  op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual);
+  CHECK(published);
+  for (std::size_t i = 0; i < direction.size(); ++i) close(actual.values[0][i], expected.values[0][i], 3e-9);
+  actual.reset(); CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, actual));
+  std::printf("COMPLEX_CAPTURED_ECP PASS B=2 Q=9 C3_slot0 C1_only CPU_allP duality stamp lease retry stale\n");
+}
+#endif
 } // namespace qmcplusplus
