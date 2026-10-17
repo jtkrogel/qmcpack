@@ -10,6 +10,9 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Direct numerical callers retain HOST results unless bounded output is explicit.
+enum class ComplexProductsHostOutput { RETAINED, CHUNKED };
+
 /// Complete numerical ownership, excluding shared immutable image/vendor/caller inputs.
 struct ComplexProductsCost
 {
@@ -18,16 +21,20 @@ struct ComplexProductsCost
   std::size_t device_bytes, host_bytes, matrix_work, parameters, electrons;
   std::size_t channels, maximum_samples, chunk, statuses;
   std::size_t dot_partials, score_dot_scalar_work;
+  ComplexProductsHostOutput host_output;
 };
 
 /// Sum both qualified owners and every prepared mixed-type product/status plane.
 /// Work is maximum B times existing kinetic lifted-matrix sites, NOT score/neural FLOPs.
 inline ComplexProductsCost estimateComplexProductsCost(const PsiFormerExecutionPlan& plan,
-    std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk)
+    std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
+    ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
 {
   const auto p = plan.parameterCount(), n = plan.modelShape().electrons();
   if (!samples || !channels || channels > 3 || !chunk || chunk > p)
     throw std::invalid_argument("Complex products require bounded B,1-3 channels and canonical chunk");
+  if (host_output != ComplexProductsHostOutput::RETAINED && host_output != ComplexProductsHostOutput::CHUNKED)
+    throw std::invalid_argument("Complex products HOST output policy is invalid");
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex products extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex products bytes overflow"); };
   const auto score = estimateComplexScoreCost(plan);
@@ -40,9 +47,10 @@ inline ComplexProductsCost estimateComplexProductsCost(const PsiFormerExecutionP
   const auto dot_host = add(add(mul(8, p), mul(16, samples)), sizeof(DerivativeFiniteStatus));
   const auto device = add(add(add(score.device_bytes, kinetic.device_bytes), add(mul(16, elements), status_bytes)), dot_device);
   const auto host = add(add(score.host_bytes, kinetic.host_bytes),
-      add(add(add(mul(sizeof(std::complex<double>), elements), mul(16, chunk)), add(mul(32, n), status_bytes)), dot_host));
+      add(add(add(mul(sizeof(std::complex<double>), host_output == ComplexProductsHostOutput::RETAINED ? elements : chunk),
+          mul(16, chunk)), add(mul(32, n), status_bytes)), dot_host));
   return {score, kinetic, device, host, mul(samples, kinetic.matrix_work), p, n, channels, samples, chunk, statuses,
-      partials, mul(mul(2, p), samples)};
+      partials, mul(mul(2, p), samples), host_output};
 }
 
 /** TRANSPOSE/HERMITIAN complex SCORE/physical dK and full-score/device-dot REAL JVP.
@@ -73,6 +81,14 @@ public:
     const Complex* data;
   };
 
+  /// The execution lease owns this nonmovable owner; the receipt retains its exact old image.
+  struct CompletedResult
+  {
+    const PreparedDeviceComplexProducts* owner;
+    std::shared_ptr<const PreparedDeviceModel> image;
+    std::size_t generation, channels, parameters;
+  };
+
   /// Borrow completed per-sample complex JVPs, never a sample-by-parameter table.
   struct ScoreJvpView
   {
@@ -86,12 +102,13 @@ public:
   static std::unique_ptr<PreparedDeviceComplexProducts> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
-      std::size_t device_budget, std::size_t host_budget, std::size_t work_budget)
+      std::size_t device_budget, std::size_t host_budget, std::size_t work_budget,
+      ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
   {
     if (!image)
       throw std::invalid_argument("Complex products require an immutable paired image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexProductsCost(image->plan(), targets, samples, channels, chunk);
+    const auto cost = estimateComplexProductsCost(image->plan(), targets, samples, channels, chunk, host_output);
     for (const auto cap : {device_budget, host_budget, work_budget})
       if (!cap || cap == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex products require positive finite numeric/work caps");
@@ -176,7 +193,8 @@ public:
     for (const auto& status : host_status_)
       if (status.nonfinite_count) throw std::runtime_error("Complex products complete contraction is nonfinite");
     // Only final channels cross D2H, in bounded format-conversion chunks, never per sample.
-    for (std::size_t offset = 0; offset < completed_.size(); offset += cost_.chunk)
+    for (std::size_t offset = 0; cost_.host_output == ComplexProductsHostOutput::RETAINED &&
+        offset < completed_.size(); offset += cost_.chunk)
     {
       const auto count = std::min(cost_.chunk, completed_.size() - offset);
       accumulated_.download(staging_.data(), count, offset);
@@ -259,7 +277,8 @@ public:
   ResultView resultView() const
   {
     image_->validateCurrentDevice();
-    if (!ready_) throw std::logic_error("Complex products response unavailable");
+    if (!ready_ || cost_.host_output != ComplexProductsHostOutput::RETAINED)
+      throw std::logic_error("Complex products retained HOST response unavailable");
     return {this, image_.get(), generation_, cost_.channels, cost_.parameters, completed_.data()};
   }
 
@@ -270,6 +289,31 @@ public:
     if (view.owner != current.owner || view.image != current.image || view.generation != current.generation ||
         view.channels != current.channels || view.parameters != current.parameters || view.data != current.data)
       throw std::invalid_argument("Complex products stale/foreign result receipt");
+  }
+
+  /// Bind only a fully finite DEVICE contraction, never a partial request.
+  CompletedResult completedResult() const
+  {
+    image_->validateCurrentDevice();
+    if (!ready_) throw std::logic_error("Complex products completion unavailable");
+    return {this, image_, generation_, cost_.channels, cost_.parameters};
+  }
+
+  /// Download one bounded canonical range; the returned HOST view lasts until the next chunk/request.
+  const Complex* downloadCompletedChunk(const CompletedResult& receipt, std::size_t channel,
+      std::size_t offset, std::size_t count)
+  {
+    const auto current = completedResult();
+    if (cost_.host_output != ComplexProductsHostOutput::CHUNKED || receipt.owner != this ||
+        receipt.image != current.image || receipt.generation != current.generation ||
+        receipt.channels != current.channels || receipt.parameters != current.parameters ||
+        channel >= cost_.channels || !count || count > cost_.chunk ||
+        offset > cost_.parameters || count > cost_.parameters - offset)
+      throw std::invalid_argument("Complex products chunk receipt or canonical range is stale/foreign/invalid");
+    accumulated_.downloadOnStream(staging_.data(), count, queue_.getNative(), channel * cost_.parameters + offset);
+    for (std::size_t i = 0; i < count; ++i)
+      completed_[i] = Complex(cuCreal(staging_[i]), cuCimag(staging_[i]));
+    return completed_.data();
   }
 
   /// Exact inventory excludes shared image/vendor/caller-owned borrowed batch inputs.
@@ -283,7 +327,7 @@ public:
         status_.data(), host_status_.data(), completed_.data(), staging_.data(), positions_.data(), direction_.data(),
         direction_host_.data(), dot_workspace_.data(), dot_status_.data(), dot_host_status_.data(), sample_products_.data()})
       result = (result ^ reinterpret_cast<std::uintptr_t>(pointer)) * 1099511628211ULL;
-    return result ^ reinterpret_cast<std::uintptr_t>(masses_.data());
+    return result ^ reinterpret_cast<std::uintptr_t>(masses_.data()) ^ static_cast<std::size_t>(cost_.host_output);
   }
 
 private:
@@ -294,7 +338,8 @@ private:
         score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
         kinetic_(PreparedDeviceComplexKinetic::prepare(image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work)),
         accumulated_(cost.channels * cost.parameters), status_(cost.statuses), host_status_(cost.statuses),
-        completed_(cost.channels * cost.parameters), staging_(cost.chunk), positions_(3 * cost.electrons), masses_(cost.electrons),
+        completed_(cost.host_output == ComplexProductsHostOutput::RETAINED ? cost.channels * cost.parameters : cost.chunk),
+        staging_(cost.chunk), positions_(3 * cost.electrons), masses_(cost.electrons),
         direction_(cost.parameters), dot_workspace_(cost.dot_partials + 2), dot_status_(cost.dot_partials + 1),
         direction_host_(cost.parameters), sample_products_(cost.maximum_samples), dot_host_status_(1)
   {
