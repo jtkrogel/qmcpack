@@ -785,9 +785,8 @@ void TrainingWaveFunctionBinding::importModel(const std::filesystem::path& path)
   std::exception_ptr failure;
   try
   {
-#ifdef QMC_COMPLEX
-    throw std::runtime_error("Conventional model import currently requires a real CPU build");
-#endif
+    // modelIdentity/readModelState enforce the attached qualified profile and
+    // exact scalar-domain identity before any import preparation/publication.
     if (prototype_particles_.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
       throw std::runtime_error("Conventional model import currently requires CPU particle coordinates");
     // One artifact read owns both active coordinates and the complete frame;

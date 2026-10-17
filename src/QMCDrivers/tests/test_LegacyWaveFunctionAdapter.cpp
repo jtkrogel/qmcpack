@@ -2115,7 +2115,11 @@ TEST_CASE("Legacy Gamma HEG products preserve scalar domains, periodicity and fu
   CHECK(op->storageDiagnostics().shared_workspace_bytes <= adapterOptions().maximum_derivative_scratch_bytes);
 
   HEG changed_cutoff("5", "7"), changed_cell("5.1", "6");
-#ifndef QMC_COMPLEX
+#ifdef QMC_COMPLEX
+  TrainingWaveFunctionBinding binding(source, particles, adapterOptions(), *OHMMS::Controller);
+  binding.setHamiltonian(model.hamiltonian);
+  const auto identity = binding.modelIdentity();
+#endif
   TrainingWaveFunctionBinding cutoff_binding(*changed_cutoff.wavefunction, *changed_cutoff.particles,
                                                adapterOptions(), *OHMMS::Controller);
   cutoff_binding.setHamiltonian(changed_cutoff.hamiltonian);
@@ -2124,9 +2128,75 @@ TEST_CASE("Legacy Gamma HEG products preserve scalar domains, periodicity and fu
   cell_binding.setHamiltonian(changed_cell.hamiltonian);
   CHECK(cutoff_binding.modelIdentity() != identity);
   CHECK(cell_binding.modelIdentity() != identity);
-#else
-  CHECK(changed_cutoff.coulomb->ewaldModelDefinition() != definition);
-  CHECK(changed_cell.coulomb->ewaldModelDefinition() != definition);
+#ifdef QMC_COMPLEX
+  // Publication and cold import retain real canonical coordinates, immutable
+  // complex SPOs and the built Ewald/scalar-domain scientific identity.
+  auto candidate = binding.snapshotParameters();
+  candidate.values[0] += 0.001;
+  ParticleSet expected_particles(particles);
+  expected_particles.update();
+  auto expected = binding.makeCandidate(expected_particles, candidate);
+  const auto expected_energy = kineticEnergy(expected_particles);
+  CHECK(binding.publishParameters(candidate, candidate.version) == candidate.version + 1);
+  source.evaluateLog(particles);
+  CHECK(source.getLogPsi() == Catch::Approx(expected->getLogPsi()).margin(1e-12));
+  checkClose(kineticEnergy(particles), expected_energy);
+  CHECK(&source.findSD().front().get().getPhi() == &spo);
+  const auto file = std::filesystem::temp_directory_path() /
+      ("complex_heg_identity_" + std::to_string(OHMMS::Controller->rank()) + "_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
+  FileCleanup cleanup(file);
+  binding.exportModel(file);
+  CHECK(binding.readModel(file).values == candidate.values);
+  std::string physical;
+  {
+    hdf_archive input;
+    REQUIRE(input.open(file, H5F_ACC_RDONLY));
+    input.push("conventional_wavefunction", false);
+    REQUIRE(input.readEntry(physical, "physical_definition"));
+  }
+  const std::string domains = "parameter=REAL64;wavefunction=COMPLEX128;";
+  REQUIRE(physical.find(domains) != std::string::npos);
+  CHECK(physical.find("complex_Gamma_FreeOrbital_kvectors_v1:") != std::string::npos);
+  HEG fresh("5", "6");
+  TrainingWaveFunctionBinding imported(*fresh.wavefunction, *fresh.particles, adapterOptions(), *OHMMS::Controller);
+  imported.setHamiltonian(fresh.hamiltonian);
+  const auto initial = imported.snapshotParameters();
+  {
+    // A real-representation payload cannot masquerade as the complex model,
+    // even with the same XML, real parameter layout and completion cookie.
+    auto other_domain = physical;
+    other_domain.replace(other_domain.find(domains), domains.size(), "parameter=REAL64;wavefunction=REAL64;");
+    hdf_archive output;
+    REQUIRE(output.open(file, H5F_ACC_RDWR));
+    output.push("conventional_wavefunction", false);
+    output.write(other_domain, "physical_definition");
+  }
+  CHECK_THROWS(imported.importModel(file));
+  CHECK(imported.snapshotParameters().values == initial.values);
+  CHECK(imported.snapshotParameters().version == initial.version);
+  fresh.wavefunction->evaluateLog(*fresh.particles);
+  CHECK(fresh.wavefunction->getLogPsi() == original_log);
+  checkClose(kineticEnergy(*fresh.particles), original_kinetic);
+  {
+    hdf_archive output;
+    REQUIRE(output.open(file, H5F_ACC_RDWR));
+    output.push("conventional_wavefunction", false);
+    output.write(physical, "physical_definition");
+  }
+  CHECK_THROWS(cutoff_binding.importModel(file));
+  CHECK_THROWS(cell_binding.importModel(file));
+  CHECK(cutoff_binding.snapshotParameters().version == 0);
+  CHECK(cell_binding.snapshotParameters().version == 0);
+  imported.importModel(file);
+  fresh.wavefunction->evaluateLog(*fresh.particles);
+  CHECK(imported.snapshotParameters().values == candidate.values);
+  CHECK(imported.snapshotParameters().version == initial.version + 1);
+  CHECK(fresh.wavefunction->getLogPsi() == Catch::Approx(expected->getLogPsi()).margin(1e-12));
+  CHECK(fresh.wavefunction->getPhase() == Catch::Approx(expected->getPhase()).margin(1e-12));
+  checkClose(kineticEnergy(*fresh.particles), expected_energy);
+  CHECK(fresh.coulomb->evaluate(*fresh.particles) == Catch::Approx(original_potential).margin(1e-12));
+  CHECK(rng.draws == 0);
 #endif
 }
 
