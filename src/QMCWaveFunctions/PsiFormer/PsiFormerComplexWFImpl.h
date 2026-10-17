@@ -1214,6 +1214,15 @@ struct PsiFormerComplexWF::Impl
     }
     return state->gpu;
   }
+
+  /// The caller holds Model read and this lane; reject drift before invalidating any borrowed epoch.
+  void bindGpuLane(GpuLane& lane) const
+  {
+    const auto& current = state->gpu->image;
+    if (current->version() != state->model.p.version())
+      throw std::logic_error("Complex crowd current image/native parameter version differs");
+    lane.catchUp(current);
+  }
 #endif
 
   /// Match the exact native loan before reading or mutating transaction scratch.
@@ -1249,7 +1258,7 @@ struct PsiFormerComplexWF::Impl
     auto permit = state->inference_concurrency.acquire();
     auto& lane = resource.gpu ? *resource.gpu : *state->gpu;
     std::unique_lock lease(lane.mutex);
-    lane.catchUp(state->gpu->image);
+    bindGpuLane(lane);
     if (lane.image->version() != state->model.p.version() || lane.capacity != state->gpu_capacity)
       throw std::logic_error("Dense complex GPU image version/capacity is stale");
     const auto n = state->model.ne;
@@ -1356,7 +1365,7 @@ struct PsiFormerComplexWF::Impl
       result.owner = selectedGpuLane();
       auto& lane = *result.owner;
       result.lease = std::unique_lock(lane.mutex);
-      lane.catchUp(state->gpu->image);
+      bindGpuLane(lane);
       lane.resizeLive(1);
       for (int e = 0; e < p.getTotalNum(); ++e)
         for (int d = 0; d < 3; ++d)
