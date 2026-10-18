@@ -333,8 +333,8 @@ private:
 class LiveKFACUpdateRule final : public wftrain::TrainingUpdateRule
 {
 public:
-  LiveKFACUpdateRule(const wftrain::KFACPreconditioner& inverse, double rate)
-      : inverse_(inverse), rate_(rate) {}
+  LiveKFACUpdateRule(const wftrain::KFACPreconditioner& inverse, double rate, double norm_constraint = 0.0)
+      : inverse_(inverse), rate_(rate), norm_constraint_(norm_constraint) {}
 
   wftrain::StructuredParameterSnapshot propose(const wftrain::StructuredParameterSchema& schema,
       const wftrain::StructuredParameterSnapshot& parameters, wftrain::ParameterGradientView objective) override
@@ -343,14 +343,31 @@ public:
     for (std::size_t i = 0; i < gradient.size(); ++i) gradient[i] = objective.gradient[i];
     inverse_.apply({schema, parameters.version, {gradient.data(), gradient.size()}},
                    {direction.data(), direction.size()});
+    if (norm_constraint_ > 0.0)
+    {
+      double product = 0.0;
+      for (std::size_t i = 0; i < gradient.size(); ++i)
+        product += (std::conj(gradient[i]) * direction[i]).real();
+      metric_ = rate_ * rate_ * product;
+      if (!wftrain::isFiniteTrainingReal(metric_) || metric_ < 0.0)
+        throw std::runtime_error("KFAC damped gradient metric is invalid");
+      scale_ = metric_ > norm_constraint_ ? std::sqrt(norm_constraint_ / metric_) : 1.0;
+    }
     auto candidate = parameters;
-    for (std::size_t i = 0; i < direction.size(); ++i) candidate.values[i] -= rate_ * direction[i].real();
+    for (std::size_t i = 0; i < direction.size(); ++i)
+      candidate.values[i] -= rate_ * scale_ * direction[i].real();
     return candidate;
   }
+
+  double constraintMetric() const noexcept { return metric_; }
+  double constraintScale() const noexcept { return scale_; }
 
 private:
   const wftrain::KFACPreconditioner& inverse_;
   double rate_;
+  double norm_constraint_;
+  double metric_ = 0.0;
+  double scale_ = 1.0;
 };
 
 /// Identify the first-order family using the common live gradient producer.
@@ -1161,6 +1178,93 @@ std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs)
   return lhs * rhs;
 }
 
+/** Gather scalar energies/weights only; parameter products remain streamed. */
+std::vector<wftrain::DerivativeValue> makeClippedKFACObjective(
+    Communicate& communicator,
+    const std::vector<wftrain::PreparedEnergyGradientBatch>& batches,
+    const WFTrainDriverInput& input,
+    std::size_t already_retained_bytes)
+{
+  std::uint64_t local_count = 0;
+  for (const auto& batch : batches)
+    local_count += batch.weights.size();
+  std::vector<std::uint64_t> rank_counts(communicator.size());
+  communicator.allgather(&local_count, rank_counts.data(), 1);
+  std::vector<int> counts(rank_counts.size()), offsets(rank_counts.size());
+  std::size_t total = 0;
+  for (std::size_t rank = 0; rank < counts.size(); ++rank)
+  {
+    if (rank_counts[rank] > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) - total)
+      throw std::overflow_error("KFAC scalar objective population exceeds transport count limit");
+    offsets[rank] = static_cast<int>(total);
+    counts[rank] = static_cast<int>(rank_counts[rank]);
+    total += counts[rank];
+  }
+  if (total == 0)
+    throw std::invalid_argument("KFAC scalar objective requires samples");
+  // Include gathered inputs, transform scratch/output and the returned local copy.
+  enforceMemoryBudget(communicator,
+      checkedMemoryAdd(already_retained_bytes, checkedMemoryMultiply(total, 80)),
+      input.getMaximumRetainedBytes());
+  std::vector<double> local_energies, local_weights, energies, weights;
+  std::exception_ptr preparation_failure;
+  try
+  {
+    local_energies.resize(std::max<std::size_t>(local_count, 1));
+    local_weights.resize(local_energies.size());
+    energies.resize(total);
+    weights.resize(total);
+    std::size_t offset = 0;
+    for (const auto& batch : batches)
+      for (std::size_t i = 0; i < batch.weights.size(); ++i, ++offset)
+      {
+        local_energies[offset] = batch.local_energies[i].real();
+        local_weights[offset] = batch.weights[i];
+      }
+  }
+  catch (...) { preparation_failure = std::current_exception(); }
+  int failed = preparation_failure ? 1 : 0;
+  communicator.allreduce(failed);
+  if (failed)
+  {
+    if (preparation_failure) std::rethrow_exception(preparation_failure);
+    throw UniformCommunicateError("Another rank failed preparing KFAC objective scalar gather");
+  }
+  communicator.gatherv(local_energies.data(), energies.data(), static_cast<int>(local_count), counts, offsets);
+  communicator.gatherv(local_weights.data(), weights.data(), static_cast<int>(local_count), counts, offsets);
+  communicator.bcast(energies.data(), static_cast<int>(total));
+  communicator.bcast(weights.data(), static_cast<int>(total));
+  std::vector<wftrain::DerivativeValue> local_residual;
+  try
+  {
+    wftrain::ClippedScoreObjectiveControl control;
+    using M = WFTrainDriverInput::KFACClipMode;
+    control.mode = input.getKFACClipMode() == M::SOFT_MEDIAN ? wftrain::ScoreObjectiveClipMode::SOFT_MEDIAN
+        : input.getKFACClipMode() == M::HARD_MEDIAN ? wftrain::ScoreObjectiveClipMode::HARD_MEDIAN
+                                                : wftrain::ScoreObjectiveClipMode::HARD_MEAN;
+    control.width = input.getKFACClipWidth();
+    control.quantile = input.getKFACClipQuantile();
+    control.exclude_width = input.getKFACExcludeWidth();
+    const auto result = wftrain::prepareClippedScoreObjective(
+        {energies.data(), energies.size()}, {weights.data(), weights.size()}, control);
+    const auto first = result.coefficients.begin() + offsets[communicator.rank()];
+    local_residual.assign(first, first + local_count);
+    if (communicator.rank() == 0)
+      app_log() << "WFTrain KFAC objective transform center=" << result.center << " scale=" << result.scale
+                << " transformed_mean=" << result.transformed_mean << " unmasked=" << result.unmasked_samples
+                << " global_samples=" << total << " gradient_factor=1 mask_denominator=count" << std::endl;
+  }
+  catch (...) { preparation_failure = std::current_exception(); }
+  failed = preparation_failure ? 1 : 0;
+  communicator.allreduce(failed);
+  if (failed)
+  {
+    if (preparation_failure) std::rethrow_exception(preparation_failure);
+    throw UniformCommunicateError("Another rank failed preparing clipped KFAC objective residual");
+  }
+  return local_residual;
+}
+
 /** Conservatively charge transient restarted-GMRES and proposal storage.
  *
  * This estimate intentionally overlaps some short-lived vectors.  A hard memory
@@ -1422,6 +1526,23 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, training.getLMInnerRestartLength());
   extendStageFingerprint(hash, training.getLMInnerRelativeTolerance());
   extendStageFingerprint(hash, training.getKFACFallbackDamping());
+  if (training.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
+      (training.getKFACObjective() != WFTrainDriverInput::KFACObjective::RAW_COVARIANCE ||
+       training.getKFACCurvature() != WFTrainDriverInput::KFACCurvature::NATIVE_SCORE ||
+       training.getKFACDampingPolicy() != WFTrainDriverInput::KFACDamping::EQUAL_SPLIT ||
+       training.getKFACConstraint() != WFTrainDriverInput::KFACConstraint::NONE))
+  {
+    extendStageFingerprint(hash, std::string("kfac-objective-curvature-v1"));
+    extendStageFingerprint(hash, static_cast<int>(training.getKFACObjective()));
+    extendStageFingerprint(hash, static_cast<int>(training.getKFACClipMode()));
+    extendStageFingerprint(hash, training.getKFACClipWidth());
+    extendStageFingerprint(hash, training.getKFACClipQuantile());
+    extendStageFingerprint(hash, training.getKFACExcludeWidth());
+    extendStageFingerprint(hash, static_cast<int>(training.getKFACCurvature()));
+    extendStageFingerprint(hash, static_cast<int>(training.getKFACDampingPolicy()));
+    extendStageFingerprint(hash, static_cast<int>(training.getKFACConstraint()));
+    extendStageFingerprint(hash, training.getKFACNormConstraint());
+  }
   extendStageFingerprint(hash, static_cast<int>(training.getLineSearch()));
   extendStageFingerprint(hash, training.getUpdateScale());
   extendStageFingerprint(hash, training.getWeightDecay());
@@ -2396,6 +2517,34 @@ void WFTrainBatched::run()
               << " substeps " << qmcdriver_input_.get_sub_steps()
               << " iteration_warmupsteps " << training_input_.getWarmupSteps() << std::endl;
 
+  if (myComm->rank() == 0 && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
+    app_log() << "WFTrain KFAC controls: objective="
+              << (training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::RAW_COVARIANCE
+                      ? "raw_covariance" : "clipped_covariance")
+              << " clip_mode="
+              << (training_input_.getKFACClipMode() == WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN
+                      ? "soft_median" : training_input_.getKFACClipMode() == WFTrainDriverInput::KFACClipMode::HARD_MEDIAN
+                      ? "hard_median" : "hard_mean")
+              << " clip_width=" << training_input_.getKFACClipWidth()
+              << " clip_quantile=" << training_input_.getKFACClipQuantile()
+              << " exclude_width=" << training_input_.getKFACExcludeWidth()
+              << " curvature="
+              << (training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::NATIVE_SCORE
+                      ? "native_score" : "registered_gaussian")
+              << " damping_policy="
+              << (training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::EQUAL_SPLIT
+                      ? "equal_split" : "trace_balanced")
+              << " damping=" << training_input_.getDamping()
+              << " fallback_damping=" << training_input_.getKFACFallbackDamping()
+              << " learning_rate=" << training_input_.getLearningRate()
+              << " constraint="
+              << (training_input_.getKFACConstraint() == WFTrainDriverInput::KFACConstraint::NONE
+                      ? "none" : "damped_kfac")
+              << " norm_constraint=" << training_input_.getKFACNormConstraint()
+              << " constraint_units=LR^2*g_dot_preconditioned_g"
+              << " euclidean_update_cap=" << training_input_.getMaximumUpdateNorm()
+              << " registered_curvature_reference_devices=1" << std::endl;
+
   for (int iteration = static_cast<int>(stage_state.completed_stage_iterations);
        iteration < num_iterations; ++iteration)
   {
@@ -3272,10 +3421,21 @@ void WFTrainBatched::run()
           // The distributed sample-space factor deliberately accepts an empty local
           // batch list; zero-walker ranks still execute every global reduction.
           const auto score_batches = makeScoreBatches(batches);
+          std::optional<std::vector<wftrain::DerivativeValue>> objective_residual;
+          std::optional<wftrain::ScoreObjectiveResidualOverride> objective_override;
+          if (optimizer_kind == WFTrainDriverInput::Optimizer::KFAC &&
+              training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE)
+          {
+            objective_residual = makeClippedKFACObjective(*myComm, batches, training_input_,
+                checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, retained_configuration_bytes));
+            objective_override = wftrain::ScoreObjectiveResidualOverride{
+                {objective_residual->data(), objective_residual->size()}};
+          }
           wftrain::ScoreCovarianceFactor factor(
               schema, parameters->version,
               {score_batches.data(), score_batches.size()},
-              wftrain::ScoreSampleDomain::REAL, reduction);
+              wftrain::ScoreSampleDomain::REAL, reduction, objective_override);
+          objective_residual.reset();
           std::optional<SPRINGFactorBindingGuard> spring_factor_binding;
           if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
           {
@@ -3407,7 +3567,11 @@ void WFTrainBatched::run()
               for (std::size_t i = 0; i < covered.size(); ++i)
                 if (schema.blocks()[i].trainable && !covered[i]) fallback.push_back(i);
               statistics = std::make_unique<wftrain::KFACFactorAccumulator>(
-                  wftrain::KFACBlockRegistry(schema, std::move(affine), std::move(fallback)), parameters->version);
+                  wftrain::KFACBlockRegistry(schema, std::move(affine), std::move(fallback),
+                      selected_provider_->genericKFACParameterBlocks()), parameters->version,
+                  training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
+                      ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
+                      : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
               LiveAffineObserver observer(*statistics);
               std::vector<double> score;
               for (const auto& samples : retained_samples)
@@ -3423,15 +3587,25 @@ void WFTrainBatched::run()
             reduction.preflight(schema, &*parameters,
                 wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN, observation_failure);
             wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
-            wftrain::KFACPreconditioner inverse(*statistics,
-                {training_input_.getDamping(), training_input_.getKFACFallbackDamping()});
+            wftrain::KFACPreconditionerControl inverse_control{
+                training_input_.getDamping(), training_input_.getKFACFallbackDamping()};
+            inverse_control.damping_policy =
+                training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
+                    ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT;
+            wftrain::KFACPreconditioner inverse(*statistics, inverse_control);
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                 checkedMemoryAdd(statistics->retainedNumericBytes(), inverse.storageDiagnostics().retained_numeric_bytes));
             enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
-            LiveKFACUpdateRule update_rule(inverse, training_input_.getLearningRate());
+            LiveKFACUpdateRule update_rule(inverse, training_input_.getLearningRate(),
+                training_input_.getKFACConstraint() == WFTrainDriverInput::KFACConstraint::DAMPED_KFAC
+                    ? training_input_.getKFACNormConstraint() : 0.0);
             iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
                 *decorate(update_rule), training_state, reduction, cache_observer,
                 energy_moments.weight_sum, energy_moments.variance);
+            if (myComm->rank() == 0)
+              app_log() << "WFTrain KFAC constraint metric=" << update_rule.constraintMetric()
+                        << " applied_scale=" << update_rule.constraintScale()
+                        << " euclidean_cap=" << training_input_.getMaximumUpdateNorm() << std::endl;
           }
           else if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
           {

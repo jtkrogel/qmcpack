@@ -11,6 +11,7 @@
 #include "Configuration.h"
 
 #include <cstddef>
+#include <limits>
 #include <string>
 
 namespace qmcplusplus
@@ -20,6 +21,11 @@ namespace qmcplusplus
 class WFTrainDriverInput
 {
 public:
+  enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE };
+  enum class KFACClipMode { SOFT_MEDIAN, HARD_MEDIAN, HARD_MEAN };
+  enum class KFACCurvature { NATIVE_SCORE, REGISTERED_GAUSSIAN };
+  enum class KFACDamping { EQUAL_SPLIT, TRACE_BALANCED };
+  enum class KFACConstraint { NONE, DAMPED_KFAC };
   /// Select fixed scaling, correlated backtracking, or sampled endpoint expansion.
   enum class LineSearch
   {
@@ -109,6 +115,15 @@ public:
   std::size_t getLMInnerRestartLength() const noexcept { return lm_inner_restart_length_; }
   double getLMInnerRelativeTolerance() const noexcept { return lm_inner_relative_tolerance_; }
   double getKFACFallbackDamping() const noexcept { return kfac_fallback_damping_; }
+  KFACObjective getKFACObjective() const noexcept { return kfac_objective_; }
+  KFACClipMode getKFACClipMode() const noexcept { return kfac_clip_mode_; }
+  KFACCurvature getKFACCurvature() const noexcept { return kfac_curvature_; }
+  KFACDamping getKFACDampingPolicy() const noexcept { return kfac_damping_policy_; }
+  KFACConstraint getKFACConstraint() const noexcept { return kfac_constraint_; }
+  double getKFACClipWidth() const noexcept { return kfac_clip_width_; }
+  double getKFACClipQuantile() const noexcept { return kfac_clip_quantile_; }
+  double getKFACExcludeWidth() const noexcept { return kfac_exclude_width_; }
+  double getKFACNormConstraint() const noexcept { return kfac_norm_constraint_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
   std::size_t getLegacyMaximumParameters() const noexcept { return legacy_maximum_parameters_; }
   std::size_t getLegacyDerivativeScratchBytes() const noexcept { return legacy_derivative_scratch_bytes_; }
@@ -190,6 +205,15 @@ private:
   std::size_t lm_inner_restart_length_{4};
   double lm_inner_relative_tolerance_{0.1};
   double kfac_fallback_damping_{1.0e-3};
+  KFACObjective kfac_objective_{KFACObjective::RAW_COVARIANCE};
+  KFACClipMode kfac_clip_mode_{KFACClipMode::SOFT_MEDIAN};
+  KFACCurvature kfac_curvature_{KFACCurvature::NATIVE_SCORE};
+  KFACDamping kfac_damping_policy_{KFACDamping::EQUAL_SPLIT};
+  KFACConstraint kfac_constraint_{KFACConstraint::NONE};
+  double kfac_clip_width_{1.0};
+  double kfac_clip_quantile_{0.95};
+  double kfac_exclude_width_{std::numeric_limits<double>::infinity()};
+  double kfac_norm_constraint_{0.0};
   LineSearch line_search_{LineSearch::OFF};
   double update_scale_{1.0};
   double weight_decay_{0.0};

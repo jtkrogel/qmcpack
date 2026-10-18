@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,46 @@ struct ScoreCovarianceBatch
   DerivativeArrayView<const DerivativeReal> weights;
   DerivativeArrayView<const DerivativeValue> local_energies;
 };
+
+/** Explicit objective residual, already normalized for a raw score VJP.
+ *
+ * Coefficients follow physical samples in batch order. They include objective
+ * weights, masks and normalization; no factor of two or score centering is added.
+ * This keeps a masked objective independent of the centered covariance operator.
+ */
+struct ScoreObjectiveResidualOverride
+{
+  DerivativeArrayView<const DerivativeValue> coefficients;
+};
+
+enum class ScoreObjectiveClipMode { SOFT_MEDIAN, HARD_MEDIAN, HARD_MEAN };
+
+struct ClippedScoreObjectiveControl
+{
+  ScoreObjectiveClipMode mode = ScoreObjectiveClipMode::SOFT_MEDIAN;
+  DerivativeReal width = 1.0;
+  DerivativeReal quantile = 0.95;
+  DerivativeReal exclude_width = std::numeric_limits<DerivativeReal>::infinity();
+};
+
+struct ClippedScoreObjectiveResult
+{
+  std::vector<DerivativeValue> coefficients;
+  DerivativeReal center = 0.0;
+  DerivativeReal scale = 0.0;
+  DerivativeReal transformed_mean = 0.0;
+  std::size_t unmasked_samples = 0;
+};
+
+/** Transform a complete scalar population into normalized raw score residuals.
+ *
+ * Statistical weights are normalized to mean one. Center the transformed energy
+ * before masking, then divide the masked contraction by the unmasked count.
+ */
+ClippedScoreObjectiveResult prepareClippedScoreObjective(
+    DerivativeArrayView<const DerivativeReal> energies,
+    DerivativeArrayView<const DerivativeReal> weights,
+    ClippedScoreObjectiveControl control = {});
 
 /// Exact numeric storage retained by a prepared score factor.
 struct ScoreCovarianceStorageDiagnostics
@@ -77,7 +118,8 @@ public:
       std::size_t parameter_version,
       DerivativeArrayView<const ScoreCovarianceBatch> batches,
       ScoreSampleDomain sample_domain = ScoreSampleDomain::REAL,
-      DistributedParameterReduction reduction = {});
+      DistributedParameterReduction reduction = {},
+      std::optional<ScoreObjectiveResidualOverride> objective_residual = std::nullopt);
   ~ScoreCovarianceFactor();
 
   ScoreCovarianceFactor(const ScoreCovarianceFactor&) = delete;
@@ -117,7 +159,7 @@ public:
                           DerivativeReal omega,
                           DerivativeArrayView<DerivativeValue> result) const;
 
-  /// Form the globally replicated score-covariance gradient A^T residual.
+  /// Form A^T residual, or the explicitly supplied raw objective score VJP.
   std::vector<DerivativeReal> scoreCovarianceGradient() const;
 
   /// Return exact retained numeric storage owned by this factor.
@@ -150,6 +192,7 @@ private:
   std::size_t global_sample_vector_size_ = 0;
   DerivativeValue mean_energy_{};
   std::vector<DerivativeValue> residual_;
+  std::optional<std::vector<DerivativeValue>> objective_residual_;
   mutable std::vector<DerivativeValue> projected_direction_;
   mutable std::vector<DerivativeValue> local_parameter_action_;
 };

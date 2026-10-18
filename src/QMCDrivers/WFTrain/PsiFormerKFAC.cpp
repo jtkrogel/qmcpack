@@ -116,6 +116,7 @@ KFACBlockRegistry makePsiFormerKFACRegistry(
                affine_blocks);
 
   std::vector<std::size_t> fallback_blocks;
+  std::vector<std::size_t> generic_blocks;
   for (ParameterRole role : {ParameterRole::ENVELOPE_PI_UP,
                              ParameterRole::ENVELOPE_PI_DOWN,
                              ParameterRole::ENVELOPE_ZETA_UP,
@@ -126,10 +127,14 @@ KFACBlockRegistry makePsiFormerKFACRegistry(
     {
       const std::size_t block = schemaBlock(schema, plan.parameter(role));
       if (schema.blocks()[block].trainable)
+      {
         fallback_blocks.push_back(block);
+        if (role == ParameterRole::CUSP_SAME_ALPHA || role == ParameterRole::CUSP_OPPOSITE_ALPHA)
+          generic_blocks.push_back(block);
+      }
     }
 
-  return {schema, std::move(affine_blocks), std::move(fallback_blocks)};
+  return {schema, std::move(affine_blocks), std::move(fallback_blocks), std::move(generic_blocks)};
 }
 
 PsiFormerKFACObservationSink::PsiFormerKFACObservationSink(

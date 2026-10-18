@@ -331,6 +331,90 @@ TEST_CASE("Weighted score factor agrees with a dense centered oracle",
   CHECK(storage.retained_numeric_bytes > 0);
 }
 
+TEST_CASE("Clipped score objective centers before masking and preserves weight units",
+          "[wftrain][minsr][objective_residual]")
+{
+  const std::array<DerivativeReal, 4> energies{0.0, 1.0, 3.0, 10.0};
+  const std::array<DerivativeReal, 4> weights{1.0, 2.0, 1.0, 2.0};
+  ClippedScoreObjectiveControl control;
+  control.mode = ScoreObjectiveClipMode::HARD_MEDIAN;
+  control.width = 0.5;
+  control.exclude_width = 3.0;
+  const auto result = prepareClippedScoreObjective(
+      {energies.data(), energies.size()}, {weights.data(), weights.size()}, control);
+  CHECK(result.center == Approx(2.0));
+  CHECK(result.scale == Approx(3.0));
+  CHECK(result.transformed_mean == Approx(25.0 / 12.0));
+  CHECK(result.unmasked_samples == 3);
+  CHECK(result.coefficients[0].real() == Approx(-19.0 / 54.0));
+  CHECK(result.coefficients[1].real() == Approx(-13.0 / 27.0));
+  CHECK(result.coefficients[2].real() == Approx(11.0 / 54.0));
+  CHECK(result.coefficients[3].real() == 0.0);
+  const std::array<DerivativeReal, 4> scaled_weights{7.0, 14.0, 7.0, 14.0};
+  const auto scaled = prepareClippedScoreObjective(
+      {energies.data(), energies.size()}, {scaled_weights.data(), scaled_weights.size()}, control);
+  for (std::size_t i = 0; i < energies.size(); ++i)
+    CHECK(scaled.coefficients[i].real() == Approx(result.coefficients[i].real()));
+  control.exclude_width = 0.1;
+  CHECK_THROWS(prepareClippedScoreObjective(
+      {energies.data(), energies.size()}, {weights.data(), weights.size()}, control));
+  const std::array<DerivativeReal, 4> constant{2.0, 2.0, 2.0, 2.0};
+  control = {};
+  CHECK_THROWS(prepareClippedScoreObjective(
+      {constant.data(), constant.size()}, {weights.data(), weights.size()}, control));
+  control.mode = ScoreObjectiveClipMode::HARD_MEAN;
+  const auto zero = prepareClippedScoreObjective(
+      {constant.data(), constant.size()}, {weights.data(), weights.size()}, control);
+  for (const auto coefficient : zero.coefficients)
+    CHECK(coefficient.real() == Approx(0.0).margin(1e-14));
+}
+
+TEST_CASE("Log squeezed objective matches an independent masked scalar fixture",
+          "[wftrain][minsr][objective_residual]")
+{
+  const std::array<DerivativeReal, 4> energies{-3.0, -1.0, 2.0, 6.0};
+  const std::array<DerivativeReal, 4> weights{1.0, 2.0, 1.0, 2.0};
+  ClippedScoreObjectiveControl control;
+  control.quantile = 0.5;
+  control.exclude_width = 1.5;
+  const auto result = prepareClippedScoreObjective(
+      {energies.data(), energies.size()}, {weights.data(), weights.size()}, control);
+  CHECK(result.center == Approx(0.5));
+  CHECK(result.scale == Approx(2.5));
+  CHECK(result.transformed_mean == Approx(1.1769699519739354));
+  CHECK(result.unmasked_samples == 3);
+  const std::array<double, 4> expected{-0.8426101275217458, -0.9533814566251588,
+                                     0.17581519410194144, 0.0};
+  for (std::size_t i = 0; i < energies.size(); ++i)
+    CHECK(result.coefficients[i].real() == Approx(expected[i]).margin(1e-12));
+}
+
+TEST_CASE("Explicit objective residual uses raw scores without recentering",
+          "[wftrain][minsr][objective_residual]")
+{
+  const auto schema = makeSchema();
+  ToyScoreOperator derivative_operator(schema, 4);
+  const std::array<DerivativeReal, 3> weights{1.0, 2.0, 1.0};
+  const std::array<DerivativeValue, 3> energies{1.0, 3.0, 2.0};
+  const ScoreCovarianceBatch batch{&derivative_operator,
+      {weights.data(), weights.size()}, {energies.data(), energies.size()}};
+  // A nonzero coefficient sum distinguishes raw scores from centered scores.
+  const std::array<DerivativeValue, 3> coefficients{2.0, 0.0, -1.0};
+  ScoreCovarianceFactor factor(schema, 4, {&batch, 1}, ScoreSampleDomain::REAL, {},
+      ScoreObjectiveResidualOverride{{coefficients.data(), coefficients.size()}});
+  const auto gradient = factor.scoreCovarianceGradient();
+  CHECK(gradient[0] == Approx(1.0));
+  CHECK(gradient[1] == Approx(-1.0));
+  CHECK(factor.meanEnergy().real() == Approx(2.25));
+  CHECK(factor.residual()[0].real() == Approx(-1.25));
+  CHECK_THROWS(ScoreCovarianceFactor(schema, 4, {&batch, 1}, ScoreSampleDomain::REAL, {},
+      ScoreObjectiveResidualOverride{{coefficients.data(), 2}}));
+  const std::array<DerivativeValue, 3> invalid{
+      0.0, std::numeric_limits<double>::infinity(), 0.0};
+  CHECK_THROWS(ScoreCovarianceFactor(schema, 4, {&batch, 1}, ScoreSampleDomain::REAL, {},
+      ScoreObjectiveResidualOverride{{invalid.data(), invalid.size()}}));
+}
+
 TEST_CASE("Sample PCG and minSR reproduce a dense damped solve",
           "[wftrain][minsr]")
 {

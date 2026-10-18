@@ -7455,6 +7455,30 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerWF::affineParameterBlocks() 
   return nativeAffineParameterBlocks(model_state_->execution_plan, *structured_parameter_schema_);
 }
 
+std::vector<std::size_t> PsiFormerWF::genericKFACParameterBlocks() const
+{
+  PsiFormerReadTransaction state_lock(*model_state_);
+  const auto& plan = model_state_->execution_plan;
+  const auto& blocks = structured_parameter_schema_->blocks();
+  std::vector<std::size_t> result;
+  for (const auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA,
+                          psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA})
+    if (plan.hasParameter(role))
+    {
+      const auto& tensor = plan.parameter(role);
+      const auto found = std::find_if(blocks.begin(), blocks.end(), [&](const auto& block) {
+        return block.id == tensor.module + "/" + tensor.name && block.offset == tensor.begin &&
+            block.count == tensor.size() && block.shape == tensor.shape &&
+            block.scalar_domain == wftrain::ParameterScalarDomain::REAL64;
+      });
+      if (found == blocks.end())
+        throw std::logic_error("PsiFormer generic curvature schema differs from its execution plan");
+      if (found->trainable)
+        result.push_back(static_cast<std::size_t>(found - blocks.begin()));
+    }
+  return result;
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

@@ -34,6 +34,43 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 
 } // namespace
 
+TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers][wf_train][kfac]")
+{
+  using I = WFTrainDriverInput;
+  const auto defaults = parseTrainingInput("<qmc><training optimizer='kfac'/></qmc>");
+  CHECK(defaults.getKFACObjective() == I::KFACObjective::RAW_COVARIANCE);
+  CHECK(defaults.getKFACCurvature() == I::KFACCurvature::NATIVE_SCORE);
+  CHECK(defaults.getKFACDampingPolicy() == I::KFACDamping::EQUAL_SPLIT);
+  CHECK(defaults.getKFACConstraint() == I::KFACConstraint::NONE);
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  const auto selected = parse(R"(
+    <parameter name="kfac_objective">clipped_covariance</parameter>
+    <parameter name="kfac_clip_mode">soft_median</parameter>
+    <parameter name="kfac_clip_width">1</parameter>
+    <parameter name="kfac_clip_quantile">0.95</parameter>
+    <parameter name="kfac_exclude_width">none</parameter>
+    <parameter name="kfac_curvature">registered_gaussian</parameter>
+    <parameter name="kfac_damping_policy">trace_balanced</parameter>
+    <parameter name="kfac_constraint">damped_kfac</parameter>
+    <parameter name="kfac_norm_constraint">0.001</parameter>)");
+  CHECK(selected.getKFACObjective() == I::KFACObjective::CLIPPED_COVARIANCE);
+  CHECK(selected.getKFACClipQuantile() == Catch::Approx(0.95));
+  CHECK(selected.getKFACNormConstraint() == Catch::Approx(0.001));
+  CHECK_THROWS(parse("<parameter name='kfac_objective'>invalid</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_clip_width'>1</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_constraint'>damped_kfac</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_norm_constraint'>0.001</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_objective'>clipped_covariance</parameter>"
+                     "<parameter name='kfac_clip_quantile'>1.1</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_objective'>clipped_covariance</parameter>"
+                     "<parameter name='kfac_clip_mode'>hard_median</parameter>"
+                     "<parameter name='kfac_clip_quantile'>0.95</parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='adam'>"
+      "<parameter name='kfac_curvature'>registered_gaussian</parameter></training></qmc>"));
+}
+
 TEST_CASE("First-order input admits the shared Euclidean update bound only",
           "[drivers][wf_train][host_controls]")
 {

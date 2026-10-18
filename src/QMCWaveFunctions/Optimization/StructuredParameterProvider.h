@@ -142,6 +142,9 @@ public:
   /// Return supported trainable affine boundaries in stable observation order.
   virtual std::vector<AffineParameterBlock> affineParameterBlocks() const { return {}; }
 
+  /// Return trainable generic-diagonal KFAC block ordinals in the parameter schema.
+  virtual std::vector<std::size_t> genericKFACParameterBlocks() const { return {}; }
+
   /// Stream affine rows and copy the canonical real parameter score for one sample.
   virtual void observeAffineScores(const ParticleSet&, AffineScoreObserver&, std::vector<double>&) const
   { throw std::runtime_error("Provider does not support affine score observations"); }

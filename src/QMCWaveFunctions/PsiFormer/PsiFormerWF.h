@@ -397,6 +397,9 @@ public:
   /// Expose native trainable affine boundaries without driver dependencies.
   std::vector<wftrain::AffineParameterBlock> affineParameterBlocks() const override;
 
+  /// Classify generic curvature leaves by typed cusp roles rather than tensor names.
+  std::vector<std::size_t> genericKFACParameterBlocks() const override;
+
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
                            wftrain::AffineScoreObserver& observer,

@@ -666,6 +666,47 @@ factor EMA or momentum history. Providers without affine observations fail
 explicitly. No Krylov controls are accepted because this update uses direct
 factor solves rather than an iterative solve.
 
+The following optional training parameters select the objective and curvature
+conventions independently. Their defaults retain the original live update:
+
+* ``kfac_objective=raw_covariance`` uses the weighted raw-energy score covariance
+  with its factor of two. ``clipped_covariance`` instead contracts raw scores with
+  ``mask * w * (T(E)-mean(w*T(E))) / count(mask)``, where weights have mean one.
+  The transformed mean includes all samples before masking, and this gradient has
+  no factor of two. Physical energy and variance reporting always use raw energies.
+* ``kfac_clip_mode=soft_median`` (default) uses the median energy center and a
+  logarithmic tail transform. ``kfac_clip_quantile=0.95`` selects a linearly
+  interpolated quantile of absolute residuals, and ``kfac_clip_width=1`` multiplies
+  that scale. ``hard_median`` and ``hard_mean`` use their named center and clamp
+  energies to center plus/minus width times the mean absolute deviation.
+* ``kfac_exclude_width=none`` disables masking. A positive value keeps samples
+  whose absolute centered residual divided by the unmultiplied quantile scale is
+  strictly below that value in soft mode. In hard mode it is a strict absolute
+  energy-residual bound. Clipping controls require ``clipped_covariance``;
+  ``kfac_clip_quantile`` is accepted only in soft mode. Nonfinite transforms,
+  zero soft scales and all-masked populations fail before parameter publication.
+* ``kfac_curvature=native_score`` retains samplewise score factors.
+  ``registered_gaussian`` selects unweighted normal-predictive curvature with
+  variance 0.5: affine sensitivities and envelope diagonals gain a factor of two,
+  while typed generic cusp entries use ``2*(sum(score))^2/N``. Objective weights
+  and clipping do not enter this curvature. MPI ranks combine signed generic
+  sums before squaring, corresponding to one global reference device.
+* ``kfac_damping_policy=equal_split`` retains equal square-root shifts.
+  ``trace_balanced`` balances two nonscalar factors by their normalized traces;
+  scalar factors are absorbed before adding damping and a zero factor yields
+  the inverse of the damped identity.
+* ``kfac_constraint=none`` retains the unconstrained preconditioned update.
+  ``damped_kfac`` requires a positive ``kfac_norm_constraint`` and scales the
+  inverse direction by ``min(1,sqrt(bound/(learning_rate^2*g.dot(P(g)))))``.
+  This damped approximate-curvature surrogate is distinct from
+  ``maximum_update_norm``, which independently caps Euclidean displacement.
+
+All these controls are KFAC-only. Resolved controls, transformed population
+statistics and constraint metric/scale are logged explicitly. A changed profile
+is bound into the stage checkpoint configuration identity; it cannot silently
+replace the profile of an exact restart. Persistent factor averages and schedule
+state require separate qualification from this selectable stateless route.
+
 Qualification includes deterministic algebra/recurrence/input tests and very
 short internally initialized H2 execution and AMSGrad restart tests. These checks
 establish execution and numerical contracts, not optimization convergence or

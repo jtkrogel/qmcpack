@@ -343,6 +343,97 @@ std::string formatFingerprint(std::uint64_t hash)
 } // namespace
 
 /// Copied numeric data and reusable scratch for one derivative batch.
+ClippedScoreObjectiveResult prepareClippedScoreObjective(
+    DerivativeArrayView<const DerivativeReal> energies,
+    DerivativeArrayView<const DerivativeReal> weights,
+    ClippedScoreObjectiveControl control)
+{
+  if (energies.empty() || energies.size() != weights.size() || !energies.data() || !weights.data() ||
+      !isFiniteTrainingReal(control.width) || control.width <= 0.0 ||
+      !isFiniteTrainingReal(control.quantile) || control.quantile <= 0.0 || control.quantile > 1.0 ||
+      control.exclude_width <= 0.0 ||
+      (!isFiniteTrainingReal(control.exclude_width) &&
+       control.exclude_width != std::numeric_limits<DerivativeReal>::infinity()))
+    throw std::invalid_argument("Clipped score objective has invalid inputs or controls");
+  if (control.mode != ScoreObjectiveClipMode::SOFT_MEDIAN &&
+      control.mode != ScoreObjectiveClipMode::HARD_MEDIAN &&
+      control.mode != ScoreObjectiveClipMode::HARD_MEAN)
+    throw std::invalid_argument("Clipped score objective has an unknown transform");
+  DerivativeReal weight_sum = 0.0;
+  DerivativeReal energy_sum = 0.0;
+  for (std::size_t i = 0; i < energies.size(); ++i)
+  {
+    if (!isFiniteTrainingReal(energies[i]) || !isFiniteTrainingReal(weights[i]) || weights[i] < 0.0)
+      throw std::invalid_argument("Clipped score objective has nonfinite energies or invalid weights");
+    weight_sum += weights[i];
+    energy_sum += energies[i];
+  }
+  if (!isFiniteTrainingReal(weight_sum) || weight_sum <= 0.0 || !isFiniteTrainingReal(energy_sum))
+    throw std::invalid_argument("Clipped score objective has invalid aggregate moments");
+  const auto quantile = [](std::vector<DerivativeReal>& sorted, DerivativeReal probability) {
+    std::sort(sorted.begin(), sorted.end());
+    const DerivativeReal index = (sorted.size() - 1) * probability;
+    const auto low = static_cast<std::size_t>(std::floor(index));
+    const auto high = static_cast<std::size_t>(std::ceil(index));
+    const DerivativeReal fraction = index - low;
+    return (1.0 - fraction) * sorted[low] + fraction * sorted[high];
+  };
+  ClippedScoreObjectiveResult result;
+  std::vector<DerivativeReal> scratch(energies.begin(), energies.end());
+  result.center = control.mode == ScoreObjectiveClipMode::HARD_MEAN
+      ? energy_sum / energies.size() : quantile(scratch, 0.5);
+  DerivativeReal absolute_sum = 0.0;
+  for (std::size_t i = 0; i < energies.size(); ++i)
+  {
+    scratch[i] = std::abs(energies[i] - result.center);
+    absolute_sum += scratch[i];
+  }
+  result.scale = control.mode == ScoreObjectiveClipMode::SOFT_MEDIAN
+      ? quantile(scratch, control.quantile) : absolute_sum / energies.size();
+  const DerivativeReal half_width = control.width * result.scale;
+  if (!isFiniteTrainingReal(half_width) ||
+      (control.mode == ScoreObjectiveClipMode::SOFT_MEDIAN && half_width <= 0.0))
+    throw std::invalid_argument("Clipped score objective has zero or nonfinite soft scale");
+  result.coefficients.resize(energies.size());
+  std::vector<bool> mask(energies.size());
+  for (std::size_t i = 0; i < energies.size(); ++i)
+  {
+    const DerivativeReal delta = energies[i] - result.center;
+    DerivativeReal transformed;
+    if (control.mode == ScoreObjectiveClipMode::SOFT_MEDIAN)
+    {
+      const DerivativeReal z = delta / (2.0 * half_width);
+      const DerivativeReal a = std::abs(z);
+      const DerivativeReal squeezed = std::copysign(
+          std::log1p((a + a * a / 2.0 + a * a * a) / (1.0 + a * a)), z);
+      transformed = result.center + 2.0 * half_width * squeezed;
+      mask[i] = std::abs(delta) / result.scale < control.exclude_width;
+    }
+    else
+    {
+      transformed = std::clamp(energies[i], result.center - half_width, result.center + half_width);
+      mask[i] = std::abs(delta) < control.exclude_width;
+    }
+    if (!isFiniteTrainingReal(transformed))
+      throw std::invalid_argument("Clipped score objective produced a nonfinite transformed energy");
+    result.coefficients[i] = transformed;
+    result.transformed_mean += weights[i] * transformed / weight_sum;
+    result.unmasked_samples += mask[i];
+  }
+  if (result.unmasked_samples == 0 || !isFiniteTrainingReal(result.transformed_mean))
+    throw std::invalid_argument("Clipped score objective has no unmasked samples or nonfinite mean");
+  const DerivativeReal normalization =
+      static_cast<DerivativeReal>(energies.size()) / weight_sum / result.unmasked_samples;
+  for (std::size_t i = 0; i < energies.size(); ++i)
+  {
+    result.coefficients[i] = mask[i]
+        ? normalization * weights[i] * (result.coefficients[i].real() - result.transformed_mean) : 0.0;
+    if (!isFinite(result.coefficients[i]))
+      throw std::invalid_argument("Clipped score objective produced a nonfinite residual");
+  }
+  return result;
+}
+
 struct ScoreCovarianceFactor::BatchStorage
 {
   const StreamingDerivativeOperator* derivative_operator = nullptr;
@@ -359,7 +450,8 @@ ScoreCovarianceFactor::ScoreCovarianceFactor(
     std::size_t parameter_version,
     DerivativeArrayView<const ScoreCovarianceBatch> batches,
     ScoreSampleDomain sample_domain,
-    DistributedParameterReduction reduction)
+    DistributedParameterReduction reduction,
+    std::optional<ScoreObjectiveResidualOverride> objective_residual)
     : schema_(schema), parameter_version_(parameter_version),
       sample_domain_(sample_domain), reduction_(std::move(reduction)),
       projected_direction_(schema.parameterCount()),
@@ -436,6 +528,21 @@ ScoreCovarianceFactor::ScoreCovarianceFactor(
       throw std::overflow_error("Score covariance sample-vector extent overflow");
     local_sample_vector_size_ += multiplier * storage.weights.size();
     batches_.push_back(std::move(storage));
+  }
+
+  if (objective_residual)
+  {
+    const auto coefficients = objective_residual->coefficients;
+    if (coefficients.size() != local_physical_sample_count_ ||
+        (!coefficients.empty() && !coefficients.data()))
+      throw std::invalid_argument("Objective residual extent does not match physical samples");
+    for (const auto coefficient : coefficients)
+      if (!isFinite(coefficient) ||
+          (sample_domain_ == ScoreSampleDomain::REAL && coefficient.imag() != 0.0))
+        throw std::invalid_argument("Objective residual contains an invalid coefficient");
+    objective_residual_.emplace(coefficients.size());
+    if (!coefficients.empty())
+      std::copy(coefficients.begin(), coefficients.end(), objective_residual_->begin());
   }
 
   std::sort(intervals.begin(), intervals.end());
@@ -676,7 +783,40 @@ void ScoreCovarianceFactor::addCenterProjector(
 std::vector<DerivativeReal> ScoreCovarianceFactor::scoreCovarianceGradient() const
 {
   std::vector<DerivativeValue> complex_gradient(schema_.parameterCount());
-  applyAdjoint(residual(), mutableView(complex_gradient));
+  if (!objective_residual_)
+    applyAdjoint(residual(), mutableView(complex_gradient));
+  else
+  {
+    std::exception_ptr failure;
+    try
+    {
+      std::size_t offset = 0;
+      for (const BatchStorage& batch : batches_)
+      {
+        if (batch.weights.empty())
+          continue;
+        const VJPCoefficientChannel channel{
+            "kfac/objective_residual", DerivativeProduct::SCORE_VJP,
+            coefficientsFor(*batch.derivative_operator,
+                {objective_residual_->data() + offset, batch.weights.size()}), 0};
+        ScoreVJPAccumulator sink(schema_, parameter_version_, mutableView(complex_gradient));
+        batch.derivative_operator->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, sink);
+        offset += batch.weights.size();
+      }
+      for (DerivativeValue& value : complex_gradient)
+        value = {value.real(), 0.0};
+      for (const auto& block : schema_.blocks())
+        if (!block.trainable)
+          std::fill(complex_gradient.begin() + block.offset,
+                    complex_gradient.begin() + block.offset + block.count, DerivativeValue{});
+    }
+    catch (...)
+    {
+      failure = std::current_exception();
+      std::fill(complex_gradient.begin(), complex_gradient.end(), DerivativeValue{});
+    }
+    reduction_.reduceParameterVector(schema_, parameter_version_, mutableView(complex_gradient), failure);
+  }
   std::vector<DerivativeReal> gradient(complex_gradient.size());
   for (std::size_t parameter = 0; parameter < gradient.size(); ++parameter)
     gradient[parameter] = complex_gradient[parameter].real();
@@ -691,7 +831,8 @@ ScoreCovarianceStorageDiagnostics ScoreCovarianceFactor::storageDiagnostics() co
   result.local_sample_vector_size = local_sample_vector_size_;
   result.global_sample_vector_size = global_sample_vector_size_;
   result.complex_parameter_vectors = 2;
-  result.complex_sample_values = residual_.capacity();
+  result.complex_sample_values = residual_.capacity() +
+      (objective_residual_ ? objective_residual_->capacity() : 0);
   for (const BatchStorage& batch : batches_)
   {
     result.real_sample_values += batch.weights.capacity() +

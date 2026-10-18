@@ -28,10 +28,12 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 70> allowed_controls{
+constexpr std::array<std::string_view, 79> allowed_controls{
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
+    "kfac_objective", "kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width",
+    "kfac_curvature", "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
     "line_search_minimum_ess_fraction", "line_search_maximum_weight", "line_search_confidence",
     "line_search_warmup_steps", "line_search_sampling_steps",
@@ -259,6 +261,15 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   lm_inner_restart_length_ = 4;
   lm_inner_relative_tolerance_ = 0.1;
   kfac_fallback_damping_ = 1.0e-3;
+  kfac_objective_ = KFACObjective::RAW_COVARIANCE;
+  kfac_clip_mode_ = KFACClipMode::SOFT_MEDIAN;
+  kfac_curvature_ = KFACCurvature::NATIVE_SCORE;
+  kfac_damping_policy_ = KFACDamping::EQUAL_SPLIT;
+  kfac_constraint_ = KFACConstraint::NONE;
+  kfac_clip_width_ = 1.0;
+  kfac_clip_quantile_ = 0.95;
+  kfac_exclude_width_ = std::numeric_limits<double>::infinity();
+  kfac_norm_constraint_ = 0.0;
   line_search_ = LineSearch::OFF;
   update_scale_ = 1.0;
   weight_decay_ = 0.0;
@@ -782,7 +793,71 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     rejectControls(seen_controls, {"lm_inner_iterations", "lm_inner_restart_length",
         "lm_inner_relative_tolerance"}, "lm");
   if (optimizer_ != Optimizer::KFAC)
-    rejectControls(seen_controls, {"kfac_fallback_damping"}, "selected optimizer");
+    rejectControls(seen_controls, {"kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
+        "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width", "kfac_curvature",
+        "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint"}, "selected optimizer");
+  else
+  {
+    if (seen_controls.count("kfac_objective"))
+    {
+      const auto& value = readControl("kfac_objective");
+      if (value == "raw_covariance") kfac_objective_ = KFACObjective::RAW_COVARIANCE;
+      else if (value == "clipped_covariance") kfac_objective_ = KFACObjective::CLIPPED_COVARIANCE;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_objective");
+    }
+    if (seen_controls.count("kfac_clip_mode"))
+    {
+      const auto& value = readControl("kfac_clip_mode");
+      if (value == "soft_median") kfac_clip_mode_ = KFACClipMode::SOFT_MEDIAN;
+      else if (value == "hard_median") kfac_clip_mode_ = KFACClipMode::HARD_MEDIAN;
+      else if (value == "hard_mean") kfac_clip_mode_ = KFACClipMode::HARD_MEAN;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_clip_mode");
+    }
+    if (seen_controls.count("kfac_curvature"))
+    {
+      const auto& value = readControl("kfac_curvature");
+      if (value == "native_score") kfac_curvature_ = KFACCurvature::NATIVE_SCORE;
+      else if (value == "registered_gaussian") kfac_curvature_ = KFACCurvature::REGISTERED_GAUSSIAN;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_curvature");
+    }
+    if (seen_controls.count("kfac_damping_policy"))
+    {
+      const auto& value = readControl("kfac_damping_policy");
+      if (value == "equal_split") kfac_damping_policy_ = KFACDamping::EQUAL_SPLIT;
+      else if (value == "trace_balanced") kfac_damping_policy_ = KFACDamping::TRACE_BALANCED;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_damping_policy");
+    }
+    if (seen_controls.count("kfac_constraint"))
+    {
+      const auto& value = readControl("kfac_constraint");
+      if (value == "none") kfac_constraint_ = KFACConstraint::NONE;
+      else if (value == "damped_kfac") kfac_constraint_ = KFACConstraint::DAMPED_KFAC;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_constraint");
+    }
+    if (seen_controls.count("kfac_clip_width"))
+      kfac_clip_width_ = parseNonnegativeReal(readControl("kfac_clip_width"), "kfac_clip_width");
+    if (seen_controls.count("kfac_clip_quantile"))
+      kfac_clip_quantile_ = parseNonnegativeReal(readControl("kfac_clip_quantile"), "kfac_clip_quantile");
+    if (seen_controls.count("kfac_exclude_width") && readControl("kfac_exclude_width") != "none")
+      kfac_exclude_width_ = parseNonnegativeReal(readControl("kfac_exclude_width"), "kfac_exclude_width");
+    if (seen_controls.count("kfac_norm_constraint"))
+      kfac_norm_constraint_ = parseNonnegativeReal(readControl("kfac_norm_constraint"), "kfac_norm_constraint");
+    if (kfac_clip_width_ <= 0.0 || kfac_clip_quantile_ <= 0.0 || kfac_clip_quantile_ > 1.0 ||
+        kfac_exclude_width_ <= 0.0)
+      throw UniformCommunicateError("WFTrainDriverInput: invalid KFAC clipping width or quantile");
+    if (kfac_objective_ == KFACObjective::RAW_COVARIANCE)
+      rejectControls(seen_controls, {"kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile",
+          "kfac_exclude_width"}, "raw KFAC objective");
+    if (kfac_clip_mode_ != KFACClipMode::SOFT_MEDIAN)
+      rejectControls(seen_controls, {"kfac_clip_quantile"}, "hard KFAC clipping");
+    if (kfac_constraint_ == KFACConstraint::DAMPED_KFAC)
+    {
+      if (kfac_norm_constraint_ <= 0.0)
+        throw UniformCommunicateError("WFTrainDriverInput: damped_kfac requires positive kfac_norm_constraint");
+    }
+    else
+      rejectControls(seen_controls, {"kfac_norm_constraint"}, "unconstrained KFAC");
+  }
 }
 
 } // namespace qmcplusplus

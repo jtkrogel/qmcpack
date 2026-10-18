@@ -33,6 +33,10 @@ namespace qmcplusplus::wftrain
 inline constexpr std::size_t NO_KFAC_BIAS_BLOCK =
     std::numeric_limits<std::size_t>::max();
 
+/// Curvature registration is independent of the energy objective's weights.
+enum class KFACCurvatureConvention { NATIVE_SCORE, REGISTERED_GAUSSIAN };
+enum class KFACDampingPolicy { EQUAL_SPLIT, TRACE_BALANCED };
+
 /** Map one affine layer to canonical schema blocks and factor dimensions. */
 struct KFACAffineBlockDescriptor
 {
@@ -49,7 +53,8 @@ class KFACBlockRegistry
 public:
   KFACBlockRegistry(const StructuredParameterSchema& schema,
                     std::vector<KFACAffineBlockDescriptor> affine_blocks,
-                    std::vector<std::size_t> fallback_blocks);
+                    std::vector<std::size_t> fallback_blocks,
+                    std::vector<std::size_t> generic_blocks = {});
 
   /// Return the copied schema that defines the canonical tangent space.
   const StructuredParameterSchema& parameterSchema() const noexcept { return schema_; }
@@ -66,6 +71,9 @@ public:
     return fallback_blocks_;
   }
 
+  /// Subset using registered NaiveDiagonal rather than samplewise score squares.
+  const std::vector<std::size_t>& genericBlocks() const noexcept { return generic_blocks_; }
+
   /// Return a stable identity for factor snapshots and distributed consensus.
   const std::string& fingerprint() const noexcept { return fingerprint_; }
 
@@ -73,6 +81,7 @@ private:
   StructuredParameterSchema schema_;
   std::vector<KFACAffineBlockDescriptor> affine_blocks_;
   std::vector<std::size_t> fallback_blocks_;
+  std::vector<std::size_t> generic_blocks_;
   std::string fingerprint_;
 };
 
@@ -106,7 +115,8 @@ class KFACFactorAccumulator
 {
 public:
   KFACFactorAccumulator(KFACBlockRegistry registry,
-                        std::size_t parameter_version);
+                        std::size_t parameter_version,
+                        KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE);
 
   /// Begin one sample with a finite nonnegative statistical weight.
   void beginSample(DerivativeReal sample_weight);
@@ -114,7 +124,7 @@ public:
   /// Add one block's repeated dense rows to the current sample transaction.
   void addObservation(const KFACLayerObservation& observation);
 
-  /// Accumulate score-squared diagonal statistics for every fallback interval.
+  /// Accumulate diagonal sufficient statistics for every fallback interval.
   void addFallbackScores(DerivativeArrayView<const DerivativeReal> score);
 
   /// Atomically merge the current sample into the published factor sums.
@@ -135,7 +145,9 @@ public:
   /// Return completed factor sums in registry order.
   const std::vector<KFACFactorStatistics>& factors() const noexcept { return factors_; }
 
-  /// Return score-squared sums packed in fallback-block/canonical-entry order.
+  /// Return diagonal numerators in fallback-block/canonical-entry order.
+  /// Registered generic entries contain twice the squared signed sample sum;
+  /// other entries contain (optionally Gaussian-scaled) samplewise score squares.
   DerivativeArrayView<const DerivativeReal> fallbackDiagonalSum() const noexcept
   {
     return {fallback_diagonal_sum_.data(), fallback_diagonal_sum_.size()};
@@ -147,6 +159,8 @@ public:
   /// Return whether a sample transaction is currently open.
   bool sampleActive() const noexcept { return sample_active_; }
 
+  KFACCurvatureConvention curvatureConvention() const noexcept { return convention_; }
+
   /// Return exact retained numeric bytes, including transactional scratch.
   std::size_t retainedNumericBytes() const noexcept;
 
@@ -156,6 +170,7 @@ private:
                                          std::size_t);
 
   KFACBlockRegistry registry_;
+  KFACCurvatureConvention convention_;
   std::size_t parameter_version_ = 0;
   std::size_t sample_count_ = 0;
   DerivativeReal sample_weight_ = 0.0;
@@ -164,6 +179,11 @@ private:
   std::vector<bool> observed_;
   std::vector<DerivativeReal> fallback_diagonal_sum_;
   std::vector<DerivativeReal> pending_fallback_diagonal_;
+  // Generic Gaussian curvature is 2*(global score sum)^2/N. Keep its signed
+  // sufficient statistic until after rank reduction; summing local squares is wrong.
+  std::vector<DerivativeReal> fallback_score_sum_;
+  std::vector<DerivativeReal> pending_fallback_score_;
+  std::vector<bool> generic_entries_;
   DerivativeReal fallback_weight_sum_ = 0.0;
   bool fallback_observed_ = false;
   bool sample_active_ = false;
@@ -184,6 +204,7 @@ struct KFACPreconditionerControl
 {
   DerivativeReal damping = 1.0e-3;
   DerivativeReal fallback_damping = 1.0e-3;
+  KFACDampingPolicy damping_policy = KFACDampingPolicy::EQUAL_SPLIT;
 };
 
 /// Exact retained state for a prepared KFAC inverse.

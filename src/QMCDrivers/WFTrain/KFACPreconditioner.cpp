@@ -150,10 +150,12 @@ void solveCholesky(const std::vector<DerivativeReal>& lower,
 KFACBlockRegistry::KFACBlockRegistry(
     const StructuredParameterSchema& schema,
     std::vector<KFACAffineBlockDescriptor> affine_blocks,
-    std::vector<std::size_t> fallback_blocks)
+    std::vector<std::size_t> fallback_blocks,
+    std::vector<std::size_t> generic_blocks)
     : schema_(schema),
       affine_blocks_(std::move(affine_blocks)),
-      fallback_blocks_(std::move(fallback_blocks))
+      fallback_blocks_(std::move(fallback_blocks)),
+      generic_blocks_(std::move(generic_blocks))
 {
   if (schema_.blocks().empty())
     throw std::invalid_argument("KFAC registry requires a nonempty parameter schema");
@@ -208,6 +210,14 @@ KFACBlockRegistry::KFACBlockRegistry(
   }
   if (!std::all_of(covered.begin(), covered.end(), [](bool value) { return value; }))
     throw std::invalid_argument("KFAC registry leaves schema blocks unclassified");
+  std::vector<bool> generic_seen(schema_.blocks().size(), false);
+  for (std::size_t block : generic_blocks_)
+  {
+    if (std::find(fallback_blocks_.begin(), fallback_blocks_.end(), block) == fallback_blocks_.end() ||
+        generic_seen[block])
+      throw std::invalid_argument("KFAC generic blocks must be a unique subset of fallback blocks");
+    generic_seen[block] = true;
+  }
 
   std::uint64_t hash = UINT64_C(14695981039346656037);
   extendHash(hash, schema_.fingerprint());
@@ -223,13 +233,23 @@ KFACBlockRegistry::KFACBlockRegistry(
   }
   for (std::size_t block : fallback_blocks_)
     extendHash(hash, static_cast<std::uint64_t>(block));
+  if (!generic_blocks_.empty())
+  {
+    extendHash(hash, "registered_generic_blocks");
+    for (std::size_t block : generic_blocks_)
+      extendHash(hash, static_cast<std::uint64_t>(block));
+  }
   fingerprint_ = formatFingerprint(hash);
 }
 
 KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
-                                             std::size_t parameter_version)
-    : registry_(std::move(registry)), parameter_version_(parameter_version)
+                                             std::size_t parameter_version,
+                                             KFACCurvatureConvention convention)
+    : registry_(std::move(registry)), convention_(convention), parameter_version_(parameter_version)
 {
+  if (convention_ != KFACCurvatureConvention::NATIVE_SCORE &&
+      convention_ != KFACCurvatureConvention::REGISTERED_GAUSSIAN)
+    throw std::invalid_argument("KFAC curvature convention is unsupported");
   factors_.reserve(registry_.affineBlocks().size());
   pending_.reserve(registry_.affineBlocks().size());
   for (const KFACAffineBlockDescriptor& block : registry_.affineBlocks())
@@ -248,6 +268,15 @@ KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
   }
   fallback_diagonal_sum_.assign(fallback_parameter_count, 0.0);
   pending_fallback_diagonal_.assign(fallback_parameter_count, 0.0);
+  if (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN && !registry_.genericBlocks().empty())
+  {
+    fallback_score_sum_.assign(fallback_parameter_count, 0.0);
+    pending_fallback_score_.assign(fallback_parameter_count, 0.0);
+    for (std::size_t block : registry_.fallbackBlocks())
+      generic_entries_.insert(generic_entries_.end(), registry_.parameterSchema().blocks()[block].count,
+          std::find(registry_.genericBlocks().begin(), registry_.genericBlocks().end(), block) !=
+              registry_.genericBlocks().end());
+  }
 }
 
 void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
@@ -258,7 +287,7 @@ void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
     throw std::logic_error("KFAC globally reduced statistics cannot accept new samples");
   if (!finite(sample_weight) || sample_weight < 0.0)
     throw std::invalid_argument("KFAC sample weight must be finite and nonnegative");
-  sample_weight_ = sample_weight;
+  sample_weight_ = convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 1.0 : sample_weight;
   std::fill(observed_.begin(), observed_.end(), false);
   for (KFACFactorStatistics& factor : pending_)
   {
@@ -269,6 +298,7 @@ void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
     std::fill(factor.sensitivity_outer_sum.begin(), factor.sensitivity_outer_sum.end(), 0.0);
   }
   std::fill(pending_fallback_diagonal_.begin(), pending_fallback_diagonal_.end(), 0.0);
+  std::fill(pending_fallback_score_.begin(), pending_fallback_score_.end(), 0.0);
   fallback_observed_ = registry_.fallbackBlocks().empty();
   sample_active_ = true;
 }
@@ -315,6 +345,7 @@ void KFACFactorAccumulator::addObservation(const KFACLayerObservation& observati
     for (std::size_t left = 0; left < block.output_width; ++left)
       for (std::size_t right = 0; right < block.output_width; ++right)
         factor.sensitivity_outer_sum[left * block.output_width + right] +=
+            (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
             sample_weight_ * observation.sensitivities[row * block.output_width + left] *
             observation.sensitivities[row * block.output_width + right];
   }
@@ -344,8 +375,13 @@ void KFACFactorAccumulator::addFallbackScores(
     {
       if (!finite(score[parameter]))
         throw std::invalid_argument("KFAC fallback score contains a non-finite value");
-      pending_fallback_diagonal_[packed++] =
-          sample_weight_ * score[parameter] * score[parameter];
+      if (!generic_entries_.empty() && generic_entries_[packed])
+        pending_fallback_score_[packed] = score[parameter];
+      else
+        pending_fallback_diagonal_[packed] =
+            (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
+            sample_weight_ * score[parameter] * score[parameter];
+      ++packed;
     }
   }
   fallback_observed_ = true;
@@ -379,7 +415,13 @@ void KFACFactorAccumulator::endSample()
       valid = finite(destination.sensitivity_outer_sum[index] + source.sensitivity_outer_sum[index]);
   }
   for (std::size_t parameter = 0; valid && parameter < fallback_diagonal_sum_.size(); ++parameter)
-    valid = finite(fallback_diagonal_sum_[parameter] + pending_fallback_diagonal_[parameter]);
+    if (!generic_entries_.empty() && generic_entries_[parameter])
+    {
+      const DerivativeReal sum = fallback_score_sum_[parameter] + pending_fallback_score_[parameter];
+      valid = finite(sum) && finite(2.0 * sum * sum);
+    }
+    else
+      valid = finite(fallback_diagonal_sum_[parameter] + pending_fallback_diagonal_[parameter]);
   if (!valid)
   {
     abortSample();
@@ -399,7 +441,14 @@ void KFACFactorAccumulator::endSample()
       destination.sensitivity_outer_sum[index] += source.sensitivity_outer_sum[index];
   }
   for (std::size_t parameter = 0; parameter < fallback_diagonal_sum_.size(); ++parameter)
-    fallback_diagonal_sum_[parameter] += pending_fallback_diagonal_[parameter];
+    if (!generic_entries_.empty() && generic_entries_[parameter])
+    {
+      fallback_score_sum_[parameter] += pending_fallback_score_[parameter];
+      fallback_diagonal_sum_[parameter] =
+          2.0 * fallback_score_sum_[parameter] * fallback_score_sum_[parameter];
+    }
+    else
+      fallback_diagonal_sum_[parameter] += pending_fallback_diagonal_[parameter];
   fallback_weight_sum_ += sample_weight_;
   ++sample_count_;
   sample_active_ = false;
@@ -420,7 +469,8 @@ std::size_t KFACFactorAccumulator::retainedNumericBytes() const noexcept
       elements += factor.activation_outer_sum.capacity() +
           factor.sensitivity_outer_sum.capacity();
   elements += fallback_diagonal_sum_.capacity() +
-      pending_fallback_diagonal_.capacity();
+      pending_fallback_diagonal_.capacity() + fallback_score_sum_.capacity() +
+      pending_fallback_score_.capacity();
   return elements * sizeof(DerivativeReal);
 }
 
@@ -458,7 +508,9 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
 
   std::uint64_t identity = UINT64_C(14695981039346656037);
   extendHash(identity, accumulator.registry_.fingerprint());
-  std::size_t packed_scalar_count = accumulator.fallback_diagonal_sum_.size();
+  extendHash(identity, static_cast<std::uint64_t>(accumulator.convention_));
+  std::size_t packed_scalar_count = accumulator.fallback_diagonal_sum_.size() +
+      accumulator.fallback_score_sum_.size();
   for (const KFACFactorStatistics& factor : accumulator.factors_)
     packed_scalar_count += factor.activation_outer_sum.size() +
         factor.sensitivity_outer_sum.size() + 2;
@@ -508,6 +560,15 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
   }
   reduce_real_array(accumulator.fallback_diagonal_sum_.data(),
                     accumulator.fallback_diagonal_sum_.size());
+  reduce_real_array(accumulator.fallback_score_sum_.data(), accumulator.fallback_score_sum_.size());
+  for (std::size_t parameter = 0; parameter < accumulator.generic_entries_.size(); ++parameter)
+    if (accumulator.generic_entries_[parameter])
+    {
+      const DerivativeReal sum = accumulator.fallback_score_sum_[parameter];
+      if (!finite(sum) || !finite(2.0 * sum * sum))
+        throw MatrixFreeNumericalError("KFAC global generic curvature overflowed");
+      accumulator.fallback_diagonal_sum_[parameter] = 2.0 * sum * sum;
+    }
   for (KFACFactorStatistics& factor : accumulator.factors_)
   {
     unsigned long row_count = static_cast<unsigned long>(factor.row_count);
@@ -549,6 +610,9 @@ KFACPreconditioner::KFACPreconditioner(
   if (!finite(control_.damping) || control_.damping <= 0.0 ||
       !finite(control_.fallback_damping) || control_.fallback_damping <= 0.0)
     throw std::invalid_argument("KFAC damping values must be finite and positive");
+  if (control_.damping_policy != KFACDampingPolicy::EQUAL_SPLIT &&
+      control_.damping_policy != KFACDampingPolicy::TRACE_BALANCED)
+    throw std::invalid_argument("KFAC damping policy is unsupported");
   std::size_t maximum_matrix = 0;
   std::size_t maximum_dimension = 0;
   blocks_.reserve(statistics.factors().size());
@@ -571,13 +635,51 @@ KFACPreconditioner::KFACPreconditioner(
       value /= factor.sample_weight_sum;
     for (DerivativeReal& value : prepared.sensitivity_cholesky)
       value /= factor.sample_weight_sum;
-    const DerivativeReal split_damping = std::sqrt(control_.damping * repeats);
+    const DerivativeReal effective_damping = control_.damping * repeats;
+    if (!finite(effective_damping))
+      throw MatrixFreeNumericalError("KFAC repeated-block damping overflowed");
+    DerivativeReal activation_damping = std::sqrt(effective_damping);
+    DerivativeReal sensitivity_damping = activation_damping;
+    if (control_.damping_policy == KFACDampingPolicy::TRACE_BALANCED)
+    {
+      DerivativeReal a = 0.0, b = 0.0;
+      for (std::size_t i = 0; i < factor.activation_dimension; ++i)
+        a += prepared.activation_cholesky[i * factor.activation_dimension + i] /
+            static_cast<DerivativeReal>(factor.activation_dimension);
+      for (std::size_t i = 0; i < factor.sensitivity_dimension; ++i)
+        b += prepared.sensitivity_cholesky[i * factor.sensitivity_dimension + i] /
+            static_cast<DerivativeReal>(factor.sensitivity_dimension);
+      if (!finite(a) || !finite(b) || a < 0.0 || b < 0.0)
+        throw MatrixFreeNumericalError("KFAC trace-balanced factor trace is invalid");
+      if (a == 0.0 || b == 0.0)
+      {
+        // The zero-factor branch represents damping*I.
+        std::fill(prepared.activation_cholesky.begin(), prepared.activation_cholesky.end(), 0.0);
+        std::fill(prepared.sensitivity_cholesky.begin(), prepared.sensitivity_cholesky.end(), 0.0);
+      }
+      else if (factor.activation_dimension == 1)
+      {
+        activation_damping = 0.0;
+        sensitivity_damping = effective_damping / a;
+      }
+      else if (factor.sensitivity_dimension == 1)
+      {
+        activation_damping = effective_damping / b;
+        sensitivity_damping = 0.0;
+      }
+      else
+      {
+        // sqrt ratios avoid unnecessary overflow of a/b or damping*a.
+        activation_damping *= std::sqrt(a) / std::sqrt(b);
+        sensitivity_damping *= std::sqrt(b) / std::sqrt(a);
+      }
+    }
     for (std::size_t diagonal = 0; diagonal < factor.activation_dimension; ++diagonal)
       prepared.activation_cholesky[diagonal * factor.activation_dimension + diagonal] +=
-          split_damping;
+          activation_damping;
     for (std::size_t diagonal = 0; diagonal < factor.sensitivity_dimension; ++diagonal)
       prepared.sensitivity_cholesky[diagonal * factor.sensitivity_dimension + diagonal] +=
-          split_damping;
+          sensitivity_damping;
     cholesky(prepared.activation_cholesky, factor.activation_dimension);
     cholesky(prepared.sensitivity_cholesky, factor.sensitivity_dimension);
     maximum_matrix = std::max(maximum_matrix,
