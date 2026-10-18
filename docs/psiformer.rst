@@ -661,8 +661,8 @@ provider, reduces their factors across ranks, and applies damped Kronecker
 inverses to the sampled energy gradient. Trainable parameters not belonging to
 an observed affine block use a diagonal fallback, controlled by
 ``kfac_fallback_damping`` (0.001). ``damping`` (0.001) stabilizes the affine factors.
-The initial live route rebuilds factors each training iteration; it does not retain
-factor EMA or momentum history. Providers without affine observations fail
+By default the live route rebuilds factors each training iteration and retains
+no factor EMA or momentum history. Providers without affine observations fail
 explicitly. No Krylov controls are accepted because this update uses direct
 factor solves rather than an iterative solve.
 
@@ -704,8 +704,37 @@ conventions independently. Their defaults retain the original live update:
 All these controls are KFAC-only. Resolved controls, transformed population
 statistics and constraint metric/scale are logged explicitly. A changed profile
 is bound into the stage checkpoint configuration identity; it cannot silently
-replace the profile of an exact restart. Persistent factor averages and schedule
-state require separate qualification from this selectable stateless route.
+replace the profile of an exact restart.
+
+``kfac_persist_state=yes`` opts into carrying optimizer state both across updates
+and through native checkpoints; it is not an output-cadence setting. Its default
+``no`` preserves stateless checkpoint compatibility. The following recurrence
+controls require the explicit opt-in:
+
+* ``kfac_ema_decay=0`` retains only the current factors. A value in ``[0,1)``
+  maintains normalized averages with ``W'=decay*W+1`` and
+  ``F'=(decay*W*F+F_batch)/W'``. The first batch is used without shrinkage.
+* ``kfac_inverse_period=1`` refreshes affine inverses at pre-update optimizer
+  steps divisible by that positive period, including step zero. Fallback diagonal
+  inverses use the current averaged diagonal and damping on every update.
+* ``kfac_learning_rate_decay=0`` keeps ``learning_rate`` constant. A positive
+  value ``d`` selects ``learning_rate/(1+t/d)`` using accepted optimizer step
+  ``t`` before the update. ``kfac_schedule_precision=float64`` is the default;
+  ``float32`` rounds the inverse schedule and its squared-rate constraint factor
+  in that dtype before promotion into the parameter/factor calculations.
+* The admitted profile has constant ``damping``/``kfac_fallback_damping``,
+  ``kfac_momentum=0``, ``kfac_burn_in=0`` and ``kfac_curvature_period=1``.
+  Other values of these last three controls are rejected explicitly.
+
+Native checkpoints preserve normalized factors and their weight, exact prepared
+affine inverse caches, fallback inverses, accepted-step/sample counters and cache
+step. Failed publication advances none of this state. Restore validates the
+configuration, shapes, finite values and state fingerprint before publication;
+the native sampler/RNG topology contract continues to apply. A parameter-only
+import starts a fresh optimizer at step zero even when its historical filename
+contains a nonzero training label. Exact continued-state restarts require a
+checkpoint containing the matching optimizer contributor; missing state is not
+silently initialized.
 
 Qualification includes deterministic algebra/recurrence/input tests and very
 short internally initialized H2 execution and AMSGrad restart tests. These checks

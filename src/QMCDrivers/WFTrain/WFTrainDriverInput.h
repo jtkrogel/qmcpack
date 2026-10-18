@@ -124,6 +124,11 @@ public:
   double getKFACClipQuantile() const noexcept { return kfac_clip_quantile_; }
   double getKFACExcludeWidth() const noexcept { return kfac_exclude_width_; }
   double getKFACNormConstraint() const noexcept { return kfac_norm_constraint_; }
+  bool getKFACPersistState() const noexcept { return kfac_persist_state_; }
+  double getKFACEMADecay() const noexcept { return kfac_ema_decay_; }
+  std::size_t getKFACInversePeriod() const noexcept { return kfac_inverse_period_; }
+  double getKFACLearningRateDecay() const noexcept { return kfac_learning_rate_decay_; }
+  bool getKFACScheduleFloat32() const noexcept { return kfac_schedule_float32_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
   std::size_t getLegacyMaximumParameters() const noexcept { return legacy_maximum_parameters_; }
   std::size_t getLegacyDerivativeScratchBytes() const noexcept { return legacy_derivative_scratch_bytes_; }
@@ -214,6 +219,11 @@ private:
   double kfac_clip_quantile_{0.95};
   double kfac_exclude_width_{std::numeric_limits<double>::infinity()};
   double kfac_norm_constraint_{0.0};
+  bool kfac_persist_state_{false};
+  double kfac_ema_decay_{0.0};
+  std::size_t kfac_inverse_period_{1};
+  double kfac_learning_rate_decay_{0.0};
+  bool kfac_schedule_float32_{false};
   LineSearch line_search_{LineSearch::OFF};
   double update_scale_{1.0};
   double weight_decay_{0.0};

@@ -23,6 +23,7 @@
 #include "QMCDrivers/WFTrain/SampledLinearMethod.h"
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
+#include "QMCDrivers/WFTrain/KFACOptimizer.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/KrylovPcgControl.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
@@ -328,6 +329,25 @@ public:
 private:
   wftrain::KFACFactorAccumulator& accumulator_;
 };
+
+wftrain::KFACBlockRegistry makeLiveKFACRegistry(const wftrain::StructuredParameterProvider& provider)
+{
+  const auto& schema = provider.parameterSchema();
+  const auto metadata = provider.affineParameterBlocks();
+  if (metadata.empty()) throw std::invalid_argument("Provider lacks live KFAC affine observations");
+  std::vector<wftrain::KFACAffineBlockDescriptor> affine;
+  std::vector<bool> covered(schema.blocks().size(), false);
+  for (const auto& block : metadata)
+  {
+    affine.push_back({block.id, block.weight_block, block.bias_block, block.input_width, block.output_width});
+    covered.at(block.weight_block) = true;
+    if (block.bias_block != wftrain::NO_AFFINE_BIAS_BLOCK) covered.at(block.bias_block) = true;
+  }
+  std::vector<std::size_t> fallback;
+  for (std::size_t i = 0; i < covered.size(); ++i)
+    if (schema.blocks()[i].trainable && !covered[i]) fallback.push_back(i);
+  return {schema, std::move(affine), std::move(fallback), provider.genericKFACParameterBlocks()};
+}
 
 /// Form a stateless Kronecker-preconditioned gradient proposal.
 class LiveKFACUpdateRule final : public wftrain::TrainingUpdateRule
@@ -1526,6 +1546,14 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, training.getLMInnerRestartLength());
   extendStageFingerprint(hash, training.getLMInnerRelativeTolerance());
   extendStageFingerprint(hash, training.getKFACFallbackDamping());
+  if (training.getKFACPersistState())
+  {
+    extendStageFingerprint(hash, std::string("kfac-persistent-v1"));
+    extendStageFingerprint(hash, training.getKFACEMADecay());
+    extendStageFingerprint(hash, training.getKFACInversePeriod());
+    extendStageFingerprint(hash, training.getKFACLearningRateDecay());
+    extendStageFingerprint(hash, training.getKFACScheduleFloat32());
+  }
   if (training.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
       (training.getKFACObjective() != WFTrainDriverInput::KFACObjective::RAW_COVARIANCE ||
        training.getKFACCurvature() != WFTrainDriverInput::KFACCurvature::NATIVE_SCORE ||
@@ -2337,11 +2365,31 @@ void WFTrainBatched::run()
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
     spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
         selected_provider_->parameterSchema(), makeSPRINGControl(training_input_));
+  std::unique_ptr<wftrain::KFACOptimizer> kfac_optimizer;
+  if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC && training_input_.getKFACPersistState())
+  {
+    wftrain::KFACOptimizerControl control;
+    control.learning_rate = training_input_.getLearningRate();
+    control.learning_rate_decay = training_input_.getKFACLearningRateDecay();
+    control.schedule_float32 = training_input_.getKFACScheduleFloat32();
+    control.ema_decay = training_input_.getKFACEMADecay();
+    control.inverse_period = training_input_.getKFACInversePeriod();
+    control.norm_constraint = training_input_.getKFACConstraint() == WFTrainDriverInput::KFACConstraint::DAMPED_KFAC
+        ? training_input_.getKFACNormConstraint() : 0.0;
+    control.convention = training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
+        ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN : wftrain::KFACCurvatureConvention::NATIVE_SCORE;
+    control.inverse = {training_input_.getDamping(), training_input_.getKFACFallbackDamping(),
+        training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
+            ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT};
+    kfac_optimizer = std::make_unique<wftrain::KFACOptimizer>(makeLiveKFACRegistry(*selected_provider_), control);
+  }
   wftrain::OptimizerCheckpointContributor* optimizer_checkpoint = nullptr;
   if (first_order_optimizer)
     optimizer_checkpoint = first_order_optimizer.get();
   else if (spring_optimizer)
     optimizer_checkpoint = spring_optimizer.get();
+  else if (kfac_optimizer)
+    optimizer_checkpoint = kfac_optimizer.get();
 
   wftrain::TrainingIterationState training_state{
       0, initial_version, selected_provider_->parameterSchema().fingerprint()};
@@ -2544,6 +2592,15 @@ void WFTrainBatched::run()
               << " constraint_units=LR^2*g_dot_preconditioned_g"
               << " euclidean_update_cap=" << training_input_.getMaximumUpdateNorm()
               << " registered_curvature_reference_devices=1" << std::endl;
+  if (myComm->rank() == 0 && kfac_optimizer)
+    app_log() << "WFTrain persistent KFAC: step=" << kfac_optimizer->step()
+              << " data_seen=" << kfac_optimizer->dataSeen()
+              << " ema_decay=" << training_input_.getKFACEMADecay()
+              << " affine_inverse_period=" << training_input_.getKFACInversePeriod()
+              << " curvature_period=1 momentum=0 burn_in=0"
+              << " learning_rate_decay=" << training_input_.getKFACLearningRateDecay()
+              << " schedule_precision=" << (training_input_.getKFACScheduleFloat32() ? "float32" : "float64")
+              << " effective_learning_rate=" << kfac_optimizer->effectiveLearningRate() << std::endl;
 
   for (int iteration = static_cast<int>(stage_state.completed_stage_iterations);
        iteration < num_iterations; ++iteration)
@@ -3552,23 +3609,8 @@ void WFTrainBatched::run()
             std::exception_ptr observation_failure;
             try
             {
-              const auto metadata = selected_provider_->affineParameterBlocks();
-              if (metadata.empty()) throw std::invalid_argument("Provider lacks live KFAC affine observations");
-              std::vector<wftrain::KFACAffineBlockDescriptor> affine;
-              std::vector<bool> covered(schema.blocks().size(), false);
-              for (const auto& block : metadata)
-              {
-                affine.push_back({block.id, block.weight_block, block.bias_block,
-                                  block.input_width, block.output_width});
-                covered.at(block.weight_block) = true;
-                if (block.bias_block != wftrain::NO_AFFINE_BIAS_BLOCK) covered.at(block.bias_block) = true;
-              }
-              std::vector<std::size_t> fallback;
-              for (std::size_t i = 0; i < covered.size(); ++i)
-                if (schema.blocks()[i].trainable && !covered[i]) fallback.push_back(i);
               statistics = std::make_unique<wftrain::KFACFactorAccumulator>(
-                  wftrain::KFACBlockRegistry(schema, std::move(affine), std::move(fallback),
-                      selected_provider_->genericKFACParameterBlocks()), parameters->version,
+                  makeLiveKFACRegistry(*selected_provider_), parameters->version,
                   training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
                       ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
                       : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
@@ -3587,6 +3629,35 @@ void WFTrainBatched::run()
             reduction.preflight(schema, &*parameters,
                 wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN, observation_failure);
             wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
+            if (kfac_optimizer)
+            {
+              std::exception_ptr preparation_failure;
+              try { kfac_optimizer->prepareStatistics(*statistics); }
+              catch (...) { preparation_failure = std::current_exception(); }
+              try
+              {
+                reduction.preflight(schema, &*parameters,
+                    wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN, preparation_failure);
+                enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_configuration_bytes,
+                    checkedMemoryAdd(retained_numeric_bytes, checkedMemoryAdd(statistics->retainedNumericBytes(),
+                        kfac_optimizer->retainedNumericBytes()))), training_input_.getMaximumRetainedBytes());
+                const auto rate = kfac_optimizer->effectiveLearningRate();
+                iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
+                    *decorate(*kfac_optimizer), training_state, reduction, cache_observer,
+                    energy_moments.weight_sum, energy_moments.variance);
+                if (myComm->rank() == 0)
+                  app_log() << "WFTrain persistent KFAC accepted step=" << kfac_optimizer->step()
+                            << " data_seen=" << kfac_optimizer->dataSeen()
+                            << " affine_inverse_step=" << kfac_optimizer->inverseStep()
+                            << " learning_rate=" << rate << " constraint_metric=" << kfac_optimizer->constraintMetric()
+                            << " constraint_scale=" << kfac_optimizer->constraintScale() << std::endl;
+              }
+              catch (...) { kfac_optimizer->proposalRejected(); throw; }
+              retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                  checkedMemoryAdd(statistics->retainedNumericBytes(), kfac_optimizer->retainedNumericBytes()));
+            }
+            else
+            {
             wftrain::KFACPreconditionerControl inverse_control{
                 training_input_.getDamping(), training_input_.getKFACFallbackDamping()};
             inverse_control.damping_policy =
@@ -3606,6 +3677,7 @@ void WFTrainBatched::run()
               app_log() << "WFTrain KFAC constraint metric=" << update_rule.constraintMetric()
                         << " applied_scale=" << update_rule.constraintScale()
                         << " euclidean_cap=" << training_input_.getMaximumUpdateNorm() << std::endl;
+            }
           }
           else if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
           {

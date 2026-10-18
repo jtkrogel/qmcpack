@@ -28,12 +28,14 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 79> allowed_controls{
+constexpr std::array<std::string_view, 87> allowed_controls{
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "kfac_objective", "kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width",
     "kfac_curvature", "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint",
+    "kfac_persist_state", "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay",
+    "kfac_schedule_precision", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
     "line_search_minimum_ess_fraction", "line_search_maximum_weight", "line_search_confidence",
     "line_search_warmup_steps", "line_search_sampling_steps",
@@ -270,6 +272,11 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   kfac_clip_quantile_ = 0.95;
   kfac_exclude_width_ = std::numeric_limits<double>::infinity();
   kfac_norm_constraint_ = 0.0;
+  kfac_persist_state_ = false;
+  kfac_ema_decay_ = 0.0;
+  kfac_inverse_period_ = 1;
+  kfac_learning_rate_decay_ = 0.0;
+  kfac_schedule_float32_ = false;
   line_search_ = LineSearch::OFF;
   update_scale_ = 1.0;
   weight_decay_ = 0.0;
@@ -795,7 +802,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (optimizer_ != Optimizer::KFAC)
     rejectControls(seen_controls, {"kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
         "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width", "kfac_curvature",
-        "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint"}, "selected optimizer");
+        "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_persist_state",
+        "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay", "kfac_schedule_precision",
+        "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"}, "selected optimizer");
   else
   {
     if (seen_controls.count("kfac_objective"))
@@ -857,6 +866,41 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     }
     else
       rejectControls(seen_controls, {"kfac_norm_constraint"}, "unconstrained KFAC");
+    if (seen_controls.count("kfac_persist_state"))
+    {
+      const auto& value = readControl("kfac_persist_state");
+      if (value != "yes" && value != "no")
+        throw UniformCommunicateError("WFTrainDriverInput: kfac_persist_state must be yes or no");
+      kfac_persist_state_ = value == "yes";
+    }
+    if (!kfac_persist_state_)
+      rejectControls(seen_controls, {"kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay",
+          "kfac_schedule_precision", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"},
+          "stateless KFAC; set kfac_persist_state=yes to carry recurrence state");
+    if (seen_controls.count("kfac_ema_decay"))
+      kfac_ema_decay_ = parseNonnegativeReal(readControl("kfac_ema_decay"), "kfac_ema_decay");
+    if (kfac_ema_decay_ >= 1.0)
+      throw UniformCommunicateError("WFTrainDriverInput: kfac_ema_decay must be below one");
+    if (seen_controls.count("kfac_inverse_period"))
+      kfac_inverse_period_ = parsePositiveSize(readControl("kfac_inverse_period"), "kfac_inverse_period");
+    if (seen_controls.count("kfac_learning_rate_decay"))
+      kfac_learning_rate_decay_ = parseNonnegativeReal(readControl("kfac_learning_rate_decay"), "kfac_learning_rate_decay");
+    if (seen_controls.count("kfac_schedule_precision"))
+    {
+      const auto& value = readControl("kfac_schedule_precision");
+      if (value != "float32" && value != "float64")
+        throw UniformCommunicateError("WFTrainDriverInput: kfac_schedule_precision must be float32 or float64");
+      kfac_schedule_float32_ = value == "float32";
+    }
+    if (seen_controls.count("kfac_momentum") &&
+        parseNonnegativeReal(readControl("kfac_momentum"), "kfac_momentum") != 0.0)
+      throw UniformCommunicateError("WFTrainDriverInput: persistent KFAC currently supports kfac_momentum=0 only");
+    if (seen_controls.count("kfac_burn_in") &&
+        parseNonnegativeSize(readControl("kfac_burn_in"), "kfac_burn_in") != 0)
+      throw UniformCommunicateError("WFTrainDriverInput: persistent KFAC currently supports kfac_burn_in=0 only");
+    if (seen_controls.count("kfac_curvature_period") &&
+        parsePositiveSize(readControl("kfac_curvature_period"), "kfac_curvature_period") != 1)
+      throw UniformCommunicateError("WFTrainDriverInput: persistent KFAC requires kfac_curvature_period=1");
   }
 }
 

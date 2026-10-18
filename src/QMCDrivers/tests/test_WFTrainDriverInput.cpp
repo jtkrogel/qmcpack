@@ -71,6 +71,32 @@ TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers]
       "<parameter name='kfac_curvature'>registered_gaussian</parameter></training></qmc>"));
 }
 
+TEST_CASE("Persistent KFAC inputs require explicit state ownership", "[drivers][wf_train][kfac]")
+{
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  CHECK_FALSE(parse("").getKFACPersistState());
+  CHECK_THROWS(parse("<parameter name='kfac_ema_decay'>0.95</parameter>"));
+  const auto input = parse("<parameter name='kfac_persist_state'>yes</parameter>"
+      "<parameter name='kfac_ema_decay'>0.95</parameter>"
+      "<parameter name='kfac_inverse_period'>3</parameter>"
+      "<parameter name='kfac_learning_rate_decay'>10000</parameter>"
+      "<parameter name='kfac_schedule_precision'>float32</parameter>"
+      "<parameter name='kfac_momentum'>0</parameter><parameter name='kfac_burn_in'>0</parameter>"
+      "<parameter name='kfac_curvature_period'>1</parameter>");
+  CHECK(input.getKFACPersistState());
+  CHECK(input.getKFACEMADecay() == Catch::Approx(0.95));
+  CHECK(input.getKFACInversePeriod() == 3);
+  CHECK(input.getKFACScheduleFloat32());
+  for (const auto& invalid : {"<parameter name='kfac_ema_decay'>1</parameter>",
+         "<parameter name='kfac_inverse_period'>0</parameter>",
+         "<parameter name='kfac_momentum'>0.1</parameter>",
+         "<parameter name='kfac_burn_in'>1</parameter>",
+         "<parameter name='kfac_curvature_period'>2</parameter>"})
+    CHECK_THROWS(parse("<parameter name='kfac_persist_state'>yes</parameter>" + std::string(invalid)));
+}
+
 TEST_CASE("First-order input admits the shared Euclidean update bound only",
           "[drivers][wf_train][host_controls]")
 {

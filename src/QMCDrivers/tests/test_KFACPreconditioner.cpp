@@ -562,6 +562,124 @@ TEST_CASE("Trace-balanced KFAC handles scalar and zero factors as damped represe
     }
 }
 
+TEST_CASE("KFAC factor EMA normalizes each batch and retains its running weight",
+          "[drivers][wftrain][kfac][kfac_state]")
+{
+  const StructuredParameterSchema schema{"ema/generic",
+      {{"envelope", {1}, 0, 1, ParameterScalarDomain::REAL64, true, "network"},
+       {"generic", {1}, 1, 1, ParameterScalarDomain::REAL64, true, "network"}}};
+  const KFACBlockRegistry registry(schema, {}, {0, 1}, {1});
+  const auto batch = [&](const std::vector<std::array<DerivativeReal, 2>>& scores) {
+    KFACFactorAccumulator statistics(registry, 0, KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+    for (const auto& score : scores)
+    {
+      statistics.beginSample(17);
+      statistics.addFallbackScores({score.data(), score.size()});
+      statistics.endSample();
+    }
+    reduceKFACFactorStatistics(statistics);
+    return statistics;
+  };
+  const auto first_batch = batch({{3, 1}, {4, 2}});
+  const auto first = updateKFACFactorState(nullptr, first_batch, 0.5);
+  CHECK(first.normalizer == 1);
+  CHECK(first.update_count == 1);
+  CHECK(first.values[0] == Catch::Approx(25));
+  CHECK(first.values[1] == Catch::Approx(9));
+  // A larger batch has the same unit estimator weight. Generic curvature is
+  // averaged AFTER each batch's signed-score square, not squared across updates.
+  const auto second_batch = batch({{1, 1}, {1, -1}, {1, 1}, {1, -1}});
+  const auto second = updateKFACFactorState(&first, second_batch, 0.5);
+  CHECK(second.normalizer == Catch::Approx(1.5));
+  CHECK(second.update_count == 2);
+  CHECK(second.values[0] == Catch::Approx((0.5 * 25 + 2) / 1.5));
+  CHECK(second.values[1] == Catch::Approx(3));
+  CHECK(first.values[0] == 25);
+  CHECK(first.values[1] == 9);
+  const auto third_batch = batch({{2, 2}});
+  const auto third = updateKFACFactorState(&second, third_batch, 0.5);
+  CHECK(third.normalizer == Catch::Approx(1.75));
+  CHECK(third.values[0] == Catch::Approx((0.25 * 25 + 0.5 * 2 + 8) / 1.75));
+  CHECK(third.values[1] == Catch::Approx((0.25 * 9 + 8) / 1.75));
+  // A copied serialized payload resumes exactly, including the EMA normalizer.
+  const KFACFactorState serialized = second;
+  const auto resumed = updateKFACFactorState(&serialized, third_batch, 0.5);
+  CHECK(resumed.normalizer == third.normalizer);
+  CHECK(resumed.values == third.values);
+  CHECK(updateKFACFactorState(&second, third_batch, 0).values ==
+        updateKFACFactorState(nullptr, third_batch, 0).values);
+  auto invalid = second;
+  invalid.normalizer = 0;
+  CHECK_THROWS(validateKFACFactorState(registry, invalid));
+  invalid = second;
+  invalid.values.pop_back();
+  CHECK_THROWS(updateKFACFactorState(&invalid, third_batch, 0.5));
+  invalid = second;
+  invalid.values[0] = std::numeric_limits<DerivativeReal>::infinity();
+  CHECK_THROWS(validateKFACFactorState(registry, invalid));
+  CHECK_THROWS(updateKFACFactorState(&second, third_batch, -0.1));
+  KFACFactorAccumulator incomplete(registry, 0, KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  CHECK_THROWS(updateKFACFactorState(nullptr, incomplete, 0.5));
+}
+
+TEST_CASE("KFAC inverse snapshots rebind exactly and refresh only current diagonal blocks",
+          "[drivers][wftrain][kfac][kfac_state]")
+{
+  const auto registry = makeRegistry();
+  const std::array<DerivativeReal, 4> x{1, 0, 0, 2}, dy{2, 0, 0, 1};
+  const std::array<DerivativeReal, 9> first_score{0, 0, 0, 0, 0, 0, 3, 4, 0};
+  KFACFactorAccumulator first_batch(registry, 0, KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  addSample(first_batch, 1, x, dy, first_score);
+  reduceKFACFactorStatistics(first_batch);
+  const auto factors = updateKFACFactorState(nullptr, first_batch, 0.95);
+  const KFACPreconditionerControl control{0.1, 0.2, KFACDampingPolicy::TRACE_BALANCED};
+  const KFACPreconditioner direct(first_batch, control);
+  const KFACPreconditioner from_factors(registry, 4, factors, control);
+  const auto cache = from_factors.exportInverseState();
+  const KFACPreconditioner rebound(registry, 7, cache);
+  const std::array<DerivativeValue, 9> gradient{{1., 2., 3., 4., 5., 6., 7., 8., 9.}};
+  const auto apply = [&](const KFACPreconditioner& inverse, std::size_t version) {
+    std::vector<DerivativeValue> result(gradient.size());
+    inverse.apply({registry.parameterSchema(), version, {gradient.data(), gradient.size()}},
+                   {result.data(), result.size()});
+    return result;
+  };
+  CHECK(apply(direct, 0) == apply(from_factors, 4));
+  CHECK(apply(from_factors, 4) == apply(rebound, 7));
+  CHECK(rebound.exportInverseState().values == cache.values);
+  CHECK_THROWS(apply(rebound, 4));
+  KFACFactorAccumulator second_batch(registry, 1, KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  const std::array<DerivativeReal, 9> second_score{0, 0, 0, 0, 0, 0, 1, 2, 0};
+  const std::array<DerivativeReal, 4> changed_x{2, 0, 0, 3};
+  addSample(second_batch, 1, changed_x, dy, second_score);
+  reduceKFACFactorStatistics(second_batch);
+  const auto next = updateKFACFactorState(&factors, second_batch, 0.95);
+  KFACPreconditioner stale(registry, 8, cache);
+  stale.refreshFallbackDiagonal(next, 0.7);
+  const auto actual = apply(stale, 8), prior = apply(rebound, 7);
+  for (std::size_t i = 0; i < 6; ++i)
+    CHECK(actual[i] == prior[i]);
+  CHECK(actual[6].real() == Catch::Approx(7 / ((0.95 * 18 + 2) / 1.95 + 0.7)));
+  CHECK(actual[7].real() == Catch::Approx(8 / ((0.95 * 32 + 8) / 1.95 + 0.7)));
+  CHECK(actual[8] == DerivativeValue{});
+  const auto updated_cache = stale.exportInverseState();
+  CHECK(updated_cache.fallback_damping == 0.7);
+  const KFACPreconditioner resumed(registry, 8, updated_cache);
+  CHECK(apply(resumed, 8) == actual);
+  auto invalid = cache;
+  invalid.values[0] = 0;
+  CHECK_THROWS(KFACPreconditioner(registry, 0, invalid));
+  invalid = cache;
+  invalid.values[1] = 1; // Upper-triangle contamination cannot be a valid cache.
+  CHECK_THROWS(KFACPreconditioner(registry, 0, invalid));
+  invalid = cache;
+  invalid.registry_fingerprint = "foreign";
+  CHECK_THROWS(KFACPreconditioner(registry, 0, invalid));
+  const auto unchanged = stale.exportInverseState().values;
+  CHECK_THROWS(stale.refreshFallbackDiagonal(next, -1));
+  CHECK(stale.exportInverseState().values == unchanged);
+}
+
 #ifdef HAVE_MPI
 TEST_CASE("Distributed registered generic curvature squares the global signed sum",
           "[drivers][wftrain][kfac][mpi]")

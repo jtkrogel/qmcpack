@@ -106,6 +106,18 @@ struct KFACFactorStatistics
   std::vector<DerivativeReal> sensitivity_outer_sum;
 };
 
+/** Normalized EMA state; each affine packs A, G, mean repeats, then fallback diagonals.
+ * The accumulator weight normalizes updates, independently of sample counts.
+ */
+struct KFACFactorState
+{
+  std::string registry_fingerprint;
+  KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE;
+  DerivativeReal normalizer = 0.0;
+  std::size_t update_count = 0;
+  std::vector<DerivativeReal> values;
+};
+
 /** Stream complete samples into layer-sized Kronecker factors.
  *
  * A sample transaction must observe every affine block exactly once.  Failed or
@@ -160,11 +172,13 @@ public:
   bool sampleActive() const noexcept { return sample_active_; }
 
   KFACCurvatureConvention curvatureConvention() const noexcept { return convention_; }
+  bool globallyReduced() const noexcept { return globally_reduced_; }
 
   /// Return exact retained numeric bytes, including transactional scratch.
   std::size_t retainedNumericBytes() const noexcept;
 
 private:
+  friend class KFACPreconditioner;
   friend void reduceKFACFactorStatistics(KFACFactorAccumulator&,
                                          Communicate*,
                                          std::size_t);
@@ -199,12 +213,33 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
                                 Communicate* communicator = nullptr,
                                 std::size_t maximum_chunk_size = 65536);
 
+/// Return a new normalized EMA state without mutating either input.
+KFACFactorState updateKFACFactorState(const KFACFactorState* previous,
+                                     const KFACFactorAccumulator& batch,
+                                     DerivativeReal decay);
+
+/// Check checkpoint identity, packing, numeric values and normalized EMA metadata.
+void validateKFACFactorState(const KFACBlockRegistry& registry, const KFACFactorState& state);
+
 /// Configure split damping and explicit behavior for unfactored tensors.
 struct KFACPreconditionerControl
 {
   DerivativeReal damping = 1.0e-3;
   DerivativeReal fallback_damping = 1.0e-3;
   KFACDampingPolicy damping_policy = KFACDampingPolicy::EQUAL_SPLIT;
+};
+
+/** Exact cached solve state, packed A/G Cholesky factors, repeat scales, fallback inverse.
+ * Cache binding to the current parameter version is supplied explicitly on restore.
+ */
+struct KFACInverseState
+{
+  std::string registry_fingerprint;
+  KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE;
+  KFACDampingPolicy damping_policy = KFACDampingPolicy::EQUAL_SPLIT;
+  DerivativeReal damping = 1.0e-3;
+  DerivativeReal fallback_damping = 1.0e-3;
+  std::vector<DerivativeReal> values;
 };
 
 /// Exact retained state for a prepared KFAC inverse.
@@ -223,6 +258,10 @@ class KFACPreconditioner final : public MatrixFreePreconditioner
 public:
   KFACPreconditioner(const KFACFactorAccumulator& statistics,
                      KFACPreconditionerControl control = {});
+  KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+                     const KFACFactorState& state, KFACPreconditionerControl control = {});
+  KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+                     const KFACInverseState& state);
   ~KFACPreconditioner() override;
 
   /// Return retained layer-factor and solve-work storage.
@@ -231,15 +270,24 @@ public:
   /// Return the immutable registry copied into this prepared inverse.
   const KFACBlockRegistry& registry() const noexcept { return registry_; }
 
+  KFACInverseState exportInverseState() const;
+
+  /// Diagonal blocks use current curvature/damping even when affine caches are stale.
+  void refreshFallbackDiagonal(const KFACFactorState& state, DerivativeReal damping);
+
 protected:
   void evaluate(const StructuredParameterVectorConstView& residual,
                 DerivativeArrayView<DerivativeValue> result) const override;
 
 private:
   struct PreparedBlock;
+  static KFACFactorAccumulator statisticsFromState(KFACBlockRegistry registry,
+      std::size_t parameter_version, const KFACFactorState& state);
+  void prepareScratch();
 
   KFACBlockRegistry registry_;
   KFACPreconditionerControl control_;
+  KFACCurvatureConvention convention_ = KFACCurvatureConvention::NATIVE_SCORE;
   std::vector<PreparedBlock> blocks_;
   /// Packed in the same fallback-block/canonical-entry order as the registry.
   std::vector<DerivativeReal> fallback_inverse_diagonal_;

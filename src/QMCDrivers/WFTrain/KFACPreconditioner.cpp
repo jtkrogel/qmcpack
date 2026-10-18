@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace qmcplusplus::wftrain
 {
@@ -587,6 +588,118 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
   accumulator.globally_reduced_ = true;
 }
 
+namespace
+{
+std::size_t packedStateSize(const KFACBlockRegistry& registry)
+{
+  std::size_t size = 0;
+  const auto add = [&](std::size_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() - size)
+      throw std::overflow_error("KFAC state packing overflow");
+    size += count;
+  };
+  for (const auto& block : registry.affineBlocks())
+  {
+    const auto input = block.input_width + (block.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
+    add(checkedProduct(input, input, "KFAC state activation"));
+    add(checkedProduct(block.output_width, block.output_width, "KFAC state sensitivity"));
+    add(1);
+  }
+  for (auto block : registry.fallbackBlocks())
+    add(registry.parameterSchema().blocks()[block].count);
+  return size;
+}
+
+bool validConvention(KFACCurvatureConvention convention)
+{
+  return convention == KFACCurvatureConvention::NATIVE_SCORE ||
+      convention == KFACCurvatureConvention::REGISTERED_GAUSSIAN;
+}
+} // namespace
+
+void validateKFACFactorState(const KFACBlockRegistry& registry, const KFACFactorState& state)
+{
+  if (state.registry_fingerprint != registry.fingerprint() || !validConvention(state.convention) ||
+      state.update_count == 0 || !finite(state.normalizer) || state.normalizer < 1.0 ||
+      state.normalizer > static_cast<DerivativeReal>(state.update_count) ||
+      state.values.size() != packedStateSize(registry) ||
+      !std::all_of(state.values.begin(), state.values.end(), finite))
+    throw std::invalid_argument("KFAC factor state has incompatible identity, metadata or values");
+  std::size_t offset = 0;
+  for (const auto& block : registry.affineBlocks())
+  {
+    for (auto dimension : {block.input_width + (block.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1),
+                           block.output_width})
+    {
+      for (std::size_t row = 0; row < dimension; ++row)
+      {
+        if (state.values[offset + row * dimension + row] < 0.0)
+          throw std::invalid_argument("KFAC factor state has a negative diagonal");
+        for (std::size_t column = 0; column < row; ++column)
+          if (std::abs(state.values[offset + row * dimension + column] -
+                       state.values[offset + column * dimension + row]) >
+              64 * std::numeric_limits<DerivativeReal>::epsilon() *
+                  std::max({DerivativeReal{1}, std::abs(state.values[offset + row * dimension + column]),
+                             std::abs(state.values[offset + column * dimension + row])}))
+            throw std::invalid_argument("KFAC factor state is not symmetric");
+      }
+      offset += dimension * dimension;
+    }
+    if (state.values[offset++] <= 0.0)
+      throw std::invalid_argument("KFAC factor state has invalid repeat normalization");
+  }
+  for (; offset < state.values.size(); ++offset)
+    if (state.values[offset] < 0.0)
+      throw std::invalid_argument("KFAC factor state has a negative fallback diagonal");
+}
+
+KFACFactorState updateKFACFactorState(const KFACFactorState* previous,
+                                     const KFACFactorAccumulator& batch, DerivativeReal decay)
+{
+  if (!finite(decay) || decay < 0.0 || decay > 1.0 || batch.sampleActive() ||
+      batch.sampleCount() == 0 || !batch.globallyReduced())
+    throw std::invalid_argument("KFAC EMA requires a valid decay and globally reduced complete batch");
+  KFACFactorState next;
+  next.registry_fingerprint = batch.registry().fingerprint();
+  next.convention = batch.curvatureConvention();
+  next.normalizer = 1.0;
+  next.update_count = 1;
+  next.values.reserve(packedStateSize(batch.registry()));
+  for (const auto& factor : batch.factors())
+  {
+    if (!finite(factor.sample_weight_sum) || factor.sample_weight_sum <= 0.0)
+      throw std::invalid_argument("KFAC EMA batch has invalid factor weight");
+    for (const auto& matrix : {&factor.activation_outer_sum, &factor.sensitivity_outer_sum})
+      for (auto value : *matrix)
+        next.values.push_back(value / factor.sample_weight_sum);
+    next.values.push_back(factor.row_weight_sum / factor.sample_weight_sum);
+  }
+  if (!batch.registry().fallbackBlocks().empty())
+  {
+    if (!finite(batch.fallbackWeightSum()) || batch.fallbackWeightSum() <= 0.0)
+      throw std::invalid_argument("KFAC EMA batch has invalid fallback weight");
+    for (auto value : batch.fallbackDiagonalSum())
+      next.values.push_back(value / batch.fallbackWeightSum());
+  }
+  validateKFACFactorState(batch.registry(), next);
+  if (previous)
+  {
+    validateKFACFactorState(batch.registry(), *previous);
+    if (previous->convention != next.convention ||
+        previous->update_count == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("KFAC EMA previous state convention or update counter is incompatible");
+    next.normalizer = decay * previous->normalizer + 1.0;
+    next.update_count = previous->update_count + 1;
+    if (!finite(next.normalizer))
+      throw std::overflow_error("KFAC EMA normalizer overflowed");
+    const DerivativeReal eta = 1.0 / next.normalizer;
+    for (std::size_t i = 0; i < next.values.size(); ++i)
+      next.values[i] = (1.0 - eta) * previous->values[i] + eta * next.values[i];
+    validateKFACFactorState(batch.registry(), next);
+  }
+  return next;
+}
+
 struct KFACPreconditioner::PreparedBlock
 {
   KFACAffineBlockDescriptor descriptor;
@@ -603,7 +716,8 @@ KFACPreconditioner::KFACPreconditioner(
     : MatrixFreePreconditioner(statistics.registry().parameterSchema(),
                                statistics.parameterVersion()),
       registry_(statistics.registry()),
-      control_(control)
+      control_(control),
+      convention_(statistics.curvatureConvention())
 {
   if (statistics.sampleActive() || statistics.sampleCount() == 0)
     throw std::invalid_argument("KFAC preconditioner requires complete nonempty statistics");
@@ -714,6 +828,125 @@ KFACPreconditioner::KFACPreconditioner(
       }
     }
   }
+}
+
+KFACFactorAccumulator KFACPreconditioner::statisticsFromState(
+    KFACBlockRegistry registry, std::size_t parameter_version, const KFACFactorState& state)
+{
+  validateKFACFactorState(registry, state);
+  KFACFactorAccumulator statistics(std::move(registry), parameter_version, state.convention);
+  std::size_t offset = 0;
+  for (auto& factor : statistics.factors_)
+  {
+    for (auto* matrix : {&factor.activation_outer_sum, &factor.sensitivity_outer_sum})
+      for (auto& value : *matrix)
+        value = state.values[offset++];
+    factor.sample_weight_sum = 1.0;
+    factor.row_weight_sum = state.values[offset++];
+    factor.row_count = 1; // Virtual normalized batch, not a physical sample receipt.
+  }
+  for (auto& value : statistics.fallback_diagonal_sum_)
+    value = state.values[offset++];
+  statistics.fallback_weight_sum_ = 1.0;
+  statistics.sample_count_ = 1;
+  statistics.globally_reduced_ = true;
+  return statistics;
+}
+
+KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+    const KFACFactorState& state, KFACPreconditionerControl control)
+    : KFACPreconditioner(statisticsFromState(std::move(registry), parameter_version, state), control)
+{}
+
+KFACInverseState KFACPreconditioner::exportInverseState() const
+{
+  KFACInverseState state{registry_.fingerprint(), convention_, control_.damping_policy,
+                         control_.damping, control_.fallback_damping, {}};
+  state.values.reserve(packedStateSize(registry_));
+  for (const auto& block : blocks_)
+  {
+    state.values.insert(state.values.end(), block.activation_cholesky.begin(), block.activation_cholesky.end());
+    state.values.insert(state.values.end(), block.sensitivity_cholesky.begin(), block.sensitivity_cholesky.end());
+    state.values.push_back(block.curvature_inverse_scale);
+  }
+  state.values.insert(state.values.end(), fallback_inverse_diagonal_.begin(), fallback_inverse_diagonal_.end());
+  return state;
+}
+
+void KFACPreconditioner::prepareScratch()
+{
+  std::size_t maximum_matrix = 0, maximum_dimension = 0;
+  for (const auto& descriptor : registry_.affineBlocks())
+  {
+    const auto input = descriptor.input_width + (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
+    maximum_matrix = std::max(maximum_matrix, input * descriptor.output_width);
+    maximum_dimension = std::max({maximum_dimension, input, descriptor.output_width});
+  }
+  matrix_scratch_.resize(maximum_matrix);
+  solve_scratch_.resize(2 * maximum_dimension);
+}
+
+KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+    const KFACInverseState& state)
+    : MatrixFreePreconditioner(registry.parameterSchema(), parameter_version), registry_(std::move(registry)),
+      control_{state.damping, state.fallback_damping, state.damping_policy}, convention_(state.convention)
+{
+  if (state.registry_fingerprint != registry_.fingerprint() || !validConvention(state.convention) ||
+      !finite(state.damping) || state.damping <= 0.0 ||
+      !finite(state.fallback_damping) || state.fallback_damping <= 0.0 ||
+      (state.damping_policy != KFACDampingPolicy::EQUAL_SPLIT &&
+       state.damping_policy != KFACDampingPolicy::TRACE_BALANCED) ||
+      state.values.size() != packedStateSize(registry_) ||
+      !std::all_of(state.values.begin(), state.values.end(), finite))
+    throw std::invalid_argument("KFAC inverse state identity, controls or packing are invalid");
+  std::size_t offset = 0;
+  for (const auto& descriptor : registry_.affineBlocks())
+  {
+    PreparedBlock block;
+    block.descriptor = descriptor;
+    const auto input = descriptor.input_width + (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
+    for (auto pair : {std::make_pair(&block.activation_cholesky, input),
+                      std::make_pair(&block.sensitivity_cholesky, descriptor.output_width)})
+    {
+      pair.first->assign(state.values.begin() + offset, state.values.begin() + offset + pair.second * pair.second);
+      offset += pair.second * pair.second;
+      for (std::size_t row = 0; row < pair.second; ++row)
+      {
+        if ((*pair.first)[row * pair.second + row] <= 0.0)
+          throw std::invalid_argument("KFAC inverse state has invalid Cholesky diagonal");
+        for (std::size_t column = row + 1; column < pair.second; ++column)
+          if ((*pair.first)[row * pair.second + column] != 0.0)
+            throw std::invalid_argument("KFAC inverse state Cholesky storage is not lower triangular");
+      }
+    }
+    block.curvature_inverse_scale = state.values[offset++];
+    if (block.curvature_inverse_scale <= 0.0)
+      throw std::invalid_argument("KFAC inverse state has invalid repeat scale");
+    blocks_.push_back(std::move(block));
+  }
+  fallback_inverse_diagonal_.assign(state.values.begin() + offset, state.values.end());
+  if (!std::all_of(fallback_inverse_diagonal_.begin(), fallback_inverse_diagonal_.end(),
+                   [](auto value) { return value > 0.0; }))
+    throw std::invalid_argument("KFAC inverse state has invalid fallback inverse");
+  prepareScratch();
+}
+
+void KFACPreconditioner::refreshFallbackDiagonal(const KFACFactorState& state, DerivativeReal damping)
+{
+  validateKFACFactorState(registry_, state);
+  if (state.convention != convention_ || !finite(damping) || damping <= 0.0)
+    throw std::invalid_argument("KFAC fallback refresh has incompatible convention or damping");
+  std::vector<DerivativeReal> inverse(fallback_inverse_diagonal_.size());
+  const auto offset = state.values.size() - inverse.size();
+  for (std::size_t i = 0; i < inverse.size(); ++i)
+  {
+    const auto denominator = state.values[offset + i] + damping;
+    inverse[i] = 1.0 / denominator;
+    if (!finite(denominator) || !finite(inverse[i]) || inverse[i] <= 0.0)
+      throw MatrixFreeNumericalError("KFAC refreshed fallback inverse is invalid");
+  }
+  fallback_inverse_diagonal_.swap(inverse);
+  control_.fallback_damping = damping;
 }
 
 KFACStorageDiagnostics KFACPreconditioner::storageDiagnostics() const noexcept
