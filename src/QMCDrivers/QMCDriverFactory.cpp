@@ -454,14 +454,15 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       }
 
       const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
+      // Keep immutable targets separate from the selected Markov-chain wavefunction.
+      const TrialWaveFunction* frozen_teacher = training_input.getObjective() != WFTrainDriverInput::Objective::ENERGY
+          ? &getPsi(training_input.getTeacherWaveFunction()) : nullptr;
+      if (frozen_teacher == &primaryPsi)
+        throw UniformCommunicateError("WFTrain teacher objectives require a wavefunction distinct from the student");
       TrialWaveFunction& sampling_wavefunction =
-          training_input.getObjective() != WFTrainDriverInput::Objective::ENERGY
+          frozen_teacher && !training_input.samplesOrbitalStudent()
           ? getPsi(training_input.getTeacherWaveFunction())
           : primaryPsi;
-      if (training_input.getObjective() != WFTrainDriverInput::Objective::ENERGY &&
-          &sampling_wavefunction == &primaryPsi)
-        throw UniformCommunicateError(
-            "WFTrain teacher objectives require a wavefunction distinct from the student");
       // Training owns scalar energy/variance diagnostics. Ignore supplemental
       // requests before constructing estimator resources, including teacher runs.
       if ((emi || qmcdriver_input.get_estimator_manager_input()) && comm->rank() == 0)
@@ -473,7 +474,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
           project_data_, std::move(qmcdriver_input), std::move(estimator_manager), std::move(vmcdriver_input),
           std::move(training_input), qmc_system, primaryPsi,
           MCPopulation(comm->size(), comm->rank(), qmc_system, sampling_wavefunction, primaryH),
-          RandomNumberControl::getChildrenRefs(), comm);
+          RandomNumberControl::getChildrenRefs(), comm, frozen_teacher);
       new_driver->setUpdateMode(is_pbyp_move);
     }
     else if (das.new_run_type == QMCRunType::DMC)

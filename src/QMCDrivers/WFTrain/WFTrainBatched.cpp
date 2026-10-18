@@ -1534,6 +1534,8 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   const auto optimizer = static_cast<std::underlying_type_t<WFTrainDriverInput::Optimizer>>(
       training.getOptimizer());
   extendStageFingerprint(hash, objective);
+  if (training.samplesOrbitalStudent())
+    extendStageFingerprint(hash, std::string("orbital-student-measure-energy-off-v1"));
   extendStageFingerprint(hash, optimizer);
   extendStageFingerprint(hash, training.getParameterChunkSize());
   extendStageFingerprint(hash, training.getLearningRate());
@@ -1661,7 +1663,8 @@ WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                                TrialWaveFunction& student_prototype,
                                MCPopulation&& population,
                                const RefVector<RandomBase<FullPrecRealType>>& random_generators,
-                               Communicate* communicator)
+                               Communicate* communicator,
+                               const TrialWaveFunction* frozen_teacher)
     : QMCDriverNew(project_data,
                    std::move(qmcdriver_input),
                    std::move(estimator_manager),
@@ -1673,7 +1676,8 @@ WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                    "WFTrainBatched"),
       vmcdriver_input_(std::move(vmc_input)),
       training_input_(std::move(training_input)),
-      student_prototype_(student_prototype)
+      student_prototype_(student_prototype),
+      frozen_teacher_(frozen_teacher)
 {}
 
 WFTrainBatched::~WFTrainBatched() = default;
@@ -2269,6 +2273,7 @@ void WFTrainBatched::run()
 
   VMCBatchedSampling::State sampling_state(qmcdriver_input_, vmcdriver_input_, *drift_modifier_, population_,
                                             steps_per_block_, serializing_crowd_walkers_);
+  sampling_state.evaluate_energy = !training_input_.samplesOrbitalStudent();
   std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> resident_observations;
   bool resident_host_dirty = false;
   if (resident_open_observation_)
@@ -2540,7 +2545,8 @@ void WFTrainBatched::run()
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);
     auto step_context_refs = getContextForStepsRefs();
-    const auto initialize = resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
+    const auto initialize = training_input_.samplesOrbitalStudent() ? initialLogEvaluationWavefunctionOnly
+        : resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
     crowd_task(crowds_.size(), initialize, crowds_, step_context_refs,
                serializing_crowd_walkers_);
     print_mem("WFTrainBatched after initialLogEvaluation", app_summary());
@@ -2629,7 +2635,8 @@ void WFTrainBatched::run()
     std::exception_ptr output_failure;
     try
     {
-      estimator_manager_->startDriverRun({(training_directory / iteration_name.str()).string(), true});
+      if (sampling_state.evaluate_energy)
+        estimator_manager_->startDriverRun({(training_directory / iteration_name.str()).string(), true});
     }
     catch (...) { output_failure = std::current_exception(); }
     int output_failed = output_failure ? 1 : 0;
@@ -2659,9 +2666,12 @@ void WFTrainBatched::run()
           ? qmcdriver_input_.get_recalculate_properties_period() : 0;
       sampling_state.is_recomputing_block = qmcdriver_input_.get_blocks_between_recompute()
           ? (1 + statistical_block) % qmcdriver_input_.get_blocks_between_recompute() == 0 : false;
-      estimator_manager_->startBlock(steps_per_block_);
-      for (auto& crowd : crowds_)
-        crowd->startBlock(steps_per_block_);
+      if (sampling_state.evaluate_energy)
+      {
+        estimator_manager_->startBlock(steps_per_block_);
+        for (auto& crowd : crowds_)
+          crowd->startBlock(steps_per_block_);
+      }
       for (int step = 0; step < steps_per_block_; ++step, ++global_step)
       {
         ScopedTimer step_timer(timers_.run_steps_timer);
@@ -2708,13 +2718,14 @@ void WFTrainBatched::run()
         enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
       }
       // Statistical rows refer only to this iteration's fixed parameter version.
-      endBlock();
+      if (sampling_state.evaluate_energy)
+        endBlock();
       wlog_manager.writeBuffers();
       ++completed_blocks;
     }
 
     int scalar_write_failed = 0;
-    try { estimator_manager_->stopDriverRun(); }
+    try { if (sampling_state.evaluate_energy) estimator_manager_->stopDriverRun(); }
     catch (...) { scalar_write_failed = 1; }
     myComm->allreduce(scalar_write_failed);
     if (scalar_write_failed)
@@ -3851,6 +3862,16 @@ void WFTrainBatched::run()
     history_failed = false;
     if (myComm->rank() == 0)
     {
+      if (!sampling_state.evaluate_energy)
+      {
+        // The objective is evaluated once on the complete retained population.
+        std::ofstream scalar(training_directory / (iteration_name.str() + ".scalar.dat"));
+        scalar << "# index OrbitalMSE SampleCount\n" << std::setprecision(17)
+               << 0 << ' ' << orbital_diagnostics->mean_loss << ' '
+               << orbital_diagnostics->sample_count << '\n';
+        scalar.flush();
+        history_failed = !scalar;
+      }
       iteration_history << std::setprecision(17) << iteration << ','
                         << sample_version << ',' << iteration_result.parameter_version << ','
                         << (orbital_mse ? "orbital_mse" : determinant_overlap ? "determinant_overlap" : "energy") << ','
@@ -3883,7 +3904,7 @@ void WFTrainBatched::run()
         iteration_history << orbital_diagnostics->mean_loss;
       iteration_history << '\n';
       iteration_history.flush();
-      history_failed = !iteration_history;
+      history_failed = history_failed || !iteration_history;
     }
     myComm->bcast(history_failed);
     if (history_failed)
@@ -3989,7 +4010,8 @@ void WFTrainBatched::run()
               << training_state.completed_iterations << " completed iteration(s)" << std::endl;
   print_mem("WFTrainBatched ends", app_log());
   wlog_manager.stopRun();
-  estimator_manager_->stopDriverRun();
+  if (sampling_state.evaluate_energy)
+    estimator_manager_->stopDriverRun();
   finalize(completed_blocks, false, false);
 }
 
@@ -4122,7 +4144,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
 {
   if (training_input_.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE)
     return;
-  if (&student_prototype_ == &population_.get_golden_twf())
+  if (!frozen_teacher_ || frozen_teacher_ == &student_prototype_)
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a distinct frozen teacher");
   bool paired = false;
 #ifdef QMC_COMPLEX
@@ -4131,6 +4153,13 @@ void WFTrainBatched::initializeOrbitalPretraining()
 #endif
   if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_))
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+  if (training_input_.samplesOrbitalStudent())
+  {
+    const auto* real_student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+    if (!real_student || real_student->usesAcceleratorParameterProducts())
+      throw UniformCommunicateError("Student-measure orbital_mse currently requires a real CPU provider");
+    app_log() << "WFTrain orbital_mse sampling=student target=frozen energy_evaluation=off" << std::endl;
+  }
 
   // Query channel count through the existing determinant-channel seam, without
   // opening native tensor metadata or depending on an imported parameter file.
@@ -4154,7 +4183,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
   const SlaterDet* single = nullptr;
   const MultiSlaterDetTableMethod* multi = nullptr;
   std::size_t determinant_components = 0;
-  for (const auto& component : population_.get_golden_twf().getOrbitals())
+  for (const auto& component : frozen_teacher_->getOrbitals())
   {
     if (auto* determinant = dynamic_cast<const SlaterDet*>(component.get()))
     {
@@ -4263,8 +4292,10 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
   // Frozen-teacher sampling caches do not depend on student parameters.  The
   // next determinant-channel owner reads the shared student model version while
   // copying the current teacher configurations, so no ParticleSet G/L state is
-  // overwritten by evaluating a student TrialWaveFunction here.
-  if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY)
+  // overwritten by evaluating a student TrialWaveFunction here. Student-measure
+  // orbital sampling instead refreshes current wavefunction caches without energy.
+  if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY &&
+      !training_input_.samplesOrbitalStudent())
   {
     if (myComm->rank() == 0)
       app_log() << "WFTrain published frozen-target student version "
@@ -4278,7 +4309,9 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
   {
     ParallelExecutor<> refresh_task;
     auto step_context_refs = getContextForStepsRefs();
-    refresh_task(crowds_.size(), initialLogEvaluation, crowds_, step_context_refs,
+    const auto refresh = training_input_.samplesOrbitalStudent()
+        ? initialLogEvaluationWavefunctionOnly : initialLogEvaluation;
+    refresh_task(crowds_.size(), refresh, crowds_, step_context_refs,
                  serializing_crowd_walkers_);
   }
   catch (...)

@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 87> allowed_controls{
+constexpr std::array<std::string_view, 88> allowed_controls{
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -48,7 +48,7 @@ constexpr std::array<std::string_view, 87> allowed_controls{
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
     "maximum_retained_bytes", "maximum_resident_bytes", "checkpoint_path", "restart_path", "provider",
     "complex_gpu_device_bytes", "complex_gpu_host_bytes", "complex_gpu_kinetic_targets", "complex_gpu_maximum_matrix_work",
-    "teacher", "overlap_target", "overlap_weighting", "target_provenance", "orbital_target",
+    "teacher", "overlap_target", "overlap_weighting", "target_provenance", "orbital_target", "orbital_sampling",
     "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
     "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
     "gmres_restart_length", "legacy_maximum_parameters", "legacy_derivative_scratch_bytes"};
@@ -324,6 +324,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   restart_path_.clear();
   provider_id_.clear();
   teacher_wavefunction_.clear();
+  orbital_sampling_ = OrbitalSampling::TEACHER;
   overlap_target_            = OverlapTarget::GENERAL_FROZEN_TEACHER;
   overlap_weighting_         = OverlapWeighting::EQUAL;
   target_provenance_.clear();
@@ -653,8 +654,15 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError(
           "WFTrainDriverInput: orbital_target must be single_reference or top_coefficients");
   }
+  if (seen_controls.count("orbital_sampling"))
+  {
+    const auto sampling = readControl("orbital_sampling");
+    if (sampling == "teacher") orbital_sampling_ = OrbitalSampling::TEACHER;
+    else if (sampling == "student") orbital_sampling_ = OrbitalSampling::STUDENT;
+    else throw UniformCommunicateError("WFTrainDriverInput: orbital_sampling must be teacher or student");
+  }
   if (objective_ != Objective::ORBITAL_MSE)
-    rejectControls(seen_controls, {"orbital_target"}, "non-orbital objective");
+    rejectControls(seen_controls, {"orbital_target", "orbital_sampling"}, "non-orbital objective");
   if (objective_ == Objective::ENERGY)
     rejectControls(seen_controls, overlap_attributes, "energy objective");
   else if (objective_ == Objective::ORBITAL_MSE)

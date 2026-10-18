@@ -52,7 +52,8 @@ public:
                  TrialWaveFunction& student_prototype,
                  MCPopulation&& population,
                  const RefVector<RandomBase<FullPrecRealType>>& random_generators,
-                 Communicate* communicator);
+                 Communicate* communicator,
+                 const TrialWaveFunction* frozen_teacher);
 
   WFTrainBatched(const WFTrainBatched&)            = delete;
   WFTrainBatched& operator=(const WFTrainBatched&) = delete;
@@ -75,6 +76,8 @@ private:
   std::uint64_t inference_seed_ = 0;
   NewTimer* inference_timer_ = nullptr;
   TrialWaveFunction& student_prototype_;
+  /// Pool-owned immutable target, independent of the selected sampling measure.
+  const TrialWaveFunction* frozen_teacher_;
   std::string selected_provider_id_;
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
   std::unique_ptr<wftrain::TrainingWaveFunctionBinding> conventional_binding_;

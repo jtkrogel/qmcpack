@@ -48,6 +48,9 @@ public:
     TOP_COEFFICIENT_MULTIDETERMINANT
   };
 
+  /// Select the fixed teacher measure or the current student's sampling measure.
+  enum class OrbitalSampling { TEACHER, STUDENT };
+
   enum class OverlapTarget
   {
     GENERAL_FROZEN_TEACHER,
@@ -96,6 +99,12 @@ public:
   std::size_t getWarmupSteps() const noexcept { return warmup_steps_; }
 
   Objective getObjective() const noexcept { return objective_; }
+
+  OrbitalSampling getOrbitalSampling() const noexcept { return orbital_sampling_; }
+
+  /// Student-measure pretraining never evaluates Hamiltonians while drawing samples.
+  bool samplesOrbitalStudent() const noexcept
+  { return objective_ == Objective::ORBITAL_MSE && orbital_sampling_ == OrbitalSampling::STUDENT; }
   OrbitalTarget getOrbitalTarget() const noexcept { return orbital_target_; }
   LineSearch getLineSearch() const noexcept { return line_search_; }
   double getUpdateScale() const noexcept { return update_scale_; }
@@ -233,6 +242,7 @@ private:
   std::size_t line_search_warmup_steps_{10};
   std::size_t line_search_sampling_steps_{10};
   Objective objective_{Objective::ENERGY};
+  OrbitalSampling orbital_sampling_{OrbitalSampling::TEACHER};
   OrbitalTarget orbital_target_{OrbitalTarget::SINGLE_REFERENCE};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};

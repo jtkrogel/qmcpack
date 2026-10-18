@@ -175,6 +175,13 @@ TEST_CASE("WFTrainDriverInput accepts conventional orbital pretraining", "[drive
   };
   CHECK(parse("").getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE);
   CHECK(parse("").getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE);
+  CHECK(parse("").getOrbitalSampling() == WFTrainDriverInput::OrbitalSampling::TEACHER);
+  CHECK_FALSE(parse("").samplesOrbitalStudent());
+  CHECK(parse("<parameter name=\"orbital_sampling\">student</parameter>").samplesOrbitalStudent());
+  CHECK_FALSE(parse("<parameter name=\"orbital_sampling\">teacher</parameter>").samplesOrbitalStudent());
+  CHECK_THROWS(parse("<parameter name=\"orbital_sampling\">unknown</parameter>"));
+  CHECK_THROWS(parseTrainingInput(R"(<qmc><training objective="energy">
+    <parameter name="orbital_sampling">teacher</parameter></training></qmc>)"));
   CHECK(parse("<parameter name=\"orbital_target\">top_coefficients</parameter>").getOrbitalTarget() ==
         WFTrainDriverInput::OrbitalTarget::TOP_COEFFICIENT_MULTIDETERMINANT);
   for (const std::string optimizer : {"sgd", "momentum_sgd", "rmsprop", "adam", "amsgrad"})
