@@ -262,12 +262,20 @@ void QMCDriverNew::initialLogEvaluationDeterministic(int crowd_id,
   initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, true);
 }
 
-/** Initialize resident walker caches with either ordinary or fixed-grid energies. */
+/** Initialize wavefunction and walker caches while leaving energies unavailable. */
+void QMCDriverNew::initialLogEvaluationWavefunctionOnly(int crowd_id,
+    UPtrVector<Crowd>& crowds, const RefVector<ContextForSteps>& contexts, bool serializing)
+{
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false, false);
+}
+
+/** Initialize resident walker caches with optional ordinary or fixed-grid energies. */
 void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
                                         UPtrVector<Crowd>& crowds,
                                         const RefVector<ContextForSteps>& context_for_steps,
                                         const bool serializing_crowd_walkers,
-                                        const bool deterministic_hamiltonian)
+                                        const bool deterministic_hamiltonian,
+                                        const bool evaluate_energy)
 {
   Crowd& crowd = *(crowds[crowd_id]);
   if (crowd.size() == 0)
@@ -299,6 +307,19 @@ void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
   auto saveElecPosAndGLToWalkers = [](ParticleSet& pset, ParticleSet::Walker_t& walker) { pset.saveWalker(walker); };
   for (int iw = 0; iw < crowd.size(); ++iw)
     saveElecPosAndGLToWalkers(walker_elecs[iw], walkers[iw]);
+
+  if (!evaluate_energy)
+  {
+    // Mark unavailable energies explicitly; objective-only callers never accumulate them.
+    for (int iw = 0; iw < crowd.size(); ++iw)
+    {
+      walkers[iw].get().resetProperty(walker_twfs[iw].getLogPsi(), walker_twfs[iw].getPhase(),
+                               std::numeric_limits<FullPrecRealType>::quiet_NaN());
+      walkers[iw].get().Weight = 1.0;
+      walkers[iw].get().wasTouched = false;
+    }
+    return;
+  }
 
   std::vector<QMCHamiltonian::FullPrecRealType> local_energies;
   if (deterministic_hamiltonian)

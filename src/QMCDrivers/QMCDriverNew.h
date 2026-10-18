@@ -257,12 +257,19 @@ public:
                                                const RefVector<ContextForSteps>& step_context,
                                                bool serializing_crowd_walkers);
 
+  /// Initialize wavefunction/walker state without any physical or auxiliary energy evaluation.
+  static void initialLogEvaluationWavefunctionOnly(int crowd_id,
+                                                   UPtrVector<Crowd>& crowds,
+                                                   const RefVector<ContextForSteps>& step_context,
+                                                   bool serializing_crowd_walkers);
+
   /// Common initialization body; public wrappers preserve the four-argument crowd ABI.
   static void initialLogEvaluationImpl(int crowd_id,
                                        UPtrVector<Crowd>& crowds,
                                        const RefVector<ContextForSteps>& step_context,
                                        bool serializing_crowd_walkers,
-                                       bool deterministic_hamiltonian);
+                                       bool deterministic_hamiltonian,
+                                       bool evaluate_energy = true);
 
 
   /** should be set in input don't see a reason to set individually

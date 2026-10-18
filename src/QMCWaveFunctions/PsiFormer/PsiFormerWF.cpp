@@ -7532,6 +7532,45 @@ wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
           parameters.flat_values()};
 }
 
+// Copy the current CPU orbital forward through the existing bounded workspace.
+void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
+                                       std::vector<double>& orbitals,
+                                       std::size_t expected_version) const
+{
+  auto scratch = acquireDerivativeScratch(*model_state_, structured_parameter_schema_->parameterCount());
+  {
+    std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+    model_state_->orbital_pretraining_scratch = scratch;
+  }
+  PsiFormerDerivativeLease scratch_lease(*scratch);
+  PsiFormerReadTransaction state_lock(*model_state_);
+  if (model_state_->model.p.version() != expected_version)
+    throw std::runtime_error("PsiFormer orbital forward has a stale parameter version");
+#ifdef ENABLE_CUDA
+  if (scratch->device_products)
+    throw std::invalid_argument("Value-only orbital inference currently requires the CPU backend");
+#endif
+  const auto& shape = model_state_->execution_plan.modelShape();
+  const auto ne = shape.electrons();
+  if (particles.isSpinor() || particles.R.size() != ne || particles.GroupID.size() != ne)
+    throw std::invalid_argument("PsiFormer orbital forward particle extent mismatch");
+  validateRuntimeLattice(particles, model_state_->execution_plan.environment(), "PsiFormer orbital forward sample");
+  for (std::size_t electron = 0; electron < ne; ++electron)
+  {
+    if (particles.GroupID[electron] != (electron < shape.spin_up_electrons ? 0 : 1))
+      throw std::invalid_argument("PsiFormer orbital forward has noncanonical spin ordering");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double coordinate = particles.R[electron][dimension];
+      if (!psiformer::determinant::isFiniteReal(coordinate))
+        throw std::invalid_argument("PsiFormer orbital forward coordinates must be finite");
+      scratch->score->setPosition(electron, dimension, coordinate);
+    }
+  }
+  const auto result = model_state_->direct_score_executor.evaluateOrbitalValues(*scratch->score);
+  orbitals.assign(result.values, result.values + result.size);
+}
+
 // Evaluate one supplied conventional orbital target with a reusable CPU/GPU lane.
 double PsiFormerWF::evaluateOrbitalMSE(const ParticleSet& particles,
                                      const std::vector<double>& target,

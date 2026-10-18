@@ -388,6 +388,11 @@ public:
                            std::vector<double>& gradient,
                            std::size_t expected_version) const;
 
+  /// Copy bounded full-matrix CPU orbital values without a reverse or energy evaluation.
+  void evaluateOrbitalValues(const ParticleSet& particles,
+                             std::vector<double>& orbitals,
+                             std::size_t expected_version) const;
+
   /// Rebuild a private model/executor state for speculative inference clones.
   void isolateParameterState() override;
 

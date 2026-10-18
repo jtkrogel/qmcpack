@@ -264,6 +264,14 @@ struct DirectOrbitalMSEArguments
   std::size_t target_size = 0;
 };
 
+/// Borrow pre-determinant orbital values until the next workspace evaluation.
+struct DirectOrbitalValueView
+{
+  const double* values = nullptr;
+  std::size_t size = 0;
+  std::size_t parameter_version = 0;
+};
+
 /** Return one pre-determinant orbital loss and its direct reverse derivative. */
 struct DirectOrbitalMSEResult
 {
@@ -913,13 +921,25 @@ public:
     return result;
   }
 
-  /**
-   * Evaluate the DeepQMC-style pre-determinant orbital loss and its VJP.
-   *
-   * The alpha and beta electron-row sectors are normalized separately.  Each
-   * sector includes every full-determinant column, so the target's off-spin
-   * blocks contribute their required exact-zero constraints.  No determinant,
-   * cusp, or scalar wavefunction operation enters this route.
+  /// Evaluate the existing orbital forward without determinant, energy or reverse work.
+  DirectOrbitalValueView evaluateOrbitalValues(DirectScoreWorkspace& workspace) const
+  {
+    requireFullProfile();
+    validateWorkspaceAndParameters(workspace);
+    const double* parameter_values = parameters_.flat_values().data();
+    buildTrunk(parameter_values, workspace);
+    buildOrbitals(parameter_values, workspace);
+    if (!std::all_of(workspace.orbital_matrices_.begin(), workspace.orbital_matrices_.end(),
+                    [](double value) { return is_finite_parameter_value(value); }))
+      throw std::runtime_error("PsiFormer orbital forward produced a nonfinite value");
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {workspace.orbital_matrices_.data(), workspace.orbital_matrices_.size(),
+            workspace.observed_parameter_version_};
+  }
+
+  /** Evaluate the spin-normalized pre-determinant orbital loss and its VJP.
+   * Each electron-spin sector includes all full-determinant columns, retaining
+   * the exact-zero off-spin target constraints. Determinant/cusp work is absent.
    */
   DirectOrbitalMSEResult evaluateOrbitalMSE(DirectScoreWorkspace& workspace,
                                             DirectOrbitalMSEArguments arguments) const

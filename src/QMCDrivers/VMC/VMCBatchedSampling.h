@@ -48,6 +48,8 @@ public:
     IndexType step            = -1;
     IndexType global_step     = -1;
     bool is_recomputing_block = false;
+    /// Objective-only CPU observations skip physical/auxiliary H and energy estimators.
+    bool evaluate_energy = true;
     const bool serializing_crowd_walkers;
     // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
     bool resident_device_observation = false;

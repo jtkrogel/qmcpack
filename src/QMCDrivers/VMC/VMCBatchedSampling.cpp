@@ -466,6 +466,15 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     ps_dispatcher.flex_saveWalker(walker_elecs, walkers);
   }
 
+  if (!sft.evaluate_energy)
+  {
+    // Sampling still publishes current positions/logs, but no fictitious local energy.
+    for (int iw = 0; iw < crowd.size(); ++iw)
+      walkers[iw].get().resetProperty(walker_twfs[iw].getLogPsi(), walker_twfs[iw].getPhase(),
+                               std::numeric_limits<QMCTraits::FullPrecRealType>::quiet_NaN());
+    return;
+  }
+
   const RefVectorWithLeader<QMCHamiltonian> walker_hamiltonians(crowd.get_walker_hamiltonians()[0],
                                                                 crowd.get_walker_hamiltonians());
   {
@@ -528,6 +537,8 @@ void VMCBatchedSampling::runVMCStep(int crowd_id,
                                     const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                     UPtrVector<Crowd>& crowds)
 {
+  if (!state.evaluate_energy && state.resident_device_observation)
+    throw std::invalid_argument("Objective-only sampling requires the CPU observation path");
   validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
@@ -546,6 +557,8 @@ void VMCBatchedSampling::runWarmupStep(int crowd_id,
                                        const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                        UPtrVector<Crowd>& crowds)
 {
+  if (!state.evaluate_energy && state.resident_device_observation)
+    throw std::invalid_argument("Objective-only sampling requires the CPU observation path");
   validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
