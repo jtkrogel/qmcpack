@@ -15,6 +15,8 @@
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
+#include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
+#include "io/hdf/hdf_archive.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
@@ -29,6 +31,7 @@
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 
 namespace qmcplusplus
 {
@@ -324,5 +327,106 @@ TEST_CASE("Frozen Cartesian target reproduces occupied orbital values",
       CHECK(matrix[4 * d + 2] == 0);
     }
   }
+}
+
+TEST_CASE("Fixed orbital MSE VJP and published fresh Adam update match a frozen oracle",
+          "[.orbital_update_fixture]")
+{
+  using namespace psiformer;
+  using namespace wftrain;
+  const char* path = std::getenv("QMC_ORBITAL_UPDATE_ORACLE");
+  REQUIRE(path != nullptr);
+  hdf_archive oracle;
+  REQUIRE(oracle.open(path, H5F_ACC_RDONLY));
+  std::vector<double> before_values, expected_gradient, expected_delta, expected_after;
+  double expected_loss;
+  REQUIRE(oracle.readEntry(before_values, "parameters_before"));
+  REQUIRE(oracle.readEntry(expected_gradient, "gradient"));
+  REQUIRE(oracle.readEntry(expected_delta, "adam_delta"));
+  REQUIRE(oracle.readEntry(expected_after, "parameters_after"));
+  REQUIRE(oracle.readEntry(expected_loss, "loss"));
+  const SimulationCell cell;
+  ParticleSet electrons(cell), ions(cell);
+  electrons.setName("e");
+  electrons.create({1, 1});
+  auto& species = electrons.getSpeciesSet();
+  species.addSpecies("u");
+  species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, 0) = species(mass, 1) = 1.0;
+  electrons.resetGroups();
+  ions.setName("ion0");
+  ions.create({1, 1});
+  auto& nuclear_species = ions.getSpeciesSet();
+  nuclear_species.addSpecies("Li");
+  nuclear_species.addSpecies("H");
+  const int charge = nuclear_species.addAttribute("charge");
+  nuclear_species(charge, 0) = nuclear_species(charge, 1) = 1.0;
+  ions.resetGroups();
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {3.0154361724853516, 0, 0};
+  const ModelShape shape{1, 1, 2, 16, 256, 4, 4};
+  auto initialized = initializePsiFormerParameters(shape, 31);
+  REQUIRE(initialized.values.size() == before_values.size());
+  initialized.values = before_values;
+  PsiFormerWF component("orbital_update", std::move(initialized), electrons, ions);
+  const auto before = component.snapshotParameters();
+  REQUIRE(before.values == before_values);
+  const std::array<ParticleSet::PosType, 4> points{{{.2, .3, -.4}, {1, -.2, .5}, {2.8, .4, .1}, {-.7, .1, .2}}};
+  const std::array<double, 4> occupied{{.027654020378702484, .08717414156316633,
+      .2820921903779103, -.01056934773879696}};
+  std::vector<double> gradient(before.values.size(), 0.0), sample_gradient(before.values.size()), target(64, 0.0);
+  double loss = 0;
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    electrons.R[0] = points[2 * sample];
+    electrons.R[1] = points[2 * sample + 1];
+    for (std::size_t d = 0; d < 16; ++d)
+    {
+      target[4 * d] = occupied[2 * sample];
+      target[4 * d + 3] = occupied[2 * sample + 1];
+    }
+    loss += 0.5 * component.evaluateOrbitalMSE(electrons, target, sample_gradient, before.version);
+    for (std::size_t i = 0; i < gradient.size(); ++i) gradient[i] += 0.5 * sample_gradient[i];
+  }
+  REQUIRE(gradient.size() == expected_gradient.size());
+  double maximum_scaled_gradient_error = 0;
+  for (std::size_t i = 0; i < gradient.size(); ++i)
+    maximum_scaled_gradient_error = std::max(maximum_scaled_gradient_error,
+        std::abs(gradient[i] - expected_gradient[i]) / (1e-10 + 1e-8 * std::abs(expected_gradient[i])));
+  CAPTURE(loss, expected_loss, maximum_scaled_gradient_error);
+  CHECK(std::abs(loss - expected_loss) < 1e-12);
+  REQUIRE(maximum_scaled_gradient_error <= 1);
+  FirstOrderOptimizerOptions options;
+  options.method = FirstOrderMethod::ADAM;
+  options.adam_beta1 = .9;
+  options.adam_beta2 = .999;
+  options.epsilon = 1e-8;
+  std::set<std::string> groups;
+  for (const auto& block : component.parameterSchema().blocks())
+    if (block.trainable) groups.insert(block.update_group);
+  for (const auto& group : groups) options.learning_rates.push_back({group, 3e-4});
+  FirstOrderOptimizer optimizer(component.parameterSchema(), options);
+  ParameterGradientView objective{before.schema_fingerprint, before.version, ReductionDomain::GLOBAL,
+      {gradient.data(), gradient.size()}};
+  REQUIRE(optimizer.acceptedUpdateCount() == 0);
+  const auto candidate = optimizer.propose(component.parameterSchema(), before, objective);
+  REQUIRE(candidate.values.size() == expected_delta.size());
+  REQUIRE(candidate.values.size() == expected_after.size());
+  double maximum_delta_error = 0, maximum_after_error = 0;
+  for (std::size_t i = 0; i < gradient.size(); ++i)
+  {
+    maximum_delta_error = std::max(maximum_delta_error,
+        std::abs(candidate.values[i] - before.values[i] - expected_delta[i]));
+    maximum_after_error = std::max(maximum_after_error, std::abs(candidate.values[i] - expected_after[i]));
+  }
+  CAPTURE(maximum_delta_error, maximum_after_error);
+  REQUIRE(maximum_delta_error < 1e-12);
+  REQUIRE(maximum_after_error < 1e-12);
+  const auto published = component.publishParameters(candidate, before.version);
+  optimizer.proposalAccepted(component.parameterSchema(), before, objective);
+  CHECK(published == before.version + 1);
+  CHECK(component.snapshotParameters().values == candidate.values);
+  CHECK(optimizer.acceptedUpdateCount() == 1);
 }
 }
