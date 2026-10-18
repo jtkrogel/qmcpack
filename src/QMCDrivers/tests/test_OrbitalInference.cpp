@@ -438,6 +438,10 @@ TEST_CASE("Prepared native training fixture passes complete input admission",
   REQUIRE(path != nullptr);
   Libxml2Document document;
   REQUIRE(document.parse(path));
+  const char* expected_walkers = std::getenv("QMC_INPUT_EXPECTED_WALKERS");
+  const char* expected_crowds = std::getenv("QMC_INPUT_EXPECTED_CROWDS");
+  const auto walkers = expected_walkers ? std::stoul(expected_walkers) : 512;
+  const auto crowds = expected_crowds ? std::stoul(expected_crowds) : 1;
   std::size_t phases = 0;
   for (auto child = xmlFirstElementChild(document.getRoot()); child; child = xmlNextElementSibling(child))
     if (std::string(castXMLCharToChar(child->name)) == "qmc")
@@ -450,7 +454,8 @@ TEST_CASE("Prepared native training fixture passes complete input admission",
       REQUIRE_NOTHROW(vmc.readXML(child));
       REQUIRE_NOTHROW(training.readXML(child));
       REQUIRE_NOTHROW(inference.readXML(child, training.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE));
-      CHECK(sampling.get_walkers_per_rank() == 512);
+      CHECK(sampling.get_walkers_per_rank() == walkers);
+      CHECK(sampling.get_num_crowds() == crowds);
       CHECK(sampling.get_sub_steps() == 20);
       CHECK_FALSE(vmc.get_use_drift());
       ++phases;
