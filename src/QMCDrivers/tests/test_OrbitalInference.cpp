@@ -16,6 +16,7 @@
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
+#include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 #include "io/hdf/hdf_archive.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
@@ -428,5 +429,32 @@ TEST_CASE("Fixed orbital MSE VJP and published fresh Adam update match a frozen 
   CHECK(published == before.version + 1);
   CHECK(component.snapshotParameters().values == candidate.values);
   CHECK(optimizer.acceptedUpdateCount() == 1);
+}
+
+TEST_CASE("Prepared native training fixture passes complete input admission",
+          "[.wftrain_input_fixture]")
+{
+  const char* path = std::getenv("QMC_TRAINING_INPUT_FIXTURE");
+  REQUIRE(path != nullptr);
+  Libxml2Document document;
+  REQUIRE(document.parse(path));
+  std::size_t phases = 0;
+  for (auto child = xmlFirstElementChild(document.getRoot()); child; child = xmlNextElementSibling(child))
+    if (std::string(castXMLCharToChar(child->name)) == "qmc")
+    {
+      QMCDriverInput sampling;
+      VMCDriverInput vmc;
+      WFTrainDriverInput training;
+      WFTrainInferenceInput inference;
+      REQUIRE_NOTHROW(sampling.readXML(child));
+      REQUIRE_NOTHROW(vmc.readXML(child));
+      REQUIRE_NOTHROW(training.readXML(child));
+      REQUIRE_NOTHROW(inference.readXML(child, training.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE));
+      CHECK(sampling.get_walkers_per_rank() == 512);
+      CHECK(sampling.get_sub_steps() == 20);
+      CHECK_FALSE(vmc.get_use_drift());
+      ++phases;
+    }
+  REQUIRE(phases > 0);
 }
 }
