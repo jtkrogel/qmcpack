@@ -50,6 +50,8 @@ public:
     bool is_recomputing_block = false;
     /// Objective-only CPU observations skip physical/auxiliary H and energy estimators.
     bool evaluate_energy = true;
+    /// A dedicated scalar observer may consume physical energies without scalar estimators.
+    bool accumulate_estimators = true;
     const bool serializing_crowd_walkers;
     // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
     bool resident_device_observation = false;

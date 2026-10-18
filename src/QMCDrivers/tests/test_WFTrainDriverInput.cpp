@@ -151,6 +151,10 @@ TEST_CASE("WFTrain inference uses native VMC inputs and completed-attempt cadenc
   CHECK(sampling.sampling.get_sub_steps() == 7);
   CHECK(sampling.sampling.get_tau() == 0.125);
   CHECK(sampling.vmc.get_use_drift());
+  CHECK(parse("<inference/>").evaluate_energy);
+  CHECK_FALSE(parse("<inference evaluate_energy=\"no\"/>").evaluate_energy);
+  CHECK(parse("<inference evaluate_energy=\"yes\"/>").evaluate_energy);
+  CHECK_THROWS(parse("<inference evaluate_energy=\"maybe\"/>"));
   for (const std::string invalid : {
       "<inference/><inference/>", "<inference interval=\"0\"/>", "<inference interval=\"-1\"/>",
       "<inference interval=\"184467440737095516160\"/>", "<inference last=\"true\"/>",

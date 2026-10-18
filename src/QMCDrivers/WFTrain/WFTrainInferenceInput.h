@@ -25,6 +25,7 @@ struct WFTrainInferenceInput
 {
   bool enabled = false;
   bool last = false;
+  bool evaluate_energy = true;
   std::size_t interval = 1000;
   QMCDriverInput sampling;
   VMCDriverInput vmc;
@@ -34,9 +35,10 @@ struct WFTrainInferenceInput
     return enabled && completed != 0 && (completed % interval == 0 || (last && final));
   }
 
-  void readXML(xmlNodePtr qmc)
+  void readXML(xmlNodePtr qmc, bool default_energy = true)
   {
     *this = WFTrainInferenceInput{};
+    evaluate_energy = default_energy;
     xmlNodePtr inference = nullptr;
     for (auto child = qmc->children; child; child = child->next)
       if (child->type == XML_ELEMENT_NODE && std::string(castXMLCharToChar(child->name)) == "inference")
@@ -73,6 +75,12 @@ struct WFTrainInferenceInput
         if (value != "yes" && value != "no")
           throw UniformCommunicateError("WFTrain inference: last must be yes or no");
         last = value == "yes";
+      }
+      else if (name == "evaluate_energy")
+      {
+        if (value != "yes" && value != "no")
+          throw UniformCommunicateError("WFTrain inference: evaluate_energy must be yes or no");
+        evaluate_energy = value == "yes";
       }
       else if (name != "move")
         throw UniformCommunicateError("WFTrain inference: unknown attribute " + name);

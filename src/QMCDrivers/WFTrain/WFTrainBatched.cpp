@@ -38,6 +38,7 @@
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
+#include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/CoulombPotential.h"
@@ -1689,7 +1690,10 @@ void WFTrainBatched::process(xmlNodePtr node)
 
   try
   {
-    inference_input_.readXML(node);
+    inference_input_.readXML(node, training_input_.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE);
+    if (inference_input_.enabled && !inference_input_.evaluate_energy &&
+        training_input_.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE)
+      throw UniformCommunicateError("Energy-off inference requires orbital_mse");
     if (inference_input_.enabled)
     {
       inference_timer_ = &createGlobalTimer("WFTrain::inference", timer_level_medium);
@@ -2064,6 +2068,10 @@ void WFTrainBatched::process(xmlNodePtr node)
     try
     {
       initializeOrbitalPretraining();
+      if (inference_input_.enabled && training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
+          (!orbital_target_ || selected_provider_->usesAcceleratorParameterProducts() ||
+           !dynamic_cast<PsiFormerWF*>(selected_provider_)))
+        throw UniformCommunicateError("Orbital inference currently requires a real CPU provider and target");
     }
     catch (...)
     {
@@ -4063,8 +4071,51 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
     generators.push_back(std::make_unique<RandomGenerator>(mix(seed ^ mix(crowd + 1))));
     refs.push_back(*generators.back());
   }
+  std::unique_ptr<wftrain::OrbitalInferenceMoments> moments;
+  std::vector<double> orbital_values;
+  std::function<void(Crowd&)> observer;
+  std::function<std::string()> block_result;
+  std::string header;
+  if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+  {
+    const auto& descriptor = orbital_target_->descriptor();
+    moments = std::make_unique<wftrain::OrbitalInferenceMoments>(descriptor.spinUpElectrons(),
+        descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
+    auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+    observer = [&, student](Crowd& crowd) {
+      for (std::size_t i = 0; i < crowd.size(); ++i)
+      {
+        const auto& particles = crowd.get_walker_elecs()[i].get();
+        student->evaluateOrbitalValues(particles, orbital_values, parameter_version);
+        std::optional<double> energy;
+        if (inference_input_.evaluate_energy)
+          energy = crowd.get_walkers()[i].get().Properties(WalkerProperties::LOCALENERGY);
+        moments->addSample(orbital_values, orbital_target_->evaluate(particles), energy);
+      }
+    };
+    block_result = [&]() {
+      auto sums = moments->sums();
+      myComm->allreduce(sums);
+      const auto result = moments->summarize(sums);
+      std::ostringstream row;
+      row << std::setprecision(17) << result.mean_mse << ' ' << result.mse_variance << ' ';
+      if (wftrain::isFiniteTrainingReal(result.occupied_column_cosine_squared))
+        row << result.occupied_column_cosine_squared;
+      else
+        row << "nan";
+      row << ' ' << result.undefined_columns << ' ' << result.samples;
+      if (inference_input_.evaluate_energy)
+        row << ' ' << result.energy << ' ' << result.energy_squared;
+      moments->reset();
+      return row.str();
+    };
+    header = "OrbitalMSE OrbitalMSEVariance EmpiricalOccupiedColumnCosineSquared UndefinedOrbitalColumns SampleCount";
+    if (inference_input_.evaluate_energy)
+      header += " LocalEnergy LocalEnergy_sq";
+  }
   WFTrainInference inference(project_data_, inference_input_, configurations, std::move(population), refs,
-                             myComm, prefix, iteration, parameter_version);
+                             myComm, prefix, iteration, parameter_version,
+                             std::move(observer), std::move(block_result), std::move(header));
   inference.process(nullptr);
   inference.run();
   if (myComm->rank() == 0)

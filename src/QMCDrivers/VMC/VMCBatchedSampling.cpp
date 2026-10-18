@@ -504,7 +504,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
       savePropertiesIntoWalker(walker_hamiltonians[iw], walkers[iw]);
   }
 
-  if (accumulate_this_step)
+  if (accumulate_this_step && sft.accumulate_estimators)
   {
     ScopedTimer est_timer(timers.estimators);
     crowd.accumulate(random_generator);
