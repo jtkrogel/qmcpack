@@ -92,6 +92,8 @@ struct KFACLayerObservation
   DerivativeArrayView<const DerivativeReal> activations;
   DerivativeArrayView<const DerivativeReal> sensitivities;
   std::size_t row_count = 0;
+  /// Empty for real responses; otherwise the same extent as sensitivities.
+  DerivativeArrayView<const DerivativeReal> imaginary_sensitivities;
 };
 
 /** Raw symmetric factor sums for one affine block. */
@@ -137,7 +139,8 @@ public:
   void addObservation(const KFACLayerObservation& observation);
 
   /// Accumulate diagonal sufficient statistics for every fallback interval.
-  void addFallbackScores(DerivativeArrayView<const DerivativeReal> score);
+  void addFallbackScores(DerivativeArrayView<const DerivativeReal> score,
+                         DerivativeArrayView<const DerivativeReal> imaginary_score = {});
 
   /// Atomically merge the current sample into the published factor sums.
   void endSample();
@@ -158,7 +161,7 @@ public:
   const std::vector<KFACFactorStatistics>& factors() const noexcept { return factors_; }
 
   /// Return diagonal numerators in fallback-block/canonical-entry order.
-  /// Registered generic entries contain twice the squared signed sample sum;
+  /// Registered generic entries contain twice the sum of squared signed channel sums;
   /// other entries contain (optionally Gaussian-scaled) samplewise score squares.
   DerivativeArrayView<const DerivativeReal> fallbackDiagonalSum() const noexcept
   {
@@ -193,10 +196,12 @@ private:
   std::vector<bool> observed_;
   std::vector<DerivativeReal> fallback_diagonal_sum_;
   std::vector<DerivativeReal> pending_fallback_diagonal_;
-  // Generic Gaussian curvature is 2*(global score sum)^2/N. Keep its signed
-  // sufficient statistic until after rank reduction; summing local squares is wrong.
+  // Keep each generic response channel signed until after rank reduction;
+  // the statistic is twice the sum of squared global channel sums, divided by N.
   std::vector<DerivativeReal> fallback_score_sum_;
   std::vector<DerivativeReal> pending_fallback_score_;
+  std::vector<DerivativeReal> fallback_imaginary_score_sum_;
+  std::vector<DerivativeReal> pending_fallback_imaginary_score_;
   std::vector<bool> generic_entries_;
   DerivativeReal fallback_weight_sum_ = 0.0;
   bool fallback_observed_ = false;

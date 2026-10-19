@@ -273,6 +273,8 @@ KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
   {
     fallback_score_sum_.assign(fallback_parameter_count, 0.0);
     pending_fallback_score_.assign(fallback_parameter_count, 0.0);
+    fallback_imaginary_score_sum_.assign(fallback_parameter_count, 0.0);
+    pending_fallback_imaginary_score_.assign(fallback_parameter_count, 0.0);
     for (std::size_t block : registry_.fallbackBlocks())
       generic_entries_.insert(generic_entries_.end(), registry_.parameterSchema().blocks()[block].count,
           std::find(registry_.genericBlocks().begin(), registry_.genericBlocks().end(), block) !=
@@ -300,6 +302,7 @@ void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
   }
   std::fill(pending_fallback_diagonal_.begin(), pending_fallback_diagonal_.end(), 0.0);
   std::fill(pending_fallback_score_.begin(), pending_fallback_score_.end(), 0.0);
+  std::fill(pending_fallback_imaginary_score_.begin(), pending_fallback_imaginary_score_.end(), 0.0);
   fallback_observed_ = registry_.fallbackBlocks().empty();
   sample_active_ = true;
 }
@@ -319,12 +322,19 @@ void KFACFactorAccumulator::addObservation(const KFACLayerObservation& observati
           checkedProduct(observation.row_count, block.output_width, "KFAC sensitivity rows") ||
       !observation.activations.data() || !observation.sensitivities.data())
     throw std::invalid_argument("KFAC observation row extents do not match the registry");
+  if (!observation.imaginary_sensitivities.empty() &&
+      (observation.imaginary_sensitivities.size() != observation.sensitivities.size() ||
+       !observation.imaginary_sensitivities.data()))
+    throw std::invalid_argument("KFAC imaginary sensitivity extent does not match the real channel");
   for (DerivativeReal value : observation.activations)
     if (!finite(value))
       throw std::invalid_argument("KFAC activation observation contains a non-finite value");
   for (DerivativeReal value : observation.sensitivities)
     if (!finite(value))
       throw std::invalid_argument("KFAC sensitivity observation contains a non-finite value");
+  for (DerivativeReal value : observation.imaginary_sensitivities)
+    if (!finite(value))
+      throw std::invalid_argument("KFAC imaginary sensitivity contains a non-finite value");
 
   KFACFactorStatistics& factor = pending_[observation.affine_block];
   for (std::size_t row = 0; row < observation.row_count; ++row)
@@ -349,6 +359,13 @@ void KFACFactorAccumulator::addObservation(const KFACLayerObservation& observati
             (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
             sample_weight_ * observation.sensitivities[row * block.output_width + left] *
             observation.sensitivities[row * block.output_width + right];
+    if (!observation.imaginary_sensitivities.empty())
+      for (std::size_t left = 0; left < block.output_width; ++left)
+        for (std::size_t right = 0; right < block.output_width; ++right)
+          factor.sensitivity_outer_sum[left * block.output_width + right] +=
+              (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
+              sample_weight_ * observation.imaginary_sensitivities[row * block.output_width + left] *
+              observation.imaginary_sensitivities[row * block.output_width + right];
   }
   factor.sample_weight_sum = sample_weight_;
   factor.row_weight_sum = sample_weight_ * static_cast<DerivativeReal>(observation.row_count);
@@ -357,7 +374,8 @@ void KFACFactorAccumulator::addObservation(const KFACLayerObservation& observati
 }
 
 void KFACFactorAccumulator::addFallbackScores(
-    DerivativeArrayView<const DerivativeReal> score)
+    DerivativeArrayView<const DerivativeReal> score,
+    DerivativeArrayView<const DerivativeReal> imaginary_score)
 {
   if (!sample_active_)
     throw std::logic_error("KFAC fallback scores require an active sample transaction");
@@ -366,6 +384,9 @@ void KFACFactorAccumulator::addFallbackScores(
   if (score.size() != registry_.parameterSchema().parameterCount() ||
       (!score.empty() && !score.data()))
     throw std::invalid_argument("KFAC fallback score extent does not match the registry schema");
+  if (!imaginary_score.empty() &&
+      (imaginary_score.size() != score.size() || !imaginary_score.data()))
+    throw std::invalid_argument("KFAC imaginary fallback score extent does not match the real channel");
   std::size_t packed = 0;
   for (std::size_t block_index : registry_.fallbackBlocks())
   {
@@ -376,12 +397,24 @@ void KFACFactorAccumulator::addFallbackScores(
     {
       if (!finite(score[parameter]))
         throw std::invalid_argument("KFAC fallback score contains a non-finite value");
+      const DerivativeReal imaginary = imaginary_score.empty() ? 0.0 : imaginary_score[parameter];
+      if (!finite(imaginary))
+        throw std::invalid_argument("KFAC imaginary fallback score contains a non-finite value");
       if (!generic_entries_.empty() && generic_entries_[packed])
+      {
         pending_fallback_score_[packed] = score[parameter];
+        pending_fallback_imaginary_score_[packed] = imaginary;
+      }
       else
+      {
         pending_fallback_diagonal_[packed] =
             (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
             sample_weight_ * score[parameter] * score[parameter];
+        if (!imaginary_score.empty())
+          pending_fallback_diagonal_[packed] +=
+              (convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 2.0 : 1.0) *
+              sample_weight_ * imaginary * imaginary;
+      }
       ++packed;
     }
   }
@@ -419,7 +452,9 @@ void KFACFactorAccumulator::endSample()
     if (!generic_entries_.empty() && generic_entries_[parameter])
     {
       const DerivativeReal sum = fallback_score_sum_[parameter] + pending_fallback_score_[parameter];
-      valid = finite(sum) && finite(2.0 * sum * sum);
+      const DerivativeReal imaginary = fallback_imaginary_score_sum_[parameter] +
+          pending_fallback_imaginary_score_[parameter];
+      valid = finite(sum) && finite(imaginary) && finite(2.0 * sum * sum + 2.0 * imaginary * imaginary);
     }
     else
       valid = finite(fallback_diagonal_sum_[parameter] + pending_fallback_diagonal_[parameter]);
@@ -447,6 +482,9 @@ void KFACFactorAccumulator::endSample()
       fallback_score_sum_[parameter] += pending_fallback_score_[parameter];
       fallback_diagonal_sum_[parameter] =
           2.0 * fallback_score_sum_[parameter] * fallback_score_sum_[parameter];
+      fallback_imaginary_score_sum_[parameter] += pending_fallback_imaginary_score_[parameter];
+      const DerivativeReal imaginary = fallback_imaginary_score_sum_[parameter];
+      fallback_diagonal_sum_[parameter] += 2.0 * imaginary * imaginary;
     }
     else
       fallback_diagonal_sum_[parameter] += pending_fallback_diagonal_[parameter];
@@ -471,7 +509,8 @@ std::size_t KFACFactorAccumulator::retainedNumericBytes() const noexcept
           factor.sensitivity_outer_sum.capacity();
   elements += fallback_diagonal_sum_.capacity() +
       pending_fallback_diagonal_.capacity() + fallback_score_sum_.capacity() +
-      pending_fallback_score_.capacity();
+      pending_fallback_score_.capacity() + fallback_imaginary_score_sum_.capacity() +
+      pending_fallback_imaginary_score_.capacity();
   return elements * sizeof(DerivativeReal);
 }
 
@@ -511,7 +550,7 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
   extendHash(identity, accumulator.registry_.fingerprint());
   extendHash(identity, static_cast<std::uint64_t>(accumulator.convention_));
   std::size_t packed_scalar_count = accumulator.fallback_diagonal_sum_.size() +
-      accumulator.fallback_score_sum_.size();
+      accumulator.fallback_score_sum_.size() + accumulator.fallback_imaginary_score_sum_.size();
   for (const KFACFactorStatistics& factor : accumulator.factors_)
     packed_scalar_count += factor.activation_outer_sum.size() +
         factor.sensitivity_outer_sum.size() + 2;
@@ -562,13 +601,17 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
   reduce_real_array(accumulator.fallback_diagonal_sum_.data(),
                     accumulator.fallback_diagonal_sum_.size());
   reduce_real_array(accumulator.fallback_score_sum_.data(), accumulator.fallback_score_sum_.size());
+  reduce_real_array(accumulator.fallback_imaginary_score_sum_.data(),
+                    accumulator.fallback_imaginary_score_sum_.size());
   for (std::size_t parameter = 0; parameter < accumulator.generic_entries_.size(); ++parameter)
     if (accumulator.generic_entries_[parameter])
     {
       const DerivativeReal sum = accumulator.fallback_score_sum_[parameter];
-      if (!finite(sum) || !finite(2.0 * sum * sum))
+      const DerivativeReal imaginary = accumulator.fallback_imaginary_score_sum_[parameter];
+      const DerivativeReal diagonal = 2.0 * sum * sum + 2.0 * imaginary * imaginary;
+      if (!finite(sum) || !finite(imaginary) || !finite(diagonal))
         throw MatrixFreeNumericalError("KFAC global generic curvature overflowed");
-      accumulator.fallback_diagonal_sum_[parameter] = 2.0 * sum * sum;
+      accumulator.fallback_diagonal_sum_[parameter] = diagonal;
     }
   for (KFACFactorStatistics& factor : accumulator.factors_)
   {

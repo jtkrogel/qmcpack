@@ -301,6 +301,113 @@ TEST_CASE("KFAC streams repeated rows with sample rather than row normalization"
   CHECK(fallback[1] == Catch::Approx(28.0));
 }
 
+TEST_CASE("KFAC complex response factors include both channels and preserve real limits",
+          "[drivers][wftrain][kfac]")
+{
+  const std::array<DerivativeReal, 4> x{1, 2, -1, 3};
+  const std::array<DerivativeReal, 4> real{2, -1, 3, 4};
+  const std::array<DerivativeReal, 4> imaginary{1, 3, -2, 1};
+  const std::array<DerivativeReal, 4> zero{};
+  const std::array<DerivativeReal, 9> score{0, 0, 0, 0, 0, 0, 3, 4, 0};
+  const std::array<DerivativeReal, 9> phase{0, 0, 0, 0, 0, 0, 4, -3, 0};
+  for (auto convention : {KFACCurvatureConvention::NATIVE_SCORE,
+                          KFACCurvatureConvention::REGISTERED_GAUSSIAN})
+  {
+    KFACFactorAccumulator combined(makeRegistry(), 3, convention);
+    combined.beginSample(2);
+    combined.addObservation({0, {x.data(), x.size()}, {real.data(), real.size()}, 2,
+                             {imaginary.data(), imaginary.size()}});
+    combined.addFallbackScores({score.data(), score.size()}, {phase.data(), phase.size()});
+    combined.endSample();
+    const double weight = convention == KFACCurvatureConvention::NATIVE_SCORE ? 2 : 1;
+    const double scale = convention == KFACCurvatureConvention::NATIVE_SCORE ? 1 : 2;
+    const auto& factor = combined.factors()[0];
+    const std::array<double, 9> expected_a{2, -1, 0, -1, 13, 5, 0, 5, 2};
+    const std::array<double, 4> expected_c{18, 11, 11, 27};
+    for (std::size_t i = 0; i < expected_a.size(); ++i)
+      CHECK(factor.activation_outer_sum[i] == Catch::Approx(weight * expected_a[i]));
+    for (std::size_t i = 0; i < expected_c.size(); ++i)
+      CHECK(factor.sensitivity_outer_sum[i] == Catch::Approx(weight * scale * expected_c[i]));
+    CHECK(factor.row_weight_sum / factor.sample_weight_sum == 2);
+    CHECK(combined.fallbackDiagonalSum()[0] == Catch::Approx(weight * scale * 25));
+    CHECK(combined.fallbackDiagonalSum()[1] == Catch::Approx(weight * scale * 25));
+
+    KFACFactorAccumulator legacy(makeRegistry(), 3, convention), real_limit(makeRegistry(), 3, convention);
+    for (auto* accumulator : {&legacy, &real_limit})
+    {
+      accumulator->beginSample(2);
+      accumulator->addObservation({0, {x.data(), x.size()}, {real.data(), real.size()}, 2,
+          accumulator == &legacy ? DerivativeArrayView<const DerivativeReal>{} :
+                                   DerivativeArrayView<const DerivativeReal>{zero.data(), zero.size()}});
+      accumulator->addFallbackScores({score.data(), score.size()});
+      accumulator->endSample();
+      reduceKFACFactorStatistics(*accumulator);
+    }
+    CHECK(updateKFACFactorState(nullptr, legacy, 0).values ==
+          updateKFACFactorState(nullptr, real_limit, 0).values);
+
+    KFACFactorAccumulator phase_only(makeRegistry(), 3, convention);
+    phase_only.beginSample(2);
+    phase_only.addObservation({0, {x.data(), x.size()}, {zero.data(), zero.size()}, 2,
+                               {real.data(), real.size()}});
+    const std::array<DerivativeReal, 9> zero_score{};
+    phase_only.addFallbackScores({zero_score.data(), zero_score.size()}, {score.data(), score.size()});
+    phase_only.endSample();
+    reduceKFACFactorStatistics(phase_only);
+    const auto state = updateKFACFactorState(nullptr, phase_only, 0);
+    CHECK(state.values == updateKFACFactorState(nullptr, legacy, 0).values);
+    const KFACPreconditioner inverse(phase_only, {0.04, 0.5});
+    const KFACPreconditioner restored(makeRegistry(), 3, state, {0.04, 0.5});
+    const KFACPreconditioner restored_inverse(makeRegistry(), 3, inverse.exportInverseState());
+    const std::array<DerivativeValue, 9> gradient{1, 2, 3, 4, 5, 6, 7, 8, 0};
+    std::array<DerivativeValue, 9> actual{}, expected{}, reloaded{};
+    // Keep the schema owner alive across all applications.
+    const auto registry = makeRegistry();
+    const StructuredParameterVectorConstView stable_view(registry.parameterSchema(), 3,
+                                                         {gradient.data(), gradient.size()});
+    inverse.apply(stable_view, {actual.data(), actual.size()});
+    restored.apply(stable_view, {expected.data(), expected.size()});
+    restored_inverse.apply(stable_view, {reloaded.data(), reloaded.size()});
+    CHECK(actual == expected);
+    CHECK(actual == reloaded);
+  }
+}
+
+TEST_CASE("KFAC rejects invalid phase channels without publishing a sample",
+          "[drivers][wftrain][kfac]")
+{
+  KFACFactorAccumulator accumulator(makeRegistry(), 0);
+  const std::array<DerivativeReal, 4> x{1, 2, 3, 4};
+  const std::array<DerivativeReal, 1> short_phase{1};
+  accumulator.beginSample(1);
+  CHECK_THROWS(accumulator.addObservation({0, {x.data(), x.size()}, {x.data(), x.size()}, 2,
+                                          {short_phase.data(), short_phase.size()}}));
+  CHECK_THROWS(accumulator.endSample());
+  CHECK(accumulator.sampleCount() == 0);
+  CHECK(accumulator.factors()[0].sample_weight_sum == 0);
+}
+
+TEST_CASE("Complex repeated affine inverse matches its explicit scalar Kronecker solve",
+          "[drivers][wftrain][kfac]")
+{
+  const StructuredParameterSchema schema{"complex/repeated",
+      {{"weight", {1, 1}, 0, 1, ParameterScalarDomain::REAL64, true, "network"}}};
+  KFACFactorAccumulator statistics({schema, {{"affine", 0, NO_KFAC_BIAS_BLOCK, 1, 1}}, {}}, 0);
+  const std::array<DerivativeReal, 2> x{1, 2}, real{2, 0}, imaginary{0, 3};
+  statistics.beginSample(1);
+  statistics.addObservation({0, {x.data(), x.size()}, {real.data(), real.size()}, 2,
+                             {imaginary.data(), imaginary.size()}});
+  statistics.endSample();
+  reduceKFACFactorStatistics(statistics);
+  const KFACPreconditioner inverse(statistics, {0.04, 0.5});
+  const std::array<DerivativeValue, 1> gradient{7};
+  std::array<DerivativeValue, 1> update{};
+  inverse.apply({schema, 0, {gradient.data(), gradient.size()}}, {update.data(), update.size()});
+  const double split = std::sqrt(0.04 * 2);
+  CHECK(update[0].real() == Catch::Approx(2 * 7 / ((5 + split) * (13 + split))));
+  CHECK(update[0].imag() == 0);
+}
+
 TEST_CASE("KFAC preconditioner matches a dense factored solve and repeat scaling",
           "[drivers][wftrain][kfac]")
 {
@@ -494,6 +601,34 @@ TEST_CASE("Registered generic diagonal squares the sample sum and preserves repl
   CHECK(cancellation.sampleCount() == 2);
   CHECK(cancellation.fallbackDiagonalSum()[0] == baseline);
   CHECK(cancellation.fallbackDiagonalSum()[1] == 0.0);
+}
+
+TEST_CASE("Registered complex generic diagonals retain separate signed population sums",
+          "[drivers][wftrain][kfac]")
+{
+  const StructuredParameterSchema schema{"generic/complex",
+      {{"ordinary", {1}, 0, 1, ParameterScalarDomain::REAL64, true, "network"},
+       {"generic", {1}, 1, 1, ParameterScalarDomain::REAL64, true, "network"}}};
+  for (int replication : {1, 3})
+  {
+    KFACFactorAccumulator statistics({schema, {}, {0, 1}, {1}}, 0,
+                                     KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+    for (int copy = 0; copy < replication; ++copy)
+      for (double sign : {1.0, -1.0})
+      {
+        const std::array<DerivativeReal, 2> real{3, sign};
+        const std::array<DerivativeReal, 2> imaginary{4, 2};
+        statistics.beginSample(19);
+        statistics.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+        statistics.endSample();
+      }
+    reduceKFACFactorStatistics(statistics, nullptr, 1);
+    CHECK(statistics.fallbackDiagonalSum()[0] / statistics.fallbackWeightSum() == Catch::Approx(50));
+    CHECK(statistics.fallbackDiagonalSum()[1] / statistics.fallbackWeightSum() ==
+          Catch::Approx(16 * replication));
+    const auto state = updateKFACFactorState(nullptr, statistics, 0);
+    CHECK_NOTHROW(validateKFACFactorState(statistics.registry(), state));
+  }
 }
 
 TEST_CASE("Trace-balanced KFAC matches independent anisotropic two-factor solves",
@@ -743,6 +878,33 @@ TEST_CASE("Distributed KFAC reduces unequal weighted populations before normaliz
         reference.factors()[0].sensitivity_outer_sum);
   CHECK(distributed.fallbackDiagonalSum()[0] ==
         Catch::Approx(reference.fallbackDiagonalSum()[0]));
+}
+
+TEST_CASE("Distributed complex generic curvature reduces channels before squaring",
+          "[drivers][wftrain][kfac][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema{"generic/complex-mpi",
+      {{"generic", {1}, 0, 1, ParameterScalarDomain::REAL64, true, "network"}}};
+  KFACFactorAccumulator statistics({schema, {}, {0}, {0}}, 0,
+                                   KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  const std::array<DerivativeReal, 1> real{communicator.rank() % 2 ? -1.0 : 1.0};
+  const std::array<DerivativeReal, 1> imaginary{double(communicator.rank() + 2)};
+  for (int sample = 0; sample <= communicator.rank(); ++sample)
+  {
+    statistics.beginSample(13);
+    statistics.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+    statistics.endSample();
+  }
+  reduceKFACFactorStatistics(statistics, &communicator, 1);
+  double real_sum = 0, imaginary_sum = 0;
+  for (int rank = 0; rank < communicator.size(); ++rank)
+  {
+    real_sum += (rank % 2 ? -1.0 : 1.0) * (rank + 1);
+    imaginary_sum += (rank + 2.0) * (rank + 1);
+  }
+  CHECK(statistics.fallbackDiagonalSum()[0] ==
+        Catch::Approx(2 * (real_sum * real_sum + imaginary_sum * imaginary_sum)));
 }
 #endif
 

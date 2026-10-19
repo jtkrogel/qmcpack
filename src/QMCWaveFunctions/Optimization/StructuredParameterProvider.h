@@ -103,6 +103,8 @@ struct AffineScoreObservation
   const double* activations = nullptr;
   const double* sensitivities = nullptr;
   std::size_t row_count = 0;
+  /// Optional phase response for real parameters; null denotes an identically zero channel.
+  const double* imaginary_sensitivities = nullptr;
 };
 
 /// Consume transient affine rows without retaining a model tape.
