@@ -223,4 +223,31 @@ TEST_CASE("Persistent KFAC schedule precision and constraint retain scalar dtype
     CHECK(optimizer.constraintScale() < 1.0);
   }
 }
+
+TEST_CASE("Pre-inverse rate scaling uses full precision parameter-space constraint arithmetic",
+          "[wftrain][kfac_state][kfac_update_order]")
+{
+  for (const double bound : {0.0, 1e-5})
+  {
+    KFACToyProvider provider;
+    KFACOptimizerControl control;
+    control.learning_rate = .05;
+    control.learning_rate_decay = 2000;
+    control.schedule_float32 = true;
+    control.inverse = {1.0, 1.0};
+    control.norm_constraint = bound;
+    control.update_order = KFACUpdateOrder::PRE_INVERSE_RATE;
+    KFACOptimizer optimizer(registry(provider.parameterSchema()), control);
+    const double rate = static_cast<double>(.05F);
+    update(optimizer, provider, std::sqrt(.4));
+    const double metric = rate * (rate / 2);
+    CHECK(optimizer.constraintMetric() == Catch::Approx(metric).epsilon(1e-14));
+    volatile float rounded = .05F * .05F;
+    CHECK(optimizer.constraintMetric() != static_cast<double>(rounded) / 2);
+    const double scale = bound ? std::sqrt(bound / metric) : 1;
+    CHECK(optimizer.constraintScale() == Catch::Approx(scale).epsilon(1e-14));
+    CHECK(provider.snapshotParameters().values[0] == Catch::Approx(1 - rate * scale / 2).epsilon(1e-14));
+    CHECK(optimizer.effectiveLearningRate() == static_cast<double>(.049975015223026276F));
+  }
+}
 }

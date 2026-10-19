@@ -65,7 +65,9 @@ KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl co
   if ((control_.convention != KFACCurvatureConvention::NATIVE_SCORE &&
        control_.convention != KFACCurvatureConvention::REGISTERED_GAUSSIAN) ||
       (control_.inverse.damping_policy != KFACDampingPolicy::EQUAL_SPLIT &&
-       control_.inverse.damping_policy != KFACDampingPolicy::TRACE_BALANCED))
+       control_.inverse.damping_policy != KFACDampingPolicy::TRACE_BALANCED) ||
+      (control_.update_order != KFACUpdateOrder::POST_INVERSE_RATE &&
+       control_.update_order != KFACUpdateOrder::PRE_INVERSE_RATE))
     throw std::invalid_argument("Invalid persistent KFAC curvature or damping policy");
   const std::vector<double> configuration{control_.learning_rate, control_.learning_rate_decay,
       static_cast<double>(control_.schedule_float32), control_.ema_decay,
@@ -73,6 +75,8 @@ KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl co
       static_cast<double>(control_.convention), control_.inverse.damping,
       control_.inverse.fallback_damping, static_cast<double>(control_.inverse.damping_policy)};
   configuration_fingerprint_ = registry_.fingerprint() + "/" + TrainingCheckpoint::valuesFingerprint(configuration);
+  if (control_.update_order == KFACUpdateOrder::PRE_INVERSE_RATE)
+    configuration_fingerprint_ += "/pre-inverse-rate-v1";
 }
 
 KFACOptimizer::~KFACOptimizer() = default;
@@ -146,7 +150,9 @@ StructuredParameterSnapshot KFACOptimizer::propose(const StructuredParameterSche
   if (!isFiniteTrainingReal(rate) || rate <= 0.0)
     throw std::runtime_error("KFAC scheduled learning rate is invalid");
   std::vector<DerivativeValue> gradient(objective.gradient.size()), direction(gradient.size());
-  for (std::size_t i = 0; i < gradient.size(); ++i) gradient[i] = objective.gradient[i];
+  const bool pre_scaled = control_.update_order == KFACUpdateOrder::PRE_INVERSE_RATE;
+  for (std::size_t i = 0; i < gradient.size(); ++i)
+    gradient[i] = (pre_scaled ? rate : 1.0) * objective.gradient[i];
   pending_->inverse->apply({schema, parameters.version, {gradient.data(), gradient.size()}},
                            {direction.data(), direction.size()});
   // Preserve the schedule's squared-rate dtype before the parameter-space product.
@@ -154,19 +160,19 @@ StructuredParameterSnapshot KFACOptimizer::propose(const StructuredParameterSche
   for (std::size_t i = 0; i < gradient.size(); ++i)
     product += (std::conj(gradient[i]) * direction[i]).real();
   double rate_squared = rate * rate;
-  if (control_.schedule_float32 && control_.learning_rate_decay > 0.0)
+  if (!pre_scaled && control_.schedule_float32 && control_.learning_rate_decay > 0.0)
   {
     volatile float square = static_cast<float>(rate) * static_cast<float>(rate);
     rate_squared = square;
   }
-  last_metric_ = rate_squared * product;
+  last_metric_ = pre_scaled ? product : rate_squared * product;
   if (!isFiniteTrainingReal(last_metric_) || last_metric_ < 0.0)
     throw std::runtime_error("KFAC damped gradient metric is invalid");
   last_scale_ = control_.norm_constraint > 0.0 && last_metric_ > control_.norm_constraint
       ? std::sqrt(control_.norm_constraint / last_metric_) : 1.0;
   auto candidate = parameters;
   for (std::size_t i = 0; i < direction.size(); ++i)
-    candidate.values[i] -= rate * last_scale_ * direction[i].real();
+    candidate.values[i] -= (pre_scaled ? 1.0 : rate) * last_scale_ * direction[i].real();
   pending_->proposed = true;
   return candidate;
 }
