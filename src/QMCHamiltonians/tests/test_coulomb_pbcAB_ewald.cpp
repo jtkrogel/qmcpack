@@ -20,6 +20,9 @@
 
 #include <stdio.h>
 #include <string>
+#include <cmath>
+#include <memory>
+#include <vector>
 
 using std::string;
 
@@ -156,6 +159,83 @@ TEST_CASE("Coulomb PBC A-B BCC H Ewald3D", "[hamiltonian]")
                                    // -3.14349127313640
 
   LRCoulombSingleton::CoulombHandler.reset(nullptr);
+}
+
+TEST_CASE("Mixed periodic local potentials retain bare species across cloning", "[hamiltonian][mixed_local_pp]")
+{
+  // Restore the shared breakup owner even when an assertion exits the test early.
+  struct RestoreHandler
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) saved = std::move(LRCoulombSingleton::CoulombHandler);
+    ~RestoreHandler() { LRCoulombSingleton::CoulombHandler = std::move(saved); }
+  } restore;
+  Lattice lattice;
+  lattice.R = {6.6, 0, 0, 0, 6.6, 0, 0, 0, 6.6};
+  lattice.BoxBConds = true;
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet ions(cell), electrons(cell);
+  ions.setName("ion0");
+  ions.create({1, 1});
+  auto& species = ions.getSpeciesSet();
+  species.addSpecies("Li");
+  species.addSpecies("H");
+  const int charge = species.addAttribute("charge");
+  species(charge, 0) = species(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {3.3, 3.3, 3.3};
+  ions.resetGroups();
+  ions.createSK();
+  ions.update();
+  electrons.setName("e");
+  electrons.create({2});
+  auto& electronic = electrons.getSpeciesSet();
+  electronic.addSpecies("u");
+  electronic(electronic.addAttribute("charge"), 0) = -1;
+  electronic(electronic.addAttribute("mass"), 0) = 1;
+  electrons.R[0] = {.7, .4, .2};
+  electrons.R[1] = {2.8, 3.1, 3.5};
+  electrons.resetGroups();
+  electrons.createSK();
+  electrons.addTable(ions);
+  electrons.update();
+  LRCoulombSingleton::CoulombHandler = std::make_unique<EwaldHandler3D>(ions);
+  LRCoulombSingleton::CoulombHandler->initBreakup(ions);
+  auto potential = std::make_unique<CoulombPBCAB>(ions, electrons);
+  const double baseline = potential->evaluate(electrons);
+  std::weak_ptr<const CoulombPBCAB::RadFunctorType> bare_owner = potential->V0;
+  const auto* bare = potential->V0.get();
+
+  // Replace Li alone with an analytic compact softening; H must remain exactly bare.
+  LinearGrid<double> grid;
+  constexpr int count = 5001;
+  grid.set(0, potential->myRcut, count);
+  std::vector<double> radial(count);
+  for (int point = 0; point < count; ++point)
+  {
+    const double r = grid[point];
+    radial[point] = 1 - (r < 2 ? std::pow(1 - r * r / 4, 4) : 0);
+  }
+  auto pp = std::make_unique<CoulombPBCAB::RadFunctorType>(grid.makeClone(), radial);
+  pp->spline(0, 0, count - 1, 0);
+  potential->add(0, std::move(pp));
+  CHECK(potential->Vat[1] == bare);
+  REQUIRE_FALSE(bare_owner.expired());
+  REQUIRE(potential->V0);
+  double expected = baseline;
+  for (const auto& position : electrons.R)
+  {
+    const double r = std::sqrt(dot(position, position));
+    if (r < 2)
+      expected += std::pow(1 - r * r / 4, 4) / r;
+  }
+  CHECK(potential->evaluate(electrons) == Approx(expected).margin(2e-8));
+  ParticleSet copy(electrons);
+  copy.update();
+  auto clone = potential->makeClone(copy);
+  potential.reset();
+  CHECK_FALSE(bare_owner.expired());
+  CHECK(dynamic_cast<CoulombPBCAB&>(*clone).evaluate(copy) == Approx(expected).margin(2e-8));
 }
 
 } // namespace qmcplusplus

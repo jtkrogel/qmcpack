@@ -564,8 +564,7 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
   RealType dr = agrid_local[1] - agrid_local[0];
   if (Vspec[groupID] == nullptr)
   {
-    V0.reset();
-
+    // Other species may still point at the bare Coulomb spline, including in clones.
     app_log() << "    Creating the short-range pseudopotential for species " << groupID << std::endl;
     std::vector<RealType> v(ng);
     for (int ig = 1; ig < ng - 2; ig++)
