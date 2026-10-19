@@ -1276,7 +1276,8 @@ struct PsiFormerComplexWF::Impl
       return {s.model.ne, s.model.cfg.nuclei.shape[0], s.model.ndet, s.model.dim, s.model.heads,
           s.plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
           s.model.blocks, s.model.p.size(), bool(s.environment.periodic_profile),
-          psiformer::occupiedMomentumCount(s.plan)};
+          psiformer::occupiedMomentumCount(s.plan), s.environment.periodic_profile ?
+              s.environment.periodic_profile->pair_feature_dimension : 8};
     }
 
     /// Include both executor ion copies and all channel buffers before any numerical allocation.
@@ -1756,7 +1757,8 @@ struct PsiFormerComplexWF::Impl
     const auto& model = state->model;
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
         state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size(),
-        bool(state->environment.periodic_profile), occupiedMomentumCount(state->plan)};
+        bool(state->environment.periodic_profile), occupiedMomentumCount(state->plan),
+        state->environment.periodic_profile ? state->environment.periodic_profile->pair_feature_dimension : 8};
     if (!state->gpu_limit)
     {
       numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);

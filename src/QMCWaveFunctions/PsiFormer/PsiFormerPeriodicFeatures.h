@@ -7,12 +7,13 @@
 #define QMCPLUSPLUS_PSIFORMER_PERIODIC_FEATURES_H
 
 #include "PsiFormerExecutionPlan.h"
+#include "PsiFormerPolynomialGeometry.h"
 #include <stdexcept>
 #include <algorithm>
 
 namespace qmcplusplus::psiformer::periodic_feature
 {
-/// One ordered displacement's eight features and jets with respect to that displacement.
+/// Up to eight ordered displacement features, with their Cartesian jets.
 struct Jet
 {
   std::array<double, 8> value{};
@@ -21,7 +22,31 @@ struct Jet
   bool differentiable = false;
 };
 
-/// Assemble raw or logarithmically rescaled features from one existing pair-cache entry.
+/// One selected radius/jet used identically by descriptors and atom-centered envelopes.
+struct RadiusJet
+{
+  double value = 0, laplacian = 0, gradient_norm_squared = 0;
+  pf::GeometryPosition gradient{};
+  bool differentiable = false;
+};
+
+/// Read cached legacy jets or compute the single selected polynomial radius and its jets.
+inline RadiusJet selectedRadius(const pf::GeometryPairTable& table, std::size_t pair,
+    const pf::GeometryBoundary& cell, const std::shared_ptr<const PeriodicProfileMetadata>& profile)
+{
+  if (profile && profile->feature_transform == PeriodicFeatureTransform::POLYNOMIAL_V1)
+  {
+    const auto selected = pf::polynomialPeriodicJet(table, pair, cell);
+    RadiusJet result{selected.radius, selected.radius_laplacian, 0,
+                     selected.radius_gradient, selected.differentiable};
+    for (double component : result.gradient) result.gradient_norm_squared += component * component;
+    return result;
+  }
+  return {table.distances()[pair], table.distanceLaplacians()[pair],
+      table.distanceGradientNormsSquared()[pair], table.distanceGradients()[pair], table.distances()[pair] != 0};
+}
+
+/// Assemble the declared trig/log or polynomial feature family from one existing cache entry.
 inline Jet evaluate(const pf::GeometryPairTable& table, std::size_t pair,
                     const pf::GeometryBoundary& cell, int orientation,
                     PeriodicFeatureTransform transform, double spin_product)
@@ -29,6 +54,21 @@ inline Jet evaluate(const pf::GeometryPairTable& table, std::size_t pair,
   if (pair >= table.size() || (orientation != 1 && orientation != -1) ||
       cell.kind != pf::GeometryBoundaryKind::PERIODIC || (spin_product != 1 && spin_product != -1))
     throw std::invalid_argument("Periodic features require an oriented periodic pair");
+  if (transform == PeriodicFeatureTransform::POLYNOMIAL_V1)
+  {
+    const auto selected = pf::polynomialPeriodicJet(table, pair, cell, orientation);
+    Jet result;
+    result.differentiable = selected.differentiable;
+    result.value[0] = selected.radius; result.gradient[0] = selected.radius_gradient;
+    result.laplacian[0] = selected.radius_laplacian;
+    for (std::size_t d = 0; d < 3; ++d)
+    {
+      result.value[1 + d] = selected.vector[d]; result.gradient[1 + d] = selected.vector_jacobian[d];
+      result.laplacian[1 + d] = selected.vector_laplacian[d];
+    }
+    result.value[4] = spin_product;
+    return result;
+  }
   if (transform != PeriodicFeatureTransform::LOG_COMPLEMENT_V1 &&
       transform != PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1)
     throw std::invalid_argument("Unknown periodic feature transform");
@@ -128,7 +168,7 @@ inline void fillAttentionLogits(const pf::PsiFormerGeometryCache& geometry, std:
       for (std::size_t head = 0; head < heads; ++head)
       {
         double value = bias[head];
-        for (std::size_t f = 0; f < 8; ++f)
+        for (std::size_t f = 0; f < periodicPairFeatureArity(transform); ++f)
           value += jet.value[f] * weights[f * heads + head];
         logits[(head * n + row) * n + column] = value;
       }

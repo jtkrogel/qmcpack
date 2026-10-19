@@ -1035,14 +1035,17 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
       {
         const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
             workspace.geometry_.electronIonBoundary(), 1, layout_->periodic_profile_->feature_transform, 1);
-        const auto begin = row_begin + 7 * nucleus;
-        std::copy_n(jet.value.data(), 7, raw.value.data() + begin);
+        if (!jet.differentiable)
+          throw std::runtime_error("Periodic feature spatial jets are undefined at a non-smooth coordinate plane");
+        const auto arity = qmcplusplus::psiformer::periodicFeatureArity(layout_->periodic_profile_->feature_transform);
+        const auto begin = row_begin + arity * nucleus;
+        std::copy_n(jet.value.data(), arity, raw.value.data() + begin);
         for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
           if (laneElectron(workspace, lane) == electron)
-            for (std::size_t f = 0; f < 7; ++f)
+            for (std::size_t f = 0; f < arity; ++f)
               raw.gradient[gradientIndex(raw, lane, begin + f)] = jet.gradient[f][laneDimension(workspace, lane)];
         if (electron >= workspace.target_begin_ && electron - workspace.target_begin_ < workspace.laplacian_lanes_)
-          for (std::size_t f = 0; f < 7; ++f)
+          for (std::size_t f = 0; f < arity; ++f)
             raw.laplacian[laplacianIndex(raw, electron - workspace.target_begin_, begin + f)] = jet.laplacian[f];
         continue;
       }
@@ -1230,7 +1233,7 @@ inline void DirectSpatialExecutor::buildAttentionWeights(const double* parameter
             workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
             layout_->periodic_profile_->feature_transform, spin);
         if (!jet.differentiable)
-          throw std::runtime_error("Pair-attention spatial derivatives are undefined at electron coalescence");
+          throw std::runtime_error("Pair-attention spatial jets are undefined at non-smooth geometry");
         const auto row = orientation == 1 ? identity.first : identity.second;
         const auto column = orientation == 1 ? identity.second : identity.first;
         for (std::size_t head = 0; head < head_count; ++head)
@@ -1238,7 +1241,7 @@ inline void DirectSpatialExecutor::buildAttentionWeights(const double* parameter
           const auto output = attention_index(head, row, column);
           double value = bias[head], laplacian = 0;
           GeometryPosition gradient{};
-          for (std::size_t f = 0; f < 8; ++f)
+          for (std::size_t f = 0; f < layout_->periodic_profile_->pair_feature_dimension; ++f)
           {
             const auto weight = weights[f * head_count + head];
             value += weight * jet.value[f];
@@ -1517,8 +1520,10 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
         {
           const std::size_t parameter = channel * nucleus_count + nucleus;
           const std::size_t pair      = row_electron * nucleus_count + nucleus;
-          const double radius         = distances[pair];
-          if (radius == 0)
+          const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+              pairs, pair, workspace.geometry_.electronIonBoundary(), layout_->periodic_profile_);
+          const double radius = selected.value;
+          if (!selected.differentiable)
             throw std::runtime_error(
                 "PsiFormer spatial derivatives are undefined at an electron-nucleus coalescence");
           const double decay_rate     = std::abs(zeta[parameter]);
@@ -1533,13 +1538,12 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
             {
               const std::size_t dimension = laneDimension(workspace, lane);
               workspace.scalar_gradient_scratch_[lane] +=
-                  radial_first * distance_gradients[pair][dimension];
+                  radial_first * selected.gradient[dimension];
             }
           if (row_electron >= workspace.target_begin_ &&
               row_electron - workspace.target_begin_ < workspace.laplacian_lanes_)
             workspace.scalar_laplacian_scratch_[row_electron - workspace.target_begin_] +=
-                radial_second * distance_gradient_norms[pair] +
-                radial_first * distance_laplacians[pair];
+                radial_second * selected.gradient_norm_squared + radial_first * selected.laplacian;
         }
 
         // Consume all projected gradients in the Laplacian product before the

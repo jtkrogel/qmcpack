@@ -1320,12 +1320,15 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
         const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
             workspace.geometry_.electronIonBoundary(), 1,
             plan_.environment().periodic_profile->feature_transform, 1);
-        const auto begin = row_begin + 7 * nucleus;
-        std::copy_n(jet.value.data(), 7, raw.value.data() + begin);
+        if (!jet.differentiable)
+          throw std::runtime_error("Periodic feature kinetic jets are undefined at a non-smooth coordinate plane");
+        const auto arity = qmcplusplus::psiformer::periodicFeatureArity(plan_.environment().periodic_profile->feature_transform);
+        const auto begin = row_begin + arity * nucleus;
+        std::copy_n(jet.value.data(), arity, raw.value.data() + begin);
         if (workspace.containsTarget(electron))
         {
           const auto target = electron - workspace.target_begin_;
-          for (std::size_t f = 0; f < 7; ++f)
+          for (std::size_t f = 0; f < arity; ++f)
           {
             raw.laplacian[laplacianIndex(raw, target, begin + f)] = jet.laplacian[f];
             for (std::size_t d = 0; d < 3; ++d)
@@ -1454,14 +1457,14 @@ inline void DirectKineticExecutor::buildAttentionLogits(
             workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
             plan_.environment().periodic_profile->feature_transform, spin);
         if (!jet.differentiable)
-          throw std::runtime_error("Pair-attention kinetic products are undefined at electron coalescence");
+          throw std::runtime_error("Pair-attention kinetic products are undefined at non-smooth geometry");
         const auto row = orientation == 1 ? identity.first : identity.second;
         const auto column = orientation == 1 ? identity.second : identity.first;
         for (std::size_t head = 0; head < workspace.heads_; ++head)
         {
           const auto output = (head * workspace.electrons_ + row) * workspace.electrons_ + column;
           logits.value[output] += bias[head];
-          for (std::size_t f = 0; f < 8; ++f)
+          for (std::size_t f = 0; f < plan_.environment().periodic_profile->pair_feature_dimension; ++f)
           {
             const auto weight = weights[f * workspace.heads_ + head];
             logits.value[output] += weight * jet.value[f];
@@ -1699,8 +1702,10 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
         {
           const std::size_t parameter_index = channel * workspace.nuclei_ + nucleus;
           const std::size_t pair             = electron * workspace.nuclei_ + nucleus;
-          const double radius                = distances[pair];
-          if (radius == 0.0)
+          const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+              pairs, pair, workspace.geometry_.electronIonBoundary(), plan_.environment().periodic_profile);
+          const double radius = selected.value;
+          if (!selected.differentiable)
             throw std::runtime_error(
                 "PsiFormer kinetic response is undefined at electron-nucleus coalescence");
           const double decay_rate     = std::abs(zeta[parameter_index]);
@@ -1716,11 +1721,10 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
           {
             const std::size_t lane = 3 * local_electron + dimension;
             envelopes.gradient[gradientIndex(envelopes, lane, matrix_element)] +=
-                radial_first * distance_gradients[pair][dimension];
+                radial_first * selected.gradient[dimension];
           }
           envelopes.laplacian[laplacianIndex(envelopes, local_electron, matrix_element)] +=
-              radial_second * distance_gradient_norms[pair] +
-              radial_first * distance_laplacians[pair];
+              radial_second * selected.gradient_norm_squared + radial_first * selected.laplacian;
         }
 
         productForwardElement(backflows, matrix_element, envelopes, matrix_element,
@@ -2068,7 +2072,9 @@ inline void DirectKineticExecutor::reverseOrbitals(
         {
           const std::size_t parameter_index = channel * workspace.nuclei_ + nucleus;
           const std::size_t pair             = electron * workspace.nuclei_ + nucleus;
-          const double radius                = distances[pair];
+          const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+              electron_nucleus_pairs, pair, workspace.geometry_.electronIonBoundary(), plan_.environment().periodic_profile);
+          const double radius = selected.value;
           const double decay_rate            = std::abs(zeta[parameter_index]);
           const double decay                 = std::exp(-decay_rate * radius);
           const double signed_abs_derivative = zeta[parameter_index] > 0.0
@@ -2092,7 +2098,7 @@ inline void DirectKineticExecutor::reverseOrbitals(
             for (std::size_t dimension = 0; dimension < 3; ++dimension)
             {
               const std::size_t lane = 3 * local_electron + dimension;
-              const double radial_gradient = distance_gradients[pair][dimension];
+              const double radial_gradient = selected.gradient[dimension];
               const double upstream = workspace.envelope_adjoint_.gradient[
                   gradientIndex(workspace.envelope_adjoint_, lane, matrix_element)];
               pi_contribution += upstream * pi_gradient_radial * radial_gradient;
@@ -2101,11 +2107,9 @@ inline void DirectKineticExecutor::reverseOrbitals(
             const double laplacian_upstream = workspace.envelope_adjoint_.laplacian[
                 laplacianIndex(workspace.envelope_adjoint_, local_electron, matrix_element)];
             pi_contribution += laplacian_upstream *
-                (pi_radial_second * distance_gradient_norms[pair] +
-                 pi_gradient_radial * distance_laplacians[pair]);
+                (pi_radial_second * selected.gradient_norm_squared + pi_gradient_radial * selected.laplacian);
             zeta_contribution += laplacian_upstream *
-                (zeta_radial_second * distance_gradient_norms[pair] +
-                 zeta_gradient_radial * distance_laplacians[pair]);
+                (zeta_radial_second * selected.gradient_norm_squared + zeta_gradient_radial * selected.laplacian);
           }
           pi_response[parameter_index] += pi_contribution;
           zeta_response[parameter_index] += zeta_contribution;
@@ -2444,7 +2448,7 @@ inline void DirectKineticExecutor::reverseAttentionLogits(
         {
           const auto output = (head * workspace.electrons_ + row) * workspace.electrons_ + column;
           bias[head] += upstream.value[output];
-          for (std::size_t f = 0; f < 8; ++f)
+          for (std::size_t f = 0; f < plan_.environment().periodic_profile->pair_feature_dimension; ++f)
           {
             double contraction = upstream.value[output] * jet.value[f];
             for (auto target : {row, column})

@@ -190,11 +190,12 @@ public:
   DirectComplexKineticExecutor(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan, std::array<double, 3> outer_k = {})
       : parameters_(model.p), trunk_(model, plan, DirectKineticPreparation::REAL_TRUNK_ONLY),
-        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan)), outer_k_(outer_k),
+        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan)),
+        profile_(plan.environment().periodic_profile), outer_k_(outer_k),
         shape_{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
                plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
                model.blocks, plan.parameterCount(), bool(plan.environment().periodic_profile),
-               qmcplusplus::psiformer::occupiedMomentumCount(plan)}
+               qmcplusplus::psiformer::occupiedMomentumCount(plan), profile_ ? profile_->pair_feature_dimension : 8}
   {
     using namespace qmcplusplus::psiformer;
     if (plan.environment().head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
@@ -276,7 +277,7 @@ public:
     const auto tape = trunk_.evaluateTrunk(*w.trunk_);
     const double* p = parameters_.flat_values().data();
     fillRealOrbitalEnvelopeJets(*tape.geometry, w.orbitals_, descriptor_.spin_up,
-        shape_.nuclei, p, pi_, zeta_, 0, w.envelopes_.data());
+        shape_.nuclei, p, pi_, zeta_, 0, w.envelopes_.data(), profile_);
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
     heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};
@@ -368,19 +369,20 @@ private:
           for (std::size_t atom = 0; atom < shape_.nuclei; ++atom)
           {
             const auto pair = row * shape_.nuclei + atom, index = channel * shape_.nuclei + atom;
+            const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+                pairs, pair, tape.geometry->electronIonBoundary(), profile_);
             const C ql = w.root_[(1 + 3 * n + row) * batch + element];
             for (std::size_t direction = 0; direction < 2; ++direction)
             {
-              const auto radial = realOrbitalEnvelopeParameterJet(pairs.distances()[pair],
+              const auto radial = realOrbitalEnvelopeParameterJet(selected.value,
                   p[pi_[spin].begin + index], p[zeta_[spin].begin + index], direction != 0);
               C response = qe0 * radial[0] + ql * b[element] *
-                  (radial[2] * pairs.distanceGradientNormsSquared()[pair] +
-                   radial[1] * pairs.distanceLaplacians()[pair]);
+                  (radial[2] * selected.gradient_norm_squared + radial[1] * selected.laplacian);
               for (std::size_t dim = 0; dim < 3; ++dim)
               {
                 const auto offset = (1 + 3 * row + dim) * batch + element;
                 response += (w.root_[offset] * b[element] + 2.0 * ql * b[offset]) *
-                    radial[1] * pairs.distanceGradients()[pair][dim];
+                    radial[1] * selected.gradient[dim];
               }
               w.response_[(direction ? zeta_[spin] : pi_[spin]).begin + index] += response;
             }
@@ -410,6 +412,7 @@ private:
   const Parameters& parameters_;
   DirectKineticExecutor trunk_;
   const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor descriptor_;
+  const std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata> profile_;
   const std::array<double, 3> outer_k_;
   const PsiFormerStorageShape shape_;
   std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_;

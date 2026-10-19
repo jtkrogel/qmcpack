@@ -218,6 +218,7 @@ std::vector<TensorSpecification> makeTensorSpecifications(
   const std::size_t electrons = checkedAdd(model.spin_up_electrons, model.spin_down_electrons, "electron count");
   const std::size_t channels = checkedMultiply(model.determinants, electrons, "determinant-orbital channels");
   const std::size_t channels_per_nucleus =
+      environment.periodic_profile ? periodicFeatureArity(environment.periodic_profile->feature_transform) :
       environment.boundary == BoundaryCondition::PERIODIC ? 7 : 4;
   const std::size_t input_width =
       checkedAdd(checkedMultiply(channels_per_nucleus, model.nuclei, "embedding input width"), 1,
@@ -301,7 +302,7 @@ std::vector<TensorSpecification> makeTensorSpecifications(
                         block, InitializationLaw::NORMAL, 0, feature_sigma, feature_sigma);
     if (environment.periodic_profile)
     {
-      appendSpecification(tensors, base + "pair_attention", "w", {8, model.attention_heads},
+      appendSpecification(tensors, base + "pair_attention", "w", {environment.periodic_profile->pair_feature_dimension, model.attention_heads},
                           ParameterRole::PAIR_ATTENTION_WEIGHT, block, InitializationLaw::CONSTANT, 0, 0, 0);
       appendSpecification(tensors, base + "pair_attention", "b", {model.attention_heads},
                           ParameterRole::PAIR_ATTENTION_BIAS, block, InitializationLaw::CONSTANT, 0, 0, 0);

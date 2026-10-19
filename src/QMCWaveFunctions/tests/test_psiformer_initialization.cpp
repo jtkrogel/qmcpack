@@ -400,6 +400,25 @@ TEST_CASE("Periodic pair initialization requires explicit metadata and zero affi
   const PsiFormerExecutionPlan real_plan(shape, real.layouts, real.environment);
   CHECK_FALSE(real_plan.hasParameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG));
   CHECK(real_plan.hasParameter(ParameterRole::PAIR_ATTENTION_WEIGHT, 0));
+  metadata->feature_transform = PeriodicFeatureTransform::POLYNOMIAL_V1;
+  metadata->pair_feature_dimension = periodicPairFeatureArity(metadata->feature_transform);
+  CHECK(periodicFeatureArity(metadata->feature_transform) == 4);
+  CHECK(metadata->pair_feature_dimension == 5);
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment),
+                  std::invalid_argument);
+  metadata->electron_electron_cusp = false;
+  for (auto head : {HeadRepresentation::REAL, HeadRepresentation::PAIRED_REAL_COMPLEX})
+  {
+    environment.head_representation = head;
+    environment.amplitude_scalar_domain = head == HeadRepresentation::REAL ? ScalarDomain::REAL : ScalarDomain::COMPLEX;
+    const auto polynomial = initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment);
+    const PsiFormerExecutionPlan polynomial_plan(shape, polynomial.layouts, polynomial.environment);
+    CHECK(polynomial_plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape ==
+          std::vector<std::size_t>{4 * shape.nuclei + 1, shape.feature_dimension});
+    CHECK(polynomial_plan.parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, 0).shape ==
+          std::vector<std::size_t>{5, shape.attention_heads});
+    CHECK_FALSE(polynomial.environment.periodic_profile->electron_electron_cusp);
+  }
 }
 
 } // namespace qmcplusplus::psiformer

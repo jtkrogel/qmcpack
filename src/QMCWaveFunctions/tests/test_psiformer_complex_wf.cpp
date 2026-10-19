@@ -1274,12 +1274,19 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
   using namespace wftrain;
   bool pair_profile = false;
   bool occupied_phase = false;
+  bool polynomial = false;
   SECTION("legacy paired profile") {}
   SECTION("two-cell pair profile with complete physical ions") { pair_profile = true; }
   SECTION("two-cell occupied reciprocal profile with complete physical ions")
   {
     pair_profile = true;
     occupied_phase = true;
+  }
+  SECTION("polynomial two-cell occupied profile with complete physical ions")
+  {
+    pair_profile = true;
+    occupied_phase = true;
+    polynomial = true;
   }
   const SimulationCell simulation_cell(cell());
   auto p = electrons(simulation_cell);
@@ -1299,6 +1306,20 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     return result;
   }();
   auto initialized = parameters();
+  if (polynomial)
+  {
+    auto embedding = std::find_if(initialized.layouts.begin(), initialized.layouts.end(), [](const auto& layout) {
+      return layout.module.find("/electron_embedding/linear") != std::string::npos;
+    });
+    const auto end = embedding->end, width = initialized.model_shape.feature_dimension;
+    const auto rows = 4 * initialized.model_shape.nuclei + 1;
+    const auto removed = embedding->end - embedding->begin - rows * width;
+    initialized.values.erase(initialized.values.begin() + embedding->begin + rows * width,
+                             initialized.values.begin() + end);
+    embedding->shape[0] = rows; embedding->end -= removed;
+    for (auto& layout : initialized.layouts)
+      if (layout.begin >= end) { layout.begin -= removed; layout.end -= removed; }
+  }
   if (pair_profile)
   {
     auto& environment = initialized.environment;
@@ -1317,7 +1338,9 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     metadata->primitive_motif = {{0, 0, 0}, {1, 1, 1}};
     metadata->motif_species = {0, 1};
     metadata->electron_electron_cusp = false;
-    metadata->feature_transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+    metadata->feature_transform = polynomial ? ps::PeriodicFeatureTransform::POLYNOMIAL_V1 :
+                                              ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+    metadata->pair_feature_dimension = ps::periodicPairFeatureArity(metadata->feature_transform);
     for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns.push_back({{}, i % 2, int(i / 2), 1});
     if (occupied_phase)
     {
@@ -1325,16 +1348,17 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
       for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns[i].reciprocal = momenta[i];
     }
     environment.periodic_profile = std::move(metadata);
+    const auto pair_arity = environment.periodic_profile->pair_feature_dimension;
     initialized.profile = ps::PSIFORMER_PERIODIC_PAIR_V1;
     for (std::size_t block = 0; block < initialized.model_shape.attention_blocks; ++block)
       for (bool bias : {false, true})
       {
         const auto begin = initialized.values.size();
         const auto heads = initialized.model_shape.attention_heads;
-        initialized.values.resize(begin + (bias ? 1 : 8) * heads, .02);
+        initialized.values.resize(begin + (bias ? 1 : pair_arity) * heads, .02);
         const auto layer = block == 0 ? std::string("electron_gnn_layer") : "electron_gnn_layer_" + std::to_string(block);
         initialized.layouts.push_back({"periodic/" + layer + "/pair_attention", bias ? "b" : "w",
-            bias ? std::vector<std::size_t>{heads} : std::vector<std::size_t>{8, heads}, begin, initialized.values.size()});
+            bias ? std::vector<std::size_t>{heads} : std::vector<std::size_t>{pair_arity, heads}, begin, initialized.values.size()});
       }
   }
   PsiFormerComplexWF component("affine", initialized, p, source, clone_cap, {.17, -.11, .07});
@@ -1477,7 +1501,8 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     CHECK(imported.parameters.model_shape.nuclei == 2);
     const auto& metadata = *imported.parameters.environment.periodic_profile;
     CHECK(metadata.cells.tiling[0][0] == 2);
-    CHECK(metadata.feature_transform == ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1);
+    CHECK(metadata.feature_transform == initialized.environment.periodic_profile->feature_transform);
+    CHECK(metadata.pair_feature_dimension == (polynomial ? 5 : 8));
     CHECK_FALSE(metadata.electron_electron_cusp);
     CHECK(metadata.occupied_columns.size() == 4);
     for (std::size_t column = 0; column < metadata.occupied_columns.size(); ++column)

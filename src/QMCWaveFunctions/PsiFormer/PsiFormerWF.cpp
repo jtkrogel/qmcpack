@@ -6566,6 +6566,8 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
   input.storage_shape.attention_blocks = model_shape.attention_blocks;
   input.storage_shape.parameter_count  = model_state_->execution_plan.parameterCount();
   input.storage_shape.pair_attention = static_cast<bool>(model_state_->execution_plan.environment().periodic_profile);
+  if (const auto& profile = model_state_->execution_plan.environment().periodic_profile)
+    input.storage_shape.pair_feature_width = profile->pair_feature_dimension;
   input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
       ValueType, PsiValue, LogValue, GradType,
       SelectedDerivativeDelta::value_type, FullPrecRealType>();
@@ -7545,7 +7547,8 @@ std::vector<wftrain::AffineParameterBlock> nativeAffineParameterBlocks(
     append(Role::UPDATE_HIDDEN_WEIGHT, block, width, width, Role::UPDATE_HIDDEN_BIAS);
     append(Role::UPDATE_OUTPUT_WEIGHT, block, width, width, Role::UPDATE_OUTPUT_BIAS);
     if (plan.environment().periodic_profile)
-      append(Role::PAIR_ATTENTION_WEIGHT, block, 8, shape.attention_heads, Role::PAIR_ATTENTION_BIAS);
+      append(Role::PAIR_ATTENTION_WEIGHT, block, plan.parameter(Role::PAIR_ATTENTION_WEIGHT, block).shape[0],
+             shape.attention_heads, Role::PAIR_ATTENTION_BIAS);
   }
   append(Role::BACKFLOW_UP_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
          width, shape.determinants * shape.electrons());
@@ -11730,9 +11733,11 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
     if (!complete || primitive.size() != 9 || tiling.size() != 9 ||
         motif.size() != 3 * shape[2] || bands.size() != shape[0] + shape[1] ||
         momenta.size() != 3 * bands.size() || spins.size() != bands.size() || occupations.size() != bands.size() ||
-        pair_dimension != 8 || (cusp != 0 && cusp != 1) ||
+        (cusp != 0 && cusp != 1) ||
         (transform != static_cast<int>(PeriodicFeatureTransform::LOG_COMPLEMENT_V1) &&
-         transform != static_cast<int>(PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1)))
+         transform != static_cast<int>(PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1) &&
+         transform != static_cast<int>(PeriodicFeatureTransform::POLYNOMIAL_V1)) ||
+        pair_dimension != periodicPairFeatureArity(static_cast<PeriodicFeatureTransform>(transform)))
       throw std::runtime_error("Incomplete or invalid periodic profile feature and occupied metadata");
     metadata->feature_transform = static_cast<PeriodicFeatureTransform>(transform);
     metadata->pair_feature_dimension = pair_dimension;

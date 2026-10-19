@@ -85,6 +85,24 @@ inline double realOrbitalEnvelopeValue(const double* radii, const double* pi,
   return value;
 }
 
+/// Share the selected geometric radius while preserving the legacy contiguous fast path.
+inline double realOrbitalEnvelopeValue(const PsiFormerGeometryCache& geometry, std::size_t row,
+    const double* pi, const double* zeta, std::size_t nucleus_count,
+    const std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata>& profile)
+{
+  const auto& pairs = geometry.electronNucleusPairs();
+  if (!profile || profile->feature_transform != qmcplusplus::psiformer::PeriodicFeatureTransform::POLYNOMIAL_V1)
+    return realOrbitalEnvelopeValue(pairs.distances().data() + row * nucleus_count, pi, zeta, nucleus_count);
+  double value = 0;
+  for (std::size_t atom = 0; atom < nucleus_count; ++atom)
+  {
+    const auto radius = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+        pairs, row * nucleus_count + atom, geometry.electronIonBoundary(), profile).value;
+    value += pi[atom] * std::exp(-std::abs(zeta[atom] * radius));
+  }
+  return value;
+}
+
 /// Hold all parameter intervals and fixed dimensions required by direct inference.
 class DirectValueParameterLayout
 {
@@ -771,7 +789,8 @@ private:
     const std::size_t na           = layout_->nucleusCount();
     const std::size_t input_width  = layout_->inputWidth();
     const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
-    const std::size_t pair_width = periodic ? 7 : 4;
+    const std::size_t pair_width = layout_->periodic_profile_ ?
+        qmcplusplus::psiformer::periodicFeatureArity(layout_->periodic_profile_->feature_transform) : periodic ? 7 : 4;
 
     for (std::size_t electron = 0; electron < ne; ++electron)
     {
@@ -784,7 +803,7 @@ private:
         {
           const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
               workspace.geometry_.electronIonBoundary(), 1, layout_->periodic_profile_->feature_transform, 1);
-          std::copy_n(jet.value.data(), 7, feature_row + feature_begin);
+          std::copy_n(jet.value.data(), pair_width, feature_row + feature_begin);
           continue;
         }
         feature_row[feature_begin] = radial_factors[pair].log1p_radius;
@@ -858,7 +877,7 @@ private:
             backflow_value += features[feature] * backflow[feature * ndet * ne + channel];
 
           const double envelope_value = realOrbitalEnvelopeValue(
-              distances.data() + electron * na, pi + channel * na, zeta + channel * na, na);
+              workspace.geometry_, electron, pi + channel * na, zeta + channel * na, na, layout_->periodic_profile_);
           workspace.orbital_matrices_[(determinant * ne + electron) * ne + orbital] =
               backflow_value * envelope_value;
         }

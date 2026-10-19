@@ -113,7 +113,8 @@ inline void attentionReal(const double* query,
                           std::size_t heads,
                           std::size_t head_width,
                           double* attention,
-                          double* target)
+                          double* target,
+                          bool add_existing_logits = false)
 {
   const std::size_t width                 = heads * head_width;
   const std::size_t feature_configuration = electrons * width;
@@ -125,7 +126,7 @@ inline void attentionReal(const double* query,
         attention + configuration * attention_configuration;
     dense::attentionWeightsReal(query + feature_offset, width, key + feature_offset,
                                 width, electrons, heads, head_width,
-                                configuration_attention);
+                                configuration_attention, add_existing_logits);
     dense::attentionContextReal(configuration_attention, value + feature_offset, width,
                                 electrons, heads, head_width,
                                 target + feature_offset);

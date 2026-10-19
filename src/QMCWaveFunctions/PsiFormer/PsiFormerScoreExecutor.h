@@ -306,6 +306,7 @@ public:
         determinants_(plan.modelShape().determinants),
         width_(plan.modelShape().feature_dimension),
         heads_(plan.modelShape().attention_heads),
+        pair_feature_width_(plan.environment().periodic_profile ? plan.environment().periodic_profile->pair_feature_dimension : 8),
         blocks_(plan.modelShape().attention_blocks),
         head_width_(width_ / heads_),
         input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
@@ -336,7 +337,7 @@ public:
         residual_adjoint_(feature_elements_),
         hidden_adjoint_(feature_elements_),
         update_adjoint_(feature_elements_),
-        pair_features_(plan.environment().periodic_profile ? checkedStorageProduct(8,
+        pair_features_(plan.environment().periodic_profile ? checkedStorageProduct(pair_feature_width_,
             checkedStorageProduct(electrons_, electrons_ - 1, "Pair feature rows overflowed"),
             "Pair feature scratch overflowed") : 0),
         pair_sensitivities_(plan.environment().periodic_profile ? checkedStorageProduct(heads_,
@@ -472,7 +473,7 @@ public:
   {
     const std::size_t complete = scoreWorkspaceStorageRequirement(
         {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
-         blocks_, parameter_score_.size(), !pair_features_.empty()});
+         blocks_, parameter_score_.size(), !pair_features_.empty(), 0, pair_feature_width_});
     return complete - headStorageBytes();
   }
 
@@ -536,6 +537,7 @@ protected:
   std::size_t determinants_;
   std::size_t width_;
   std::size_t heads_;
+  std::size_t pair_feature_width_;
   std::size_t blocks_;
   std::size_t head_width_;
   std::size_t input_width_;
@@ -1059,7 +1061,8 @@ private:
           const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(
               workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
               plan_.environment().periodic_profile->feature_transform, spin);
-          std::copy_n(jet.value.data(), 8, workspace.pair_features_.data() + 8 * ordered);
+          std::copy_n(jet.value.data(), workspace.pair_feature_width_,
+                      workspace.pair_features_.data() + workspace.pair_feature_width_ * ordered);
         }
       }
     buildEmbedding(parameters, workspace);
@@ -1126,7 +1129,8 @@ private:
     const auto& complementary      = pairs.complementaryDisplacements();
     const auto& radial_factors     = pairs.softenedRadialFactors();
     const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
-    const std::size_t pair_width = periodic ? 7 : 4;
+    const std::size_t pair_width = plan_.environment().periodic_profile ?
+        qmcplusplus::psiformer::periodicFeatureArity(plan_.environment().periodic_profile->feature_transform) : periodic ? 7 : 4;
     for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
     {
       double* feature_row = workspace.raw_features_.data() + electron * workspace.input_width_;
@@ -1139,7 +1143,7 @@ private:
           const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
               workspace.geometry_.electronIonBoundary(), 1,
               plan_.environment().periodic_profile->feature_transform, 1);
-          std::copy_n(jet.value.data(), 7, feature_row + feature_begin);
+          std::copy_n(jet.value.data(), pair_width, feature_row + feature_begin);
           continue;
         }
         feature_row[feature_begin] = radial_factors[pair].log1p_radius;
@@ -1247,7 +1251,9 @@ private:
           for (std::size_t nucleus = 0; nucleus < workspace.nuclei_; ++nucleus)
           {
             const std::size_t index = channel * workspace.nuclei_ + nucleus;
-            const double radius     = distances[electron * workspace.nuclei_ + nucleus];
+            const double radius = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+                workspace.geometry_.electronNucleusPairs(), electron * workspace.nuclei_ + nucleus,
+                workspace.geometry_.electronIonBoundary(), plan_.environment().periodic_profile).value;
             envelope_value += pi[index] * std::exp(-std::abs(zeta[index] * radius));
           }
           workspace.orbital_matrices_[(determinant * workspace.electrons_ + electron) *
@@ -1319,7 +1325,9 @@ private:
           for (std::size_t nucleus = 0; nucleus < workspace.nuclei_; ++nucleus)
           {
             const std::size_t index = channel * workspace.nuclei_ + nucleus;
-            const double radius     = distances[electron * workspace.nuclei_ + nucleus];
+            const double radius = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+                workspace.geometry_.electronNucleusPairs(), electron * workspace.nuclei_ + nucleus,
+                workspace.geometry_.electronIonBoundary(), plan_.environment().periodic_profile).value;
             envelope_value += pi[index] * std::exp(-std::abs(zeta[index] * radius));
           }
 
@@ -1339,7 +1347,9 @@ private:
           for (std::size_t nucleus = 0; nucleus < workspace.nuclei_; ++nucleus)
           {
             const std::size_t index = channel * workspace.nuclei_ + nucleus;
-            const double radius     = distances[electron * workspace.nuclei_ + nucleus];
+            const double radius = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+                workspace.geometry_.electronNucleusPairs(), electron * workspace.nuclei_ + nucleus,
+                workspace.geometry_.electronIonBoundary(), plan_.environment().periodic_profile).value;
             const double zeta_radius = zeta[index] * radius;
             const double decay       = std::exp(-std::abs(zeta_radius));
             const double abs_derivative = zeta_radius > 0.0 ? 1.0 : (zeta_radius < 0.0 ? -1.0 : 0.0);
@@ -1461,13 +1471,14 @@ private:
               const double sensitivity = inverse_scale * workspace.attention_adjoint_[(head * n + row) * n + column];
               workspace.pair_sensitivities_[ordered * heads + head] = sensitivity;
               bias_score[head] += sensitivity;
-              for (std::size_t f = 0; f < 8; ++f)
-                weight_score[f * heads + head] += workspace.pair_features_[8 * ordered + f] * sensitivity;
+              for (std::size_t f = 0; f < workspace.pair_feature_width_; ++f)
+                weight_score[f * heads + head] +=
+                    workspace.pair_features_[workspace.pair_feature_width_ * ordered + f] * sensitivity;
             }
           }
       if (observer)
         observer->observe({ParameterRole::PAIR_ATTENTION_WEIGHT, block, workspace.pair_features_.data(),
-            workspace.pair_sensitivities_.data(), n * (n - 1), 8, heads});
+            workspace.pair_sensitivities_.data(), n * (n - 1), workspace.pair_feature_width_, heads});
     }
 
     if (observer)

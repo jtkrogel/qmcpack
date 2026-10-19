@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 #include <memory>
@@ -99,8 +100,27 @@ enum class GeometryFeaturePolicy
 enum class PeriodicFeatureTransform
 {
   LOG_COMPLEMENT_V1,
-  RAW_TRIGONOMETRIC_V1
+  RAW_TRIGONOMETRIC_V1,
+  POLYNOMIAL_V1
 };
+
+/// Return the declared displacement descriptor width, before the spin channel.
+inline std::size_t periodicFeatureArity(PeriodicFeatureTransform transform)
+{
+  switch (transform)
+  {
+  case PeriodicFeatureTransform::LOG_COMPLEMENT_V1:
+  case PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1: return 7;
+  case PeriodicFeatureTransform::POLYNOMIAL_V1: return 4;
+  }
+  throw std::invalid_argument("Unknown periodic feature transform");
+}
+
+/// Ordered pair descriptors append one explicit spin-product channel.
+inline std::size_t periodicPairFeatureArity(PeriodicFeatureTransform transform)
+{
+  return periodicFeatureArity(transform) + 1;
+}
 
 /// A full occupied column preserves band identity even when reciprocal triplets repeat.
 struct OccupiedReciprocalColumn

@@ -151,7 +151,8 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
   switch (role)
   {
   case ParameterRole::ELECTRON_EMBEDDING_WEIGHT:
-    return {(environment.boundary == BoundaryCondition::PERIODIC ? 7 : 4) * model.nuclei + 1,
+    return {(environment.periodic_profile ? periodicFeatureArity(environment.periodic_profile->feature_transform) :
+             environment.boundary == BoundaryCondition::PERIODIC ? 7 : 4) * model.nuclei + 1,
             model.feature_dimension};
   case ParameterRole::ATTENTION_QUERY_WEIGHT:
   case ParameterRole::ATTENTION_KEY_WEIGHT:
@@ -164,7 +165,7 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
   case ParameterRole::UPDATE_OUTPUT_BIAS:
     return {model.feature_dimension};
   case ParameterRole::PAIR_ATTENTION_WEIGHT:
-    return {8, model.attention_heads};
+    return {environment.periodic_profile ? environment.periodic_profile->pair_feature_dimension : 8, model.attention_heads};
   case ParameterRole::PAIR_ATTENTION_BIAS:
     return {model.attention_heads};
   case ParameterRole::BACKFLOW_UP_WEIGHT:
@@ -226,9 +227,8 @@ void validatePeriodicProfileMetadata(const ModelShape& model, const ExecutionEnv
       environment.compute_scalar_domain != ScalarDomain::REAL ||
       environment.amplitude_scalar_domain != (environment.head_representation == HeadRepresentation::REAL ?
           ScalarDomain::REAL : ScalarDomain::COMPLEX) || !environment.fixed_nuclei ||
-      profile.pair_feature_dimension != 8 ||
-      (profile.feature_transform != PeriodicFeatureTransform::LOG_COMPLEMENT_V1 &&
-       profile.feature_transform != PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1))
+      profile.pair_feature_dimension != periodicPairFeatureArity(profile.feature_transform) ||
+      (profile.feature_transform == PeriodicFeatureTransform::POLYNOMIAL_V1 && profile.electron_electron_cusp))
     throw std::invalid_argument("Unsupported versioned periodic feature/head metadata");
   pf::validatePeriodicGeometryMapping(profile.cells);
   if (profile.cells.simulation.lattice_vectors != environment.lattice_vectors ||

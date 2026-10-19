@@ -20,7 +20,8 @@ namespace pf
 inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
   const qmcplusplus::psiformer::SpatialJetLayout& orbitals, std::size_t spin_up,
   std::size_t nuclei, const double* p, const std::array<DirectParameterTensor, 2>& pi,
-  const std::array<DirectParameterTensor, 2>& zeta, std::size_t active, double* output)
+  const std::array<DirectParameterTensor, 2>& zeta, std::size_t active, double* output,
+  const std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata>& profile = {})
 {
   std::fill_n(output, qmcplusplus::psiformer::spatialJetSpanElements(orbitals), 0.0);
   const auto& pairs = geometry.electronNucleusPairs();
@@ -33,9 +34,11 @@ inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
       for (std::size_t atom = 0; atom < nuclei; ++atom)
       {
         const std::size_t pair = row * nuclei + atom, parameter = channel * nuclei + atom;
-        const double radius = pairs.distances()[pair];
-        if (radius == 0)
-          throw std::runtime_error("PsiFormer complex spatial undefined at electron-nucleus coalescence");
+        const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+            pairs, pair, geometry.electronIonBoundary(), profile);
+        const double radius = selected.value;
+        if (!selected.differentiable)
+          throw std::runtime_error("PsiFormer complex envelope jets are undefined at non-smooth geometry");
         const double decay = std::abs(p[zeta[spin].begin + parameter]);
         const double weighted = p[pi[spin].begin + parameter] * std::exp(-decay * radius);
         const double first = -decay * weighted;
@@ -43,11 +46,10 @@ inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
         for (std::size_t lane = 0; lane < orbitals.gradient_lanes; ++lane)
           if ((orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL ? lane / 3 : active) == row)
             output[orbitals.uncheckedPlaneOffset(0, 1 + lane, element)] +=
-                first * pairs.distanceGradients()[pair][lane % 3];
+                first * selected.gradient[lane % 3];
         if (orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL)
           output[orbitals.uncheckedPlaneOffset(0, 1 + orbitals.gradient_lanes + row, element)] +=
-              decay * decay * weighted * pairs.distanceGradientNormsSquared()[pair] +
-              first * pairs.distanceLaplacians()[pair];
+              decay * decay * weighted * selected.gradient_norm_squared + first * selected.laplacian;
       }
     }
 }
@@ -321,7 +323,8 @@ private:
                                                       trunk_.evaluateTrunkActive(*w.trunk_, active);
     const double* p = parameters_.flat_values().data();
     fillRealOrbitalEnvelopeJets(*t.geometry, w.orbitals_, descriptor_.spin_up,
-        metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data());
+        metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data(),
+        metadata_.trunkLayout()->periodicProfile());
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
     heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};

@@ -228,8 +228,8 @@ public:
         {
           const std::size_t channel = d * n + orbital;
           workspace.envelopes_[(d * n + row) * n + orbital] = realOrbitalEnvelopeValue(
-              distances.data() + row * nuclei, parameters + pi_[spin].begin + channel * nuclei,
-              parameters + zeta_[spin].begin + channel * nuclei, nuclei);
+              *trunk.geometry, row, parameters + pi_[spin].begin + channel * nuclei,
+              parameters + zeta_[spin].begin + channel * nuclei, nuclei, trunk_.trunkLayout()->periodicProfile());
         }
     }
     qmcplusplus::psiformer::ComplexOrbitalHeadParameters heads;

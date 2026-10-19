@@ -292,8 +292,8 @@ public:
       {
         const std::size_t spin = row < descriptor_.spin_up ? 0 : 1;
         w.envelopes_[(channel / n * n + row) * n + channel % n] = realOrbitalEnvelopeValue(
-            radii.data() + row * nuclei_, p + pi_[spin].begin + channel * nuclei_,
-            p + zeta_[spin].begin + channel * nuclei_, nuclei_);
+            *tape.geometry, row, p + pi_[spin].begin + channel * nuclei_,
+            p + zeta_[spin].begin + channel * nuclei_, nuclei_, trunk_.plan().environment().periodic_profile);
       }
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
@@ -408,8 +408,8 @@ public:
       {
         const std::size_t spin = row < descriptor_.spin_up ? 0 : 1;
         w.envelopes_[(channel / n * n + row) * n + channel % n] = realOrbitalEnvelopeValue(
-            radii.data() + row * nuclei_, p + pi_[spin].begin + channel * nuclei_,
-            p + zeta_[spin].begin + channel * nuclei_, nuclei_);
+            *tape.geometry, row, p + pi_[spin].begin + channel * nuclei_,
+            p + zeta_[spin].begin + channel * nuclei_, nuclei_, trunk_.plan().environment().periodic_profile);
       }
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
@@ -517,7 +517,10 @@ private:
         for (std::size_t atom = 0; atom < nuclei_; ++atom)
         {
           const std::size_t index = channel * nuclei_ + atom;
-          const double radius = radii[row * nuclei_ + atom], argument = p[zeta_[spin].begin + index] * radius;
+          const double radius = qmcplusplus::psiformer::periodic_feature::selectedRadius(tape.geometry->electronNucleusPairs(),
+              row * nuclei_ + atom, tape.geometry->electronIonBoundary(),
+              trunk_.plan().environment().periodic_profile).value;
+          const double argument = p[zeta_[spin].begin + index] * radius;
           const double decay = std::exp(-std::abs(argument));
           const double sign = argument > 0 ? 1.0 : (argument < 0 ? -1.0 : 0.0);
           w.score_[pi_[spin].begin + index] += envelope_seed * decay;

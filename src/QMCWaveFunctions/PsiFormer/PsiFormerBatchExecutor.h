@@ -1748,8 +1748,8 @@ private:
 
     value_geometries_.reserve(capacity);
     while (value_geometries_.size() < capacity)
-      value_geometries_.emplace_back(
-          electron_count_, value_executor_->nuclearPositions(), value_executor_->boundary());
+      value_geometries_.push_back(qmcplusplus::psiformer::periodic_feature::makeGeometry(
+          electron_count_, value_executor_->nuclearPositions(), value_executor_->boundary(), layout.periodicProfile()));
     determinant_workspaces_.reserve(capacity);
     while (determinant_workspaces_.size() < capacity)
       determinant_workspaces_.push_back(
@@ -2412,10 +2412,6 @@ private:
       DirectSpatialWorkspace& spatial = *workspaces[local];
       DirectSpatialJetBuffer& orbitals = spatial.orbital_matrices_;
       const GeometryPairTable& pairs = spatial.geometry_.electronNucleusPairs();
-      const auto& distances = pairs.distances();
-      const auto& distance_gradients = pairs.distanceGradients();
-      const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
-      const auto& distance_laplacians = pairs.distanceLaplacians();
       for (std::size_t spin_electron = 0; spin_electron < spin_count;
            ++spin_electron)
       {
@@ -2437,8 +2433,10 @@ private:
             {
               const std::size_t parameter = channel * nuclei + nucleus;
               const std::size_t pair = electron * nuclei + nucleus;
-              const double radius = distances[pair];
-              if (radius == 0)
+              const auto selected = qmcplusplus::psiformer::periodic_feature::selectedRadius(
+                  pairs, pair, spatial.geometry_.electronIonBoundary(), layout.periodicProfile());
+              const double radius = selected.value;
+              if (!selected.differentiable)
                 throw std::runtime_error(
                     "PsiFormer batch configuration " +
                     std::to_string(tile_begin + local) +
@@ -2456,12 +2454,12 @@ private:
                   const std::size_t dimension =
                       DirectSpatialExecutor::laneDimension(spatial, lane);
                   spatial.scalar_gradient_scratch_[lane] +=
-                      radial_first * distance_gradients[pair][dimension];
+                      radial_first * selected.gradient[dimension];
                 }
               if (spatial.mode_ == DirectSpatialMode::FULL_VGL)
                 spatial.scalar_laplacian_scratch_[electron] +=
-                    radial_second * distance_gradient_norms[pair] +
-                    radial_first * distance_laplacians[pair];
+                    radial_second * selected.gradient_norm_squared +
+                    radial_first * selected.laplacian;
             }
 
             orbitals.value[matrix_element] = backflow_value * envelope_value;
@@ -2705,6 +2703,8 @@ private:
                           const DirectValueParameterLayout& layout,
                           const PsiFormerGeometryCache& geometry)
   {
+    if (layout.periodicProfile() && !layout.periodicProfile()->electron_electron_cusp)
+      return 0;
     const double same_alpha = layout.same_alpha_.size == 0
         ? 1.0
         : tensor(parameters, layout.same_alpha_)[0];
@@ -2755,7 +2755,9 @@ private:
       const auto& radial_factors = pairs.softenedRadialFactors();
       const bool periodic = workspace.value_geometries_[local].boundary().kind ==
           GeometryBoundaryKind::PERIODIC;
-      const std::size_t pair_width = periodic ? 7 : 4;
+      const auto& profile = layout.periodicProfile();
+      const std::size_t pair_width = profile ? qmcplusplus::psiformer::periodicFeatureArity(profile->feature_transform) :
+                                             periodic ? 7 : 4;
       for (std::size_t electron = 0; electron < ne; ++electron)
       {
         double* row = workspace.raw_features_.data() +
@@ -2764,6 +2766,13 @@ private:
         {
           const std::size_t pair = electron * na + nucleus;
           const std::size_t feature_begin = pair_width * nucleus;
+          if (profile)
+          {
+            const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
+                workspace.value_geometries_[local].electronIonBoundary(), 1, profile->feature_transform, 1);
+            std::copy_n(jet.value.data(), pair_width, row + feature_begin);
+            continue;
+          }
           row[feature_begin] = radial_factors[pair].log1p_radius;
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
             row[feature_begin + 1 + dimension] =
@@ -2792,10 +2801,17 @@ private:
                             tensor(parameters, layer.value), electron_rows, width,
                             workspace.query_.data(), workspace.key_.data(),
                             workspace.projected_value_.data(), statistics);
+      // Reuse the prepared logit planes; no pair features persist across attention blocks.
+      if (layout.periodicProfile())
+        for (std::size_t local = 0; local < tile_size; ++local)
+          qmcplusplus::psiformer::periodic_feature::fillAttentionLogits(workspace.value_geometries_[local],
+              layout.spinUpCount(), layout.periodicProfile()->feature_transform,
+              tensor(parameters, layer.pair_weight), tensor(parameters, layer.pair_bias), heads,
+              workspace.attention_.data() + local * heads * ne * ne);
       batch::attentionReal(workspace.query_.data(), workspace.key_.data(),
                            workspace.projected_value_.data(), tile_size, ne, heads,
                            head_width, workspace.attention_.data(),
-                           workspace.attended_.data());
+                           workspace.attended_.data(), static_cast<bool>(layout.periodicProfile()));
       batch::productReal(workspace.attended_.data(),
                          tensor(parameters, layer.projection), nullptr,
                          electron_rows, width, width, updated_features, statistics);
@@ -2862,14 +2878,8 @@ private:
           for (std::size_t orbital = 0; orbital < ne; ++orbital)
           {
             const std::size_t channel = determinant * ne + orbital;
-            double envelope = 0;
-            for (std::size_t nucleus = 0; nucleus < na; ++nucleus)
-            {
-              const std::size_t parameter = channel * na + nucleus;
-              envelope += pi[parameter] *
-                  std::exp(-std::abs(zeta[parameter] *
-                                     distances[electron * na + nucleus]));
-            }
+            const double envelope = realOrbitalEnvelopeValue(workspace.value_geometries_[local], electron,
+                pi + channel * na, zeta + channel * na, na, layout.periodicProfile());
             workspace.orbital_matrices_[local * matrices_per_configuration +
                 (determinant * ne + electron) * ne + orbital] =
                 backflow[channel] * envelope;
