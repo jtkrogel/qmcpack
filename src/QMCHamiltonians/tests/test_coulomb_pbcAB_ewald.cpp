@@ -238,4 +238,67 @@ TEST_CASE("Mixed periodic local potentials retain bare species across cloning", 
   CHECK(dynamic_cast<CoulombPBCAB&>(*clone).evaluate(copy) == Approx(expected).margin(2e-8));
 }
 
+TEST_CASE("Periodic local radial origin preserves the supplied endpoint", "[hamiltonian][local_pp_origin]")
+{
+  struct RestoreHandler
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) saved = std::move(LRCoulombSingleton::CoulombHandler);
+    ~RestoreHandler() { LRCoulombSingleton::CoulombHandler = std::move(saved); }
+  } restore;
+  Lattice lattice;
+  lattice.R = {6.6, 0, 0, 0, 6.6, 0, 0, 0, 6.6};
+  lattice.BoxBConds = true;
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet ions(cell), electrons(cell);
+  ions.setName("ion");
+  ions.create({1});
+  auto& ionic = ions.getSpeciesSet();
+  ionic.addSpecies("X");
+  ionic(ionic.addAttribute("charge"), 0) = 1;
+  ions.R[0] = {0, 0, 0};
+  ions.resetGroups();
+  ions.createSK();
+  ions.update();
+  electrons.setName("e");
+  electrons.create({1});
+  auto& electronic = electrons.getSpeciesSet();
+  electronic.addSpecies("u");
+  electronic(electronic.addAttribute("charge"), 0) = -1;
+  electronic(electronic.addAttribute("mass"), 0) = 1;
+  electrons.R[0] = {.2, .3, .4};
+  electrons.resetGroups();
+  electrons.createSK();
+  electrons.update();
+  LRCoulombSingleton::CoulombHandler = std::make_unique<EwaldHandler3D>(ions);
+  LRCoulombSingleton::CoulombHandler->initBreakup(ions);
+
+  for (double endpoint : {0.0, 0.37})
+  {
+    CoulombPBCAB potential(ions, electrons);
+    LinearGrid<double> grid;
+    constexpr int count = 10001;
+    grid.set(0, 10, count);
+    std::vector<double> values(count);
+    const double slope = (1 - endpoint) * 2 / std::sqrt(std::acos(-1.0));
+    for (int point = 0; point < count; ++point)
+      values[point] = endpoint + (1 - endpoint) * std::erf(grid[point]);
+    auto pp = std::make_unique<CoulombPBCAB::RadFunctorType>(grid.makeClone(), values);
+    pp->spline(0, slope, count - 1, 0);
+    potential.add(0, std::move(pp));
+    const auto& radial = *potential.Vspec[0];
+    double first, second;
+    CHECK(radial.splint(0, first, second) == Approx(endpoint).margin(1e-15));
+    CHECK(first == Approx(slope - potential.AB->evaluateLR_r0()).margin(1e-12));
+    // A zero supplied endpoint must remain regular even far below the first knot.
+    // Nonzero endpoints retain their declared Coulomb singularity instead.
+    for (double r : {1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2})
+    {
+      const double reconstructed = radial.splint(r) / r + potential.AB->evaluateLR(r);
+      const double expected = endpoint / r + (1 - endpoint) * std::erf(r) / r;
+      CHECK(reconstructed == Approx(expected).margin(1e-7));
+    }
+  }
+}
+
 } // namespace qmcplusplus

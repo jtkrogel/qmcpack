@@ -573,11 +573,14 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
       //need to multiply r for the LR
       v[ig] = -r * AB->evaluateLR(r) + ppot->splint(r);
     }
-    v[0] = 2.0 * v[1] - v[2];
+    // Preserve the supplied endpoint: extrapolation creates an artificial 1/r pole
+    // for regular local potentials after the radial energy is divided by r.
+    RealType ppot_deriv(0), ppot_2deriv(0);
+    v[0] = ppot->splint(0.0, ppot_deriv, ppot_2deriv);
     //by construction, v has to go to zero at the boundary
     v[ng - 2]      = 0.0;
     v[ng - 1]      = 0.0;
-    RealType deriv = (v[1] - v[0]) / dr;
+    RealType deriv = ppot_deriv - AB->evaluateLR_r0();
     auto rfunc     = std::make_unique<RadFunctorType>(agrid_local.makeClone(), v);
     rfunc->spline(0, deriv, ng - 1, 0.0);
     for (int iat = 0; iat < NptclA; iat++)
@@ -591,8 +594,9 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
     if (!ewald_model_definition_.empty())
     {
       std::ostringstream definition;
-      definition << std::hexfloat << ";local_pp_v1:species=" << groupID << ";grid=" << ng
-                 << ";start=0;end=" << myRcut << ";dr=" << dr << ";origin=2v1-v2;tail=zero2";
+      definition << std::hexfloat << ";local_pp_v2:species=" << groupID << ";grid=" << ng
+                 << ";start=0;end=" << myRcut << ";dr=" << dr
+                 << ";origin=input;origin_slope=input-lr0;tail=zero2";
       ewald_model_definition_ += definition.str();
     }
   }
