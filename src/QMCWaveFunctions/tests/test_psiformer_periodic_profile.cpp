@@ -20,7 +20,8 @@ namespace ps = qmcplusplus::psiformer;
 using C = std::complex<double>;
 
 pf::PsiFormer modelWithPairBias(bool paired = true,
-                              ps::PeriodicFeatureTransform transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1)
+                              ps::PeriodicFeatureTransform transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1,
+                              bool fourier = false)
 {
   auto original = qmcplusplus::testing::psiformer::value::tinyModel(true, paired);
   auto values = original.p.flat_values();
@@ -51,12 +52,39 @@ pf::PsiFormer modelWithPairBias(bool paired = true,
           begin, begin + count});
     }
   }
+  if (fourier)
+  {
+    std::vector<double> selected;
+    std::vector<pf::Layout> selected_layouts;
+    for (auto layout : layouts)
+      if (layout.module.find("/exponential_envelopes") == std::string::npos)
+      {
+        const auto begin = selected.size();
+        selected.insert(selected.end(), values.begin() + layout.begin, values.begin() + layout.end);
+        layout.begin = begin;
+        layout.end = selected.size();
+        selected_layouts.push_back(std::move(layout));
+      }
+    const auto channels = original.ndet * original.ne;
+    for (bool up : {false, true})
+    {
+      const auto begin = selected.size();
+      for (std::size_t mode = 0; mode < 3; ++mode)
+        for (std::size_t channel = 0; channel < channels; ++channel)
+          selected.push_back(mode == 0 ? 1 : .04 * std::sin(double(channel + 1 + 3 * mode + up)));
+      selected_layouts.push_back({"periodic/fourier_envelopes", up ? "coefficients_up" : "coefficients_down",
+          {3, original.ndet, original.ne}, begin, selected.size()});
+    }
+    values = std::move(selected);
+    layouts = std::move(selected_layouts);
+  }
   return {pf::Parameters(std::move(values), std::move(layouts)), std::move(original.cfg),
           original.ndet, original.dim, original.heads, original.blocks};
 }
 
 ps::PsiFormerExecutionPlan profilePlan(const pf::PsiFormer& model, ps::PeriodicFeatureTransform transform,
-                                     bool two_cells, bool cusp = true, bool paired = true, bool occupied = false)
+                                     bool two_cells, bool cusp = true, bool paired = true, bool occupied = false,
+                                     bool fourier = false)
 {
   auto environment = qmcplusplus::testing::psiformer::value::environment(true, paired);
   environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
@@ -85,6 +113,12 @@ ps::PsiFormerExecutionPlan profilePlan(const pf::PsiFormer& model, ps::PeriodicF
     const std::array<std::array<int, 3>, 4> momenta{{{-1, 0, 0}, {0, 1, 0}, {1, 0, 1}, {0, -1, -1}}};
     for (std::size_t column = 0; column < model.ne; ++column)
       metadata->occupied_columns[column].reciprocal = momenta[column];
+  }
+  if (fourier)
+  {
+    metadata->envelope_policy = ps::PeriodicEnvelopePolicy::FOURIER;
+    metadata->fourier_modes = {{0, 0, 0}, {1, -1, 0}, {0, 1, 2}};
+    metadata->fourier_origin = {.2, -.3, .4};
   }
   environment.periodic_profile = std::move(metadata);
   return ps::PsiFormerExecutionPlan::fromParameters(model.p,
@@ -134,9 +168,10 @@ TEST_CASE("Periodic pair value and spatial products share the same feature contr
                          ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1,
                          ps::PeriodicFeatureTransform::POLYNOMIAL_V1})
     for (bool occupied : {false, true})
+    for (bool fourier : {false, true})
   {
-    auto model = modelWithPairBias(true, transform);
-    const auto plan = profilePlan(model, transform, true, true, true, occupied);
+    auto model = modelWithPairBias(true, transform, fourier);
+    const auto plan = profilePlan(model, transform, true, true, true, occupied, fourier);
     auto parameters = model.p.flat_values();
     for (std::size_t block = 0; block < model.blocks; ++block)
     {
@@ -154,7 +189,7 @@ TEST_CASE("Periodic pair value and spatial products share the same feature contr
     auto s = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim,
         model.heads, plan.parameter(ps::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks,
-        plan.parameterCount(), true, ps::occupiedMomentumCount(plan), ps::periodicPairFeatureArity(transform)};
+        plan.parameterCount(), true, ps::occupiedMomentumCount(plan), ps::periodicPairFeatureArity(transform), ps::fourierModeCount(plan)};
     CHECK(v->vectorStorageBytes() == pf::DirectComplexValueWorkspace::storageRequirement(shape));
     CHECK(s->vectorStorageBytes() == pf::DirectComplexSpatialWorkspace::storageRequirement(
         shape, pf::DirectSpatialMode::FULL_VGL));
@@ -192,9 +227,10 @@ TEST_CASE("Periodic pair parameter scores and affine rows match full complex dif
 {
   for (auto transform : {ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1, ps::PeriodicFeatureTransform::POLYNOMIAL_V1})
   for (bool occupied : {false, true})
+  for (bool fourier : {false, true})
   {
-  auto model = modelWithPairBias(true, transform);
-  const auto plan = profilePlan(model, transform, true, true, true, occupied);
+  auto model = modelWithPairBias(true, transform, fourier);
+  const auto plan = profilePlan(model, transform, true, true, true, occupied, fourier);
   auto parameters = model.p.flat_values();
   for (std::size_t block = 0; block < model.blocks; ++block)
   {
@@ -314,9 +350,10 @@ TEST_CASE("Periodic pair kinetic parameter responses include full geometric jets
                          ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1,
                          ps::PeriodicFeatureTransform::POLYNOMIAL_V1})
     for (bool occupied : {false, true})
+    for (bool fourier : {false, true})
   {
-    auto model = modelWithPairBias(true, transform);
-    const auto plan = profilePlan(model, transform, true, false, true, occupied);
+    auto model = modelWithPairBias(true, transform, fourier);
+    const auto plan = profilePlan(model, transform, true, false, true, occupied, fourier);
     auto parameters = model.p.flat_values();
     for (std::size_t block = 0; block < model.blocks; ++block)
     {

@@ -45,7 +45,8 @@ enum class InitializationLaw
 {
   CONSTANT,
   NORMAL,
-  TRUNCATED_NORMAL
+  TRUNCATED_NORMAL,
+  UNIT_ZERO_MODE
 };
 
 /** Summarize the requested and observed statistics of one initialized tensor. */

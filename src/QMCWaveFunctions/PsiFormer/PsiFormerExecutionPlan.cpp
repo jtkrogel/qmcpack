@@ -10,6 +10,7 @@
  */
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerFourierHead.h"
 
 #include <algorithm>
 #include <array>
@@ -106,6 +107,13 @@ ClassifiedParameter classifyParameter(const ParameterLayoutInput& layout)
     if (layout.name == "zetas_down")
       return {ParameterRole::ENVELOPE_ZETA_DOWN, NO_ATTENTION_BLOCK};
   }
+  if (endsWith(layout.module, "/fourier_envelopes"))
+  {
+    if (layout.name == "coefficients_up")
+      return {ParameterRole::FOURIER_COEFFICIENT_UP, NO_ATTENTION_BLOCK};
+    if (layout.name == "coefficients_down")
+      return {ParameterRole::FOURIER_COEFFICIENT_DOWN, NO_ATTENTION_BLOCK};
+  }
   if (endsWith(layout.module, "/electronic_cusp_asymptotic"))
   {
     if (layout.name == "same_alpha")
@@ -179,6 +187,10 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
   case ParameterRole::CUSP_SAME_ALPHA:
   case ParameterRole::CUSP_OPPOSITE_ALPHA:
     return {};
+  case ParameterRole::FOURIER_COEFFICIENT_UP:
+  case ParameterRole::FOURIER_COEFFICIENT_DOWN:
+    return {environment.periodic_profile ? environment.periodic_profile->fourier_modes.size() : 0,
+            model.determinants, electrons};
   case ParameterRole::COUNT:
     break;
   }
@@ -219,6 +231,15 @@ void validatePeriodicProfileMetadata(const ModelShape& model, const ExecutionEnv
     return;
   }
   const auto& profile = *environment.periodic_profile;
+  if (profile.envelope_policy == PeriodicEnvelopePolicy::FOURIER)
+  {
+    if (environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX)
+      throw std::invalid_argument("Fourier envelopes require paired complex CPU heads");
+    (void)FourierHeadModes(profile.cells.simulation, profile.fourier_modes, profile.fourier_origin);
+  }
+  else if (profile.envelope_policy != PeriodicEnvelopePolicy::ATOM_CENTERED ||
+           !profile.fourier_modes.empty() || profile.fourier_origin != pf::GeometryPosition{})
+    throw std::invalid_argument("Atom-centered envelopes cannot carry unused Fourier metadata");
   if (profile.version != 1 || environment.boundary != BoundaryCondition::PERIODIC ||
       environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1 ||
       (environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX &&
@@ -357,19 +378,24 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
   // Every role is required except same-spin alpha when neither spin population
   // contains a pair.  DeepQMC does not materialize that unused leaf for a 1+1
   // system, while older portable exports may still contain it.
-  const std::array<ParameterRole, 8> required_global_roles{
+  const bool fourier = environment_.periodic_profile &&
+      environment_.periodic_profile->envelope_policy == PeriodicEnvelopePolicy::FOURIER;
+  const std::array<ParameterRole, 4> required_global_roles{
       ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
       ParameterRole::BACKFLOW_UP_WEIGHT,
       ParameterRole::BACKFLOW_DOWN_WEIGHT,
-      ParameterRole::ENVELOPE_PI_UP,
-      ParameterRole::ENVELOPE_PI_DOWN,
-      ParameterRole::ENVELOPE_ZETA_UP,
-      ParameterRole::ENVELOPE_ZETA_DOWN,
       ParameterRole::CUSP_OPPOSITE_ALPHA};
   for (ParameterRole role : required_global_roles)
     if (!hasParameter(role))
       throw std::invalid_argument(std::string("PsiFormer parameter export is missing required role ") +
                                   parameterRoleName(role));
+  for (ParameterRole role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN,
+                             ParameterRole::ENVELOPE_ZETA_UP, ParameterRole::ENVELOPE_ZETA_DOWN})
+    if (hasParameter(role) == fourier)
+      throw std::invalid_argument("Selected periodic envelope has incompatible atom-centered parameter roles");
+  for (ParameterRole role : {ParameterRole::FOURIER_COEFFICIENT_UP, ParameterRole::FOURIER_COEFFICIENT_DOWN})
+    if (hasParameter(role) != fourier)
+      throw std::invalid_argument("Selected periodic envelope has incompatible Fourier parameter roles");
   for (std::size_t block = 0; block < model_shape_.attention_blocks; ++block)
     for (ParameterRole role : {ParameterRole::ATTENTION_QUERY_WEIGHT,
                                ParameterRole::ATTENTION_KEY_WEIGHT,
@@ -401,7 +427,7 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
         throw std::invalid_argument(std::string("PsiFormer paired-real export is missing imaginary head ") +
                                     parameterRoleName(role));
 
-  const std::size_t expected_tensor_count = 8 + 8 * model_shape_.attention_blocks +
+  const std::size_t expected_tensor_count = (fourier ? 6 : 8) + 8 * model_shape_.attention_blocks +
       (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0) + (paired_head ? 2 : 0) +
       (environment_.periodic_profile ? 2 * model_shape_.attention_blocks : 0);
   if (parameter_tensors_.size() != expected_tensor_count)
@@ -512,6 +538,10 @@ const char* parameterRoleName(ParameterRole role)
     return "pair_attention_weight";
   case ParameterRole::PAIR_ATTENTION_BIAS:
     return "pair_attention_bias";
+  case ParameterRole::FOURIER_COEFFICIENT_UP:
+    return "fourier_coefficient_up";
+  case ParameterRole::FOURIER_COEFFICIENT_DOWN:
+    return "fourier_coefficient_down";
   case ParameterRole::COUNT:
     break;
   }

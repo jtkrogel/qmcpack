@@ -229,6 +229,8 @@ std::vector<TensorSpecification> makeTensorSpecifications(
   const double head_sigma = paired_head ? feature_sigma / std::sqrt(2.0) : feature_sigma;
   const double embedding_sigma = 1.0 / std::sqrt(static_cast<double>(input_width));
   const std::string prefix = "neural_network_wave_function/~/";
+  const bool fourier = environment.periodic_profile &&
+      environment.periodic_profile->envelope_policy == PeriodicEnvelopePolicy::FOURIER;
 
   std::vector<TensorSpecification> tensors;
   const bool has_same_spin_pair = model.spin_up_electrons > 1 || model.spin_down_electrons > 1;
@@ -243,14 +245,29 @@ std::vector<TensorSpecification> makeTensorSpecifications(
   if (has_same_spin_pair)
     appendSpecification(tensors, prefix + "electronic_cusp_asymptotic", "same_alpha", {},
                         ParameterRole::CUSP_SAME_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
-  appendSpecification(tensors, prefix + "exponential_envelopes", "pi_down", {channels, model.nuclei},
-                      ParameterRole::ENVELOPE_PI_DOWN, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
-  appendSpecification(tensors, prefix + "exponential_envelopes", "pi_up", {channels, model.nuclei},
-                      ParameterRole::ENVELOPE_PI_UP, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
-  appendSpecification(tensors, prefix + "exponential_envelopes", "zetas_down", {channels, model.nuclei},
-                      ParameterRole::ENVELOPE_ZETA_DOWN, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
-  appendSpecification(tensors, prefix + "exponential_envelopes", "zetas_up", {channels, model.nuclei},
-                      ParameterRole::ENVELOPE_ZETA_UP, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+  if (fourier)
+  {
+    const std::vector<std::size_t> shape{environment.periodic_profile->fourier_modes.size(), model.determinants, electrons};
+    const double modes = static_cast<double>(shape.front());
+    // Deterministic zero-mode units have nonzero across-tensor variance when other modes exist.
+    appendSpecification(tensors, prefix + "fourier_envelopes", "coefficients_down", shape,
+                        ParameterRole::FOURIER_COEFFICIENT_DOWN, NO_ATTENTION_BLOCK, InitializationLaw::UNIT_ZERO_MODE,
+                        1 / modes, 0, std::sqrt(modes - 1) / modes);
+    appendSpecification(tensors, prefix + "fourier_envelopes", "coefficients_up", shape,
+                        ParameterRole::FOURIER_COEFFICIENT_UP, NO_ATTENTION_BLOCK, InitializationLaw::UNIT_ZERO_MODE,
+                        1 / modes, 0, std::sqrt(modes - 1) / modes);
+  }
+  else
+  {
+    appendSpecification(tensors, prefix + "exponential_envelopes", "pi_down", {channels, model.nuclei},
+                        ParameterRole::ENVELOPE_PI_DOWN, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+    appendSpecification(tensors, prefix + "exponential_envelopes", "pi_up", {channels, model.nuclei},
+                        ParameterRole::ENVELOPE_PI_UP, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+    appendSpecification(tensors, prefix + "exponential_envelopes", "zetas_down", {channels, model.nuclei},
+                        ParameterRole::ENVELOPE_ZETA_DOWN, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+    appendSpecification(tensors, prefix + "exponential_envelopes", "zetas_up", {channels, model.nuclei},
+                        ParameterRole::ENVELOPE_ZETA_UP, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+  }
   appendSpecification(tensors, prefix + "omni_net/~/Backflow/~/mlp/linear_0", "w",
                       {model.feature_dimension, channels}, ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
                       InitializationLaw::NORMAL, 0, head_sigma, head_sigma);
@@ -416,12 +433,14 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
         value += tensor.distribution_standard_deviation * random.normal();
       else if (tensor.law == InitializationLaw::TRUNCATED_NORMAL)
         value += tensor.distribution_standard_deviation * random.truncatedNormal();
+      else if (tensor.law == InitializationLaw::UNIT_ZERO_MODE)
+        value = element < model_shape.determinants * model_shape.electrons() ? 1.0 : 0.0;
       initialized.values.push_back(value);
     }
     const std::size_t end = initialized.values.size();
     initialized.layouts.push_back({tensor.module, tensor.name, tensor.shape, begin, end});
     initialized.diagnostics.tensors.push_back(makeDiagnostic(tensor, initialized.values, begin, end));
-    if (tensor.law == InitializationLaw::CONSTANT)
+    if (tensor.law == InitializationLaw::CONSTANT || tensor.law == InitializationLaw::UNIT_ZERO_MODE)
       initialized.diagnostics.constant_parameter_count += size;
     else
       initialized.diagnostics.random_parameter_count += size;
@@ -450,6 +469,8 @@ const char* initializationLawName(InitializationLaw law)
     return "normal";
   case InitializationLaw::TRUNCATED_NORMAL:
     return "truncated_normal";
+  case InitializationLaw::UNIT_ZERO_MODE:
+    return "unit_zero_mode";
   }
   return "unknown";
 }

@@ -1277,7 +1277,7 @@ struct PsiFormerComplexWF::Impl
           s.plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
           s.model.blocks, s.model.p.size(), bool(s.environment.periodic_profile),
           psiformer::occupiedMomentumCount(s.plan), s.environment.periodic_profile ?
-              s.environment.periodic_profile->pair_feature_dimension : 8};
+              s.environment.periodic_profile->pair_feature_dimension : 8, psiformer::fourierModeCount(s.plan)};
     }
 
     /// Include both executor ion copies and all channel buffers before any numerical allocation.
@@ -1291,6 +1291,7 @@ struct PsiFormerComplexWF::Impl
           pf::checkedStorageProduct(3, dimensions.parameter_count, message), message), message);
       std::size_t doubles = pf::checkedStorageProduct(6, dimensions.nuclei, message);
       pf::addStorageBytes(doubles, pf::checkedStorageProduct(6, dimensions.occupied_momentum_count, message), message);
+      pf::addStorageBytes(doubles, pf::checkedStorageProduct(6, dimensions.fourier_mode_count, message), message);
       pf::addStorageBytes(doubles, pf::checkedStorageProduct(4,
           pf::checkedStorageProduct(samples, dimensions.electrons, message), message), message);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(doubles, message), message);
@@ -1348,7 +1349,8 @@ struct PsiFormerComplexWF::Impl
           3, s.model.cfg.nuclei.shape[0], "orbital metadata overflow"), "orbital metadata overflow"),
           "orbital owner overflow");
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<std::array<double, 3>>(
-          psiformer::occupiedMomentumCount(s.plan), "orbital momentum metadata overflow"), "orbital owner overflow");
+          pf::checkedStorageSum(psiformer::occupiedMomentumCount(s.plan), psiformer::fourierModeCount(s.plan),
+              "orbital mode extent overflow"), "orbital momentum metadata overflow"), "orbital owner overflow");
       return bytes;
     }
     explicit OrbitalMSELane(const Model& s) : score(s.model, s.plan), work(score.makeWorkspace()) {}
@@ -1758,7 +1760,8 @@ struct PsiFormerComplexWF::Impl
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
         state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size(),
         bool(state->environment.periodic_profile), occupiedMomentumCount(state->plan),
-        state->environment.periodic_profile ? state->environment.periodic_profile->pair_feature_dimension : 8};
+        state->environment.periodic_profile ? state->environment.periodic_profile->pair_feature_dimension : 8,
+        fourierModeCount(state->plan)};
     if (!state->gpu_limit)
     {
       numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
@@ -2929,13 +2932,14 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::affineParameterBl
   return gpuInferenceEnabled() ? std::vector<wftrain::AffineParameterBlock>{} : Impl::affineBlocks(*impl_->state);
 }
 
-/// Classify trainable cusp coordinates without treating envelope tensors as generic sums.
+/// Classify cusp and reciprocal-factor coefficients for exact per-coordinate diagonal statistics.
 std::vector<std::size_t> PsiFormerComplexWF::genericKFACParameterBlocks() const
 {
   std::shared_lock read(impl_->state->mutex);
   std::vector<std::size_t> result;
   const auto& state = *impl_->state;
-  for (auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA, psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA})
+  for (auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA, psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA,
+                   psiformer::ParameterRole::FOURIER_COEFFICIENT_UP, psiformer::ParameterRole::FOURIER_COEFFICIENT_DOWN})
     if (state.plan.hasParameter(role))
     {
       const auto offset = state.plan.parameter(role).begin;

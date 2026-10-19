@@ -1293,6 +1293,7 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
   bool pair_profile = false;
   bool occupied_phase = false;
   bool polynomial = false;
+  bool fourier = false;
   SECTION("legacy paired profile") {}
   SECTION("two-cell pair profile with complete physical ions") { pair_profile = true; }
   SECTION("two-cell occupied reciprocal profile with complete physical ions")
@@ -1305,6 +1306,12 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     pair_profile = true;
     occupied_phase = true;
     polynomial = true;
+  }
+  SECTION("Fourier replacement two-cell occupied profile with complete physical ions")
+  {
+    pair_profile = true;
+    occupied_phase = true;
+    fourier = true;
   }
   const SimulationCell simulation_cell(cell());
   auto p = electrons(simulation_cell);
@@ -1359,6 +1366,12 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     metadata->feature_transform = polynomial ? ps::PeriodicFeatureTransform::POLYNOMIAL_V1 :
                                               ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
     metadata->pair_feature_dimension = ps::periodicPairFeatureArity(metadata->feature_transform);
+    if (fourier)
+    {
+      metadata->envelope_policy = ps::PeriodicEnvelopePolicy::FOURIER;
+      metadata->fourier_modes = {{0, 0, 0}, {1, -1, 0}, {0, 1, 2}};
+      metadata->fourier_origin = {2.5, .5, .5};
+    }
     for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns.push_back({{}, i % 2, int(i / 2), 1});
     if (occupied_phase)
     {
@@ -1378,6 +1391,39 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
         initialized.layouts.push_back({"periodic/" + layer + "/pair_attention", bias ? "b" : "w",
             bias ? std::vector<std::size_t>{heads} : std::vector<std::size_t>{pair_arity, heads}, begin, initialized.values.size()});
       }
+  }
+  if (fourier)
+  {
+    std::vector<double> values;
+    std::vector<ps::ParameterLayoutInput> layouts;
+    for (auto layout : initialized.layouts)
+      if (layout.module.find("/exponential_envelopes") == std::string::npos)
+      {
+        const auto begin = values.size();
+        values.insert(values.end(), initialized.values.begin() + layout.begin, initialized.values.begin() + layout.end);
+        layout.begin = begin;
+        layout.end = values.size();
+        layouts.push_back(std::move(layout));
+      }
+    const auto& shape = initialized.model_shape;
+    const auto channels = shape.determinants * shape.electrons();
+    for (bool up : {false, true})
+    {
+      const auto begin = values.size();
+      for (std::size_t mode = 0; mode < 3; ++mode)
+        for (std::size_t channel = 0; channel < channels; ++channel)
+          values.push_back(mode == 0 ? 1 : .03 * std::sin(double(channel + 1 + mode + up)));
+      layouts.push_back({"periodic/fourier_envelopes", up ? "coefficients_up" : "coefficients_down",
+          {3, shape.determinants, shape.electrons()}, begin, values.size()});
+    }
+    initialized.values = std::move(values);
+    initialized.layouts = std::move(layouts);
+    auto invalid = initialized;
+    auto metadata = std::make_shared<ps::PeriodicProfileMetadata>(*initialized.environment.periodic_profile);
+    invalid.environment.periodic_profile = metadata;
+    // The feature motif mean is not the declared full physical-source image mean.
+    metadata->fourier_origin = {.5, .5, .5};
+    CHECK_THROWS(PsiFormerComplexWF("bad_origin", invalid, p, source, clone_cap, {.17, -.11, .07}));
   }
   PsiFormerComplexWF component("affine", initialized, p, source, clone_cap, {.17, -.11, .07});
   const auto& schema = component.parameterSchema();
@@ -1478,6 +1524,55 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     close({real[index], imaginary[index]}, (plus - minus) / (2 * step), 2e-7);
   }
   CHECK(component.affineScoreStorage().prepared_bytes == required);
+  if (fourier)
+  {
+    std::vector<C> raw_values;
+    component.evaluateOrbitalValues(p, raw_values, component.snapshotParameters().version);
+    const std::vector<C> target(raw_values.size(), C{.02, -.03});
+    auto value_loss = [&]() {
+      component.evaluateOrbitalValues(p, raw_values, component.snapshotParameters().version);
+      double loss = 0;
+      for (std::size_t index = 0; index < target.size(); ++index)
+        loss += std::norm(raw_values[index] - target[index]) / (component.orbitalMSEChannelCount() * 2 * 4);
+      return loss;
+    };
+    const auto owner = component.orbitalMSEStorage();
+    CHECK(owner.prepared_bytes == 0);
+    CHECK_THROWS(component.prepareOrbitalMSE(owner.required_bytes - 1));
+    component.prepareOrbitalMSE(owner.required_bytes);
+    CHECK(component.orbitalMSEStorage().prepared_bytes == owner.required_bytes);
+    std::vector<double> gradient(original.values.size());
+    const auto version = component.snapshotParameters().version;
+    const double loss = component.evaluateOrbitalMSE(p, target, gradient, version);
+    CHECK(loss == Catch::Approx(value_loss()).epsilon(1e-12));
+    const ps::PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
+    const auto generic = component.genericKFACParameterBlocks();
+    for (auto role : {ps::ParameterRole::FOURIER_COEFFICIENT_UP, ps::ParameterRole::FOURIER_COEFFICIENT_DOWN})
+    {
+      const auto& tensor = plan.parameter(role);
+      const auto block = std::find_if(schema.blocks().begin(), schema.blocks().end(), [&](const auto& candidate) {
+        return candidate.offset == tensor.begin;
+      });
+      REQUIRE(block != schema.blocks().end());
+      CHECK(std::find(generic.begin(), generic.end(), std::size_t(block - schema.blocks().begin())) != generic.end());
+      const auto index = tensor.begin + initialized.model_shape.determinants * initialized.model_shape.electrons();
+      auto candidate = component.snapshotParameters();
+      candidate.values[index] += step;
+      component.publishParameters(candidate, candidate.version);
+      const C plus = evaluate(component, p);
+      const double plus_loss = value_loss();
+      candidate = component.snapshotParameters();
+      candidate.values[index] -= 2 * step;
+      component.publishParameters(candidate, candidate.version);
+      const C minus = evaluate(component, p);
+      const double minus_loss = value_loss();
+      candidate = component.snapshotParameters();
+      candidate.values = original.values;
+      component.publishParameters(candidate, candidate.version);
+      close({real[index], imaginary[index]}, (plus - minus) / (2 * step), 2e-7);
+      CHECK(gradient[index] == Catch::Approx((plus_loss - minus_loss) / (2 * step)).margin(2e-8));
+    }
+  }
   if (pair_profile)
   {
     evaluate(component, p);
@@ -1523,6 +1618,18 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     CHECK(metadata.pair_feature_dimension == (polynomial ? 5 : 8));
     CHECK_FALSE(metadata.electron_electron_cusp);
     CHECK(metadata.occupied_columns.size() == 4);
+    CHECK(metadata.envelope_policy == (fourier ? ps::PeriodicEnvelopePolicy::FOURIER : ps::PeriodicEnvelopePolicy::ATOM_CENTERED));
+    if (fourier)
+    {
+      CHECK(metadata.fourier_modes == initialized.environment.periodic_profile->fourier_modes);
+      CHECK(metadata.fourier_origin == std::array<double, 3>{2.5, .5, .5});
+      const ps::PsiFormerExecutionPlan plan(imported.parameters.model_shape, imported.parameters.layouts,
+                                           imported.parameters.environment);
+      CHECK_FALSE(plan.hasParameter(ps::ParameterRole::ENVELOPE_PI_UP));
+      CHECK_FALSE(plan.hasParameter(ps::ParameterRole::ENVELOPE_ZETA_DOWN));
+      CHECK(plan.parameter(ps::ParameterRole::FOURIER_COEFFICIENT_UP).shape ==
+            std::vector<std::size_t>{3, initialized.model_shape.determinants, 4});
+    }
     for (std::size_t column = 0; column < metadata.occupied_columns.size(); ++column)
       CHECK(metadata.occupied_columns[column].reciprocal ==
             initialized.environment.periodic_profile->occupied_columns[column].reciprocal);

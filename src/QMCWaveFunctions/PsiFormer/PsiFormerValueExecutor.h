@@ -155,10 +155,13 @@ public:
     anti_alpha_ = interval(plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
     if (const auto* same_alpha = plan.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
       same_alpha_ = interval(*same_alpha);
-    pi_down_    = interval(plan.parameter(ParameterRole::ENVELOPE_PI_DOWN));
-    pi_up_      = interval(plan.parameter(ParameterRole::ENVELOPE_PI_UP));
-    zeta_down_  = interval(plan.parameter(ParameterRole::ENVELOPE_ZETA_DOWN));
-    zeta_up_    = interval(plan.parameter(ParameterRole::ENVELOPE_ZETA_UP));
+    if (!periodic_profile_ || periodic_profile_->envelope_policy == qmcplusplus::psiformer::PeriodicEnvelopePolicy::ATOM_CENTERED)
+    {
+      pi_down_    = interval(plan.parameter(ParameterRole::ENVELOPE_PI_DOWN));
+      pi_up_      = interval(plan.parameter(ParameterRole::ENVELOPE_PI_UP));
+      zeta_down_  = interval(plan.parameter(ParameterRole::ENVELOPE_ZETA_DOWN));
+      zeta_up_    = interval(plan.parameter(ParameterRole::ENVELOPE_ZETA_UP));
+    }
     backflow_up_   = interval(plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT));
     backflow_down_ = interval(plan.parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT));
     embedding_     = interval(plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT));

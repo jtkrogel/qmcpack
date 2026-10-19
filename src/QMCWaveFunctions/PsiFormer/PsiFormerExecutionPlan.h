@@ -62,6 +62,8 @@ enum class ParameterRole
   CUSP_OPPOSITE_ALPHA,
   PAIR_ATTENTION_WEIGHT,
   PAIR_ATTENTION_BIAS,
+  FOURIER_COEFFICIENT_UP,
+  FOURIER_COEFFICIENT_DOWN,
   COUNT
 };
 
@@ -131,6 +133,9 @@ struct OccupiedReciprocalColumn
   double occupation = 1;
 };
 
+/// Atom-centered envelopes remain the default; Fourier replaces, rather than compounds, them.
+enum class PeriodicEnvelopePolicy { ATOM_CENTERED, FOURIER };
+
 /// Immutable opt-in periodic feature/head contract; legacy environments have no record.
 struct PeriodicProfileMetadata
 {
@@ -142,6 +147,9 @@ struct PeriodicProfileMetadata
   std::size_t pair_feature_dimension = 8;
   bool electron_electron_cusp = true;
   std::vector<OccupiedReciprocalColumn> occupied_columns;
+  PeriodicEnvelopePolicy envelope_policy = PeriodicEnvelopePolicy::ATOM_CENTERED;
+  std::vector<std::array<int, 3>> fourier_modes;
+  pf::GeometryPosition fourier_origin{};
 };
 
 /// Select the scalar algebra expected by forward and adjoint kernels.

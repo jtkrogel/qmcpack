@@ -11,6 +11,13 @@
 
 namespace qmcplusplus::psiformer
 {
+/// Count prepared Fourier vectors only for the explicit replacement-envelope option.
+inline std::size_t fourierModeCount(const PsiFormerExecutionPlan& plan)
+{
+  const auto& profile = plan.environment().periodic_profile;
+  return profile && profile->envelope_policy == PeriodicEnvelopePolicy::FOURIER ? profile->fourier_modes.size() : 0;
+}
+
 /// Count only nonzero-G descriptor storage, preserving Gamma's legacy allocation.
 inline std::size_t occupiedMomentumCount(const PsiFormerExecutionPlan& plan)
 {
@@ -38,6 +45,8 @@ inline ComplexOrbitalHeadDescriptor occupiedFullHeadDescriptor(const PsiFormerEx
       ComplexOrbitalPhase::NONE, {}};
   const auto& metadata = plan.environment().periodic_profile;
   const auto count = occupiedMomentumCount(plan);
+  if (fourierModeCount(plan))
+    result.fourier_modes.emplace(metadata->cells.simulation, metadata->fourier_modes, metadata->fourier_origin);
   if (!count)
     return result;
   const auto& a = metadata->cells.simulation.lattice_vectors;

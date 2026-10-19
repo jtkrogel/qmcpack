@@ -58,7 +58,7 @@ public:
     const auto layout = makeSpatialJetLayout(1, orbitals, shape.electrons, SpatialJetMode::VALUE_ONLY);
     std::size_t bytes = valueWorkspaceStorageRequirement(shape) -
         determinantStorageRequirement(shape.determinants, shape.electrons);
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count),
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count, shape.fourier_mode_count),
                     "complex value bytes overflow");
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
         shape.determinants, shape.electrons), "complex value bytes overflow");
@@ -193,8 +193,13 @@ public:
       const auto role = spin ? ParameterRole::BACKFLOW_DOWN_WEIGHT : ParameterRole::BACKFLOW_UP_WEIGHT;
       real_[spin] = interval(plan.parameter(role));
       imaginary_[spin] = interval(plan.parameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG));
-      pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
-      zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      if (descriptor_.fourier_modes)
+        fourier_[spin] = interval(plan.parameter(spin ? ParameterRole::FOURIER_COEFFICIENT_DOWN : ParameterRole::FOURIER_COEFFICIENT_UP));
+      else
+      {
+        pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
+        zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      }
     }
   }
 
@@ -236,16 +241,16 @@ private:
         for (std::size_t orbital = 0; orbital < n; ++orbital)
         {
           const std::size_t channel = d * n + orbital;
-          workspace.envelopes_[(d * n + row) * n + orbital] = realOrbitalEnvelopeValue(
+          workspace.envelopes_[(d * n + row) * n + orbital] = descriptor_.fourier_modes ? 1.0 : realOrbitalEnvelopeValue(
               *trunk.geometry, row, parameters + pi_[spin].begin + channel * nuclei,
               parameters + zeta_[spin].begin + channel * nuclei, nuclei, trunk_.trunkLayout()->periodicProfile());
         }
     }
     qmcplusplus::psiformer::ComplexOrbitalHeadParameters heads;
     heads.up = {parameters + real_[0].begin, parameters + imaginary_[0].begin,
-                nullptr, nullptr, real_[0].size, 0};
+                nullptr, nullptr, real_[0].size, 0, fourier_[0].size ? parameters + fourier_[0].begin : nullptr, fourier_[0].size};
     heads.down = {parameters + real_[1].begin, parameters + imaginary_[1].begin,
-                  nullptr, nullptr, real_[1].size, 0};
+                  nullptr, nullptr, real_[1].size, 0, fourier_[1].size ? parameters + fourier_[1].begin : nullptr, fourier_[1].size};
     workspace.head_.evaluate(trunk.features, workspace.features_.element_count,
         workspace.envelopes_.data(), workspace.envelopes_.size(), trunk.packed_positions,
         3 * n, heads);
@@ -310,7 +315,7 @@ private:
   const Parameters& parameters_;
   DirectValueExecutor trunk_;
   const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor descriptor_;
-  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_;
+  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_, fourier_;
 };
 } // namespace pf
 #endif

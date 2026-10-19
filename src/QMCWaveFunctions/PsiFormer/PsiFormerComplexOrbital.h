@@ -11,6 +11,8 @@
 
 #include "PsiFormerComplexDeterminant.h"
 #include "PsiFormerSpatialLayout.h"
+#include "PsiFormerFourierHead.h"
+#include <optional>
 
 namespace qmcplusplus::psiformer
 {
@@ -36,6 +38,7 @@ struct ComplexOrbitalHeadDescriptor
   ComplexOrbitalStructure structure = ComplexOrbitalStructure::FULL;
   ComplexOrbitalPhase phase = ComplexOrbitalPhase::NONE;
   std::vector<std::array<double, 3>> reciprocal_momenta;
+  std::optional<FourierHeadModes> fourier_modes;
 };
 
 /** Two real affine projections for one row-spin sector.
@@ -51,6 +54,8 @@ struct ComplexOrbitalSpinParameters
   const double* imaginary_bias = nullptr;
   std::size_t weight_count = 0;
   std::size_t bias_count = 0;
+  const double* fourier_coefficients = nullptr;
+  std::size_t fourier_coefficient_count = 0;
 };
 
 /// Separate real parameter views share the same real trunk by physical row.
@@ -177,6 +182,17 @@ private:
             compose(envelopes, positions, configuration, d, row, orbital, element, active_electron);
           }
         }
+    if (descriptor_.fourier_modes)
+    {
+      transformFourierHeadJets(*descriptor_.fourier_modes, output_, descriptor_.determinants,
+          descriptor_.spin_up, positions, position_count,
+          {parameters.up.fourier_coefficients, parameters.down.fourier_coefficients},
+          {parameters.up.fourier_coefficient_count, parameters.down.fourier_coefficient_count},
+          result_.data(), result_.size(), false, active_electron);
+      for (const auto value : result_)
+        if (!determinant::isFiniteComplex(value))
+          throw std::overflow_error("complex orbital product output overflow");
+    }
     valid_ = true;
   }
 
@@ -214,10 +230,12 @@ public:
   }
 
   /// Count explicitly owned numeric buffers and copied reciprocal momentum storage.
-  static std::size_t storageRequirement(const SpatialJetLayout& output, std::size_t momentum_count = 0)
+  static std::size_t storageRequirement(const SpatialJetLayout& output, std::size_t momentum_count = 0,
+      std::size_t fourier_mode_count = 0)
   {
     return spatial_detail::checkedAdd(multiply(multiply(2, spatialJetSpanElements(output)), sizeof(C)),
-        multiply(momentum_count, sizeof(std::array<double, 3>)), "complex head storage bytes overflow");
+        multiply(spatial_detail::checkedAdd(momentum_count, fourier_mode_count, "complex mode extent overflow"),
+                 sizeof(std::array<double, 3>)), "complex head storage bytes overflow");
   }
 
   /// Count live vector capacities rather than shared parameter storage.
@@ -226,6 +244,8 @@ public:
     std::size_t bytes = multiply(projected_.capacity(), sizeof(C));
     bytes = spatial_detail::checkedAdd(bytes, multiply(result_.capacity(), sizeof(C)),
                                        "complex head storage bytes overflow");
+    if (descriptor_.fourier_modes)
+      bytes = spatial_detail::checkedAdd(bytes, descriptor_.fourier_modes->storageBytes(), "complex Fourier storage overflow");
     return spatial_detail::checkedAdd(bytes,
         multiply(descriptor_.reciprocal_momenta.capacity(), sizeof(std::array<double, 3>)),
         "complex head storage bytes overflow");
@@ -236,6 +256,8 @@ public:
   {
     std::size_t hash = 1469598103934665603ULL;
     determinant::detail::mixStorage(hash, descriptor_.reciprocal_momenta);
+    if (descriptor_.fourier_modes)
+      determinant::detail::mixStorage(hash, descriptor_.fourier_modes->momenta());
     determinant::detail::mixStorage(hash, projected_);
     determinant::detail::mixStorage(hash, result_);
     return hash;
@@ -271,6 +293,9 @@ private:
   {
     validateSpatialJetLayout(features_);
     validateSpatialJetLayout(envelopes_);
+    if (descriptor_.fourier_modes && (descriptor_.structure != ComplexOrbitalStructure::FULL ||
+        !descriptor_.spin_up || descriptor_.spin_up >= descriptor_.electrons))
+      throw std::invalid_argument("Fourier orbital factors require full matrices with both row-spin sectors");
     if (!descriptor_.electrons || descriptor_.spin_up > descriptor_.electrons ||
         !descriptor_.determinants || !descriptor_.feature_width ||
         (descriptor_.structure != ComplexOrbitalStructure::FULL &&

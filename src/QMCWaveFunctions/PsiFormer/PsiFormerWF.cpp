@@ -300,6 +300,14 @@ void mixPeriodicProfile(std::uint64_t& hash, const psiformer::ExecutionEnvironme
     mixPersistentInteger(hash, column.spin);
     mixPersistentDouble(hash, column.occupation);
   }
+  if (profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::FOURIER)
+  {
+    mixPersistentString(hash, "fourier_replacement_envelope_v1");
+    mixPersistentInteger(hash, profile->fourier_modes.size());
+    for (const auto& mode : profile->fourier_modes)
+      for (int value : mode) mixPersistentInteger(hash, value);
+    for (double value : profile->fourier_origin) mixPersistentDouble(hash, value);
+  }
 }
 
 /** Build a cross-rank identity from immutable physics, layout, and initial weights.
@@ -871,6 +879,9 @@ InitializedNativeModel makeInitializedNativeModel(
   {
     validateRuntimeLattice(electrons, initialized.environment, "Periodic PsiFormer initialization");
     validateRuntimeLattice(ions, initialized.environment, "Periodic PsiFormer source");
+    if (profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::FOURIER)
+      psiformer::validateFourierOrigin(profile->fourier_origin,
+          pf::GeometryPositionView::interleaved(nuclear_positions.data(), ions.getTotalNum()));
     if (shape.nuclei != profile->primitive_motif.size())
       throw std::invalid_argument("Periodic PsiFormer feature count differs from its primitive motif");
     std::vector<double> motif_positions;
@@ -11580,15 +11591,21 @@ void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
                           const std::vector<double>& physical_source = {})
 {
   const bool versioned = static_cast<bool>(environment.periodic_profile);
+  const bool fourier = versioned &&
+      environment.periodic_profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::FOURIER;
   if (versioned && (profile != psiformer::PSIFORMER_PERIODIC_PAIR_V1 || physical_source.empty() ||
                    physical_source.size() % 5 != 0))
     throw std::invalid_argument("Periodic profile export requires complete physical source metadata");
+  if (fourier)
+    psiformer::validateFourierOrigin(environment.periodic_profile->fourier_origin,
+        pf::GeometryPositionView::interleaved(physical_source.data(), physical_source.size() / 5, 5));
   model.p.write(path);
   hdf_archive output;
   if (!output.open(path, H5F_ACC_RDWR))
     throw std::runtime_error("Unable to append PsiFormer model metadata");
   output.push("psiformer_model");
-  output.write(versioned ? std::vector<int>{1, 1, 0} : std::vector<int>{1, 0, 0}, "format_version");
+  output.write(fourier ? std::vector<int>{1, 2, 0} :
+      versioned ? std::vector<int>{1, 1, 0} : std::vector<int>{1, 0, 0}, "format_version");
   output.write(std::string("fp64_reference"), "precision");
   output.write(std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
       model.ndet, model.dim, model.heads, model.blocks}, "shape");
@@ -11640,6 +11657,15 @@ void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
     output.write(bands, "occupied_bands");
     output.write(spins, "occupied_spins");
     output.write(occupations, "occupied_occupations");
+    if (fourier)
+    {
+      std::vector<int> modes;
+      for (const auto& mode : metadata.fourier_modes)
+        modes.insert(modes.end(), mode.begin(), mode.end());
+      output.write(static_cast<int>(metadata.envelope_policy), "envelope_policy");
+      output.write(modes, "fourier_modes");
+      output.write(std::vector<double>(metadata.fourier_origin.begin(), metadata.fourier_origin.end()), "fourier_origin");
+    }
     output.pop();
   }
   output.write(model.p.layout_fingerprint(), "layout_fingerprint");
@@ -11682,7 +11708,7 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
   const bool versioned = result.parameters.profile == PSIFORMER_PERIODIC_PAIR_V1;
   if (versioned)
   {
-    if (version != std::vector<int>{1, 1, 0} || shape.size() != 7 ||
+    if ((version != std::vector<int>{1, 1, 0} && version != std::vector<int>{1, 2, 0}) || shape.size() != 7 ||
         std::any_of(shape.begin(), shape.end(), [](auto n) {
           return n == 0 || n > std::numeric_limits<std::size_t>::max(); }) ||
         precision != "fp64_reference" || cookie != "psiformer-model-complete-v1" ||
@@ -11729,6 +11755,20 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
         input.readEntry(metadata->motif_species, "motif_species") && input.readEntry(momenta, "occupied_reciprocal") &&
         input.readEntry(bands, "occupied_bands") && input.readEntry(spins, "occupied_spins") &&
         input.readEntry(occupations, "occupied_occupations");
+    if (version == std::vector<int>{1, 2, 0})
+    {
+      int policy = -1;
+      std::vector<int> modes;
+      std::vector<double> origin;
+      if (!input.readEntry(policy, "envelope_policy") || policy != static_cast<int>(PeriodicEnvelopePolicy::FOURIER) ||
+          !input.readEntry(modes, "fourier_modes") || modes.empty() || modes.size() % 3 ||
+          modes.size() / 3 > FOURIER_MODE_LIMIT || !input.readEntry(origin, "fourier_origin") || origin.size() != 3)
+        throw std::runtime_error("Incomplete Fourier replacement-envelope model metadata");
+      metadata->envelope_policy = PeriodicEnvelopePolicy::FOURIER;
+      std::copy(origin.begin(), origin.end(), metadata->fourier_origin.begin());
+      for (std::size_t mode = 0; mode < modes.size() / 3; ++mode)
+        metadata->fourier_modes.push_back({modes[3 * mode], modes[3 * mode + 1], modes[3 * mode + 2]});
+    }
     input.pop();
     if (!complete || primitive.size() != 9 || tiling.size() != 9 ||
         motif.size() != 3 * shape[2] || bands.size() != shape[0] + shape[1] ||
@@ -11763,6 +11803,14 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
     }
     environment.periodic_profile = std::move(metadata);
     validatePeriodicProfileMetadata(result.parameters.model_shape, environment);
+    if (environment.periodic_profile->envelope_policy == PeriodicEnvelopePolicy::FOURIER)
+    {
+      std::vector<double> physical;
+      if (!input.readEntry(physical, "physical_source") || physical.empty() || physical.size() % 5)
+        throw std::runtime_error("Fourier model lacks its complete physical source snapshot");
+      validateFourierOrigin(environment.periodic_profile->fourier_origin,
+          pf::GeometryPositionView::interleaved(physical.data(), physical.size() / 5, 5));
+    }
   }
   pf::Parameters parameters(path);
   if (parameters.layout_fingerprint() != layout ||
@@ -11816,6 +11864,9 @@ void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, cons
         if (physical[5 * atom + d] != ions.R[atom][d])
           throw std::invalid_argument("Periodic profile physical source positions differ from XML");
     }
+    if (metadata.envelope_policy == PeriodicEnvelopePolicy::FOURIER)
+      validateFourierOrigin(metadata.fourier_origin,
+          pf::GeometryPositionView::interleaved(physical.data(), physical.size() / 5, 5));
     std::vector<double> motif_positions;
     for (const auto& atom : metadata.primitive_motif)
       motif_positions.insert(motif_positions.end(), atom.begin(), atom.end());

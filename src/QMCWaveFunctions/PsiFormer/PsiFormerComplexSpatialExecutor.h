@@ -24,6 +24,11 @@ inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
   const std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata>& profile = {})
 {
   std::fill_n(output, qmcplusplus::psiformer::spatialJetSpanElements(orbitals), 0.0);
+  if (profile && profile->envelope_policy == qmcplusplus::psiformer::PeriodicEnvelopePolicy::FOURIER)
+  {
+    std::fill_n(output, orbitals.element_count, 1.0);
+    return;
+  }
   const auto& pairs = geometry.electronNucleusPairs();
   const std::size_t n = orbitals.electron_count;
   for (std::size_t row = 0; row < n; ++row)
@@ -107,7 +112,7 @@ public:
             jets.gradient_lanes, jets.laplacian_lanes) -
         checkedStorageBytes<double>(outputs, "real output bytes overflow");
     // The omitted real orbital jets and the explicit real envelope jets have identical extents.
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets, shape.occupied_momentum_count),
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets, shape.occupied_momentum_count, shape.fourier_mode_count),
                     "complex spatial bytes overflow");
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(shape.determinants,
         shape.electrons, 0, jets.gradient_lanes, jets.laplacian_lanes), "complex spatial bytes overflow");
@@ -253,8 +258,13 @@ public:
       const auto role = spin ? ParameterRole::BACKFLOW_DOWN_WEIGHT : ParameterRole::BACKFLOW_UP_WEIGHT;
       real_[spin] = interval(plan.parameter(role));
       imaginary_[spin] = interval(plan.parameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG));
-      pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
-      zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      if (descriptor_.fourier_modes)
+        fourier_[spin] = interval(plan.parameter(spin ? ParameterRole::FOURIER_COEFFICIENT_DOWN : ParameterRole::FOURIER_COEFFICIENT_UP));
+      else
+      {
+        pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
+        zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      }
     }
   }
 
@@ -326,8 +336,10 @@ private:
         metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data(),
         metadata_.trunkLayout()->periodicProfile());
     ComplexOrbitalHeadParameters heads;
-    heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
-    heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};
+    heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0,
+        fourier_[0].size ? p + fourier_[0].begin : nullptr, fourier_[0].size};
+    heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0,
+        fourier_[1].size ? p + fourier_[1].begin : nullptr, fourier_[1].size};
     const auto& f = *t.features;
     const ComplexOrbitalFeatureJetView features{f.value.data(), f.gradient.data(), f.laplacian.data(),
                                                f.value.size(), f.gradient.size(), f.laplacian.size()};
@@ -365,7 +377,7 @@ private:
   DirectValueExecutor metadata_;
   DirectSpatialExecutor trunk_;
   const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor descriptor_;
-  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_;
+  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_, fourier_;
 };
 } // namespace pf
 #endif

@@ -279,7 +279,7 @@ TEST_CASE("PsiFormer complex periodic initialization uses independent normalized
   CHECK(initialized.values.size() == 1644802);
   CHECK(initialized.diagnostics.constant_parameter_count == 514);
   CHECK(initialized.diagnostics.random_parameter_count == 1644288);
-  CHECK(PARAMETER_ROLE_COUNT == 19);
+  CHECK(PARAMETER_ROLE_COUNT == 21);
   CHECK_FALSE(PsiFormerExecutionPlan::capabilities().complex_scalars);
   for (ParameterRole role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
   {
@@ -419,6 +419,35 @@ TEST_CASE("Periodic pair initialization requires explicit metadata and zero affi
           std::vector<std::size_t>{5, shape.attention_heads});
     CHECK_FALSE(polynomial.environment.periodic_profile->electron_electron_cusp);
   }
+  metadata->feature_transform = PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+  metadata->pair_feature_dimension = periodicPairFeatureArity(metadata->feature_transform);
+  metadata->envelope_policy = PeriodicEnvelopePolicy::FOURIER;
+  metadata->fourier_modes = {{0, 0, 0}, {1, -1, 0}, {0, 1, 2}};
+  metadata->fourier_origin = {.2, -.3, .4};
+  const auto fourier = initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment);
+  const PsiFormerExecutionPlan fourier_plan(shape, fourier.layouts, fourier.environment);
+  for (auto role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN,
+                    ParameterRole::ENVELOPE_ZETA_UP, ParameterRole::ENVELOPE_ZETA_DOWN})
+    CHECK_FALSE(fourier_plan.hasParameter(role));
+  for (auto role : {ParameterRole::FOURIER_COEFFICIENT_UP, ParameterRole::FOURIER_COEFFICIENT_DOWN})
+  {
+    const auto& tensor = fourier_plan.parameter(role);
+    CHECK(tensor.shape == std::vector<std::size_t>{3, shape.determinants, shape.electrons()});
+    for (std::size_t index = 0; index < tensor.size(); ++index)
+      CHECK(fourier.values[tensor.begin + index] == (index < shape.determinants * shape.electrons() ? 1 : 0));
+    CHECK(diagnostic(fourier.diagnostics, role).law == InitializationLaw::UNIT_ZERO_MODE);
+  }
+  metadata->fourier_modes[1] = {};
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment), std::invalid_argument);
+  CHECK(fourier_plan.environment().periodic_profile->fourier_modes[1] == std::array<int, 3>{1, -1, 0});
+  metadata->fourier_modes[1] = {1, -1, 0};
+  environment.head_representation = HeadRepresentation::REAL;
+  environment.amplitude_scalar_domain = ScalarDomain::REAL;
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment), std::invalid_argument);
+  environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+  environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  metadata->envelope_policy = PeriodicEnvelopePolicy::ATOM_CENTERED;
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment), std::invalid_argument);
 }
 
 } // namespace qmcplusplus::psiformer

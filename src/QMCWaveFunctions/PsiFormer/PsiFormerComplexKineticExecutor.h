@@ -45,7 +45,7 @@ public:
     const auto layout = makeSpatialJetLayout(1,
         checkedStorageProduct(shape.determinants, square, message), n, SpatialJetMode::FULL_VGL);
     std::size_t bytes = kineticTrunkWorkspaceStorageRequirement(shape);
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count), message);
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count, shape.fourier_mode_count), message);
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
         shape.determinants, n, 0, g, n), message);
     addStorageBytes(bytes, checkedStorageBytes<double>(spatialJetSpanElements(layout), message), message);
@@ -195,7 +195,8 @@ public:
         shape_{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
                plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
                model.blocks, plan.parameterCount(), bool(plan.environment().periodic_profile),
-               qmcplusplus::psiformer::occupiedMomentumCount(plan), profile_ ? profile_->pair_feature_dimension : 8}
+               qmcplusplus::psiformer::occupiedMomentumCount(plan), profile_ ? profile_->pair_feature_dimension : 8,
+               qmcplusplus::psiformer::fourierModeCount(plan)}
   {
     using namespace qmcplusplus::psiformer;
     if (plan.environment().head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
@@ -214,8 +215,13 @@ public:
       };
       real_[spin] = interval(plan.parameter(role));
       imaginary_[spin] = interval(plan.parameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG));
-      pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
-      zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      if (descriptor_.fourier_modes)
+        fourier_[spin] = interval(plan.parameter(spin ? ParameterRole::FOURIER_COEFFICIENT_DOWN : ParameterRole::FOURIER_COEFFICIENT_UP));
+      else
+      {
+        pi_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_PI_DOWN : ParameterRole::ENVELOPE_PI_UP));
+        zeta_[spin] = interval(plan.parameter(spin ? ParameterRole::ENVELOPE_ZETA_DOWN : ParameterRole::ENVELOPE_ZETA_UP));
+      }
     }
   }
 
@@ -238,7 +244,9 @@ public:
   std::size_t numericMetadataStorageBytes() const
   {
     return checkedStorageSum(trunk_.numericMetadataStorageBytes(),
-        checkedStorageBytes<std::array<double, 3>>(descriptor_.reciprocal_momenta.capacity(),
+        checkedStorageBytes<std::array<double, 3>>(checkedStorageSum(descriptor_.reciprocal_momenta.capacity(),
+            descriptor_.fourier_modes ? descriptor_.fourier_modes->momenta().capacity() : 0,
+            "complex kinetic mode extent overflow"),
             "complex kinetic momentum metadata overflow"), "complex kinetic metadata overflow");
   }
 
@@ -248,6 +256,8 @@ public:
     auto hash = trunk_.numericMetadataStorageFingerprint();
     if (!descriptor_.reciprocal_momenta.empty())
       qmcplusplus::psiformer::determinant::detail::mixStorage(hash, descriptor_.reciprocal_momenta);
+    if (descriptor_.fourier_modes)
+      qmcplusplus::psiformer::determinant::detail::mixStorage(hash, descriptor_.fourier_modes->momenta());
     return hash;
   }
 
@@ -279,8 +289,10 @@ public:
     fillRealOrbitalEnvelopeJets(*tape.geometry, w.orbitals_, descriptor_.spin_up,
         shape_.nuclei, p, pi_, zeta_, 0, w.envelopes_.data(), profile_);
     ComplexOrbitalHeadParameters heads;
-    heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
-    heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};
+    heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0,
+        fourier_[0].size ? p + fourier_[0].begin : nullptr, fourier_[0].size};
+    heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0,
+        fourier_[1].size ? p + fourier_[1].begin : nullptr, fourier_[1].size};
     const auto& f = *tape.features;
     w.head_.evaluate({f.value.data(), f.gradient.data(), f.laplacian.data(),
         f.value.size(), f.gradient.size(), f.laplacian.size()}, w.envelopes_.data(), w.envelopes_.size(),
@@ -310,6 +322,15 @@ public:
     pullBackOccupiedPhase(descriptor_, w.orbitals_, tape.packed_positions, 3 * n,
                            w.root_.data(), w.root_.size());
     std::fill(w.response_.begin(), w.response_.end(), C{});
+    if (descriptor_.fourier_modes)
+    {
+      accumulateFourierCoefficientResponses(*descriptor_.fourier_modes, w.orbitals_, descriptor_.determinants,
+          descriptor_.spin_up, tape.packed_positions, 3 * n, w.head_.affineProjectionData(), w.root_.data(), w.root_.size(),
+          {w.response_.data() + fourier_[0].begin, w.response_.data() + fourier_[1].begin}, {fourier_[0].size, fourier_[1].size});
+      transformFourierHeadJets(*descriptor_.fourier_modes, w.orbitals_, descriptor_.determinants, descriptor_.spin_up,
+          tape.packed_positions, 3 * n, {p + fourier_[0].begin, p + fourier_[1].begin},
+          {fourier_[0].size, fourier_[1].size}, w.root_.data(), w.root_.size(), true);
+    }
     for (std::size_t component = 0; component < 2; ++component)
     {
       w.feature_seed_.clear();
@@ -365,7 +386,7 @@ private:
           qb0 += w.root_[k * batch + element] * w.envelopes_[k * batch + element];
           qe0 += w.root_[k * batch + element] * b[k * batch + element];
         }
-        if (component == 0)
+        if (component == 0 && !descriptor_.fourier_modes)
           for (std::size_t atom = 0; atom < shape_.nuclei; ++atom)
           {
             const auto pair = row * shape_.nuclei + atom, index = channel * shape_.nuclei + atom;
@@ -415,7 +436,7 @@ private:
   const std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata> profile_;
   const std::array<double, 3> outer_k_;
   const PsiFormerStorageShape shape_;
-  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_;
+  std::array<DirectParameterTensor, 2> real_, imaginary_, pi_, zeta_, fourier_;
 };
 } // namespace pf
 #endif
