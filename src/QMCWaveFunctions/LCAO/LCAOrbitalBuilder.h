@@ -120,6 +120,7 @@ private:
   std::string source_identity_;
   std::size_t source_identity_max_bytes_ = 0;
   std::shared_ptr<const LCAOFileImageIdentity> file_identity_;
+  bool periodic_coefficients_ = false;
   /// Collective admission around each actual HDF read, before its next data broadcast.
   void checkSourceIdentity(hdf_archive& archive);
   ///load a basis set from XML input

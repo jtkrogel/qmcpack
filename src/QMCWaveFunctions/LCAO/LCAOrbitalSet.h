@@ -14,6 +14,7 @@
 #define QMCPLUSPLUS_SOA_LINEARCOMIBINATIONORBITALSET_TEMP_H
 
 #include <memory>
+#include <array>
 #include "QMCWaveFunctions/SPOSet.h"
 #include "QMCWaveFunctions/BasisSetBase.h"
 
@@ -27,6 +28,15 @@ struct LCAOFileImageIdentity
 {
   std::string source_report, image_hex;
   std::size_t byteCount() const noexcept { return image_hex.size() / 2; }
+};
+
+/// Actual periodic basis construction recorded by the CPU orbital reader.
+struct LCAOPeriodicIdentity
+{
+  std::array<std::array<double, 3>, 3> lattice{};
+  std::array<double, 3> cartesian_twist{};
+  std::array<int, 3> images{};
+  const ParticleSet* source_ions = nullptr;
 };
 /** class to handle linear combinations of basis orbitals used to evaluate the Dirac determinants.
    *
@@ -65,6 +75,7 @@ public:
 
   std::string getClassName() const final { return "LCAOrbitalSet"; }
   const std::shared_ptr<const LCAOFileImageIdentity>& fileImageIdentity() const noexcept { return file_identity_; }
+  const std::shared_ptr<const LCAOPeriodicIdentity>& periodicIdentity() const noexcept { return periodic_identity_; }
 
   bool isRotationSupported() const final { return true; }
 
@@ -277,6 +288,7 @@ protected:
 private:
   friend class LCAOrbitalBuilder;
   std::shared_ptr<const LCAOFileImageIdentity> file_identity_;
+  std::shared_ptr<const LCAOPeriodicIdentity> periodic_identity_;
   ///helper functions to handle Identity
   void evaluate_vgl_impl(const vgl_type& temp, ValueVector& psi, GradVector& dpsi, ValueVector& d2psi) const;
 

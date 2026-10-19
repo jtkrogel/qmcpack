@@ -143,12 +143,19 @@ LCAOrbitalBuilder::LCAOrbitalBuilder(ParticleSet& els, ParticleSet& ions, Commun
   if (!source_identity_.empty())
   {
 #ifdef QMC_COMPLEX
-    throw std::runtime_error("LCAO file-image identity currently requires a real CPU build");
+    if (targetPtcl.getLattice().SuperCellEnum != SUPERCELL_BULK)
+      throw std::runtime_error("Complex LCAO file-image identity requires periodic Gamma input");
 #endif
     if (h5_path.empty() || source_identity_max_bytes_ == 0 || source_identity_max_bytes_ > 1048576 ||
-        doCuspCorrection || PBCImages != TinyVector<int, 3>(0) || SuperTwist != PosType(0) ||
-        targetPtcl.getLattice().SuperCellEnum != SUPERCELL_OPEN)
-      throw std::runtime_error("LCAO file-image identity requires open CPU/no-cusp input and a positive cap <=1048576");
+        doCuspCorrection || SuperTwist != PosType(0) ||
+        (targetPtcl.getLattice().SuperCellEnum != SUPERCELL_OPEN &&
+         targetPtcl.getLattice().SuperCellEnum != SUPERCELL_BULK))
+      throw std::runtime_error("LCAO file-image identity requires CPU/no-cusp Gamma input and a positive cap <=1048576");
+    for (int d = 0; d < 3; ++d)
+      if (PBCImages[d] < 0 ||
+          (targetPtcl.getLattice().SuperCellEnum == SUPERCELL_OPEN && PBCImages[d] != 0) ||
+          (targetPtcl.getLattice().SuperCellEnum == SUPERCELL_BULK && PBCImages[d] == 0))
+        throw std::runtime_error("LCAO file-image identity has inconsistent periodic images");
   }
   //Evaluate the Phase factor. Equals 1 for OBC.
   EvalPeriodicImagePhaseFactors(SuperTwist, PeriodicImagePhaseFactors, PeriodicImageDisplacements);
@@ -623,6 +630,19 @@ std::unique_ptr<SPOSet> LCAOrbitalBuilder::createSPOSetFromXML(xmlNodePtr cur)
     if (!identity)
       loadMO(*lcos, cur);
     lcos->file_identity_ = file_identity_;
+    if (file_identity_ && periodic_coefficients_ && targetPtcl.getLattice().SuperCellEnum == SUPERCELL_BULK)
+    {
+      auto periodic = std::make_shared<LCAOPeriodicIdentity>();
+      periodic->source_ions = &sourcePtcl;
+      for (int d = 0; d < 3; ++d)
+      {
+        periodic->cartesian_twist[d] = SuperTwist[d];
+        periodic->images[d] = PBCImages[d];
+        for (int c = 0; c < 3; ++c)
+          periodic->lattice[d][c] = Lattice(d, c);
+      }
+      lcos->periodic_identity_ = std::move(periodic);
+    }
     sposet = std::move(lcos);
   }
 
@@ -689,6 +709,7 @@ std::unique_ptr<SPOSet> LCAOrbitalBuilder::createSPOSetFromXML(xmlNodePtr cur)
    */
 bool LCAOrbitalBuilder::loadMO(LCAOrbitalSet& spo, xmlNodePtr cur)
 {
+  periodic_coefficients_ = false;
 #undef FunctionName
 #define FunctionName                                      \
   printf("Calling FunctionName from %s\n", __FUNCTION__); \
@@ -756,8 +777,7 @@ bool LCAOrbitalBuilder::loadMO(LCAOrbitalSet& spo, xmlNodePtr cur)
     checkSourceIdentity(hin);
     if (myComm->rank() == 0) hin.close();
     myComm->bcast(PBC);
-    if (PBC && !source_identity_.empty())
-      throw std::runtime_error("LCAO file-image identity currently requires nonperiodic HDF coefficients");
+    periodic_coefficients_ = PBC;
     if (PBC)
       success = putPBCFromH5(spo, coeff_ptr);
     else
@@ -934,10 +954,11 @@ bool LCAOrbitalBuilder::putPBCFromH5(LCAOrbitalSet& spo, xmlNodePtr coeff_ptr)
   aAttrib.add(SuperTwist, "twist");
   aAttrib.put(curtemp);
 
+  if (myComm->rank() == 0 && !hin.open(h5_path, H5F_ACC_RDONLY))
+    APP_ABORT("LCAOrbitalBuilder::putFromH5 missing or incorrect path to H5 file.");
+  checkSourceIdentity(hin);
   if (myComm->rank() == 0)
   {
-    if (!hin.open(h5_path, H5F_ACC_RDONLY))
-      APP_ABORT("LCAOrbitalBuilder::putFromH5 missing or incorrect path to H5 file.");
     hin.push("parameters");
     hin.read(IsComplex, "IsComplex");
     hin.pop();
@@ -970,8 +991,9 @@ bool LCAOrbitalBuilder::putPBCFromH5(LCAOrbitalSet& spo, xmlNodePtr coeff_ptr)
       n++;
     }
 
-    hin.close();
   }
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0) hin.close();
   myComm->bcast(*spo.C);
   return true;
 }
@@ -1116,16 +1138,16 @@ void LCAOrbitalBuilder::EvalPeriodicImagePhaseFactors(
   if (h5_path != "" && !usesOpenBC)
   {
     hdf_archive hin(myComm);
+    if (myComm->rank() == 0 && !hin.open(h5_path, H5F_ACC_RDONLY))
+      APP_ABORT("Could not open H5 file");
+    checkSourceIdentity(hin);
     if (myComm->rank() == 0)
     {
-      if (!hin.open(h5_path, H5F_ACC_RDONLY))
-        APP_ABORT("Could not open H5 file");
-
       hin.push("Cell", false);
-
       hin.read(Lattice, "LatticeVectors");
-      hin.close();
     }
+    checkSourceIdentity(hin);
+    if (myComm->rank() == 0) hin.close();
     for (int i = 0; i < 3; i++)
       for (int j = 0; j < 3; j++)
         myComm->bcast(Lattice(i, j));
@@ -1169,16 +1191,16 @@ void LCAOrbitalBuilder::EvalPeriodicImagePhaseFactors(
   if (h5_path != "" && !usesOpenBC)
   {
     hdf_archive hin(myComm);
+    if (myComm->rank() == 0 && !hin.open(h5_path, H5F_ACC_RDONLY))
+      APP_ABORT("Could not open H5 file");
+    checkSourceIdentity(hin);
     if (myComm->rank() == 0)
     {
-      if (!hin.open(h5_path, H5F_ACC_RDONLY))
-        APP_ABORT("Could not open H5 file");
-
       hin.push("Cell", false);
-
       hin.read(Lattice, "LatticeVectors");
-      hin.close();
     }
+    checkSourceIdentity(hin);
+    if (myComm->rank() == 0) hin.close();
     for (int i = 0; i < 3; i++)
       for (int j = 0; j < 3; j++)
         myComm->bcast(Lattice(i, j));

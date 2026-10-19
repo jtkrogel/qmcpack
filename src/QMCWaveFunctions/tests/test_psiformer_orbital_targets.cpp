@@ -13,13 +13,23 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Particle/ParticleSet.h"
+#include "Particle/ParticleSetPool.h"
+#include "OhmmsData/Libxml2Doc.h"
+#include "QMCWaveFunctions/WaveFunctionFactory.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/tests/ConstantSPOSet.h"
 #include "SimulationCell.h"
+#include "Utilities/RuntimeOptions.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <vector>
 
 namespace qmcplusplus::psiformer
@@ -45,6 +55,200 @@ std::unique_ptr<ConstantSPOSet<QMCTraits::ValueType>> makeSource(
 }
 
 } // namespace
+
+#ifdef QMC_COMPLEX
+TEST_CASE("Periodic Gaussian targets freeze coefficients and occupied gauge",
+          "[wavefunction][psiformer][pretraining][periodic_lcao_target]")
+{
+  Libxml2Document document;
+  REQUIRE(document.parseFromString(R"(<qmcsystem>
+    <simulationcell><parameter name="lattice">
+      6.7463223 6.7463223 0  0 3.37316115 3.37316115  3.37316115 0 3.37316115
+    </parameter><parameter name="bconds">p p p</parameter></simulationcell>
+    <particleset name="ion0" size="4"><group name="C"><parameter name="charge">4</parameter></group>
+      <attrib name="position" datatype="posArray">
+      0 0 0  1.686580575 1.686580575 1.686580575  3.37316115 3.37316115 0
+      5.059741725 5.059741725 1.686580575</attrib>
+      <attrib name="ionid" datatype="stringArray">C C C C</attrib></particleset>
+    <particleset name="e"><group name="u" size="8"><parameter name="charge">-1</parameter></group>
+      <group name="d" size="8"><parameter name="charge">-1</parameter></group></particleset>
+    <wavefunction name="teacher" target="e">
+      <sposet_collection type="MolecularOrbital" name="LCAOBSet" source="ion0"
+        transform="no" key="GTO" href="C_Diamond_2x1x1-Gaussian.h5" twist="0 0 0"
+        PBCimages="5 5 5" gpu="no" source_identity="file_image" source_identity_max_bytes="524288">
+        <basisset name="LCAOBSet" key="GTO" transform="no"/>
+        <sposet name="occupied" size="8"><occupation mode="ground"/>
+          <coefficient size="116" spindataset="0"/></sposet>
+      </sposet_collection>
+      <determinantset><slaterdeterminant><determinant id="up" sposet="occupied"/>
+        <determinant id="down" sposet="occupied"/></slaterdeterminant></determinantset>
+    </wavefunction></qmcsystem>)"));
+  ParticleSetPool pool(OHMMS::Controller);
+  auto* child = document.getRoot()->children;
+  xmlNodePtr wavefunction = nullptr;
+  for (; child; child = child->next)
+    if (xmlStrEqual(child->name, BAD_CAST "simulationcell"))
+      pool.readSimulationCellXML(child);
+    else if (xmlStrEqual(child->name, BAD_CAST "particleset"))
+      REQUIRE(pool.put(child));
+    else if (xmlStrEqual(child->name, BAD_CAST "wavefunction"))
+      wavefunction = child;
+  auto* electrons = pool.getParticleSet("e");
+  auto* ions = pool.getParticleSet("ion0");
+  REQUIRE(electrons != nullptr);
+  REQUIRE(ions != nullptr);
+  for (std::size_t row = 0; row < electrons->R.size(); ++row)
+    electrons->R[row] = {0.21 + 0.07 * row, -0.34 + 0.11 * row, 0.53 - 0.03 * row};
+  WaveFunctionFactory factory(*electrons, pool.getPool(), OHMMS::Controller);
+  auto state = factory.buildTWF(wavefunction, RuntimeOptions{});
+  REQUIRE(state != nullptr);
+  REQUIRE(state->getOrbitals().size() == 1);
+  const auto* slater = dynamic_cast<const SlaterDet*>(state->getOrbitals()[0].get());
+  REQUIRE(slater != nullptr);
+  const auto& source = dynamic_cast<const LCAOrbitalSet&>(state->getSPOSet("occupied"));
+  REQUIRE(source.fileImageIdentity() != nullptr);
+  REQUIRE(source.periodicIdentity() != nullptr);
+  const auto n = electrons->R.size();
+  const auto cap = (n * n + 2 * source.getOrbitalSetSize() + 2 * source.C->size()) * sizeof(std::complex<double>);
+  CHECK_THROWS_AS(ComplexOrbitalTargetEvaluator::fromSingleReference(*slater, *electrons, {}, 1, cap - 1),
+                  std::length_error);
+  auto target = ComplexOrbitalTargetEvaluator::fromSingleReference(*slater, *electrons, {}, 1, cap);
+  CHECK(target.retainedScalarBytes() == cap);
+  electrons->update();
+  const auto frozen = target.evaluate(*electrons);
+  const auto fingerprint = target.descriptor().fingerprint();
+  auto reference = source.makeClone();
+  SPOSet::ValueVector values(source.getOrbitalSetSize());
+  for (std::size_t row = 0; row < n; ++row)
+  {
+    reference->evaluateValue(*electrons, row, values);
+    for (std::size_t column = 0; column < n; ++column)
+      CHECK(std::abs(frozen[row * n + column] -
+          ((row < 8) == (column < 8) ? values[column % 8] : std::complex<double>{})) < 1e-12);
+  }
+  const auto accepted = source.C->data()[0];
+  source.C->data()[0] += std::complex<double>{0.13, -0.09};
+  CHECK(target.evaluate(*electrons) == frozen);
+  auto changed = ComplexOrbitalTargetEvaluator::fromSingleReference(*slater, *electrons, {}, 1, cap);
+  CHECK(changed.descriptor().fingerprint() != fingerprint);
+  source.C->data()[0] = accepted;
+  const auto position = electrons->R[0];
+  for (int d = 0; d < 3; ++d)
+    electrons->R[0][d] += electrons->getLattice().R(1, d);
+  electrons->update();
+  const auto wrapped = target.evaluate(*electrons);
+  for (std::size_t element = 0; element < frozen.size(); ++element)
+    CHECK(std::abs(wrapped[element] - frozen[element]) < 1e-10);
+  electrons->R[0] = position;
+  electrons->update();
+  ions->R[0][0] += 0.01;
+  CHECK_THROWS_AS(target.evaluate(*electrons), std::invalid_argument);
+  ions->R[0][0] -= 0.01;
+  electrons->setTwist(ParticleSet::PosType{0.1, 0, 0});
+  CHECK_THROWS_AS(target.evaluate(*electrons), std::invalid_argument);
+}
+#endif
+
+TEST_CASE("Periodic occupied SPO fixed-point VGL export",
+          "[.periodic_spo_oracle][wavefunction][psiformer]")
+{
+  const char* xml_path = std::getenv("PSIFORMER_SPO_XML");
+  const char* oracle_path = std::getenv("PSIFORMER_SPO_ORACLE");
+  const char* output_path = std::getenv("PSIFORMER_SPO_OUTPUT");
+  if (!xml_path || !oracle_path || !output_path)
+    SKIP("Set PSIFORMER_SPO_XML, PSIFORMER_SPO_ORACLE and PSIFORMER_SPO_OUTPUT for this diagnostic");
+  const char* requested_name = std::getenv("PSIFORMER_SPO_NAME");
+  Libxml2Document document;
+  REQUIRE(document.parse(xml_path));
+  auto* root = document.getRoot();
+  REQUIRE(root != nullptr);
+  if (xmlStrEqual(root->name, BAD_CAST "simulation"))
+    for (auto* child = root->children; child; child = child->next)
+      if (xmlStrEqual(child->name, BAD_CAST "qmcsystem"))
+      {
+        root = child;
+        break;
+      }
+  ParticleSetPool pool(OHMMS::Controller);
+  bool cell_found = false;
+  for (auto* child = root->children; child; child = child->next)
+    if (xmlStrEqual(child->name, BAD_CAST "simulationcell"))
+    {
+      pool.readSimulationCellXML(child);
+      cell_found = true;
+    }
+  REQUIRE(cell_found);
+  for (auto* child = root->children; child; child = child->next)
+    if (xmlStrEqual(child->name, BAD_CAST "particleset"))
+      REQUIRE(pool.put(child));
+  auto* electrons = pool.getParticleSet("e");
+  REQUIRE(electrons != nullptr);
+  xmlNodePtr wavefunction = nullptr;
+  for (auto* child = root->children; child; child = child->next)
+    if (xmlStrEqual(child->name, BAD_CAST "wavefunction"))
+    {
+      REQUIRE(wavefunction == nullptr);
+      wavefunction = child;
+    }
+  REQUIRE(wavefunction != nullptr);
+  WaveFunctionFactory factory(*electrons, pool.getPool(), OHMMS::Controller);
+  auto state = factory.buildTWF(wavefunction, RuntimeOptions{});
+  REQUIRE(state != nullptr);
+  auto orbitals = state->getSPOSet(requested_name ? requested_name : "spo-up").makeClone();
+  REQUIRE(orbitals != nullptr);
+  const auto count = orbitals->getOrbitalSetSize();
+  REQUIRE(count > 0);
+  SPOSet::ValueVector values(count), laplacians(count);
+  SPOSet::GradVector gradients(count);
+  std::ifstream oracle(oracle_path);
+  REQUIRE(oracle.good());
+  std::ofstream output(output_path);
+  REQUIRE(output.good());
+  output << std::setprecision(17) << "# x y z occupied_column real_value real_gx real_gy real_gz real_laplacian\n";
+  std::array<double, 5> maximum_error{};
+  std::size_t rows = 0;
+  std::string line;
+  while (std::getline(oracle, line))
+  {
+    const auto first = line.find_first_not_of(" \t\r");
+    if (first == std::string::npos || line[first] == '#')
+      continue;
+    std::istringstream fields(line);
+    ParticleSet::PosType position;
+    int column;
+    std::array<double, 5> expected;
+    REQUIRE(static_cast<bool>(fields >> position[0] >> position[1] >> position[2] >> column >>
+                              expected[0] >> expected[1] >> expected[2] >> expected[3] >> expected[4]));
+    REQUIRE(column >= 0);
+    REQUIRE(column < count);
+    for (int d = 0; d < 3; ++d)
+      REQUIRE(std::isfinite(position[d]));
+    electrons->R[0] = position;
+    electrons->update();
+    orbitals->evaluateVGL(*electrons, 0, values, gradients, laplacians);
+    const std::array<QMCTraits::ValueType, 5> actual{
+        values[column], gradients[column][0], gradients[column][1], gradients[column][2], laplacians[column]};
+    output << position[0] << ' ' << position[1] << ' ' << position[2] << ' ' << column;
+    for (std::size_t product = 0; product < actual.size(); ++product)
+    {
+      REQUIRE(std::isfinite(std::real(actual[product])));
+      REQUIRE(std::isfinite(std::imag(actual[product])));
+      REQUIRE(std::isfinite(expected[product]));
+      maximum_error[product] = std::max(maximum_error[product], std::abs(actual[product] - expected[product]));
+      output << ' ' << std::real(actual[product]);
+    }
+    output << '\n';
+    ++rows;
+  }
+  REQUIRE(rows > 0);
+  output.flush();
+  REQUIRE(output.good());
+  // This diagnostic reports export error; scientific acceptance uses the fixed campaign tolerances.
+  app_log() << "Periodic SPO oracle rows " << rows << " max absolute errors value/gx/gy/gz/laplacian";
+  for (double error : maximum_error)
+    app_log() << ' ' << error;
+  app_log() << std::endl;
+}
 
 TEST_CASE("PsiFormer single-reference orbital target repeats full spin blocks",
           "[wavefunction][psiformer][pretraining]")

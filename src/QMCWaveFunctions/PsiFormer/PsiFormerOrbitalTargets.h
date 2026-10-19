@@ -173,12 +173,12 @@ private:
 };
 
 #ifdef QMC_COMPLEX
-/** Frozen FreeOrbital single-reference targets in fixed-gauge periodic-part form. */
+/** Frozen occupied periodic single-reference targets in fixed-gauge periodic-part form. */
 class ComplexOrbitalTargetEvaluator
 {
 public:
-  /// Freeze actual occupied FreeOrbital momenta, spin ranges and the matching Bloch convention.
-  /// The cap covers target/SPO-value scratch, not cloned SPO storage or identity metadata.
+  /// Freeze occupied plane waves or CPU Gamma Gaussian orbitals with exact reader identity.
+  /// The cap covers target/value scratch and detached coefficients; AO clone storage is separate.
   static ComplexOrbitalTargetEvaluator fromSingleReference(const SlaterDet& source,
       const ParticleSet& electrons, std::array<double, 3> expected_reduced_twist, std::size_t channels,
       std::size_t maximum_numeric_bytes);
@@ -186,19 +186,24 @@ public:
   const std::vector<std::complex<double>>& evaluate(const ParticleSet& electrons);
   /// Return immutable occupation/channel and exact scientific identity metadata.
   const OrbitalTargetDescriptor& descriptor() const noexcept { return descriptor_; }
-  /// Explicit target/scratch only; cloned SPO and immutable descriptor metadata are excluded.
+  /// Target/scratch/detached coefficients; AO clone and immutable metadata are excluded.
   std::size_t retainedScalarBytes() const noexcept;
 
 private:
   ComplexOrbitalTargetEvaluator(OrbitalTargetDescriptor descriptor,
       std::array<std::unique_ptr<SPOSet>, 2>&& orbitals, std::array<double, 9> lattice,
-      std::array<double, 3> reduced, std::array<double, 3> cartesian);
+      std::array<double, 3> reduced, std::array<double, 3> cartesian,
+      std::array<const ParticleSet*, 2> source_ions = {}, std::size_t detached_coefficient_bytes = 0);
   OrbitalTargetDescriptor descriptor_;
   std::array<std::unique_ptr<SPOSet>, 2> orbitals_;
   std::array<SPOSet::ValueVector, 2> scratch_;
   const std::array<double, 9> lattice_;
   const std::array<double, 3> reduced_twist_, cartesian_twist_;
   std::vector<std::complex<double>> target_;
+  std::array<const ParticleSet*, 2> source_ions_{};
+  std::array<std::vector<std::array<double, 3>>, 2> source_positions_;
+  std::array<std::vector<int>, 2> source_species_;
+  std::size_t detached_coefficient_bytes_ = 0;
 };
 #endif
 

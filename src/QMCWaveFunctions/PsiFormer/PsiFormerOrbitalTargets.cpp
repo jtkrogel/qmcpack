@@ -17,6 +17,7 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,7 +33,7 @@ namespace
 bool isFiniteDouble(double value) noexcept;
 }
 #ifdef QMC_COMPLEX
-/// Freeze the actual occupied plane waves and fixed periodic-part gauge, not parsed names.
+/// Freeze the actual occupied orbitals and fixed periodic-part gauge, not parsed names.
 ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference(const SlaterDet& source,
     const ParticleSet& electrons, std::array<double, 3> reduced, std::size_t channels, std::size_t maximum_numeric_bytes)
 {
@@ -47,7 +48,9 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
     throw std::invalid_argument("Complex orbital target requires two-spin bulk single Slater");
   std::array<double, 9> lattice;
   ParticleSet::PosType reduced_vector;
-  std::string identity = "complex-free-orbital-fixed-gauge-periodic-part-v1;";
+  const bool localized = dynamic_cast<const LCAOrbitalSet*>(&source.getDet(0).getPhi()) != nullptr;
+  std::string identity = localized ? "complex-lcao-fixed-gauge-periodic-part-v1;" :
+                                    "complex-free-orbital-fixed-gauge-periodic-part-v1;";
   auto append = [&](double value) {
     std::uint64_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -69,61 +72,148 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
   for (double value : cartesian)
     append(value);
   std::array<std::unique_ptr<SPOSet>, 2> orbitals;
-  std::array<const FreeOrbital*, 2> sources;
+  std::array<const SPOSet*, 2> sources;
+  std::array<const ParticleSet*, 2> source_ions{};
+  std::size_t detached_coefficient_elements = 0;
   std::size_t numeric_elements = channels * n * n;
   int first = 0;
   for (int spin = 0; spin < 2; ++spin)
   {
     const auto& determinant = source.getDet(spin);
     const auto* free = dynamic_cast<const FreeOrbital*>(&determinant.getPhi());
+    const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(&determinant.getPhi());
     const auto count = electrons.groupsize(spin);
-    if (!free || determinant.getFirstIndex() != first || determinant.getLastIndex() != first + count ||
-        free->kVectors().size() < static_cast<std::size_t>(count))
-      throw std::invalid_argument("Complex orbital target requires occupied FreeOrbital spin blocks");
-    for (int column = 0; column < count; ++column)
+    if (determinant.getFirstIndex() != first || determinant.getLastIndex() != first + count ||
+        determinant.getPhi().getOrbitalSetSize() < count || (localized ? !lcao : !free))
+      throw std::invalid_argument("Complex orbital target requires matching occupied periodic spin blocks");
+    if (localized)
     {
-      const auto& k = free->kVectors()[column];
+      if (lcao->isOMPoffload() || lcao->isIdentity() || !lcao->C || !lcao->fileImageIdentity() ||
+          !lcao->periodicIdentity() || !lcao->periodicIdentity()->source_ions)
+        throw std::invalid_argument("Complex Gaussian target requires CPU coefficients and periodic reader identity");
+      const auto& periodic = *lcao->periodicIdentity();
+      source_ions[spin] = periodic.source_ions;
       for (int d = 0; d < 3; ++d)
       {
-        append(k[d]);
-        double reciprocal = 0;
-        for (int e = 0; e < 3; ++e)
-          reciprocal += (k[e] - twist[e]) * lattice[3 * d + e] / (2 * std::acos(-1.0));
-        if (!isFiniteDouble(reciprocal) || std::abs(reciprocal - std::round(reciprocal)) > 1e-10)
-          throw std::invalid_argument("Complex orbital target momentum/twist is not reciprocal");
+        if (reduced[d] != 0 || periodic.cartesian_twist[d] != 0 || periodic.images[d] <= 0)
+          throw std::invalid_argument("Complex Gaussian target currently requires periodic Gamma images");
+        append(periodic.images[d]);
+        for (int c = 0; c < 3; ++c)
+        {
+          const double actual = periodic.lattice[d][c];
+          if (!isFiniteDouble(actual) || std::abs(actual - lattice[3 * d + c]) >
+              1e-10 * std::max(1.0, std::abs(lattice[3 * d + c])))
+            throw std::invalid_argument("Complex Gaussian target basis lattice differs from electron cell");
+          append(actual);
+        }
+      }
+      const auto& ions = *source_ions[spin];
+      if (ions.R.size() != static_cast<std::size_t>(ions.getTotalNum()) || ions.GroupID.size() != ions.R.size())
+        throw std::invalid_argument("Complex Gaussian target ionic metadata is incomplete");
+      for (std::size_t ion = 0; ion < ions.R.size(); ++ion)
+      {
+        if (ions.GroupID[ion] < 0 || ions.GroupID[ion] >= ions.getSpeciesSet().getTotalNum())
+          throw std::invalid_argument("Complex Gaussian target ionic species is invalid");
+        identity += ions.getSpeciesSet().getSpeciesName(ions.GroupID[ion]) + ";";
+        for (int d = 0; d < 3; ++d)
+          append(ions.R[ion][d]);
+      }
+      // Exact reader image and accepted coefficients preserve column order and gauge.
+      identity += lcao->fileImageIdentity()->image_hex + ";";
+      for (std::size_t coefficient = 0; coefficient < lcao->C->size(); ++coefficient)
+      {
+        append(std::real(lcao->C->data()[coefficient]));
+        append(std::imag(lcao->C->data()[coefficient]));
+      }
+      if (lcao->C->size() > std::numeric_limits<std::size_t>::max() - detached_coefficient_elements)
+        throw std::length_error("Complex Gaussian target coefficient extent overflow");
+      detached_coefficient_elements += lcao->C->size();
+    }
+    else
+    {
+      if (free->kVectors().size() < static_cast<std::size_t>(count))
+        throw std::invalid_argument("Complex orbital target lacks occupied plane-wave momenta");
+      for (int column = 0; column < count; ++column)
+      {
+        const auto& k = free->kVectors()[column];
+        for (int d = 0; d < 3; ++d)
+        {
+          append(k[d]);
+          double reciprocal = 0;
+          for (int e = 0; e < 3; ++e)
+            reciprocal += (k[e] - twist[e]) * lattice[3 * d + e] / (2 * std::acos(-1.0));
+          if (!isFiniteDouble(reciprocal) || std::abs(reciprocal - std::round(reciprocal)) > 1e-10)
+            throw std::invalid_argument("Complex orbital target momentum/twist is not reciprocal");
+        }
       }
     }
-    const auto scratch = static_cast<std::size_t>(free->getOrbitalSetSize());
+    const auto scratch = static_cast<std::size_t>(determinant.getPhi().getOrbitalSetSize());
     if (scratch > std::numeric_limits<std::size_t>::max() - numeric_elements)
       throw std::length_error("Complex orbital target numeric extent overflow");
     numeric_elements += scratch;
-    sources[spin] = free;
+    sources[spin] = &determinant.getPhi();
     first += count;
   }
   // Admit target plus per-spin scratch before cloning or allocating either numeric buffer.
-  if (numeric_elements > maximum_numeric_bytes / sizeof(std::complex<double>))
+  if (detached_coefficient_elements > std::numeric_limits<std::size_t>::max() - numeric_elements ||
+      numeric_elements + detached_coefficient_elements > maximum_numeric_bytes / sizeof(std::complex<double>))
     throw std::length_error("Complex orbital target numeric cap exceeded before allocation");
   for (int spin = 0; spin < 2; ++spin)
+  {
     orbitals[spin] = sources[spin]->makeClone();
+    if (localized)
+    {
+      auto& frozen = static_cast<LCAOrbitalSet&>(*orbitals[spin]);
+      frozen.C = std::make_shared<LCAOrbitalSet::OffloadValueMatrix>(*frozen.C);
+    }
+  }
   return {OrbitalTargetDescriptor::makeSingleReference(identity, electrons.groupsize(0),
-      electrons.groupsize(1), channels), std::move(orbitals), lattice, reduced, cartesian};
+      electrons.groupsize(1), channels), std::move(orbitals), lattice, reduced, cartesian, source_ions,
+      detached_coefficient_elements * sizeof(std::complex<double>)};
 }
 
 /// Allocate only the frozen target and per-spin value scratch; SPO clone storage is separate.
 ComplexOrbitalTargetEvaluator::ComplexOrbitalTargetEvaluator(OrbitalTargetDescriptor descriptor,
     std::array<std::unique_ptr<SPOSet>, 2>&& orbitals, std::array<double, 9> lattice,
-    std::array<double, 3> reduced, std::array<double, 3> cartesian)
+    std::array<double, 3> reduced, std::array<double, 3> cartesian,
+    std::array<const ParticleSet*, 2> source_ions, std::size_t detached_coefficient_bytes)
     : descriptor_(std::move(descriptor)), orbitals_(std::move(orbitals)), lattice_(lattice),
       reduced_twist_(reduced), cartesian_twist_(cartesian),
-      target_(descriptor_.terms().size() * descriptor_.electronCount() * descriptor_.electronCount())
+      target_(descriptor_.terms().size() * descriptor_.electronCount() * descriptor_.electronCount()),
+      source_ions_(source_ions), detached_coefficient_bytes_(detached_coefficient_bytes)
 {
   for (int spin = 0; spin < 2; ++spin)
+  {
     scratch_[spin].resize(orbitals_[spin]->getOrbitalSetSize());
+    if (source_ions_[spin])
+      for (std::size_t ion = 0; ion < source_ions_[spin]->R.size(); ++ion)
+      {
+        const auto& r = source_ions_[spin]->R[ion];
+        source_positions_[spin].push_back({r[0], r[1], r[2]});
+        source_species_[spin].push_back(source_ions_[spin]->GroupID[ion]);
+      }
+  }
 }
 
 /// Validate all sample metadata/coordinates before filling one reusable target matrix.
 const std::vector<std::complex<double>>& ComplexOrbitalTargetEvaluator::evaluate(const ParticleSet& electrons)
 {
+  // Localized basis clones refer to fixed physical ions; reject later ionic moves.
+  for (int spin = 0; spin < 2; ++spin)
+    if (source_ions_[spin])
+    {
+      const auto& ions = *source_ions_[spin];
+      if (ions.R.size() != source_positions_[spin].size() || ions.GroupID.size() != source_species_[spin].size())
+        throw std::invalid_argument("Complex Gaussian target ionic count changed");
+      for (std::size_t ion = 0; ion < ions.R.size(); ++ion)
+      {
+        if (ions.GroupID[ion] != source_species_[spin][ion])
+          throw std::invalid_argument("Complex Gaussian target ionic species changed");
+        for (int d = 0; d < 3; ++d)
+          if (ions.R[ion][d] != source_positions_[spin][ion][d])
+            throw std::invalid_argument("Complex Gaussian target requires fixed ionic positions");
+      }
+    }
   const auto n = descriptor_.electronCount(), up = descriptor_.spinUpElectrons();
   if (electrons.isSpinor() || electrons.getActivePtcl() >= 0 || electrons.getTotalNum() != n ||
       electrons.groups() != 2 || electrons.groupsize(0) != up || electrons.groupsize(1) != n - up ||
@@ -164,7 +254,8 @@ const std::vector<std::complex<double>>& ComplexOrbitalTargetEvaluator::evaluate
 /// Excludes opaque SPO clone storage and descriptor metadata, as documented by the API.
 std::size_t ComplexOrbitalTargetEvaluator::retainedScalarBytes() const noexcept
 {
-  return (target_.capacity() + scratch_[0].capacity() + scratch_[1].capacity()) * sizeof(std::complex<double>);
+  return (target_.capacity() + scratch_[0].capacity() + scratch_[1].capacity()) * sizeof(std::complex<double>) +
+      detached_coefficient_bytes_;
 }
 #endif
 
