@@ -640,13 +640,48 @@ bool isNegativeInfinity(double value) noexcept
   return bits == UINT64_C(0xfff0000000000000);
 }
 
-/// Couple an in-memory native model to the provenance needed by persistence and diagnostics.
+/// Snapshot all physical ions without replacing them by feature-only centers.
+std::vector<double> physicalSourceSnapshot(const ParticleSet& ions)
+{
+  const auto& species = ions.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  if (charge < 0 || ions.GroupID.size() != ions.R.size())
+    throw std::invalid_argument("PsiFormer physical source metadata is incomplete");
+  std::vector<double> result;
+  result.reserve(pf::checkedStorageProduct(5, ions.getTotalNum(), "physical source size overflow"));
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+  {
+    const auto group = ions.GroupID[ion];
+    if (group < 0 || group >= ions.groups())
+      throw std::invalid_argument("PsiFormer physical source species is invalid");
+    for (int d = 0; d < 3; ++d) result.push_back(ions.R[ion][d]);
+    result.push_back(species(charge, group));
+    result.push_back(group);
+  }
+  if (!std::all_of(result.begin(), result.end(), [](double value) { return std::isfinite(value); }))
+    throw std::invalid_argument("PsiFormer physical source must be finite");
+  return result;
+}
+
+/// Retain physical species names independently of mutable source metadata.
+std::vector<std::string> physicalSpeciesSnapshot(const ParticleSet& ions)
+{
+  std::vector<std::string> result;
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+    result.push_back(ions.getSpeciesSet().getSpeciesName(ions.GroupID[ion]));
+  return result;
+}
+
+/// Couple an in-memory native model to its immutable feature and physical source metadata.
 struct InitializedNativeModel
 {
   pf::PsiFormer model;
   std::string profile;
   std::uint64_t seed;
   psiformer::ExecutionEnvironment environment;
+  std::vector<double> physical_source;
+  std::vector<std::string> physical_species;
+  const ParticleSet* source = nullptr;
 };
 
 /** Immutable outer Bloch phase applied by the QMCPACK adapter.
@@ -873,7 +908,10 @@ InitializedNativeModel makeInitializedNativeModel(
       shape.spin_down_electrons);
   pf::PsiFormer model(std::move(parameters), std::move(configuration), shape.determinants,
                       shape.feature_dimension, shape.attention_heads, shape.attention_blocks);
-  return {std::move(model), std::move(initialized.profile), initialized.seed, std::move(initialized.environment)};
+  const bool profile = static_cast<bool>(initialized.environment.periodic_profile);
+  return {std::move(model), std::move(initialized.profile), initialized.seed, std::move(initialized.environment),
+          profile ? physicalSourceSnapshot(ions) : std::vector<double>{},
+          profile ? physicalSpeciesSnapshot(ions) : std::vector<std::string>{}, profile ? &ions : nullptr};
 }
 
 /// Convert the native DeepQMC leaf layout into compact tensor-level training metadata.
@@ -1220,8 +1258,9 @@ public:
                        psiformer::PsiFormerPrecisionPolicy precision)
       : PsiFormerSharedState(std::move(initialized.model), "internal",
                              std::move(initialized.profile), initialized.seed,
-                             std::move(environment), std::move(twist_phase),
-                             accelerator_resolution, precision)
+                             initialized.environment.periodic_profile ? std::move(initialized.environment) : std::move(environment),
+                             std::move(twist_phase), accelerator_resolution, precision,
+                             std::move(initialized.physical_source), std::move(initialized.physical_species), initialized.source)
   {}
 
   /// Complete shared executor construction for imported and internally initialized models.
@@ -1232,7 +1271,9 @@ public:
                        psiformer::ExecutionEnvironment environment,
                        PsiFormerTwistPhase twist_phase,
                        psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
-                       psiformer::PsiFormerPrecisionPolicy precision)
+                       psiformer::PsiFormerPrecisionPolicy precision,
+                       std::vector<double> physical_source = {},
+                       std::vector<std::string> physical_species = {}, const ParticleSet* source = nullptr)
       : accelerator_resolution(validateProductionAcceleratorResolution(accelerator_resolution)),
         precision(precision),
         model(std::move(model_input)),
@@ -1240,11 +1281,20 @@ public:
         initialization_profile(std::move(profile)),
         initialization_seed(seed),
         twist_phase(std::move(twist_phase)),
+        physical_source(std::move(physical_source)), physical_species(std::move(physical_species)), source(source),
         persistent_model_identity(
-            persistentModelIdentity(model, model_origin, initialization_profile,
+            [&]() {
+              auto identity = persistentModelIdentity(model, model_origin, initialization_profile,
                                     initialization_seed, environment,
                                     this->twist_phase.reduced,
-                                    this->twist_phase.cartesian)),
+                                    this->twist_phase.cartesian);
+              if (environment.periodic_profile)
+              {
+                for (double value : this->physical_source) mixPersistentDouble(identity, value);
+                for (const auto& name : this->physical_species) mixPersistentString(identity, name);
+              }
+              return identity;
+            }()),
         execution_plan(psiformer::PsiFormerExecutionPlan::fromParameters(
             model.p,
             {/*spin_up_electrons=*/model.cfg.nup,
@@ -1269,6 +1319,11 @@ public:
         cpu_target_kinetic(configuredCpuTargetKinetic(this->accelerator_resolution, execution_plan,
                                                     *direct_value_executor.layout()))
   {
+    if (execution_plan.environment().periodic_profile &&
+        (numerical_tile_backend || direct_value_mode != DirectBackendMode::DIRECT ||
+         direct_spatial_mode != DirectBackendMode::DIRECT || direct_score_mode != DirectBackendMode::DIRECT ||
+         direct_kinetic_mode != DirectBackendMode::DIRECT))
+      throw std::invalid_argument("Periodic real profile requires direct CPU value, spatial, score and kinetic products");
     if (cpu_target_kinetic.targets &&
         (direct_score_mode != DirectBackendMode::DIRECT || direct_kinetic_mode != DirectBackendMode::DIRECT))
       throw std::invalid_argument("PsiFormer CPU target streaming products require DIRECT score/kinetic backends");
@@ -1317,6 +1372,34 @@ public:
     else
       parameters.set_flat_values(values);
     host_mirror_version = parameters.version();
+  }
+
+  /// Validate fixed physical ions centrally before any new-profile model read.
+  void validatePhysicalSource() const
+  {
+    if (!execution_plan.environment().periodic_profile)
+      return;
+    if (!source || source->getTotalNum() != static_cast<int>(physical_source.size() / 5) ||
+        physical_source.size() % 5 != 0 || physical_source.empty() ||
+        source->R.size() != physical_source.size() / 5 || source->GroupID.size() != source->R.size() ||
+        physical_species.size() != source->R.size())
+      throw std::invalid_argument("Periodic real profile physical source extent changed");
+    validateRuntimeLattice(*source, execution_plan.environment(), "Periodic real fixed source");
+    const auto& species = source->getSpeciesSet();
+    const int charge = species.findAttribute("charge");
+    if (charge < 0)
+      throw std::invalid_argument("Periodic real profile source charges are unavailable");
+    for (std::size_t ion = 0; ion < source->R.size(); ++ion)
+    {
+      const int group = source->GroupID[ion];
+      if (group < 0 || group >= source->groups() || group != physical_source[5 * ion + 4] ||
+          species(charge, group) != physical_source[5 * ion + 3] ||
+          species.getSpeciesName(group) != physical_species[ion])
+        throw std::invalid_argument("Periodic real profile physical source species or charge changed");
+      for (std::size_t d = 0; d < 3; ++d)
+        if (source->R[ion][d] != physical_source[5 * ion + d])
+          throw std::invalid_argument("Periodic real profile physical source positions changed");
+    }
   }
 
   /// Refresh cached native leaves without upgrading a held shared model lock.
@@ -1405,6 +1488,10 @@ public:
   const std::uint64_t initialization_seed;
   /// Fixed outer Bloch phase; zero keeps the exact Gamma/open adapter path.
   const PsiFormerTwistPhase twist_phase;
+  /// Full physical supercell source, distinct from feature-only primitive centers.
+  const std::vector<double> physical_source;
+  const std::vector<std::string> physical_species;
+  const ParticleSet* const source;
   /// Stable content identity used to reject buffers from another physical model.
   const std::uint64_t persistent_model_identity;
   /// Immutable typed tensor descriptors shared by every component clone.
@@ -1488,6 +1575,7 @@ public:
   explicit PsiFormerReadTransaction(PsiFormerSharedState& state, bool device_only = false)
       : state_(state), lock_(state_.mutex)
   {
+    state_.validatePhysicalSource();
     while (!device_only && state_.host_mirror_version != state_.model.p.version())
     {
       lock_.unlock();
@@ -5983,7 +6071,9 @@ std::string modelFingerprint(const pf::PsiFormer& model,
                              std::uint64_t initialization_seed,
                              const psiformer::ExecutionEnvironment& environment,
                              const std::array<double, 3>& reduced_twist,
-                             const std::array<double, 3>& cartesian_twist)
+                             const std::array<double, 3>& cartesian_twist,
+                             const std::vector<double>& physical_source,
+                             const std::vector<std::string>& physical_species)
 {
   std::uint64_t hash = 14695981039346656037ULL;
   auto mix_byte      = [&hash](std::uint8_t byte) {
@@ -6009,6 +6099,12 @@ std::string modelFingerprint(const pf::PsiFormer& model,
   mix_string(model_origin);
   mix_string(initialization_profile);
   mix_integer(initialization_seed);
+  mixPeriodicProfile(hash, environment);
+  if (environment.periodic_profile)
+  {
+    for (double value : physical_source) mix_double(value);
+    for (const auto& name : physical_species) mix_string(name);
+  }
   // Keep OPEN restart fingerprints backward compatible while binding periodic
   // state to the exact feature policy and simulation cell.
   if (environment.boundary == psiformer::BoundaryCondition::PERIODIC)
@@ -6367,7 +6463,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
                                 model_state_->initialization_seed,
                                 model_state_->execution_plan.environment(),
                                 model_state_->twist_phase.reduced,
-                                model_state_->twist_phase.cartesian)
+                                model_state_->twist_phase.cartesian,
+                                model_state_->physical_source, model_state_->physical_species)
             << ", origin=" << model_state_->model_origin;
   if (!model_state_->initialization_profile.empty())
     app_log() << ", initialization=" << model_state_->initialization_profile
@@ -6468,6 +6565,7 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
   input.storage_shape.input_width      = value_layout->inputWidth();
   input.storage_shape.attention_blocks = model_shape.attention_blocks;
   input.storage_shape.parameter_count  = model_state_->execution_plan.parameterCount();
+  input.storage_shape.pair_attention = static_cast<bool>(model_state_->execution_plan.environment().periodic_profile);
   input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
       ValueType, PsiValue, LogValue, GradType,
       SelectedDerivativeDelta::value_type, FullPrecRealType>();
@@ -7364,7 +7462,8 @@ void PsiFormerWF::isolateParameterState()
   model_state_ = std::make_shared<PsiFormerSharedState>(
       std::move(independent_model), original->model_origin, original->initialization_profile,
       original->initialization_seed, original->execution_plan.environment(),
-      original->twist_phase, original->accelerator_resolution, original->precision);
+      original->twist_phase, original->accelerator_resolution, original->precision,
+      original->physical_source, original->physical_species, original->source);
   invalidateParameterCaches(model_state_->model.p.version());
 }
 
@@ -7382,6 +7481,7 @@ std::vector<std::string> PsiFormerWF::neuralWeightBlocks() const
     case Role::ATTENTION_OUTPUT_WEIGHT:
     case Role::UPDATE_HIDDEN_WEIGHT:
     case Role::UPDATE_OUTPUT_WEIGHT:
+    case Role::PAIR_ATTENTION_WEIGHT:
     case Role::BACKFLOW_UP_WEIGHT:
     case Role::BACKFLOW_DOWN_WEIGHT:
       result.push_back(tensor.module + "/" + tensor.name);
@@ -7436,7 +7536,7 @@ std::vector<wftrain::AffineParameterBlock> nativeAffineParameterBlocks(
   };
   const auto width = shape.feature_dimension;
   append(Role::ELECTRON_EMBEDDING_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
-         4 * shape.nuclei + 1, width);
+         plan.parameter(Role::ELECTRON_EMBEDDING_WEIGHT).shape[0], width);
   for (std::size_t block = 0; block < shape.attention_blocks; ++block)
   {
     for (Role role : {Role::ATTENTION_QUERY_WEIGHT, Role::ATTENTION_KEY_WEIGHT,
@@ -7444,6 +7544,8 @@ std::vector<wftrain::AffineParameterBlock> nativeAffineParameterBlocks(
       append(role, block, width, width);
     append(Role::UPDATE_HIDDEN_WEIGHT, block, width, width, Role::UPDATE_HIDDEN_BIAS);
     append(Role::UPDATE_OUTPUT_WEIGHT, block, width, width, Role::UPDATE_OUTPUT_BIAS);
+    if (plan.environment().periodic_profile)
+      append(Role::PAIR_ATTENTION_WEIGHT, block, 8, shape.attention_heads, Role::PAIR_ATTENTION_BIAS);
   }
   append(Role::BACKFLOW_UP_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
          width, shape.determinants * shape.electrons());
@@ -11293,7 +11395,8 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
                        model_state_->initialization_seed,
                        model_state_->execution_plan.environment(),
                        model_state_->twist_phase.reduced,
-                       model_state_->twist_phase.cartesian);
+                       model_state_->twist_phase.cartesian,
+                       model_state_->physical_source, model_state_->physical_species);
 
   output.write(format_version, "format_version");
   output.write(parameter_count, "parameter_count");
@@ -11417,7 +11520,8 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
                          model_state_->initialization_seed,
                          model_state_->execution_plan.environment(),
                          model_state_->twist_phase.reduced,
-                         model_state_->twist_phase.cartesian))
+                         model_state_->twist_phase.cartesian,
+                         model_state_->physical_source, model_state_->physical_species))
       throw std::runtime_error("PsiFormer VP model fingerprint does not match the configured model");
     if (system_kind != system_kind_)
       throw std::runtime_error("PsiFormer VP system declaration does not match the configured model");
@@ -11745,7 +11849,7 @@ void PsiFormerWF::exportModel(const std::string& path) const
   PsiFormerReadTransaction state_lock(*model_state_);
   writeStandaloneModel(path, model_state_->model, model_state_->execution_plan.environment(),
       model_state_->initialization_profile, model_state_->initialization_seed, system_kind_,
-      model_state_->twist_phase.reduced);
+      model_state_->twist_phase.reduced, model_state_->physical_source);
 }
 
 void PsiFormerWF::exportParameters(const std::string& path) const
@@ -11774,7 +11878,7 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
   if (electrons.groups() != 2 || electrons.groupsize(0) != static_cast<int>(model.cfg.nup) ||
       electrons.groupsize(1) != static_cast<int>(model.cfg.ndown))
     throw std::invalid_argument("PsiFormer runtime spin populations do not match the exported model");
-  if (ions.getTotalNum() != static_cast<int>(model.cfg.nuclei.shape[0]))
+  if (!environment.periodic_profile && ions.getTotalNum() != static_cast<int>(model.cfg.nuclei.shape[0]))
     throw std::invalid_argument("PsiFormer runtime nucleus count does not match the exported model");
 
   const SpeciesSet& species = ions.getSpeciesSet();
@@ -11782,7 +11886,13 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
   if (charge_index < 0)
     throw std::invalid_argument("PsiFormer source particle set has no charge attribute");
   constexpr double tolerance = 1e-10;
-  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+  if (environment.periodic_profile)
+  {
+    if (model_state_->source != &ions)
+      throw std::invalid_argument("Periodic real profile cannot rebind its fixed physical source");
+    model_state_->validatePhysicalSource();
+  }
+  else for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
   {
     for (int dimension = 0; dimension < 3; ++dimension)
       if (std::abs(ions.R[nucleus][dimension] - model.cfg.nuclei.x[3 * nucleus + dimension]) > tolerance)

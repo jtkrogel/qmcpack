@@ -33,6 +33,7 @@
 #include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "Utilities/RuntimeOptions.h"
 #include "OhmmsData/Libxml2Doc.h"
+#include "io/hdf/hdf_archive.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCHamiltonians/HamiltonianFactory.h"
 #include "Particle/VirtualParticleSet.h"
@@ -1140,6 +1141,131 @@ TEST_CASE("PsiFormer public inference rejects unsafe inherited fallback APIs",
   close(spin, C{.2, -.1});
   close(gradient[0], C{.3, .4});
   close(ratios[0], C{.7, -.2});
+}
+
+TEST_CASE("Real Gamma pair components retain complete physical ions and profile persistence",
+          "[wavefunction][psiformer][complex_wf][real_periodic_profile]")
+{
+  for (bool two_cells : {false, true})
+  {
+    const SimulationCell simulation_cell(cell());
+    auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+    ParticleSet source(simulation_cell);
+    source.setName("ion0");
+    source.create(two_cells ? std::vector<int>{2, 2} : std::vector<int>{1, 1});
+    auto& species = source.getSpeciesSet();
+    species.addSpecies("Li"); species.addSpecies("H");
+    const int charge = species.addAttribute("charge");
+    species(charge, 0) = 3; species(charge, 1) = 1;
+    source.resetGroups();
+    source.R[0] = {0, 0, 0};
+    if (two_cells)
+    {
+      source.R[1] = {4, 0, 0}; source.R[2] = {1, 1, 1}; source.R[3] = {5, 1, 1};
+    }
+    else source.R[1] = {1, 1, 1};
+    source.update();
+    auto initialized = parameters(false);
+    initialized.profile = ps::PSIFORMER_PERIODIC_PAIR_V1;
+    auto& environment = initialized.environment;
+    environment.boundary = ps::BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    environment.periodic_axes = {true, true, true};
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d) environment.lattice_vectors[a][d] = cell().R(a, d);
+    auto metadata = std::make_shared<ps::PeriodicProfileMetadata>();
+    metadata->cells.primitive = metadata->cells.simulation =
+        {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+    if (two_cells)
+    {
+      metadata->cells.primitive.lattice_vectors[0][0] = 4;
+      metadata->cells.tiling[0][0] = 2;
+    }
+    metadata->primitive_motif = {{0, 0, 0}, {1, 1, 1}};
+    metadata->motif_species = {0, 1};
+    metadata->feature_transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+    metadata->electron_electron_cusp = false;
+    for (std::size_t column = 0; column < 4; ++column)
+      metadata->occupied_columns.push_back({{}, column % 2, int(column / 2), 1});
+    environment.periodic_profile = metadata;
+    for (std::size_t block = 0; block < initialized.model_shape.attention_blocks; ++block)
+      for (bool bias : {false, true})
+      {
+        const auto begin = initialized.values.size(), heads = initialized.model_shape.attention_heads;
+        initialized.values.resize(begin + (bias ? 1 : 8) * heads, .02);
+        const auto layer = block ? "electron_gnn_layer_" + std::to_string(block) : std::string("electron_gnn_layer");
+        initialized.layouts.push_back({"periodic/" + layer + "/pair_attention", bias ? "b" : "w",
+            bias ? std::vector<std::size_t>{heads} : std::vector<std::size_t>{8, heads}, begin, initialized.values.size()});
+      }
+    PsiFormerWF component("real_pair", initialized, p, source, true, {}, true);
+    component.validateSystem(p, source, "all_electron");
+    const auto center = evaluate(component, p);
+    const auto gradient = p.G;
+    const auto laplacian = p.L;
+    constexpr double step = 1e-4;
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+      for (int d = 0; d < 3; ++d)
+      {
+        const auto position = p.R[electron][d];
+        p.R[electron][d] = position + step;
+        const auto plus = evaluate(component, p);
+        p.R[electron][d] = position - step;
+        const auto minus = evaluate(component, p);
+        p.R[electron][d] = position;
+        close((plus - minus) / (2 * step), gradient[electron][d], 2e-6);
+      }
+    auto clone = component.makeClone(clone_p);
+    auto* typed = dynamic_cast<PsiFormerWF*>(clone.get());
+    REQUIRE(typed);
+    typed->isolateParameterState();
+    close(evaluate(*typed, clone_p), center);
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      close(clone_p.L[electron], laplacian[electron]);
+      for (int d = 0; d < 3; ++d) close(clone_p.G[electron][d], gradient[electron][d]);
+    }
+    const auto replica = two_cells ? 1 : 0;
+    source.R[replica][0] += .01;
+    CHECK_THROWS(evaluate(component, p)); CHECK_THROWS(evaluate(*typed, clone_p));
+    source.R[replica][0] -= .01;
+    close(evaluate(component, p), center);
+    const auto path = "psiformer_real_pair." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+    REQUIRE_FALSE(std::filesystem::exists(path));
+    component.exportModel(path);
+    auto imported = ps::readPsiFormerModelFile(path);
+    CHECK_FALSE(imported.paired_complex);
+    REQUIRE(imported.parameters.environment.periodic_profile);
+    CHECK(imported.parameters.model_shape.nuclei == 2);
+    CHECK(imported.parameters.environment.periodic_profile->cells.tiling[0][0] == (two_cells ? 2 : 1));
+    ps::validatePsiFormerModelFile(imported, path, clone_p, source, "all_electron", {});
+    PsiFormerWF loaded("real_pair", imported.parameters, clone_p, source, true, {}, true);
+    loaded.validateSystem(clone_p, source, "all_electron");
+    close(evaluate(loaded, clone_p), center);
+    std::size_t receipt = 0;
+    const auto fingerprint = [&](PsiFormerWF& model) {
+      const auto vp_path = path + ".vp" + std::to_string(receipt++);
+      REQUIRE_FALSE(std::filesystem::exists(vp_path));
+      {
+        hdf_archive output;
+        REQUIRE(output.create(vp_path));
+        model.writeVariationalParameters(output);
+        output.flush();
+      }
+      std::string result;
+      {
+        hdf_archive input;
+        REQUIRE(input.open(vp_path, H5F_ACC_RDONLY));
+        input.push("PsiFormer", false); input.push("real_pair", false);
+        input.read(result, "model_fingerprint");
+      }
+      CHECK(std::filesystem::remove(vp_path));
+      return result;
+    };
+    const auto original_identity = fingerprint(component);
+    CHECK(fingerprint(*typed) == original_identity);
+    CHECK(fingerprint(loaded) == original_identity);
+    CHECK(std::filesystem::remove(path));
+  }
 }
 
 TEST_CASE("Complex provider affine rows preserve canonical phase scores and bounded factors",

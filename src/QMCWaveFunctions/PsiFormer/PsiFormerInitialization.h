@@ -34,7 +34,7 @@ inline constexpr char DEEPQMC_PSIFORMER_V1[] = "deepqmc_psiformer_v1";
 /// Full complex periodic heads with real trunk/parameters and no inner phases.
 inline constexpr char PSIFORMER_COMPLEX_PERIODIC_V1[] = "psiformer_complex_periodic_v1";
 
-/// Opt-in two-cell features, affine pair bias and explicit occupied full complex heads.
+/// Opt-in two-cell features, pair bias and occupied full real-Gamma or paired-complex heads.
 inline constexpr char PSIFORMER_PERIODIC_PAIR_V1[] = "psiformer_periodic_pair_v1";
 
 /// Stable name of the integer generator and Gaussian transform used by v1.

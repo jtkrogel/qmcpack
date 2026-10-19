@@ -273,34 +273,13 @@ struct PsiFormerComplexWF::Impl
     /// Snapshot all physical ions independently of any reduced primitive feature motif.
     static std::vector<double> physicalSource(const ParticleSet& ions)
     {
-      const auto& species = ions.getSpeciesSet();
-      const int charge = species.findAttribute("charge");
-      if (charge < 0 || ions.GroupID.size() != ions.R.size())
-        throw std::invalid_argument("Complex PsiFormer physical source metadata is incomplete");
-      std::vector<double> result;
-      result.reserve(5 * ions.getTotalNum());
-      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
-      {
-        const auto group = ions.GroupID[ion];
-        if (group < 0 || group >= ions.groups())
-          throw std::invalid_argument("Complex PsiFormer physical source species is invalid");
-        for (int d = 0; d < 3; ++d)
-          result.push_back(ions.R[ion][d]);
-        result.push_back(species(charge, group));
-        result.push_back(group);
-      }
-      if (!std::all_of(result.begin(), result.end(), [](double value) { return std::isfinite(value); }))
-        throw std::invalid_argument("Complex PsiFormer physical source must be finite");
-      return result;
+      return physicalSourceSnapshot(ions);
     }
 
     /// Preserve ordered physical species labels independently of mutable ParticleSet metadata.
     static std::vector<std::string> physicalSpecies(const ParticleSet& ions)
     {
-      std::vector<std::string> result;
-      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
-        result.push_back(ions.getSpeciesSet().getSpeciesName(ions.GroupID[ion]));
-      return result;
+      return physicalSpeciesSnapshot(ions);
     }
 
     /// Preserve existing AE identities exactly; only explicit PP metadata adds a new distinction.

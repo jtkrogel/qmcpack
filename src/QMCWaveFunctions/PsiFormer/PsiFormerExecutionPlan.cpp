@@ -208,6 +208,7 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
 
 } // namespace
 
+// Validate the complete opt-in geometry, feature and occupied-column contract before allocation.
 void validatePeriodicProfileMetadata(const ModelShape& model, const ExecutionEnvironment& environment)
 {
   if (!environment.periodic_profile)
