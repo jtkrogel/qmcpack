@@ -21,6 +21,7 @@
 #include "QMCHamiltonians/HarmonicExternalPotential.h"
 #include "Utilities/FakeRandom.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
@@ -5232,4 +5233,206 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   std::printf("COMPLEX_ACTUAL_ECP PASS actual_traversal=1 complex_energy=1 real_reporting=1 CPU_allP=1 duality=1 cap_abort_stale=1\n");
 }
 #endif
+} // namespace qmcplusplus
+
+namespace qmcplusplus
+{
+TEST_CASE("CPU paired energies preserve accepted ordinary nonlocal quadrature",
+          "[wavefunction][psiformer][complex_cpu_ecp_energy]")
+{
+  using namespace wftrain;
+  struct Point
+  {
+    std::size_t sample, electron;
+    ParticleSet::PosType position;
+    C bare, ratio;
+  };
+  class Audit final : public NonLocalECPDerivativeConsumer
+  {
+  public:
+    /// Keep the production scalar reduction and an independent test-only accepted-point oracle.
+    Audit(const StructuredParameterSchema& schema) : sum(schema, 0, 19, 23, 2, 2, 2 * sizeof(C)) {}
+
+    /// Forward the exact pre-RNG identity check without any parameter output.
+    void preflight(const NonLocalECPDerivativeContext& c, DerivativeArrayView<const VJPCoefficientChannel> v,
+                   const ParameterReductionSink& s) const override { sum.preflight(c, v, s); }
+
+    /// Bind both numerical and audit paths to one actual native grid.
+    void begin(const NonLocalECPDerivativeContext& c, DerivativeArrayView<const VJPCoefficientChannel> v,
+               ParameterReductionSink& s) override { sum.begin(c, v, s); }
+
+    /// Retain test-only coordinates before the native transient buffers are reused.
+    void consume(const NonLocalECPDerivativeTile& tile) override
+    {
+      for (std::size_t segment = 0; segment < tile.virtual_particles.segmentCount(); ++segment)
+      {
+        const auto slice = tile.virtual_particles.slice(segment);
+        for (std::size_t q = 0; q < slice.size(); ++q)
+        {
+          const auto index = slice.flatOffset() + q;
+          points.push_back({static_cast<std::size_t>(slice.walkerId()), static_cast<std::size_t>(slice.electronId()),
+              slice.absolutePosition(q), tile.bare_weights[index], tile.complete_ratios[index]});
+        }
+      }
+      sum.consume(tile);
+    }
+
+    /// Require complete native traversal in the production reduction.
+    void end() override { sum.end(); }
+
+    /// Poison the partial production result without publishing it.
+    void abort() noexcept override { sum.abort(); }
+
+    /// The production owner has no parameter-direction replay.
+    std::unique_ptr<NonLocalECPJVPReplay> releaseJVPReplay() override { return sum.releaseJVPReplay(); }
+
+    /// Exclude the deliberately test-only point bank from production storage diagnostics.
+    StreamingDerivativeStorageDiagnostics storageDiagnostics() const override { return sum.storageDiagnostics(); }
+
+    NonLocalEnergyAccumulator sum;
+    std::vector<Point> points;
+  };
+  class NoDerivativeSink final : public ParameterReductionSink
+  {
+    /// A score-only energy capture must never produce a local-energy parameter derivative.
+    void consume(std::size_t, const ParameterChunkConstView&) override
+    { throw std::logic_error("Unexpected nonlocal parameter derivative"); }
+  } sink;
+  Lattice lattice;
+  lattice.R = {6.6, 0, 0, 0, 6.6, 0, 0, 0, 6.6};
+  lattice.BoxBConds = {true, true, true}; lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  std::array<C, 2> positive{};
+  for (const double sign : {1.0, -1.0})
+  {
+    ParticleSet source(simulation_cell), p(simulation_cell);
+    source.setName("ion0"); source.create({2});
+    auto& ions = source.getSpeciesSet(); const int li = ions.addSpecies("Li");
+    ions(ions.addAttribute("charge"), li) = 1;
+    ions(ions.addAttribute("atomicnumber"), li) = 3;
+    source.R[0] = {0, 0, 0}; source.R[1] = {3.3, 3.3, 3.3};
+    source.resetGroups(); source.update();
+    p.setName("e"); p.create({1, 1});
+    auto& species = p.getSpeciesSet(); species.addSpecies("u"); species.addSpecies("d");
+    const int mass = species.addAttribute("mass"); species(mass, 0) = species(mass, 1) = 1;
+    p.R[0] = {.7, .4, .2}; p.R[1] = {2.8, 3.1, 3.5};
+    p.resetGroups(); p.addTable(source); p.update();
+    auto nonlocal = std::make_unique<NonLocalECPotential>(source, p, false, true);
+    auto* nl0 = nonlocal.get();
+    const char* selected = std::getenv("PSIFORMER_TEST_ECP_XML");
+    const auto pp_path = selected ? std::filesystem::path(selected) :
+        std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+        "tests/molecules/LiH_pp/Li.BFD.xml";
+    ECPComponentBuilder builder("scalar_energy", OHMMS::Controller, 4, 1);
+    REQUIRE(builder.read_pp_file(pp_path.string())); REQUIRE(builder.pp_nonloc);
+    nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+    testing::TestNonLocalECPotential::setTileCapacity(*nonlocal, 5);
+    p.update(); ParticleSet p1(p); p1.R[0][2] += .037; p1.update();
+    ps::ExecutionEnvironment environment;
+    environment.boundary = ps::BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    environment.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    environment.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    environment.periodic_axes = {true, true, true};
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) environment.lattice_vectors[i][j] = lattice.R(i, j);
+    auto leaves = fixture::makeLayout(2, 2, false, 1, 7);
+    for (auto& leaf : leaves)
+      for (auto& extent : leaf.shape)
+        if (extent == 256) extent = 8;
+        else if (extent == 32) extent = 4;
+    const auto real_leaves = leaves;
+    for (const auto& leaf : real_leaves)
+      if (leaf.module.find("Backflow") != std::string::npos)
+        leaves.push_back({leaf.module, "w_imag", leaf.shape});
+    std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
+      return std::tie(a.module, a.name) < std::tie(b.module, b.name);
+    });
+    ps::InitializedPsiFormerParameters initialized;
+    initialized.model_shape = {1, 1, 2, 2, 8, 2, 1};
+    initialized.profile = ps::PSIFORMER_COMPLEX_PERIODIC_V1;
+    initialized.seed = 17; initialized.environment = environment;
+    initialized.values = fixture::makeParameters("h2", leaves);
+    std::size_t cursor = 0;
+    for (const auto& leaf : leaves)
+    {
+      const auto end = cursor + fixture::product(leaf.shape);
+      initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, cursor, end});
+      cursor = end;
+    }
+    // A real periodic part isolates the conjugate response of the common nonzero boundary twist.
+    for (const auto& layout : initialized.layouts)
+      if (layout.name == "w_imag") std::fill(initialized.values.begin() + layout.begin,
+                                             initialized.values.begin() + layout.end, 0.0);
+    const std::array<double, 3> twist{sign / 8, sign / 5, sign / 7};
+    RuntimeOptions options; TrialWaveFunction trial(options);
+    auto owner = std::make_unique<PsiFormerComplexWF>("cpu_ecp", initialized, p, source, clone_cap,
+        twist, 0, "", "pseudopotential");
+    auto& cpu = *owner; trial.addComponent(std::move(owner));
+    auto trial1 = trial.makeClone(p1);
+    QMCHamiltonian ham("operator_energy_oracle");
+    ham.addOperator(std::make_unique<BareKineticEnergy>(p), "Kinetic", true);
+    ham.addOperator(std::move(nonlocal), "NonLocalECP", true);
+    auto local = std::make_unique<HarmonicExternalPotential>(p);
+    local->mass = local->energy = local->length = 1; local->center = 0;
+    ham.addOperator(std::move(local), "LocalBaseline", true); ham.addObservables(p);
+    auto ham1 = ham.makeClone(p1, *trial1);
+    auto& nl1 = dynamic_cast<NonLocalECPotential&>(*ham1->getComponent(1));
+    FakeRandom<double> rng0, rng1; rng0.set_value(.371); rng1.set_value(.371);
+    nl0->setRandomGenerator(&rng0); nl1.setRandomGenerator(&rng1);
+    RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial, *trial1});
+    RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
+    RefVectorWithLeader<QMCHamiltonian> hamiltonians(ham, {ham, *ham1});
+    ResourceCollection pr("cpu ECP particles"), wr("cpu ECP wavefunctions"), hr("cpu ECP H");
+    p.createResource(pr); trial.createResource(wr); ham.createResource(hr);
+    ResourceCollectionTeamLock<ParticleSet> pl(pr, particles);
+    ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, trials);
+    ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hamiltonians);
+    trial.evaluateLog(p); trial1->evaluateLog(p1);
+    const auto snapshot = cpu.snapshotParameters();
+    const auto storage = NonLocalEnergyAccumulator::requiredBytes(2);
+    Audit audit(cpu.parameterSchema());
+    std::vector<C> ones(2, {1, 0});
+    VJPCoefficientChannel channel{"energy", DerivativeProduct::LOCAL_ENERGY_VJP,
+        {cpu.parameterSchema().providerId(), cpu.parameterSchema().fingerprint(), 0, 19, 23, {ones.data(), 2}},
+        localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+    const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+        hamiltonians, trials, particles, audit, {&channel, 1}, sink);
+    REQUIRE(audit.points.size() > 5);
+    CHECK(audit.sum.gridFingerprint() == result.grid_fingerprint);
+    CHECK(audit.sum.storageDiagnostics().retained_numeric_bytes == storage);
+    CHECK(sink.state() == DerivativeSinkState::IDLE);
+    std::array<C, 2> independent{};
+    for (const auto& point : audit.points)
+    {
+      auto& original = particles[point.sample];
+      ParticleSet private_p(original);
+      private_p.R[point.electron] = point.position; private_p.update();
+      auto& component = *trials[point.sample].getOrbitals()[0];
+      auto private_wf = component.makeClone(private_p);
+      ParticleSet accepted_p(original);
+      auto accepted_wf = component.makeClone(accepted_p);
+      const auto ratio = std::exp(evaluate(*private_wf, private_p) - evaluate(*accepted_wf, accepted_p));
+      close(ratio, point.ratio, 3e-10);
+      independent[point.sample] += point.bare * ratio;
+    }
+    for (std::size_t sample = 0; sample < 2; ++sample)
+    {
+      close(audit.sum.energies()[sample], independent[sample], 3e-10);
+      const auto& nl = dynamic_cast<const NonLocalECPotential&>(*hamiltonians[sample].getComponent(1));
+      CHECK(independent[sample].real() == Catch::Approx(nl.getValue()).margin(3e-10));
+      auto& component = dynamic_cast<PsiFormerComplexWF&>(*trials[sample].getOrbitals()[0]);
+      const auto observation = component.observeCoulombEnergy(particles[sample], hamiltonians[sample].getLocalPotential());
+      const C full = observation.local_energy + C{0, audit.sum.energies()[sample].imag()};
+      CHECK(full.real() == Catch::Approx(result.local_energies[sample]).margin(3e-10));
+      double baseline = 0;
+      for (const auto& position : particles[sample].R) baseline += .5 * dot(position, position);
+      close(full, observation.kinetic + baseline + independent[sample], 3e-10);
+      if (sign > 0) positive[sample] = independent[sample];
+      else close(independent[sample], std::conj(positive[sample]), 3e-10);
+    }
+    CHECK(std::abs(independent[0].imag()) + std::abs(independent[1].imag()) > 1e-7);
+    CHECK(cpu.snapshotParameters().values == snapshot.values);
+  }
+}
 } // namespace qmcplusplus
