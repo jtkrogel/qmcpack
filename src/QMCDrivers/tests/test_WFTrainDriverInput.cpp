@@ -71,6 +71,26 @@ TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers]
       "<parameter name='kfac_curvature'>registered_gaussian</parameter></training></qmc>"));
 }
 
+TEST_CASE("Complex median covariance is an explicit independent KFAC policy", "[drivers][wf_train][kfac]")
+{
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training optimizer='kfac'>"
+        "<parameter name='kfac_objective'>componentwise_mad_covariance</parameter>" + controls + "</training></qmc>");
+  };
+  const auto defaults = parse("");
+  CHECK(defaults.getKFACObjective() == WFTrainDriverInput::KFACObjective::COMPONENTWISE_MAD_COVARIANCE);
+  CHECK(defaults.getKFACComplexClipWidth() == 5);
+  CHECK(defaults.getKFACClipWidth() == 1);
+  CHECK(parse("<parameter name='kfac_complex_clip_width'>2</parameter>").getKFACComplexClipWidth() == 2);
+  CHECK_THROWS(parse("<parameter name='kfac_complex_clip_width'>0</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_clip_width'>5</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_clip_mode'>hard_median</parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='kfac'>"
+      "<parameter name='kfac_complex_clip_width'>5</parameter></training></qmc>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='adam'>"
+      "<parameter name='kfac_complex_clip_width'>5</parameter></training></qmc>"));
+}
+
 TEST_CASE("Persistent KFAC inputs require explicit state ownership", "[drivers][wf_train][kfac]")
 {
   const auto parse = [](const std::string& controls) {

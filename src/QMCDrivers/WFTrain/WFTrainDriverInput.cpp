@@ -28,11 +28,12 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 88> allowed_controls{
+constexpr std::array<std::string_view, 89> allowed_controls{
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "kfac_objective", "kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width",
+    "kfac_complex_clip_width",
     "kfac_curvature", "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint",
     "kfac_persist_state", "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay",
     "kfac_schedule_precision", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period",
@@ -269,6 +270,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   kfac_damping_policy_ = KFACDamping::EQUAL_SPLIT;
   kfac_constraint_ = KFACConstraint::NONE;
   kfac_clip_width_ = 1.0;
+  kfac_complex_clip_width_ = 5.0;
   kfac_clip_quantile_ = 0.95;
   kfac_exclude_width_ = std::numeric_limits<double>::infinity();
   kfac_norm_constraint_ = 0.0;
@@ -810,6 +812,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (optimizer_ != Optimizer::KFAC)
     rejectControls(seen_controls, {"kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
         "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width", "kfac_curvature",
+        "kfac_complex_clip_width",
         "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_persist_state",
         "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay", "kfac_schedule_precision",
         "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"}, "selected optimizer");
@@ -820,6 +823,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       const auto& value = readControl("kfac_objective");
       if (value == "raw_covariance") kfac_objective_ = KFACObjective::RAW_COVARIANCE;
       else if (value == "clipped_covariance") kfac_objective_ = KFACObjective::CLIPPED_COVARIANCE;
+      else if (value == "componentwise_mad_covariance") kfac_objective_ = KFACObjective::COMPONENTWISE_MAD_COVARIANCE;
       else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_objective");
     }
     if (seen_controls.count("kfac_clip_mode"))
@@ -867,6 +871,17 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
           "kfac_exclude_width"}, "raw KFAC objective");
     if (kfac_clip_mode_ != KFACClipMode::SOFT_MEDIAN)
       rejectControls(seen_controls, {"kfac_clip_quantile"}, "hard KFAC clipping");
+    if (kfac_objective_ == KFACObjective::COMPONENTWISE_MAD_COVARIANCE)
+    {
+      rejectControls(seen_controls, {"kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width"},
+                     "componentwise median clipping");
+      if (seen_controls.count("kfac_complex_clip_width"))
+        kfac_complex_clip_width_ = parseNonnegativeReal(readControl("kfac_complex_clip_width"), "kfac_complex_clip_width");
+      if (kfac_complex_clip_width_ <= 0)
+        throw UniformCommunicateError("WFTrainDriverInput: kfac_complex_clip_width must be positive");
+    }
+    else
+      rejectControls(seen_controls, {"kfac_complex_clip_width"}, "selected KFAC objective");
     if (kfac_constraint_ == KFACConstraint::DAMPED_KFAC)
     {
       if (kfac_norm_constraint_ <= 0.0)

@@ -21,7 +21,7 @@ namespace qmcplusplus
 class WFTrainDriverInput
 {
 public:
-  enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE };
+  enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE, COMPONENTWISE_MAD_COVARIANCE };
   enum class KFACClipMode { SOFT_MEDIAN, HARD_MEDIAN, HARD_MEAN };
   enum class KFACCurvature { NATIVE_SCORE, REGISTERED_GAUSSIAN };
   enum class KFACDamping { EQUAL_SPLIT, TRACE_BALANCED };
@@ -130,6 +130,7 @@ public:
   KFACDamping getKFACDampingPolicy() const noexcept { return kfac_damping_policy_; }
   KFACConstraint getKFACConstraint() const noexcept { return kfac_constraint_; }
   double getKFACClipWidth() const noexcept { return kfac_clip_width_; }
+  double getKFACComplexClipWidth() const noexcept { return kfac_complex_clip_width_; }
   double getKFACClipQuantile() const noexcept { return kfac_clip_quantile_; }
   double getKFACExcludeWidth() const noexcept { return kfac_exclude_width_; }
   double getKFACNormConstraint() const noexcept { return kfac_norm_constraint_; }
@@ -225,6 +226,7 @@ private:
   KFACDamping kfac_damping_policy_{KFACDamping::EQUAL_SPLIT};
   KFACConstraint kfac_constraint_{KFACConstraint::NONE};
   double kfac_clip_width_{1.0};
+  double kfac_complex_clip_width_{5.0};
   double kfac_clip_quantile_{0.95};
   double kfac_exclude_width_{std::numeric_limits<double>::infinity()};
   double kfac_norm_constraint_{0.0};

@@ -38,16 +38,18 @@ def main():
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--ranks", type=int, default=1, choices=(1, 2))
     parser.add_argument("--twist-only", action="store_true")
+    parser.add_argument("--clipped", action="store_true")
     args = parser.parse_args()
     application = args.qmcpack.resolve()
     root = args.workdir or Path(tempfile.mkdtemp(prefix="complex_kfac_"))
     root.mkdir(parents=True, exist_ok=True)
     fixture = Path(__file__).with_name("wftrain_complex_orbital_mse.xml")
     report = dict(application=str(application), application_sha256=digest(application),
-                  fixture_sha256=digest(fixture), ranks=args.ranks, cases=[])
+                  fixture_sha256=digest(fixture), ranks=args.ranks, cases=[],
+                  objective="componentwise_mad_covariance" if args.clipped else "raw_covariance")
     print(f"Evidence: {root}", flush=True)
 
-    def run(label, twist, iterations, restart=None):
+    def run(label, twist, iterations, restart=None, clip_width=5, rejection=None):
         """Run one tiny native energy workflow with actual complex local energies."""
         directory = root / label
         directory.mkdir()
@@ -72,6 +74,8 @@ def main():
                         kfac_ema_decay="0.5", kfac_inverse_period=2,
                         kfac_curvature="registered_gaussian", kfac_objective="raw_covariance",
                         kfac_damping_policy="trace_balanced")
+        if args.clipped:
+            controls.update(kfac_objective="componentwise_mad_covariance", kfac_complex_clip_width=clip_width)
         for name, value in controls.items():
             parameter(training, name, value)
         if restart is not None:
@@ -87,8 +91,14 @@ def main():
             result = subprocess.run(command, cwd=directory, env=environment, stdout=output,
                                     stderr=subprocess.STDOUT, timeout=90)
         console = (directory / "console.log").read_text()
+        if rejection is not None:
+            assert result.returncode != 0 and rejection in console, (label, result.returncode, console[-6000:])
+            assert not list(directory.rglob("*.parameters.h5")), directory
+            return directory, []
         assert result.returncode == 0, (label, result.returncode, console[-6000:])
         assert "complex_covariance=yes parameter_response_mask=0" in console
+        if args.clipped:
+            assert "WFTrain componentwise median clipping:" in console
         with (directory / "complex_orbital_mse.s000.training_info.csv").open() as stream:
             rows = list(csv.DictReader(stream))
         assert len(rows) == (iterations if restart is None else 1), rows
@@ -130,6 +140,10 @@ def main():
                 compare_archives(bundle(full_models[-1]), bundle(resumed_models[-1]), pattern)
             assert len(list(bundle(resumed_models[-1]).glob("*.rank_*.h5"))) == args.ranks
             assert protected == {str(path): digest(path) for path in split.rglob("*.h5")}
+            if args.clipped:
+                run(label + "_reject_changed_window", twist, 2, checkpoint, clip_width=4,
+                    rejection="Training checkpoint stage identity or configuration mismatch")
+                assert protected == {str(path): digest(path) for path in split.rglob("*.h5")}
             report["cases"].append(dict(twist=twist, exact_model_optimizer_sampler_restart=True,
                                          imaginary_head_changed=True, samples_per_update=2 * args.ranks))
         report["status"] = "PASS"
