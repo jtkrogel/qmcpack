@@ -479,7 +479,7 @@ void DistributedParameterReduction::reduce(
   const EnergyClippingDescriptor* clipping = accumulator.clipping_descriptor_
       ? &*accumulator.clipping_descriptor_
       : nullptr;
-  const std::array<std::uint64_t, 21> local_record{
+  const std::array<std::uint64_t, 25> local_record{
       static_cast<std::uint64_t>(reason),
       protocol_version,
       accumulator.local_energy_term_mask_,
@@ -500,7 +500,11 @@ void DistributedParameterReduction::reduce(
       clipping ? doubleBits(clipping->scale) : 0,
       clipping ? doubleBits(clipping->width) : 0,
       accumulator.clipped_sample_count_,
-      accumulator.clipping_consumed_sample_count_};
+      accumulator.clipping_consumed_sample_count_,
+      clipping ? static_cast<std::uint64_t>(clipping->componentwise) : 0,
+      clipping ? doubleBits(clipping->imaginary_center) : 0,
+      clipping ? doubleBits(clipping->imaginary_scale) : 0,
+      clipping ? doubleBits(clipping->imaginary_width) : 0};
   const auto records = gatherRecords(communicator_, local_record);
 
   const std::size_t failed_rank = firstFailedRank(records);

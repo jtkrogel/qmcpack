@@ -26,7 +26,8 @@ namespace qmcplusplus::wftrain
 enum class EnergyClippingScaleRule : std::uint64_t
 {
   MEAN_ABSOLUTE_DEVIATION = 0,
-  EMPIRICAL_QUANTILE      = 1
+  EMPIRICAL_QUANTILE      = 1,
+  MEDIAN_ABSOLUTE_DEVIATION = 2
 };
 
 /// Fully specified policy used identically by every distributed participant.
@@ -46,6 +47,10 @@ struct EnergyClippingDescriptor
   DerivativeReal scale   = 0.0;
   DerivativeReal width   = 0.0;
   std::uint64_t identity = 0;
+  bool componentwise = false;
+  DerivativeReal imaginary_center = 0.0;
+  DerivativeReal imaginary_scale = 0.0;
+  DerivativeReal imaginary_width = 0.0;
 
   /// Compare all semantic fields bit-for-bit rather than relying on a hash alone.
   bool equivalent(const EnergyClippingDescriptor& other) const noexcept;
@@ -53,8 +58,8 @@ struct EnergyClippingDescriptor
 
 /** Immutable symmetric clipping transform prepared from a complete population.
  *
- * Only the real part is clamped. The imaginary component is retained so complex
- * local-energy algebra is not silently changed by this real robust-statistics rule.
+ * The ordinary policy clamps only the real part. An explicitly componentwise
+ * descriptor instead supplies independently prepared real and imaginary windows.
  */
 class EnergyClippingTransform
 {
@@ -64,10 +69,10 @@ public:
   /// Return the complete immutable transform descriptor.
   const EnergyClippingDescriptor& descriptor() const noexcept { return descriptor_; }
 
-  /// Clamp the real component and preserve the imaginary component exactly.
+  /// Apply the explicitly prepared windows, preserving unselected channels.
   DerivativeValue apply(DerivativeValue energy) const noexcept;
 
-  /// Report whether applying the transform changes the real component.
+  /// Report whether either selected component changes.
   bool clips(DerivativeValue energy) const noexcept;
 
 private:
@@ -82,6 +87,13 @@ private:
 EnergyClippingTransform prepareEnergyClippingTransform(
     DerivativeArrayView<const DerivativeValue> local_energies,
     const EnergyClippingPolicy& policy = {},
+    Communicate* communicator = nullptr);
+
+/// Prepare independent median/MAD windows for unit-weight complex samples across ranks.
+EnergyClippingTransform prepareComplexEnergyClippingTransform(
+    DerivativeArrayView<const DerivativeValue> local_energies,
+    DerivativeArrayView<const DerivativeReal> local_weights,
+    DerivativeReal width_multiplier = 5.0,
     Communicate* communicator = nullptr);
 
 } // namespace qmcplusplus::wftrain

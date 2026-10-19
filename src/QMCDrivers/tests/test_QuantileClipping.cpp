@@ -190,6 +190,114 @@ EnergyGradientResult evaluateObjective(
 
 } // namespace
 
+TEST_CASE("Complex median clipping preserves raw energy and centers both covariance channels",
+          "[drivers][training][clipping][complex_clipping]")
+{
+  const std::vector<DerivativeValue> energies{{-100, 0}, {0, -50}, {1, 0}, {2, 2}, {100, 100}};
+  const std::vector<DerivativeReal> weights(energies.size(), 1);
+  const auto transform = prepareComplexEnergyClippingTransform(
+      {energies.data(), energies.size()}, {weights.data(), weights.size()});
+  const auto& descriptor = transform.descriptor();
+  CHECK(descriptor.componentwise);
+  CHECK(descriptor.policy.scale_rule == EnergyClippingScaleRule::MEDIAN_ABSOLUTE_DEVIATION);
+  CHECK(descriptor.center == 1);
+  CHECK(descriptor.scale == 1);
+  CHECK(descriptor.width == 5);
+  CHECK(descriptor.imaginary_center == 0);
+  CHECK(descriptor.imaginary_scale == 2);
+  CHECK(descriptor.imaginary_width == 10);
+  const std::vector<DerivativeValue> clipped{{-4, 0}, {0, -10}, {1, 0}, {2, 2}, {6, 10}};
+  std::vector<std::vector<DerivativeValue>> scores(energies.size(), std::vector<DerivativeValue>(2));
+  for (std::size_t sample = 0; sample < energies.size(); ++sample)
+  {
+    CHECK(transform.apply(energies[sample]) == clipped[sample]);
+    scores[sample] = {DerivativeValue{0, double(sample + 1)}, DerivativeValue{double(sample % 2), -.25 * sample}};
+  }
+  const auto schema = makeClippingSchema();
+  ClippingStreamingOperator derivative(schema, scores,
+      std::vector<std::vector<DerivativeValue>>(energies.size(), std::vector<DerivativeValue>(2)));
+  EnergyGradientAccumulator accumulator(schema, 0, EnergyGradientEstimator::SCORE_COVARIANCE);
+  accumulateEnergyGradientBatch(derivative, {weights.data(), weights.size()}, {energies.data(), energies.size()},
+                                 0, accumulator, DerivativeAdjoint::TRANSPOSE, &transform);
+  accumulator.completeSingleParticipantReduction();
+  const auto result = accumulator.finalize();
+  CHECK(result.mean_energy.real() == Approx(.6));
+  CHECK(result.mean_energy.imag() == Approx(10.4));
+  REQUIRE(result.clipped_mean_energy.has_value());
+  CHECK(result.clipped_mean_energy->real() == Approx(1));
+  CHECK(result.clipped_mean_energy->imag() == Approx(.4));
+  CHECK(result.clipped_sample_count == 3);
+  for (std::size_t parameter = 0; parameter < 2; ++parameter)
+  {
+    double expected = 0;
+    for (std::size_t sample = 0; sample < energies.size(); ++sample)
+      expected += 2.0 * std::real(std::conj(scores[sample][parameter]) *
+          (clipped[sample] - DerivativeValue{1, .4})) / 5.0;
+    CHECK(result.gradient[parameter] == Approx(expected).margin(1e-13));
+  }
+  auto bad_weights = weights;
+  bad_weights.back() = 2;
+  CHECK_THROWS_WITH(prepareComplexEnergyClippingTransform({energies.data(), energies.size()},
+      {bad_weights.data(), bad_weights.size()}), Catch::Matchers::ContainsSubstring("unit statistical weights"));
+
+  const std::vector<DerivativeValue> even{{-4, -10}, {-1, 0}, {1, 1}, {9, 50}};
+  const std::vector<DerivativeReal> even_weights(even.size(), 1);
+  const auto even_transform = prepareComplexEnergyClippingTransform(
+      {even.data(), even.size()}, {even_weights.data(), even_weights.size()}, 1);
+  CHECK(even_transform.descriptor().center == 0);
+  CHECK(even_transform.descriptor().scale == 2.5);
+  CHECK(even_transform.descriptor().imaginary_center == .5);
+  CHECK(even_transform.descriptor().imaginary_scale == 5.5);
+}
+
+TEST_CASE("Distributed complex clipping uses global component medians before covariance",
+          "[drivers][training][clipping][complex_clipping][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const std::vector<DerivativeValue> population{{-100, 0}, {0, -50}, {1, 0}, {2, 2}, {100, 100}};
+  const std::vector<DerivativeValue> clipped{{-4, 0}, {0, -10}, {1, 0}, {2, 2}, {6, 10}};
+  std::vector<DerivativeValue> energies;
+  std::vector<std::vector<DerivativeValue>> scores;
+  for (std::size_t sample = 0; sample < population.size(); ++sample)
+    if (sample % communicator.size() == communicator.rank())
+    {
+      energies.push_back(population[sample]);
+      scores.push_back({DerivativeValue{0, double(sample + 1)}, DerivativeValue{double(sample), -double(sample)}});
+    }
+  std::vector<DerivativeReal> weights(energies.size(), 1);
+  const auto transform = prepareComplexEnergyClippingTransform(
+      {energies.data(), energies.size()}, {weights.data(), weights.size()}, 5, &communicator);
+  CHECK(transform.descriptor().population == population.size());
+  CHECK(transform.descriptor().scale == 1);
+  CHECK(transform.descriptor().imaginary_scale == 2);
+  const auto schema = makeClippingSchema();
+  ClippingStreamingOperator derivative(schema, scores,
+      std::vector<std::vector<DerivativeValue>>(energies.size(), std::vector<DerivativeValue>(2)),
+      ReductionDomain::RANK_LOCAL);
+  EnergyGradientAccumulator accumulator(schema, 0, EnergyGradientEstimator::SCORE_COVARIANCE);
+  accumulateEnergyGradientBatch(derivative, {weights.data(), weights.size()}, {energies.data(), energies.size()},
+                                 0, accumulator, DerivativeAdjoint::TRANSPOSE, &transform);
+  DistributedParameterReduction(communicator, {1}).reduce(accumulator);
+  const auto result = accumulator.finalize();
+  for (std::size_t parameter = 0; parameter < 2; ++parameter)
+  {
+    double expected = 0;
+    for (std::size_t sample = 0; sample < population.size(); ++sample)
+    {
+      const DerivativeValue response = parameter == 0 ? DerivativeValue{0, double(sample + 1)}
+          : DerivativeValue{double(sample), -double(sample)};
+      expected += 2.0 * std::real(std::conj(response) * (clipped[sample] - DerivativeValue{1, .4})) / 5.0;
+    }
+    CHECK(result.gradient[parameter] == Approx(expected).margin(1e-13));
+  }
+  CHECK(result.mean_energy.real() == Approx(.6));
+  CHECK(result.mean_energy.imag() == Approx(10.4));
+  if (communicator.rank() == 0)
+    weights.front() = 2;
+  CHECK_THROWS(prepareComplexEnergyClippingTransform({energies.data(), energies.size()},
+      {weights.data(), weights.size()}, 5, &communicator));
+}
+
 TEST_CASE("Energy clipping exact local statistics", "[drivers][training][clipping]")
 {
   const std::vector<DerivativeValue> energies{{-4.0, 0.1}, {-1.0, 0.2},
