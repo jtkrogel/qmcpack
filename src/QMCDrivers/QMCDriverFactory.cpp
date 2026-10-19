@@ -87,7 +87,7 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
   auto reject = []() { throw UniformCommunicateError(
       "Complex PsiFormer selected-system admission requires a sole component, CPU bare kinetic and "
       "three physical periodic Coulomb terms bound to its actual target/source"); };
-  const bool ecp = wftrain && complex->gpuInferenceEnabled() && ham.hasPhysicalNLPP();
+  const bool ecp = wftrain && ham.hasPhysicalNLPP();
   const auto& provenance = ham.ecpModelProvenance();
   if (complex->isPseudopotentialSystem() != ecp || ham.hasPhysicalNLPP() != ecp ||
       (ecp && (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())) ||

@@ -32,6 +32,7 @@
 #include "QMCDrivers/WFTrain/ProposalSelection.h"
 #include "QMCDrivers/WFTrain/NativeLineSearch.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
 #include "QMCDrivers/WFTrain/OrbitalPretraining.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
@@ -656,6 +657,60 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       app_log() << std::setprecision(17) << "WFTrain paired accepted-grid ECP: Q=" << actual_points
                 << " grid=" << result.grid_fingerprint << " version=" << batch.derivative_operator->parameterVersion()
                 << " samples=" << samples << " max_abs_ImVnl=" << maximum_imaginary_nonlocal << std::endl;
+      return batch;
+    }
+    if (!gpu_training && has_nonlocal_ecp)
+    {
+      // The score owner supplies immutable identity only; no local-energy parameter products are requested.
+      for (std::size_t sample = 0; sample < walkers.size(); ++sample)
+        component_batch.push_back(componentAt(sample));
+      const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+      batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
+          component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+      const auto& schema = batch.derivative_operator->parameterSchema();
+      const auto version = batch.derivative_operator->parameterVersion();
+      const auto energy_bytes = wftrain::NonLocalEnergyAccumulator::requiredBytes(walkers.size());
+      wftrain::NonLocalEnergyAccumulator energy(schema, version, batch_ordinal, sample_offset,
+          walkers.size(), electrons[0].get().getTotalNum(), energy_bytes);
+      std::vector<wftrain::DerivativeValue> ones(walkers.size(), {1, 0});
+      const wftrain::VJPCoefficientChannel channel{wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+          wftrain::DerivativeProduct::LOCAL_ENERGY_VJP,
+          {schema.providerId(), schema.fingerprint(), version, batch_ordinal, sample_offset,
+              {ones.data(), ones.size()}}, wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)};
+      ReplayOnlyECPSink sink;
+      const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+          hamiltonian_batch, twf_batch, electron_batch, energy, {&channel, 1}, sink);
+      if (energy.gridFingerprint() != result.grid_fingerprint)
+        throw std::logic_error("CPU nonlocal energy accepted-grid identity changed");
+      double maximum_imaginary_nonlocal = 0;
+      batch.local_energies.reserve(walkers.size());
+      for (std::size_t sample = 0; sample < walkers.size(); ++sample)
+      {
+        auto& hamiltonian = hamiltonians[sample].get();
+        const auto captured = energy.energies()[sample];
+        double reported_nonlocal = 0;
+        for (int term = 0; term < hamiltonian.size(); ++term)
+          if (const auto* nonlocal = dynamic_cast<const NonLocalECPotential*>(hamiltonian.getComponent(term)))
+            reported_nonlocal += nonlocal->getValue();
+        const auto tolerance = 512 * std::numeric_limits<double>::epsilon() *
+            (1 + std::abs(reported_nonlocal) + std::abs(captured.real()));
+        if (!wftrain::isFiniteTrainingReal(reported_nonlocal) ||
+            std::abs(reported_nonlocal - captured.real()) > tolerance)
+          throw std::logic_error("CPU complex nonlocal energy differs from the native accepted real potential");
+        // Native V already contains Re(Vnl). Restore only Im(Vnl), together with the actual complex kinetic value.
+        const auto observed = componentAt(sample).observeCoulombEnergy(
+            electrons[sample], hamiltonian.getLocalPotential());
+        const auto complete = observed.local_energy + wftrain::DerivativeValue{0, captured.imag()};
+        if (!wftrain::isFiniteTrainingReal(complete.real()) || !wftrain::isFiniteTrainingReal(complete.imag()))
+          throw std::overflow_error("CPU complete complex nonlocal energy is nonfinite");
+        batch.local_energies.push_back(complete);
+        maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(captured.imag()));
+      }
+      // The physical energy includes ECP, but the derivative owner does not advertise an ECP dEL response.
+      app_log() << std::setprecision(17) << "WFTrain CPU accepted-grid ECP: grid=" << result.grid_fingerprint
+                << " version=" << version << " samples=" << walkers.size()
+                << " max_abs_ImVnl=" << maximum_imaginary_nonlocal
+                << " capture_numeric_bytes=" << energy_bytes << " ECP_derivative_response_mask=0" << std::endl;
       return batch;
     }
     batch.local_energies.reserve(walkers.size());
@@ -1841,7 +1896,13 @@ void WFTrainBatched::process(xmlNodePtr node)
             (!complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
              training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
-        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        const bool cpu_score_ecp = !complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
+            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !inference_input_.enabled &&
+            complex->isPseudopotentialSystem() && population_.get_golden_hamiltonian().ecpModelProvenance() &&
+            population_.get_golden_hamiltonian().ecpModelProvenance()->ordinary_locality_vp;
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
              training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
              (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF &&
@@ -1849,7 +1910,8 @@ void WFTrainBatched::process(xmlNodePtr node)
              inference_input_.enabled ||
              training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
              training_input_.getMaximumUpdateNorm() != 0))
-          throw UniformCommunicateError("Paired ECP training requires GPU ENERGY Adam/OFF or REFERENCE with default update controls");
+          throw UniformCommunicateError("Paired ECP training requires CPU score-only ENERGY KFAC/OFF with ordinary scalar VP "
+              "or GPU ENERGY Adam/OFF or REFERENCE with default update controls");
         // GPU reference candidates require the separate budgeted private lane/image route.
         const bool energy_reference =
             training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
@@ -2381,6 +2443,15 @@ void WFTrainBatched::run()
       prospective = checkedMemoryAdd(prospective, successor_bytes);
       prospective = checkedMemoryAdd(prospective, complex_fixed_grid_host_bytes);
       prospective = checkedMemoryAdd(prospective, complex_kfac_allowance);
+      if (!complex_gpu_provider_ && population_.get_golden_hamiltonian().hasPhysicalNLPP())
+      {
+        // One temporary B-energy vector and one B-coefficient vector coexist only during accepted-grid capture.
+        const auto nonlocal_capture_bytes = checkedMemoryMultiply(2,
+            wftrain::NonLocalEnergyAccumulator::requiredBytes(largest_batch));
+        prospective = checkedMemoryAdd(prospective, nonlocal_capture_bytes);
+        app_log() << "WFTrain CPU nonlocal energy before allocation: temporary_numeric_bytes="
+                  << nonlocal_capture_bytes << "; no ECP parameter derivatives or retained quadrature replay" << std::endl;
+      }
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
         prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
       complex_physical_identity = complex->trainingConfigurationFingerprint();

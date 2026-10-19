@@ -280,10 +280,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
-  if (pair_profile && (!periodic || system != "all_electron" ||
+  if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
       (normalizedAcceleratorRequest(gpu) != "no" && normalizedAcceleratorRequest(gpu) != "cpu") ||
       precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE))
-    throw std::invalid_argument("Versioned periodic profiles currently require explicit all-electron CPU fp64_reference");
+    throw std::invalid_argument("Versioned periodic profiles require explicit qualified CPU fp64_reference physics");
   if (complex_profile)
   {
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
@@ -293,15 +293,19 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     // its values are not a sampler restart or a saved PP-provenance guarantee.
     const bool gpu_ecp = explicit_gpu && system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((initialization == "psiformer_complex_periodic_v1" && parameters.empty()) || direct_model);
+    const bool cpu_ecp = !explicit_gpu && (request == "no" || request == "cpu") &&
+        optimization_enabled && system == "pseudopotential" && parameter_checkpoint.empty() &&
+        ((parameters.empty() && (initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 || pair_profile)) || direct_model);
     const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&
-        optimization_enabled && optimize_scope == "all" && optimize_indices.empty() && system == "all_electron";
+        optimization_enabled && optimize_scope == "all" && optimize_indices.empty() &&
+        (system == "all_electron" || cpu_ecp);
     if ((!explicit_gpu && request != "no" && request != "cpu") || (optimization_enabled && !cpu_training) ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Complex PsiFormer requires qualified CPU optimize_scope=all training or "
                                  "CPU/strict cuda/hip inference, and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
         feature_policy != (pair_profile ? "periodic_two_cell_v1" : "periodic_torus_v1") ||
-        (system != "all_electron" && !gpu_ecp) ||
+        (system != "all_electron" && !gpu_ecp && !cpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() ||
         optimize_scope != (cpu_training ? "all" : "indices"))
@@ -372,7 +376,9 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
   if (pair_profile && !complex_profile && (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Real versioned periodic profiles currently require Gamma twist");
-  if (complex_profile && system == "pseudopotential" && (nonzero_twist || !particle_twist_is_zero))
+  if (complex_profile && system == "pseudopotential" &&
+      accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
+      (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Native paired pseudopotential initialization requires Gamma twist");
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||

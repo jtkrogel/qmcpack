@@ -40,12 +40,18 @@ def main():
     parser.add_argument("--ranks", type=int, default=1, choices=(1, 2))
     parser.add_argument("--twist-only", action="store_true")
     parser.add_argument("--real-limit", action="store_true")
+    parser.add_argument("--ecp", type=Path, help="Exact scalar Li PP for a separate two-Li periodic operator qualifier")
+    parser.add_argument("--admission-only", action="store_true", help="Run only the bounded unsupported-localization check")
     policy = parser.add_mutually_exclusive_group()
     policy.add_argument("--clipped", action="store_true")
     policy.add_argument("--defaults", choices=("deepqmc", "deepsolid", "jaqmc"))
     args = parser.parse_args()
     if args.real_limit and not args.defaults:
         parser.error("--real-limit requires an explicit defaults policy")
+    if args.ecp and (args.real_limit or not args.twist_only):
+        parser.error("--ecp requires --twist-only and the paired complex executable")
+    if args.admission_only and not args.ecp:
+        parser.error("--admission-only requires --ecp")
     application = args.qmcpack.resolve()
     root = args.workdir or Path(tempfile.mkdtemp(prefix="complex_kfac_"))
     root.mkdir(parents=True, exist_ok=True)
@@ -57,9 +63,14 @@ def main():
                   objective=preset_objectives[args.defaults] if args.defaults else
                       "componentwise_mad_covariance" if args.clipped else "raw_covariance",
                   defaults=args.defaults)
+    if args.ecp:
+        args.ecp = args.ecp.resolve()
+        report.update(pseudopotential=str(args.ecp), pseudopotential_sha256=digest(args.ecp),
+                      physical_system="two-Li operator qualifier, not a selected-system comparison")
     print(f"Evidence: {root}", flush=True)
 
-    def run(label, twist, iterations, restart=None, clip_width=5, rejection=None, defaults=None, rate_override=None):
+    def run(label, twist, iterations, restart=None, clip_width=5, rejection=None, defaults=None, rate_override=None,
+            localization="no"):
         """Run one tiny native energy workflow with actual complex local energies."""
         directory = root / label
         directory.mkdir()
@@ -70,6 +81,34 @@ def main():
         student.set("twist", twist)
         student.set("optimize", "yes")
         student.set("optimize_scope", "all")
+        if args.ecp:
+            # A neutral two-Li cell avoids mixing a bare-ion source with a periodic PP source.
+            system.find("simulationcell/parameter[@name='lattice']").text = "6.6 0 0 0 6.6 0 0 0 6.6"
+            parameter(system.find("simulationcell"), "LR_handler", "ewald")
+            parameter(system.find("simulationcell"), "LR_dim_cutoff", 30)
+            ions = system.find("particleset[@name='ion0']")
+            ions.find("group").set("name", "Li")
+            parameter(ions.find("group"), "atomicnumber", 3)
+            ions.find("attrib[@name='position']").text = "0 0 0 3.3 3.3 3.3"
+            positions = system.findall("particleset[@name='e']/group/attrib[@name='position']")
+            positions[0].text, positions[1].text = ".7 .4 .2", "2.8 3.1 3.5"
+            student.set("system", "pseudopotential")
+            student.set("initialization", "psiformer_periodic_pair_v1")
+            student.set("feature_policy", "periodic_two_cell_v1")
+            profile = ET.SubElement(student, "periodic_profile", version="1", head="paired_complex",
+                                    feature_transform="raw_trigonometric_v1", electron_electron_cusp="no")
+            for name, value in dict(primitive_lattice="6.6 0 0 0 6.6 0 0 0 6.6", tiling="1 0 0 0 1 0 0 0 1",
+                                    primitive_motif="0 0 0 3.3 3.3 3.3", motif_species="Li Li",
+                                    occupied_columns="0 0 0 0 0 1 0 0 0 0 1 1").items():
+                parameter(profile, name, value)
+            pair = system.find("hamiltonian/pairpot[@name='ElecIon']")
+            pair.set("type", "pseudo")
+            for name, value in dict(wavefunction="student", format="xml", algorithm="batched", DLA=localization).items():
+                pair.set(name, value)
+            ET.SubElement(pair, "pseudo", elementType="Li", href=str(args.ecp), format="xml", nrule="4", **{"l-local": "1"})
+            for pair in system.findall("hamiltonian/pairpot"):
+                pair.set("pbc", "yes")
+                pair.set("gpu", "no")
         if args.real_limit:
             real_fixture = ET.parse(Path(__file__).with_name("wftrain.xml"))
             student.set("initialization", real_fixture.find(".//psiformer").get("initialization"))
@@ -120,6 +159,10 @@ def main():
             return directory, []
         assert result.returncode == 0, (label, result.returncode, console[-6000:])
         assert "parameter_response_mask=0" in console
+        if args.ecp:
+            assert "ECP_derivative_response_mask=0" in console
+            imaginary = re.findall(r"WFTrain CPU accepted-grid ECP:[^\n]*max_abs_ImVnl=([^\s]+)", console)
+            assert imaginary and max(abs(float(value)) for value in imaginary) > 1e-7, console[-6000:]
         if args.clipped or args.defaults:
             assert "WFTrain score weighting:" in console
         if args.defaults:
@@ -140,7 +183,14 @@ def main():
         return directory, rows
 
     try:
+        if args.admission_only:
+            run("ecp_reject_localization", "0.125 0.2 0.14285714285714285", 1, localization="yes",
+                rejection="selected-system admission")
+            report.update(status="PASS", unsupported_localization_rejected=True)
+            return
         twists = [("twist", "0.17 -0.11 0.07")]
+        if args.ecp:
+            twists = [("ecp_twist", "0.125 0.2 0.14285714285714285")]
         if args.real_limit:
             twists = [("real_gamma", "0 0 0")]
         elif not args.twist_only:
@@ -174,6 +224,9 @@ def main():
                 compare_archives(bundle(full_models[-1]), bundle(resumed_models[-1]), pattern)
             assert len(list(bundle(resumed_models[-1]).glob("*.rank_*.h5"))) == args.ranks
             assert protected == {str(path): digest(path) for path in split.rglob("*.h5")}
+            if args.ecp:
+                run(label + "_reject_localization", twist, 1, localization="yes",
+                    rejection="selected-system admission")
             if args.clipped or args.defaults:
                 run(label + "_reject_changed_window", twist, 2, checkpoint, clip_width=4,
                     rejection="Training checkpoint stage identity or configuration mismatch")

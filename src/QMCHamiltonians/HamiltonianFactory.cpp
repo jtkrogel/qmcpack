@@ -116,7 +116,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
     if (psi_optional_->get().getOrbitals().size() != 1 || defaultKE != "yes")
       throw std::invalid_argument("Complex PsiFormer requires a sole component and ordinary bare kinetic energy");
     const auto& source = complex->sourceParticles();
-    const bool pp = complex->isPseudopotentialSystem() && complex->gpuInferenceEnabled();
+    const bool pp = complex->isPseudopotentialSystem();
     std::array<bool, 3> seen{};
     processChildren(cur, [&](const std::string& kind, xmlNodePtr element) {
       if (element->type != XML_ELEMENT_NODE)
