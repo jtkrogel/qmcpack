@@ -158,6 +158,9 @@ TEST_CASE("Periodic occupied SPO fixed-point VGL export",
   if (!xml_path || !oracle_path || !output_path)
     SKIP("Set PSIFORMER_SPO_XML, PSIFORMER_SPO_ORACLE and PSIFORMER_SPO_OUTPUT for this diagnostic");
   const char* requested_name = std::getenv("PSIFORMER_SPO_NAME");
+  const char* complex_input = std::getenv("PSIFORMER_SPO_COMPLEX_ORACLE");
+  const bool complex_oracle = complex_input && std::string(complex_input) == "1";
+  REQUIRE((!complex_input || std::string(complex_input) == "0" || complex_oracle));
   Libxml2Document document;
   REQUIRE(document.parse(xml_path));
   auto* root = document.getRoot();
@@ -183,6 +186,14 @@ TEST_CASE("Periodic occupied SPO fixed-point VGL export",
       REQUIRE(pool.put(child));
   auto* electrons = pool.getParticleSet("e");
   REQUIRE(electrons != nullptr);
+  const char* target_twist_input = std::getenv("PSIFORMER_SPO_TARGET_TWIST");
+  std::array<double, 3> target_twist{};
+  if (target_twist_input)
+  {
+    std::istringstream fields(target_twist_input);
+    REQUIRE(static_cast<bool>(fields >> target_twist[0] >> target_twist[1] >> target_twist[2]));
+    electrons->setTwist(ParticleSet::PosType{target_twist[0], target_twist[1], target_twist[2]});
+  }
   xmlNodePtr wavefunction = nullptr;
   for (auto* child = root->children; child; child = child->next)
     if (xmlStrEqual(child->name, BAD_CAST "wavefunction"))
@@ -198,14 +209,35 @@ TEST_CASE("Periodic occupied SPO fixed-point VGL export",
   REQUIRE(orbitals != nullptr);
   const auto count = orbitals->getOrbitalSetSize();
   REQUIRE(count > 0);
+#ifdef QMC_COMPLEX
+  std::unique_ptr<ComplexOrbitalTargetEvaluator> target;
+  if (target_twist_input)
+  {
+    const auto* slater = dynamic_cast<const SlaterDet*>(state->getOrbitals()[0].get());
+    REQUIRE(slater != nullptr);
+    const auto& source = dynamic_cast<const LCAOrbitalSet&>(state->getSPOSet(requested_name ? requested_name : "spo-up"));
+    const auto n = electrons->R.size();
+    const auto cap = (n * n + 2 * count + 2 * source.C->size()) * sizeof(std::complex<double>);
+    CHECK_THROWS_AS(ComplexOrbitalTargetEvaluator::fromSingleReference(*slater, *electrons, target_twist, 1, cap - 1),
+                    std::length_error);
+    target = std::make_unique<ComplexOrbitalTargetEvaluator>(
+        ComplexOrbitalTargetEvaluator::fromSingleReference(*slater, *electrons, target_twist, 1, cap));
+    CHECK(target->retainedScalarBytes() == cap);
+  }
+#else
+  REQUIRE(target_twist_input == nullptr);
+#endif
   SPOSet::ValueVector values(count), laplacians(count);
   SPOSet::GradVector gradients(count);
   std::ifstream oracle(oracle_path);
   REQUIRE(oracle.good());
   std::ofstream output(output_path);
   REQUIRE(output.good());
-  output << std::setprecision(17) << "# x y z occupied_column real_value real_gx real_gy real_gz real_laplacian\n";
+  output << std::setprecision(17) << (complex_oracle
+      ? "# x y z occupied_column real_imag_value real_imag_gx real_imag_gy real_imag_gz real_imag_laplacian\n"
+      : "# x y z occupied_column real_value real_gx real_gy real_gz real_laplacian\n");
   std::array<double, 5> maximum_error{};
+  double maximum_imaginary_value = 0;
   std::size_t rows = 0;
   std::string line;
   while (std::getline(oracle, line))
@@ -215,10 +247,22 @@ TEST_CASE("Periodic occupied SPO fixed-point VGL export",
       continue;
     std::istringstream fields(line);
     ParticleSet::PosType position;
-    int column;
-    std::array<double, 5> expected;
-    REQUIRE(static_cast<bool>(fields >> position[0] >> position[1] >> position[2] >> column >>
-                              expected[0] >> expected[1] >> expected[2] >> expected[3] >> expected[4]));
+    double column_value;
+    std::array<std::complex<double>, 5> expected;
+    REQUIRE(static_cast<bool>(fields >> position[0] >> position[1] >> position[2] >> column_value));
+    // Oracle tables may write integral column indices in scientific notation; consume the complete token.
+    REQUIRE(column_value >= 0);
+    REQUIRE(column_value < count);
+    const int column = static_cast<int>(column_value);
+    REQUIRE(static_cast<double>(column) == column_value);
+    // Complex oracle rows explicitly interleave real/imaginary values for all five physical products.
+    for (auto& product : expected)
+    {
+      double real, imaginary = 0;
+      REQUIRE(static_cast<bool>(fields >> real));
+      if (complex_oracle) REQUIRE(static_cast<bool>(fields >> imaginary));
+      product = {real, imaginary};
+    }
     REQUIRE(column >= 0);
     REQUIRE(column < count);
     for (int d = 0; d < 3; ++d)
@@ -228,19 +272,59 @@ TEST_CASE("Periodic occupied SPO fixed-point VGL export",
     orbitals->evaluateVGL(*electrons, 0, values, gradients, laplacians);
     const std::array<QMCTraits::ValueType, 5> actual{
         values[column], gradients[column][0], gradients[column][1], gradients[column][2], laplacians[column]};
+#ifdef QMC_COMPLEX
+    if (target)
+    {
+      const auto momentum = electrons->getLattice().k_cart(electrons->getTwist());
+      const double angle = -dot(momentum, position);
+      const std::complex<double> phase{std::cos(angle), std::sin(angle)};
+      // Remove the common row twist once, retaining the occupied-column complex gauge.
+      CHECK(std::abs(target->evaluate(*electrons)[column] - phase * values[column]) < 1e-11);
+    }
+#endif
     output << position[0] << ' ' << position[1] << ' ' << position[2] << ' ' << column;
     for (std::size_t product = 0; product < actual.size(); ++product)
     {
       REQUIRE(std::isfinite(std::real(actual[product])));
       REQUIRE(std::isfinite(std::imag(actual[product])));
-      REQUIRE(std::isfinite(expected[product]));
+      REQUIRE(std::isfinite(expected[product].real()));
+      REQUIRE(std::isfinite(expected[product].imag()));
       maximum_error[product] = std::max(maximum_error[product], std::abs(actual[product] - expected[product]));
       output << ' ' << std::real(actual[product]);
+      if (complex_oracle) output << ' ' << std::imag(actual[product]);
     }
+    maximum_imaginary_value = std::max(maximum_imaginary_value, std::abs(std::imag(values[column])));
     output << '\n';
     ++rows;
   }
   REQUIRE(rows > 0);
+  if (complex_oracle) CHECK(maximum_imaginary_value > 1e-8);
+#ifdef QMC_COMPLEX
+  if (target)
+  {
+    const auto frozen = target->evaluate(*electrons);
+    const auto fingerprint = target->descriptor().fingerprint();
+    const auto& source = dynamic_cast<const LCAOrbitalSet&>(state->getSPOSet(requested_name ? requested_name : "spo-up"));
+    const auto coefficient = source.C->data()[0];
+    source.C->data()[0] += std::complex<double>{0.17, -0.12};
+    CHECK(target->evaluate(*electrons) == frozen);
+    source.C->data()[0] = coefficient;
+    // The periodic-part target must wrap without a common Bloch phase.
+    for (int d = 0; d < 3; ++d)
+      electrons->R[0][d] += electrons->getLattice().R(1, d);
+    electrons->update();
+    const auto wrapped = target->evaluate(*electrons);
+    for (std::size_t element = 0; element < frozen.size(); ++element)
+      CHECK(std::abs(wrapped[element] - frozen[element]) < 1e-9);
+    CHECK(target->descriptor().fingerprint() == fingerprint);
+    electrons->setTwist(ParticleSet::PosType{target_twist[0] + 0.01, target_twist[1], target_twist[2]});
+    CHECK_THROWS_AS(target->evaluate(*electrons), std::invalid_argument);
+    const auto* slater = dynamic_cast<const SlaterDet*>(state->getOrbitals()[0].get());
+    const std::array<double, 3> mismatched{target_twist[0] + 0.01, target_twist[1], target_twist[2]};
+    CHECK_THROWS_AS(ComplexOrbitalTargetEvaluator::fromSingleReference(
+        *slater, *electrons, mismatched, 1, target->retainedScalarBytes()), std::invalid_argument);
+  }
+#endif
   output.flush();
   REQUIRE(output.good());
   // This diagnostic reports export error; scientific acceptance uses the fixed campaign tolerances.

@@ -37,6 +37,8 @@
 #include "CPU/math.hpp"
 
 #include <array>
+#include <cstdint>
+#include <cstring>
 
 namespace qmcplusplus
 {
@@ -144,18 +146,29 @@ LCAOrbitalBuilder::LCAOrbitalBuilder(ParticleSet& els, ParticleSet& ions, Commun
   {
 #ifdef QMC_COMPLEX
     if (targetPtcl.getLattice().SuperCellEnum != SUPERCELL_BULK)
-      throw std::runtime_error("Complex LCAO file-image identity requires periodic Gamma input");
+      throw std::runtime_error("Complex LCAO file-image identity requires periodic input");
+#else
+    if (SuperTwist != PosType(0))
+      throw std::runtime_error("Real LCAO file-image identity requires Gamma input");
 #endif
     if (h5_path.empty() || source_identity_max_bytes_ == 0 || source_identity_max_bytes_ > 1048576 ||
-        doCuspCorrection || SuperTwist != PosType(0) ||
+        doCuspCorrection ||
         (targetPtcl.getLattice().SuperCellEnum != SUPERCELL_OPEN &&
          targetPtcl.getLattice().SuperCellEnum != SUPERCELL_BULK))
-      throw std::runtime_error("LCAO file-image identity requires CPU/no-cusp Gamma input and a positive cap <=1048576");
+      throw std::runtime_error("LCAO file-image identity requires CPU/no-cusp input and a positive cap <=1048576");
     for (int d = 0; d < 3; ++d)
+    {
+      // Bind only finite Cartesian twists to the immutable accepted reader image.
+      std::uint64_t bits;
+      const double component = SuperTwist[d];
+      std::memcpy(&bits, &component, sizeof(bits));
+      if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000))
+        throw std::runtime_error("LCAO file-image identity requires finite Cartesian twist");
       if (PBCImages[d] < 0 ||
           (targetPtcl.getLattice().SuperCellEnum == SUPERCELL_OPEN && PBCImages[d] != 0) ||
           (targetPtcl.getLattice().SuperCellEnum == SUPERCELL_BULK && PBCImages[d] == 0))
         throw std::runtime_error("LCAO file-image identity has inconsistent periodic images");
+    }
   }
   //Evaluate the Phase factor. Equals 1 for OBC.
   EvalPeriodicImagePhaseFactors(SuperTwist, PeriodicImagePhaseFactors, PeriodicImageDisplacements);

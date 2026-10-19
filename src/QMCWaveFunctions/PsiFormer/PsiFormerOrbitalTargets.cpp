@@ -95,8 +95,11 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
       source_ions[spin] = periodic.source_ions;
       for (int d = 0; d < 3; ++d)
       {
-        if (reduced[d] != 0 || periodic.cartesian_twist[d] != 0 || periodic.images[d] <= 0)
-          throw std::invalid_argument("Complex Gaussian target currently requires periodic Gamma images");
+        // The reader uses Cartesian Bloch momentum; the student supplies reduced simulation twist.
+        if (!isFiniteDouble(periodic.cartesian_twist[d]) || periodic.images[d] <= 0 ||
+            std::abs(periodic.cartesian_twist[d] - cartesian[d]) >
+                1e-10 * std::max(1.0, std::abs(cartesian[d])))
+          throw std::invalid_argument("Complex Gaussian target requires matching periodic Cartesian twist and images");
         append(periodic.images[d]);
         for (int c = 0; c < 3; ++c)
         {

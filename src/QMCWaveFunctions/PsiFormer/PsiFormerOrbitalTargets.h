@@ -177,7 +177,7 @@ private:
 class ComplexOrbitalTargetEvaluator
 {
 public:
-  /// Freeze occupied plane waves or CPU Gamma Gaussian orbitals with exact reader identity.
+  /// Freeze occupied plane waves or CPU periodic Gaussian orbitals with exact reader identity.
   /// The cap covers target/value scratch and detached coefficients; AO clone storage is separate.
   static ComplexOrbitalTargetEvaluator fromSingleReference(const SlaterDet& source,
       const ParticleSet& electrons, std::array<double, 3> expected_reduced_twist, std::size_t channels,
