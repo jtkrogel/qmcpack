@@ -29,6 +29,14 @@ struct DirectComplexValueResult
   std::size_t evaluation_generation = 0;
 };
 
+/// Borrowed complete raw-orbital values, valid until this workspace is used again.
+struct DirectComplexOrbitalValueView
+{
+  const std::complex<double>* values = nullptr;
+  std::size_t size = 0;
+  std::size_t parameter_version = 0;
+};
+
 /// Stable executor address identifies the owner of each prepared clone workspace.
 class DirectComplexValueExecutor;
 
@@ -209,8 +217,9 @@ public:
         new DirectComplexValueWorkspace(this, trunk_.makeTrunkWorkspace(), descriptor_));
   }
 
-  /// Compose real trunk -> real envelope -> complex head/determinants -> real cusp.
-  DirectComplexValueResult evaluate(DirectComplexValueWorkspace& workspace) const
+private:
+  /// Share the existing trunk/envelope/head forward without determinant or parameter products.
+  DirectValueTrunkResultView evaluateOrbitalHead(DirectComplexValueWorkspace& workspace) const
   {
     workspace.invalidate();
     if (workspace.owner_ != this)
@@ -240,6 +249,21 @@ public:
     workspace.head_.evaluate(trunk.features, workspace.features_.element_count,
         workspace.envelopes_.data(), workspace.envelopes_.size(), trunk.packed_positions,
         3 * n, heads);
+    return trunk;
+  }
+
+public:
+  /// Publish raw matrices through the already prepared VALUE owner; no inverse or reverse pass.
+  DirectComplexOrbitalValueView evaluateOrbitalValues(DirectComplexValueWorkspace& workspace) const
+  {
+    const auto trunk = evaluateOrbitalHead(workspace);
+    return {workspace.head_.data(), workspace.orbitals_.element_count, trunk.parameter_version};
+  }
+
+  /// Compose real trunk -> real envelope -> complex head/determinants -> real cusp.
+  DirectComplexValueResult evaluate(DirectComplexValueWorkspace& workspace) const
+  {
+    const auto trunk = evaluateOrbitalHead(workspace);
     const auto determinant = workspace.determinant_.evaluate(workspace.head_.data(), nullptr, false);
     auto amplitude = determinant.amplitude;
     // Preserve the exact same-spin physical node contract, including lattice images.

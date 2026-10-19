@@ -364,6 +364,22 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
   evaluate(component, p);
   const auto accepted = component.get_log_value();
   const auto snapshot = component.snapshotParameters();
+  const auto numeric = component.numericStorage();
+  std::vector<C> raw_values;
+  component.evaluateOrbitalValues(p, raw_values, snapshot.version);
+  REQUIRE(raw_values.size() == fixed.size());
+  CHECK(component.orbitalMSEStorage().prepared_bytes == 0);
+  double value_only_loss = 0;
+  for (std::size_t i = 0; i < raw_values.size(); ++i)
+    value_only_loss += std::norm(raw_values[i] - fixed[i]) / (component.orbitalMSEChannelCount() * 2 * 4);
+  const auto preserved_values = raw_values;
+  CHECK_THROWS(component.evaluateOrbitalValues(p, raw_values, snapshot.version + 1));
+  CHECK(raw_values == preserved_values);
+  CHECK_THROWS(component.evaluateOrbitalValues(altered_p, raw_values, snapshot.version));
+  CHECK(raw_values == preserved_values);
+  CHECK(component.numericStorage().allocated_bytes == numeric.allocated_bytes);
+  CHECK(component.numericStorage().fingerprint == numeric.fingerprint);
+  CHECK(component.get_log_value() == accepted);
   std::vector<double> gradient(snapshot.values.size(), 123);
   CHECK_THROWS(component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version));
   auto owner = component.orbitalMSEStorage();
@@ -376,6 +392,7 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
   owner = component.orbitalMSEStorage();
   CHECK(owner.prepared_bytes == owner.required_bytes);
   const double loss = component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version);
+  CHECK(loss == Catch::Approx(value_only_loss).epsilon(1e-12));
   CHECK(std::isfinite(loss));
   CHECK(std::any_of(gradient.begin(), gradient.end(), [](double value) { return std::abs(value) > 1e-8; }));
   const auto analytic = gradient;

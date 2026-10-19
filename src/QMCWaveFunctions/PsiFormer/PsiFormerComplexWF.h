@@ -99,6 +99,11 @@ public:
   std::array<double, 3> reducedTwist() const;
   /// Return the immutable raw-orbital channel count without preparing determinant products.
   std::size_t orbitalMSEChannelCount() const noexcept;
+
+  /// Copy version-coherent CPU raw orbital values without determinant or parameter derivatives.
+  void evaluateOrbitalValues(const ParticleSet& particles, std::vector<std::complex<double>>& orbitals,
+      std::size_t expected_version) const;
+
   /// Evaluate a prepared CPU raw-orbital loss without changing accepted state or caller output on failure.
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
       std::vector<double>& gradient, std::size_t expected_version) const;

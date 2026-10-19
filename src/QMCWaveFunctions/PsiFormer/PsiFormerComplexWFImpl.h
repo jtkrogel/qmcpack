@@ -2513,6 +2513,33 @@ void PsiFormerComplexWF::prepareOrbitalMSE(std::size_t maximum_bytes)
     impl_->orbital_mse = std::make_shared<Impl::OrbitalMSELane>(*state);
 }
 
+/// Reuse clone-local VALUE scratch under the sequential observation contract, without a P-sized owner.
+void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
+    std::vector<std::complex<double>>& orbitals, std::size_t expected_version) const
+{
+  auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex orbital forward is CPU-only");
+  if (state->model.p.version() != expected_version)
+    throw std::runtime_error("Complex orbital forward parameter version is stale");
+  impl_->requireIdle(*impl_->particles);
+  Impl::validateDerivativeSource(*state);
+  const auto n = state->model.ne, up = state->model.cfg.nup;
+  if (state->pending_proposals.load(std::memory_order_relaxed) || particles.getActivePtcl() >= 0 ||
+      particles.isSpinor() || particles.getTotalNum() != n || particles.groups() != 2 ||
+      particles.groupsize(0) != up || particles.groupsize(1) != n - up || particles.R.size() != n || particles.GroupID.size() != n)
+    throw std::invalid_argument("Complex orbital forward sample/proposal/spin mismatch");
+  validateRuntimeLattice(particles, state->environment, "Complex orbital forward sample");
+  for (std::size_t row = 0; row < n; ++row)
+    for (int d = 0; d < 3; ++d)
+      if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
+        throw std::invalid_argument("Complex orbital forward coordinates/spin order invalid");
+  impl_->positions(*impl_->value, particles);
+  const auto values = state->value.evaluateOrbitalValues(*impl_->value);
+  orbitals.assign(values.values, values.values + values.size);
+}
+
 /// Read one stable model version and use only prepared scratch, never accepted caches.
 double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
     const std::vector<std::complex<double>>& target, std::vector<double>& gradient,

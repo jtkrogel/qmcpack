@@ -40,6 +40,7 @@
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
+#include "QMCDrivers/WFTrain/ComplexOrbitalInferenceMoments.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/CoulombPotential.h"
@@ -2263,10 +2264,16 @@ void WFTrainBatched::process(xmlNodePtr node)
     try
     {
       initializeOrbitalPretraining();
-      if (inference_input_.enabled && training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
-          (!orbital_target_ || selected_provider_->usesAcceleratorParameterProducts() ||
-           !dynamic_cast<PsiFormerWF*>(selected_provider_)))
-        throw UniformCommunicateError("Orbital inference currently requires a real CPU provider and target");
+      if (inference_input_.enabled && training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+      {
+        bool admitted = orbital_target_ && dynamic_cast<PsiFormerWF*>(selected_provider_);
+#ifdef QMC_COMPLEX
+        admitted = admitted || (complex_orbital_target_ && complex_training_component_ &&
+                                 !complex_training_component_->gpuInferenceEnabled());
+#endif
+        if (!admitted || selected_provider_->usesAcceleratorParameterProducts())
+          throw UniformCommunicateError("Orbital inference requires a matching CPU provider and frozen target");
+      }
     }
     catch (...)
     {
@@ -2453,7 +2460,21 @@ void WFTrainBatched::run()
                   << nonlocal_capture_bytes << "; no ECP parameter derivatives or retained quadrature replay" << std::endl;
       }
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+      {
         prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
+        if (inference_input_.enabled)
+        {
+          const auto n = static_cast<std::size_t>(population_.get_golden_electrons().getTotalNum());
+          const auto columns = checkedMemoryMultiply(complex->orbitalMSEChannelCount(), n);
+          const auto matrix_bytes = checkedMemoryMultiply(checkedMemoryMultiply(columns, n), sizeof(std::complex<double>));
+          const auto statistics_bytes = checkedMemoryMultiply(2 * sizeof(double),
+              checkedMemoryAdd(5, checkedMemoryMultiply(4, columns)));
+          const auto observation_bytes = checkedMemoryAdd(matrix_bytes, statistics_bytes);
+          prospective = checkedMemoryAdd(prospective, observation_bytes);
+          app_log() << "WFTrain complex orbital observer before allocation: numeric_bytes=" << observation_bytes
+                    << "; existing VALUE workspace, no parameter products" << std::endl;
+        }
+      }
       complex_physical_identity = complex->trainingConfigurationFingerprint();
       if (const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance())
       {
@@ -4436,30 +4457,73 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
   }
   std::unique_ptr<wftrain::OrbitalInferenceMoments> moments;
   std::vector<double> orbital_values;
+#ifdef QMC_COMPLEX
+  std::unique_ptr<wftrain::ComplexOrbitalInferenceMoments> complex_moments;
+  std::vector<std::complex<double>> complex_orbital_values;
+#endif
   std::function<void(Crowd&)> observer;
   std::function<std::string()> block_result;
   std::string header;
   if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
   {
-    const auto& descriptor = orbital_target_->descriptor();
-    moments = std::make_unique<wftrain::OrbitalInferenceMoments>(descriptor.spinUpElectrons(),
-        descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
-    auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-    observer = [&, student](Crowd& crowd) {
-      for (std::size_t i = 0; i < crowd.size(); ++i)
-      {
-        const auto& particles = crowd.get_walker_elecs()[i].get();
-        student->evaluateOrbitalValues(particles, orbital_values, parameter_version);
-        std::optional<double> energy;
-        if (inference_input_.evaluate_energy)
-          energy = crowd.get_walkers()[i].get().Properties(WalkerProperties::LOCALENERGY);
-        moments->addSample(orbital_values, orbital_target_->evaluate(particles), energy);
-      }
-    };
+#ifdef QMC_COMPLEX
+    if (complex_orbital_target_)
+    {
+      const auto& descriptor = complex_orbital_target_->descriptor();
+      complex_moments = std::make_unique<wftrain::ComplexOrbitalInferenceMoments>(descriptor.spinUpElectrons(),
+          descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
+      const auto n = checkedMemoryAdd(descriptor.spinUpElectrons(), descriptor.spinDownElectrons());
+      complex_orbital_values.reserve(checkedMemoryMultiply(descriptor.terms().size(), checkedMemoryMultiply(n, n)));
+      auto* student = complex_training_component_;
+      observer = [&, student](Crowd& crowd) {
+        for (std::size_t i = 0; i < crowd.size(); ++i)
+        {
+          const auto& particles = crowd.get_walker_elecs()[i].get();
+          student->evaluateOrbitalValues(particles, complex_orbital_values, parameter_version);
+          std::optional<double> energy;
+          if (inference_input_.evaluate_energy)
+            energy = crowd.get_walkers()[i].get().Properties(WalkerProperties::LOCALENERGY);
+          complex_moments->addSample(complex_orbital_values, complex_orbital_target_->evaluate(particles), energy);
+        }
+      };
+    }
+    else
+#endif
+    {
+      const auto& descriptor = orbital_target_->descriptor();
+      moments = std::make_unique<wftrain::OrbitalInferenceMoments>(descriptor.spinUpElectrons(),
+          descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
+      auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+      observer = [&, student](Crowd& crowd) {
+        for (std::size_t i = 0; i < crowd.size(); ++i)
+        {
+          const auto& particles = crowd.get_walker_elecs()[i].get();
+          student->evaluateOrbitalValues(particles, orbital_values, parameter_version);
+          std::optional<double> energy;
+          if (inference_input_.evaluate_energy)
+            energy = crowd.get_walkers()[i].get().Properties(WalkerProperties::LOCALENERGY);
+          moments->addSample(orbital_values, orbital_target_->evaluate(particles), energy);
+        }
+      };
+    }
     block_result = [&]() {
-      auto sums = moments->sums();
-      myComm->allreduce(sums);
-      const auto result = moments->summarize(sums);
+      wftrain::OrbitalInferenceResult result;
+#ifdef QMC_COMPLEX
+      if (complex_moments)
+      {
+        auto sums = complex_moments->sums();
+        myComm->allreduce(sums);
+        result = complex_moments->summarize(sums);
+        complex_moments->reset();
+      }
+      else
+#endif
+      {
+        auto sums = moments->sums();
+        myComm->allreduce(sums);
+        result = moments->summarize(sums);
+        moments->reset();
+      }
       std::ostringstream row;
       row << std::setprecision(17) << result.mean_mse << ' ' << result.mse_variance << ' ';
       if (wftrain::isFiniteTrainingReal(result.occupied_column_cosine_squared))
@@ -4469,7 +4533,6 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
       row << ' ' << result.undefined_columns << ' ' << result.samples;
       if (inference_input_.evaluate_energy)
         row << ' ' << result.energy << ' ' << result.energy_squared;
-      moments->reset();
       return row.str();
     };
     header = "OrbitalMSE OrbitalMSEVariance EmpiricalOccupiedColumnCosineSquared UndefinedOrbitalColumns SampleCount";
