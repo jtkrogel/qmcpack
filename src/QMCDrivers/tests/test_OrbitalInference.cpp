@@ -300,6 +300,42 @@ TEST_CASE("Complex orbital inference preserves phase errors and pools Hermitian 
   CHECK(pooled.energy == Catch::Approx((.3 * even + .5 * odd) / ranks));
   CHECK(pooled.occupied_column_cosine_squared ==
       Catch::Approx((even + 2 * odd) * (even + 2 * odd) / (ranks * (even + 4 * odd))));
+
+  // Full-matrix normalization changes only error moments, including after actual MPI pooling.
+  wftrain::ComplexOrbitalInferenceMoments full(1, 1, 1, true,
+      wftrain::OrbitalLossNormalization::FULL_MATRIX_MEAN);
+  full.addSample(a, target, .3);
+  full.addSample(b, target, .5);
+  const auto full_result = full.summarize(full.sums());
+  CHECK(full_result.mean_mse == Catch::Approx(.5 * result.mean_mse));
+  CHECK(full_result.mse_variance == Catch::Approx(.25 * result.mse_variance));
+  CHECK(full_result.occupied_column_cosine_squared == result.occupied_column_cosine_squared);
+  CHECK(full_result.energy == result.energy);
+  CHECK(full_result.energy_squared == result.energy_squared);
+  full.reset();
+  full.addSample(comm->rank() % 2 ? b : a, target, comm->rank() % 2 ? .5 : .3);
+  auto full_reduced = full.sums();
+  comm->allreduce(full_reduced);
+  const auto full_pooled = full.summarize(full_reduced);
+  CHECK(full_pooled.mean_mse == Catch::Approx(.5 * pooled.mean_mse));
+  CHECK(full_pooled.mse_variance == Catch::Approx(.25 * pooled.mse_variance));
+  CHECK(full_pooled.occupied_column_cosine_squared == pooled.occupied_column_cosine_squared);
+
+  // Unequal spin populations require entry weights, not a global factor-of-two shortcut.
+  wftrain::ComplexOrbitalInferenceMoments unequal(1, 2, 1, false,
+      wftrain::OrbitalLossNormalization::FULL_MATRIX_MEAN);
+  std::vector<Complex> unequal_student(9), unequal_target(9);
+  double dense_mean = 0;
+  for (std::size_t index = 0; index < 9; ++index)
+  {
+    unequal_student[index] = Complex{double(index + 1), -.3 * index};
+    unequal_target[index] = Complex{.2 * index, .4};
+    dense_mean += std::norm(unequal_student[index] - unequal_target[index]) / 9;
+  }
+  unequal.addSample(unequal_student, unequal_target);
+  CHECK(unequal.summarize(unequal.sums()).mean_mse == Catch::Approx(dense_mean));
+  CHECK_THROWS(wftrain::ComplexOrbitalInferenceMoments(1, 1, 1, false,
+      static_cast<wftrain::OrbitalLossNormalization>(99)));
 }
 
 TEST_CASE("Orbital inference scalar observer controls every Hamiltonian evaluation",

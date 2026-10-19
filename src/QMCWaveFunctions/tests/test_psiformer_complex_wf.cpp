@@ -393,6 +393,12 @@ TEST_CASE("Complex orbital targets and a capped CPU MSE adapter preserve fixed g
   owner = component.orbitalMSEStorage();
   CHECK(owner.prepared_bytes == owner.required_bytes);
   const double loss = component.evaluateOrbitalMSE(p, fixed, gradient, snapshot.version);
+  std::vector<double> full_gradient(gradient.size());
+  const double full_loss = component.evaluateOrbitalMSE(p, fixed, full_gradient, snapshot.version,
+      wftrain::OrbitalLossNormalization::FULL_MATRIX_MEAN);
+  CHECK(full_loss == Catch::Approx(.5 * loss).epsilon(1e-12));
+  for (std::size_t index = 0; index < gradient.size(); ++index)
+    CHECK(full_gradient[index] == Catch::Approx(.5 * gradient[index]).margin(1e-12));
   CHECK(loss == Catch::Approx(value_only_loss).epsilon(1e-12));
   CHECK(std::isfinite(loss));
   CHECK(std::any_of(gradient.begin(), gradient.end(), [](double value) { return std::abs(value) > 1e-8; }));

@@ -7,6 +7,7 @@
  * @brief Complex real-parameter scores from complete VALUE differences and real parity.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
@@ -274,6 +275,8 @@ TEST_CASE("PsiFormer complex score publication rejects nodes foreign owners and 
 TEST_CASE("Complex raw orbital MSE has real parameter gradients and exact spin normalization",
           "[wavefunction][psiformer][complex_orbital_mse]")
 {
+  using Normalization = qmcplusplus::wftrain::OrbitalLossNormalization;
+  const auto normalization = GENERATE(Normalization::SPIN_SECTOR_SUM, Normalization::FULL_MATRIX_MEAN);
   auto model = tinyModel(true, true);
   model.cfg.nup = 1;
   model.cfg.ndown = 3;
@@ -285,7 +288,8 @@ TEST_CASE("Complex raw orbital MSE has real parameter gradients and exact spin n
   std::vector<C> target(model.ndet * model.ne * model.ne);
   std::vector<double> gradient(model.p.size());
   auto evaluate = [&]() {
-    return executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size(), gradient.data(), gradient.size()});
+    return executor.evaluateOrbitalMSE(*workspace,
+        {target.data(), target.size(), gradient.data(), gradient.size(), normalization});
   };
   const auto zero_target = evaluate();
   double expected_loss = 0;
@@ -297,7 +301,9 @@ TEST_CASE("Complex raw orbital MSE has real parameter gradients and exact spin n
         const bool same_spin = (row < model.cfg.nup) == (column < model.cfg.nup);
         // Off-spin targets are zero, but FULL student heads still train those entries.
         target[index] = same_spin ? C{0.03 * (index + 1), -0.02 * (row + 1)} : C{};
-        const double scale = 1.0 / (model.ndet * model.ne * (row < model.cfg.nup ? model.cfg.nup : model.cfg.ndown));
+        const auto rows = normalization == Normalization::FULL_MATRIX_MEAN
+            ? model.ne : (row < model.cfg.nup ? model.cfg.nup : model.cfg.ndown);
+        const double scale = 1.0 / (model.ndet * model.ne * rows);
         expected_loss += scale * std::norm(zero_target.orbital_matrices[index] - target[index]);
       }
   const auto result = evaluate();
@@ -411,6 +417,9 @@ TEST_CASE("Complex orbital MSE rejects invalid requests before caller publicatio
     CHECK(model.p.flat_values() == original);
   };
   auto bad = valid;
+  bad.normalization = static_cast<qmcplusplus::wftrain::OrbitalLossNormalization>(99);
+  failure(bad, executor);
+  bad = valid;
   --bad.target_size;
   failure(bad, executor);
   bad = valid;

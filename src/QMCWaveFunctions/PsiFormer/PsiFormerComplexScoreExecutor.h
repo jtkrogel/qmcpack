@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOccupiedHead.h"
+#include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
 
 namespace pf
 {
@@ -35,6 +36,8 @@ struct DirectComplexOrbitalMSEArguments
   std::size_t target_size = 0;
   double* parameter_gradient = nullptr;
   std::size_t gradient_size = 0;
+  qmcplusplus::wftrain::OrbitalLossNormalization normalization =
+      qmcplusplus::wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM;
 };
 
 /// Borrow occupied-gauge orbital matrices until the next workspace mutation/evaluation.
@@ -376,7 +379,7 @@ public:
     return w.result_;
   }
 
-  /** Raw complex orbital loss with the real executor's per-spin normalization.
+  /** Raw complex orbital loss with explicit entry normalization (legacy by default).
    * Ordinary matrix cotangents are 2*scale*conj(A-T); take the real response
    * for real canonical parameters. No determinant inverse, cusp or node gate.
    * No new workspace vectors: caller output is copied only after all checks.
@@ -388,6 +391,10 @@ public:
     w.invalidate();
     if (w.owner_ != this)
       throw std::invalid_argument("PsiFormer complex orbital-MSE workspace belongs to another executor");
+    using Normalization = qmcplusplus::wftrain::OrbitalLossNormalization;
+    if (arguments.normalization != Normalization::SPIN_SECTOR_SUM &&
+        arguments.normalization != Normalization::FULL_MATRIX_MEAN)
+      throw std::invalid_argument("Invalid complex orbital-MSE normalization");
     if (arguments.target_size != w.orbitals_.element_count || !arguments.target ||
         arguments.gradient_size != parameter_count_ || !arguments.parameter_gradient)
       throw std::invalid_argument("PsiFormer complex orbital-MSE target/gradient extent mismatch");
@@ -436,7 +443,8 @@ public:
         {
           const std::size_t index = (determinant * n + row) * n + column;
           const std::size_t spin_rows = row < descriptor_.spin_up ? descriptor_.spin_up : n - descriptor_.spin_up;
-          const double scale = 1.0 / static_cast<double>(descriptor_.determinants * spin_rows * n);
+          const auto row_denominator = arguments.normalization == Normalization::FULL_MATRIX_MEAN ? n : spin_rows;
+          const double scale = 1.0 / static_cast<double>(descriptor_.determinants * row_denominator * n);
           const C residual = w.head_.data()[index] - arguments.target[index];
           loss += scale * std::norm(residual);
           w.matrix_adjoint_[index] = 2.0 * scale * std::conj(residual);

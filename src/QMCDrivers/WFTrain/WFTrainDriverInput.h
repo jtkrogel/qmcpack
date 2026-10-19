@@ -9,6 +9,7 @@
 #define QMCPLUSPLUS_WFTRAIN_DRIVER_INPUT_H
 
 #include "Configuration.h"
+#include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
 
 #include <cstddef>
 #include <limits>
@@ -110,6 +111,9 @@ public:
   Objective getObjective() const noexcept { return objective_; }
 
   OrbitalSampling getOrbitalSampling() const noexcept { return orbital_sampling_; }
+
+  /// Select the per-entry supervised loss convention without changing its target gauge.
+  wftrain::OrbitalLossNormalization getOrbitalNormalization() const noexcept { return orbital_normalization_; }
 
   /// Student-measure pretraining never evaluates Hamiltonians while drawing samples.
   bool samplesOrbitalStudent() const noexcept
@@ -271,6 +275,7 @@ private:
   std::size_t line_search_sampling_steps_{10};
   Objective objective_{Objective::ENERGY};
   OrbitalSampling orbital_sampling_{OrbitalSampling::TEACHER};
+  wftrain::OrbitalLossNormalization orbital_normalization_{wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM};
   OrbitalTarget orbital_target_{OrbitalTarget::SINGLE_REFERENCE};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};

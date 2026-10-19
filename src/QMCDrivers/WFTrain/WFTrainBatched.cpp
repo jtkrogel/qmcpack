@@ -170,9 +170,11 @@ class SampledOrbitalPretrainingProducer final : public wftrain::OrbitalPretraini
 public:
   SampledOrbitalPretrainingProducer(Student& student,
                                     Target& target,
-                                    const std::vector<RetainedCrowdSamples>& samples)
+                                    const std::vector<RetainedCrowdSamples>& samples,
+                                    wftrain::OrbitalLossNormalization normalization =
+                                        wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM)
       : student_(student), target_(target), samples_(samples),
-        gradient_(student.parameterSchema().parameterCount())
+        gradient_(student.parameterSchema().parameterCount()), normalization_(normalization)
   {}
 
   wftrain::TrainingCapabilities capabilities() const noexcept override
@@ -188,8 +190,15 @@ public:
     for (const auto& crowd : samples_)
       for (const auto& particles : crowd.particles)
       {
-        const double loss = student_.evaluateOrbitalMSE(
-            *particles, target_.evaluate(*particles), gradient_, parameters.version);
+        double loss;
+#ifdef QMC_COMPLEX
+        if constexpr (std::is_same_v<Student, PsiFormerComplexWF>)
+          loss = student_.evaluateOrbitalMSE(
+              *particles, target_.evaluate(*particles), gradient_, parameters.version, normalization_);
+        else
+#endif
+          loss = student_.evaluateOrbitalMSE(
+              *particles, target_.evaluate(*particles), gradient_, parameters.version);
         accumulator.addSample(loss, parameters.version, {gradient_.data(), gradient_.size()});
       }
   }
@@ -202,6 +211,7 @@ private:
   Target& target_;
   const std::vector<RetainedCrowdSamples>& samples_;
   std::vector<double> gradient_;
+  wftrain::OrbitalLossNormalization normalization_;
 };
 
 /** Replay a retained snapshot on resident clones and reconstruct coherent VGL.
@@ -1796,7 +1806,12 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
     extendStageFingerprint(hash, training.getMinimumEffectiveSamples());
     extendStageFingerprint(hash, resolved_overlap_fingerprint);
     if (training.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+    {
       extendStageFingerprint(hash, static_cast<int>(training.getOrbitalTarget()));
+      // Omitted/default normalization preserves all existing stage identities.
+      if (training.getOrbitalNormalization() != wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM)
+        extendStageFingerprint(hash, std::string("orbital-full-matrix-mean-v1"));
+    }
   }
   extendStageFingerprint(hash, qmc.get_tau());
   extendStageFingerprint(hash, qmc.get_spin_mass());
@@ -3221,7 +3236,8 @@ void WFTrainBatched::run()
           if (complex_orbital_target_)
           {
             auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerComplexWF,
-                psiformer::ComplexOrbitalTargetEvaluator>>(*complex_training_component_, *complex_orbital_target_, retained_samples);
+                psiformer::ComplexOrbitalTargetEvaluator>>(*complex_training_component_, *complex_orbital_target_, retained_samples,
+                    training_input_.getOrbitalNormalization());
             producer_retained_bytes = typed->retainedBytes();
             producer = std::move(typed);
           }
@@ -4471,7 +4487,8 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
     {
       const auto& descriptor = complex_orbital_target_->descriptor();
       complex_moments = std::make_unique<wftrain::ComplexOrbitalInferenceMoments>(descriptor.spinUpElectrons(),
-          descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
+          descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy,
+          training_input_.getOrbitalNormalization());
       const auto n = checkedMemoryAdd(descriptor.spinUpElectrons(), descriptor.spinDownElectrons());
       complex_orbital_values.reserve(checkedMemoryMultiply(descriptor.terms().size(), checkedMemoryMultiply(n, n)));
       auto* student = complex_training_component_;
@@ -4630,6 +4647,16 @@ void WFTrainBatched::initializeOrbitalPretraining()
 #endif
   if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_))
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+  if (training_input_.getOrbitalNormalization() != wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM)
+  {
+    bool supported = false;
+#ifdef QMC_COMPLEX
+    supported = complex && !complex->gpuInferenceEnabled();
+#endif
+    if (!supported)
+      throw UniformCommunicateError("Full-matrix orbital normalization requires the CPU paired provider");
+    app_log() << "WFTrain orbital_mse normalization=full_matrix_mean" << std::endl;
+  }
   if (training_input_.samplesOrbitalStudent())
   {
     const auto* real_student = dynamic_cast<PsiFormerWF*>(selected_provider_);

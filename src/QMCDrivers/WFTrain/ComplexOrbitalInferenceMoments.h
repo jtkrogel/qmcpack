@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_COMPLEX_ORBITAL_INFERENCE_MOMENTS_H
 
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
+#include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
 #include <complex>
 
 namespace qmcplusplus::wftrain
@@ -17,9 +18,13 @@ class ComplexOrbitalInferenceMoments
 {
 public:
   /// Freeze the matrix convention and allocate only O(D Ne) reducible statistics.
-  ComplexOrbitalInferenceMoments(std::size_t up, std::size_t down, std::size_t determinants, bool energy)
-      : up_(up), down_(down), determinants_(determinants), energy_(energy)
+  ComplexOrbitalInferenceMoments(std::size_t up, std::size_t down, std::size_t determinants, bool energy,
+      OrbitalLossNormalization normalization = OrbitalLossNormalization::SPIN_SECTOR_SUM)
+      : up_(up), down_(down), determinants_(determinants), energy_(energy), normalization_(normalization)
   {
+    if (normalization != OrbitalLossNormalization::SPIN_SECTOR_SUM &&
+        normalization != OrbitalLossNormalization::FULL_MATRIX_MEAN)
+      throw std::invalid_argument("Invalid complex orbital inference normalization");
     if (!up || !down || !determinants || up > std::numeric_limits<std::size_t>::max() - down)
       throw std::invalid_argument("Invalid complex orbital inference dimensions");
     const auto n = up + down;
@@ -48,7 +53,9 @@ public:
         for (std::size_t col = 0; col < n; ++col)
         {
           const auto i = (d * n + row) * n + col;
-          loss += std::norm(student[i] - target[i]) / (determinants_ * (row < up_ ? up_ : down_) * n);
+          const auto row_denominator = normalization_ == OrbitalLossNormalization::FULL_MATRIX_MEAN
+              ? n : (row < up_ ? up_ : down_);
+          loss += std::norm(student[i] - target[i]) / (determinants_ * row_denominator * n);
           if ((row < up_) == (col < up_))
           {
             const auto j = 5 + 4 * (d * n + col);
@@ -116,6 +123,7 @@ public:
 private:
   std::size_t up_, down_, determinants_;
   bool energy_;
+  OrbitalLossNormalization normalization_;
   std::vector<double> sums_;
 };
 }

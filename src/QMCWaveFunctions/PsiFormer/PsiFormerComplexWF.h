@@ -12,6 +12,7 @@
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
 #include <array>
 #include <complex>
 #include <memory>
@@ -106,7 +107,8 @@ public:
 
   /// Evaluate a prepared CPU raw-orbital loss without changing accepted state or caller output on failure.
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
-      std::vector<double>& gradient, std::size_t expected_version) const;
+      std::vector<double>& gradient, std::size_t expected_version,
+      wftrain::OrbitalLossNormalization normalization = wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM) const;
 
   /// Detach an idle CPU trial clone into owning parameter leaves and fresh numerical caches.
   void isolateParameterState() override;

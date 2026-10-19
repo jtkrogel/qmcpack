@@ -2546,7 +2546,7 @@ void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
 /// Read one stable model version and use only prepared scratch, never accepted caches.
 double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
     const std::vector<std::complex<double>>& target, std::vector<double>& gradient,
-    std::size_t expected_version) const
+    std::size_t expected_version, wftrain::OrbitalLossNormalization normalization) const
 {
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
@@ -2576,7 +2576,7 @@ double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
   std::lock_guard execution(lane->execution_mutex);
   impl_->positions(*lane->work, particles);
   return lane->score.evaluateOrbitalMSE(*lane->work,
-      {target.data(), target.size(), gradient.data(), gradient.size()}).loss;
+      {target.data(), target.size(), gradient.data(), gradient.size(), normalization}).loss;
 }
 
 /// Report immutable system metadata without exposing a borrowed string or model.

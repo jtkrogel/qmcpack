@@ -261,6 +261,14 @@ TEST_CASE("WFTrainDriverInput accepts conventional orbital pretraining", "[drive
   CHECK(parse("").getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE);
   CHECK(parse("").getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE);
   CHECK(parse("").getOrbitalSampling() == WFTrainDriverInput::OrbitalSampling::TEACHER);
+  CHECK(parse("").getOrbitalNormalization() == wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM);
+  CHECK(parse("<parameter name=\"orbital_normalization\">spin_sector_sum</parameter>").getOrbitalNormalization() ==
+        wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM);
+  CHECK(parse("<parameter name=\"orbital_normalization\">full_matrix_mean</parameter>").getOrbitalNormalization() ==
+        wftrain::OrbitalLossNormalization::FULL_MATRIX_MEAN);
+  CHECK_THROWS(parse("<parameter name=\"orbital_normalization\">unknown</parameter>"));
+  CHECK_THROWS(parseTrainingInput(R"(<qmc><training objective="energy">
+    <parameter name="orbital_normalization">full_matrix_mean</parameter></training></qmc>)"));
   CHECK_FALSE(parse("").samplesOrbitalStudent());
   CHECK(parse("<parameter name=\"orbital_sampling\">student</parameter>").samplesOrbitalStudent());
   CHECK_FALSE(parse("<parameter name=\"orbital_sampling\">teacher</parameter>").samplesOrbitalStudent());
