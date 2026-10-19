@@ -19,6 +19,8 @@
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicProfileInput.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -39,6 +41,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -1818,6 +1821,131 @@ TEST_CASE("PsiFormer standalone model imports without a configuration file",
   }
   CHECK_THROWS(builder.buildComponent(document.getRoot()));
   std::filesystem::remove(model_path);
+}
+
+TEST_CASE("Versioned periodic XML preserves explicit feature and physical metadata",
+          "[wavefunction][psiformer][periodic_profile_input]")
+{
+  bool two_cells = false;
+  SECTION("Identity feature cell") {}
+  SECTION("Two physical cells share one primitive motif") { two_cells = true; }
+  Lattice lattice;
+  lattice.R = {8, 0, 0, .6, 7.4, 0, -.3, .5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  auto particles = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap sources;
+  auto ions = makeLiHIons(simulation_cell);
+  if (two_cells)
+  {
+    ions = std::make_unique<ParticleSet>(simulation_cell);
+    ions->setName("ion0");
+    ions->create({4});
+    auto& species = ions->getSpeciesSet();
+    const int hydrogen = species.addSpecies("H");
+    species(species.addAttribute("charge"), hydrogen) = 1;
+    ions->R[0] = {0, 0, 0};
+    ions->R[1] = {1, 1, 1};
+    ions->R[2] = {4, 0, 0};
+    ions->R[3] = {5, 1, 1};
+    ions->resetGroups();
+    ions->update();
+  }
+  const auto* source = ions.get();
+  sources.emplace(ions->getName(), std::move(ions));
+  const std::string tiling = two_cells ? "2 0 0 0 1 0 0 0 1" : "1 0 0 0 1 0 0 0 1";
+  const std::string motif_species = two_cells ? "H H" : "ion_0 ion_1";
+  const auto profile = [&](const std::string& head, const std::string& transform) {
+    std::ostringstream xml;
+    xml << std::setprecision(17)
+        << "<periodic_profile version='1' head='" << head << "' feature_transform='" << transform
+        << "' electron_electron_cusp='no'><parameter name='primitive_lattice'>";
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) xml << lattice.R(i, j) / (two_cells && i == 0 ? 2 : 1) << ' ';
+    xml << "</parameter><parameter name='tiling'>" << tiling << "</parameter>"
+        << "<parameter name='primitive_motif'>";
+    for (int ion = 0; ion < 2; ++ion)
+      for (int d = 0; d < 3; ++d) xml << source->R[ion][d] << ' ';
+    xml << "</parameter><parameter name='motif_species'>" << motif_species << "</parameter>"
+        << "<parameter name='occupied_columns'>0 0 0 0 0 1 0 0 0 1 0 1 "
+        << "0 0 0 0 1 1 0 0 0 1 1 1</parameter></periodic_profile>";
+    return xml.str();
+  };
+  const auto parse = [&](const std::string& text) {
+    Libxml2Document xml;
+    REQUIRE(xml.parseFromString(text));
+    return psiformer::parsePeriodicProfileInput(xml.getRoot(), particles, *source);
+  };
+  const auto expected = profile("real", "raw_trigonometric_v1");
+  const auto environment = parse(expected);
+  REQUIRE(environment.periodic_profile);
+  CHECK(environment.periodic_profile->primitive_motif.size() == 2);
+  CHECK(source->getTotalNum() == (two_cells ? 4 : 2));
+  CHECK(environment.periodic_profile->occupied_columns.size() == 4);
+  CHECK_FALSE(environment.periodic_profile->electron_electron_cusp);
+  CHECK(environment.head_representation == psiformer::HeadRepresentation::REAL);
+  CHECK(environment.lattice_vectors == environment.periodic_profile->cells.simulation.lattice_vectors);
+  for (const auto& name : {"primitive_lattice", "tiling", "primitive_motif", "motif_species", "occupied_columns"})
+  {
+    Libxml2Document xml;
+    REQUIRE(xml.parseFromString(expected));
+    auto* child = xml.getRoot()->children;
+    while (child && getXMLAttributeValue(child, "name") != name) child = child->next;
+    REQUIRE(child);
+    xmlUnlinkNode(child); xmlFreeNode(child);
+    CHECK_THROWS(psiformer::parsePeriodicProfileInput(xml.getRoot(), particles, *source));
+  }
+  auto invalid = expected;
+  invalid.replace(invalid.find(tiling), tiling.size(), "1.5 0 0 0 1 0 0 0 1");
+  CHECK_THROWS(parse(invalid));
+  invalid = expected;
+  invalid.replace(invalid.find(motif_species), motif_species.size(), "missing ion_1");
+  CHECK_THROWS(parse(invalid));
+  for (const auto& head : {std::string("real"), std::string("paired_complex")})
+  {
+#ifndef QMC_COMPLEX
+    if (head == "paired_complex") continue;
+#endif
+    for (const auto& transform : {"raw_trigonometric_v1", "log_complement_v1"})
+    {
+      PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+      const auto attributes = std::string("name='profile_input' source='ion0' system='all_electron' gpu='cpu' ") +
+          "feature_policy='periodic_two_cell_v1' " +
+          (head == "paired_complex" ? "max_clone_numeric_bytes='33554432' " : "");
+      Libxml2Document xml;
+      REQUIRE(xml.parseFromString("<psiformer " + attributes +
+          "initialization='psiformer_periodic_pair_v1' initialization_seed='17'>" + profile(head, transform) + "</psiformer>"));
+      auto component = builder.buildComponent(xml.getRoot());
+      REQUIRE(component);
+      particles.G = ValueType{}; particles.L = ValueType{};
+      const auto log = component->evaluateLog(particles, particles.G, particles.L);
+      CHECK(psiformer::determinant::isFiniteReal(std::real(log)));
+      ScopedTestDirectory directory("periodic_profile_input");
+      const auto path = (directory.path / "model.h5").string();
+      if (auto* real = dynamic_cast<PsiFormerWF*>(component.get())) real->exportModel(path);
+#ifdef QMC_COMPLEX
+      else dynamic_cast<PsiFormerComplexWF&>(*component).exportModel(path);
+#endif
+      Libxml2Document imported;
+      REQUIRE(imported.parseFromString("<psiformer " + attributes + "parameters='" + path + "'/>"));
+      auto reloaded = builder.buildComponent(imported.getRoot());
+      particles.G = ValueType{}; particles.L = ValueType{};
+      const auto loaded_log = reloaded->evaluateLog(particles, particles.G, particles.L);
+      CHECK(std::real(loaded_log) == Catch::Approx(std::real(log)).margin(1e-12));
+      CHECK(std::imag(loaded_log) == Catch::Approx(std::imag(log)).margin(1e-12));
+      if (two_cells)
+      {
+        // A replicated physical ion remains part of restart identity even though it is not a feature center.
+        auto& physical_source = *sources.at("ion0");
+        physical_source.R[3][0] += 0.125;
+        physical_source.update();
+        CHECK_THROWS(builder.buildComponent(imported.getRoot()));
+        physical_source.R[3][0] -= 0.125;
+        physical_source.update();
+      }
+    }
+  }
 }
 
 TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "[wavefunction][psiformer]")

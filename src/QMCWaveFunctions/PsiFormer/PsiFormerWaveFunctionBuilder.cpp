@@ -16,6 +16,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicProfileInput.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 
@@ -245,8 +246,16 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::optional<psiformer::PsiFormerModelFile> imported_model;
   if (direct_model)
     imported_model.emplace(psiformer::readPsiFormerModelFile(parameters));
+  const bool pair_profile = initialization == psiformer::PSIFORMER_PERIODIC_PAIR_V1 ||
+      (imported_model && imported_model->parameters.environment.periodic_profile);
+  auto* profile_node = psiformer::periodicProfileChild(cur);
+  if (profile_node && (!pair_profile || direct_model))
+    throw std::invalid_argument("periodic_profile XML requires fresh versioned initialization, not legacy or imported metadata");
+  const auto profile_head = pair_profile && !direct_model ? psiformer::periodicProfileHead(profile_node)
+      : psiformer::HeadRepresentation::REAL;
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
-      (imported_model && imported_model->paired_complex);
+      (imported_model && imported_model->paired_complex) ||
+      (pair_profile && profile_head == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX);
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
   {
@@ -271,6 +280,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
+  if (pair_profile && (!periodic || system != "all_electron" ||
+      (normalizedAcceleratorRequest(gpu) != "no" && normalizedAcceleratorRequest(gpu) != "cpu") ||
+      precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE))
+    throw std::invalid_argument("Versioned periodic profiles currently require explicit all-electron CPU fp64_reference");
   if (complex_profile)
   {
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
@@ -287,7 +300,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       throw std::invalid_argument("Complex PsiFormer requires qualified CPU optimize_scope=all training or "
                                  "CPU/strict cuda/hip inference, and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
-        feature_policy != "periodic_torus_v1" || (system != "all_electron" && !gpu_ecp) ||
+        feature_policy != (pair_profile ? "periodic_two_cell_v1" : "periodic_torus_v1") ||
+        (system != "all_electron" && !gpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() ||
         optimize_scope != (cpu_training ? "all" : "indices"))
@@ -331,7 +345,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (!internal_initialization && has_initialization_seed)
     throw std::invalid_argument(
         "PsiFormer initialization_seed requires internal initialization");
-  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1 && !complex_profile)
+  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1 && !complex_profile && !pair_profile)
     throw std::invalid_argument("Unsupported PsiFormer initialization profile: " + initialization);
   const std::uint64_t initialization_seed = parseInitializationSeed(initialization_seed_text);
 
@@ -356,6 +370,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   if (nonzero_twist && !periodic)
     throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
+  if (pair_profile && !complex_profile && (nonzero_twist || !particle_twist_is_zero))
+    throw std::invalid_argument("Real versioned periodic profiles currently require Gamma twist");
   if (complex_profile && system == "pseudopotential" && (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Native paired pseudopotential initialization requires Gamma twist");
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
@@ -383,9 +399,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 #endif
   if (periodic && targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
     throw std::invalid_argument("Periodic PsiFormer currently supports only 3D bulk periodic cells");
-  if (periodic && feature_policy != "periodic_torus_v1")
+  if (periodic && feature_policy != (pair_profile ? "periodic_two_cell_v1" : "periodic_torus_v1"))
     throw std::invalid_argument(
-        "Periodic PsiFormer requires explicit feature_policy=periodic_torus_v1 metadata");
+        pair_profile ? "Periodic PsiFormer requires explicit feature_policy=periodic_two_cell_v1 metadata" :
+                       "Periodic PsiFormer requires explicit feature_policy=periodic_torus_v1 metadata");
   if (!periodic && !feature_policy.empty() && feature_policy != "open_euclidean_v1")
     throw std::invalid_argument("Open PsiFormer requires feature_policy=open_euclidean_v1 when specified");
   if (optimization_enabled)
@@ -444,7 +461,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       throw std::invalid_argument(
           "Internally initialized PsiFormer requires two nonempty electron spin groups");
 
-    const psiformer::ModelShape shape{
+    psiformer::ModelShape shape{
         static_cast<std::size_t>(targetPtcl.groupsize(0)),
         static_cast<std::size_t>(targetPtcl.groupsize(1)),
         static_cast<std::size_t>(source_particles->getTotalNum()),
@@ -466,6 +483,11 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       for (std::size_t axis = 0; axis < 3; ++axis)
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           environment.lattice_vectors[axis][dimension] = targetPtcl.getLattice().R(axis, dimension);
+    }
+    if (pair_profile && !direct_model)
+    {
+      environment = psiformer::parsePeriodicProfileInput(profile_node, targetPtcl, *source_particles);
+      shape.nuclei = environment.periodic_profile->primitive_motif.size();
     }
     if (direct_model)
       psiformer::validatePsiFormerModelFile(*imported_model, parameters, targetPtcl, *source_particles,
