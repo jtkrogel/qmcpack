@@ -226,6 +226,13 @@ protected:
   void initBreakup(ParticleSet& P);
 
 private:
+  /// Immutable supplied local channels, shared with clones rather than copied per walker.
+  std::vector<std::shared_ptr<const RadFunctorType>> local_pp_species_;
+  std::vector<const RadFunctorType*> local_pp_ions_;
+
+  /// Compose the energy-only local correction with the unchanged bare Coulomb split.
+  RealType energyRadial(size_t ion, RealType r) const;
+
   std::string ewald_model_definition_;
   ///source particle set
   ParticleSet& pset_ions_;

@@ -9,6 +9,7 @@
 // File created by: Mark Dewing, markdewing@gmail.com, University of Illinois at Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "OhmmsData/Libxml2Doc.h"
@@ -297,6 +298,117 @@ TEST_CASE("Periodic local radial origin preserves the supplied endpoint", "[hami
       const double reconstructed = radial.splint(r) / r + potential.AB->evaluateLR(r);
       const double expected = endpoint / r + (1 - endpoint) * std::erf(r) / r;
       CHECK(reconstructed == Approx(expected).margin(1e-7));
+      electrons.R[0] = {r, 0, 0};
+      electrons.update();
+      const double bare_difference = r < potential.V0->grid()[1]
+          ? -r * potential.AB->evaluateLR(r)
+          : potential.V0->splint(r) - 1;
+      CHECK(potential.evalSR(electrons) == Approx(-expected - bare_difference / r).margin(1e-7));
+    }
+  }
+}
+
+TEST_CASE("Periodic local energy retains the nearest-image radial correction", "[hamiltonian][local_pp_tail]")
+{
+  // Isolate both the cached breakup and its policy from preceding suite cases.
+  struct RestoreHandler
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) saved = std::move(LRCoulombSingleton::CoulombHandler);
+    const LRCoulombSingleton::lr_type saved_type = LRCoulombSingleton::this_lr_type;
+    ~RestoreHandler()
+    {
+      LRCoulombSingleton::CoulombHandler = std::move(saved);
+      LRCoulombSingleton::this_lr_type = saved_type;
+    }
+  } restore;
+  const bool ordinary_ewald = GENERATE(false, true);
+  LRCoulombSingleton::CoulombHandler.reset();
+  LRCoulombSingleton::this_lr_type = LRCoulombSingleton::ESLER;
+  Lattice lattice;
+  constexpr double a = 3.837088895929358;
+  lattice.R = {0, a, a, a, 0, a, a, a, 0};
+  lattice.BoxBConds = true;
+  lattice.LR_dim_cutoff = 15;
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet ions(cell), electrons(cell);
+  ions.setName("ion");
+  ions.create({1, 1});
+  auto& ionic = ions.getSpeciesSet();
+  ionic.addSpecies("Li");
+  ionic.addSpecies("H");
+  const int charge = ionic.addAttribute("charge");
+  ionic(charge, 0) = ionic(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {a, a, a};
+  ions.resetGroups();
+  ions.createSK();
+  ions.update();
+  electrons.setName("e");
+  electrons.create({1, 1});
+  auto& electronic = electrons.getSpeciesSet();
+  electronic.addSpecies("u");
+  electronic.addSpecies("d");
+  const int electron_charge = electronic.addAttribute("charge");
+  const int mass = electronic.addAttribute("mass");
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    electronic(electron_charge, spin) = -1;
+    electronic(mass, spin) = 1;
+  }
+  electrons.R[0] = {.2, .3, .4};
+  electrons.R[1] = {.7, .8, .9};
+  electrons.resetGroups();
+  electrons.createSK();
+  electrons.update();
+  if (ordinary_ewald)
+  {
+    LRCoulombSingleton::CoulombHandler = std::make_unique<EwaldHandler3D>(ions);
+    LRCoulombSingleton::CoulombHandler->initBreakup(ions);
+  }
+  CoulombPBCAB bare(ions, electrons), local(ions, electrons);
+  auto correction = [](double r) {
+    return std::exp(-15 * r * r) / r - 1.24272969818004 * std::exp(-1.80605426846072 * r * r)
+        + 15 * r * std::exp(-15.0479971422127 * r * r);
+  };
+  LinearGrid<double> grid;
+  constexpr int count = 100000;
+  grid.set(0, 10, count);
+  std::vector<double> radial(count);
+  radial[0] = 0;
+  for (int point = 1; point < count; ++point)
+    radial[point] = 1 - grid[point] * correction(grid[point]);
+  auto pp = std::make_unique<CoulombPBCAB::RadFunctorType>(grid.makeClone(), radial);
+  pp->spline(0, 1.24272969818004, count - 1, 0);
+  local.add(0, std::move(pp));
+  CHECK_FALSE(pp);
+  REQUIRE(local.Vat[1] == local.V0.get());
+  // Sweep across and beyond the Coulomb cutoff, then sample fractional-cell points.
+  for (int point = 0; point < 99; ++point)
+  {
+    if (point >= 96)
+      electrons.R[0] = {local.V0->grid()[1] * (1 + (point - 97) * 1e-8), 0, 0};
+    else if (point < 32)
+      electrons.R[0] = {local.myRcut - .01 + point * .001, 0, 0};
+    else
+    {
+      const double u = std::fmod(.173 + point * .6180339887498949, 1.);
+      const double v = std::fmod(.291 + point * .4142135623730950, 1.);
+      const double w = std::fmod(.437 + point * .7320508075688772, 1.);
+      electrons.R[0] = {a * (v + w), a * (u + w), a * (u + v)};
+    }
+    electrons.update();
+    double expected = bare.evaluate(electrons);
+    const auto& distances = electrons.getDistTableAB(local.myTableIndex);
+    for (int electron = 0; electron < 2; ++electron)
+      expected += correction(distances.getDistRow(electron)[0]);
+    CHECK(local.evaluate(electrons) == Approx(expected).margin(1e-6));
+    if (point == 98)
+    {
+      ParticleSet copy(electrons);
+      copy.update();
+      auto clone = local.makeClone(copy);
+      CHECK(dynamic_cast<CoulombPBCAB&>(*clone).evaluate(copy) == Approx(expected).margin(1e-6));
     }
   }
 }

@@ -160,7 +160,7 @@ CoulombPBCAB::Return_t CoulombPBCAB::evaluate_sp(ParticleSet& P)
       const auto& dist = d_ab.getDistRow(b);
       for (size_t a = 0; a < NptclA; ++a)
       {
-        Return_t pairpot = z * Zat[a] * Vat[a]->splint(dist[a]) / dist[a];
+        Return_t pairpot = z * Zat[a] * energyRadial(a, dist[a]) / dist[a];
         Vi_samp(a) += pairpot;
         Ve_samp(b) += pairpot;
         Vsr += pairpot;
@@ -297,7 +297,7 @@ void CoulombPBCAB::mw_evaluatePerParticle(const RefVectorWithLeader<OperatorBase
         const auto& dist = d_ab.getDistRow(b);
         for (size_t a = 0; a < pset_source.getTotalNum(); ++a)
         {
-          Return_t pairpot = z * cpbcab.Zat[a] * cpbcab.Vat[a]->splint(dist[a]) / dist[a];
+          Return_t pairpot = z * cpbcab.Zat[a] * cpbcab.energyRadial(a, dist[a]) / dist[a];
           vi_sample[a] += pairpot;
           ve_sample[b] += pairpot;
           Vsr += pairpot;
@@ -412,6 +412,25 @@ CoulombPBCAB::Return_t CoulombPBCAB::evalConsts(const ParticleSet& Peln, bool re
 }
 
 
+// Keep the bare breakup exactly as constructed, adding only the supplied local
+// correction at the same minimum-image distance used by the energy operator.
+CoulombPBCAB::RealType CoulombPBCAB::energyRadial(size_t ion, RealType r) const
+{
+  if (ComputeForces || local_pp_ions_[ion] == nullptr)
+    return Vat[ion]->splint(r);
+
+  RealType bare_minus_one;
+  if (r < V0->grid()[1])
+  {
+    // The bare spline extrapolates its endpoint. Use the exact bare definition
+    // here so that its small endpoint residue cannot manufacture a 1/r pole.
+    bare_minus_one = -r * (r > 0.0 ? AB->evaluateLR(r) : AB->evaluateLR_r0());
+  }
+  else
+    bare_minus_one = V0->splint(r) - 1.0;
+  return bare_minus_one + local_pp_ions_[ion]->splint(r);
+}
+
 CoulombPBCAB::Return_t CoulombPBCAB::evalSR(ParticleSet& P)
 {
   constexpr mRealType czero(0);
@@ -423,7 +442,7 @@ CoulombPBCAB::Return_t CoulombPBCAB::evalSR(ParticleSet& P)
     const auto& dist = d_ab.getDistRow(b);
     mRealType esum   = czero;
     for (size_t a = 0; a < NptclA; ++a)
-      esum += Zat[a] * Vat[a]->splint(dist[a]) / dist[a];
+      esum += Zat[a] * energyRadial(a, dist[a]) / dist[a];
     res += esum * Qat[b];
   }
   return res;
@@ -527,6 +546,8 @@ void CoulombPBCAB::initBreakup(ParticleSet& P)
     }
     Vat.resize(NptclA, V0.get());
     Vspec.resize(NumSpeciesA); //prepare for PP to overwrite it
+    local_pp_species_.resize(NumSpeciesA);
+    local_pp_ions_.resize(NptclA, nullptr);
   }
 
   //If ComputeForces is true, then we allocate space for the radial derivative functors.
@@ -597,6 +618,8 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
       definition << std::hexfloat << ";local_pp_v2:species=" << groupID << ";grid=" << ng
                  << ";start=0;end=" << myRcut << ";dr=" << dr
                  << ";origin=input;origin_slope=input-lr0;tail=zero2";
+      if (!ComputeForces)
+        definition << ";energy_v3=bare-plus-input-minus-one;first_interval=exact-lr;input_end=" << ppot->r_max;
       ewald_model_definition_ += definition.str();
     }
   }
@@ -665,6 +688,14 @@ void CoulombPBCAB::add(int groupID, std::unique_ptr<RadFunctorType>&& ppot)
       }
       fclose(fout);
     }
+  }
+
+  if (!ComputeForces && local_pp_species_[groupID] == nullptr)
+  {
+    local_pp_species_[groupID] = std::move(ppot);
+    for (int ion = 0; ion < NptclA; ++ion)
+      if (pset_ions_.GroupID[ion] == groupID)
+        local_pp_ions_[ion] = local_pp_species_[groupID].get();
   }
 }
 
