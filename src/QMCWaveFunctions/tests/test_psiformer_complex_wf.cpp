@@ -5497,6 +5497,47 @@ TEST_CASE("CPU paired energies preserve accepted ordinary nonlocal quadrature",
     ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hamiltonians);
     trial.evaluateLog(p); trial1->evaluateLog(p1);
     const auto snapshot = cpu.snapshotParameters();
+    // Orbital fitting uses only the neural value/score owners, even for a physical PP component.
+    const auto accepted_log = cpu.get_log_value();
+    const auto accepted_positions = p.R;
+    const auto numeric = cpu.numericStorage();
+    const double unevaluated_energy = ham.getLocalEnergy();
+    std::vector<C> orbital_values;
+    cpu.evaluateOrbitalValues(p, orbital_values, snapshot.version);
+    REQUIRE(orbital_values.size() == cpu.orbitalMSEChannelCount() * 4);
+    CHECK(cpu.orbitalMSEStorage().prepared_bytes == 0);
+    CHECK(cpu.numericStorage().allocated_bytes == numeric.allocated_bytes);
+    std::vector<C> fixed_orbitals(orbital_values.size());
+    double independent_loss = 0;
+    for (std::size_t index = 0; index < fixed_orbitals.size(); ++index)
+    {
+      fixed_orbitals[index] = index % 4 == 0 || index % 4 == 3 ? C{.7, .2} : C{};
+      independent_loss += std::norm(orbital_values[index] - fixed_orbitals[index]) /
+          (cpu.orbitalMSEChannelCount() * 2);
+    }
+    const auto mse_bytes = cpu.orbitalMSEStorage().required_bytes;
+    REQUIRE(mse_bytes > 0);
+    CHECK_THROWS(cpu.prepareOrbitalMSE(mse_bytes - 1));
+    CHECK(cpu.orbitalMSEStorage().prepared_bytes == 0);
+    cpu.prepareOrbitalMSE(mse_bytes);
+    const auto prepared_numeric = cpu.numericStorage();
+    std::vector<double> orbital_gradient(snapshot.values.size());
+    const double orbital_loss = cpu.evaluateOrbitalMSE(p, fixed_orbitals, orbital_gradient, snapshot.version);
+    CHECK(orbital_loss == Catch::Approx(independent_loss).epsilon(1e-12));
+    CHECK(ps::determinant::isFiniteReal(orbital_loss));
+    CHECK(std::all_of(orbital_gradient.begin(), orbital_gradient.end(),
+                      [](double value) { return ps::determinant::isFiniteReal(value); }));
+    CHECK(std::any_of(orbital_gradient.begin(), orbital_gradient.end(),
+                      [](double value) { return std::abs(value) > 1e-8; }));
+    CHECK(cpu.orbitalMSEStorage().prepared_bytes == mse_bytes);
+    CHECK(cpu.numericStorage().allocated_bytes == prepared_numeric.allocated_bytes);
+    CHECK(cpu.numericStorage().fingerprint == prepared_numeric.fingerprint);
+    CHECK(cpu.get_log_value() == accepted_log);
+    for (std::size_t electron = 0; electron < p.R.size(); ++electron)
+      CHECK(p.R[electron] == accepted_positions[electron]);
+    CHECK(ham.getLocalEnergy() == unevaluated_energy);
+    CHECK(cpu.snapshotParameters().version == snapshot.version);
+    CHECK(cpu.snapshotParameters().values == snapshot.values);
     const auto storage = NonLocalEnergyAccumulator::requiredBytes(2);
     Audit audit(cpu.parameterSchema());
     std::vector<C> ones(2, {1, 0});
