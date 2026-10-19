@@ -449,3 +449,160 @@ TEST_CASE("PsiFormer periodic geometry validates bulk cells", "[wavefunction][ps
                       2, pf::GeometryPositionView::interleaved(nucleus.data(), 1), periodic),
                   std::invalid_argument);
 }
+
+TEST_CASE("PsiFormer two-cell geometry retains simulation pair information",
+          "[wavefunction][psiformer][periodic]")
+{
+  pf::PeriodicGeometryMapping mapping;
+  mapping.primitive = {pf::GeometryBoundaryKind::PERIODIC,
+                       {{{3.2, 0.4, -0.2}, {0.3, 2.8, 0.5}, {-0.1, 0.6, 3.6}}},
+                       {{true, true, true}}};
+  mapping.simulation = mapping.primitive;
+  mapping.tiling[0][0] = 2;
+  for (std::size_t c = 0; c < 3; ++c)
+    mapping.simulation.lattice_vectors[0][c] *= 2;
+  const std::array<double, 3> motif{0.12, -0.23, 0.31};
+  const std::array<double, 6> positions{0.71, 0.52, -0.41, -0.27, 1.18, 0.84};
+  pf::PsiFormerGeometryCache cache(2, pf::GeometryPositionView::interleaved(motif.data(), 1), mapping);
+  cache.update(pf::GeometryPositionView::interleaved(positions.data(), 2));
+  const auto ei = cache.electronNucleusPairs().distances();
+  const auto ei_q = cache.electronNucleusPairs().displacements();
+  const auto ei_p = cache.electronNucleusPairs().complementaryDisplacements();
+  const double ee = cache.electronElectronPairs().distances()[0];
+  const auto fingerprint = cache.storageFingerprint();
+  const auto bytes = cache.storageBytes();
+  auto shifted = cache.electrons()[0];
+  for (std::size_t c = 0; c < 3; ++c)
+    shifted[c] += mapping.primitive.lattice_vectors[0][c];
+  cache.updateElectron(0, shifted);
+  for (std::size_t i = 0; i < 2; ++i)
+  {
+    checkClose(cache.electronNucleusPairs().distances()[i], ei[i], 1e-12);
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+      checkClose(cache.electronNucleusPairs().displacements()[i][c], ei_q[i][c], 1e-12);
+      checkClose(cache.electronNucleusPairs().complementaryDisplacements()[i][c], ei_p[i][c], 1e-12);
+    }
+  }
+  CHECK(std::abs(cache.electronElectronPairs().distances()[0] - ee) > 0.1);
+  CHECK(cache.storageFingerprint() == fingerprint);
+  CHECK(cache.storageBytes() == bytes);
+  CHECK(cache.boundary().lattice_vectors == mapping.simulation.lattice_vectors);
+  CHECK(cache.electronIonBoundary().lattice_vectors == mapping.primitive.lattice_vectors);
+
+  // A second primitive shift is a full simulation translation for both channels.
+  for (std::size_t c = 0; c < 3; ++c)
+    shifted[c] += mapping.primitive.lattice_vectors[0][c];
+  cache.updateElectron(0, shifted);
+  checkClose(cache.electronElectronPairs().distances()[0], ee, 1e-12);
+}
+
+TEST_CASE("PsiFormer two-cell skew geometry jets use their respective cells",
+          "[wavefunction][psiformer][periodic]")
+{
+  pf::PeriodicGeometryMapping mapping;
+  mapping.primitive = {pf::GeometryBoundaryKind::PERIODIC,
+                       {{{3.2, 0.4, -0.2}, {0.3, 2.8, 0.5}, {-0.1, 0.6, 3.6}}},
+                       {{true, true, true}}};
+  mapping.simulation = mapping.primitive;
+  mapping.tiling[1][0] = 1;
+  mapping.tiling[1][1] = 2;
+  for (std::size_t c = 0; c < 3; ++c)
+    mapping.simulation.lattice_vectors[1][c] =
+        mapping.primitive.lattice_vectors[0][c] + 2 * mapping.primitive.lattice_vectors[1][c];
+  const std::array<double, 3> motif{0.12, -0.23, 0.31};
+  const std::array<double, 6> positions{0.71, 0.52, -0.41, -0.27, 1.18, 0.84};
+  pf::PsiFormerGeometryCache cache(2, pf::GeometryPositionView::interleaved(motif.data(), 1), mapping);
+  cache.update(pf::GeometryPositionView::interleaved(positions.data(), 2));
+  const std::array<double, 2> radius{cache.electronNucleusPairs().distances()[0],
+                                      cache.electronElectronPairs().distances()[0]};
+  const std::array<pf::GeometryPosition, 2> gradient{cache.electronNucleusPairs().distanceGradients()[0],
+                                                    cache.electronElectronPairs().distanceGradients()[0]};
+  const std::array<double, 2> laplacian{cache.electronNucleusPairs().distanceLaplacians()[0],
+                                         cache.electronElectronPairs().distanceLaplacians()[0]};
+  for (double step : {2e-4, 1e-4})
+  {
+    std::array<double, 2> trace{};
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+      auto plus = positions;
+      auto minus = positions;
+      plus[c] += step;
+      minus[c] -= step;
+      cache.update(pf::GeometryPositionView::interleaved(plus.data(), 2));
+      const std::array<double, 2> rp{cache.electronNucleusPairs().distances()[0],
+                                     cache.electronElectronPairs().distances()[0]};
+      cache.update(pf::GeometryPositionView::interleaved(minus.data(), 2));
+      const std::array<double, 2> rm{cache.electronNucleusPairs().distances()[0],
+                                     cache.electronElectronPairs().distances()[0]};
+      for (std::size_t channel = 0; channel < 2; ++channel)
+      {
+        checkClose((rp[channel] - rm[channel]) / (2 * step), gradient[channel][c], 2e-7);
+        trace[channel] += (rp[channel] - 2 * radius[channel] + rm[channel]) / (step * step);
+      }
+    }
+    for (std::size_t channel = 0; channel < 2; ++channel)
+      checkClose(trace[channel], laplacian[channel], 2e-5);
+  }
+}
+
+TEST_CASE("PsiFormer two-cell mapping validates and preserves identity geometry",
+          "[wavefunction][psiformer][periodic]")
+{
+  pf::PeriodicGeometryMapping mapping;
+  mapping.primitive = {pf::GeometryBoundaryKind::PERIODIC,
+                       {{{-1.718, 1.718, 1.718}, {1.718, -1.718, 1.718}, {1.718, 1.718, -1.718}}},
+                       {{true, true, true}}};
+  mapping.simulation = {pf::GeometryBoundaryKind::PERIODIC,
+                        {{{3.436, 0, 0}, {0, 3.436, 0}, {0, 0, 3.436}}},
+                        {{true, true, true}}};
+  mapping.tiling = {{{0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+  CHECK_NOTHROW(pf::validatePeriodicGeometryMapping(mapping));
+  const std::array<double, 3> one_site{0, 0, 0};
+  const std::array<double, 6> conventional_sites{0, 0, 0, 1.718, 1.718, 1.718};
+  const auto one_view = pf::GeometryPositionView::interleaved(one_site.data(), 1);
+  const auto conventional_view = pf::GeometryPositionView::interleaved(conventional_sites.data(), 2);
+  CHECK(pf::mapPeriodicIonMotif(mapping, one_view, {3}, conventional_view, {3, 3}) ==
+        std::vector<std::size_t>{0, 0});
+  CHECK_THROWS_AS(pf::mapPeriodicIonMotif(mapping, one_view, {3}, conventional_view, {3, 1}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(pf::mapPeriodicIonMotif(mapping, one_view, {3}, one_view, {3}),
+                  std::invalid_argument);
+  auto duplicate_sites = conventional_sites;
+  for (std::size_t c = 0; c < 3; ++c)
+    duplicate_sites[3 + c] = mapping.simulation.lattice_vectors[0][c];
+  CHECK_THROWS_AS(pf::mapPeriodicIonMotif(mapping, one_view, {3},
+      pf::GeometryPositionView::interleaved(duplicate_sites.data(), 2), {3, 3}), std::invalid_argument);
+  auto displaced_sites = conventional_sites;
+  displaced_sites[3] += 0.1;
+  CHECK_THROWS_AS(pf::mapPeriodicIonMotif(mapping, one_view, {3},
+      pf::GeometryPositionView::interleaved(displaced_sites.data(), 2), {3, 3}), std::invalid_argument);
+  auto wrapped_sites = conventional_sites;
+  for (std::size_t c = 0; c < 3; ++c)
+    wrapped_sites[3 + c] -= mapping.simulation.lattice_vectors[1][c];
+  CHECK(pf::mapPeriodicIonMotif(mapping, one_view, {3},
+      pf::GeometryPositionView::interleaved(wrapped_sites.data(), 2), {3, 3}) == std::vector<std::size_t>{0, 0});
+  auto invalid = mapping;
+  invalid.tiling[0][0] = 1;
+  CHECK_THROWS_AS(pf::validatePeriodicGeometryMapping(invalid), std::invalid_argument);
+  invalid = mapping;
+  invalid.primitive.periodic_axes[0] = false;
+  CHECK_THROWS_AS(pf::validatePeriodicGeometryMapping(invalid), std::invalid_argument);
+  invalid = mapping;
+  invalid.simulation.lattice_vectors[2] = invalid.simulation.lattice_vectors[1];
+  CHECK_THROWS_AS(pf::validatePeriodicGeometryMapping(invalid), std::invalid_argument);
+
+  mapping.primitive = mapping.simulation;
+  mapping.tiling = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+  const std::array<double, 6> motif{0, 0, 0, 1.718, 1.718, 1.718};
+  const std::array<double, 6> electrons{0.4, 0.6, 0.9, -0.3, 1.2, 0.2};
+  pf::PsiFormerGeometryCache legacy(2, pf::GeometryPositionView::interleaved(motif.data(), 2), mapping.simulation);
+  pf::PsiFormerGeometryCache selected(2, pf::GeometryPositionView::interleaved(motif.data(), 2), mapping);
+  legacy.update(pf::GeometryPositionView::interleaved(electrons.data(), 2));
+  selected.update(pf::GeometryPositionView::interleaved(electrons.data(), 2));
+  CHECK(legacy.electronNucleusPairs().distances() == selected.electronNucleusPairs().distances());
+  CHECK(legacy.electronNucleusPairs().distanceGradients() == selected.electronNucleusPairs().distanceGradients());
+  CHECK(legacy.electronNucleusPairs().distanceLaplacians() == selected.electronNucleusPairs().distanceLaplacians());
+  CHECK(legacy.electronElectronPairs().distances() == selected.electronElectronPairs().distances());
+  CHECK(legacy.storageBytes() == selected.storageBytes());
+}

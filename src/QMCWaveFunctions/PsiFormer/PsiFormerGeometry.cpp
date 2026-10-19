@@ -10,6 +10,7 @@
  */
 
 #include "PsiFormerGeometry.h"
+#include "PsiFormerPeriodicGeometry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -106,6 +107,43 @@ bool supportsGeometryBoundary(GeometryBoundaryKind kind) noexcept
   return kind == GeometryBoundaryKind::OPEN || kind == GeometryBoundaryKind::PERIODIC;
 }
 
+void validatePeriodicGeometryMapping(const PeriodicGeometryMapping& mapping)
+{
+  if (mapping.primitive.kind != GeometryBoundaryKind::PERIODIC ||
+      mapping.simulation.kind != GeometryBoundaryKind::PERIODIC)
+    throw std::invalid_argument("PsiFormer two-cell mapping requires periodic cells");
+  const auto primitive = qmcplusplus::psiformer::periodic_geometry::makeCell(
+      mapping.primitive.lattice_vectors, mapping.primitive.periodic_axes);
+  (void)qmcplusplus::psiformer::periodic_geometry::makeCell(
+      mapping.simulation.lattice_vectors, mapping.simulation.periodic_axes);
+  double scale = 0;
+  for (const auto& row : mapping.simulation.lattice_vectors)
+    for (double value : row)
+      scale = std::max(scale, std::abs(value));
+  for (std::size_t row = 0; row < 3; ++row)
+    for (std::size_t column = 0; column < 3; ++column)
+    {
+      double expected = 0;
+      for (std::size_t axis = 0; axis < 3; ++axis)
+        expected += static_cast<double>(mapping.tiling[row][axis]) * primitive.lattice[axis][column];
+      const double actual = mapping.simulation.lattice_vectors[row][column];
+      if (!isFiniteGeometryValue(expected) ||
+          std::abs(expected - actual) > 256 * std::numeric_limits<double>::epsilon() *
+              std::max(scale, std::abs(expected)))
+        throw std::invalid_argument("PsiFormer cell mapping conflicts with integer tiling");
+    }
+}
+
+namespace
+{
+/// Validate both feature cells before delegating to pair-table allocation.
+GeometryBoundary validatedSimulationBoundary(const PeriodicGeometryMapping& mapping)
+{
+  validatePeriodicGeometryMapping(mapping);
+  return mapping.simulation;
+}
+}
+
 GeometryPositionView::GeometryPositionView(std::array<const GeometryReal*, 3> components,
                                            std::array<std::size_t, 3> strides,
                                            std::size_t particle_count)
@@ -152,6 +190,77 @@ GeometryReal GeometryPositionView::operator()(std::size_t particle, std::size_t 
 GeometryPosition GeometryPositionView::position(std::size_t particle) const
 {
   return {(*this)(particle, 0), (*this)(particle, 1), (*this)(particle, 2)};
+}
+
+std::vector<std::size_t> mapPeriodicIonMotif(const PeriodicGeometryMapping& mapping,
+                                           GeometryPositionView primitive_motif,
+                                           const std::vector<int>& primitive_species,
+                                           GeometryPositionView simulation_ions,
+                                           const std::vector<int>& simulation_species)
+{
+  validatePeriodicGeometryMapping(mapping);
+  if (primitive_motif.size() == 0 || primitive_motif.size() != primitive_species.size() ||
+      simulation_ions.size() != simulation_species.size())
+    throw std::invalid_argument("PsiFormer periodic motif has inconsistent species or positions");
+  const auto primitive = qmcplusplus::psiformer::periodic_geometry::makeCell(
+      mapping.primitive.lattice_vectors, mapping.primitive.periodic_axes);
+  const auto simulation = qmcplusplus::psiformer::periodic_geometry::makeCell(
+      mapping.simulation.lattice_vectors, mapping.simulation.periodic_axes);
+  // Every primitive site must have exactly |det T| simulation-cell images.
+  const auto& t = mapping.tiling;
+  const double multiplicity = std::abs(
+      static_cast<double>(t[0][0]) * (static_cast<double>(t[1][1]) * t[2][2] - static_cast<double>(t[1][2]) * t[2][1]) -
+      static_cast<double>(t[0][1]) * (static_cast<double>(t[1][0]) * t[2][2] - static_cast<double>(t[1][2]) * t[2][0]) +
+      static_cast<double>(t[0][2]) * (static_cast<double>(t[1][0]) * t[2][1] - static_cast<double>(t[1][1]) * t[2][0]));
+  if (multiplicity < 1 || static_cast<double>(simulation_ions.size()) !=
+      multiplicity * static_cast<double>(primitive_motif.size()))
+    throw std::invalid_argument("PsiFormer periodic motif has incorrect ionic multiplicity");
+  const auto equivalent = [](const auto& cell, const GeometryPosition& left, const GeometryPosition& right) {
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+      double fractional = 0;
+      for (std::size_t c = 0; c < 3; ++c)
+        fractional += cell.reciprocal[axis][c] * (left[c] - right[c]);
+      if (!isFiniteGeometryValue(fractional) || std::abs(fractional - std::nearbyint(fractional)) >
+          512 * std::numeric_limits<double>::epsilon() * (1 + std::abs(fractional)))
+        return false;
+    }
+    return true;
+  };
+  // Reject redundant feature centers before assigning physical ion identities.
+  for (std::size_t i = 0; i < primitive_motif.size(); ++i)
+  {
+    validatePosition(primitive_motif.position(i));
+    for (std::size_t j = 0; j < i; ++j)
+      if (equivalent(primitive, primitive_motif.position(i), primitive_motif.position(j)))
+        throw std::invalid_argument("PsiFormer primitive motif contains duplicate periodic sites");
+  }
+  std::vector<std::size_t> indices(simulation_ions.size());
+  std::vector<std::size_t> counts(primitive_motif.size());
+  for (std::size_t i = 0; i < simulation_ions.size(); ++i)
+  {
+    validatePosition(simulation_ions.position(i));
+    for (std::size_t j = 0; j < i; ++j)
+      if (equivalent(simulation, simulation_ions.position(i), simulation_ions.position(j)))
+        throw std::invalid_argument("PsiFormer simulation motif contains duplicate periodic sites");
+    std::size_t match = primitive_motif.size();
+    // Match species and primitive images, allowing negative coordinate representatives.
+    for (std::size_t j = 0; j < primitive_motif.size(); ++j)
+      if (primitive_species[j] == simulation_species[i] &&
+          equivalent(primitive, simulation_ions.position(i), primitive_motif.position(j)))
+      {
+        match = j;
+        break;
+      }
+    if (match == primitive_motif.size())
+      throw std::invalid_argument("PsiFormer simulation ion does not match the primitive motif");
+    indices[i] = match;
+    ++counts[match];
+  }
+  for (std::size_t count : counts)
+    if (static_cast<double>(count) != multiplicity)
+      throw std::invalid_argument("PsiFormer primitive motif has unequal ionic replication");
+  return indices;
 }
 
 SoftenedRadialFactors evaluateSoftenedRadialFactors(GeometryReal radius)
@@ -293,6 +402,7 @@ PsiFormerGeometryCache::PsiFormerGeometryCache(std::size_t electron_count,
                                                GeometryPositionView nuclei,
                                                GeometryBoundary boundary)
     : boundary_(boundary),
+      electron_ion_boundary_(boundary),
       nuclei_(nuclei.size()),
       electrons_(electron_count),
       electron_nucleus_pairs_(checkedProduct(electron_count, nuclei.size())),
@@ -353,6 +463,20 @@ PsiFormerGeometryCache::PsiFormerGeometryCache(std::size_t electron_count,
   }
 
   initializeElectronPairs();
+  electron_ion_reciprocal_vectors_ = reciprocal_vectors_;
+}
+
+PsiFormerGeometryCache::PsiFormerGeometryCache(std::size_t electron_count,
+                                               GeometryPositionView primitive_motif,
+                                               const PeriodicGeometryMapping& mapping)
+    : PsiFormerGeometryCache(electron_count, primitive_motif, validatedSimulationBoundary(mapping))
+{
+  electron_ion_boundary_ = mapping.primitive;
+  const auto cell = qmcplusplus::psiformer::periodic_geometry::makeCell(
+      mapping.primitive.lattice_vectors, mapping.primitive.periodic_axes);
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    for (std::size_t component = 0; component < 3; ++component)
+      electron_ion_reciprocal_vectors_[axis][component] = cell.reciprocal[axis][component];
 }
 
 std::size_t PsiFormerGeometryCache::storageFingerprint() const noexcept
@@ -410,7 +534,7 @@ void PsiFormerGeometryCache::update(GeometryPositionView electrons)
   // changing accepted electron or pair-table state.
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-      (void)pairGeometry(electrons.position(electron), nuclei_[nucleus]);
+      (void)pairGeometry(electrons.position(electron), nuclei_[nucleus], true);
   for (const ElectronPair& pair : electron_pairs_)
     (void)pairGeometry(electrons.position(pair.first), electrons.position(pair.second));
 
@@ -420,7 +544,7 @@ void PsiFormerGeometryCache::update(GeometryPositionView electrons)
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
       updatePair(electron_nucleus_pairs_, electronNucleusPairIndex(electron, nucleus),
-                 pairGeometry(electrons_[electron], nuclei_[nucleus]));
+                 pairGeometry(electrons_[electron], nuclei_[nucleus], true));
 
   for (std::size_t pair_index = 0; pair_index < electron_pairs_.size(); ++pair_index)
   {
@@ -444,7 +568,7 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
   // Validate every affected derived quantity while the accepted cache is
   // untouched.  The publication pass below repeats only proven-safe arithmetic.
   for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-    (void)pairGeometry(position, nuclei_[nucleus]);
+    (void)pairGeometry(position, nuclei_[nucleus], true);
   for (std::size_t incidence_index = incidence_offsets_[electron];
        incidence_index < incidence_offsets_[electron + 1]; ++incidence_index)
   {
@@ -460,7 +584,7 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
   electrons_[electron] = position;
   for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
     updatePair(electron_nucleus_pairs_, electronNucleusPairIndex(electron, nucleus),
-               pairGeometry(electrons_[electron], nuclei_[nucleus]));
+               pairGeometry(electrons_[electron], nuclei_[nucleus], true));
 
   for (std::size_t incidence_index = incidence_offsets_[electron];
        incidence_index < incidence_offsets_[electron + 1]; ++incidence_index)
@@ -476,13 +600,16 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
 
 PsiFormerGeometryCache::PairGeometry PsiFormerGeometryCache::pairGeometry(
     const GeometryPosition& target,
-    const GeometryPosition& source) const
+    const GeometryPosition& source,
+    bool electron_ion) const
 {
+  const auto& boundary = electron_ion ? electron_ion_boundary_ : boundary_;
+  const auto& reciprocal_vectors = electron_ion ? electron_ion_reciprocal_vectors_ : reciprocal_vectors_;
   PairGeometry pair;
   const GeometryPosition difference{target[0] - source[0], target[1] - source[1], target[2] - source[2]};
   validatePosition(difference);
 
-  if (boundary_.kind == GeometryBoundaryKind::OPEN)
+  if (boundary.kind == GeometryBoundaryKind::OPEN)
   {
     pair.displacement = difference;
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
@@ -509,8 +636,8 @@ PsiFormerGeometryCache::PairGeometry PsiFormerGeometryCache::pairGeometry(
     {
       GeometryReal fractional = 0;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
-        fractional += reciprocal_vectors_[axis][dimension] * difference[dimension];
-      if (boundary_.periodic_axes[axis])
+        fractional += reciprocal_vectors[axis][dimension] * difference[dimension];
+      if (boundary.periodic_axes[axis])
       {
         const GeometryReal nearest_image = std::nearbyint(fractional);
         GeometryReal reduced = fractional - nearest_image;
@@ -536,13 +663,13 @@ PsiFormerGeometryCache::PairGeometry PsiFormerGeometryCache::pairGeometry(
     for (std::size_t component = 0; component < 3; ++component)
       for (std::size_t axis = 0; axis < 3; ++axis)
       {
-        const GeometryReal lattice_component = boundary_.lattice_vectors[axis][component];
+        const GeometryReal lattice_component = boundary.lattice_vectors[axis][component];
         pair.displacement[component] += lattice_component * sine_coordinates[axis];
         pair.complementary_displacement[component] += lattice_component * cosine_coordinates[axis];
         GeometryReal reciprocal_norm_squared = 0;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
         {
-          const GeometryReal reciprocal_component = reciprocal_vectors_[axis][dimension];
+          const GeometryReal reciprocal_component = reciprocal_vectors[axis][dimension];
           pair.displacement_jacobian[component][dimension] +=
               lattice_component * sine_first[axis] * reciprocal_component;
           pair.complementary_displacement_jacobian[component][dimension] +=

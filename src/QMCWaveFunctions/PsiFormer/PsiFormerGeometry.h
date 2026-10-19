@@ -57,6 +57,17 @@ struct GeometryBoundary
   std::array<bool, 3> periodic_axes{};
 };
 
+/// Feature-cell mapping; physical ions and interaction distances are independent.
+struct PeriodicGeometryMapping
+{
+  GeometryBoundary primitive;
+  GeometryBoundary simulation;
+  std::array<std::array<int, 3>, 3> tiling{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+};
+
+/// Validate full-rank cells and A_simulation = tiling * A_primitive.
+void validatePeriodicGeometryMapping(const PeriodicGeometryMapping& mapping);
+
 /// Report whether this implementation can evaluate the requested boundary policy.
 bool supportsGeometryBoundary(GeometryBoundaryKind kind) noexcept;
 
@@ -102,6 +113,13 @@ private:
   std::array<std::size_t, 3> strides_{};
   std::size_t particle_count_ = 0;
 };
+
+/// Validate a complete species-preserving replication and return feature-motif indices.
+std::vector<std::size_t> mapPeriodicIonMotif(const PeriodicGeometryMapping& mapping,
+                                           GeometryPositionView primitive_motif,
+                                           const std::vector<int>& primitive_species,
+                                           GeometryPositionView simulation_ions,
+                                           const std::vector<int>& simulation_species);
 
 /** Stable scalar factors for the PsiFormer feature f(r) = log(1+r)/r.
  *
@@ -286,6 +304,11 @@ public:
                          GeometryPositionView nuclei,
                          GeometryBoundary boundary = {});
 
+  /// Cache feature-only primitive motif pairs and simulation-cell electron pairs.
+  PsiFormerGeometryCache(std::size_t electron_count,
+                         GeometryPositionView primitive_motif,
+                         const PeriodicGeometryMapping& mapping);
+
   /// Report whether the cache contains at least one complete electron configuration.
   bool valid() const noexcept { return valid_; }
 
@@ -300,6 +323,9 @@ public:
 
   /// Return the boundary descriptor selected at construction.
   const GeometryBoundary& boundary() const noexcept { return boundary_; }
+
+  /// Return the feature cell used for electron-ion pairs (legacy: simulation cell).
+  const GeometryBoundary& electronIonBoundary() const noexcept { return electron_ion_boundary_; }
 
   /// Return the immutable nuclear positions copied at construction.
   const std::vector<GeometryPosition>& nuclei() const noexcept { return nuclei_; }
@@ -386,7 +412,8 @@ private:
 
   /// Form open Cartesian or smooth image-periodic geometry for one pair.
   PairGeometry pairGeometry(const GeometryPosition& target,
-                            const GeometryPosition& source) const;
+                            const GeometryPosition& source,
+                            bool electron_ion = false) const;
 
   /// Store one already validated pair result in the selected table entry.
   static void updatePair(GeometryPairTable& table,
@@ -397,7 +424,9 @@ private:
   void initializeElectronPairs();
 
   GeometryBoundary boundary_;
+  GeometryBoundary electron_ion_boundary_;
   std::array<GeometryPosition, 3> reciprocal_vectors_{};
+  std::array<GeometryPosition, 3> electron_ion_reciprocal_vectors_{};
   std::vector<GeometryPosition> nuclei_;
   std::vector<GeometryPosition> electrons_;
   GeometryPairTable electron_nucleus_pairs_;
