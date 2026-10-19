@@ -14,6 +14,8 @@
 #include "SetupPools.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
+#include "QMCDrivers/WFTrain/ComplexOrbitalInferenceMoments.h"
+#include "Message/CommOperators.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
@@ -218,6 +220,86 @@ TEST_CASE("Orbital inference merges raw moments before empirical column normaliz
   CHECK_FALSE(wftrain::isFiniteTrainingReal(undefined.occupied_column_cosine_squared));
   CHECK(undefined.mean_mse == 0);
   CHECK_THROWS(wftrain::OrbitalInferenceMoments(0, 1, 1, false));
+}
+
+TEST_CASE("Complex orbital inference preserves phase errors and pools Hermitian moments",
+          "[wftrain][orbital_inference][complex_orbital_moments]")
+{
+  using Complex = std::complex<double>;
+  wftrain::ComplexOrbitalInferenceMoments first(1, 1, 1, true), second(1, 1, 1, true), together(1, 1, 1, true);
+  const std::vector<Complex> target{2, 0, 0, 3};
+  const std::vector<Complex> a{Complex{0, 1}, Complex{4, 2}, Complex{5, -1}, Complex{0, 3}};
+  auto b = a;
+  b[0] *= 2;
+  b[3] *= 2;
+  first.addSample(a, target, .3);
+  second.addSample(b, target, .5);
+  together.addSample(a, target, .3);
+  together.addSample(b, target, .5);
+  auto global = first.sums();
+  for (std::size_t i = 0; i < global.size(); ++i)
+    global[i] += second.sums()[i];
+  CHECK(global == together.sums());
+  const auto result = first.summarize(global);
+  CHECK(result.samples == 2);
+  CHECK(result.mean_mse == Catch::Approx(42));
+  CHECK(result.mse_variance == Catch::Approx(56.25));
+  CHECK(result.occupied_column_cosine_squared == Catch::Approx(.9));
+  CHECK(result.undefined_columns == 0);
+  CHECK(result.energy == Catch::Approx(.4));
+  CHECK(result.energy_squared == Catch::Approx(.17));
+  CHECK(first.summarize(first.sums()).mean_mse == Catch::Approx(34.5));
+  CHECK(first.summarize(first.sums()).occupied_column_cosine_squared == Catch::Approx(1));
+
+  // A common phase is retained by the supervised loss but not fitted into a column diagnostic.
+  wftrain::ComplexOrbitalInferenceMoments phase(1, 1, 1, false);
+  auto rotated = target;
+  for (auto& value : rotated)
+    value *= Complex{0, 1};
+  phase.addSample(rotated, target);
+  CHECK(phase.summarize(phase.sums()).mean_mse == Catch::Approx(13));
+  CHECK(phase.summarize(phase.sums()).occupied_column_cosine_squared == Catch::Approx(1));
+
+  wftrain::OrbitalInferenceMoments real(1, 1, 1, true);
+  wftrain::ComplexOrbitalInferenceMoments limit(1, 1, 1, true);
+  const std::vector<double> real_a{-2, 4, 5, -3}, real_b{-4, 4, 5, -6}, real_target{2, 0, 0, 3};
+  real.addSample(real_a, real_target, .3);
+  real.addSample(real_b, real_target, .5);
+  limit.addSample(std::vector<Complex>(real_a.begin(), real_a.end()), target, .3);
+  limit.addSample(std::vector<Complex>(real_b.begin(), real_b.end()), target, .5);
+  const auto real_result = real.summarize(real.sums());
+  const auto limit_result = limit.summarize(limit.sums());
+  CHECK(limit_result.mean_mse == real_result.mean_mse);
+  CHECK(limit_result.mse_variance == real_result.mse_variance);
+  CHECK(limit_result.occupied_column_cosine_squared == real_result.occupied_column_cosine_squared);
+  CHECK(limit_result.energy == real_result.energy);
+  CHECK(limit_result.energy_squared == real_result.energy_squared);
+  CHECK(limit.sums().size() == 13);
+  first.reset();
+  CHECK_THROWS(first.summarize(first.sums()));
+  CHECK_THROWS(first.addSample(a, target));
+  auto invalid = a;
+  invalid[1] = {0, std::numeric_limits<double>::infinity()};
+  CHECK_THROWS(first.addSample(invalid, target, .3));
+  CHECK(first.sums()[0] == 0);
+  wftrain::ComplexOrbitalInferenceMoments zero(1, 1, 1, false);
+  zero.addSample(std::vector<Complex>(4), std::vector<Complex>(4));
+  CHECK(zero.summarize(zero.sums()).undefined_columns == 2);
+  CHECK_FALSE(wftrain::isFiniteTrainingReal(zero.summarize(zero.sums()).occupied_column_cosine_squared));
+
+  // Reduce raw complex-dot components across actual rank partitions before normalization.
+  auto* comm = OHMMS::Controller;
+  wftrain::ComplexOrbitalInferenceMoments distributed(1, 1, 1, true);
+  distributed.addSample(comm->rank() % 2 ? b : a, target, comm->rank() % 2 ? .5 : .3);
+  auto reduced = distributed.sums();
+  comm->allreduce(reduced);
+  const auto pooled = distributed.summarize(reduced);
+  const double odd = comm->size() / 2, even = comm->size() - odd, ranks = comm->size();
+  CHECK(pooled.samples == ranks);
+  CHECK(pooled.mean_mse == Catch::Approx((34.5 * even + 49.5 * odd) / ranks));
+  CHECK(pooled.energy == Catch::Approx((.3 * even + .5 * odd) / ranks));
+  CHECK(pooled.occupied_column_cosine_squared ==
+      Catch::Approx((even + 2 * odd) * (even + 2 * odd) / (ranks * (even + 4 * odd))));
 }
 
 TEST_CASE("Orbital inference scalar observer controls every Hamiltonian evaluation",
