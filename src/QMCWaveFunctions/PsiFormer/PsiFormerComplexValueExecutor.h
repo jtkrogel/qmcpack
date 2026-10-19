@@ -7,15 +7,15 @@
  * @brief Complete CPU complex periodic VALUE composition over the shared real trunk.
  *
  * Include after PsiFormerNative.h, following its one-translation-unit restriction.
- * This numerical owner is full-determinant and strictly free of inner reciprocal
- * phases. The common outer twist belongs to the future wavefunction adapter.
+ * This numerical owner supports full occupied reciprocal-column phases.
+ * The common outer twist belongs to the wavefunction adapter.
  * Public XML, spatial/parameter derivatives and accelerator admission are unchanged.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_VALUE_EXECUTOR_H
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_VALUE_EXECUTOR_H
 
 #include "PsiFormerValueExecutor.h"
-#include "PsiFormerComplexOrbital.h"
+#include "PsiFormerOccupiedHead.h"
 
 namespace pf
 {
@@ -50,7 +50,8 @@ public:
     const auto layout = makeSpatialJetLayout(1, orbitals, shape.electrons, SpatialJetMode::VALUE_ONLY);
     std::size_t bytes = valueWorkspaceStorageRequirement(shape) -
         determinantStorageRequirement(shape.determinants, shape.electrons);
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout), "complex value bytes overflow");
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count),
+                    "complex value bytes overflow");
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
         shape.determinants, shape.electrons), "complex value bytes overflow");
     return bytes;
@@ -125,7 +126,7 @@ public:
 private:
   friend class DirectComplexValueExecutor;
 
-  /// Prepare one G-free full head with compact value planes matching the determinant.
+  /// Prepare one full head with compact value planes matching the determinant.
   DirectComplexValueWorkspace(const DirectComplexValueExecutor* owner,
       std::unique_ptr<DirectValueTrunkWorkspace> trunk,
       const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor& descriptor)
@@ -162,7 +163,7 @@ private:
   bool valid_ = false;
 };
 
-/** Complete G-free complex periodic amplitude using one existing real neural trunk.
+/** Complete complex periodic amplitude using one existing real neural trunk.
  * Resolve canonical parameter offsets once; parameter updates retain the existing
  * real store and version protocol. This owner exposes VALUE only, without claiming
  * the public wavefunction, training or accelerator capabilities are qualified.
@@ -170,13 +171,11 @@ private:
 class DirectComplexValueExecutor
 {
 public:
-  /// Admit only the approved paired-real, full/no-inner-phase periodic schema.
+  /// Admit the paired-real full periodic schema and explicit occupied column phases.
   DirectComplexValueExecutor(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
       : parameters_(model.p), trunk_(model, requirePairedPlan(model, plan), DirectValuePreparation::REAL_TRUNK_ONLY),
-        descriptor_{model.ne, model.cfg.nup, model.ndet, model.dim,
-                    qmcplusplus::psiformer::ComplexOrbitalStructure::FULL,
-                    qmcplusplus::psiformer::ComplexOrbitalPhase::NONE, {}}
+        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan))
   {
     using qmcplusplus::psiformer::HeadTensorComponent;
     using qmcplusplus::psiformer::NO_ATTENTION_BLOCK;

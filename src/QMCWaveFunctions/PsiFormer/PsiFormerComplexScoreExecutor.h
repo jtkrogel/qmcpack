@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexScoreExecutor.h
- * @brief Complete G-free CPU complex log score for real canonical parameters.
+ * @brief Complete CPU complex log score for real canonical parameters.
  * Include after PsiFormerNative.h. No public wavefunction or kinetic admission.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_SCORE_EXECUTOR_H
@@ -12,7 +12,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
-#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexOrbital.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOccupiedHead.h"
 
 namespace pf
 {
@@ -37,7 +37,7 @@ struct DirectComplexOrbitalMSEArguments
   std::size_t gradient_size = 0;
 };
 
-/// Borrow raw G-free orbital matrices until the next workspace mutation/evaluation.
+/// Borrow occupied-gauge orbital matrices until the next workspace mutation/evaluation.
 struct DirectComplexOrbitalMSEResult
 {
   double loss = 0;
@@ -65,7 +65,7 @@ public:
     std::size_t bytes = scoreWorkspaceStorageRequirement(shape) -
         checkedStorageBytes<double>(checkedStorageProduct(3, matrix, message), message) -
         determinantStorageRequirement(shape.determinants, shape.electrons);
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout), message);
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count), message);
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
         shape.determinants, shape.electrons), message);
     addStorageBytes(bytes, checkedStorageBytes<double>(checkedStorageSum(matrix, features, message), message), message);
@@ -211,9 +211,7 @@ public:
   DirectComplexScoreExecutor(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
       : parameters_(model.p), trunk_(model, admit(model, plan), DirectScorePreparation::REAL_TRUNK_ONLY),
-        descriptor_{model.ne, model.cfg.nup, model.ndet, model.dim,
-                    qmcplusplus::psiformer::ComplexOrbitalStructure::FULL,
-                    qmcplusplus::psiformer::ComplexOrbitalPhase::NONE, {}},
+        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan)),
         nuclei_(model.cfg.nuclei.shape[0]), parameter_count_(plan.parameterCount())
   {
     using namespace qmcplusplus::psiformer;
@@ -242,12 +240,22 @@ public:
   /// Preserve stable identity under assignment as well.
   DirectComplexScoreExecutor& operator=(DirectComplexScoreExecutor&&) = delete;
 
-  /// Include the real trunk executor's fixed-ion copy in external lane accounting.
-  std::size_t numericMetadataStorageBytes() const { return trunk_.numericMetadataStorageBytes(); }
+  /// Include fixed-ion and occupied-column metadata in external lane accounting.
+  std::size_t numericMetadataStorageBytes() const
+  {
+    return checkedStorageSum(trunk_.numericMetadataStorageBytes(),
+        checkedStorageBytes<std::array<double, 3>>(descriptor_.reciprocal_momenta.capacity(),
+            "complex score momentum metadata overflow"), "complex score metadata overflow");
+  }
 
   /// Track fixed-ion metadata separately from the mutable tape allocation identity.
   std::size_t numericMetadataStorageFingerprint() const noexcept
-  { return trunk_.numericMetadataStorageFingerprint(); }
+  {
+    auto hash = trunk_.numericMetadataStorageFingerprint();
+    if (!descriptor_.reciprocal_momenta.empty())
+      qmcplusplus::psiformer::determinant::detail::mixStorage(hash, descriptor_.reciprocal_momenta);
+    return hash;
+  }
 
   /// Prepare one independent clone with only the real taped trunk and complex head.
   std::unique_ptr<DirectComplexScoreWorkspace> makeWorkspace() const
@@ -295,6 +303,8 @@ public:
     // Ordinary inverse-transpose seeds differentiate log(sum_d det A_d), without conjugation.
     auto amplitude = w.determinant_.evaluate(w.head_.data()).amplitude;
     w.determinant_.fillLogMatrixAdjoints(w.matrix_adjoint_.data());
+    pullBackOccupiedPhase(descriptor_, w.orbitals_, tape.packed_positions, 3 * n,
+                           w.matrix_adjoint_.data(), w.matrix_adjoint_.size());
     std::fill(w.score_.begin(), w.score_.end(), C{});
     reverseHead(w, tape, p);
     // Two real feature cotangents reuse the identical immutable forward tape and P scratch.
@@ -418,6 +428,8 @@ public:
           loss += scale * std::norm(residual);
           w.matrix_adjoint_[index] = 2.0 * scale * std::conj(residual);
         }
+    pullBackOccupiedPhase(descriptor_, w.orbitals_, tape.packed_positions, 3 * n,
+                           w.matrix_adjoint_.data(), w.matrix_adjoint_.size());
     std::fill(w.score_.begin(), w.score_.end(), C{});
     reverseHead(w, tape, p);
     std::fill(w.feature_seed_.begin(), w.feature_seed_.end(), 0.0);
@@ -460,7 +472,7 @@ private:
     return left_bytes && right_bytes && a < b + right_bytes && b < a + left_bytes;
   }
 
-  /// Enforce the current full/G-free paired periodic profile and exact model dimensions.
+  /// Enforce the full paired periodic profile and exact model dimensions.
   static const qmcplusplus::psiformer::PsiFormerExecutionPlan& admit(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
   {

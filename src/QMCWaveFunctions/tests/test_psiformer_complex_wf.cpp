@@ -1147,8 +1147,14 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
 {
   using namespace wftrain;
   bool pair_profile = false;
+  bool occupied_phase = false;
   SECTION("legacy paired profile") {}
   SECTION("two-cell pair profile with complete physical ions") { pair_profile = true; }
+  SECTION("two-cell occupied reciprocal profile with complete physical ions")
+  {
+    pair_profile = true;
+    occupied_phase = true;
+  }
   const SimulationCell simulation_cell(cell());
   auto p = electrons(simulation_cell);
   auto source = [&]() {
@@ -1187,6 +1193,11 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     metadata->electron_electron_cusp = false;
     metadata->feature_transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
     for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns.push_back({{}, i % 2, int(i / 2), 1});
+    if (occupied_phase)
+    {
+      const std::array<std::array<int, 3>, 4> momenta{{{-1, 0, 0}, {0, 1, 0}, {1, 0, 1}, {0, -1, -1}}};
+      for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns[i].reciprocal = momenta[i];
+    }
     environment.periodic_profile = std::move(metadata);
     initialized.profile = ps::PSIFORMER_PERIODIC_PAIR_V1;
     for (std::size_t block = 0; block < initialized.model_shape.attention_blocks; ++block)
@@ -1343,6 +1354,9 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     CHECK(metadata.feature_transform == ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1);
     CHECK_FALSE(metadata.electron_electron_cusp);
     CHECK(metadata.occupied_columns.size() == 4);
+    for (std::size_t column = 0; column < metadata.occupied_columns.size(); ++column)
+      CHECK(metadata.occupied_columns[column].reciprocal ==
+            initialized.environment.periodic_profile->occupied_columns[column].reciprocal);
     ps::validatePsiFormerModelFile(imported, path, clone_particles, source, "all_electron", {.17, -.11, .07});
     PsiFormerComplexWF reloaded("affine", imported.parameters, clone_particles, source, clone_cap,
                                {.17, -.11, .07});

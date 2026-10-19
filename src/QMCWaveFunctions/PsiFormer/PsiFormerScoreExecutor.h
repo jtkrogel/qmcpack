@@ -658,7 +658,7 @@ public:
         spin_up_electrons_(model.cfg.nup),
         boundary_(mappedBoundary(plan.environment()))
   {
-    if (plan_.environment().periodic_profile)
+    if (plan_.environment().periodic_profile && preparation_ == DirectScorePreparation::REAL_WAVEFUNCTION)
       for (const auto& column : plan_.environment().periodic_profile->occupied_columns)
         if (column.reciprocal != std::array<int, 3>{})
           throw std::invalid_argument("Occupied reciprocal phases require a qualified score head");

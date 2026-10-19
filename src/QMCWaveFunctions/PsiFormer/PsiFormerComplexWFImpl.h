@@ -1296,7 +1296,8 @@ struct PsiFormerComplexWF::Impl
     {
       return {s.model.ne, s.model.cfg.nuclei.shape[0], s.model.ndet, s.model.dim, s.model.heads,
           s.plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
-          s.model.blocks, s.model.p.size(), bool(s.environment.periodic_profile)};
+          s.model.blocks, s.model.p.size(), bool(s.environment.periodic_profile),
+          psiformer::occupiedMomentumCount(s.plan)};
     }
 
     /// Include both executor ion copies and all channel buffers before any numerical allocation.
@@ -1309,6 +1310,7 @@ struct PsiFormerComplexWF::Impl
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(
           pf::checkedStorageProduct(3, dimensions.parameter_count, message), message), message);
       std::size_t doubles = pf::checkedStorageProduct(6, dimensions.nuclei, message);
+      pf::addStorageBytes(doubles, pf::checkedStorageProduct(6, dimensions.occupied_momentum_count, message), message);
       pf::addStorageBytes(doubles, pf::checkedStorageProduct(4,
           pf::checkedStorageProduct(samples, dimensions.electrons, message), message), message);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(doubles, message), message);
@@ -1365,6 +1367,8 @@ struct PsiFormerComplexWF::Impl
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(
           3, s.model.cfg.nuclei.shape[0], "orbital metadata overflow"), "orbital metadata overflow"),
           "orbital owner overflow");
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<std::array<double, 3>>(
+          psiformer::occupiedMomentumCount(s.plan), "orbital momentum metadata overflow"), "orbital owner overflow");
       return bytes;
     }
     explicit OrbitalMSELane(const Model& s) : score(s.model, s.plan), work(score.makeWorkspace()) {}
@@ -1773,7 +1777,7 @@ struct PsiFormerComplexWF::Impl
     const auto& model = state->model;
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
         state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size(),
-        bool(state->environment.periodic_profile)};
+        bool(state->environment.periodic_profile), occupiedMomentumCount(state->plan)};
     if (!state->gpu_limit)
     {
       numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);

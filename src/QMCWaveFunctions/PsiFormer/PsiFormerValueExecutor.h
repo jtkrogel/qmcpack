@@ -118,7 +118,7 @@ public:
     using qmcplusplus::psiformer::ParameterRole;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan.environment();
-    if (periodic_profile_)
+    if (periodic_profile_ && preparation_ == DirectValuePreparation::REAL_WAVEFUNCTION)
       for (const auto& column : periodic_profile_->occupied_columns)
         if (column.reciprocal != std::array<int, 3>{})
           throw std::invalid_argument("Occupied reciprocal phases require a qualified full-head executor");

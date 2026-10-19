@@ -41,7 +41,7 @@ pf::PsiFormer modelWithPairBias(bool paired = true)
 }
 
 ps::PsiFormerExecutionPlan profilePlan(const pf::PsiFormer& model, ps::PeriodicFeatureTransform transform,
-                                     bool two_cells, bool cusp = true, bool paired = true)
+                                     bool two_cells, bool cusp = true, bool paired = true, bool occupied = false)
 {
   auto environment = qmcplusplus::testing::psiformer::value::environment(true, paired);
   environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
@@ -64,6 +64,12 @@ ps::PsiFormerExecutionPlan profilePlan(const pf::PsiFormer& model, ps::PeriodicF
   for (std::size_t column = 0; column < model.ne; ++column)
     metadata->occupied_columns.push_back({{}, column < model.cfg.nup ? column : column - model.cfg.nup,
                                           column < model.cfg.nup ? 0 : 1, 1});
+  if (occupied)
+  {
+    const std::array<std::array<int, 3>, 4> momenta{{{-1, 0, 0}, {0, 1, 0}, {1, 0, 1}, {0, -1, -1}}};
+    for (std::size_t column = 0; column < model.ne; ++column)
+      metadata->occupied_columns[column].reciprocal = momenta[column];
+  }
   environment.periodic_profile = std::move(metadata);
   return ps::PsiFormerExecutionPlan::fromParameters(model.p,
       {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads, model.blocks},
@@ -110,9 +116,10 @@ TEST_CASE("Periodic pair value and spatial products share the same feature contr
 {
   for (auto transform : {ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1,
                          ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1})
+    for (bool occupied : {false, true})
   {
     auto model = modelWithPairBias();
-    const auto plan = profilePlan(model, transform, true);
+    const auto plan = profilePlan(model, transform, true, true, true, occupied);
     auto parameters = model.p.flat_values();
     for (std::size_t block = 0; block < model.blocks; ++block)
     {
@@ -128,6 +135,12 @@ TEST_CASE("Periodic pair value and spatial products share the same feature contr
     pf::DirectComplexSpatialExecutor spatial(model, plan);
     auto v = value.makeWorkspace();
     auto s = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+    const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+        model.heads, plan.parameter(ps::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks,
+        plan.parameterCount(), true, ps::occupiedMomentumCount(plan)};
+    CHECK(v->vectorStorageBytes() == pf::DirectComplexValueWorkspace::storageRequirement(shape));
+    CHECK(s->vectorStorageBytes() == pf::DirectComplexSpatialWorkspace::storageRequirement(
+        shape, pf::DirectSpatialMode::FULL_VGL));
     const auto positions = model.cfg.configuration(0).x;
     const auto view = pf::GeometryPositionView::interleaved(positions.data(), model.ne);
     v->setPositions(view);
@@ -160,8 +173,10 @@ TEST_CASE("Periodic pair value and spatial products share the same feature contr
 TEST_CASE("Periodic pair parameter scores and affine rows match full complex differences",
           "[wavefunction][psiformer][periodic_profile]")
 {
+  for (bool occupied : {false, true})
+  {
   auto model = modelWithPairBias();
-  const auto plan = profilePlan(model, ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1, true);
+  const auto plan = profilePlan(model, ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1, true, true, true, occupied);
   auto parameters = model.p.flat_values();
   for (std::size_t block = 0; block < model.blocks; ++block)
   {
@@ -219,6 +234,20 @@ TEST_CASE("Periodic pair parameter scores and affine rows match full complex dif
   const std::vector<C> analytic(evaluated.parameter_score, evaluated.parameter_score + plan.parameterCount());
   CHECK(real.calls == model.blocks);
   CHECK(imaginary.calls == model.blocks);
+  for (std::size_t spin = 0; spin < 2; ++spin)
+    for (std::size_t feature = 0; feature < model.dim; ++feature)
+      for (std::size_t channel = 0; channel < model.ndet * model.ne; ++channel)
+      {
+        C reconstructed{};
+        for (std::size_t row = spin ? model.cfg.nup : 0; row < (spin ? model.ne : model.cfg.nup); ++row)
+          reconstructed += evaluated.head_activations[row * model.dim + feature] *
+              evaluated.head_sensitivities[(channel / model.ne * model.ne + row) * model.ne + channel % model.ne];
+        const auto role = spin ? ps::ParameterRole::BACKFLOW_DOWN_WEIGHT : ps::ParameterRole::BACKFLOW_UP_WEIGHT;
+        const auto index = feature * model.ndet * model.ne + channel;
+        CHECK(std::abs(analytic[plan.parameter(role).begin + index] - reconstructed) < 1e-12);
+        CHECK(std::abs(analytic[plan.parameter(role, ps::NO_ATTENTION_BLOCK, ps::HeadTensorComponent::IMAG).begin + index] -
+                       C{0, 1} * reconstructed) < 1e-12);
+      }
   for (std::size_t block = 0; block < model.blocks; ++block)
     for (auto role : {ps::ParameterRole::PAIR_ATTENTION_WEIGHT, ps::ParameterRole::PAIR_ATTENTION_BIAS})
     {
@@ -240,6 +269,22 @@ TEST_CASE("Periodic pair parameter scores and affine rows match full complex dif
   }
   score.evaluate(*s);
   CHECK(s->storageFingerprint() == fingerprint);
+  std::vector<C> target(model.ndet * model.ne * model.ne);
+  for (std::size_t i = 0; i < target.size(); ++i)
+    target[i] = C{.03 * std::sin(i + .2), .04 * std::cos(.3 * i + .5)};
+  std::vector<double> mse_gradient(parameters.size()), scratch(parameters.size());
+  score.evaluateOrbitalMSE(*s, {target.data(), target.size(), mse_gradient.data(), mse_gradient.size()});
+  for (std::size_t p = 0; p < parameters.size(); ++p)
+  {
+    model.p.set_flat_value(p, parameters[p] + step);
+    const auto plus = score.evaluateOrbitalMSE(*s, {target.data(), target.size(), scratch.data(), scratch.size()}).loss;
+    model.p.set_flat_value(p, parameters[p] - step);
+    const auto minus = score.evaluateOrbitalMSE(*s, {target.data(), target.size(), scratch.data(), scratch.size()}).loss;
+    model.p.set_flat_value(p, parameters[p]);
+    CHECK(std::abs((plus - minus) / (2 * step) - mse_gradient[p]) < 3e-6);
+  }
+  CHECK(s->storageFingerprint() == fingerprint);
+  }
 }
 
 TEST_CASE("Periodic pair kinetic parameter responses include full geometric jets",
@@ -249,9 +294,10 @@ TEST_CASE("Periodic pair kinetic parameter responses include full geometric jets
   const std::vector<double> masses{1, 0.7, 1.2, 0.9};
   for (auto transform : {ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1,
                          ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1})
+    for (bool occupied : {false, true})
   {
     auto model = modelWithPairBias();
-    const auto plan = profilePlan(model, transform, true, false);
+    const auto plan = profilePlan(model, transform, true, false, true, occupied);
     auto parameters = model.p.flat_values();
     for (std::size_t block = 0; block < model.blocks; ++block)
     {

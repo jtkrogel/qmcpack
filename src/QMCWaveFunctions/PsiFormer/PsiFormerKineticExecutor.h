@@ -650,7 +650,7 @@ public:
     using qmcplusplus::psiformer::BoundaryCondition;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan_.environment();
-    if (environment.periodic_profile)
+    if (environment.periodic_profile && preparation_ == DirectKineticPreparation::REAL_WAVEFUNCTION)
       for (const auto& column : environment.periodic_profile->occupied_columns)
         if (column.reciprocal != std::array<int, 3>{})
           throw std::invalid_argument("Occupied reciprocal phases require a qualified kinetic head");

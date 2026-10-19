@@ -45,7 +45,7 @@ public:
     const auto layout = makeSpatialJetLayout(1,
         checkedStorageProduct(shape.determinants, square, message), n, SpatialJetMode::FULL_VGL);
     std::size_t bytes = kineticTrunkWorkspaceStorageRequirement(shape);
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout), message);
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout, shape.occupied_momentum_count), message);
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
         shape.determinants, n, 0, g, n), message);
     addStorageBytes(bytes, checkedStorageBytes<double>(spatialJetSpanElements(layout), message), message);
@@ -190,12 +190,11 @@ public:
   DirectComplexKineticExecutor(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan, std::array<double, 3> outer_k = {})
       : parameters_(model.p), trunk_(model, plan, DirectKineticPreparation::REAL_TRUNK_ONLY),
-        descriptor_{model.ne, model.cfg.nup, model.ndet, model.dim,
-                    qmcplusplus::psiformer::ComplexOrbitalStructure::FULL,
-                    qmcplusplus::psiformer::ComplexOrbitalPhase::NONE, {}}, outer_k_(outer_k),
+        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan)), outer_k_(outer_k),
         shape_{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
                plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
-               model.blocks, plan.parameterCount(), bool(plan.environment().periodic_profile)}
+               model.blocks, plan.parameterCount(), bool(plan.environment().periodic_profile),
+               qmcplusplus::psiformer::occupiedMomentumCount(plan)}
   {
     using namespace qmcplusplus::psiformer;
     if (plan.environment().head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
@@ -234,12 +233,22 @@ public:
   /// Expose the exact FULL numeric requirement, not allocator/shared/aggregate clone costs.
   std::size_t requiredStorageBytes() const { return DirectComplexKineticWorkspace::storageRequirement(shape_); }
 
-  /// Include the real trunk executor's fixed-ion copy in external lane accounting.
-  std::size_t numericMetadataStorageBytes() const { return trunk_.numericMetadataStorageBytes(); }
+  /// Include fixed-ion and occupied-column metadata in external lane accounting.
+  std::size_t numericMetadataStorageBytes() const
+  {
+    return checkedStorageSum(trunk_.numericMetadataStorageBytes(),
+        checkedStorageBytes<std::array<double, 3>>(descriptor_.reciprocal_momenta.capacity(),
+            "complex kinetic momentum metadata overflow"), "complex kinetic metadata overflow");
+  }
 
   /// Track fixed-ion metadata separately from the mutable tape allocation identity.
   std::size_t numericMetadataStorageFingerprint() const noexcept
-  { return trunk_.numericMetadataStorageFingerprint(); }
+  {
+    auto hash = trunk_.numericMetadataStorageFingerprint();
+    if (!descriptor_.reciprocal_momenta.empty())
+      qmcplusplus::psiformer::determinant::detail::mixStorage(hash, descriptor_.reciprocal_momenta);
+    return hash;
+  }
 
   /// Reject zero, unbounded or insufficient caps before allocating any numerical clone scratch.
   std::unique_ptr<DirectComplexKineticWorkspace> makeWorkspace(std::size_t maximum_bytes) const
@@ -297,6 +306,8 @@ public:
     w.determinant_.fillSpatialRootMatrixAdjoints(a + batch, a + (1 + 3 * n) * batch,
         w.gradient_.data(), w.laplacian_.data(), w.root_.data(), w.root_.size(),
         w.scratch_.data(), w.scratch_.size());
+    pullBackOccupiedPhase(descriptor_, w.orbitals_, tape.packed_positions, 3 * n,
+                           w.root_.data(), w.root_.size());
     std::fill(w.response_.begin(), w.response_.end(), C{});
     for (std::size_t component = 0; component < 2; ++component)
     {

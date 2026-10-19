@@ -244,6 +244,7 @@ struct PsiFormerStorageShape
   std::size_t attention_blocks = 0;
   std::size_t parameter_count   = 0;
   bool pair_attention = false;
+  std::size_t occupied_momentum_count = 0;
 };
 
 /// Independently selected tile capacities for each direct batch call family.

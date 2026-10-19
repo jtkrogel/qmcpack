@@ -164,8 +164,8 @@ struct ExecutionEnvironment
   ScalarDomain compute_scalar_domain   = ScalarDomain::REAL;
   ScalarDomain amplitude_scalar_domain = ScalarDomain::REAL;
   bool fixed_nuclei                     = true;
-  // PAIRED_REAL_COMPLEX currently describes full, reciprocal-phase-free heads
-  // only. Public execution admission remains a separate adapter capability gate.
+  // Paired heads use full matrices. Optional occupied reciprocal phases belong
+  // to the explicit periodic profile; the common outer twist is separate.
   HeadRepresentation head_representation = HeadRepresentation::REAL;
   std::shared_ptr<const PeriodicProfileMetadata> periodic_profile;
 };

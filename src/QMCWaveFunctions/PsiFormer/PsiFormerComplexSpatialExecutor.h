@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexSpatialExecutor.h
- * @brief G-free CPU complex FULL/ACTIVE derivatives over the shared real spatial trunk.
+ * @brief CPU complex FULL/ACTIVE derivatives over the shared real spatial trunk.
  * Include after PsiFormerNative.h. No public wavefunction or outer twist is admitted.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_SPATIAL_EXECUTOR_H
@@ -12,7 +12,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
-#include "PsiFormerComplexOrbital.h"
+#include "PsiFormerOccupiedHead.h"
 
 namespace pf
 {
@@ -105,7 +105,8 @@ public:
             jets.gradient_lanes, jets.laplacian_lanes) -
         checkedStorageBytes<double>(outputs, "real output bytes overflow");
     // The omitted real orbital jets and the explicit real envelope jets have identical extents.
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets), "complex spatial bytes overflow");
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets, shape.occupied_momentum_count),
+                    "complex spatial bytes overflow");
     addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(shape.determinants,
         shape.electrons, 0, jets.gradient_lanes, jets.laplacian_lanes), "complex spatial bytes overflow");
     addStorageBytes(bytes, checkedStorageBytes<C>(outputs, "complex output bytes overflow"),
@@ -233,7 +234,7 @@ private:
   bool valid_ = false;
 };
 
-/// Complete G-free complex derivatives; the metadata companion owns no value workspace.
+/// Complete complex derivatives; the metadata companion owns no value workspace.
 class DirectComplexSpatialExecutor
 {
 public:
@@ -242,9 +243,7 @@ public:
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
       : parameters_(model.p), metadata_(model, admit(model, plan), DirectValuePreparation::REAL_TRUNK_ONLY),
         trunk_(model, metadata_, plan, DirectOrbitalProjection::SCALAR, DirectValuePreparation::REAL_TRUNK_ONLY),
-        descriptor_{model.ne, model.cfg.nup, model.ndet, model.dim,
-                    qmcplusplus::psiformer::ComplexOrbitalStructure::FULL,
-                    qmcplusplus::psiformer::ComplexOrbitalPhase::NONE, {}}
+        descriptor_(qmcplusplus::psiformer::occupiedFullHeadDescriptor(plan))
   {
     using namespace qmcplusplus::psiformer;
     for (std::size_t spin = 0; spin < 2; ++spin)
@@ -289,7 +288,7 @@ public:
   }
 
 private:
-  /// Enforce the current full/G-free paired periodic schema before resolving real metadata.
+  /// Enforce the full paired periodic schema before resolving real metadata.
   static const qmcplusplus::psiformer::PsiFormerExecutionPlan& admit(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
   {
