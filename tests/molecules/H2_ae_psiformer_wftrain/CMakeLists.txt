@@ -315,6 +315,17 @@ if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION AND Python3_EXECUTABLE)
                          TIMEOUT 240 PROCESSORS 1
                          ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1"
                          LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
+    set(PRESET_ORDINAL 0)
+    foreach(PRESET_LABEL IN ITEMS deepqmc deepsolid jaqmc)
+      math(EXPR PRESET_ORDINAL "${PRESET_ORDINAL}+1")
+      set(PRESET_TEST deterministic-H2-psiformer-complex-cpu-kfac-preset-${PRESET_ORDINAL}-restart)
+      add_test(NAME ${PRESET_TEST}
+               COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_complex_kfac.py"
+                       --qmcpack $<TARGET_FILE:qmcpack> --defaults ${PRESET_LABEL})
+      set_tests_properties(${PRESET_TEST} PROPERTIES TIMEOUT 300 PROCESSORS 1
+                           ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1"
+                           LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
+    endforeach()
     add_test(NAME deterministic-H2-psiformer-complex-cpu-orbital-mse-restart
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_complex_orbital_mse.py"
                      --qmcpack $<TARGET_FILE:qmcpack>)

@@ -21,7 +21,16 @@ namespace qmcplusplus
 class WFTrainDriverInput
 {
 public:
-  enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE, COMPONENTWISE_MAD_COVARIANCE };
+  enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE, COMPONENTWISE_MAD_COVARIANCE, COMPONENTWISE_MEAN_RESIDUAL };
+
+  enum class KFACDefaults { LEGACY, SOFT_COVARIANCE, MEAN_RESIDUAL, MEDIAN_COVARIANCE };
+
+  enum class KFACGradient { LEGACY, PHYSICAL_COVARIANCE, HALF_COVARIANCE, REAL_CENTERED_RESIDUAL };
+
+  enum class KFACUpdateOrder { POST_INVERSE_RATE, PRE_INVERSE_RATE };
+
+  enum class KFACScheduleArithmetic { DIVIDE_RATE, MULTIPLY_RECIPROCAL };
+
   enum class KFACClipMode { SOFT_MEDIAN, HARD_MEDIAN, HARD_MEAN };
   enum class KFACCurvature { NATIVE_SCORE, REGISTERED_GAUSSIAN };
   enum class KFACDamping { EQUAL_SPLIT, TRACE_BALANCED };
@@ -125,6 +134,19 @@ public:
   double getLMInnerRelativeTolerance() const noexcept { return lm_inner_relative_tolerance_; }
   double getKFACFallbackDamping() const noexcept { return kfac_fallback_damping_; }
   KFACObjective getKFACObjective() const noexcept { return kfac_objective_; }
+
+  /// Identify the selected bundle independently of its explicitly overridden settings.
+  KFACDefaults getKFACDefaults() const noexcept { return kfac_defaults_; }
+
+  /// Return the finite-sample gradient convention, not a learning-rate compensation.
+  KFACGradient getKFACGradient() const noexcept { return kfac_gradient_; }
+
+  /// Locate schedule scaling relative to inverse and constraint arithmetic.
+  KFACUpdateOrder getKFACUpdateOrder() const noexcept { return kfac_update_order_; }
+
+  /// Preserve the scalar evaluation order selected for the inverse schedule.
+  KFACScheduleArithmetic getKFACScheduleArithmetic() const noexcept { return kfac_schedule_arithmetic_; }
+
   KFACClipMode getKFACClipMode() const noexcept { return kfac_clip_mode_; }
   KFACCurvature getKFACCurvature() const noexcept { return kfac_curvature_; }
   KFACDamping getKFACDampingPolicy() const noexcept { return kfac_damping_policy_; }
@@ -221,6 +243,10 @@ private:
   double lm_inner_relative_tolerance_{0.1};
   double kfac_fallback_damping_{1.0e-3};
   KFACObjective kfac_objective_{KFACObjective::RAW_COVARIANCE};
+  KFACDefaults kfac_defaults_{KFACDefaults::LEGACY};
+  KFACGradient kfac_gradient_{KFACGradient::LEGACY};
+  KFACUpdateOrder kfac_update_order_{KFACUpdateOrder::POST_INVERSE_RATE};
+  KFACScheduleArithmetic kfac_schedule_arithmetic_{KFACScheduleArithmetic::DIVIDE_RATE};
   KFACClipMode kfac_clip_mode_{KFACClipMode::SOFT_MEDIAN};
   KFACCurvature kfac_curvature_{KFACCurvature::NATIVE_SCORE};
   KFACDamping kfac_damping_policy_{KFACDamping::EQUAL_SPLIT};

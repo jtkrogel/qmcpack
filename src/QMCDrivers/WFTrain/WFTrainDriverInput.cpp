@@ -28,7 +28,8 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 89> allowed_controls{
+constexpr std::array<std::string_view, 93> allowed_controls{
+    "defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -265,6 +266,10 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   lm_inner_relative_tolerance_ = 0.1;
   kfac_fallback_damping_ = 1.0e-3;
   kfac_objective_ = KFACObjective::RAW_COVARIANCE;
+  kfac_defaults_ = KFACDefaults::LEGACY;
+  kfac_gradient_ = KFACGradient::LEGACY;
+  kfac_update_order_ = KFACUpdateOrder::POST_INVERSE_RATE;
+  kfac_schedule_arithmetic_ = KFACScheduleArithmetic::DIVIDE_RATE;
   kfac_clip_mode_ = KFACClipMode::SOFT_MEDIAN;
   kfac_curvature_ = KFACCurvature::NATIVE_SCORE;
   kfac_damping_policy_ = KFACDamping::EQUAL_SPLIT;
@@ -332,6 +337,43 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   target_provenance_.clear();
   minimum_fidelity_          = 1.0e-14;
   minimum_effective_samples_ = 1.0;
+  // Expand the selected bundle before applying any explicit scalar override.
+  if (seen_controls.count("defaults"))
+  {
+    const auto& label = readControl("defaults");
+    if (label == "deepqmc") kfac_defaults_ = KFACDefaults::SOFT_COVARIANCE;
+    else if (label == "deepsolid") kfac_defaults_ = KFACDefaults::MEAN_RESIDUAL;
+    else if (label == "jaqmc") kfac_defaults_ = KFACDefaults::MEDIAN_COVARIANCE;
+    else throw UniformCommunicateError("WFTrainDriverInput: unknown defaults label");
+    learning_rate_ = .05;
+    damping_ = kfac_fallback_damping_ = .001;
+    kfac_curvature_ = KFACCurvature::REGISTERED_GAUSSIAN;
+    kfac_damping_policy_ = KFACDamping::TRACE_BALANCED;
+    kfac_persist_state_ = true;
+    kfac_ema_decay_ = .95;
+    kfac_inverse_period_ = 1;
+    kfac_constraint_ = KFACConstraint::DAMPED_KFAC;
+    kfac_norm_constraint_ = .001;
+    kfac_learning_rate_decay_ = kfac_defaults_ == KFACDefaults::MEDIAN_COVARIANCE ? 2000 : 10000;
+    kfac_schedule_float32_ = kfac_defaults_ == KFACDefaults::MEDIAN_COVARIANCE;
+    if (kfac_defaults_ == KFACDefaults::SOFT_COVARIANCE)
+    {
+      kfac_objective_ = KFACObjective::CLIPPED_COVARIANCE;
+      kfac_gradient_ = KFACGradient::HALF_COVARIANCE;
+    }
+    else if (kfac_defaults_ == KFACDefaults::MEAN_RESIDUAL)
+    {
+      kfac_objective_ = KFACObjective::COMPONENTWISE_MEAN_RESIDUAL;
+      kfac_gradient_ = KFACGradient::REAL_CENTERED_RESIDUAL;
+    }
+    else
+    {
+      kfac_objective_ = KFACObjective::COMPONENTWISE_MAD_COVARIANCE;
+      kfac_gradient_ = KFACGradient::PHYSICAL_COVARIANCE;
+      kfac_update_order_ = KFACUpdateOrder::PRE_INVERSE_RATE;
+      kfac_schedule_arithmetic_ = KFACScheduleArithmetic::MULTIPLY_RECIPROCAL;
+    }
+  }
   if (seen_controls.count("iterations"))
     iterations_ = parsePositiveSize(readControl("iterations"), "iterations");
   if (seen_controls.count("checkpoint_interval"))
@@ -810,7 +852,8 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     rejectControls(seen_controls, {"lm_inner_iterations", "lm_inner_restart_length",
         "lm_inner_relative_tolerance"}, "lm");
   if (optimizer_ != Optimizer::KFAC)
-    rejectControls(seen_controls, {"kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
+    rejectControls(seen_controls, {"defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
+        "kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
         "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width", "kfac_curvature",
         "kfac_complex_clip_width",
         "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_persist_state",
@@ -818,12 +861,35 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
         "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"}, "selected optimizer");
   else
   {
+    if (seen_controls.count("kfac_gradient_convention"))
+    {
+      const auto& value = readControl("kfac_gradient_convention");
+      if (value == "physical_covariance") kfac_gradient_ = KFACGradient::PHYSICAL_COVARIANCE;
+      else if (value == "half_covariance") kfac_gradient_ = KFACGradient::HALF_COVARIANCE;
+      else if (value == "real_centered_residual") kfac_gradient_ = KFACGradient::REAL_CENTERED_RESIDUAL;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_gradient_convention");
+    }
+    if (seen_controls.count("kfac_update_order"))
+    {
+      const auto& value = readControl("kfac_update_order");
+      if (value == "post_inverse_rate") kfac_update_order_ = KFACUpdateOrder::POST_INVERSE_RATE;
+      else if (value == "pre_inverse_rate") kfac_update_order_ = KFACUpdateOrder::PRE_INVERSE_RATE;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_update_order");
+    }
+    if (seen_controls.count("kfac_schedule_arithmetic"))
+    {
+      const auto& value = readControl("kfac_schedule_arithmetic");
+      if (value == "divide_rate") kfac_schedule_arithmetic_ = KFACScheduleArithmetic::DIVIDE_RATE;
+      else if (value == "multiply_reciprocal") kfac_schedule_arithmetic_ = KFACScheduleArithmetic::MULTIPLY_RECIPROCAL;
+      else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_schedule_arithmetic");
+    }
     if (seen_controls.count("kfac_objective"))
     {
       const auto& value = readControl("kfac_objective");
       if (value == "raw_covariance") kfac_objective_ = KFACObjective::RAW_COVARIANCE;
       else if (value == "clipped_covariance") kfac_objective_ = KFACObjective::CLIPPED_COVARIANCE;
       else if (value == "componentwise_mad_covariance") kfac_objective_ = KFACObjective::COMPONENTWISE_MAD_COVARIANCE;
+      else if (value == "componentwise_mean_residual") kfac_objective_ = KFACObjective::COMPONENTWISE_MEAN_RESIDUAL;
       else throw UniformCommunicateError("WFTrainDriverInput: invalid kfac_objective");
     }
     if (seen_controls.count("kfac_clip_mode"))
@@ -866,12 +932,16 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (kfac_clip_width_ <= 0.0 || kfac_clip_quantile_ <= 0.0 || kfac_clip_quantile_ > 1.0 ||
         kfac_exclude_width_ <= 0.0)
       throw UniformCommunicateError("WFTrainDriverInput: invalid KFAC clipping width or quantile");
+    if (kfac_objective_ == KFACObjective::COMPONENTWISE_MEAN_RESIDUAL &&
+        kfac_gradient_ != KFACGradient::REAL_CENTERED_RESIDUAL)
+      throw UniformCommunicateError("WFTrainDriverInput: componentwise_mean_residual requires real_centered_residual convention");
     if (kfac_objective_ == KFACObjective::RAW_COVARIANCE)
       rejectControls(seen_controls, {"kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile",
           "kfac_exclude_width"}, "raw KFAC objective");
     if (kfac_clip_mode_ != KFACClipMode::SOFT_MEDIAN)
       rejectControls(seen_controls, {"kfac_clip_quantile"}, "hard KFAC clipping");
-    if (kfac_objective_ == KFACObjective::COMPONENTWISE_MAD_COVARIANCE)
+    if (kfac_objective_ == KFACObjective::COMPONENTWISE_MAD_COVARIANCE ||
+        kfac_objective_ == KFACObjective::COMPONENTWISE_MEAN_RESIDUAL)
     {
       rejectControls(seen_controls, {"kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width"},
                      "componentwise median clipping");
@@ -897,9 +967,14 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       kfac_persist_state_ = value == "yes";
     }
     if (!kfac_persist_state_)
+    {
+      if (kfac_update_order_ != KFACUpdateOrder::POST_INVERSE_RATE ||
+          kfac_schedule_arithmetic_ != KFACScheduleArithmetic::DIVIDE_RATE)
+        throw UniformCommunicateError("WFTrainDriverInput: selected update order/schedule arithmetic requires persistent KFAC");
       rejectControls(seen_controls, {"kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay",
-          "kfac_schedule_precision", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"},
+          "kfac_schedule_precision", "kfac_schedule_arithmetic", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"},
           "stateless KFAC; set kfac_persist_state=yes to carry recurrence state");
+    }
     if (seen_controls.count("kfac_ema_decay"))
       kfac_ema_decay_ = parseNonnegativeReal(readControl("kfac_ema_decay"), "kfac_ema_decay");
     if (kfac_ema_decay_ >= 1.0)

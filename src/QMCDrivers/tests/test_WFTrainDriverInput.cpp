@@ -91,6 +91,67 @@ TEST_CASE("Complex median covariance is an explicit independent KFAC policy", "[
       "<parameter name='kfac_complex_clip_width'>5</parameter></training></qmc>"));
 }
 
+TEST_CASE("Typed curvature bundles expand before explicit controls without changing legacy defaults",
+          "[drivers][wf_train][kfac][kfac_presets]")
+{
+  using I = WFTrainDriverInput;
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training objective='energy' optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  const auto legacy = parse("");
+  CHECK(legacy.getKFACDefaults() == I::KFACDefaults::LEGACY);
+  CHECK(legacy.getKFACGradient() == I::KFACGradient::LEGACY);
+  CHECK(legacy.getLearningRate() == .001);
+  CHECK_FALSE(legacy.getKFACPersistState());
+  const std::array<std::string, 3> labels{"deepqmc", "deepsolid", "jaqmc"};
+  const std::array<I::KFACObjective, 3> objectives{I::KFACObjective::CLIPPED_COVARIANCE,
+      I::KFACObjective::COMPONENTWISE_MEAN_RESIDUAL, I::KFACObjective::COMPONENTWISE_MAD_COVARIANCE};
+  const std::array<I::KFACGradient, 3> gradients{I::KFACGradient::HALF_COVARIANCE,
+      I::KFACGradient::REAL_CENTERED_RESIDUAL, I::KFACGradient::PHYSICAL_COVARIANCE};
+  for (std::size_t i = 0; i < labels.size(); ++i)
+  {
+    const auto selector = "<parameter name='defaults'>" + labels[i] + "</parameter>";
+    const auto input = parse(selector);
+    CHECK(input.getLearningRate() == .05);
+    CHECK(input.getDamping() == .001);
+    CHECK(input.getKFACFallbackDamping() == .001);
+    CHECK(input.getKFACObjective() == objectives[i]);
+    CHECK(input.getKFACGradient() == gradients[i]);
+    CHECK(input.getKFACCurvature() == I::KFACCurvature::REGISTERED_GAUSSIAN);
+    CHECK(input.getKFACDampingPolicy() == I::KFACDamping::TRACE_BALANCED);
+    CHECK(input.getKFACPersistState());
+    CHECK(input.getKFACEMADecay() == .95);
+    CHECK(input.getKFACInversePeriod() == 1);
+    CHECK(input.getKFACNormConstraint() == .001);
+    CHECK(input.getKFACConstraint() == I::KFACConstraint::DAMPED_KFAC);
+    CHECK(input.getKFACLearningRateDecay() == (i == 2 ? 2000 : 10000));
+    CHECK(input.getKFACScheduleFloat32() == (i == 2));
+    CHECK(input.getKFACScheduleArithmetic() == (i == 2 ? I::KFACScheduleArithmetic::MULTIPLY_RECIPROCAL : I::KFACScheduleArithmetic::DIVIDE_RATE));
+    CHECK(input.getKFACUpdateOrder() == (i == 2 ? I::KFACUpdateOrder::PRE_INVERSE_RATE : I::KFACUpdateOrder::POST_INVERSE_RATE));
+    CHECK(input.getKFACClipWidth() == 1);
+    CHECK(input.getKFACClipQuantile() == .95);
+    CHECK(input.getKFACComplexClipWidth() == 5);
+    const auto overridden = parse("<parameter name='learning_rate'>.007</parameter>" + selector +
+        "<parameter name='kfac_ema_decay'>.7</parameter><parameter name='kfac_objective'>raw_covariance</parameter>"
+        "<parameter name='kfac_gradient_convention'>physical_covariance</parameter>"
+        "<parameter name='kfac_update_order'>post_inverse_rate</parameter>"
+        "<parameter name='kfac_schedule_arithmetic'>divide_rate</parameter>");
+    CHECK(overridden.getLearningRate() == .007);
+    CHECK(overridden.getKFACEMADecay() == .7);
+    CHECK(overridden.getKFACObjective() == I::KFACObjective::RAW_COVARIANCE);
+    CHECK(overridden.getKFACGradient() == I::KFACGradient::PHYSICAL_COVARIANCE);
+    CHECK(overridden.getKFACUpdateOrder() == I::KFACUpdateOrder::POST_INVERSE_RATE);
+    CHECK(overridden.getKFACScheduleArithmetic() == I::KFACScheduleArithmetic::DIVIDE_RATE);
+  }
+  CHECK_THROWS(parse("<parameter name='defaults'>unknown</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_gradient_convention'>unknown</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_update_order'>unknown</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_schedule_arithmetic'>unknown</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_update_order'>pre_inverse_rate</parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='adam'><parameter name='defaults'>jaqmc</parameter></training></qmc>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='kfac' defaults='jaqmc'/></qmc>"));
+}
+
 TEST_CASE("Persistent KFAC inputs require explicit state ownership", "[drivers][wf_train][kfac]")
 {
   const auto parse = [](const std::string& controls) {
