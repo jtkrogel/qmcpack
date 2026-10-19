@@ -4410,8 +4410,12 @@ void WFTrainBatched::initializeOrbitalPretraining()
   if (training_input_.samplesOrbitalStudent())
   {
     const auto* real_student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-    if (!real_student || real_student->usesAcceleratorParameterProducts())
-      throw UniformCommunicateError("Student-measure orbital_mse currently requires a real CPU provider");
+    bool cpu_student = real_student && !real_student->usesAcceleratorParameterProducts();
+#ifdef QMC_COMPLEX
+    cpu_student = cpu_student || (complex && !complex->gpuInferenceEnabled());
+#endif
+    if (!cpu_student)
+      throw UniformCommunicateError("Student-measure orbital_mse requires a CPU provider");
     app_log() << "WFTrain orbital_mse sampling=student target=frozen energy_evaluation=off" << std::endl;
   }
 
