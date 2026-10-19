@@ -324,7 +324,11 @@ public:
     accumulator_.addObservation({observation.affine_block,
         {observation.activations, observation.row_count * block.input_width},
         {observation.sensitivities, observation.row_count * block.output_width},
-        observation.row_count});
+        observation.row_count,
+        observation.imaginary_sensitivities
+            ? wftrain::DerivativeArrayView<const wftrain::DerivativeReal>{observation.imaginary_sensitivities,
+                observation.row_count * block.output_width}
+            : wftrain::DerivativeArrayView<const wftrain::DerivativeReal>{}});
   }
 
 private:
@@ -1199,6 +1203,23 @@ std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs)
   return lhs * rhs;
 }
 
+/// Charge transactional factor arrays before construction; optimizer/inverse allowance is separate.
+std::size_t kfacStatisticsBytes(const wftrain::KFACBlockRegistry& registry)
+{
+  std::size_t elements = 0;
+  for (const auto& block : registry.affineBlocks())
+  {
+    const auto activation = checkedMemoryAdd(block.input_width,
+        block.bias_block == wftrain::NO_KFAC_BIAS_BLOCK ? 0 : 1);
+    elements = checkedMemoryAdd(elements, checkedMemoryMultiply(2, checkedMemoryAdd(
+        checkedMemoryMultiply(activation, activation), checkedMemoryMultiply(block.output_width, block.output_width))));
+  }
+  for (auto block : registry.fallbackBlocks())
+    elements = checkedMemoryAdd(elements, checkedMemoryMultiply(registry.parameterSchema().blocks()[block].count,
+        registry.genericBlocks().empty() ? 2 : 6));
+  return checkedMemoryMultiply(elements, sizeof(wftrain::DerivativeReal));
+}
+
 /** Gather scalar energies/weights only; parameter products remain streamed. */
 std::vector<wftrain::DerivativeValue> makeClippedKFACObjective(
     Communicate& communicator,
@@ -1726,6 +1747,9 @@ void WFTrainBatched::process(xmlNodePtr node)
             (optimizer == O::ADAM || optimizer == O::SGD);
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
+            (!complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
+             training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::RAW_COVARIANCE &&
+             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
         if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
@@ -1761,7 +1785,7 @@ void WFTrainBatched::process(xmlNodePtr node)
              (training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
               training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
+          throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD/CPU raw KFAC-OFF "
               "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls "
               "except ENERGY reference search with default update controls, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
@@ -2118,6 +2142,7 @@ void WFTrainBatched::run()
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;
+  std::size_t complex_affine_score_bytes = 0;
   std::size_t complex_expected_prepared_bytes = 0;
   std::size_t complex_fixed_grid_host_bytes = 0;
   std::string complex_physical_identity;
@@ -2196,6 +2221,18 @@ void WFTrainBatched::run()
         derivative_bytes = complex->orbitalMSEStorage().prepared_bytes;
       else
         derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
+      std::size_t complex_kfac_allowance = 0;
+      if (!complex_gpu_provider_ && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
+      {
+        complex_affine_score_bytes = complex->affineScoreStorage().required_bytes;
+        const auto statistics_bytes = kfacStatisticsBytes(makeLiveKFACRegistry(*complex));
+        // Include committed/pending factor states, inverse caches and solve scratch.
+        complex_kfac_allowance = checkedMemoryAdd(complex_affine_score_bytes,
+            checkedMemoryMultiply(8, statistics_bytes));
+        app_log() << "WFTrain complex KFAC before allocation: affine_score_bytes=" << complex_affine_score_bytes
+                  << " transactional_factor_bytes=" << statistics_bytes
+                  << " factor_inverse_allowance=" << complex_kfac_allowance << std::endl;
+      }
       complex_expected_prepared_bytes = checkedMemoryAdd(derivative_bytes,
           training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE ? 0 :
           checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
@@ -2234,6 +2271,7 @@ void WFTrainBatched::run()
           checkedMemoryAdd(covariance_bytes, checkedMemoryAdd(optimizer_bytes, allowance)));
       prospective = checkedMemoryAdd(prospective, successor_bytes);
       prospective = checkedMemoryAdd(prospective, complex_fixed_grid_host_bytes);
+      prospective = checkedMemoryAdd(prospective, complex_kfac_allowance);
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
         prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
       complex_physical_identity = complex->trainingConfigurationFingerprint();
@@ -2267,6 +2305,8 @@ void WFTrainBatched::run()
       throw UniformCommunicateError("WFTrainBatched: another rank failed paired training preallocation admission");
     }
     enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
+    if (complex_affine_score_bytes)
+      complex_training_component_->prepareAffineScores(complex_affine_score_bytes);
     app_log() << "WFTrain paired " << (complex_gpu_provider_ ? "GPU" : "CPU")
               << " prospective named numeric bytes plus allowance=" << prospective
               << ", conservative snapshot/solve allowance=" << allowance
@@ -2330,9 +2370,12 @@ void WFTrainBatched::run()
   wftrain::DistributedParameterReduction reduction(*myComm, reduction_policy);
   wftrain::TrainingCapabilities requirements{
       wftrain::TrainingCapability::VALUE_EVALUATION};
+  const bool complex_kfac_training = complex_training && !complex_gpu_provider_ &&
+      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC;
   wftrain::HighParameterTraining trainer(
-      requirements, complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
-                                    : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+      requirements, complex_kfac_training ? wftrain::EnergyGradientEstimator::SCORE_COVARIANCE :
+          complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
+                           : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
       reduction);
   logTrainingAllocation("initial_parameter_snapshot", 0, selected_provider_->parameterSchema().parameterCount(),
       checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double)));
@@ -2662,7 +2705,8 @@ void WFTrainBatched::run()
     }
 
     std::vector<RetainedCrowdSamples> retained_samples;
-    std::size_t retained_configuration_bytes = checkedMemoryAdd(resident_authority_extra_bytes_, complex_fixed_grid_host_bytes);
+    std::size_t retained_configuration_bytes = checkedMemoryAdd(complex_affine_score_bytes,
+        checkedMemoryAdd(resident_authority_extra_bytes_, complex_fixed_grid_host_bytes));
     for (int block = 0; block < num_blocks; ++block)
     {
       const int statistical_block = iteration * num_blocks + block;
@@ -3373,6 +3417,95 @@ void WFTrainBatched::run()
           cache_observer.parametersPublished(training_state.parameter_version);
           iteration_result.completed_iteration = training_state.completed_iterations;
           iteration_result.parameter_version = training_state.parameter_version;
+        }
+        else if (complex_kfac_training)
+        {
+          const auto& schema = selected_provider_->parameterSchema();
+          std::optional<wftrain::StructuredParameterSnapshot> parameters;
+          std::unique_ptr<wftrain::KFACFactorAccumulator> statistics;
+          std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
+          std::exception_ptr preparation_failure;
+          try
+          {
+            NativeTimerScope timer(phase_timers_.affine_observation);
+            parameters.emplace(selected_provider_->snapshotParameters());
+            auto registry = makeLiveKFACRegistry(*selected_provider_);
+            logTrainingAllocation("complex_kfac_transactional_factors", 0, schema.parameterCount(),
+                                  kfacStatisticsBytes(registry));
+            statistics = std::make_unique<wftrain::KFACFactorAccumulator>(std::move(registry), parameters->version,
+                training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
+                    ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
+                    : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
+            LiveAffineObserver observer(*statistics);
+            std::vector<double> real_score, imaginary_score;
+            for (const auto& samples : retained_samples)
+              for (const auto& particles : samples.particles)
+              {
+                statistics->beginSample(1);
+                selected_provider_->observeComplexAffineScores(*particles, observer, real_score, imaginary_score);
+                statistics->addFallbackScores({real_score.data(), real_score.size()},
+                                               {imaginary_score.data(), imaginary_score.size()});
+                statistics->endSample();
+              }
+            // Complete complex local energies were observed on the same AE Coulomb samples.
+            // Covariance consumes score products only, so its parameter-response mask is zero.
+            producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(std::move(batches));
+          }
+          catch (...) { preparation_failure = std::current_exception(); }
+          reduction.preflight(schema, parameters ? &*parameters : nullptr,
+                              wftrain::EnergyGradientEstimator::SCORE_COVARIANCE, preparation_failure);
+          wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
+          storage_diagnostics = producer->storageDiagnostics();
+          retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
+                                                    statistics->retainedNumericBytes());
+          if (kfac_optimizer)
+          {
+            std::exception_ptr inverse_failure;
+            try { kfac_optimizer->prepareStatistics(*statistics); }
+            catch (...) { inverse_failure = std::current_exception(); }
+            try
+            {
+              reduction.preflight(schema, &*parameters, wftrain::EnergyGradientEstimator::SCORE_COVARIANCE,
+                                  inverse_failure);
+              retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes, kfac_optimizer->retainedNumericBytes());
+              enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_configuration_bytes, retained_numeric_bytes),
+                                  training_input_.getMaximumRetainedBytes());
+              applied_scale = kfac_optimizer->effectiveLearningRate();
+              iteration_result = trainer.runIteration(*selected_provider_, *producer, *decorate(*kfac_optimizer),
+                                                       training_state, &cache_observer);
+              if (myComm->rank() == 0)
+                app_log() << "WFTrain persistent KFAC accepted step=" << kfac_optimizer->step()
+                          << " data_seen=" << kfac_optimizer->dataSeen()
+                          << " affine_inverse_step=" << kfac_optimizer->inverseStep()
+                          << " learning_rate=" << *applied_scale << " constraint_metric=" << kfac_optimizer->constraintMetric()
+                          << " constraint_scale=" << kfac_optimizer->constraintScale()
+                          << " complex_covariance=yes parameter_response_mask=0" << std::endl;
+            }
+            catch (...) { kfac_optimizer->proposalRejected(); throw; }
+          }
+          else
+          {
+            std::unique_ptr<wftrain::KFACPreconditioner> inverse;
+            std::exception_ptr inverse_failure;
+            try
+            {
+              inverse = std::make_unique<wftrain::KFACPreconditioner>(*statistics,
+                  wftrain::KFACPreconditionerControl{training_input_.getDamping(), training_input_.getKFACFallbackDamping(),
+                      training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
+                          ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT});
+            }
+            catch (...) { inverse_failure = std::current_exception(); }
+            reduction.preflight(schema, &*parameters, wftrain::EnergyGradientEstimator::SCORE_COVARIANCE, inverse_failure);
+            retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes, inverse->storageDiagnostics().retained_numeric_bytes);
+            enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_configuration_bytes, retained_numeric_bytes),
+                                training_input_.getMaximumRetainedBytes());
+            LiveKFACUpdateRule update_rule(*inverse, training_input_.getLearningRate(),
+                training_input_.getKFACConstraint() == WFTrainDriverInput::KFACConstraint::DAMPED_KFAC
+                    ? training_input_.getKFACNormConstraint() : 0);
+            iteration_result = trainer.runIteration(*selected_provider_, *producer, *decorate(update_rule),
+                                                     training_state, &cache_observer);
+            applied_scale = update_rule.constraintScale();
+          }
         }
         else if (isFirstOrder(optimizer_kind))
         {
@@ -4257,7 +4390,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
   {
     // Only the fixed-gauge single-reference CPU target is qualified, never a GPU fallback.
     if (top || !single || complex->gpuInferenceEnabled())
-      throw UniformCommunicateError("Paired orbital_mse requires a CPU single-reference FreeOrbital teacher");
+      throw UniformCommunicateError("Paired orbital_mse requires a CPU single-reference periodic orbital teacher");
     complex_orbital_target_ = std::make_unique<psiformer::ComplexOrbitalTargetEvaluator>(
         psiformer::ComplexOrbitalTargetEvaluator::fromSingleReference(*single, electrons, complex->reducedTwist(),
             count, training_input_.getMaximumRetainedBytes()));

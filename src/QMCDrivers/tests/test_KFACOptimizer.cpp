@@ -5,6 +5,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "QMCDrivers/WFTrain/KFACOptimizer.h"
+#include "QMCDrivers/WFTrain/ProposalSelection.h"
 #include "io/hdf/hdf_archive.h"
 #include <array>
 #include <chrono>
@@ -106,6 +107,47 @@ TEST_CASE("Persistent KFAC commits normalized factors only after successful publ
   auto wrong_convention = statistics(provider.parameterSchema(), provider.snapshotParameters().version, 1.0,
                                      KFACCurvatureConvention::REGISTERED_GAUSSIAN);
   CHECK_THROWS(optimizer.prepareStatistics(wrong_convention));
+}
+
+TEST_CASE("Complex KFAC factors and decorated recurrence survive failed publication",
+          "[wftrain][kfac_state][complex_kfac_transaction]")
+{
+  KFACToyProvider provider;
+  const auto original = provider.snapshotParameters();
+  KFACOptimizerControl control;
+  control.learning_rate = 0.1;
+  control.convention = KFACCurvatureConvention::REGISTERED_GAUSSIAN;
+  control.inverse = {0.1, 0.1, KFACDampingPolicy::TRACE_BALANCED};
+  KFACOptimizer optimizer(registry(provider.parameterSchema()), control);
+  KFACFactorAccumulator factors(registry(provider.parameterSchema()), 0, control.convention);
+  const std::array<double, 2> real{1, 2}, imaginary{2, -1};
+  for (std::size_t sample = 0; sample < real.size(); ++sample)
+  {
+    factors.beginSample(1);
+    factors.addFallbackScores({real.data() + sample, 1}, {imaginary.data() + sample, 1});
+    factors.endSample();
+  }
+  reduceKFACFactorStatistics(factors);
+  const auto original_state = optimizer.checkpointMetadata().state_fingerprint;
+  const auto original_diagonal = factors.fallbackDiagonalSum()[0];
+  const double gradient = 2;
+  const ParameterGradientView objective{provider.parameterSchema().fingerprint(), 0,
+                                        ReductionDomain::GLOBAL, {&gradient, 1}};
+  optimizer.prepareStatistics(factors);
+  SelectedUpdateRule decorated(optimizer, {});
+  provider.rejectNext();
+  CHECK_THROWS(completeParameterUpdate(provider, original, objective, decorated, {}));
+  CHECK(provider.snapshotParameters().values == original.values);
+  CHECK(provider.snapshotParameters().version == original.version);
+  CHECK(optimizer.step() == 0);
+  CHECK(optimizer.dataSeen() == 0);
+  CHECK(optimizer.checkpointMetadata().state_fingerprint == original_state);
+  CHECK(factors.fallbackDiagonalSum()[0] == original_diagonal);
+  optimizer.prepareStatistics(factors);
+  completeParameterUpdate(provider, original, objective, decorated, {});
+  CHECK(optimizer.step() == 1);
+  CHECK(optimizer.dataSeen() == 2);
+  CHECK(provider.snapshotParameters().values[0] == Catch::Approx(1 - 0.1 * 2 / 10.1));
 }
 
 TEST_CASE("Persistent KFAC continuous and split checkpoints preserve the next update exactly",

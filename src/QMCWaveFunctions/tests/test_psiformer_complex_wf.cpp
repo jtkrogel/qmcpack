@@ -1032,6 +1032,31 @@ TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device 
   CHECK_THROWS(build(complexXml())); // ECP effective charges cannot masquerade as AE metadata
 }
 
+TEST_CASE("Paired CPU XML admits complete structured optimization and preserves narrow guards",
+          "[wavefunction][psiformer][complex_wf][complex_admission]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  pool.emplace("ion0", std::make_unique<ParticleSet>(ions(simulation_cell)));
+  AdmissionReadiness readiness;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, pool, &readiness);
+  const auto build = [&](const std::string& xml) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(xml));
+    return builder.buildComponent(document.getRoot());
+  };
+  auto component = build(complexXml("gpu='cpu' optimize='yes' optimize_scope='all'"));
+  auto* provider = component->structuredParameterProvider();
+  REQUIRE(provider != nullptr);
+  REQUIRE_FALSE(provider->affineParameterBlocks().empty());
+  CHECK(std::all_of(provider->parameterSchema().blocks().begin(), provider->parameterSchema().blocks().end(),
+                    [](const auto& block) { return block.trainable; }));
+  CHECK_THROWS(build(complexXml("gpu='cpu' optimize='yes' optimize_indices='0'")));
+  CHECK_THROWS(build(complexXml("gpu='cuda' optimize='yes' optimize_scope='all'")));
+  CHECK(readiness.calls == 0);
+}
+
 TEST_CASE("PsiFormer paired XML observes the same production Coulomb Hamiltonian sample",
           "[wavefunction][psiformer][complex_wf][complex_admission]")
 {

@@ -280,13 +280,17 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     // its values are not a sampler restart or a saved PP-provenance guarantee.
     const bool gpu_ecp = explicit_gpu && system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((initialization == "psiformer_complex_periodic_v1" && parameters.empty()) || direct_model);
-    if ((!explicit_gpu && request != "no" && request != "cpu") || optimization_enabled ||
+    const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&
+        optimization_enabled && optimize_scope == "all" && optimize_indices.empty() && system == "all_electron";
+    if ((!explicit_gpu && request != "no" && request != "cpu") || (optimization_enabled && !cpu_training) ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
-      throw std::invalid_argument("Complex PsiFormer requires CPU or strict cuda/hip, optimize=no and fp64_reference");
+      throw std::invalid_argument("Complex PsiFormer requires qualified CPU optimize_scope=all training or "
+                                 "CPU/strict cuda/hip inference, and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
         feature_policy != "periodic_torus_v1" || (system != "all_electron" && !gpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
-        !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
+        !export_parameters.empty() || !optimize_indices.empty() ||
+        optimize_scope != (cpu_training ? "all" : "indices"))
       throw std::invalid_argument("Complex PsiFormer requires explicit qualified periodic native metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
     if (explicit_gpu)

@@ -19,6 +19,7 @@ struct TrainingTimers
 
   NewTimer& preparation = createGlobalTimer("WFTrain::product_preparation", timer_level_medium);
   NewTimer& objective = createGlobalTimer("WFTrain::objective_gradient", timer_level_medium);
+  NewTimer& affine_observation = createGlobalTimer("WFTrain::affine_observation_factors", timer_level_fine);
   NewTimer& reduction = createGlobalTimer("WFTrain::parameter_metric_reduction", timer_level_medium);
   NewTimer& proposal = createGlobalTimer("WFTrain::optimizer_proposal_solve", timer_level_medium);
   NewTimer& candidate = createGlobalTimer("WFTrain::candidate_line_search", timer_level_medium);
