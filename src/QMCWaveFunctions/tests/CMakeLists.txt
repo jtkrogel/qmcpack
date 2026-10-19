@@ -729,6 +729,13 @@ add_unit_test(deterministic-unit_test_psiformer_polynomial_geometry
               1 1 $<TARGET_FILE:test_psiformer_polynomial_geometry>)
 set_tests_properties(deterministic-unit_test_psiformer_polynomial_geometry PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_fourier_factor test_psiformer_fourier_factor.cpp)
+target_link_libraries(test_psiformer_fourier_factor catch_main)
+target_include_directories(test_psiformer_fourier_factor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_fourier_factor
+              1 1 $<TARGET_FILE:test_psiformer_fourier_factor>)
+set_tests_properties(deterministic-unit_test_psiformer_fourier_factor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_complex_value
                test_psiformer_complex_value.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp
