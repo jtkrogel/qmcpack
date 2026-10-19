@@ -250,4 +250,32 @@ TEST_CASE("Pre-inverse rate scaling uses full precision parameter-space constrai
     CHECK(optimizer.effectiveLearningRate() == static_cast<double>(.049975015223026276F));
   }
 }
+
+TEST_CASE("Inverse schedule scalar arithmetic is explicit at early and late accepted updates",
+          "[wftrain][kfac_state][kfac_schedule]")
+{
+  const std::array<std::uint64_t, 4> counts{0, 1, 50, 399};
+  const std::array<double, 4> division{.05000000074505806, .049975015223026276, .04878048971295357, .04168403521180153};
+  const std::array<double, 4> reciprocal{.05000000074505806, .049975015223026276, .04878048971295357, .04168403893709183};
+  for (bool multiply : {false, true})
+  {
+    KFACToyProvider provider;
+    KFACOptimizerControl control;
+    control.learning_rate = .05;
+    control.learning_rate_decay = 2000;
+    control.schedule_float32 = true;
+    control.schedule_arithmetic = multiply ? KFACScheduleArithmetic::MULTIPLY_RECIPROCAL : KFACScheduleArithmetic::DIVIDE_RATE;
+    KFACOptimizer optimizer(registry(provider.parameterSchema()), control);
+    std::size_t ordinal = 0;
+    for (std::uint64_t count = 0; count <= counts.back(); ++count)
+    {
+      if (count == counts[ordinal])
+      {
+        CHECK(optimizer.effectiveLearningRate() == (multiply ? reciprocal[ordinal] : division[ordinal]));
+        ++ordinal;
+      }
+      if (count < counts.back()) update(optimizer, provider, 1, 0);
+    }
+  }
+}
 }

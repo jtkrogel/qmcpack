@@ -16,6 +16,9 @@ namespace qmcplusplus::wftrain
 /// Select whether the schedule scalar enters before or after inverse/constraint arithmetic.
 enum class KFACUpdateOrder { POST_INVERSE_RATE, PRE_INVERSE_RATE };
 
+/// Preserve the declared scalar evaluation order of an inverse schedule.
+enum class KFACScheduleArithmetic { DIVIDE_RATE, MULTIPLY_RECIPROCAL };
+
 /// Selected fixed-damping recurrence, schedule, inverse cadence and step controls.
 struct KFACOptimizerControl
 {
@@ -28,6 +31,7 @@ struct KFACOptimizerControl
   KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE;
   KFACPreconditionerControl inverse;
   KFACUpdateOrder update_order = KFACUpdateOrder::POST_INVERSE_RATE;
+  KFACScheduleArithmetic schedule_arithmetic = KFACScheduleArithmetic::DIVIDE_RATE;
 };
 
 /** Persistent KFAC recurrence committed only with a published model update. */

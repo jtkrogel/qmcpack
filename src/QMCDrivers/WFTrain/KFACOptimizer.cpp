@@ -67,7 +67,9 @@ KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl co
       (control_.inverse.damping_policy != KFACDampingPolicy::EQUAL_SPLIT &&
        control_.inverse.damping_policy != KFACDampingPolicy::TRACE_BALANCED) ||
       (control_.update_order != KFACUpdateOrder::POST_INVERSE_RATE &&
-       control_.update_order != KFACUpdateOrder::PRE_INVERSE_RATE))
+       control_.update_order != KFACUpdateOrder::PRE_INVERSE_RATE) ||
+      (control_.schedule_arithmetic != KFACScheduleArithmetic::DIVIDE_RATE &&
+       control_.schedule_arithmetic != KFACScheduleArithmetic::MULTIPLY_RECIPROCAL))
     throw std::invalid_argument("Invalid persistent KFAC curvature or damping policy");
   const std::vector<double> configuration{control_.learning_rate, control_.learning_rate_decay,
       static_cast<double>(control_.schedule_float32), control_.ema_decay,
@@ -77,6 +79,8 @@ KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl co
   configuration_fingerprint_ = registry_.fingerprint() + "/" + TrainingCheckpoint::valuesFingerprint(configuration);
   if (control_.update_order == KFACUpdateOrder::PRE_INVERSE_RATE)
     configuration_fingerprint_ += "/pre-inverse-rate-v1";
+  if (control_.schedule_arithmetic == KFACScheduleArithmetic::MULTIPLY_RECIPROCAL)
+    configuration_fingerprint_ += "/reciprocal-schedule-v1";
 }
 
 KFACOptimizer::~KFACOptimizer() = default;
@@ -95,10 +99,18 @@ DerivativeReal KFACOptimizer::effectiveLearningRate() const noexcept
     // Preserve scalar dtype rounding even in builds that permit reassociation.
     volatile float progress = static_cast<float>(state_->step) / static_cast<float>(control_.learning_rate_decay);
     volatile float denominator = 1.0F + progress;
+    if (control_.schedule_arithmetic == KFACScheduleArithmetic::MULTIPLY_RECIPROCAL)
+    {
+      volatile float reciprocal = 1.0F / denominator;
+      volatile float rate = static_cast<float>(control_.learning_rate) * reciprocal;
+      return rate;
+    }
     volatile float rate = static_cast<float>(control_.learning_rate) / denominator;
     return rate;
   }
-  return control_.learning_rate / (1.0 + static_cast<double>(state_->step) / control_.learning_rate_decay);
+  const double denominator = 1.0 + static_cast<double>(state_->step) / control_.learning_rate_decay;
+  return control_.schedule_arithmetic == KFACScheduleArithmetic::MULTIPLY_RECIPROCAL
+      ? control_.learning_rate * (1.0 / denominator) : control_.learning_rate / denominator;
 }
 
 void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
