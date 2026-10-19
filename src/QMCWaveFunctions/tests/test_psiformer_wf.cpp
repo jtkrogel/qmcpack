@@ -24,6 +24,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "QMCDrivers/WFTrain/TrainingTimers.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -1912,6 +1913,47 @@ TEST_CASE("Versioned periodic XML preserves explicit feature and physical metada
   invalid = profile("real", "polynomial_unversioned");
   CHECK_THROWS(parse(invalid));
   const auto original_positions = particles.R;
+  const auto reciprocal_profile = [&](const std::string& head, const std::string& policy, const std::string& modes) {
+    auto text = profile(head, "raw_trigonometric_v1");
+    text.insert(text.find(" feature_transform"), " envelope_policy='" + policy + "'");
+    text.insert(text.find("</periodic_profile>"), "<parameter name='fourier_modes'>" + modes + "</parameter>");
+    return text;
+  };
+  const std::string declared_modes = "0 0 0 1 0 0 0 -1 1";
+  const auto reciprocal = parse(reciprocal_profile("paired_complex", "fourier", declared_modes));
+  CHECK(reciprocal.periodic_profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::FOURIER);
+  const std::vector<std::array<int, 3>> expected_modes{{0, 0, 0}, {1, 0, 0}, {0, -1, 1}};
+  CHECK(reciprocal.periodic_profile->fourier_modes == expected_modes);
+  for (int d = 0; d < 3; ++d)
+  {
+    long double sum = 0;
+    for (const auto& position : source->R)
+      sum += position[d];
+    CHECK(reciprocal.periodic_profile->fourier_origin[d] == static_cast<double>(sum / source->R.size()));
+  }
+  if (two_cells)
+    CHECK(reciprocal.periodic_profile->fourier_origin[0] != .5);
+  CHECK(environment.periodic_profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::ATOM_CENTERED);
+  CHECK(environment.periodic_profile->fourier_modes.empty());
+  invalid = expected;
+  invalid.insert(invalid.find(" feature_transform"), " envelope_policy='atom_centered'");
+  CHECK(parse(invalid).periodic_profile->envelope_policy == environment.periodic_profile->envelope_policy);
+  CHECK_THROWS(parse(reciprocal_profile("real", "fourier", declared_modes)));
+  CHECK_THROWS(parse(reciprocal_profile("paired_complex", "atom_centered", declared_modes)));
+  CHECK_THROWS(parse(reciprocal_profile("paired_complex", "", declared_modes)));
+  CHECK_THROWS(parse(reciprocal_profile("paired_complex", "unknown", declared_modes)));
+  for (const auto& modes : {"", "0 0", "1 0 0", "0 0 0 0 0 0", "0 0 0 0.5 0 0", "0 0 0 2147483648 0 0"})
+    CHECK_THROWS(parse(reciprocal_profile("paired_complex", "fourier", modes)));
+  std::ostringstream oversized_modes;
+  for (std::size_t mode = 0; mode <= psiformer::FOURIER_MODE_LIMIT; ++mode)
+    oversized_modes << mode << " 0 0 ";
+  CHECK_THROWS(parse(reciprocal_profile("paired_complex", "fourier", oversized_modes.str())));
+  invalid = expected;
+  invalid.insert(invalid.find(" feature_transform"), " envelope_policy='fourier'");
+  CHECK_THROWS(parse(invalid));
+  invalid = reciprocal_profile("paired_complex", "fourier", declared_modes);
+  invalid.insert(invalid.find(" feature_transform"), " fourier_origin='0 0 0'");
+  CHECK_THROWS(parse(invalid));
   for (const auto& head : {std::string("real"), std::string("paired_complex")})
   {
 #ifndef QMC_COMPLEX
@@ -1965,6 +2007,55 @@ TEST_CASE("Versioned periodic XML preserves explicit feature and physical metada
       particles.update();
     }
   }
+#ifdef QMC_COMPLEX
+  // Exercise full construction/import with a physical-source origin distinct from the feature motif.
+  for (std::size_t row = 0; row < particles.R.size(); ++row)
+    particles.R[row] = {.21 + .17 * row, -.31 + .13 * row, .51 - .11 * row};
+  particles.update();
+  PsiFormerWaveFunctionBuilder reciprocal_builder(OHMMS::Controller, particles, sources);
+  const std::string reciprocal_attributes = "name='reciprocal_input' source='ion0' system='all_electron' gpu='cpu' "
+      "feature_policy='periodic_two_cell_v1' max_clone_numeric_bytes='33554432' ";
+  Libxml2Document reciprocal_xml;
+  REQUIRE(reciprocal_xml.parseFromString("<psiformer " + reciprocal_attributes +
+      "initialization='psiformer_periodic_pair_v1' initialization_seed='17'>" +
+      reciprocal_profile("paired_complex", "fourier", declared_modes) + "</psiformer>"));
+  auto reciprocal_component = reciprocal_builder.buildComponent(reciprocal_xml.getRoot());
+  auto* paired = dynamic_cast<PsiFormerComplexWF*>(reciprocal_component.get());
+  REQUIRE(paired);
+  particles.G = ValueType{};
+  particles.L = ValueType{};
+  const auto reciprocal_log = paired->evaluateLog(particles, particles.G, particles.L);
+  CHECK(psiformer::determinant::isFiniteReal(std::real(reciprocal_log)));
+  ScopedTestDirectory reciprocal_directory("reciprocal_profile_input");
+  const auto reciprocal_path = (reciprocal_directory.path / "model.h5").string();
+  paired->exportModel(reciprocal_path);
+  const auto model = psiformer::readPsiFormerModelFile(reciprocal_path);
+  REQUIRE(model.parameters.environment.periodic_profile);
+  CHECK(model.parameters.environment.periodic_profile->fourier_modes == reciprocal.periodic_profile->fourier_modes);
+  CHECK(model.parameters.environment.periodic_profile->fourier_origin == reciprocal.periodic_profile->fourier_origin);
+  CHECK(std::none_of(model.parameters.layouts.begin(), model.parameters.layouts.end(), [](const auto& tensor) {
+    return tensor.module.find("exponential_envelopes") != std::string::npos;
+  }));
+  Libxml2Document reciprocal_imported;
+  REQUIRE(reciprocal_imported.parseFromString("<psiformer " + reciprocal_attributes + "parameters='" + reciprocal_path + "'/>"));
+  auto reciprocal_loaded = reciprocal_builder.buildComponent(reciprocal_imported.getRoot());
+  particles.G = ValueType{};
+  particles.L = ValueType{};
+  const auto reciprocal_loaded_log = reciprocal_loaded->evaluateLog(particles, particles.G, particles.L);
+  CHECK(std::real(reciprocal_loaded_log) == Catch::Approx(std::real(reciprocal_log)).margin(1e-12));
+  CHECK(std::imag(reciprocal_loaded_log) == Catch::Approx(std::imag(reciprocal_log)).margin(1e-12));
+  if (two_cells)
+  {
+    auto& physical_source = *sources.at("ion0");
+    physical_source.R[3][0] += .125;
+    physical_source.update();
+    CHECK_THROWS(reciprocal_builder.buildComponent(reciprocal_imported.getRoot()));
+    physical_source.R[3][0] -= .125;
+    physical_source.update();
+  }
+  particles.R = original_positions;
+  particles.update();
+#endif
 }
 
 TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "[wavefunction][psiformer]")

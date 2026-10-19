@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -501,6 +502,16 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     psiformer::InitializedPsiFormerParameters initialized = direct_model
         ? std::move(imported_model->parameters)
         : psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization, environment);
+    if (const auto& profile = initialized.environment.periodic_profile;
+        profile && profile->envelope_policy == psiformer::PeriodicEnvelopePolicy::FOURIER)
+    {
+      // Report the resolved immutable physical-source gauge, including on standalone import.
+      std::ostringstream resolved;
+      resolved << std::setprecision(17) << "  Periodic envelope: policy=fourier; physical_ion_mean_origin=("
+               << profile->fourier_origin[0] << ' ' << profile->fourier_origin[1] << ' ' << profile->fourier_origin[2]
+               << "); modes=" << profile->fourier_modes.size();
+      app_log() << resolved.str() << std::endl;
+    }
 
     // All ranks must evaluate exactly the same model even when platform math
     // libraries round the Gaussian transform differently.  Communicate's

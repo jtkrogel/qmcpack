@@ -10,6 +10,7 @@
 #include "OhmmsData/XMLParsingString.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerFourierHead.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -97,7 +98,7 @@ inline ExecutionEnvironment parsePeriodicProfileInput(xmlNodePtr node, const Par
   {
     const std::string name = castXMLCharToChar(attribute->name);
     if (attribute->ns || (name != "version" && name != "head" && name != "feature_transform" &&
-                         name != "electron_electron_cusp"))
+                         name != "electron_electron_cusp" && name != "envelope_policy"))
       throw std::invalid_argument("Unknown periodic_profile attribute: " + name);
   }
   auto metadata = std::make_shared<PeriodicProfileMetadata>();
@@ -115,7 +116,13 @@ inline ExecutionEnvironment parsePeriodicProfileInput(xmlNodePtr node, const Par
   metadata->electron_electron_cusp = cusp == "yes";
   if (metadata->feature_transform == PeriodicFeatureTransform::POLYNOMIAL_V1 && metadata->electron_electron_cusp)
     throw std::invalid_argument("Polynomial periodic features require electron_electron_cusp=no");
-  const std::array<std::string, 5> names{"primitive_lattice", "tiling", "primitive_motif", "motif_species", "occupied_columns"};
+  const auto envelope = getXMLAttributeValue(node, "envelope_policy");
+  if (envelope == "fourier") metadata->envelope_policy = PeriodicEnvelopePolicy::FOURIER;
+  else if (xmlHasProp(node, BAD_CAST "envelope_policy") && envelope != "atom_centered")
+    throw std::invalid_argument("Periodic envelope_policy must be atom_centered or fourier");
+  const bool fourier = metadata->envelope_policy == PeriodicEnvelopePolicy::FOURIER;
+  std::vector<std::string> names{"primitive_lattice", "tiling", "primitive_motif", "motif_species", "occupied_columns"};
+  if (fourier) names.push_back("fourier_modes");
   std::unordered_map<std::string, std::string> fields;
   for (auto* child = node->children; child; child = child->next)
   {
@@ -136,11 +143,14 @@ inline ExecutionEnvironment parsePeriodicProfileInput(xmlNodePtr node, const Par
       throw std::invalid_argument("Unknown or duplicate periodic profile parameter: " + name);
   }
   if (fields.size() != names.size())
-    throw std::invalid_argument("Periodic profile requires primitive_lattice, tiling, primitive_motif, motif_species and occupied_columns");
+    throw std::invalid_argument("Periodic profile requires primitive_lattice, tiling, primitive_motif, motif_species and occupied_columns" +
+        std::string(fourier ? ", plus fourier_modes for Fourier envelopes" : ""));
   ExecutionEnvironment environment;
   environment.boundary = BoundaryCondition::PERIODIC;
   environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
   environment.head_representation = periodicProfileHead(node);
+  if (fourier && environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX)
+    throw std::invalid_argument("Fourier envelopes require paired_complex periodic heads");
   environment.amplitude_scalar_domain = environment.head_representation == HeadRepresentation::REAL ? ScalarDomain::REAL : ScalarDomain::COMPLEX;
   environment.periodic_axes = {true, true, true};
   // Physical ParticleSets define the simulation lattice; the feature cell cannot replace it.
@@ -194,6 +204,19 @@ inline ExecutionEnvironment parsePeriodicProfileInput(xmlNodePtr node, const Par
   (void)pf::mapPeriodicIonMotif(metadata->cells,
       pf::GeometryPositionView::interleaved(motif.data(), motif.size() / 3), metadata->motif_species,
       pf::GeometryPositionView::interleaved(physical_positions.data(), ions.getTotalNum()), physical_species);
+  if (fourier)
+  {
+    // The fixed gauge uses every physical ion before any primitive-feature substitution.
+    const auto modes = periodicProfileScalars(fields.at("fourier_modes"));
+    if (modes.empty() || modes.size() % 3 || modes.size() / 3 > FOURIER_MODE_LIMIT)
+      throw std::invalid_argument("Fourier modes require a bounded nonempty list of integer triplets");
+    for (std::size_t mode = 0; mode < modes.size() / 3; ++mode)
+      metadata->fourier_modes.push_back({periodicProfileInteger(modes[3 * mode]),
+          periodicProfileInteger(modes[3 * mode + 1]), periodicProfileInteger(modes[3 * mode + 2])});
+    metadata->fourier_origin = physicalIonFourierOrigin(
+        pf::GeometryPositionView::interleaved(physical_positions.data(), ions.getTotalNum()));
+    (void)FourierHeadModes(metadata->cells.simulation, metadata->fourier_modes, metadata->fourier_origin);
+  }
   // Preserve explicit spin and band column order while decoding reciprocal phases and occupations.
   const auto occupied = periodicProfileScalars(fields.at("occupied_columns"));
   if (occupied.size() != 6 * static_cast<std::size_t>(electrons.getTotalNum()))
