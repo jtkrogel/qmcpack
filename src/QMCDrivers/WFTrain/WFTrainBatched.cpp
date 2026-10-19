@@ -1912,13 +1912,18 @@ void WFTrainBatched::process(xmlNodePtr node)
             (!complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
              training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
-        const bool cpu_score_ecp = !complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
-            training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
-            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
-            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !inference_input_.enabled &&
+        const bool cpu_scalar_ecp = !complex->gpuInferenceEnabled() &&
+            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP &&
             complex->isPseudopotentialSystem() && population_.get_golden_hamiltonian().ecpModelProvenance() &&
             population_.get_golden_hamiltonian().ecpModelProvenance()->ordinary_locality_vp;
-        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp &&
+        const bool cpu_score_ecp = cpu_scalar_ecp && optimizer == O::KFAC &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF;
+        // Supervised PP fitting needs raw orbitals only; it does not admit energy Adam or PP dEL.
+        const bool cpu_mse_ecp = cpu_scalar_ecp && cpu_orbital_mse && optimizer == O::ADAM &&
+            training_input_.samplesOrbitalStudent() &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF;
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp && !cpu_mse_ecp &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
              training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
              (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF &&
@@ -1926,7 +1931,8 @@ void WFTrainBatched::process(xmlNodePtr node)
              inference_input_.enabled ||
              training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
              training_input_.getMaximumUpdateNorm() != 0))
-          throw UniformCommunicateError("Paired ECP training requires CPU score-only ENERGY KFAC/OFF with ordinary scalar VP "
+          throw UniformCommunicateError("Paired ECP training requires CPU score-only ENERGY KFAC/OFF or student single-reference "
+              "orbital_mse Adam/OFF with ordinary scalar VP "
               "or GPU ENERGY Adam/OFF or REFERENCE with default update controls");
         // GPU reference candidates require the separate budgeted private lane/image route.
         const bool energy_reference =

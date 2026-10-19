@@ -290,12 +290,12 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
     const auto request = normalizedAcceleratorRequest(gpu);
     const bool explicit_gpu = request == "cuda" || request == "hip";
-    // A standalone model starts fresh training under the CURRENT validated PP Hamiltonian;
+    // A standalone model supplies parameters under the CURRENT validated PP Hamiltonian;
     // its values are not a sampler restart or a saved PP-provenance guarantee.
     const bool gpu_ecp = explicit_gpu && system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((initialization == "psiformer_complex_periodic_v1" && parameters.empty()) || direct_model);
     const bool cpu_ecp = !explicit_gpu && (request == "no" || request == "cpu") &&
-        optimization_enabled && system == "pseudopotential" && parameter_checkpoint.empty() &&
+        (optimization_enabled || direct_model) && system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((parameters.empty() && (initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 || pair_profile)) || direct_model);
     const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&
         optimization_enabled && optimize_scope == "all" && optimize_indices.empty() &&

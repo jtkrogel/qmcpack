@@ -79,7 +79,7 @@ const PsiFormerComplexWF* selectedComplexProfile(const TrialWaveFunction& psi)
 
 /// Validate concrete selected objects before estimators/drivers/clones; store no admission pointer/token.
 void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMCHamiltonian& ham,
-                                        const ParticleSet& target, bool wftrain)
+                                        const ParticleSet& target, QMCRunType run_type)
 {
   const auto* complex = selectedComplexProfile(psi);
   if (!complex)
@@ -87,7 +87,10 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
   auto reject = []() { throw UniformCommunicateError(
       "Complex PsiFormer selected-system admission requires a sole component, CPU bare kinetic and "
       "three physical periodic Coulomb terms bound to its actual target/source"); };
-  const bool ecp = wftrain && ham.hasPhysicalNLPP();
+  // Ordinary scalar PP inference is qualified only on the CPU batched VMC route.
+  const bool ecp_run = run_type == QMCRunType::WF_TRAIN_BATCH ||
+      (!complex->gpuInferenceEnabled() && run_type == QMCRunType::VMC_BATCH);
+  const bool ecp = ecp_run && ham.hasPhysicalNLPP();
   const auto& provenance = ham.ecpModelProvenance();
   if (complex->isPseudopotentialSystem() != ecp || ham.hasPhysicalNLPP() != ecp ||
       (ecp && (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())) ||
@@ -357,7 +360,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       }
     }
 #ifdef QMC_COMPLEX
-    requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system, das.new_run_type == QMCRunType::WF_TRAIN_BATCH);
+    requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system, das.new_run_type);
     if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
         das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
       throw UniformCommunicateError("Complex GPU requires PBYP VMC_BATCH or explicitly admitted WF_TRAIN_BATCH");
@@ -416,6 +419,9 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
           !is_pbyp_move && !complex->supportsMultiParticleMoves())
         throw UniformCommunicateError("Complex GPU inference requires parsed PBYP VMC_BATCH moves");
+      if (const auto* complex = selectedComplexProfile(primaryPsi); complex && !complex->gpuInferenceEnabled() &&
+          complex->isPseudopotentialSystem() && !is_pbyp_move)
+        throw UniformCommunicateError("CPU scalar PP inference requires PBYP VMC_BATCH moves");
 #endif
 
       // I don't like that QMCDriverFactory is unpacking the driver input here, ideally only the driver should need to
