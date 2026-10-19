@@ -16,6 +16,7 @@
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
 
 #include <algorithm>
 #include <array>
@@ -1030,6 +1031,161 @@ TEST_CASE("Missing streaming capability fails before producer work",
   CHECK_THROWS_WITH(training.runIteration(provider, producer, updater, state),
                     Catch::Matchers::ContainsSubstring("local_energy_vjp"));
   CHECK(producer.calls == 0);
+}
+
+TEST_CASE("Accepted nonlocal tiles reduce complete complex energies without derivatives",
+          "[drivers][training][nonlocal_energy]")
+{
+  ToyProvider provider;
+  const auto& schema = provider.parameterSchema();
+  const auto cap = NonLocalEnergyAccumulator::requiredBytes(2);
+  CHECK(cap == 2 * sizeof(DerivativeValue));
+  CHECK_THROWS(NonLocalEnergyAccumulator::requiredBytes(0));
+  CHECK_THROWS(NonLocalEnergyAccumulator::requiredBytes(std::numeric_limits<std::size_t>::max()));
+  CHECK_THROWS(NonLocalEnergyAccumulator(schema, 3, 7, 11, 2, 2, cap - 1));
+  std::vector<DerivativeValue> ones(2, {1, 0});
+  VJPCoefficientChannel channel{"energy", DerivativeProduct::LOCAL_ENERGY_VJP,
+      {schema.providerId(), schema.fingerprint(), 3, 7, 11, {ones.data(), ones.size()}},
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+  NonLocalECPDerivativeContext context{schema.providerId(), schema.fingerprint(), 3, 7, 11, 2, 5, 17};
+  class NoDerivativeSink final : public ParameterReductionSink
+  {
+    /// Any parameter output is a violation of this score-only energy transaction.
+    void consume(std::size_t, const ParameterChunkConstView&) override
+    { throw std::logic_error("Unexpected parameter output from energy accumulation"); }
+  } sink;
+  bool imaginary = false;
+  SECTION("Exact real limit") {}
+#ifdef QMC_COMPLEX
+  SECTION("Nonzero imaginary energy") { imaginary = true; }
+#endif
+  NonLocalEnergyAccumulator accumulator(schema, 3, 7, 11, 2, 2, cap);
+  const auto storage = accumulator.storageDiagnostics();
+  CHECK(storage.retained_numeric_bytes == cap);
+  CHECK(storage.parameter_scratch_bytes == 0);
+  accumulator.preflight(context, {&channel, 1}, sink);
+  CHECK_THROWS(accumulator.energies());
+  accumulator.begin(context, {&channel, 1}, sink);
+  using Value = QMCTraits::ValueType;
+  std::vector<Value> weights{.2, -.4, .7, -1.2, .25};
+  std::vector<Value> ratios{1.1, -.8, .9, 1.3, -.2};
+#ifdef QMC_COMPLEX
+  if (imaginary)
+    for (std::size_t q = 0; q < ratios.size(); ++q) ratios[q] += Value{0, .15 * (q + 1)};
+#endif
+  std::array<DerivativeValue, 2> expected{};
+  const std::array<std::size_t, 5> sample{0, 0, 1, 0, 1};
+  for (std::size_t q = 0; q < weights.size(); ++q)
+    expected[sample[q]] += DerivativeValue(weights[q]) * DerivativeValue(ratios[q]);
+  std::vector<std::size_t> offsets_a{0, 2, 3}, offsets_b{0, 1, 2};
+  std::vector<VirtualParticleBatch::Segment> segments_a{{0, 0}, {1, 1}}, segments_b{{0, 1}, {1, 0}};
+  std::vector<ParticleSet::PosType> positions_a(3), positions_b(2);
+  VirtualParticleBatch a(2, {offsets_a.data(), offsets_a.size()}, {segments_a.data(), segments_a.size()},
+                         {positions_a.data(), positions_a.size()});
+  VirtualParticleBatch b(2, {offsets_b.data(), offsets_b.size()}, {segments_b.data(), segments_b.size()},
+                         {positions_b.data(), positions_b.size()});
+  accumulator.consume({a, {weights.data(), 3}, {ratios.data(), 3}, {}, 0, 17});
+  accumulator.consume({b, {weights.data() + 3, 2}, {ratios.data() + 3, 2}, {}, 1, 17});
+  CHECK_THROWS(accumulator.energies());
+  accumulator.end();
+  for (std::size_t sample_index = 0; sample_index < expected.size(); ++sample_index)
+  {
+    CHECK(accumulator.energies()[sample_index].real() == Catch::Approx(expected[sample_index].real()));
+    CHECK(accumulator.energies()[sample_index].imag() == Catch::Approx(expected[sample_index].imag()));
+  }
+  CHECK((std::abs(expected[0].imag()) + std::abs(expected[1].imag()) > .01) == imaginary);
+  CHECK(accumulator.gridFingerprint() == 17);
+  CHECK(sink.state() == DerivativeSinkState::IDLE);
+  CHECK(accumulator.storageDiagnostics().storage_fingerprint == storage.storage_fingerprint);
+  CHECK(accumulator.storageDiagnostics().retained_numeric_bytes == cap);
+  CHECK_THROWS(accumulator.releaseJVPReplay());
+  CHECK_THROWS(accumulator.begin(context, {&channel, 1}, sink));
+}
+
+TEST_CASE("Nonlocal energy transactions reject incomplete or mismatched native tiles",
+          "[drivers][training][nonlocal_energy]")
+{
+  ToyProvider provider;
+  const auto& schema = provider.parameterSchema();
+  NonLocalEnergyAccumulator accumulator(schema, 3, 7, 11, 1, 2, sizeof(DerivativeValue));
+  std::vector<DerivativeValue> ones(1, {1, 0});
+  VJPCoefficientChannel channel{"energy", DerivativeProduct::LOCAL_ENERGY_VJP,
+      {schema.providerId(), schema.fingerprint(), 3, 7, 11, {ones.data(), 1}},
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+  NonLocalECPDerivativeContext context{schema.providerId(), schema.fingerprint(), 3, 7, 11, 1, 1, 17};
+  class NoDerivativeSink final : public ParameterReductionSink
+  {
+    /// Energy-only capture leaves the checked parameter sink idle.
+    void consume(std::size_t, const ParameterChunkConstView&) override
+    { throw std::logic_error("Unexpected parameter output from energy accumulation"); }
+  } sink;
+  SECTION("Stale provider version fails before grid activation")
+  {
+    ++context.parameter_version;
+    CHECK_THROWS(accumulator.preflight(context, {&channel, 1}, sink));
+    CHECK(sink.state() == DerivativeSinkState::IDLE);
+  }
+  SECTION("Unsupported localization fails before grid activation")
+  {
+    context.localization = NonLocalECPLocalization::DLA;
+    CHECK_THROWS(accumulator.preflight(context, {&channel, 1}, sink));
+  }
+  SECTION("Missing accepted grid is rejected")
+  {
+    context.grid_fingerprint = 0;
+    CHECK_THROWS(accumulator.begin(context, {&channel, 1}, sink));
+  }
+  SECTION("Incomplete traversal cannot publish sums")
+  {
+    accumulator.begin(context, {&channel, 1}, sink);
+    CHECK_THROWS(accumulator.end());
+    CHECK_THROWS(accumulator.energies());
+  }
+  SECTION("Nonfinite coefficient is rejected before arithmetic")
+  {
+    ones[0] = {std::numeric_limits<double>::infinity(), 0};
+    CHECK_THROWS(accumulator.preflight(context, {&channel, 1}, sink));
+  }
+  SECTION("Wrong tile identity poisons partial sums")
+  {
+    std::vector<std::size_t> offsets{0, 1};
+    std::vector<VirtualParticleBatch::Segment> segments{{0, 0}};
+    std::vector<ParticleSet::PosType> positions(1);
+    VirtualParticleBatch batch(1, {offsets.data(), 2}, {segments.data(), 1}, {positions.data(), 1});
+    const QMCTraits::ValueType value{1};
+    accumulator.begin(context, {&channel, 1}, sink);
+    CHECK_THROWS(accumulator.consume({batch, {&value, 1}, {&value, 1}, {}, 0, 18}));
+    CHECK_THROWS(accumulator.energies());
+    CHECK_THROWS(accumulator.end());
+  }
+  SECTION("Nonfinite complete ratios poison the accepted traversal")
+  {
+    std::vector<std::size_t> offsets{0, 1};
+    std::vector<VirtualParticleBatch::Segment> segments{{0, 0}};
+    std::vector<ParticleSet::PosType> positions(1);
+    VirtualParticleBatch batch(1, {offsets.data(), 2}, {segments.data(), 1}, {positions.data(), 1});
+    const QMCTraits::ValueType weight{1}, ratio{std::numeric_limits<double>::infinity()};
+    accumulator.begin(context, {&channel, 1}, sink);
+    CHECK_THROWS(accumulator.consume({batch, {&weight, 1}, {&ratio, 1}, {}, 0, 17}));
+    CHECK_THROWS(accumulator.energies());
+  }
+  SECTION("A mismatched coefficient batch fails before grid activation")
+  {
+    ++channel.coefficients.batch_ordinal;
+    CHECK_THROWS(accumulator.preflight(context, {&channel, 1}, sink));
+  }
+  SECTION("Traversal overflow fails before consuming an extra tile")
+  {
+    std::vector<std::size_t> offsets{0, 1};
+    std::vector<VirtualParticleBatch::Segment> segments{{0, 0}};
+    std::vector<ParticleSet::PosType> positions(1);
+    VirtualParticleBatch batch(1, {offsets.data(), 2}, {segments.data(), 1}, {positions.data(), 1});
+    const QMCTraits::ValueType value{1};
+    accumulator.begin(context, {&channel, 1}, sink);
+    accumulator.consume({batch, {&value, 1}, {&value, 1}, {}, 0, 17});
+    CHECK_THROWS(accumulator.consume({batch, {&value, 1}, {&value, 1}, {}, 1, 17}));
+    CHECK_THROWS(accumulator.energies());
+  }
 }
 
 } // namespace qmcplusplus::wftrain
