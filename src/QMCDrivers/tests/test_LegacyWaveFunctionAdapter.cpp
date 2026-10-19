@@ -2585,8 +2585,8 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
             // Stationary alt/ref=1/3 and CI1=-6 contract to -2. This is
             // the raw CI numerator with fixed reference product, NOT d(PsiQ/PsiR).
             CHECK(determinant(configurations[0], 0, 2) - 2 * determinant(configurations[1], 0, 2) == 0);
-            CHECK(std::real(actual[ref] - 2 * actual[alt]) == Catch::Approx(0).margin(3e-13));
-            CHECK(std::real(orbital_derivatives[ref] - 2 * orbital_derivatives[alt]) ==
+            CHECK(std::real(actual[ref] - QMCTraits::ValueType{2} * actual[alt]) == Catch::Approx(0).margin(3e-13));
+            CHECK(std::real(orbital_derivatives[ref] - QMCTraits::ValueType{2} * orbital_derivatives[alt]) ==
                   Catch::Approx(10. / 3).margin(3e-13));
           }
           CHECK(block.getLogValueRefDet() == original_log);
