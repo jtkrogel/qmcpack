@@ -78,8 +78,9 @@ void EnergyGradientAccumulator::onBegin(
       descriptor.result_scalar_domain != ParameterScalarDomain::COMPLEX128)
     throw std::invalid_argument(
         "Energy-gradient accumulation currently requires real parameters and complex contractions");
-  if (channels.size() != 3)
-    throw std::invalid_argument("Energy-gradient stream must contain exactly three VJP channels");
+  const bool covariance = estimator_ == EnergyGradientEstimator::SCORE_COVARIANCE;
+  if (channels.size() != (covariance ? 2 : 3))
+    throw std::invalid_argument("Energy-gradient stream has the wrong number of VJP channels");
 
   channel_kinds_.clear();
   channel_kinds_.reserve(channels.size());
@@ -104,7 +105,7 @@ void EnergyGradientAccumulator::onBegin(
     }
     else if (channel.id == WEIGHTED_LOCAL_ENERGY_CHANNEL &&
              channel.product == DerivativeProduct::LOCAL_ENERGY_VJP &&
-             !found_weighted_local_energy)
+             !found_weighted_local_energy && !covariance)
     {
       if (channel.local_energy_term_mask == 0)
         throw std::invalid_argument(
@@ -232,6 +233,8 @@ void EnergyGradientAccumulator::addLocalEnergyVJP(
     DerivativeArrayView<const DerivativeValue> weighted_vjp,
     std::uint32_t local_energy_term_mask)
 {
+  if (estimator_ == EnergyGradientEstimator::SCORE_COVARIANCE)
+    throw std::invalid_argument("Score covariance does not consume local-energy parameter responses");
   if (state() != DerivativeSinkState::COMPLETE || !derivative_complete_)
     throw std::logic_error(
         "Additive local-energy VJP requires a complete primary derivative stream");
@@ -399,7 +402,14 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
 
   for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
   {
-    if (estimator_ == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN)
+    if (estimator_ == EnergyGradientEstimator::SCORE_COVARIANCE)
+    {
+      const DerivativeValue center = adjoint_ == DerivativeAdjoint::TRANSPOSE
+          ? std::conj(covariance_center) : covariance_center;
+      result.gradient[parameter] = 2.0 * std::real(weighted_energy_score_sum_[parameter] -
+          center * weighted_score_sum_[parameter]) / weight_sum_;
+    }
+    else if (estimator_ == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN)
     {
       const DerivativeValue contraction =
           weighted_energy_derivative_sum_[parameter] +
@@ -434,7 +444,8 @@ PreparedEnergyCoefficients prepareEnergyCoefficients(
     DerivativeArrayView<const DerivativeReal> weights,
     DerivativeArrayView<const DerivativeValue> local_energies,
     EnergyGradientEstimator estimator,
-    const EnergyClippingTransform* clipping_transform)
+    const EnergyClippingTransform* clipping_transform,
+    DerivativeAdjoint adjoint)
 {
   if ((weights.size() != 0 && weights.data() == nullptr) ||
       (local_energies.size() != 0 && local_energies.data() == nullptr))
@@ -473,6 +484,9 @@ PreparedEnergyCoefficients prepareEnergyCoefficients(
         (estimator == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN
              ? score_energy
              : DerivativeValue{std::real(score_energy), 0.0});
+    if (estimator == EnergyGradientEstimator::SCORE_COVARIANCE)
+      energy_weighted_score_coefficients[sample] = weights[sample] *
+          (adjoint == DerivativeAdjoint::TRANSPOSE ? std::conj(score_energy) : score_energy);
   }
   requireFinite(weight_sum, "batch weight sum");
   requireFinite(weighted_energy_sum, "batch weighted energy sum");
@@ -512,9 +526,11 @@ void accumulateEnergyGradientBatch(const StreamingDerivativeOperator& derivative
     DerivativeAdjoint adjoint, const EnergyClippingTransform* clipping_transform)
 {
   const auto prepared = prepareEnergyCoefficients(derivative_operator, weights, local_energies,
-                                                 accumulator.estimator(), clipping_transform);
+                                                 accumulator.estimator(), clipping_transform, adjoint);
   const auto channels = prepared.channels(derivative_operator, local_energy_term_mask);
-  derivative_operator.applyVJPs({channels.data(), channels.size()}, adjoint, accumulator);
+  const std::size_t channel_count = accumulator.estimator() == EnergyGradientEstimator::SCORE_COVARIANCE
+      ? 2 : channels.size();
+  derivative_operator.applyVJPs({channels.data(), channel_count}, adjoint, accumulator);
   accumulator.addScalarSums(derivative_operator.sampleCount(), prepared.weight_sum, prepared.weighted_energy_sum,
       prepared.weighted_energy_norm_sum, clipping_transform,
       prepared.clipped_weighted_energy_sum, prepared.clipped_sample_count);

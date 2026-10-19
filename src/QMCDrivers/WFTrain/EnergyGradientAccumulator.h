@@ -32,7 +32,9 @@ class DistributedParameterReduction;
 enum class EnergyGradientEstimator
 {
   SYMMETRIZED_HAMILTONIAN,
-  PATHWISE_LOCAL_ENERGY
+  PATHWISE_LOCAL_ENERGY,
+  /// Real-parameter physical gradient from the full complex score/energy covariance.
+  SCORE_COVARIANCE
 };
 
 /// Final scalar moments and one real, parameter-shaped energy gradient.
@@ -62,8 +64,9 @@ struct EnergyGradientResult
 
 /** Accumulate checked VJP chunks and scalar moments without retaining sample rows.
  *
- * One transaction consumes three named channels: weighted score, energy-weighted
- * score, and weighted local-energy response. Retained storage is three O(P)
+ * One transaction consumes weighted score and energy-weighted score channels;
+ * estimators with an explicit local-energy response consume that third channel.
+ * Retained storage is three O(P)
  * contraction vectors regardless of the number of samples.
  */
 class EnergyGradientAccumulator final : public ParameterReductionSink
@@ -200,9 +203,10 @@ struct PreparedEnergyCoefficients
 /// Reuse the ordinary estimator's checked weighted scalars and O(B) coefficients.
 PreparedEnergyCoefficients prepareEnergyCoefficients(const StreamingDerivativeOperator& derivative,
     DerivativeArrayView<const DerivativeReal> weights, DerivativeArrayView<const DerivativeValue> energies,
-    EnergyGradientEstimator estimator, const EnergyClippingTransform* clipping = nullptr);
+    EnergyGradientEstimator estimator, const EnergyClippingTransform* clipping = nullptr,
+    DerivativeAdjoint adjoint = DerivativeAdjoint::TRANSPOSE);
 
-/** Compose the three checked VJP channels required by one energy-gradient batch.
+/** Compose the checked VJP channels required by one energy-gradient batch.
  *
  * Coefficient scratch is O(samples); the operator can emit only bounded parameter
  * chunks through the sink. No sample-by-parameter derivative representation exists.

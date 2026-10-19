@@ -426,6 +426,48 @@ TEST_CASE("Energy gradient streaming matches both finite-sample estimators",
   }
 }
 
+TEST_CASE("Complex score covariance includes phase response without local-energy derivatives",
+          "[drivers][training][complex_covariance]")
+{
+  ToyProvider provider;
+  const ComplexRows scores{{{0, 1}, {1, -2}, {0, 3}},
+                           {{0, -2}, {-1, 1}, {0, 3}},
+                           {{0, 4}, {2, 3}, {0, 3}}};
+  const std::vector<DerivativeReal> weights{1, 2, 3};
+  const std::vector<DerivativeValue> energies{{-1, 2}, {3, -1}, {2, 4}};
+  // Any accidental request for a local-energy response contaminates the stream.
+  const DerivativeValue poison{std::numeric_limits<double>::quiet_NaN(), 0};
+  const ComplexRows unused_responses(3, std::vector<DerivativeValue>(3, poison));
+  DerivativeValue mean_energy{};
+  for (std::size_t sample = 0; sample < weights.size(); ++sample)
+    mean_energy += weights[sample] * energies[sample] / 6.0;
+  std::array<double, 3> expected{};
+  for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+    for (std::size_t sample = 0; sample < weights.size(); ++sample)
+      expected[parameter] += 2.0 * weights[sample] *
+          std::real(std::conj(scores[sample][parameter]) * (energies[sample] - mean_energy)) / 6.0;
+  REQUIRE(std::abs(expected[0]) > 1);
+  CHECK(expected[2] == Catch::Approx(0).margin(1e-14));
+  for (auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    ToyStreamingOperator derivative(provider.parameterSchema(), 0, scores, unused_responses);
+    EnergyGradientAccumulator accumulator(provider.parameterSchema(), 0,
+                                           EnergyGradientEstimator::SCORE_COVARIANCE, adjoint);
+    accumulateEnergyGradientBatch(derivative, {weights.data(), weights.size()},
+        {energies.data(), energies.size()}, 0, accumulator, adjoint);
+    const std::array<DerivativeValue, 3> extra{};
+    CHECK_THROWS(accumulator.addLocalEnergyVJP({extra.data(), extra.size()},
+                                               localEnergyTermBit(LocalEnergyTerm::KINETIC)));
+    accumulator.completeSingleParticipantReduction();
+    const auto result = accumulator.finalize();
+    CHECK(result.local_energy_term_mask == 0);
+    CHECK(result.mean_energy.real() == Catch::Approx(mean_energy.real()));
+    CHECK(result.mean_energy.imag() == Catch::Approx(mean_energy.imag()));
+    for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+      CHECK(result.gradient[parameter] == Catch::Approx(expected[parameter]).margin(1e-14));
+  }
+}
+
 TEST_CASE("Energy-gradient batches reject nonempty null input views before sink work",
           "[drivers][training]")
 {
