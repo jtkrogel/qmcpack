@@ -115,7 +115,8 @@ std::size_t clippingPreflight(DerivativeArrayView<const DerivativeValue> energie
   ConsensusReason reason = ConsensusReason::NONE;
   const bool known_rule = policy.scale_rule == EnergyClippingScaleRule::MEAN_ABSOLUTE_DEVIATION ||
       policy.scale_rule == EnergyClippingScaleRule::EMPIRICAL_QUANTILE ||
-      policy.scale_rule == EnergyClippingScaleRule::MEDIAN_ABSOLUTE_DEVIATION;
+      policy.scale_rule == EnergyClippingScaleRule::MEDIAN_ABSOLUTE_DEVIATION ||
+      policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE;
   if (!known_rule || !isFiniteBits(policy.width_multiplier) ||
       policy.width_multiplier < 0.0 || !isFiniteBits(policy.residual_quantile) ||
       policy.residual_quantile < 0.0 || policy.residual_quantile > 1.0)
@@ -378,6 +379,7 @@ EnergyClippingTransform::EnergyClippingTransform(EnergyClippingDescriptor descri
   if (descriptor_.population == 0 || !isFiniteBits(descriptor_.center) ||
       !isFiniteBits(descriptor_.scale) || !isFiniteBits(descriptor_.width) ||
       descriptor_.scale < 0.0 || descriptor_.width < 0.0 ||
+      (descriptor_.policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE && descriptor_.width <= 0) ||
       !isFiniteBits(descriptor_.imaginary_center) || !isFiniteBits(descriptor_.imaginary_scale) ||
       !isFiniteBits(descriptor_.imaginary_width) || descriptor_.imaginary_scale < 0 || descriptor_.imaginary_width < 0 ||
       (descriptor_.componentwise &&
@@ -391,6 +393,13 @@ EnergyClippingTransform::EnergyClippingTransform(EnergyClippingDescriptor descri
 
 DerivativeValue EnergyClippingTransform::apply(DerivativeValue energy) const noexcept
 {
+  if (descriptor_.policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE)
+  {
+    const double z = (energy.real() - descriptor_.center) / (2 * descriptor_.width);
+    const double a = std::abs(z);
+    const double squeezed = std::copysign(std::log1p((a + a * a / 2 + a * a * a) / (1 + a * a)), z);
+    return {descriptor_.center + 2 * descriptor_.width * squeezed, energy.imag()};
+  }
   const double lower = descriptor_.center - descriptor_.width;
   const double upper = descriptor_.center + descriptor_.width;
   const double imaginary = descriptor_.componentwise
@@ -402,6 +411,8 @@ DerivativeValue EnergyClippingTransform::apply(DerivativeValue energy) const noe
 
 bool EnergyClippingTransform::clips(DerivativeValue energy) const noexcept
 {
+  if (descriptor_.policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE)
+    return apply(energy).real() != energy.real();
   return std::real(energy) < descriptor_.center - descriptor_.width ||
       std::real(energy) > descriptor_.center + descriptor_.width ||
       (descriptor_.componentwise && (std::imag(energy) < descriptor_.imaginary_center - descriptor_.imaginary_width ||
@@ -452,6 +463,16 @@ EnergyClippingTransform prepareScalarEnergyClippingTransform(
         ? finiteMidpoint(selectOrderStatistic(local_energies.size(), upper_ordinal - 1, residual, communicator), upper)
         : upper;
   }
+  else if (policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE)
+  {
+    const double position = policy.residual_quantile * static_cast<double>(population - 1);
+    const auto lower = static_cast<std::size_t>(std::floor(position));
+    const auto upper = static_cast<std::size_t>(std::ceil(position));
+    const auto left = selectOrderStatistic(local_energies.size(), lower, residual, communicator);
+    const auto right = selectOrderStatistic(local_energies.size(), upper, residual, communicator);
+    const double fraction = position - static_cast<double>(lower);
+    scale = (1 - fraction) * left + fraction * right;
+  }
   else
   {
     const std::size_t ordinal =
@@ -461,6 +482,7 @@ EnergyClippingTransform prepareScalarEnergyClippingTransform(
 
   const double width = policy.width_multiplier * scale;
   if (!isFiniteBits(scale) || !isFiniteBits(width) ||
+      (policy.scale_rule == EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE && width <= 0) ||
       !isFiniteBits(center - width) || !isFiniteBits(center + width))
     throw std::runtime_error("Distributed energy clipping produced a non-finite width");
 
@@ -478,11 +500,13 @@ EnergyClippingTransform prepareEnergyClippingTransform(
   return prepareScalarEnergyClippingTransform(local_energies, policy, communicator, false);
 }
 
-/// Validate unit weights collectively, then prepare both component windows without a sample copy.
-EnergyClippingTransform prepareComplexEnergyClippingTransform(
+namespace
+{
+/// Agree on uniform statistical weights before population-only objective preparation.
+void requireUnitWeights(
     DerivativeArrayView<const DerivativeValue> local_energies,
     DerivativeArrayView<const DerivativeReal> local_weights,
-    DerivativeReal width_multiplier, Communicate* communicator)
+    Communicate* communicator)
 {
   ConsensusReason reason = ConsensusReason::NONE;
   if (local_weights.size() != local_energies.size() || (!local_weights.empty() && !local_weights.data()))
@@ -499,6 +523,16 @@ EnergyClippingTransform prepareComplexEnergyClippingTransform(
   for (std::size_t rank = 0; rank < records.size(); ++rank)
     if (records[rank][0] != static_cast<std::uint64_t>(ConsensusReason::NONE))
       throw std::invalid_argument("Complex energy clipping requires unit statistical weights on every rank");
+}
+}
+
+/// Validate unit weights collectively, then prepare both component windows without a sample copy.
+EnergyClippingTransform prepareComplexEnergyClippingTransform(
+    DerivativeArrayView<const DerivativeValue> local_energies,
+    DerivativeArrayView<const DerivativeReal> local_weights,
+    DerivativeReal width_multiplier, Communicate* communicator)
+{
+  requireUnitWeights(local_energies, local_weights, communicator);
   const EnergyClippingPolicy policy{EnergyClippingScaleRule::MEDIAN_ABSOLUTE_DEVIATION, width_multiplier, 0.5};
   auto descriptor = prepareScalarEnergyClippingTransform(local_energies, policy, communicator, false).descriptor();
   const auto imaginary = prepareScalarEnergyClippingTransform(local_energies, policy, communicator, true).descriptor();
@@ -506,6 +540,39 @@ EnergyClippingTransform prepareComplexEnergyClippingTransform(
   descriptor.imaginary_center = imaginary.center;
   descriptor.imaginary_scale = imaginary.scale;
   descriptor.imaginary_width = imaginary.width;
+  descriptor.identity = descriptorIdentity(descriptor);
+  return EnergyClippingTransform(std::move(descriptor));
+}
+
+/// Preserve the raw real-mean center while clipping independent component residuals.
+EnergyClippingTransform prepareMeanResidualEnergyClippingTransform(
+    DerivativeArrayView<const DerivativeValue> local_energies,
+    DerivativeArrayView<const DerivativeReal> local_weights,
+    DerivativeReal width_multiplier, Communicate* communicator)
+{
+  requireUnitWeights(local_energies, local_weights, communicator);
+  const EnergyClippingPolicy policy{EnergyClippingScaleRule::MEAN_ABSOLUTE_DEVIATION, width_multiplier, .5};
+  const auto population = clippingPreflight(local_energies, policy, communicator);
+  double center = 0;
+  for (const auto energy : local_energies) center += energy.real();
+  requireFiniteResidualSum(center, communicator);
+  if (communicator) communicator->allreduce_in_place(&center, 1);
+  center /= static_cast<double>(population);
+  std::array<double, 2> scales{};
+  for (const auto energy : local_energies)
+  {
+    scales[0] += std::abs(energy.real() - center);
+    scales[1] += std::abs(energy.imag());
+  }
+  for (double scale : scales) requireFiniteResidualSum(scale, communicator);
+  if (communicator) communicator->allreduce_in_place(scales.data(), scales.size());
+  for (auto& scale : scales) scale /= static_cast<double>(population);
+  EnergyClippingDescriptor descriptor{policy, population, center, scales[0], width_multiplier * scales[0], 0};
+  descriptor.componentwise = true;
+  descriptor.imaginary_scale = scales[1];
+  descriptor.imaginary_width = width_multiplier * scales[1];
+  if (!isFiniteBits(center - descriptor.width) || !isFiniteBits(center + descriptor.width))
+    throw std::runtime_error("Mean-residual energy clipping produced a non-finite window");
   descriptor.identity = descriptorIdentity(descriptor);
   return EnergyClippingTransform(std::move(descriptor));
 }

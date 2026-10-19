@@ -15,6 +15,7 @@
 
 #include "Message/Communicate.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
+#include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 
 #include <algorithm>
 #include <cmath>
@@ -61,7 +62,8 @@ public:
     StreamingDerivativeCapabilities result;
     result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
         derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
-    result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE);
+    result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) |
+        derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
     result.parameter_scalar_domain = ParameterScalarDomain::REAL64;
     result.result_scalar_domain = ParameterScalarDomain::COMPLEX128;
     result.reduction_domain = domain_;
@@ -83,7 +85,7 @@ public:
 
 protected:
   void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
-                    DerivativeAdjoint,
+                    DerivativeAdjoint adjoint,
                     ParameterReductionSink& sink) const override
   {
     for (const ParameterChunkDescriptor& descriptor : plan_.chunks())
@@ -100,7 +102,8 @@ protected:
                 ? score_rows_
                 : response_rows_;
             contraction[local_parameter] +=
-                channels[channel].coefficients.values[sample] * rows[sample][parameter];
+                channels[channel].coefficients.values[sample] *
+                (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(rows[sample][parameter]) : rows[sample][parameter]);
           }
         }
         sink.add(channel, {descriptor, {contraction.data(), contraction.size()}});
@@ -430,6 +433,134 @@ TEST_CASE("Clipping changes only the energy-score covariance channel",
   CHECK(unchanged.mean_energy == raw.mean_energy);
   CHECK(unchanged.energy_variance == raw.energy_variance);
   CHECK(unchanged.clipped_sample_count == 0);
+}
+
+TEST_CASE("Distinct complex score conventions match independent frozen population formulas",
+          "[drivers][training][clipping][complex_gradient_policies]")
+{
+  const std::vector<DerivativeValue> energies{{-100, 0}, {0, -50}, {1, 0}, {2, 2}, {100, 100}};
+  const std::vector<double> weights(5, 1);
+  const std::vector<DerivativeValue> transformed{{-39.88, 0}, {0, -30.4}, {1, 0}, {2, 2}, {41.08, 30.4}};
+  const auto transform = prepareMeanResidualEnergyClippingTransform({energies.data(), 5}, {weights.data(), 5}, 1);
+  CHECK(transform.descriptor().center == Approx(.6));
+  CHECK(transform.descriptor().scale == Approx(40.48));
+  CHECK(transform.descriptor().imaginary_center == 0);
+  CHECK(transform.descriptor().imaginary_scale == Approx(30.4));
+  const auto schema = makeClippingSchema();
+  std::vector<std::vector<DerivativeValue>> scores(5, std::vector<DerivativeValue>(2));
+  for (std::size_t sample = 0; sample < 5; ++sample)
+  {
+    scores[sample] = {{0, 1}, {double(sample % 2), -.25 * sample}};
+    CHECK(transform.apply(energies[sample]).real() == Approx(transformed[sample].real()));
+    CHECK(transform.apply(energies[sample]).imag() == Approx(transformed[sample].imag()));
+  }
+  for (bool clipped : {false, true})
+    for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+    for (const auto estimator : {EnergyGradientEstimator::SCORE_COVARIANCE,
+         EnergyGradientEstimator::HALF_SCORE_COVARIANCE, EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL})
+    {
+      ClippingStreamingOperator derivative(schema, scores,
+          std::vector<std::vector<DerivativeValue>>(5, std::vector<DerivativeValue>(2, {999, -999})));
+      EnergyGradientAccumulator accumulator(schema, 0, estimator, adjoint);
+      accumulateEnergyGradientBatch(derivative, {weights.data(), 5}, {energies.data(), 5}, 0,
+                                    accumulator, adjoint, clipped ? &transform : nullptr);
+      accumulator.completeSingleParticipantReduction();
+      const auto result = accumulator.finalize();
+      const auto& values = clipped ? transformed : energies;
+      DerivativeValue mean{};
+      for (auto value : values) mean += value / 5.0;
+      for (std::size_t parameter = 0; parameter < 2; ++parameter)
+      {
+        double expected = 0;
+        for (std::size_t sample = 0; sample < 5; ++sample)
+          expected += std::real(std::conj(scores[sample][parameter]) * (values[sample] -
+              (estimator == EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL ? DerivativeValue{.6, 0} : mean))) / 5;
+        if (estimator == EnergyGradientEstimator::SCORE_COVARIANCE) expected *= 2;
+        CHECK(result.gradient[parameter] == Approx(expected).margin(2e-13));
+      }
+      CHECK(result.mean_energy.real() == Approx(.6));
+      CHECK(result.mean_energy.imag() == Approx(10.4));
+      CHECK(result.local_energy_term_mask == 0);
+      CHECK(result.gradient[0] == Approx(estimator == EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL
+          ? (clipped ? .4 : 10.4) : 0).margin(1e-13));
+    }
+}
+
+TEST_CASE("Distributed soft quantile weighting preserves the qualified real limit and imaginary energy",
+          "[drivers][training][clipping][complex_gradient_policies][mpi]")
+{
+  const std::vector<DerivativeValue> energies{{0, 3}, {1, -2}, {2, 7}, {100, 5}};
+  const std::vector<double> real{0, 1, 2, 100}, weights(4, 1);
+  const EnergyClippingPolicy policy{EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE, 1, .95};
+  const auto serial = prepareEnergyClippingTransform({energies.data(), energies.size()}, policy);
+  CHECK(serial.descriptor().center == 1.5);
+  CHECK(serial.descriptor().scale == Approx(83.95));
+  auto zero_width = serial.descriptor();
+  zero_width.width = 0;
+  CHECK_THROWS_AS(EnergyClippingTransform(zero_width), std::invalid_argument);
+  // Preserve checked rejection of nonfinite soft tails, rather than publishing NaNs.
+  std::vector<DerivativeValue> extreme(22, 1);
+  extreme.front() = 0;
+  extreme.back() = 1e120;
+  const auto extreme_transform = prepareEnergyClippingTransform({extreme.data(), extreme.size()}, policy);
+  const std::vector<double> extreme_weights(extreme.size(), 1);
+  const auto extreme_schema = makeClippingSchema();
+  ClippingStreamingOperator extreme_operator(extreme_schema,
+      std::vector<std::vector<DerivativeValue>>(22, std::vector<DerivativeValue>(2, 1)),
+      std::vector<std::vector<DerivativeValue>>(22, std::vector<DerivativeValue>(2)));
+  EnergyGradientAccumulator extreme_accumulator(extreme_schema, 0, EnergyGradientEstimator::HALF_SCORE_COVARIANCE);
+  CHECK_THROWS(accumulateEnergyGradientBatch(extreme_operator, {extreme_weights.data(), 22}, {extreme.data(), 22},
+      0, extreme_accumulator, DerivativeAdjoint::TRANSPOSE, &extreme_transform));
+  const auto baseline = prepareClippedScoreObjective({real.data(), 4}, {weights.data(), 4});
+  DerivativeValue mean{};
+  for (auto energy : energies) mean += serial.apply(energy) / 4.0;
+  for (std::size_t sample = 0; sample < energies.size(); ++sample)
+  {
+    CHECK(serial.apply(energies[sample]).imag() == energies[sample].imag());
+    CHECK((serial.apply(energies[sample]).real() - mean.real()) / 4 == Approx(baseline.coefficients[sample].real()).margin(1e-14));
+  }
+  auto& communicator = *OHMMS::Controller;
+  std::vector<DerivativeValue> local;
+  for (std::size_t sample = communicator.rank(); sample < energies.size(); sample += communicator.size())
+    local.push_back(energies[sample]);
+  const auto distributed = prepareEnergyClippingTransform({local.data(), local.size()}, policy, &communicator);
+  CHECK(distributed.descriptor().equivalent(serial.descriptor()));
+  const std::vector<double> local_weights(local.size(), 1);
+  const auto distributed_mean = prepareMeanResidualEnergyClippingTransform(
+      {local.data(), local.size()}, {local_weights.data(), local_weights.size()}, 5, &communicator);
+  const auto serial_mean = prepareMeanResidualEnergyClippingTransform({energies.data(), 4}, {weights.data(), 4});
+  CHECK(distributed_mean.descriptor().equivalent(serial_mean.descriptor()));
+  const auto schema = makeClippingSchema();
+  std::vector<std::vector<DerivativeValue>> global_scores(4, std::vector<DerivativeValue>(2));
+  std::vector<std::vector<DerivativeValue>> local_scores;
+  for (std::size_t sample = 0; sample < 4; ++sample)
+    global_scores[sample] = {{0, 1}, {double(sample % 2), -.25 * sample}};
+  for (std::size_t sample = communicator.rank(); sample < energies.size(); sample += communicator.size())
+    local_scores.push_back(global_scores[sample]);
+  for (const auto estimator : {EnergyGradientEstimator::HALF_SCORE_COVARIANCE,
+                               EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL})
+  {
+    const auto& transform = estimator == EnergyGradientEstimator::HALF_SCORE_COVARIANCE ? distributed : distributed_mean;
+    ClippingStreamingOperator derivative(schema, local_scores,
+        std::vector<std::vector<DerivativeValue>>(local.size(), std::vector<DerivativeValue>(2)), ReductionDomain::RANK_LOCAL);
+    EnergyGradientAccumulator accumulator(schema, 0, estimator);
+    accumulateEnergyGradientBatch(derivative, {local_weights.data(), local_weights.size()},
+        {local.data(), local.size()}, 0, accumulator, DerivativeAdjoint::TRANSPOSE, &transform);
+    DistributedParameterReduction(communicator, {1}).reduce(accumulator);
+    const auto result = accumulator.finalize();
+    DerivativeValue transformed_mean{};
+    for (auto energy : energies) transformed_mean += transform.apply(energy) / 4.0;
+    for (std::size_t parameter = 0; parameter < 2; ++parameter)
+    {
+      double expected = 0;
+      for (std::size_t sample = 0; sample < 4; ++sample)
+        expected += std::real(std::conj(global_scores[sample][parameter]) * (transform.apply(energies[sample]) -
+            (estimator == EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL ? DerivativeValue{25.75, 0} : transformed_mean))) / 4;
+      CHECK(result.gradient[parameter] == Approx(expected).margin(1e-13));
+    }
+    CHECK(result.mean_energy.real() == 25.75);
+    CHECK(result.mean_energy.imag() == 3.25);
+  }
 }
 
 TEST_CASE("Clipping merge enforces transform and complete-population identity",

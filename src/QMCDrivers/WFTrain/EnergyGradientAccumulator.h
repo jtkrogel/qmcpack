@@ -34,8 +34,18 @@ enum class EnergyGradientEstimator
   SYMMETRIZED_HAMILTONIAN,
   PATHWISE_LOCAL_ENERGY,
   /// Real-parameter physical gradient from the full complex score/energy covariance.
-  SCORE_COVARIANCE
+  SCORE_COVARIANCE,
+  HALF_SCORE_COVARIANCE,
+  REAL_CENTERED_SCORE_RESIDUAL
 };
+
+/// Score-only estimators never request local-energy parameter responses.
+inline bool isScoreOnlyEstimator(EnergyGradientEstimator estimator) noexcept
+{
+  return estimator == EnergyGradientEstimator::SCORE_COVARIANCE ||
+      estimator == EnergyGradientEstimator::HALF_SCORE_COVARIANCE ||
+      estimator == EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL;
+}
 
 /// Final scalar moments and one real, parameter-shaped energy gradient.
 struct EnergyGradientResult

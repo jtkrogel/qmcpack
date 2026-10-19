@@ -27,7 +27,8 @@ enum class EnergyClippingScaleRule : std::uint64_t
 {
   MEAN_ABSOLUTE_DEVIATION = 0,
   EMPIRICAL_QUANTILE      = 1,
-  MEDIAN_ABSOLUTE_DEVIATION = 2
+  MEDIAN_ABSOLUTE_DEVIATION = 2,
+  LINEAR_QUANTILE_SOFT_SQUEEZE = 3
 };
 
 /// Fully specified policy used identically by every distributed participant.
@@ -58,8 +59,9 @@ struct EnergyClippingDescriptor
 
 /** Immutable symmetric clipping transform prepared from a complete population.
  *
- * The ordinary policy clamps only the real part. An explicitly componentwise
- * descriptor instead supplies independently prepared real and imaginary windows.
+ * The ordinary policy clamps only the real part; the explicit soft policy replaces
+ * that clamp with logarithmic tails. Componentwise descriptors supply independent
+ * real and imaginary windows. Unselected imaginary components are preserved.
  */
 class EnergyClippingTransform
 {
@@ -91,6 +93,13 @@ EnergyClippingTransform prepareEnergyClippingTransform(
 
 /// Prepare independent median/MAD windows for unit-weight complex samples across ranks.
 EnergyClippingTransform prepareComplexEnergyClippingTransform(
+    DerivativeArrayView<const DerivativeValue> local_energies,
+    DerivativeArrayView<const DerivativeReal> local_weights,
+    DerivativeReal width_multiplier = 5.0,
+    Communicate* communicator = nullptr);
+
+/// Clamp both components about the raw real mean, using their mean absolute residuals.
+EnergyClippingTransform prepareMeanResidualEnergyClippingTransform(
     DerivativeArrayView<const DerivativeValue> local_energies,
     DerivativeArrayView<const DerivativeReal> local_weights,
     DerivativeReal width_multiplier = 5.0,
