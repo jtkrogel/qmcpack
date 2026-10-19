@@ -1320,6 +1320,163 @@ struct PsiFormerComplexWF::Impl
     std::mutex execution_mutex;
   };
 
+  /// Resolve each actual real affine tensor, including the two independent head leaves.
+  static std::vector<wftrain::AffineParameterBlock> affineBlocks(const Model& s)
+  {
+    using Role = psiformer::ParameterRole;
+    const auto schema_block = [&](const psiformer::ParameterTensorDescriptor& tensor) {
+      const auto& blocks = s.schema->blocks();
+      const auto found = std::find_if(blocks.begin(), blocks.end(), [&](const auto& block) {
+        return block.id == tensor.module + "/" + tensor.name && block.offset == tensor.begin &&
+            block.count == tensor.size() && block.shape == tensor.shape &&
+            block.scalar_domain == wftrain::ParameterScalarDomain::REAL64;
+      });
+      if (found == blocks.end())
+        throw std::logic_error("Complex affine tensor differs from the canonical schema");
+      return static_cast<std::size_t>(found - blocks.begin());
+    };
+    std::vector<wftrain::AffineParameterBlock> result;
+    for (const auto& tensor : s.plan.parameterTensors())
+    {
+      switch (tensor.role)
+      {
+      case Role::ELECTRON_EMBEDDING_WEIGHT:
+      case Role::ATTENTION_QUERY_WEIGHT:
+      case Role::ATTENTION_KEY_WEIGHT:
+      case Role::ATTENTION_VALUE_WEIGHT:
+      case Role::ATTENTION_OUTPUT_WEIGHT:
+      case Role::UPDATE_HIDDEN_WEIGHT:
+      case Role::UPDATE_OUTPUT_WEIGHT:
+      case Role::BACKFLOW_UP_WEIGHT:
+      case Role::BACKFLOW_DOWN_WEIGHT: break;
+      default: continue;
+      }
+      const auto weight = schema_block(tensor);
+      auto bias = wftrain::NO_AFFINE_BIAS_BLOCK;
+      if (tensor.role == Role::UPDATE_HIDDEN_WEIGHT || tensor.role == Role::UPDATE_OUTPUT_WEIGHT)
+      {
+        const auto bias_role = tensor.role == Role::UPDATE_HIDDEN_WEIGHT
+            ? Role::UPDATE_HIDDEN_BIAS : Role::UPDATE_OUTPUT_BIAS;
+        bias = schema_block(s.plan.parameter(bias_role, tensor.attention_block));
+        if (s.schema->blocks()[bias].trainable != s.schema->blocks()[weight].trainable)
+          throw std::logic_error("Complex affine weight and bias trainability differ");
+      }
+      if (tensor.shape.size() != 2)
+        throw std::logic_error("Complex affine weight must be a matrix");
+      if (s.schema->blocks()[weight].trainable)
+        result.push_back({s.schema->blocks()[weight].id, weight, bias, tensor.shape[0], tensor.shape[1]});
+    }
+    return result;
+  }
+
+  /// One sample's channel pairing scratch; neither sample count nor parameter count is an axis.
+  struct AffineLane
+  {
+    /// Bind a typed model tensor to its provider ordinal and first-channel scratch interval.
+    struct Binding
+    {
+      psiformer::ParameterRole role;
+      std::size_t attention_block, ordinal, response_offset;
+      psiformer::HeadTensorComponent component;
+    };
+
+    /// Count one saved real sensitivity array per trunk affine boundary.
+    static std::size_t responseElements(const Model& s)
+    {
+      const char* error = "Complex affine response extent overflow";
+      const auto layers = pf::checkedStorageSum(1, pf::checkedStorageProduct(6, s.model.blocks, error), error);
+      return pf::checkedStorageProduct(layers,
+          pf::checkedStorageProduct(s.model.ne, s.model.dim, error), error);
+    }
+
+    /// Charge the score owner and all channel-pairing buffers before numerical allocation.
+    static std::size_t required(const Model& s)
+    {
+      const char* error = "Complex affine owner bytes overflow";
+      auto elements = responseElements(s);
+      pf::addStorageBytes(elements, pf::checkedStorageProduct(2,
+          pf::checkedStorageProduct(s.model.ndet, pf::checkedStorageProduct(s.model.ne, s.model.ne, error), error),
+          error), error);
+      auto bytes = OrbitalMSELane::required(s);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(elements, error), error);
+      return bytes;
+    }
+
+    /// Prepare fixed-size buffers and resolve canonical affine bindings once per owner.
+    explicit AffineLane(const Model& s)
+        : score(s.model, s.plan), work(score.makeWorkspace()), blocks(affineBlocks(s)),
+          real_responses(responseElements(s)),
+          head_real(s.model.ndet * s.model.ne * s.model.ne), head_imaginary(head_real.size())
+    {
+      std::size_t offset = 0;
+      for (std::size_t ordinal = 0; ordinal < blocks.size(); ++ordinal)
+      {
+        const auto& weight = s.schema->blocks()[blocks[ordinal].weight_block];
+        const auto& tensors = s.plan.parameterTensors();
+        const auto tensor = std::find_if(tensors.begin(), tensors.end(), [&](const auto& candidate) {
+          return candidate.begin == weight.offset && candidate.size() == weight.count;
+        });
+        if (tensor == tensors.end())
+          throw std::logic_error("Complex affine observation lacks a tensor binding");
+        bindings.push_back({tensor->role, tensor->attention_block, ordinal, offset, tensor->head_component});
+        if (tensor->role != psiformer::ParameterRole::BACKFLOW_UP_WEIGHT &&
+            tensor->role != psiformer::ParameterRole::BACKFLOW_DOWN_WEIGHT)
+          offset += s.model.ne * blocks[ordinal].output_width;
+      }
+      if (offset > real_responses.size())
+        throw std::logic_error("Complex affine response scratch is smaller than its bindings");
+    }
+
+    /// Report actual retained numeric capacities, including executor-owned ion metadata.
+    std::size_t bytes() const
+    {
+      return work->vectorStorageBytes() + score.numericMetadataStorageBytes() + sizeof(double) *
+          (real_responses.capacity() + head_real.capacity() + head_imaginary.capacity());
+    }
+
+    /// Pair the same typed boundary across the two existing real reverse passes.
+    class ChannelSink final : public pf::DirectAffineObservationSink
+    {
+    public:
+      /// Select which reverse channel this transient adapter consumes.
+      ChannelSink(AffineLane& lane, wftrain::AffineScoreObserver& observer, bool imaginary)
+          : lane_(lane), observer_(observer), imaginary_(imaginary) {}
+      /// Save the amplitude response or pair it with the matching phase response.
+      void observe(const pf::DirectAffineObservation& observation) override
+      {
+        const auto found = std::find_if(lane_.bindings.begin(), lane_.bindings.end(), [&](const auto& binding) {
+          return binding.role == observation.role && binding.attention_block == observation.attention_block;
+        });
+        if (found == lane_.bindings.end())
+          return;
+        const auto& block = lane_.blocks[found->ordinal];
+        if (observation.input_width != block.input_width || observation.output_width != block.output_width)
+          throw std::logic_error("Complex affine observation widths differ from its registry");
+        const auto count = observation.row_count * observation.output_width;
+        if (found->response_offset > lane_.real_responses.size() ||
+            count > lane_.real_responses.size() - found->response_offset)
+          throw std::logic_error("Complex affine observation exceeds prepared response scratch");
+        auto* real = lane_.real_responses.data() + found->response_offset;
+        if (!imaginary_)
+          std::copy_n(observation.sensitivities, count, real);
+        else
+          observer_.observe({found->ordinal, observation.activations, real, observation.row_count,
+                              observation.sensitivities});
+      }
+    private:
+      AffineLane& lane_;
+      wftrain::AffineScoreObserver& observer_;
+      bool imaginary_;
+    };
+
+    const pf::DirectComplexScoreExecutor score;
+    std::unique_ptr<pf::DirectComplexScoreWorkspace> work;
+    const std::vector<wftrain::AffineParameterBlock> blocks;
+    std::vector<Binding> bindings;
+    std::vector<double> real_responses, head_real, head_imaginary;
+    std::mutex execution_mutex;
+  };
+
   /// Immutable sample snapshot; operators in one model family lease a single numerical lane.
   struct DerivativeStream final : wftrain::StreamingDerivativeOperator
   {
@@ -2161,6 +2318,7 @@ struct PsiFormerComplexWF::Impl
   psiformer::PsiFormerTimers phase_timers;
   std::shared_ptr<Model> state;
   std::shared_ptr<OrbitalMSELane> orbital_mse;
+  std::shared_ptr<AffineLane> affine_lane;
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
@@ -2679,6 +2837,137 @@ bool PsiFormerComplexWF::gpuInferenceEnabled() const noexcept { return impl_->st
 const wftrain::StructuredParameterSchema& PsiFormerComplexWF::parameterSchema() const noexcept
 {
   return *impl_->state->schema;
+}
+
+/// Expose exact affine metadata for the qualified CPU component.
+std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::affineParameterBlocks() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return gpuInferenceEnabled() ? std::vector<wftrain::AffineParameterBlock>{} : Impl::affineBlocks(*impl_->state);
+}
+
+/// Classify trainable cusp coordinates without treating envelope tensors as generic sums.
+std::vector<std::size_t> PsiFormerComplexWF::genericKFACParameterBlocks() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  std::vector<std::size_t> result;
+  const auto& state = *impl_->state;
+  for (auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA, psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA})
+    if (state.plan.hasParameter(role))
+    {
+      const auto offset = state.plan.parameter(role).begin;
+      for (std::size_t block = 0; block < state.schema->blocks().size(); ++block)
+        if (state.schema->blocks()[block].offset == offset && state.schema->blocks()[block].trainable)
+          result.push_back(block);
+    }
+  return result;
+}
+
+/// Inspect required and prepared numeric storage under the model/factory locks.
+PsiFormerComplexWF::AffineScoreStorage PsiFormerComplexWF::affineScoreStorage() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  std::lock_guard factory(impl_->state->derivative_factory_mutex);
+  return {Impl::AffineLane::required(*impl_->state), impl_->affine_lane ? impl_->affine_lane->bytes() : 0};
+}
+
+/// Allocate the complete affine owner only after explicit idle-state and budget admission.
+void PsiFormerComplexWF::prepareAffineScores(std::size_t maximum_bytes)
+{
+  NativeTimerScope timer(impl_->phase_timers.preparation);
+  const auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex affine observations require CPU execution");
+  impl_->requireIdle(*impl_->particles);
+  Impl::validateDerivativeSource(*state);
+  const auto required = Impl::AffineLane::required(*state);
+  if (!maximum_bytes || maximum_bytes == std::numeric_limits<std::size_t>::max() || required > maximum_bytes)
+    throw std::length_error("Complex affine numeric cap exceeded before preparation");
+  if (state->pending_proposals.load(std::memory_order_relaxed))
+    throw std::logic_error("Complex affine preparation requires an idle model family");
+  std::lock_guard factory(state->derivative_factory_mutex);
+  if (!impl_->affine_lane)
+  {
+    auto lane = std::make_shared<Impl::AffineLane>(*state);
+    if (lane->bytes() != required)
+      throw std::logic_error("Complex affine prepared storage differs from its admission");
+    impl_->affine_lane = std::move(lane);
+  }
+}
+
+/// Observe one retained sample without changing accepted inference caches or model parameters.
+void PsiFormerComplexWF::observeComplexAffineScores(const ParticleSet& particles,
+    wftrain::AffineScoreObserver& observer, std::vector<double>& real_score,
+    std::vector<double>& imaginary_score) const
+{
+  NativeTimerScope timer(impl_->phase_timers.cpu_reverse);
+  const auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex affine observations require CPU execution");
+  impl_->requireIdle(*impl_->particles);
+  Impl::validateDerivativeSource(*state);
+  const auto n = state->model.ne, up = state->model.cfg.nup;
+  if (state->pending_proposals.load(std::memory_order_relaxed) || particles.getActivePtcl() >= 0 ||
+      particles.R.getUnit() != PosUnit::Cartesian || particles.isSpinor() || particles.getTotalNum() != n ||
+      particles.groups() != 2 || particles.groupsize(0) != up || particles.groupsize(1) != n - up ||
+      particles.R.size() != n || particles.GroupID.size() != n)
+    throw std::invalid_argument("Complex affine sample/proposal/spin mismatch");
+  validateRuntimeLattice(particles, state->environment, "Complex affine sample");
+  for (std::size_t row = 0; row < n; ++row)
+    for (int d = 0; d < 3; ++d)
+      if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
+        throw std::invalid_argument("Complex affine coordinates/spin order invalid");
+  std::shared_ptr<Impl::AffineLane> lane;
+  {
+    std::lock_guard factory(state->derivative_factory_mutex);
+    lane = impl_->affine_lane;
+  }
+  if (!lane)
+    throw std::logic_error("Complex affine scores must be explicitly prepared");
+  std::lock_guard execution(lane->execution_mutex);
+  Impl::AffineLane::ChannelSink real(*lane, observer, false), imaginary(*lane, observer, true);
+  impl_->positions(*lane->work, particles);
+  const auto result = lane->score.evaluate(*lane->work, &real, &imaginary);
+  const auto channels = state->model.ndet * n, width = state->model.dim;
+  for (std::size_t spin = 0; spin < 2; ++spin)
+  {
+    const std::size_t begin = spin ? up : 0, end = spin ? n : up;
+    const auto role = spin ? psiformer::ParameterRole::BACKFLOW_DOWN_WEIGHT : psiformer::ParameterRole::BACKFLOW_UP_WEIGHT;
+    for (std::size_t row = begin; row < end; ++row)
+      for (std::size_t channel = 0; channel < channels; ++channel)
+      {
+        const auto sensitivity = result.head_sensitivities[(channel / n * n + row) * n + channel % n];
+        const auto index = (row - begin) * channels + channel;
+        lane->head_real[index] = sensitivity.real();
+        lane->head_imaginary[index] = sensitivity.imag();
+      }
+    for (auto component : {psiformer::HeadTensorComponent::REAL, psiformer::HeadTensorComponent::IMAG})
+    {
+      const auto binding = std::find_if(lane->bindings.begin(), lane->bindings.end(), [&](const auto& candidate) {
+        return candidate.role == role && candidate.component == component;
+      });
+      if (binding == lane->bindings.end())
+        continue;
+      if (component == psiformer::HeadTensorComponent::IMAG)
+        for (std::size_t index = 0; index < (end - begin) * channels; ++index)
+          lane->head_imaginary[index] = -lane->head_imaginary[index];
+      observer.observe({binding->ordinal, result.head_activations + begin * width,
+          component == psiformer::HeadTensorComponent::REAL ? lane->head_real.data() : lane->head_imaginary.data(),
+          end - begin,
+          component == psiformer::HeadTensorComponent::REAL ? lane->head_imaginary.data() : lane->head_real.data()});
+    }
+  }
+  if (result.parameter_version != state->model.p.version() || result.parameter_count != state->schema->parameterCount())
+    throw std::logic_error("Complex affine result has an inconsistent parameter identity");
+  real_score.resize(result.parameter_count);
+  imaginary_score.resize(result.parameter_count);
+  for (std::size_t parameter = 0; parameter < result.parameter_count; ++parameter)
+  {
+    real_score[parameter] = result.parameter_score[parameter].real();
+    imaginary_score[parameter] = result.parameter_score[parameter].imag();
+  }
 }
 
 /// Immutable typed roles select canonical weights, never names masquerading as policy.

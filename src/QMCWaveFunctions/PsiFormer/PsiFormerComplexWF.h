@@ -70,6 +70,22 @@ public:
   /// Select typed neural weights, including imaginary backflow heads, for decoupled shrink.
   std::vector<std::string> neuralWeightBlocks() const override;
 
+  /// Classify real trunk tensors and both real leaves of each complex affine head.
+  std::vector<wftrain::AffineParameterBlock> affineParameterBlocks() const override;
+  /// Return the canonical cusp blocks with registered generic-diagonal statistics.
+  std::vector<std::size_t> genericKFACParameterBlocks() const override;
+  /// Stream amplitude and phase responses using the explicitly prepared CPU owner.
+  void observeComplexAffineScores(const ParticleSet&, wftrain::AffineScoreObserver&,
+                                  std::vector<double>& real_score,
+                                  std::vector<double>& imaginary_score) const override;
+
+  /// Explicit score/affine owner, separately charged from inference and kinetic products.
+  struct AffineScoreStorage { std::size_t required_bytes, prepared_bytes; };
+  /// Report exact numeric preparation requirements without allocating a workspace.
+  AffineScoreStorage affineScoreStorage() const;
+  /// Admit and prepare one reusable affine workspace before observing any samples.
+  void prepareAffineScores(std::size_t maximum_bytes);
+
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 

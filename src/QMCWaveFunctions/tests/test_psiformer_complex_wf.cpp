@@ -22,6 +22,7 @@
 #include "Utilities/FakeRandom.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+#include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
@@ -1114,6 +1115,114 @@ TEST_CASE("PsiFormer public inference rejects unsafe inherited fallback APIs",
   close(spin, C{.2, -.1});
   close(gradient[0], C{.3, .4});
   close(ratios[0], C{.7, -.2});
+}
+
+TEST_CASE("Complex provider affine rows preserve canonical phase scores and bounded factors",
+          "[wavefunction][psiformer][complex_wf][complex_affine_provider]")
+{
+  using namespace wftrain;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF component("affine", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  const auto& schema = component.parameterSchema();
+  const auto affine = component.affineParameterBlocks();
+  REQUIRE_FALSE(affine.empty());
+  std::vector<KFACAffineBlockDescriptor> descriptors;
+  std::vector<bool> covered(schema.blocks().size());
+  for (const auto& block : affine)
+  {
+    descriptors.push_back({block.id, block.weight_block, block.bias_block, block.input_width, block.output_width});
+    covered[block.weight_block] = true;
+    if (block.bias_block != NO_AFFINE_BIAS_BLOCK)
+      covered[block.bias_block] = true;
+  }
+  std::vector<std::size_t> fallback;
+  for (std::size_t block = 0; block < covered.size(); ++block)
+    if (!covered[block] && schema.blocks()[block].trainable)
+      fallback.push_back(block);
+  KFACFactorAccumulator factors({schema, descriptors, fallback, component.genericKFACParameterBlocks()}, 0,
+                                 KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  class Observer final : public AffineScoreObserver
+  {
+  public:
+    Observer(const StructuredParameterSchema& schema, const std::vector<AffineParameterBlock>& blocks,
+             KFACFactorAccumulator& factors)
+        : response(schema.parameterCount()), schema_(schema), blocks_(blocks), factors_(factors) {}
+    void observe(const AffineScoreObservation& observation) override
+    {
+      REQUIRE(observation.imaginary_sensitivities != nullptr);
+      const auto& block = blocks_.at(observation.affine_block);
+      const auto weight_offset = schema_.blocks()[block.weight_block].offset;
+      for (std::size_t row = 0; row < observation.row_count; ++row)
+        for (std::size_t output = 0; output < block.output_width; ++output)
+        {
+          const auto index = row * block.output_width + output;
+          const C sensitivity{observation.sensitivities[index], observation.imaginary_sensitivities[index]};
+          for (std::size_t input = 0; input < block.input_width; ++input)
+            response[weight_offset + input * block.output_width + output] +=
+                observation.activations[row * block.input_width + input] * sensitivity;
+          if (block.bias_block != NO_AFFINE_BIAS_BLOCK)
+            response[schema_.blocks()[block.bias_block].offset + output] += sensitivity;
+        }
+      factors_.addObservation({observation.affine_block,
+          {observation.activations, observation.row_count * block.input_width},
+          {observation.sensitivities, observation.row_count * block.output_width}, observation.row_count,
+          {observation.imaginary_sensitivities, observation.row_count * block.output_width}});
+    }
+    std::vector<C> response;
+  private:
+    const StructuredParameterSchema& schema_;
+    const std::vector<AffineParameterBlock>& blocks_;
+    KFACFactorAccumulator& factors_;
+  } observer(schema, affine, factors);
+  std::vector<double> real, imaginary;
+  CHECK_THROWS(component.observeComplexAffineScores(p, observer, real, imaginary));
+  const auto required = component.affineScoreStorage().required_bytes;
+  CHECK(component.affineScoreStorage().prepared_bytes == 0);
+  CHECK_THROWS(component.prepareAffineScores(required - 1));
+  CHECK(component.affineScoreStorage().prepared_bytes == 0);
+  component.prepareAffineScores(required);
+  CHECK(component.affineScoreStorage().prepared_bytes == required);
+  factors.beginSample(1);
+  component.observeComplexAffineScores(p, observer, real, imaginary);
+  factors.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+  factors.endSample();
+  reduceKFACFactorStatistics(factors);
+  REQUIRE(real.size() == schema.parameterCount());
+  REQUIRE(imaginary.size() == real.size());
+  bool phase_response = false;
+  for (std::size_t block = 0; block < covered.size(); ++block)
+    if (covered[block])
+      for (std::size_t index = schema.blocks()[block].offset;
+           index < schema.blocks()[block].offset + schema.blocks()[block].count; ++index)
+      {
+        close(observer.response[index], {real[index], imaginary[index]}, 3e-10);
+        phase_response |= std::abs(imaginary[index]) > 1e-8;
+      }
+  CHECK(phase_response);
+  CHECK(factors.sampleCount() == 1);
+  const KFACPreconditioner inverse(factors);
+  CHECK(inverse.storageDiagnostics().affine_block_count == affine.size());
+  const auto original = component.snapshotParameters();
+  const double step = 1e-5;
+  for (const auto& block : affine)
+  {
+    const auto index = schema.blocks()[block.weight_block].offset;
+    auto candidate = component.snapshotParameters();
+    candidate.values[index] += step;
+    component.publishParameters(candidate, candidate.version);
+    const C plus = evaluate(component, p);
+    candidate = component.snapshotParameters();
+    candidate.values[index] -= 2 * step;
+    component.publishParameters(candidate, candidate.version);
+    const C minus = evaluate(component, p);
+    candidate = component.snapshotParameters();
+    candidate.values = original.values;
+    component.publishParameters(candidate, candidate.version);
+    close({real[index], imaginary[index]}, (plus - minus) / (2 * step), 2e-7);
+  }
+  CHECK(component.affineScoreStorage().prepared_bytes == required);
 }
 
 TEST_CASE("PsiFormer complex structured provider publishes canonical real tensors atomically",

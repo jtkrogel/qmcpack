@@ -151,6 +151,15 @@ public:
   virtual void observeAffineScores(const ParticleSet&, AffineScoreObserver&, std::vector<double>&) const
   { throw std::runtime_error("Provider does not support affine score observations"); }
 
+  /// Stream both response channels for real parameters; an empty imaginary score denotes zero.
+  virtual void observeComplexAffineScores(const ParticleSet& particles, AffineScoreObserver& observer,
+                                          std::vector<double>& real_score,
+                                          std::vector<double>& imaginary_score) const
+  {
+    observeAffineScores(particles, observer, real_score);
+    imaginary_score.clear();
+  }
+
   /** Atomically publish a complete candidate if the expected version matches.
    *
    * Returns the newly committed version.  Implementations must reject schema,
