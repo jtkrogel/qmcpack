@@ -719,7 +719,8 @@ public:
    * a fresh forward call. Seeds may not alias the reusable reverse score scratch.
    */
   DirectScoreTrunkReverseResult reverseTrunk(DirectScoreTrunkWorkspace& workspace,
-      const DirectScoreTrunkResultView& tape, const double* seed, std::size_t seed_count) const
+      const DirectScoreTrunkResultView& tape, const double* seed, std::size_t seed_count,
+      DirectAffineObservationSink* observer = nullptr) const
   {
     workspace.invalidateReverse();
     validateTrunkOwner(workspace);
@@ -746,7 +747,12 @@ public:
              &workspace.residual_adjoint_, &workspace.hidden_adjoint_, &workspace.update_adjoint_})
       std::fill(buffer->begin(), buffer->end(), 0.0);
     std::copy_n(seed, seed_count, workspace.feature_adjoint_a_.data());
-    reverseFeatures(parameters_.flat_values().data(), workspace);
+    reverseFeatures(parameters_.flat_values().data(), workspace, observer);
+    if (observer)
+      observer->observe({qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
+                         qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
+                         workspace.raw_features_.data(), workspace.feature_adjoint_a_.data(),
+                         workspace.electrons_, workspace.input_width_, workspace.width_});
     // Reverse helpers swap only adjoint buffers, never any immutable forward tape.
     if (workspace.blocks_ % 2)
       workspace.feature_adjoint_a_.swap(workspace.feature_adjoint_b_);

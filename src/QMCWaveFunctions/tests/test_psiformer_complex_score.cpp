@@ -50,7 +50,95 @@ C difference(pf::PsiFormer& model, const pf::DirectComplexValueExecutor& executo
   model.p.set_flat_values(original);
   return (plus - minus) / (2 * step);
 }
+
+/// Reconstruct one real response channel from explicit affine rows in test code.
+class AffineResponseOracle final : public pf::DirectAffineObservationSink
+{
+public:
+  explicit AffineResponseOracle(const ps::PsiFormerExecutionPlan& plan)
+      : gradient(plan.parameterCount()), covered(plan.parameterCount()), plan_(plan) {}
+
+  void observe(const pf::DirectAffineObservation& observation) override
+  {
+    const auto& tensor = plan_.parameter(observation.role, observation.attention_block);
+    REQUIRE(tensor.size() == observation.input_width * observation.output_width);
+    for (std::size_t input = 0; input < observation.input_width; ++input)
+      for (std::size_t output = 0; output < observation.output_width; ++output)
+      {
+        const auto parameter = tensor.begin + input * observation.output_width + output;
+        REQUIRE_FALSE(covered[parameter]);
+        covered[parameter] = true;
+        for (std::size_t row = 0; row < observation.row_count; ++row)
+          gradient[parameter] += observation.activations[row * observation.input_width + input] *
+              observation.sensitivities[row * observation.output_width + output];
+      }
+    using Role = ps::ParameterRole;
+    if (observation.role == Role::UPDATE_HIDDEN_WEIGHT || observation.role == Role::UPDATE_OUTPUT_WEIGHT)
+    {
+      const auto bias_role = observation.role == Role::UPDATE_HIDDEN_WEIGHT
+          ? Role::UPDATE_HIDDEN_BIAS : Role::UPDATE_OUTPUT_BIAS;
+      const auto& bias = plan_.parameter(bias_role, observation.attention_block);
+      for (std::size_t output = 0; output < observation.output_width; ++output)
+      {
+        covered[bias.begin + output] = true;
+        for (std::size_t row = 0; row < observation.row_count; ++row)
+          gradient[bias.begin + output] += observation.sensitivities[row * observation.output_width + output];
+      }
+    }
+    ++observations;
+  }
+
+  std::vector<double> gradient;
+  std::vector<bool> covered;
+  std::size_t observations = 0;
+private:
+  const ps::PsiFormerExecutionPlan& plan_;
+};
 } // namespace
+
+TEST_CASE("Complex affine observations reconstruct both trunk and paired head scores",
+          "[wavefunction][psiformer][complex_score][complex_affine]")
+{
+  auto model = tinyModel(true, true);
+  const auto execution_plan = plan(model, true, true);
+  pf::DirectComplexScoreExecutor score(model, execution_plan);
+  auto workspace = score.makeWorkspace();
+  const auto positions = model.cfg.configuration(0);
+  workspace->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+  const auto bytes = workspace->vectorStorageBytes(), fingerprint = workspace->storageFingerprint();
+  AffineResponseOracle real(execution_plan), imaginary(execution_plan);
+  const auto result = score.evaluate(*workspace, &real, &imaginary);
+  REQUIRE(result.head_activations != nullptr);
+  REQUIRE(result.head_sensitivities != nullptr);
+  CHECK(real.observations == 1 + 6 * model.blocks);
+  CHECK(imaginary.observations == real.observations);
+  for (std::size_t parameter = 0; parameter < result.parameter_count; ++parameter)
+    if (real.covered[parameter])
+      close({real.gradient[parameter], imaginary.gradient[parameter]}, result.parameter_score[parameter], 2e-11);
+  const auto channels = model.ndet * model.ne;
+  for (std::size_t spin = 0; spin < 2; ++spin)
+  {
+    const auto role = spin ? ps::ParameterRole::BACKFLOW_DOWN_WEIGHT : ps::ParameterRole::BACKFLOW_UP_WEIGHT;
+    const auto& real_head = execution_plan.parameter(role);
+    const auto& imaginary_head = execution_plan.parameter(role, ps::NO_ATTENTION_BLOCK, ps::HeadTensorComponent::IMAG);
+    const auto begin = spin ? model.cfg.nup : 0, end = spin ? model.ne : model.cfg.nup;
+    for (std::size_t feature = 0; feature < model.dim; ++feature)
+      for (std::size_t channel = 0; channel < channels; ++channel)
+      {
+        C response{};
+        for (std::size_t row = begin; row < end; ++row)
+          response += result.head_activations[row * model.dim + feature] *
+              result.head_sensitivities[(channel / model.ne * model.ne + row) * model.ne + channel % model.ne];
+        const auto index = feature * channels + channel;
+        close(response, result.parameter_score[real_head.begin + index], 2e-11);
+        close(C{0, 1} * response, result.parameter_score[imaginary_head.begin + index], 2e-11);
+      }
+  }
+  CHECK(workspace->vectorStorageBytes() == bytes);
+  CHECK(workspace->storageFingerprint() == fingerprint);
+  CHECK_THROWS(score.evaluate(*workspace, &real, nullptr));
+  CHECK(score.evaluate(*workspace).head_sensitivities == nullptr);
+}
 
 TEST_CASE("PsiFormer complete complex score covers every real canonical tensor and tail",
           "[wavefunction][psiformer][complex_score]")

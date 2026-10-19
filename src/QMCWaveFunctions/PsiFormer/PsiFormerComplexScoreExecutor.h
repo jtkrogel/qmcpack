@@ -22,6 +22,10 @@ struct DirectComplexScoreResult
   qmcplusplus::psiformer::determinant::ComplexLogAmplitude amplitude;
   const qmcplusplus::psiformer::determinant::Complex* parameter_score = nullptr;
   std::size_t parameter_count = 0, parameter_version = 0, evaluation_generation = 0;
+  /// Present only for affine observation requests; valid until the next workspace mutation.
+  const double* head_activations = nullptr;
+  /// Complex head responses in determinant,row,column order, including the envelope.
+  const qmcplusplus::psiformer::determinant::Complex* head_sensitivities = nullptr;
 };
 
 /// Caller owns the real P output; it must not alias targets, model or workspace storage.
@@ -253,12 +257,16 @@ public:
   }
 
   /// Compose amplitude, analytic head/envelope/cusp seeds, and two real trunk reverses.
-  DirectComplexScoreResult evaluate(DirectComplexScoreWorkspace& w) const
+  DirectComplexScoreResult evaluate(DirectComplexScoreWorkspace& w,
+      DirectAffineObservationSink* real_observer = nullptr,
+      DirectAffineObservationSink* imaginary_observer = nullptr) const
   {
     using namespace qmcplusplus::psiformer;
     w.invalidate();
     if (w.owner_ != this)
       throw std::invalid_argument("PsiFormer complex score workspace belongs to another executor");
+    if ((real_observer == nullptr) != (imaginary_observer == nullptr))
+      throw std::invalid_argument("PsiFormer complex affine observations require both response channels");
     const auto tape = trunk_.evaluateTrunk(*w.trunk_);
     const auto& identities = tape.geometry->electronPairs();
     const auto& electron_radii = tape.geometry->electronElectronPairs().distances();
@@ -307,7 +315,8 @@ public:
                 component ? contribution.imag() : contribution.real();
           }
         }
-      const auto reverse = trunk_.reverseTrunk(*w.trunk_, tape, w.feature_seed_.data(), w.feature_seed_.size());
+      const auto reverse = trunk_.reverseTrunk(*w.trunk_, tape, w.feature_seed_.data(), w.feature_seed_.size(),
+                                               component ? imaginary_observer : real_observer);
       for (std::size_t parameter = 0; parameter < parameter_count_; ++parameter)
         w.score_[parameter] += component ? C{0, reverse.parameter_score[parameter]} :
                                           C{reverse.parameter_score[parameter], 0};
@@ -327,6 +336,19 @@ public:
       if (!determinant::isFiniteReal(value.real()) || !determinant::isFiniteReal(value.imag()))
         throw std::overflow_error("PsiFormer complex score response overflow");
     w.result_ = {amplitude, w.score_.data(), parameter_count_, tape.parameter_version, w.generation_};
+    if (real_observer)
+    {
+      // The matrix adjoints have completed every reverse product and can now hold
+      // the head response without adding another orbital-sized numerical buffer.
+      for (std::size_t element = 0; element < w.matrix_adjoint_.size(); ++element)
+      {
+        w.matrix_adjoint_[element] *= w.envelopes_[element];
+        if (!determinant::isFiniteComplex(w.matrix_adjoint_[element]))
+          throw std::overflow_error("PsiFormer complex affine head response overflow");
+      }
+      w.result_.head_activations = tape.features;
+      w.result_.head_sensitivities = w.matrix_adjoint_.data();
+    }
     w.valid_ = true;
     return w.result_;
   }
