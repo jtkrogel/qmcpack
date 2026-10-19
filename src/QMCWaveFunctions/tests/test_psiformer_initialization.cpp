@@ -279,7 +279,7 @@ TEST_CASE("PsiFormer complex periodic initialization uses independent normalized
   CHECK(initialized.values.size() == 1644802);
   CHECK(initialized.diagnostics.constant_parameter_count == 514);
   CHECK(initialized.diagnostics.random_parameter_count == 1644288);
-  CHECK(PARAMETER_ROLE_COUNT == 17);
+  CHECK(PARAMETER_ROLE_COUNT == 19);
   CHECK_FALSE(PsiFormerExecutionPlan::capabilities().complex_scalars);
   for (ParameterRole role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
   {
@@ -361,6 +361,45 @@ TEST_CASE("PsiFormer v1 initialization rejects unsupported profiles and shapes",
   invalid = valid;
   invalid.nuclei = std::numeric_limits<std::size_t>::max();
   CHECK_THROWS_AS(initializePsiFormerParameters(invalid, 0), std::overflow_error);
+}
+
+TEST_CASE("Periodic pair initialization requires explicit metadata and zero affine biases",
+          "[wavefunction][psiformer][periodic_profile]")
+{
+  const ModelShape shape{2, 2, 1, 16, 256, 4, 4};
+  auto environment = pairedPeriodicEnvironment();
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment),
+                  std::invalid_argument);
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+  auto metadata = std::make_shared<PeriodicProfileMetadata>();
+  metadata->cells.primitive = metadata->cells.simulation =
+      {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+  metadata->primitive_motif = {{0, 0, 0}};
+  metadata->motif_species = {3};
+  metadata->feature_transform = PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+  metadata->occupied_columns = {{{0, 0, 0}, 0, 0, 1}, {{0, 0, 0}, 1, 0, 1},
+                                {{0, 0, 0}, 0, 1, 1}, {{0, 0, 0}, 1, 1, 1}};
+  environment.periodic_profile = metadata;
+  CHECK_THROWS_AS(initializePsiFormerParameters(shape, 29, PSIFORMER_COMPLEX_PERIODIC_V1, environment),
+                  std::invalid_argument);
+  const auto initialized = initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment);
+  const PsiFormerExecutionPlan plan(shape, initialized.layouts, initialized.environment);
+  CHECK(initialized.profile == PSIFORMER_PERIODIC_PAIR_V1);
+  CHECK(initialized.environment.periodic_profile->feature_transform == PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1);
+  CHECK(initialized.environment.periodic_profile.get() != metadata.get());
+  for (std::size_t block = 0; block < shape.attention_blocks; ++block)
+    for (auto role : {ParameterRole::PAIR_ATTENTION_WEIGHT, ParameterRole::PAIR_ATTENTION_BIAS})
+    {
+      const auto& tensor = plan.parameter(role, block);
+      CHECK(std::all_of(initialized.values.begin() + tensor.begin, initialized.values.begin() + tensor.end,
+                        [](double value) { return value == 0; }));
+    }
+  environment.head_representation = HeadRepresentation::REAL;
+  environment.amplitude_scalar_domain = ScalarDomain::REAL;
+  const auto real = initializePsiFormerParameters(shape, 29, PSIFORMER_PERIODIC_PAIR_V1, environment);
+  const PsiFormerExecutionPlan real_plan(shape, real.layouts, real.environment);
+  CHECK_FALSE(real_plan.hasParameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG));
+  CHECK(real_plan.hasParameter(ParameterRole::PAIR_ATTENTION_WEIGHT, 0));
 }
 
 } // namespace qmcplusplus::psiformer

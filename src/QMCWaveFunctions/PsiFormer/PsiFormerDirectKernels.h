@@ -96,7 +96,8 @@ inline void attentionWeightsForward(const double* query,
                                     std::size_t electrons,
                                     std::size_t heads,
                                     std::size_t head_width,
-                                    double* weights)
+                                    double* weights,
+                                    bool add_existing_logits = false)
 {
   const std::size_t width = heads * head_width;
   const double scale      = 1.0 / std::sqrt(static_cast<double>(head_width));
@@ -112,7 +113,10 @@ inline void attentionWeightsForward(const double* query,
         const std::size_t key_begin   = key_electron * width + head * head_width;
         for (std::size_t feature = 0; feature < head_width; ++feature)
           logit += query[query_begin + feature] * key[key_begin + feature];
+        const double bias = add_existing_logits ? row[key_electron] : 0;
         row[key_electron] = scale * logit;
+        if (add_existing_logits)
+          row[key_electron] += bias;
         row_maximum       = std::max(row_maximum, row[key_electron]);
       }
 

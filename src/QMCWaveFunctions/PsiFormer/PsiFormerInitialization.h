@@ -34,6 +34,9 @@ inline constexpr char DEEPQMC_PSIFORMER_V1[] = "deepqmc_psiformer_v1";
 /// Full complex periodic heads with real trunk/parameters and no inner phases.
 inline constexpr char PSIFORMER_COMPLEX_PERIODIC_V1[] = "psiformer_complex_periodic_v1";
 
+/// Opt-in two-cell features, affine pair bias and explicit occupied full complex heads.
+inline constexpr char PSIFORMER_PERIODIC_PAIR_V1[] = "psiformer_periodic_pair_v1";
+
 /// Stable name of the integer generator and Gaussian transform used by v1.
 inline constexpr char PSIFORMER_INITIALIZATION_RNG_V1[] = "splitmix64_box_muller_v1";
 
@@ -90,6 +93,7 @@ struct InitializedPsiFormerParameters
   std::vector<ParameterLayoutInput> layouts;
   std::vector<double> values;
   InitializationDiagnostics diagnostics;
+  ExecutionEnvironment environment;
 };
 
 /**

@@ -2275,7 +2275,7 @@ private:
         const std::size_t configuration = tile_begin + local;
         try
         {
-          spatial_executor_.buildAttentionWeights(*workspaces[local]);
+          spatial_executor_.buildAttentionWeights(parameters, layer, *workspaces[local]);
           spatial_executor_.buildAttentionContext(*workspaces[local]);
         }
         catch (const std::exception& error)

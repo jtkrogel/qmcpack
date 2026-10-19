@@ -38,6 +38,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
+#include "PsiFormerPeriodicFeatures.h"
 
 #include "PsiFormerDenseKernels.h"
 #include "PsiFormerDeterminant.h"
@@ -171,7 +172,8 @@ protected:
         attention_elements_(heads_ * electrons_ * electrons_),
         orbital_elements_(determinants_ * electrons_ * electrons_),
         electron_positions_(3 * electrons_),
-        geometry_(electrons_, nuclei, boundary),
+        geometry_(qmcplusplus::psiformer::periodic_feature::makeGeometry(
+            electrons_, nuclei, boundary, plan.environment().periodic_profile)),
         raw_features_(electrons_ * input_width_, gradient_lanes_, laplacian_lanes_),
         feature_adjoint_a_(feature_elements_, gradient_lanes_, laplacian_lanes_),
         feature_adjoint_b_(feature_elements_, gradient_lanes_, laplacian_lanes_),
@@ -648,6 +650,10 @@ public:
     using qmcplusplus::psiformer::BoundaryCondition;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan_.environment();
+    if (environment.periodic_profile)
+      for (const auto& column : environment.periodic_profile->occupied_columns)
+        if (column.reciprocal != std::array<int, 3>{})
+          throw std::invalid_argument("Occupied reciprocal phases require a qualified kinetic head");
     if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         (preparation_ == DirectKineticPreparation::REAL_WAVEFUNCTION &&
@@ -896,7 +902,7 @@ private:
   void buildEmbedding(const double* parameters, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Build scaled query-key logits for one attention block.
-  void buildAttentionLogits(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
+  void buildAttentionLogits(const double* parameters, std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Normalize one block's attention rows with stable trace-jet softmax.
   void softmaxForward(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
@@ -930,7 +936,8 @@ private:
   void softmaxReverse(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Reverse query-key logits into query and key trace jets.
-  void reverseAttentionLogits(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
+  void reverseAttentionLogits(std::size_t block, DirectKineticTrunkWorkspace& workspace,
+                              std::vector<double>& destination) const;
 
   /// Reverse attention-value contraction into probabilities and values.
   void reverseAttentionContext(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
@@ -1308,6 +1315,25 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
       if (radius == 0.0)
         throw std::runtime_error(
             "PsiFormer kinetic response is undefined at electron-nucleus coalescence");
+      if (plan_.environment().periodic_profile)
+      {
+        const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
+            workspace.geometry_.electronIonBoundary(), 1,
+            plan_.environment().periodic_profile->feature_transform, 1);
+        const auto begin = row_begin + 7 * nucleus;
+        std::copy_n(jet.value.data(), 7, raw.value.data() + begin);
+        if (workspace.containsTarget(electron))
+        {
+          const auto target = electron - workspace.target_begin_;
+          for (std::size_t f = 0; f < 7; ++f)
+          {
+            raw.laplacian[laplacianIndex(raw, target, begin + f)] = jet.laplacian[f];
+            for (std::size_t d = 0; d < 3; ++d)
+              raw.gradient[gradientIndex(raw, 3 * target + d, begin + f)] = jet.gradient[f][d];
+          }
+        }
+        continue;
+      }
       const GeometryPosition& displacement = displacements[pair];
       const SoftenedRadialFactors& radial  = factors[pair];
       const std::size_t radial_element     = row_begin + pair_width * nucleus;
@@ -1386,7 +1412,7 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
 
 /// Form one block's scaled query-key products.
 inline void DirectKineticExecutor::buildAttentionLogits(
-    std::size_t block,
+    const double* parameters, std::size_t block,
     DirectKineticTrunkWorkspace& workspace) const
 {
   DirectTraceJetBuffer& logits = workspace.logits_[block];
@@ -1414,6 +1440,45 @@ inline void DirectKineticExecutor::buildAttentionLogits(
                                 logits, output, scale);
         }
       }
+  if (plan_.environment().periodic_profile)
+  {
+    const auto* weights = parameter(parameters, ParameterRole::PAIR_ATTENTION_WEIGHT, block);
+    const auto* bias = parameter(parameters, ParameterRole::PAIR_ATTENTION_BIAS, block);
+    for (std::size_t pair = 0; pair < workspace.geometry_.electronPairs().size(); ++pair)
+    {
+      const auto& identity = workspace.geometry_.electronPairs()[pair];
+      const double spin = (identity.first < spin_up_electrons_) == (identity.second < spin_up_electrons_) ? 1 : -1;
+      for (int orientation : {1, -1})
+      {
+        const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(
+            workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
+            plan_.environment().periodic_profile->feature_transform, spin);
+        if (!jet.differentiable)
+          throw std::runtime_error("Pair-attention kinetic products are undefined at electron coalescence");
+        const auto row = orientation == 1 ? identity.first : identity.second;
+        const auto column = orientation == 1 ? identity.second : identity.first;
+        for (std::size_t head = 0; head < workspace.heads_; ++head)
+        {
+          const auto output = (head * workspace.electrons_ + row) * workspace.electrons_ + column;
+          logits.value[output] += bias[head];
+          for (std::size_t f = 0; f < 8; ++f)
+          {
+            const auto weight = weights[f * workspace.heads_ + head];
+            logits.value[output] += weight * jet.value[f];
+            for (auto target : {row, column})
+              if (workspace.containsTarget(target))
+              {
+                const auto local = target - workspace.target_begin_;
+                const double sign = target == row ? 1 : -1;
+                logits.laplacian[laplacianIndex(logits, local, output)] += weight * jet.laplacian[f];
+                for (std::size_t d = 0; d < 3; ++d)
+                  logits.gradient[gradientIndex(logits, 3 * local + d, output)] += sign * weight * jet.gradient[f][d];
+              }
+          }
+        }
+      }
+    }
+  }
 }
 
 /// Evaluate stable row softmax on primal and contracted derivative planes.
@@ -1549,7 +1614,7 @@ inline void DirectKineticExecutor::applyAttentionBlock(
   denseForward(input, parameter(parameters, ParameterRole::ATTENTION_VALUE_WEIGHT, block),
                nullptr, workspace.electrons_, workspace.width_, workspace.width_,
                workspace.gradient_lanes_, workspace.laplacian_lanes_, workspace.values_[block]);
-  buildAttentionLogits(block, workspace);
+  buildAttentionLogits(parameters, block, workspace);
   softmaxForward(block, workspace);
   buildAttentionContext(block, workspace);
 
@@ -1671,6 +1736,8 @@ inline double DirectKineticExecutor::buildCusp(const double* parameters,
 {
   std::fill(workspace.cusp_gradient_.begin(), workspace.cusp_gradient_.end(), 0.0);
   std::fill(workspace.cusp_laplacian_.begin(), workspace.cusp_laplacian_.end(), 0.0);
+  if (plan_.environment().periodic_profile && !plan_.environment().periodic_profile->electron_electron_cusp)
+    return 0;
   const double same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA)
       ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
       : 1.0;
@@ -2053,6 +2120,8 @@ inline void DirectKineticExecutor::reverseCusp(
     DirectKineticTrunkWorkspace& workspace,
     std::vector<double>& destination) const
 {
+  if (plan_.environment().periodic_profile && !plan_.environment().periodic_profile->electron_electron_cusp)
+    return;
   const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
   const double same_alpha = has_same_alpha
       ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
@@ -2327,7 +2396,7 @@ inline void DirectKineticExecutor::softmaxReverse(std::size_t block,
 /// Reverse scaled query-key products for one attention block.
 inline void DirectKineticExecutor::reverseAttentionLogits(
     std::size_t block,
-    DirectKineticTrunkWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace, std::vector<double>& destination) const
 {
   workspace.query_adjoint_.clear();
   workspace.key_adjoint_.clear();
@@ -2355,6 +2424,44 @@ inline void DirectKineticExecutor::reverseAttentionLogits(
                                 workspace.query_adjoint_, workspace.key_adjoint_, scale);
         }
       }
+  if (plan_.environment().periodic_profile)
+  {
+    auto* weights = response(destination, ParameterRole::PAIR_ATTENTION_WEIGHT, block);
+    auto* bias = response(destination, ParameterRole::PAIR_ATTENTION_BIAS, block);
+    const auto& upstream = workspace.logit_adjoint_;
+    for (std::size_t pair = 0; pair < workspace.geometry_.electronPairs().size(); ++pair)
+    {
+      const auto& identity = workspace.geometry_.electronPairs()[pair];
+      const double spin = (identity.first < spin_up_electrons_) == (identity.second < spin_up_electrons_) ? 1 : -1;
+      for (int orientation : {1, -1})
+      {
+        const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(
+            workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
+            plan_.environment().periodic_profile->feature_transform, spin);
+        const auto row = orientation == 1 ? identity.first : identity.second;
+        const auto column = orientation == 1 ? identity.second : identity.first;
+        for (std::size_t head = 0; head < workspace.heads_; ++head)
+        {
+          const auto output = (head * workspace.electrons_ + row) * workspace.electrons_ + column;
+          bias[head] += upstream.value[output];
+          for (std::size_t f = 0; f < 8; ++f)
+          {
+            double contraction = upstream.value[output] * jet.value[f];
+            for (auto target : {row, column})
+              if (workspace.containsTarget(target))
+              {
+                const auto local = target - workspace.target_begin_;
+                const double sign = target == row ? 1 : -1;
+                contraction += upstream.laplacian[laplacianIndex(upstream, local, output)] * jet.laplacian[f];
+                for (std::size_t d = 0; d < 3; ++d)
+                  contraction += sign * upstream.gradient[gradientIndex(upstream, 3 * local + d, output)] * jet.gradient[f][d];
+              }
+            weights[f * workspace.heads_ + head] += contraction;
+          }
+        }
+      }
+    }
+  }
 }
 
 /// Reverse one full attention/update/residual block.
@@ -2405,7 +2512,7 @@ inline void DirectKineticExecutor::reverseAttentionBlock(
 
   reverseAttentionContext(block, workspace);
   softmaxReverse(block, workspace);
-  reverseAttentionLogits(block, workspace);
+  reverseAttentionLogits(block, workspace, destination);
 
   denseReverse(input, parameter(parameters, ParameterRole::ATTENTION_QUERY_WEIGHT, block),
                workspace.query_adjoint_, workspace.electrons_, workspace.width_, workspace.width_,

@@ -141,7 +141,7 @@ TEST_CASE("PsiFormer execution plan types imported parameter layouts", "[wavefun
   CHECK(plan.adjointConvention() == AdjointConvention::TRANSPOSE);
   CHECK(plan.environment().boundary == BoundaryCondition::OPEN);
   CHECK(plan.environment().head_representation == HeadRepresentation::REAL);
-  CHECK(PARAMETER_ROLE_COUNT == 17);
+  CHECK(PARAMETER_ROLE_COUNT == 19);
   CHECK(static_cast<std::size_t>(ParameterRole::BACKFLOW_UP_WEIGHT) == 9);
   CHECK(static_cast<std::size_t>(ParameterRole::BACKFLOW_DOWN_WEIGHT) == 10);
   CHECK(static_cast<std::size_t>(ParameterRole::CUSP_OPPOSITE_ALPHA) == 16);
@@ -325,6 +325,75 @@ TEST_CASE("PsiFormer workspace grows only at explicit preparation boundaries", "
       makeWorkspaceRequirements(plan, {EvaluationMode::VIRTUAL_WEIGHTED_PARAMETER_VJP, 2, 7, 0});
   CHECK(weighted_vjp[WorkspaceRegion::PARAMETER_OUTPUT] == plan.parameterCount());
   CHECK(weighted_vjp[WorkspaceRegion::REVERSE_ADJOINTS] > score_requirements[WorkspaceRegion::REVERSE_ADJOINTS]);
+}
+
+TEST_CASE("Periodic profile metadata preserves cells occupations and pair tensor identity",
+          "[wavefunction][psiformer][periodic_profile]")
+{
+  const auto model = testModelShape();
+  auto environment = pairedEnvironment();
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+  auto profile = std::make_shared<PeriodicProfileMetadata>();
+  profile->cells.simulation = {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors,
+                               environment.periodic_axes};
+  profile->cells.primitive = profile->cells.simulation;
+  profile->cells.primitive.lattice_vectors[0][0] = 4;
+  profile->cells.tiling[0][0] = 2;
+  profile->primitive_motif = {{0.13, -0.22, 0.31}};
+  profile->motif_species = {3};
+  profile->occupied_columns = {{{0, 0, 0}, 0, 0, 1}, {{0, 0, 0}, 0, 1, 1}};
+  environment.periodic_profile = profile;
+  auto store = makeParameterStore(model, true, true);
+  appendImaginaryHeads(store);
+  CHECK_THROWS_AS(PsiFormerExecutionPlan(model, store.layouts, environment), std::invalid_argument);
+  for (std::size_t block = 0; block < model.attention_blocks; ++block)
+  {
+    const auto layer = block == 0 ? std::string("electron_gnn_layer") : "electron_gnn_layer_" + std::to_string(block);
+    const auto module = "periodic/" + layer + "/pair_attention";
+    appendLayout(store.layouts, module, "w", {8, model.attention_heads});
+    appendLayout(store.layouts, module, "b", {model.attention_heads});
+  }
+  const PsiFormerExecutionPlan plan(model, store.layouts, environment);
+  CHECK(static_cast<std::size_t>(ParameterRole::CUSP_OPPOSITE_ALPHA) == 16);
+  CHECK(static_cast<std::size_t>(ParameterRole::PAIR_ATTENTION_WEIGHT) == 17);
+  CHECK(plan.parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, 0).shape == std::vector<std::size_t>{8, 2});
+  CHECK(plan.parameter(ParameterRole::PAIR_ATTENTION_BIAS, 1).shape == std::vector<std::size_t>{2});
+  CHECK(plan.environment().periodic_profile.get() != profile.get());
+  profile->feature_transform = PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+  CHECK(plan.environment().periodic_profile->feature_transform == PeriodicFeatureTransform::LOG_COMPLEMENT_V1);
+  CHECK_NOTHROW(PsiFormerExecutionPlan(model, store.layouts, environment));
+  auto invalid = environment;
+  invalid.periodic_profile.reset();
+  CHECK_THROWS_AS(PsiFormerExecutionPlan(model, store.layouts, invalid), std::invalid_argument);
+  invalid = pairedEnvironment();
+  CHECK_THROWS_AS(PsiFormerExecutionPlan(model, store.layouts, invalid), std::invalid_argument);
+  profile->version = 2;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(model, environment), std::invalid_argument);
+  profile->version = 1;
+  profile->occupied_columns[1].spin = 0;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(model, environment), std::invalid_argument);
+  profile->occupied_columns[1].spin = 1;
+  profile->occupied_columns[0].occupation = 0.5;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(model, environment), std::invalid_argument);
+  profile->occupied_columns[0].occupation = 1;
+  profile->cells.tiling[0][0] = 1;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(model, environment), std::invalid_argument);
+  profile->cells.tiling[0][0] = 2;
+  auto repeated = model;
+  repeated.spin_up_electrons = repeated.spin_down_electrons = 2;
+  profile->occupied_columns = {{{0, 0, 0}, 0, 0, 1}, {{0, 0, 0}, 1, 0, 1},
+                               {{0, 0, 0}, 0, 1, 1}, {{0, 0, 0}, 1, 1, 1}};
+  CHECK_NOTHROW(validatePeriodicProfileMetadata(repeated, environment));
+  profile->occupied_columns[1].band = 0;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(repeated, environment), std::invalid_argument);
+  profile->occupied_columns[1].reciprocal = {1, -1, 0};
+  CHECK_NOTHROW(validatePeriodicProfileMetadata(repeated, environment));
+  environment.head_representation = HeadRepresentation::REAL;
+  environment.amplitude_scalar_domain = ScalarDomain::REAL;
+  CHECK_THROWS_AS(validatePeriodicProfileMetadata(repeated, environment), std::invalid_argument);
+  profile->occupied_columns[1].band = 1;
+  profile->occupied_columns[1].reciprocal = {};
+  CHECK_NOTHROW(validatePeriodicProfileMetadata(repeated, environment));
 }
 
 } // namespace qmcplusplus::psiformer

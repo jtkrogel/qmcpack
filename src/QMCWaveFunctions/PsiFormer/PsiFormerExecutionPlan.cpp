@@ -117,6 +117,10 @@ ClassifiedParameter classifyParameter(const ParameterLayoutInput& layout)
   const std::optional<std::size_t> block = attentionBlock(layout.module);
   if (block)
   {
+    if (endsWith(layout.module, "/pair_attention") && layout.name == "w")
+      return {ParameterRole::PAIR_ATTENTION_WEIGHT, *block};
+    if (endsWith(layout.module, "/pair_attention") && layout.name == "b")
+      return {ParameterRole::PAIR_ATTENTION_BIAS, *block};
     if (endsWith(layout.module, "/multi_head_attention/query") && layout.name == "w")
       return {ParameterRole::ATTENTION_QUERY_WEIGHT, *block};
     if (endsWith(layout.module, "/multi_head_attention/key") && layout.name == "w")
@@ -159,6 +163,10 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
   case ParameterRole::UPDATE_HIDDEN_BIAS:
   case ParameterRole::UPDATE_OUTPUT_BIAS:
     return {model.feature_dimension};
+  case ParameterRole::PAIR_ATTENTION_WEIGHT:
+    return {8, model.attention_heads};
+  case ParameterRole::PAIR_ATTENTION_BIAS:
+    return {model.attention_heads};
   case ParameterRole::BACKFLOW_UP_WEIGHT:
   case ParameterRole::BACKFLOW_DOWN_WEIGHT:
     return {model.feature_dimension, model.determinants * electrons};
@@ -200,12 +208,62 @@ std::vector<std::size_t> expectedShape(ParameterRole role,
 
 } // namespace
 
+void validatePeriodicProfileMetadata(const ModelShape& model, const ExecutionEnvironment& environment)
+{
+  if (!environment.periodic_profile)
+  {
+    if (environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1)
+      throw std::invalid_argument("Two-cell periodic features require explicit versioned metadata");
+    return;
+  }
+  const auto& profile = *environment.periodic_profile;
+  if (profile.version != 1 || environment.boundary != BoundaryCondition::PERIODIC ||
+      environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1 ||
+      (environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX &&
+       environment.head_representation != HeadRepresentation::REAL) ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != (environment.head_representation == HeadRepresentation::REAL ?
+          ScalarDomain::REAL : ScalarDomain::COMPLEX) || !environment.fixed_nuclei ||
+      profile.pair_feature_dimension != 8 ||
+      (profile.feature_transform != PeriodicFeatureTransform::LOG_COMPLEMENT_V1 &&
+       profile.feature_transform != PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1))
+    throw std::invalid_argument("Unsupported versioned periodic feature/head metadata");
+  pf::validatePeriodicGeometryMapping(profile.cells);
+  if (profile.cells.simulation.lattice_vectors != environment.lattice_vectors ||
+      profile.cells.simulation.periodic_axes != environment.periodic_axes ||
+      profile.primitive_motif.size() != model.nuclei || profile.motif_species.size() != model.nuclei ||
+      model.nuclei == 0 || profile.occupied_columns.size() != model.electrons())
+    throw std::invalid_argument("Periodic profile cell, motif or occupied-column extent disagrees with model");
+  // An identity replication validates feature-site uniqueness without replacing physical ions.
+  pf::PeriodicGeometryMapping identity;
+  identity.primitive = identity.simulation = profile.cells.primitive;
+  const auto motif = pf::GeometryPositionView::interleaved(profile.primitive_motif.front().data(), model.nuclei);
+  (void)pf::mapPeriodicIonMotif(identity, motif, profile.motif_species, motif, profile.motif_species);
+  for (std::size_t column = 0; column < profile.occupied_columns.size(); ++column)
+  {
+    const auto& occupied = profile.occupied_columns[column];
+    if (occupied.spin != (column < model.spin_up_electrons ? 0 : 1) || occupied.occupation != 1)
+      throw std::invalid_argument("Periodic profile requires fully occupied columns in spin-major order");
+    if (environment.head_representation == HeadRepresentation::REAL && occupied.reciprocal != std::array<int, 3>{})
+      throw std::invalid_argument("Real periodic heads require zero reciprocal column vectors");
+    for (std::size_t previous = 0; previous < column; ++previous)
+      if (profile.occupied_columns[previous].spin == occupied.spin &&
+          profile.occupied_columns[previous].band == occupied.band &&
+          profile.occupied_columns[previous].reciprocal == occupied.reciprocal)
+        throw std::invalid_argument("Periodic profile repeats an occupied spin band reciprocal tuple");
+  }
+}
+
 // Validate model dimensions and translate each canonical parameter interval once.
 PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
                                                std::vector<ParameterLayoutInput> parameter_layouts,
                                                ExecutionEnvironment environment)
     : model_shape_(std::move(model_shape)), environment_(environment)
 {
+  validatePeriodicProfileMetadata(model_shape_, environment_);
+  if (environment_.periodic_profile)
+    environment_.periodic_profile = std::make_shared<const PeriodicProfileMetadata>(*environment_.periodic_profile);
   const ModelCapabilities support = capabilities();
   if ((environment_.boundary == BoundaryCondition::OPEN && !support.open_boundary) ||
       (environment_.boundary == BoundaryCondition::PERIODIC && !support.periodic_boundary))
@@ -215,7 +273,8 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
     throw std::invalid_argument("Open PsiFormer execution requires open_euclidean_v1 features");
   if (environment_.boundary == BoundaryCondition::PERIODIC)
   {
-    if (environment_.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
+    if (environment_.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+        environment_.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1)
       throw std::invalid_argument("Periodic PsiFormer execution requires periodic_torus_v1 features");
     if (!std::all_of(environment_.periodic_axes.begin(), environment_.periodic_axes.end(),
                      [](bool periodic) { return periodic; }))
@@ -268,6 +327,9 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
       throw std::invalid_argument("PsiFormer parameter tensor shape does not match its flat interval");
 
     const auto [role, block, component] = classifyParameter(layout);
+    if ((role == ParameterRole::PAIR_ATTENTION_WEIGHT || role == ParameterRole::PAIR_ATTENTION_BIAS) &&
+        !environment_.periodic_profile)
+      throw std::invalid_argument("Pair-attention tensors require a versioned periodic profile");
     if (component == HeadTensorComponent::IMAG && !paired_head)
       throw std::invalid_argument("Imaginary PsiFormer head tensors require paired-real head metadata");
     if (block != NO_ATTENTION_BLOCK && block >= model_shape_.attention_blocks)
@@ -326,6 +388,12 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
     throw std::invalid_argument(
         "PsiFormer parameter export is missing same-spin cusp alpha for a populated same-spin pair");
 
+  if (environment_.periodic_profile)
+    for (std::size_t block = 0; block < model_shape_.attention_blocks; ++block)
+      for (ParameterRole role : {ParameterRole::PAIR_ATTENTION_WEIGHT, ParameterRole::PAIR_ATTENTION_BIAS})
+        if (!hasParameter(role, block))
+          throw std::invalid_argument("Periodic profile is missing a pair-attention tensor");
+
   if (paired_head)
     for (ParameterRole role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
       if (!hasParameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG))
@@ -333,7 +401,8 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
                                     parameterRoleName(role));
 
   const std::size_t expected_tensor_count = 8 + 8 * model_shape_.attention_blocks +
-      (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0) + (paired_head ? 2 : 0);
+      (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0) + (paired_head ? 2 : 0) +
+      (environment_.periodic_profile ? 2 * model_shape_.attention_blocks : 0);
   if (parameter_tensors_.size() != expected_tensor_count)
     throw std::invalid_argument("PsiFormer parameter export does not contain the complete architecture layout");
 }
@@ -438,6 +507,10 @@ const char* parameterRoleName(ParameterRole role)
     return "cusp_same_alpha";
   case ParameterRole::CUSP_OPPOSITE_ALPHA:
     return "cusp_opposite_alpha";
+  case ParameterRole::PAIR_ATTENTION_WEIGHT:
+    return "pair_attention_weight";
+  case ParameterRole::PAIR_ATTENTION_BIAS:
+    return "pair_attention_bias";
   case ParameterRole::COUNT:
     break;
   }

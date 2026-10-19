@@ -159,7 +159,8 @@ protected:
         gradient_lanes_(3 * target_capacity_),
         laplacian_lanes_(mode == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? 0 : target_capacity_),
         electron_positions_(3 * layout.electronCount()),
-        geometry_(layout.electronCount(), nuclei, boundary),
+        geometry_(qmcplusplus::psiformer::periodic_feature::makeGeometry(
+            layout.electronCount(), nuclei, boundary, layout.periodicProfile())),
         raw_features_(layout.electronCount() * layout.inputWidth(), gradient_lanes_, laplacian_lanes_),
         features_a_(layout.electronCount() * layout.featureWidth(), gradient_lanes_, laplacian_lanes_),
         features_b_(layout.electronCount() * layout.featureWidth(), gradient_lanes_, laplacian_lanes_),
@@ -860,7 +861,8 @@ private:
                              std::size_t laplacian_lanes);
 
   /// Build stable softmax attention values and derivative traces.
-  void buildAttentionWeights(DirectSpatialTrunkWorkspace& workspace) const;
+  void buildAttentionWeights(const double* parameters,
+      const DirectValueParameterLayout::DirectAttentionLayer& layer, DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Contract attention weights with value heads using spatial product rules.
   void buildAttentionContext(DirectSpatialTrunkWorkspace& workspace) const;
@@ -1029,6 +1031,21 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
       const double radius    = distances[pair];
       if (radius == 0)
         throw std::runtime_error("PsiFormer spatial derivatives are undefined at an electron-nucleus coalescence");
+      if (layout_->periodic_profile_)
+      {
+        const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
+            workspace.geometry_.electronIonBoundary(), 1, layout_->periodic_profile_->feature_transform, 1);
+        const auto begin = row_begin + 7 * nucleus;
+        std::copy_n(jet.value.data(), 7, raw.value.data() + begin);
+        for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+          if (laneElectron(workspace, lane) == electron)
+            for (std::size_t f = 0; f < 7; ++f)
+              raw.gradient[gradientIndex(raw, lane, begin + f)] = jet.gradient[f][laneDimension(workspace, lane)];
+        if (electron >= workspace.target_begin_ && electron - workspace.target_begin_ < workspace.laplacian_lanes_)
+          for (std::size_t f = 0; f < 7; ++f)
+            raw.laplacian[laplacianIndex(raw, electron - workspace.target_begin_, begin + f)] = jet.laplacian[f];
+        continue;
+      }
       const GeometryPosition& displacement = displacements[pair];
       const SoftenedRadialFactors& radial  = factors[pair];
       const std::size_t radial_element     = row_begin + pair_width * nucleus;
@@ -1145,7 +1162,8 @@ inline void DirectSpatialExecutor::tanhJetInPlace(DirectSpatialJetBuffer& buffer
   }
 }
 
-inline void DirectSpatialExecutor::buildAttentionWeights(DirectSpatialTrunkWorkspace& workspace) const
+inline void DirectSpatialExecutor::buildAttentionWeights(const double* parameters,
+    const DirectValueParameterLayout::DirectAttentionLayer& layer, DirectSpatialTrunkWorkspace& workspace) const
 {
   DirectSpatialJetBuffer& attention = workspace.attention_;
   const DirectSpatialJetBuffer& query = workspace.query_;
@@ -1196,6 +1214,52 @@ inline void DirectSpatialExecutor::buildAttentionWeights(DirectSpatialTrunkWorks
           }
         }
       }
+
+  if (layout_->periodic_profile_)
+  {
+    const auto* weights = tensor(parameters, layer.pair_weight);
+    const auto* bias = tensor(parameters, layer.pair_bias);
+    for (std::size_t pair = 0; pair < workspace.geometry_.electronPairs().size(); ++pair)
+    {
+      const auto& identity = workspace.geometry_.electronPairs()[pair];
+      const double spin = (identity.first < layout_->spinUpCount()) ==
+          (identity.second < layout_->spinUpCount()) ? 1 : -1;
+      for (int orientation : {1, -1})
+      {
+        const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(
+            workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
+            layout_->periodic_profile_->feature_transform, spin);
+        if (!jet.differentiable)
+          throw std::runtime_error("Pair-attention spatial derivatives are undefined at electron coalescence");
+        const auto row = orientation == 1 ? identity.first : identity.second;
+        const auto column = orientation == 1 ? identity.second : identity.first;
+        for (std::size_t head = 0; head < head_count; ++head)
+        {
+          const auto output = attention_index(head, row, column);
+          double value = bias[head], laplacian = 0;
+          GeometryPosition gradient{};
+          for (std::size_t f = 0; f < 8; ++f)
+          {
+            const auto weight = weights[f * head_count + head];
+            value += weight * jet.value[f];
+            laplacian += weight * jet.laplacian[f];
+            for (std::size_t d = 0; d < 3; ++d)
+              gradient[d] += weight * jet.gradient[f][d];
+          }
+          attention.value[output] += value;
+          for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+          {
+            const auto target = laneElectron(workspace, lane);
+            const double sign = target == row ? 1 : (target == column ? -1 : 0);
+            attention.gradient[gradientIndex(attention, lane, output)] += sign * gradient[laneDimension(workspace, lane)];
+          }
+          for (std::size_t target = 0; target < workspace.laplacian_lanes_; ++target)
+            if (workspace.target_begin_ + target == row || workspace.target_begin_ + target == column)
+              attention.laplacian[laplacianIndex(attention, target, output)] += laplacian;
+        }
+      }
+    }
+  }
 
   // Apply stable row-wise softmax.  Laplacians are transformed before gradients
   // because their formula requires the original logit gradients.
@@ -1337,7 +1401,7 @@ inline void DirectSpatialExecutor::applyAttentionBlock(
               tensor(parameters, layer.value), electron_count, feature_width,
               workspace.gradient_lanes_, workspace.laplacian_lanes_, workspace.query_, workspace.key_,
               workspace.projected_value_);
-  buildAttentionWeights(workspace);
+  buildAttentionWeights(parameters, layer, workspace);
   buildAttentionContext(workspace);
 
   denseJet(workspace.attended_, tensor(parameters, layer.projection), nullptr, electron_count,
@@ -1528,6 +1592,8 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
 {
   std::fill(workspace.scalar_gradient_scratch_.begin(), workspace.scalar_gradient_scratch_.end(), 0.0);
   std::fill(workspace.scalar_laplacian_scratch_.begin(), workspace.scalar_laplacian_scratch_.end(), 0.0);
+  if (layout_->periodic_profile_ && !layout_->periodic_profile_->electron_electron_cusp)
+    return 0;
   const double same_alpha = layout_->same_alpha_.size == 0
       ? 1.0
       : tensor(parameters, layout_->same_alpha_)[0];

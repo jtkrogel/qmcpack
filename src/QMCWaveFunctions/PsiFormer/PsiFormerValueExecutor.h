@@ -35,6 +35,7 @@
 #define QMCPLUSPLUS_PSIFORMER_VALUE_EXECUTOR_H
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
+#include "PsiFormerPeriodicFeatures.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDenseKernels.h"
 #include "PsiFormerDeterminant.h"
@@ -103,6 +104,7 @@ public:
         head_count_(plan.modelShape().attention_heads),
         head_width_(feature_width_ / head_count_),
         input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
+        periodic_profile_(plan.environment().periodic_profile),
         layers_(plan.modelShape().attention_blocks)
   {
     if (electron_count_ == 0 || spin_up_count_ + spin_down_count_ != electron_count_ ||
@@ -116,6 +118,10 @@ public:
     using qmcplusplus::psiformer::ParameterRole;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan.environment();
+    if (periodic_profile_)
+      for (const auto& column : periodic_profile_->occupied_columns)
+        if (column.reciprocal != std::array<int, 3>{})
+          throw std::invalid_argument("Occupied reciprocal phases require a qualified full-head executor");
     if (preparation_ != DirectValuePreparation::REAL_WAVEFUNCTION &&
         preparation_ != DirectValuePreparation::REAL_TRUNK_ONLY)
       throw std::invalid_argument("Unknown PsiFormer direct value preparation profile");
@@ -150,6 +156,11 @@ public:
       descriptor.mlp_bias_0   = interval(plan.parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
       descriptor.mlp_weight_1 = interval(plan.parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer));
       descriptor.mlp_bias_1   = interval(plan.parameter(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
+      if (periodic_profile_)
+      {
+        descriptor.pair_weight = interval(plan.parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, layer));
+        descriptor.pair_bias = interval(plan.parameter(ParameterRole::PAIR_ATTENTION_BIAS, layer));
+      }
     }
   }
 
@@ -174,6 +185,7 @@ public:
   std::size_t headCount() const noexcept { return head_count_; }
   std::size_t headWidth() const noexcept { return head_width_; }
   std::size_t inputWidth() const noexcept { return input_width_; }
+  const auto& periodicProfile() const noexcept { return periodic_profile_; }
 
 private:
   friend class DirectValueExecutor;
@@ -191,6 +203,8 @@ private:
     DirectParameterTensor mlp_bias_0;
     DirectParameterTensor mlp_weight_1;
     DirectParameterTensor mlp_bias_1;
+    DirectParameterTensor pair_weight;
+    DirectParameterTensor pair_bias;
   };
 
   /// Convert one shared typed descriptor to the minimal hot-path interval.
@@ -211,6 +225,7 @@ private:
   std::size_t head_count_;
   std::size_t head_width_;
   std::size_t input_width_;
+  std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata> periodic_profile_;
 
   DirectParameterTensor anti_alpha_;
   DirectParameterTensor same_alpha_;
@@ -239,7 +254,8 @@ public:
                        GeometryBoundary boundary = {})
       : layout_identity_(&layout),
         electron_positions_(3 * layout.electronCount()),
-        geometry_(layout.electronCount(), nuclei, boundary),
+        geometry_(qmcplusplus::psiformer::periodic_feature::makeGeometry(
+            layout.electronCount(), nuclei, boundary, layout.periodicProfile())),
         raw_features_(layout.electronCount() * layout.inputWidth()),
         features_a_(layout.electronCount() * layout.featureWidth()),
         features_b_(layout.electronCount() * layout.featureWidth()),
@@ -722,12 +738,17 @@ private:
   }
 
   /// Form stable row-wise softmax(Q*K^T/sqrt(head_width)) in the attention buffer.
-  void buildAttentionWeights(DirectValueTrunkWorkspace& workspace) const
+  void buildAttentionWeights(const double* parameters,
+      const DirectValueParameterLayout::DirectAttentionLayer& layer, DirectValueTrunkWorkspace& workspace) const
   {
+    if (layout_->periodic_profile_)
+      qmcplusplus::psiformer::periodic_feature::fillAttentionLogits(workspace.geometry_, layout_->spinUpCount(),
+          layout_->periodic_profile_->feature_transform, tensor(parameters, layer.pair_weight),
+          tensor(parameters, layer.pair_bias), layout_->headCount(), workspace.attention_.data());
     qmcplusplus::psiformer::dense::attentionWeightsReal(
         workspace.query_.data(), layout_->featureWidth(), workspace.key_.data(),
         layout_->featureWidth(), layout_->electronCount(), layout_->headCount(),
-        layout_->headWidth(), workspace.attention_.data());
+        layout_->headWidth(), workspace.attention_.data(), static_cast<bool>(layout_->periodic_profile_));
   }
 
   /// Contract softmax attention with projected values into electron-major features.
@@ -759,6 +780,13 @@ private:
       {
         const std::size_t pair = electron * na + nucleus;
         const std::size_t feature_begin = pair_width * nucleus;
+        if (layout_->periodic_profile_)
+        {
+          const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
+              workspace.geometry_.electronIonBoundary(), 1, layout_->periodic_profile_->feature_transform, 1);
+          std::copy_n(jet.value.data(), 7, feature_row + feature_begin);
+          continue;
+        }
         feature_row[feature_begin] = radial_factors[pair].log1p_radius;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           feature_row[feature_begin + 1 + dimension] =
@@ -785,7 +813,7 @@ private:
     denseQKV(workspace.features_a_.data(), tensor(parameters, layer.query), tensor(parameters, layer.key),
              tensor(parameters, layer.value), ne, width, workspace.query_.data(), workspace.key_.data(),
              workspace.value_.data());
-    buildAttentionWeights(workspace);
+    buildAttentionWeights(parameters, layer, workspace);
     buildAttentionContext(workspace);
 
     dense(workspace.attended_.data(), tensor(parameters, layer.projection), nullptr, ne, width, width,
@@ -840,6 +868,8 @@ private:
   /// Accumulate same- and opposite-spin analytic electron-electron cusp terms.
   double cuspValue(const double* parameters, const DirectValueTrunkWorkspace& workspace) const
   {
+    if (layout_->periodic_profile_ && !layout_->periodic_profile_->electron_electron_cusp)
+      return 0;
     const double same_alpha = layout_->same_alpha_.size == 0
         ? 1.0
         : tensor(parameters, layout_->same_alpha_)[0];

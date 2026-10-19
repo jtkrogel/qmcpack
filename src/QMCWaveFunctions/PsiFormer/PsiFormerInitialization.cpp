@@ -299,6 +299,13 @@ std::vector<TensorSpecification> makeTensorSpecifications(
     appendSpecification(tensors, base + "multi_head_attention/value", "w",
                         {model.feature_dimension, model.feature_dimension}, ParameterRole::ATTENTION_VALUE_WEIGHT,
                         block, InitializationLaw::NORMAL, 0, feature_sigma, feature_sigma);
+    if (environment.periodic_profile)
+    {
+      appendSpecification(tensors, base + "pair_attention", "w", {8, model.attention_heads},
+                          ParameterRole::PAIR_ATTENTION_WEIGHT, block, InitializationLaw::CONSTANT, 0, 0, 0);
+      appendSpecification(tensors, base + "pair_attention", "b", {model.attention_heads},
+                          ParameterRole::PAIR_ATTENTION_BIAS, block, InitializationLaw::CONSTANT, 0, 0, 0);
+    }
   }
 
   std::sort(tensors.begin(), tensors.end(), [](const TensorSpecification& left, const TensorSpecification& right) {
@@ -356,13 +363,20 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
                                                              ExecutionEnvironment environment)
 {
   if (profile != DEEPQMC_PSIFORMER_V1 && profile != PSIFORMER_COMPLEX_PERIODIC_V1)
-    throw std::invalid_argument("Unknown PsiFormer initialization profile: " + profile);
-  const bool paired_profile = profile == PSIFORMER_COMPLEX_PERIODIC_V1;
+    if (profile != PSIFORMER_PERIODIC_PAIR_V1)
+      throw std::invalid_argument("Unknown PsiFormer initialization profile: " + profile);
+  const bool pair_profile = profile == PSIFORMER_PERIODIC_PAIR_V1;
+  if (pair_profile != static_cast<bool>(environment.periodic_profile))
+    throw std::invalid_argument("Versioned periodic metadata requires the explicit periodic pair initialization profile");
+  validatePeriodicProfileMetadata(model_shape, environment);
+  const bool paired_profile = profile == PSIFORMER_COMPLEX_PERIODIC_V1 ||
+      (pair_profile && environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX);
   if (paired_profile)
   {
     if (environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.boundary != BoundaryCondition::PERIODIC ||
-        environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        environment.geometry_feature_policy != (pair_profile ? GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1 :
+                                                               GeometryFeaturePolicy::PERIODIC_TORUS_V1) ||
         !std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(),
                      [](bool periodic) { return periodic; }) ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
@@ -418,6 +432,7 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
   // Reuse the production plan validator as a final assertion that generated
   // names, shapes, intervals, and architecture completeness remain compatible.
   const PsiFormerExecutionPlan plan(model_shape, initialized.layouts, environment);
+  initialized.environment = plan.environment();
   if (plan.parameterCount() != initialized.values.size())
     throw std::logic_error("Generated PsiFormer layout and flat parameter vector disagree");
   return initialized;

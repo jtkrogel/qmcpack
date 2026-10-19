@@ -243,6 +243,7 @@ struct PsiFormerStorageShape
   std::size_t input_width     = 0;
   std::size_t attention_blocks = 0;
   std::size_t parameter_count   = 0;
+  bool pair_attention = false;
 };
 
 /// Independently selected tile capacities for each direct batch call family.
@@ -851,6 +852,11 @@ inline std::size_t scoreWorkspaceStorageRequirement(const PsiFormerStorageShape&
                   "PsiFormer score element extent overflowed");
   addStorageBytes(elements, attention,
                   "PsiFormer score element extent overflowed");
+  if (shape.pair_attention)
+    addStorageBytes(elements, checkedStorageProduct(
+        checkedStorageProduct(shape.electrons, shape.electrons - 1, "Pair observation row extent overflowed"),
+        checkedStorageSum(8, shape.attention_heads, "Pair observation width overflowed"),
+        "Pair observation scratch extent overflowed"), "Pair observation scratch extent overflowed");
 
   std::size_t bytes = checkedStorageBytes<double>(
       elements, "PsiFormer score vector bytes overflowed");

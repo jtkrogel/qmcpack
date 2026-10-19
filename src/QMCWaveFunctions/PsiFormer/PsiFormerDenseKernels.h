@@ -213,7 +213,8 @@ inline void attentionWeightsReal(const double* query,
                                  std::size_t rows,
                                  std::size_t heads,
                                  std::size_t head_width,
-                                 double* attention)
+                                 double* attention,
+                                 bool add_existing_logits = false)
 {
   const int blas_rows = checkedBlasDimension(
       rows, "PsiFormer attention row count exceeds the BLAS integer ABI");
@@ -231,7 +232,7 @@ inline void attentionWeightsReal(const double* query,
     // Column-major K^T*Q has the row-major storage of Q*K^T.
     BLAS::gemm('T', 'N', blas_rows, blas_rows, blas_head_width, scale,
                key + head * head_width, blas_key_stride,
-               query + head * head_width, blas_query_stride, 0.0,
+               query + head * head_width, blas_query_stride, add_existing_logits ? 1.0 : 0.0,
                head_attention, blas_rows);
 
     for (std::size_t query_row = 0; query_row < rows; ++query_row)

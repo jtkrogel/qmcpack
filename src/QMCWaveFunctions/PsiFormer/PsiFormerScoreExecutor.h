@@ -43,6 +43,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
+#include "PsiFormerPeriodicFeatures.h"
 
 #include <algorithm>
 #include <cmath>
@@ -312,7 +313,8 @@ public:
         attention_elements_(heads_ * electrons_ * electrons_),
         orbital_elements_(determinants_ * electrons_ * electrons_),
         electron_positions_(3 * electrons_),
-        geometry_(electrons_, nuclei, boundary),
+        geometry_(qmcplusplus::psiformer::periodic_feature::makeGeometry(
+            electrons_, nuclei, boundary, plan.environment().periodic_profile)),
         raw_features_(electrons_ * input_width_),
         features_((blocks_ + 1) * feature_elements_),
         queries_(blocks_ * feature_elements_),
@@ -333,7 +335,13 @@ public:
         context_adjoint_(feature_elements_),
         residual_adjoint_(feature_elements_),
         hidden_adjoint_(feature_elements_),
-        update_adjoint_(feature_elements_)
+        update_adjoint_(feature_elements_),
+        pair_features_(plan.environment().periodic_profile ? checkedStorageProduct(8,
+            checkedStorageProduct(electrons_, electrons_ - 1, "Pair feature rows overflowed"),
+            "Pair feature scratch overflowed") : 0),
+        pair_sensitivities_(plan.environment().periodic_profile ? checkedStorageProduct(heads_,
+            checkedStorageProduct(electrons_, electrons_ - 1, "Pair response rows overflowed"),
+            "Pair response scratch overflowed") : 0)
   {
     if (heads_ == 0 || width_ % heads_ != 0)
       throw std::invalid_argument("PsiFormer score workspace received inconsistent attention dimensions");
@@ -423,7 +431,7 @@ public:
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
-             &hidden_adjoint_, &update_adjoint_})
+             &hidden_adjoint_, &update_adjoint_, &pair_features_, &pair_sensitivities_})
       mix(*buffer);
     hash ^= geometry_.storageFingerprint();
     hash *= 1099511628211ULL;
@@ -448,7 +456,7 @@ public:
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
-             &hidden_adjoint_, &update_adjoint_})
+             &hidden_adjoint_, &update_adjoint_, &pair_features_, &pair_sensitivities_})
       add(*buffer);
     addStorageBytes(bytes, geometry_.storageBytes(),
                     "PsiFormer score storage bytes overflowed");
@@ -464,7 +472,7 @@ public:
   {
     const std::size_t complete = scoreWorkspaceStorageRequirement(
         {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
-         blocks_, parameter_score_.size()});
+         blocks_, parameter_score_.size(), !pair_features_.empty()});
     return complete - headStorageBytes();
   }
 
@@ -559,6 +567,8 @@ protected:
   std::vector<double> residual_adjoint_;
   std::vector<double> hidden_adjoint_;
   std::vector<double> update_adjoint_;
+  std::vector<double> pair_features_;
+  std::vector<double> pair_sensitivities_;
   std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
 };
 
@@ -648,6 +658,10 @@ public:
         spin_up_electrons_(model.cfg.nup),
         boundary_(mappedBoundary(plan.environment()))
   {
+    if (plan_.environment().periodic_profile)
+      for (const auto& column : plan_.environment().periodic_profile->occupied_columns)
+        if (column.reciprocal != std::array<int, 3>{})
+          throw std::invalid_argument("Occupied reciprocal phases require a qualified score head");
     if (plan_.parameterCount() != parameters_.size() ||
         plan_.modelShape().electrons() != model.ne ||
         plan_.modelShape().nuclei != model.cfg.nuclei.shape[0] ||
@@ -1032,6 +1046,22 @@ private:
   {
     workspace.geometry_.update(
         GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
+    if (plan_.environment().periodic_profile)
+      for (std::size_t pair = 0; pair < workspace.geometry_.electronPairs().size(); ++pair)
+      {
+        const auto& identity = workspace.geometry_.electronPairs()[pair];
+        const double spin = (identity.first < spin_up_electrons_) == (identity.second < spin_up_electrons_) ? 1 : -1;
+        for (int orientation : {1, -1})
+        {
+          const auto row = orientation == 1 ? identity.first : identity.second;
+          const auto column = orientation == 1 ? identity.second : identity.first;
+          const auto ordered = row * (workspace.electrons_ - 1) + column - (column > row ? 1 : 0);
+          const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(
+              workspace.geometry_.electronElectronPairs(), pair, workspace.geometry_.boundary(), orientation,
+              plan_.environment().periodic_profile->feature_transform, spin);
+          std::copy_n(jet.value.data(), 8, workspace.pair_features_.data() + 8 * ordered);
+        }
+      }
     buildEmbedding(parameters, workspace);
     for (std::size_t block = 0; block < workspace.blocks_; ++block)
       applyAttentionBlock(parameters, block, workspace);
@@ -1104,6 +1134,14 @@ private:
       {
         const std::size_t pair = electron * workspace.nuclei_ + nucleus;
         const std::size_t feature_begin = pair_width * nucleus;
+        if (plan_.environment().periodic_profile)
+        {
+          const auto jet = qmcplusplus::psiformer::periodic_feature::evaluate(pairs, pair,
+              workspace.geometry_.electronIonBoundary(), 1,
+              plan_.environment().periodic_profile->feature_transform, 1);
+          std::copy_n(jet.value.data(), 7, feature_row + feature_begin);
+          continue;
+        }
         feature_row[feature_begin] = radial_factors[pair].log1p_radius;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           feature_row[feature_begin + 1 + dimension] =
@@ -1143,8 +1181,14 @@ private:
     double* attention =
         DirectScoreTrunkWorkspace::blockBuffer(workspace.attention_weights_, block, workspace.attention_elements_);
     double* context = DirectScoreTrunkWorkspace::blockBuffer(workspace.contexts_, block, workspace.feature_elements_);
+    if (plan_.environment().periodic_profile)
+      qmcplusplus::psiformer::periodic_feature::fillAttentionLogits(workspace.geometry_, spin_up_electrons_,
+          plan_.environment().periodic_profile->feature_transform,
+          parameter(parameters, ParameterRole::PAIR_ATTENTION_WEIGHT, block),
+          parameter(parameters, ParameterRole::PAIR_ATTENTION_BIAS, block), workspace.heads_, attention);
     qmcplusplus::psiformer::direct::attentionWeightsForward(
-        query, key, workspace.electrons_, workspace.heads_, workspace.head_width_, attention);
+        query, key, workspace.electrons_, workspace.heads_, workspace.head_width_, attention,
+        static_cast<bool>(plan_.environment().periodic_profile));
     qmcplusplus::psiformer::direct::attentionContextForward(
         attention, value, workspace.electrons_, workspace.heads_, workspace.head_width_, context);
 
@@ -1218,6 +1262,8 @@ private:
                              DirectScoreWorkspace& workspace,
                              double reverse_seed) const
   {
+    if (plan_.environment().periodic_profile && !plan_.environment().periodic_profile->electron_electron_cusp)
+      return 0;
     const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
     const double same_alpha = has_same_alpha
         ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
@@ -1398,6 +1444,31 @@ private:
     qmcplusplus::psiformer::direct::attentionWeightsReverse(
         query, key, attention, workspace.attention_adjoint_.data(), workspace.electrons_, workspace.heads_,
         workspace.head_width_, workspace.query_adjoint_.data(), workspace.key_adjoint_.data());
+
+    if (plan_.environment().periodic_profile)
+    {
+      auto* weight_score = score(workspace, ParameterRole::PAIR_ATTENTION_WEIGHT, block);
+      auto* bias_score = score(workspace, ParameterRole::PAIR_ATTENTION_BIAS, block);
+      const double inverse_scale = std::sqrt(static_cast<double>(workspace.head_width_));
+      const auto n = workspace.electrons_, heads = workspace.heads_;
+      for (std::size_t row = 0; row < n; ++row)
+        for (std::size_t column = 0; column < n; ++column)
+          if (row != column)
+          {
+            const auto ordered = row * (n - 1) + column - (column > row ? 1 : 0);
+            for (std::size_t head = 0; head < heads; ++head)
+            {
+              const double sensitivity = inverse_scale * workspace.attention_adjoint_[(head * n + row) * n + column];
+              workspace.pair_sensitivities_[ordered * heads + head] = sensitivity;
+              bias_score[head] += sensitivity;
+              for (std::size_t f = 0; f < 8; ++f)
+                weight_score[f * heads + head] += workspace.pair_features_[8 * ordered + f] * sensitivity;
+            }
+          }
+      if (observer)
+        observer->observe({ParameterRole::PAIR_ATTENTION_WEIGHT, block, workspace.pair_features_.data(),
+            workspace.pair_sensitivities_.data(), n * (n - 1), 8, heads});
+    }
 
     if (observer)
     {

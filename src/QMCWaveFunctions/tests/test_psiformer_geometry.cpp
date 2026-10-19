@@ -9,6 +9,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicFeatures.h"
 
 #include <array>
 #include <cmath>
@@ -605,4 +606,85 @@ TEST_CASE("PsiFormer two-cell mapping validates and preserves identity geometry"
   CHECK(legacy.electronNucleusPairs().distanceLaplacians() == selected.electronNucleusPairs().distanceLaplacians());
   CHECK(legacy.electronElectronPairs().distances() == selected.electronElectronPairs().distances());
   CHECK(legacy.storageBytes() == selected.storageBytes());
+}
+
+TEST_CASE("Periodic feature policies and ordered pair jets match independent skew formulas",
+          "[wavefunction][psiformer][periodic_profile]")
+{
+  using qmcplusplus::psiformer::PeriodicFeatureTransform;
+  namespace feature = qmcplusplus::psiformer::periodic_feature;
+  const pf::GeometryBoundary cell{pf::GeometryBoundaryKind::PERIODIC,
+      {{{3.1, 0, 0}, {0.7, 2.9, 0}, {-0.2, 0.4, 3.6}}}, {{true, true, true}}};
+  const std::array<double, 3> origin{};
+  const pf::GeometryPosition x{0.71, -0.43, 0.61};
+  pf::PsiFormerGeometryCache cache(1, pf::GeometryPositionView::interleaved(origin.data(), 1), cell);
+  cache.update(pf::GeometryPositionView::interleaved(x.data(), 1));
+  // Solve this triangular lattice explicitly; the oracle does not use cache vectors or reciprocal helpers.
+  const auto oracle = [&](const pf::GeometryPosition& displacement, PeriodicFeatureTransform transform) {
+    constexpr double pi2 = 6.283185307179586476925286766559;
+    pf::GeometryPosition fractional;
+    fractional[2] = displacement[2] / 3.6;
+    fractional[1] = (displacement[1] - 0.4 * fractional[2]) / 2.9;
+    fractional[0] = (displacement[0] - 0.7 * fractional[1] + 0.2 * fractional[2]) / 3.1;
+    pf::GeometryPosition sine{}, complement{}, cosine{};
+    for (std::size_t a = 0; a < 3; ++a)
+      for (std::size_t c = 0; c < 3; ++c)
+      {
+        const double dual = cell.lattice_vectors[a][c] / pi2;
+        sine[c] += dual * std::sin(pi2 * fractional[a]);
+        complement[c] += dual * (1 - std::cos(pi2 * fractional[a]));
+        cosine[c] += dual * std::cos(pi2 * fractional[a]);
+      }
+    double radius2 = 0;
+    for (std::size_t c = 0; c < 3; ++c)
+      radius2 += sine[c] * sine[c] + complement[c] * complement[c];
+    const double radius = std::sqrt(radius2);
+    const bool raw = transform == PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+    std::array<double, 8> result{};
+    result[0] = raw ? radius : std::log1p(radius);
+    result[7] = -1;
+    const double scale = raw ? 1 : std::log1p(radius) / radius;
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+      result[1 + c] = scale * sine[c];
+      result[4 + c] = raw ? cosine[c] : scale * complement[c];
+    }
+    return result;
+  };
+  for (auto policy : {PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1, PeriodicFeatureTransform::LOG_COMPLEMENT_V1})
+    for (int orientation : {1, -1})
+    {
+      const auto jet = feature::evaluate(cache.electronNucleusPairs(), 0, cell, orientation, policy, -1);
+      REQUIRE(jet.differentiable);
+      auto point = x;
+      for (double& c : point)
+        c *= orientation;
+      const auto value = oracle(point, policy);
+      for (std::size_t f = 0; f < value.size(); ++f)
+        checkClose(jet.value[f], value[f], 1e-12);
+      for (double step : {2e-4, 1e-4})
+      {
+        std::array<double, 8> trace{};
+        for (std::size_t d = 0; d < 3; ++d)
+        {
+          auto plus = point, minus = point;
+          plus[d] += step;
+          minus[d] -= step;
+          const auto vp = oracle(plus, policy), vm = oracle(minus, policy);
+          for (std::size_t f = 0; f < value.size(); ++f)
+          {
+            checkClose((vp[f] - vm[f]) / (2 * step), jet.gradient[f][d], 2e-7);
+            trace[f] += (vp[f] - 2 * value[f] + vm[f]) / (step * step);
+          }
+        }
+        for (std::size_t f = 0; f < value.size(); ++f)
+          checkClose(trace[f], jet.laplacian[f], 2e-5);
+      }
+    }
+  cache.update(pf::GeometryPositionView::interleaved(origin.data(), 1));
+  const auto coalescent = feature::evaluate(cache.electronNucleusPairs(), 0, cell, 1,
+      PeriodicFeatureTransform::LOG_COMPLEMENT_V1, 1);
+  CHECK_FALSE(coalescent.differentiable);
+  CHECK(coalescent.value[0] == 0);
+  CHECK(coalescent.value[7] == 1);
 }

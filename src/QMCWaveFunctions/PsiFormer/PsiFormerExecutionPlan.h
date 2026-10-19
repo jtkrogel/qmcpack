@@ -24,10 +24,14 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
+#include <memory>
+
+#include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
 
 namespace qmcplusplus::psiformer
 {
@@ -55,6 +59,8 @@ enum class ParameterRole
   ENVELOPE_ZETA_DOWN,
   CUSP_SAME_ALPHA,
   CUSP_OPPOSITE_ALPHA,
+  PAIR_ATTENTION_WEIGHT,
+  PAIR_ATTENTION_BIAS,
   COUNT
 };
 
@@ -85,7 +91,37 @@ enum class BoundaryCondition
 enum class GeometryFeaturePolicy
 {
   OPEN_EUCLIDEAN_V1,
-  PERIODIC_TORUS_V1
+  PERIODIC_TORUS_V1,
+  PERIODIC_TWO_CELL_V1
+};
+
+/// Distinguish equal-radius periodic descriptors with different vector/rescale inputs.
+enum class PeriodicFeatureTransform
+{
+  LOG_COMPLEMENT_V1,
+  RAW_TRIGONOMETRIC_V1
+};
+
+/// A full occupied column preserves band identity even when reciprocal triplets repeat.
+struct OccupiedReciprocalColumn
+{
+  std::array<int, 3> reciprocal{};
+  std::size_t band = 0;
+  int spin = 0;
+  double occupation = 1;
+};
+
+/// Immutable opt-in periodic feature/head contract; legacy environments have no record.
+struct PeriodicProfileMetadata
+{
+  std::uint32_t version = 1;
+  pf::PeriodicGeometryMapping cells;
+  std::vector<pf::GeometryPosition> primitive_motif;
+  std::vector<int> motif_species;
+  PeriodicFeatureTransform feature_transform = PeriodicFeatureTransform::LOG_COMPLEMENT_V1;
+  std::size_t pair_feature_dimension = 8;
+  bool electron_electron_cusp = true;
+  std::vector<OccupiedReciprocalColumn> occupied_columns;
 };
 
 /// Select the scalar algebra expected by forward and adjoint kernels.
@@ -131,7 +167,11 @@ struct ExecutionEnvironment
   // PAIRED_REAL_COMPLEX currently describes full, reciprocal-phase-free heads
   // only. Public execution admission remains a separate adapter capability gate.
   HeadRepresentation head_representation = HeadRepresentation::REAL;
+  std::shared_ptr<const PeriodicProfileMetadata> periodic_profile;
 };
+
+/// Validate opt-in metadata independently before initializer/workspace allocations.
+void validatePeriodicProfileMetadata(const ModelShape& model, const ExecutionEnvironment& environment);
 
 /** Advertise implemented and reserved evaluator capabilities. */
 struct ModelCapabilities
