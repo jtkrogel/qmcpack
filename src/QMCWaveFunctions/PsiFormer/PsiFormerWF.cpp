@@ -273,12 +273,37 @@ void mixPersistentDouble(std::uint64_t& hash, double value) noexcept
   mixPersistentInteger(hash, bits);
 }
 
-/** Build a cross-rank model identity from immutable physics, layout, and initial weights.
- *
- * Including initial weights distinguishes independently loaded models whose local
- * parameter-version counters happen to agree.  Later optimizer changes are tracked
- * separately by the synchronized parameter version.
- */
+/// Extend identity only for opt-in two-cell profiles, preserving legacy fingerprints.
+void mixPeriodicProfile(std::uint64_t& hash, const psiformer::ExecutionEnvironment& environment)
+{
+  const auto& profile = environment.periodic_profile;
+  if (!profile) return;
+  mixPersistentString(hash, "periodic_two_cell_profile_v1");
+  mixPersistentInteger(hash, profile->version);
+  mixPersistentInteger(hash, static_cast<std::uint64_t>(profile->feature_transform));
+  mixPersistentInteger(hash, profile->pair_feature_dimension);
+  mixPersistentInteger(hash, profile->electron_electron_cusp);
+  for (const auto* cell : {&profile->cells.primitive, &profile->cells.simulation})
+    for (const auto& row : cell->lattice_vectors)
+      for (double value : row) mixPersistentDouble(hash, value);
+  for (const auto& row : profile->cells.tiling)
+    for (int value : row) mixPersistentInteger(hash, value);
+  mixPersistentInteger(hash, profile->primitive_motif.size());
+  for (const auto& position : profile->primitive_motif)
+    for (double value : position) mixPersistentDouble(hash, value);
+  for (int species : profile->motif_species) mixPersistentInteger(hash, species);
+  mixPersistentInteger(hash, profile->occupied_columns.size());
+  for (const auto& column : profile->occupied_columns)
+  {
+    for (int value : column.reciprocal) mixPersistentInteger(hash, value);
+    mixPersistentInteger(hash, column.band);
+    mixPersistentInteger(hash, column.spin);
+    mixPersistentDouble(hash, column.occupation);
+  }
+}
+
+/** Build a cross-rank identity from immutable physics, layout, and initial weights.
+ * Later optimizer changes are tracked separately by the synchronized parameter version. */
 std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
                                       const std::string& model_origin,
                                       const std::string& initialization_profile,
@@ -291,6 +316,7 @@ std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
   mixPersistentString(hash, model_origin);
   mixPersistentString(hash, initialization_profile);
   mixPersistentInteger(hash, initialization_seed);
+  mixPeriodicProfile(hash, environment);
   // Preserve the established OPEN identity exactly.  Periodic models add the
   // complete feature-policy and cell contract because identical parameters in
   // distinct cells do not represent the same physical wavefunction.
@@ -620,6 +646,7 @@ struct InitializedNativeModel
   pf::PsiFormer model;
   std::string profile;
   std::uint64_t seed;
+  psiformer::ExecutionEnvironment environment;
 };
 
 /** Immutable outer Bloch phase applied by the QMCPACK adapter.
@@ -777,7 +804,8 @@ InitializedNativeModel makeInitializedNativeModel(
         "Internally initialized PsiFormer requires two nonempty electron spin groups");
   if (shape.spin_up_electrons != static_cast<std::size_t>(electrons.groupsize(0)) ||
       shape.spin_down_electrons != static_cast<std::size_t>(electrons.groupsize(1)) ||
-      shape.nuclei != static_cast<std::size_t>(ions.getTotalNum()))
+      (!initialized.environment.periodic_profile &&
+       shape.nuclei != static_cast<std::size_t>(ions.getTotalNum())))
     throw std::invalid_argument(
         "Internally initialized PsiFormer dimensions do not match the QMCPACK particle sets");
 
@@ -804,6 +832,33 @@ InitializedNativeModel makeInitializedNativeModel(
     nuclear_charges.push_back(ion_species(charge_index, ions.GroupID[nucleus]));
   }
 
+  if (const auto& profile = initialized.environment.periodic_profile)
+  {
+    validateRuntimeLattice(electrons, initialized.environment, "Periodic PsiFormer initialization");
+    validateRuntimeLattice(ions, initialized.environment, "Periodic PsiFormer source");
+    if (shape.nuclei != profile->primitive_motif.size())
+      throw std::invalid_argument("Periodic PsiFormer feature count differs from its primitive motif");
+    std::vector<double> motif_positions;
+    for (const auto& position : profile->primitive_motif)
+      motif_positions.insert(motif_positions.end(), position.begin(), position.end());
+    std::vector<int> physical_species;
+    for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+      physical_species.push_back(ions.GroupID[ion]);
+    const auto mapping = pf::mapPeriodicIonMotif(profile->cells,
+        pf::GeometryPositionView::interleaved(motif_positions.data(), shape.nuclei), profile->motif_species,
+        pf::GeometryPositionView::interleaved(nuclear_positions.data(), ions.getTotalNum()), physical_species);
+    std::vector<double> motif_charges(shape.nuclei, std::numeric_limits<double>::quiet_NaN());
+    for (std::size_t ion = 0; ion < mapping.size(); ++ion)
+    {
+      auto& charge = motif_charges[mapping[ion]];
+      if (std::isfinite(charge) && charge != nuclear_charges[ion])
+        throw std::invalid_argument("Periodic PsiFormer motif replicas have different charges");
+      charge = nuclear_charges[ion];
+    }
+    nuclear_positions = std::move(motif_positions);
+    nuclear_charges = std::move(motif_charges);
+  }
+
   std::vector<pf::Layout> native_layouts;
   native_layouts.reserve(initialized.layouts.size());
   for (psiformer::ParameterLayoutInput& layout : initialized.layouts)
@@ -818,7 +873,7 @@ InitializedNativeModel makeInitializedNativeModel(
       shape.spin_down_electrons);
   pf::PsiFormer model(std::move(parameters), std::move(configuration), shape.determinants,
                       shape.feature_dimension, shape.attention_heads, shape.attention_blocks);
-  return {std::move(model), std::move(initialized.profile), initialized.seed};
+  return {std::move(model), std::move(initialized.profile), initialized.seed, std::move(initialized.environment)};
 }
 
 /// Convert the native DeepQMC leaf layout into compact tensor-level training metadata.
@@ -11414,14 +11469,19 @@ namespace
 void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
                           const psiformer::ExecutionEnvironment& environment,
                           const std::string& profile, std::uint64_t seed,
-                          const std::string& system, const std::array<double, 3>& twist)
+                          const std::string& system, const std::array<double, 3>& twist,
+                          const std::vector<double>& physical_source = {})
 {
+  const bool versioned = static_cast<bool>(environment.periodic_profile);
+  if (versioned && (profile != psiformer::PSIFORMER_PERIODIC_PAIR_V1 || physical_source.empty() ||
+                   physical_source.size() % 5 != 0))
+    throw std::invalid_argument("Periodic profile export requires complete physical source metadata");
   model.p.write(path);
   hdf_archive output;
   if (!output.open(path, H5F_ACC_RDWR))
     throw std::runtime_error("Unable to append PsiFormer model metadata");
   output.push("psiformer_model");
-  output.write(std::vector<int>{1, 0, 0}, "format_version");
+  output.write(versioned ? std::vector<int>{1, 1, 0} : std::vector<int>{1, 0, 0}, "format_version");
   output.write(std::string("fp64_reference"), "precision");
   output.write(std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
       model.ndet, model.dim, model.heads, model.blocks}, "shape");
@@ -11430,7 +11490,8 @@ void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
   output.write(system, "system");
   output.write(static_cast<int>(environment.head_representation == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX), "paired_complex");
   output.write(static_cast<int>(environment.boundary == psiformer::BoundaryCondition::PERIODIC), "periodic");
-  output.write(std::string(environment.boundary == psiformer::BoundaryCondition::PERIODIC ?
+  output.write(std::string(versioned ? "periodic_two_cell_v1" :
+      environment.boundary == psiformer::BoundaryCondition::PERIODIC ?
       "periodic_torus_v1" : "open_euclidean_v1"), "feature_policy");
   std::vector<double> lattice;
   for (const auto& row : environment.lattice_vectors)
@@ -11439,6 +11500,41 @@ void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
   output.write(std::vector<double>(twist.begin(), twist.end()), "twist");
   output.write(model.cfg.nuclei.x, "nuclear_positions");
   output.write(model.cfg.charges.x, "nuclear_charges");
+  if (versioned)
+  {
+    const auto& metadata = *environment.periodic_profile;
+    output.write(physical_source, "physical_source");
+    output.push("periodic_profile");
+    output.write(metadata.version, "version");
+    output.write(static_cast<int>(metadata.feature_transform), "feature_transform");
+    output.write(static_cast<std::uint64_t>(metadata.pair_feature_dimension), "pair_feature_dimension");
+    output.write(static_cast<int>(metadata.electron_electron_cusp), "electron_electron_cusp");
+    std::vector<double> primitive, motif, occupations;
+    std::vector<int> tiling, momenta, spins;
+    std::vector<std::uint64_t> bands;
+    for (const auto& row : metadata.cells.primitive.lattice_vectors)
+      primitive.insert(primitive.end(), row.begin(), row.end());
+    for (const auto& row : metadata.cells.tiling)
+      tiling.insert(tiling.end(), row.begin(), row.end());
+    for (const auto& atom : metadata.primitive_motif)
+      motif.insert(motif.end(), atom.begin(), atom.end());
+    for (const auto& column : metadata.occupied_columns)
+    {
+      momenta.insert(momenta.end(), column.reciprocal.begin(), column.reciprocal.end());
+      bands.push_back(column.band);
+      spins.push_back(column.spin);
+      occupations.push_back(column.occupation);
+    }
+    output.write(primitive, "primitive_lattice");
+    output.write(tiling, "tiling");
+    output.write(motif, "primitive_motif");
+    output.write(metadata.motif_species, "motif_species");
+    output.write(momenta, "occupied_reciprocal");
+    output.write(bands, "occupied_bands");
+    output.write(spins, "occupied_spins");
+    output.write(occupations, "occupied_occupations");
+    output.pop();
+  }
   output.write(model.p.layout_fingerprint(), "layout_fingerprint");
   output.write(wftrain::TrainingCheckpoint::valuesFingerprint(model.p.flat_values()), "values_fingerprint");
   output.write(static_cast<std::uint64_t>(model.p.version()), "parameter_version");
@@ -11476,6 +11572,19 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
   input.read(result.parameters.seed, "seed");
   input.read(result.system, "system");
   input.read(twist, "twist");
+  const bool versioned = result.parameters.profile == PSIFORMER_PERIODIC_PAIR_V1;
+  if (versioned)
+  {
+    if (version != std::vector<int>{1, 1, 0} || shape.size() != 7 ||
+        std::any_of(shape.begin(), shape.end(), [](auto n) {
+          return n == 0 || n > std::numeric_limits<std::size_t>::max(); }) ||
+        precision != "fp64_reference" || cookie != "psiformer-model-complete-v1" ||
+        (paired != 0 && paired != 1) || periodic != 1 || twist.size() != 3 ||
+        feature != "periodic_two_cell_v1" ||
+        (result.system != "all_electron" && result.system != "pseudopotential"))
+      throw std::runtime_error("Incompatible or incomplete periodic profile model metadata");
+  }
+  else
   if (version != std::vector<int>{1, 0, 0} || shape.size() != 7 ||
       std::any_of(shape.begin(), shape.end(), [](auto n) { return n == 0 || n > std::numeric_limits<std::size_t>::max(); }) ||
       precision != "fp64_reference" || cookie != "psiformer-model-complete-v1" ||
@@ -11489,6 +11598,63 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
   result.periodic = periodic;
   std::copy(twist.begin(), twist.end(), result.twist.begin());
   result.parameters.model_shape = {shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6]};
+  if (versioned)
+  {
+    auto metadata = std::make_shared<PeriodicProfileMetadata>();
+    auto& environment = result.parameters.environment;
+    environment.boundary = BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    environment.periodic_axes = {true, true, true};
+    environment.head_representation = paired ? HeadRepresentation::PAIRED_REAL_COMPLEX : HeadRepresentation::REAL;
+    environment.amplitude_scalar_domain = paired ? ScalarDomain::COMPLEX : ScalarDomain::REAL;
+    std::vector<double> lattice, primitive, motif, occupations;
+    std::vector<int> tiling, momenta, spins;
+    std::vector<std::uint64_t> bands;
+    std::uint64_t pair_dimension = 0;
+    int transform = -1, cusp = -1;
+    if (!input.readEntry(lattice, "lattice") || lattice.size() != 9 || !input.is_group("periodic_profile"))
+      throw std::runtime_error("Periodic profile model is missing cell metadata");
+    input.push("periodic_profile", false);
+    const bool complete = input.readEntry(metadata->version, "version") &&
+        input.readEntry(transform, "feature_transform") && input.readEntry(pair_dimension, "pair_feature_dimension") &&
+        input.readEntry(cusp, "electron_electron_cusp") && input.readEntry(primitive, "primitive_lattice") &&
+        input.readEntry(tiling, "tiling") && input.readEntry(motif, "primitive_motif") &&
+        input.readEntry(metadata->motif_species, "motif_species") && input.readEntry(momenta, "occupied_reciprocal") &&
+        input.readEntry(bands, "occupied_bands") && input.readEntry(spins, "occupied_spins") &&
+        input.readEntry(occupations, "occupied_occupations");
+    input.pop();
+    if (!complete || primitive.size() != 9 || tiling.size() != 9 ||
+        motif.size() != 3 * shape[2] || bands.size() != shape[0] + shape[1] ||
+        momenta.size() != 3 * bands.size() || spins.size() != bands.size() || occupations.size() != bands.size() ||
+        pair_dimension != 8 || (cusp != 0 && cusp != 1) ||
+        (transform != static_cast<int>(PeriodicFeatureTransform::LOG_COMPLEMENT_V1) &&
+         transform != static_cast<int>(PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1)))
+      throw std::runtime_error("Incomplete or invalid periodic profile feature and occupied metadata");
+    metadata->feature_transform = static_cast<PeriodicFeatureTransform>(transform);
+    metadata->pair_feature_dimension = pair_dimension;
+    metadata->electron_electron_cusp = cusp;
+    metadata->cells.primitive.kind = metadata->cells.simulation.kind = pf::GeometryBoundaryKind::PERIODIC;
+    metadata->cells.primitive.periodic_axes = metadata->cells.simulation.periodic_axes = {true, true, true};
+    for (std::size_t a = 0; a < 3; ++a)
+      for (std::size_t d = 0; d < 3; ++d)
+      {
+        environment.lattice_vectors[a][d] = lattice[3 * a + d];
+        metadata->cells.simulation.lattice_vectors[a][d] = lattice[3 * a + d];
+        metadata->cells.primitive.lattice_vectors[a][d] = primitive[3 * a + d];
+        metadata->cells.tiling[a][d] = tiling[3 * a + d];
+      }
+    for (std::size_t atom = 0; atom < shape[2]; ++atom)
+      metadata->primitive_motif.push_back({motif[3 * atom], motif[3 * atom + 1], motif[3 * atom + 2]});
+    for (std::size_t column = 0; column < bands.size(); ++column)
+    {
+      if (bands[column] > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("Periodic profile occupied band index overflows native size");
+      metadata->occupied_columns.push_back({{momenta[3 * column], momenta[3 * column + 1],
+          momenta[3 * column + 2]}, static_cast<std::size_t>(bands[column]), spins[column], occupations[column]});
+    }
+    environment.periodic_profile = std::move(metadata);
+    validatePeriodicProfileMetadata(result.parameters.model_shape, environment);
+  }
   pf::Parameters parameters(path);
   if (parameters.layout_fingerprint() != layout ||
       wftrain::TrainingCheckpoint::valuesFingerprint(parameters.flat_values()) != values_fingerprint)
@@ -11504,9 +11670,11 @@ void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, cons
     const std::array<double, 3>& twist)
 {
   const auto& shape = model.parameters.model_shape;
+  const bool versioned = static_cast<bool>(model.parameters.environment.periodic_profile);
   if (system != model.system || electrons.groups() != 2 ||
       electrons.groupsize(0) != shape.spin_up_electrons || electrons.groupsize(1) != shape.spin_down_electrons ||
-      ions.getTotalNum() != shape.nuclei || model.periodic != (electrons.getLattice().getSuperCellEnum() == SUPERCELL_BULK) ||
+      (!versioned && ions.getTotalNum() != shape.nuclei) ||
+      model.periodic != (electrons.getLattice().getSuperCellEnum() == SUPERCELL_BULK) ||
       model.twist != twist)
     throw std::invalid_argument("Standalone PsiFormer model disagrees with XML system/spins/boundary/twist");
   hdf_archive input;
@@ -11523,7 +11691,40 @@ void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, cons
   const int charge = species.findAttribute("charge");
   if (charge < 0)
     throw std::invalid_argument("Standalone PsiFormer XML ions require charges");
-  for (std::size_t atom = 0; atom < shape.nuclei; ++atom)
+  if (versioned)
+  {
+    const auto& metadata = *model.parameters.environment.periodic_profile;
+    std::vector<double> physical;
+    if (!input.readEntry(physical, "physical_source") || physical.empty() || physical.size() % 5 != 0 ||
+        physical.size() / 5 != static_cast<std::size_t>(ions.getTotalNum()))
+      throw std::invalid_argument("Periodic profile physical source snapshot is incomplete");
+    for (std::size_t atom = 0; atom < physical.size() / 5; ++atom)
+    {
+      if (physical[5 * atom + 3] != species(charge, ions.GroupID[atom]) ||
+          physical[5 * atom + 4] != ions.GroupID[atom])
+        throw std::invalid_argument("Periodic profile physical source charge or species differs from XML");
+      for (std::size_t d = 0; d < 3; ++d)
+        if (physical[5 * atom + d] != ions.R[atom][d])
+          throw std::invalid_argument("Periodic profile physical source positions differ from XML");
+    }
+    std::vector<double> motif_positions;
+    for (const auto& atom : metadata.primitive_motif)
+      motif_positions.insert(motif_positions.end(), atom.begin(), atom.end());
+    std::vector<int> runtime_species;
+    for (std::size_t atom = 0; atom < physical.size() / 5; ++atom)
+      runtime_species.push_back(ions.GroupID[atom]);
+    const auto mapping = pf::mapPeriodicIonMotif(metadata.cells,
+        pf::GeometryPositionView::interleaved(motif_positions.data(), shape.nuclei), metadata.motif_species,
+        pf::GeometryPositionView::interleaved(physical.data(), physical.size() / 5, 5), runtime_species);
+    for (std::size_t atom = 0; atom < shape.nuclei; ++atom)
+      for (std::size_t d = 0; d < 3; ++d)
+        if (positions[3 * atom + d] != metadata.primitive_motif[atom][d])
+          throw std::invalid_argument("Periodic profile feature centers disagree with its motif");
+    for (std::size_t atom = 0; atom < mapping.size(); ++atom)
+      if (charges[mapping[atom]] != physical[5 * atom + 3])
+        throw std::invalid_argument("Periodic profile feature charges disagree with physical source");
+  }
+  else for (std::size_t atom = 0; atom < shape.nuclei; ++atom)
   {
     if (charges[atom] != species(charge, ions.GroupID[atom]))
       throw std::invalid_argument("Standalone PsiFormer ionic charges differ from XML");

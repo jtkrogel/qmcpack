@@ -1146,10 +1146,61 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
           "[wavefunction][psiformer][complex_wf][complex_affine_provider]")
 {
   using namespace wftrain;
+  bool pair_profile = false;
+  SECTION("legacy paired profile") {}
+  SECTION("two-cell pair profile with complete physical ions") { pair_profile = true; }
   const SimulationCell simulation_cell(cell());
   auto p = electrons(simulation_cell);
-  auto source = ions(simulation_cell);
-  PsiFormerComplexWF component("affine", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  auto source = [&]() {
+    if (!pair_profile) return ions(simulation_cell);
+    ParticleSet result(simulation_cell);
+    result.setName("ion0");
+    result.create({2, 2});
+    auto& species = result.getSpeciesSet();
+    species.addSpecies("Li"); species.addSpecies("H");
+    const int charge = species.addAttribute("charge");
+    species(charge, 0) = 3; species(charge, 1) = 1;
+    result.resetGroups();
+    result.R[0] = {0, 0, 0}; result.R[1] = {4, 0, 0};
+    result.R[2] = {1, 1, 1}; result.R[3] = {5, 1, 1};
+    result.update();
+    return result;
+  }();
+  auto initialized = parameters();
+  if (pair_profile)
+  {
+    auto& environment = initialized.environment;
+    environment.boundary = ps::BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    environment.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    environment.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    environment.periodic_axes = {true, true, true};
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) environment.lattice_vectors[i][j] = cell().R(i, j);
+    auto metadata = std::make_shared<ps::PeriodicProfileMetadata>();
+    metadata->cells.primitive = metadata->cells.simulation =
+        {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+    metadata->cells.primitive.lattice_vectors[0][0] = 4;
+    metadata->cells.tiling[0][0] = 2;
+    metadata->primitive_motif = {{0, 0, 0}, {1, 1, 1}};
+    metadata->motif_species = {0, 1};
+    metadata->electron_electron_cusp = false;
+    metadata->feature_transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+    for (std::size_t i = 0; i < 4; ++i) metadata->occupied_columns.push_back({{}, i % 2, int(i / 2), 1});
+    environment.periodic_profile = std::move(metadata);
+    initialized.profile = ps::PSIFORMER_PERIODIC_PAIR_V1;
+    for (std::size_t block = 0; block < initialized.model_shape.attention_blocks; ++block)
+      for (bool bias : {false, true})
+      {
+        const auto begin = initialized.values.size();
+        const auto heads = initialized.model_shape.attention_heads;
+        initialized.values.resize(begin + (bias ? 1 : 8) * heads, .02);
+        const auto layer = block == 0 ? std::string("electron_gnn_layer") : "electron_gnn_layer_" + std::to_string(block);
+        initialized.layouts.push_back({"periodic/" + layer + "/pair_attention", bias ? "b" : "w",
+            bias ? std::vector<std::size_t>{heads} : std::vector<std::size_t>{8, heads}, begin, initialized.values.size()});
+      }
+  }
+  PsiFormerComplexWF component("affine", initialized, p, source, clone_cap, {.17, -.11, .07});
   const auto& schema = component.parameterSchema();
   const auto affine = component.affineParameterBlocks();
   REQUIRE_FALSE(affine.empty());
@@ -1248,6 +1299,66 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     close({real[index], imaginary[index]}, (plus - minus) / (2 * step), 2e-7);
   }
   CHECK(component.affineScoreStorage().prepared_bytes == required);
+  if (pair_profile)
+  {
+    evaluate(component, p);
+    C expected_kinetic{};
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      C contraction = p.L[electron];
+      for (int d = 0; d < 3; ++d) contraction += p.G[electron][d] * p.G[electron][d];
+      expected_kinetic -= .5 * contraction;
+    }
+    close(component.observeCoulombEnergy(p, 0).kinetic, expected_kinetic);
+    RefVectorWithLeader<WaveFunctionComponent> components(component);
+    components.push_back(component);
+    RefVectorWithLeader<ParticleSet> particles(p);
+    particles.push_back(p);
+    const auto derivative_bytes = component.streamingDerivativeRequiredBytes(1);
+    CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(components, particles, 0, 0, 7,
+                                                                  derivative_bytes - 1));
+    auto derivative = component.makeBudgetedStreamingDerivativeOperator(components, particles, 0, 0, 7,
+                                                                       derivative_bytes);
+    CHECK(derivative->storageDiagnostics().retained_numeric_bytes == derivative_bytes);
+    // The second replica is not a feature center, but remains fixed physical data.
+    const auto fixed = source.R[1][0];
+    source.R[1][0] += .01;
+    CHECK_THROWS(component.observeComplexAffineScores(p, observer, real, imaginary));
+    source.R[1][0] = fixed;
+    auto clone_particles = electrons(simulation_cell);
+    auto clone = component.makeClone(clone_particles);
+    auto* typed = dynamic_cast<PsiFormerComplexWF*>(clone.get());
+    REQUIRE(typed);
+    typed->isolateParameterState();
+    close(evaluate(*typed, clone_particles), evaluate(component, p));
+    CHECK(typed->trainingConfigurationFingerprint() == component.trainingConfigurationFingerprint());
+    const auto path = "psiformer_pair_component." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+    REQUIRE_FALSE(std::filesystem::exists(path));
+    component.exportModel(path);
+    auto imported = ps::readPsiFormerModelFile(path);
+    REQUIRE(imported.parameters.environment.periodic_profile);
+    CHECK(imported.parameters.model_shape.nuclei == 2);
+    const auto& metadata = *imported.parameters.environment.periodic_profile;
+    CHECK(metadata.cells.tiling[0][0] == 2);
+    CHECK(metadata.feature_transform == ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1);
+    CHECK_FALSE(metadata.electron_electron_cusp);
+    CHECK(metadata.occupied_columns.size() == 4);
+    ps::validatePsiFormerModelFile(imported, path, clone_particles, source, "all_electron", {.17, -.11, .07});
+    PsiFormerComplexWF reloaded("affine", imported.parameters, clone_particles, source, clone_cap,
+                               {.17, -.11, .07});
+    CHECK(reloaded.snapshotParameters().values == component.snapshotParameters().values);
+    CHECK(reloaded.trainingConfigurationFingerprint() == component.trainingConfigurationFingerprint());
+    close(evaluate(reloaded, clone_particles), evaluate(component, p));
+    source.R[1][0] += .01;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, clone_particles, source, "all_electron",
+                                               {.17, -.11, .07}));
+    source.R[1][0] = fixed;
+    source.GroupID[1] = 1;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, clone_particles, source, "all_electron",
+                                               {.17, -.11, .07}));
+    source.GroupID[1] = 0;
+    std::filesystem::remove(path);
+  }
 }
 
 TEST_CASE("PsiFormer complex structured provider publishes canonical real tensors atomically",

@@ -195,7 +195,7 @@ public:
                     qmcplusplus::psiformer::ComplexOrbitalPhase::NONE, {}}, outer_k_(outer_k),
         shape_{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
                plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
-               model.blocks, plan.parameterCount()}
+               model.blocks, plan.parameterCount(), bool(plan.environment().periodic_profile)}
   {
     using namespace qmcplusplus::psiformer;
     if (plan.environment().head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||

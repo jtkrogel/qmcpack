@@ -323,9 +323,11 @@ public:
     }
     // The common real cusp contributes only to the real part of its parameter scores.
     double same_score = 0, opposite_score = 0;
-    amplitude.log_abs += realCuspValueAndReverse(*tape.geometry, descriptor_.spin_up,
-        same_.size ? p[same_.begin] : 1.0, p[opposite_.begin], same_.size ? &same_score : nullptr,
-        opposite_score, 1.0);
+    const auto& profile = trunk_.plan().environment().periodic_profile;
+    if (!profile || profile->electron_electron_cusp)
+      amplitude.log_abs += realCuspValueAndReverse(*tape.geometry, descriptor_.spin_up,
+          same_.size ? p[same_.begin] : 1.0, p[opposite_.begin], same_.size ? &same_score : nullptr,
+          opposite_score, 1.0);
     if (same_.size)
       w.score_[same_.begin] += same_score;
     w.score_[opposite_.begin] += opposite_score;

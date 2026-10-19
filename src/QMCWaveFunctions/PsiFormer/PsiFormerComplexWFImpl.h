@@ -251,23 +251,71 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Preserve paired metadata rather than recreating a default-real environment.
-    static psiformer::ExecutionEnvironment environmentFor(const ParticleSet& electrons)
+    static psiformer::ExecutionEnvironment environmentFor(const ParticleSet& electrons,
+        const psiformer::ExecutionEnvironment& initialized)
     {
       auto environment = makeExecutionEnvironment(electrons);
       if (environment.boundary != psiformer::BoundaryCondition::PERIODIC || electrons.isSpinor())
         throw std::invalid_argument("Complex PsiFormer inference requires nonspinor periodic bulk electrons");
       environment.head_representation = psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX;
       environment.amplitude_scalar_domain = psiformer::ScalarDomain::COMPLEX;
+      if (initialized.periodic_profile)
+      {
+        validateRuntimeLattice(electrons, initialized, "Complex PsiFormer periodic initialization");
+        if (initialized.head_representation != environment.head_representation ||
+            initialized.amplitude_scalar_domain != environment.amplitude_scalar_domain)
+          throw std::invalid_argument("Complex PsiFormer periodic profile requires paired complex metadata");
+        environment = initialized;
+      }
       return environment;
+    }
+
+    /// Snapshot all physical ions independently of any reduced primitive feature motif.
+    static std::vector<double> physicalSource(const ParticleSet& ions)
+    {
+      const auto& species = ions.getSpeciesSet();
+      const int charge = species.findAttribute("charge");
+      if (charge < 0 || ions.GroupID.size() != ions.R.size())
+        throw std::invalid_argument("Complex PsiFormer physical source metadata is incomplete");
+      std::vector<double> result;
+      result.reserve(5 * ions.getTotalNum());
+      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+      {
+        const auto group = ions.GroupID[ion];
+        if (group < 0 || group >= ions.groups())
+          throw std::invalid_argument("Complex PsiFormer physical source species is invalid");
+        for (int d = 0; d < 3; ++d)
+          result.push_back(ions.R[ion][d]);
+        result.push_back(species(charge, group));
+        result.push_back(group);
+      }
+      if (!std::all_of(result.begin(), result.end(), [](double value) { return std::isfinite(value); }))
+        throw std::invalid_argument("Complex PsiFormer physical source must be finite");
+      return result;
+    }
+
+    /// Preserve ordered physical species labels independently of mutable ParticleSet metadata.
+    static std::vector<std::string> physicalSpecies(const ParticleSet& ions)
+    {
+      std::vector<std::string> result;
+      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+        result.push_back(ions.getSpeciesSet().getSpeciesName(ions.GroupID[ion]));
+      return result;
     }
 
     /// Preserve existing AE identities exactly; only explicit PP metadata adds a new distinction.
     static std::uint64_t identityFor(const pf::PsiFormer& model, const std::string& profile, std::uint64_t seed,
         const psiformer::ExecutionEnvironment& environment, const std::array<double, 3>& reduced,
-        const std::array<double, 3>& cartesian, const std::string& kind)
+        const std::array<double, 3>& cartesian, const std::string& kind, const ParticleSet& ions)
     {
       auto identity = persistentModelIdentity(model, "internal", profile, seed, environment, reduced, cartesian);
       if (kind != "all_electron") mixPersistentString(identity, kind);
+      if (environment.periodic_profile)
+      {
+        for (double value : physicalSource(ions)) mixPersistentDouble(identity, value);
+        for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+          mixPersistentString(identity, ions.getSpeciesSet().getSpeciesName(ions.GroupID[ion]));
+      }
       return identity;
     }
 
@@ -280,12 +328,14 @@ struct PsiFormerComplexWF::Impl
 #endif
           )
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
-          system_kind(kind), environment(environmentFor(electrons)), reduced_twist(reduced),
+          system_kind(kind), environment(environmentFor(electrons, initialized.environment)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
           plan(psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
               {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
-          identity(identityFor(model, profile, seed, environment, reduced_twist, cartesian_twist, system_kind)), source(&ions),
+          identity(identityFor(model, profile, seed, environment, reduced_twist, cartesian_twist, system_kind, ions)), source(&ions),
+          physical_source(physicalSource(ions)),
+          physical_species(physicalSpecies(ions)),
           schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit),
           gpu_capacity(
 #ifdef ENABLE_CUDA
@@ -325,6 +375,8 @@ struct PsiFormerComplexWF::Impl
     const pf::DirectComplexSpatialExecutor spatial;
     const std::uint64_t identity;
     const ParticleSet* const source;
+    const std::vector<double> physical_source;
+    const std::vector<std::string> physical_species;
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     const std::size_t gpu_limit;
     const std::size_t gpu_capacity, gpu_crowds;
@@ -478,8 +530,8 @@ struct PsiFormerComplexWF::Impl
   static void validateDerivativeSource(const Model& s)
   {
     validateRuntimeLattice(*s.source, s.environment, "Complex PsiFormer derivative source");
-    if (s.source->getTotalNum() != static_cast<int>(s.model.cfg.nuclei.shape[0]) ||
-        s.source->R.size() != s.model.cfg.nuclei.shape[0] || s.source->GroupID.size() != s.source->R.size())
+    if (s.source->getTotalNum() != static_cast<int>(s.physical_source.size() / 5) ||
+        s.source->R.size() != s.physical_source.size() / 5 || s.source->GroupID.size() != s.source->R.size())
       throw std::invalid_argument("Complex PsiFormer derivative fixed-source extent mismatch");
     const auto& species = s.source->getSpeciesSet();
     const int charge = species.findAttribute("charge");
@@ -489,11 +541,13 @@ struct PsiFormerComplexWF::Impl
     {
       if (s.source->GroupID[atom] < 0 || s.source->GroupID[atom] >= s.source->groups() ||
           !psiformer::determinant::isFiniteReal(species(charge, s.source->GroupID[atom])) ||
-          species(charge, s.source->GroupID[atom]) != s.model.cfg.charges.x[atom])
+          species(charge, s.source->GroupID[atom]) != s.physical_source[5 * atom + 3] ||
+          s.source->GroupID[atom] != s.physical_source[5 * atom + 4] ||
+          species.getSpeciesName(s.source->GroupID[atom]) != s.physical_species[atom])
         throw std::invalid_argument("Complex PsiFormer derivative fixed-source charge changed");
       for (int d = 0; d < 3; ++d)
         if (!psiformer::determinant::isFiniteReal(s.source->R[atom][d]) ||
-            s.source->R[atom][d] != s.model.cfg.nuclei.x[3 * atom + d])
+            s.source->R[atom][d] != s.physical_source[5 * atom + d])
           throw std::invalid_argument("Complex PsiFormer derivative fixed-source configuration changed");
     }
   }
@@ -1242,7 +1296,7 @@ struct PsiFormerComplexWF::Impl
     {
       return {s.model.ne, s.model.cfg.nuclei.shape[0], s.model.ndet, s.model.dim, s.model.heads,
           s.plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
-          s.model.blocks, s.model.p.size()};
+          s.model.blocks, s.model.p.size(), bool(s.environment.periodic_profile)};
     }
 
     /// Include both executor ion copies and all channel buffers before any numerical allocation.
@@ -1347,16 +1401,19 @@ struct PsiFormerComplexWF::Impl
       case Role::ATTENTION_OUTPUT_WEIGHT:
       case Role::UPDATE_HIDDEN_WEIGHT:
       case Role::UPDATE_OUTPUT_WEIGHT:
+      case Role::PAIR_ATTENTION_WEIGHT:
       case Role::BACKFLOW_UP_WEIGHT:
       case Role::BACKFLOW_DOWN_WEIGHT: break;
       default: continue;
       }
       const auto weight = schema_block(tensor);
       auto bias = wftrain::NO_AFFINE_BIAS_BLOCK;
-      if (tensor.role == Role::UPDATE_HIDDEN_WEIGHT || tensor.role == Role::UPDATE_OUTPUT_WEIGHT)
+      if (tensor.role == Role::UPDATE_HIDDEN_WEIGHT || tensor.role == Role::UPDATE_OUTPUT_WEIGHT ||
+          tensor.role == Role::PAIR_ATTENTION_WEIGHT)
       {
         const auto bias_role = tensor.role == Role::UPDATE_HIDDEN_WEIGHT
-            ? Role::UPDATE_HIDDEN_BIAS : Role::UPDATE_OUTPUT_BIAS;
+            ? Role::UPDATE_HIDDEN_BIAS : tensor.role == Role::UPDATE_OUTPUT_WEIGHT
+            ? Role::UPDATE_OUTPUT_BIAS : Role::PAIR_ATTENTION_BIAS;
         bias = schema_block(s.plan.parameter(bias_role, tensor.attention_block));
         if (s.schema->blocks()[bias].trainable != s.schema->blocks()[weight].trainable)
           throw std::logic_error("Complex affine weight and bias trainability differ");
@@ -1385,8 +1442,13 @@ struct PsiFormerComplexWF::Impl
     {
       const char* error = "Complex affine response extent overflow";
       const auto layers = pf::checkedStorageSum(1, pf::checkedStorageProduct(6, s.model.blocks, error), error);
-      return pf::checkedStorageProduct(layers,
+      auto elements = pf::checkedStorageProduct(layers,
           pf::checkedStorageProduct(s.model.ne, s.model.dim, error), error);
+      if (s.environment.periodic_profile)
+        pf::addStorageBytes(elements, pf::checkedStorageProduct(s.model.blocks,
+            pf::checkedStorageProduct(s.model.ne, pf::checkedStorageProduct(s.model.ne - 1,
+                s.model.heads, error), error), error), error);
+      return elements;
     }
 
     /// Charge the score owner and all channel-pairing buffers before numerical allocation.
@@ -1421,7 +1483,8 @@ struct PsiFormerComplexWF::Impl
         bindings.push_back({tensor->role, tensor->attention_block, ordinal, offset, tensor->head_component});
         if (tensor->role != psiformer::ParameterRole::BACKFLOW_UP_WEIGHT &&
             tensor->role != psiformer::ParameterRole::BACKFLOW_DOWN_WEIGHT)
-          offset += s.model.ne * blocks[ordinal].output_width;
+          offset += (tensor->role == psiformer::ParameterRole::PAIR_ATTENTION_WEIGHT
+              ? s.model.ne * (s.model.ne - 1) : s.model.ne) * blocks[ordinal].output_width;
       }
       if (offset > real_responses.size())
         throw std::logic_error("Complex affine response scratch is smaller than its bindings");
@@ -1654,7 +1717,8 @@ struct PsiFormerComplexWF::Impl
   {
     if (system_kind != "all_electron" && system_kind != "pseudopotential")
       throw std::invalid_argument("Complex PsiFormer requires an explicit AE or pseudopotential system kind");
-    if (initialized.profile != psiformer::PSIFORMER_COMPLEX_PERIODIC_V1)
+    if (initialized.profile != psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 &&
+        initialized.profile != psiformer::PSIFORMER_PERIODIC_PAIR_V1)
       throw std::invalid_argument("Complex PsiFormer inference requires explicit paired initialization");
     validateMatchingLattices(electrons, ions);
     auto native = makeInitializedNativeModel(std::move(initialized), electrons, ions);
@@ -1708,7 +1772,8 @@ struct PsiFormerComplexWF::Impl
       throw std::invalid_argument("Complex PsiFormer requires a positive finite per-clone numeric byte cap");
     const auto& model = state->model;
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
-        state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size()};
+        state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size(),
+        bool(state->environment.periodic_profile)};
     if (!state->gpu_limit)
     {
       numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
@@ -2524,6 +2589,12 @@ std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
   mixPersistentString(hash, s.profile);
   if (s.system_kind != "all_electron") mixPersistentString(hash, s.system_kind);
   mixPersistentInteger(hash, s.seed);
+  mixPeriodicProfile(hash, s.environment);
+  if (s.environment.periodic_profile)
+  {
+    for (double value : s.physical_source) mixPersistentDouble(hash, value);
+    for (const auto& species : s.physical_species) mixPersistentString(hash, species);
+  }
   mixPersistentString(hash, s.schema->fingerprint());
   mixPersistentInteger(hash, static_cast<std::uint64_t>(s.environment.geometry_feature_policy));
   for (bool periodic : s.environment.periodic_axes)
@@ -2821,7 +2892,7 @@ void PsiFormerComplexWF::exportModel(const std::string& path) const
   std::shared_lock lock(impl_->state->mutex);
   const auto& state = *impl_->state;
   writeStandaloneModel(path, state.model, state.environment, state.profile, state.seed,
-                       state.system_kind, state.reduced_twist);
+                       state.system_kind, state.reduced_twist, state.physical_source);
 }
 
 bool PsiFormerComplexWF::isMultiDet() const
@@ -3030,7 +3101,7 @@ void PsiFormerComplexWF::isolateParameterState()
     pf::PsiFormer detached(std::move(parameters), model.cfg, model.ndet,
                            model.dim, model.heads, model.blocks);
     auto state = std::make_shared<Impl::Model>(getName(),
-        InitializedNativeModel{std::move(detached), original->profile, original->seed},
+        InitializedNativeModel{std::move(detached), original->profile, original->seed, original->environment},
         *impl_->particles, *original->source, original->reduced_twist, 0, original->system_kind);
     independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   }
@@ -3091,7 +3162,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
-      InitializedNativeModel{std::move(model), original->profile, original->seed},
+      InitializedNativeModel{std::move(model), original->profile, original->seed, original->environment},
       *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind, std::move(lane));
   state->private_origin = original;
   state->private_origin_image = image;
