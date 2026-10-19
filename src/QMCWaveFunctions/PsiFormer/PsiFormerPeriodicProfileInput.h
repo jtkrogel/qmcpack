@@ -106,11 +106,15 @@ inline ExecutionEnvironment parsePeriodicProfileInput(xmlNodePtr node, const Par
   const auto transform = getXMLAttributeValue(node, "feature_transform");
   if (transform == "raw_trigonometric_v1") metadata->feature_transform = PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
   else if (transform == "log_complement_v1") metadata->feature_transform = PeriodicFeatureTransform::LOG_COMPLEMENT_V1;
+  else if (transform == "polynomial_v1") metadata->feature_transform = PeriodicFeatureTransform::POLYNOMIAL_V1;
   else throw std::invalid_argument("Periodic profile requires an explicit supported feature_transform");
+  metadata->pair_feature_dimension = periodicPairFeatureArity(metadata->feature_transform);
   const auto cusp = getXMLAttributeValue(node, "electron_electron_cusp");
   if (cusp != "yes" && cusp != "no")
     throw std::invalid_argument("periodic_profile requires electron_electron_cusp=yes or no");
   metadata->electron_electron_cusp = cusp == "yes";
+  if (metadata->feature_transform == PeriodicFeatureTransform::POLYNOMIAL_V1 && metadata->electron_electron_cusp)
+    throw std::invalid_argument("Polynomial periodic features require electron_electron_cusp=no");
   const std::array<std::string, 5> names{"primitive_lattice", "tiling", "primitive_motif", "motif_species", "occupied_columns"};
   std::unordered_map<std::string, std::string> fields;
   for (auto* child = node->children; child; child = child->next)

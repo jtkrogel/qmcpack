@@ -1902,13 +1902,30 @@ TEST_CASE("Versioned periodic XML preserves explicit feature and physical metada
   invalid = expected;
   invalid.replace(invalid.find(motif_species), motif_species.size(), "missing ion_1");
   CHECK_THROWS(parse(invalid));
+  const auto polynomial = parse(profile("real", "polynomial_v1"));
+  CHECK(polynomial.periodic_profile->feature_transform == psiformer::PeriodicFeatureTransform::POLYNOMIAL_V1);
+  CHECK(polynomial.periodic_profile->pair_feature_dimension == 5);
+  invalid = profile("real", "polynomial_v1");
+  invalid.replace(invalid.find("electron_electron_cusp='no'"), std::string("electron_electron_cusp='no'").size(),
+                  "electron_electron_cusp='yes'");
+  CHECK_THROWS(parse(invalid));
+  invalid = profile("real", "polynomial_unversioned");
+  CHECK_THROWS(parse(invalid));
+  const auto original_positions = particles.R;
   for (const auto& head : {std::string("real"), std::string("paired_complex")})
   {
 #ifndef QMC_COMPLEX
     if (head == "paired_complex") continue;
 #endif
-    for (const auto& transform : {"raw_trigonometric_v1", "log_complement_v1"})
+    for (const auto& transform : {"raw_trigonometric_v1", "log_complement_v1", "polynomial_v1"})
     {
+      // Polynomial spatial products require generic points away from the C1 coordinate planes.
+      if (std::string(transform) == "polynomial_v1")
+      {
+        for (std::size_t row = 0; row < particles.R.size(); ++row)
+          particles.R[row] = {.21 + .17 * row, -.31 + .13 * row, .51 - .11 * row};
+        particles.update();
+      }
       PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
       const auto attributes = std::string("name='profile_input' source='ion0' system='all_electron' gpu='cpu' ") +
           "feature_policy='periodic_two_cell_v1' " +
@@ -1944,6 +1961,8 @@ TEST_CASE("Versioned periodic XML preserves explicit feature and physical metada
         physical_source.R[3][0] -= 0.125;
         physical_source.update();
       }
+      particles.R = original_positions;
+      particles.update();
     }
   }
 }
