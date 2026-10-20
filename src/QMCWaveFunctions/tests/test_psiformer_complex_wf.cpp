@@ -4,9 +4,10 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file test_psiformer_complex_wf.cpp
- * @brief Native-free scalar component tests; XML admission is deliberately unchanged.
+ * @brief Scalar component and XML/device admission regression tests.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "Particle/ParticleSet.h"
 #include "Particle/ParticleIO/XMLParticleIO.h"
@@ -1047,6 +1048,9 @@ TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device 
                              "max_gpu_numeric_bytes='1024'", "optimize='yes'",
                              "precision='fp32_dense_fp64_islands'"})
     CHECK_THROWS(build(complexXml(request)));
+  CHECK_THROWS_WITH(build(complexXml("gpu='hip' max_gpu_numeric_bytes='67108864' "
+                                    "optimize='no' optimize_scope='indices'")),
+                    "Paired-complex HIP native profiles require separate runtime qualification");
   CHECK_THROWS(build(complexXml("", "")));
   CHECK_THROWS(build(complexXml("", "0")));
   CHECK_THROWS(build(complexXml("parameter_checkpoint=''")));

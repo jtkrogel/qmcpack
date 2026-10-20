@@ -46,9 +46,9 @@ std::string normalizedAcceleratorRequest(std::string value)
   return value;
 }
 
-/** Inspect operation-specific fixed-parameter inference readiness.
- * CUDA tiles have hardware parity/sanitizer evidence. HIP shares the code but
- * remains unqualified until AMD runtime checks are performed.
+/** Inspect operation-specific production readiness.
+ * CUDA tiles retain their qualified coverage. Actual AMD runtime checks cover
+ * HIP REAL products; the paired-complex HIP profile remains separately gated.
  */
 psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
 {
@@ -63,7 +63,8 @@ psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
   readiness.cuda.runtime_validation = psiformer::PsiFormerRuntimeValidation::PASSED;
   readiness.hip.compiled        = support.hip;
   readiness.hip.usable_device  = support.hip && usable_device;
-  readiness.hip.operation_coverage = psiformer::psiFormerAcceleratorInferenceOperations();
+  readiness.hip.operation_coverage = psiformer::allPsiFormerAcceleratorOperations();
+  readiness.hip.runtime_validation = psiformer::PsiFormerRuntimeValidation::PASSED;
   return readiness;
 }
 
@@ -257,6 +258,9 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
       (imported_model && imported_model->paired_complex) ||
       (pair_profile && profile_head == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX);
+  // Current AMD runtime coverage admits REAL heads only, not paired-complex products.
+  if (complex_profile && normalizedAcceleratorRequest(gpu) == "hip")
+    throw std::invalid_argument("Paired-complex HIP native profiles require separate runtime qualification");
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
   {
