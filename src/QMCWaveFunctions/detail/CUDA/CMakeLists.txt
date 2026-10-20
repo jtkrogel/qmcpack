@@ -179,6 +179,14 @@ else()
 endif()
 target_link_libraries(psiformer_device_lifted_products_validation PRIVATE psiformer_device)
 
+# Plan metadata validation now checks the primitive/simulation-cell mapping.
+# Keep standalone consumers linked to that host implementation as well.
+foreach(validation_target psiformer_device_link_check psiformer_device_runtime_validation
+    psiformer_device_benchmark psiformer_device_spatial_trace_validation
+    psiformer_device_lifted_products_validation)
+  target_sources(${validation_target} PRIVATE ../../PsiFormer/PsiFormerGeometry.cpp)
+endforeach()
+
 # Correctness oracles must retain IEEE NaN/infinity semantics even when the
 # application's Release flags use fast-math. Library kernel policy is unchanged.
 foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation psiformer_device_concurrency_validation)
