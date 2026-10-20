@@ -12,6 +12,7 @@
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -42,8 +43,11 @@ inline bool supportsHybridKFACPolicy(const WFTrainDriverInput& input) noexcept
   using I = WFTrainDriverInput;
   const auto objective = input.getKFACObjective();
   const auto gradient = input.getKFACGradient();
+  const bool clipping = objective != I::KFACObjective::CLIPPED_COVARIANCE ||
+      (input.getKFACClipMode() == I::KFACClipMode::SOFT_MEDIAN &&
+       input.getKFACExcludeWidth() == std::numeric_limits<double>::infinity());
   return input.getOptimizer() == I::Optimizer::KFAC && input.getObjective() == I::Objective::ENERGY &&
-      input.getLineSearch() == I::LineSearch::OFF && hasExplicitKFACPolicy(input) &&
+      input.getLineSearch() == I::LineSearch::OFF && hasExplicitKFACPolicy(input) && clipping &&
       (objective == I::KFACObjective::RAW_COVARIANCE || objective == I::KFACObjective::CLIPPED_COVARIANCE) &&
       (gradient == I::KFACGradient::HALF_COVARIANCE || gradient == I::KFACGradient::PHYSICAL_COVARIANCE) &&
       input.getMaximumRetainedBytes() > 0 &&

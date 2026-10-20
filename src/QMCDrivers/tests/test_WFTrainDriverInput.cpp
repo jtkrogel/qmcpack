@@ -79,6 +79,13 @@ TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policie
       "<parameter name='kfac_objective'>componentwise_mad_covariance</parameter>")));
   CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(cap + half +
       "<parameter name='line_search'>reference</parameter>")));
+  const auto clipped = cap + half + "<parameter name='kfac_objective'>clipped_covariance</parameter>";
+  CHECK(wftrain::supportsHybridKFACPolicy(parse(clipped)));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(clipped +
+      "<parameter name='kfac_clip_mode'>hard_median</parameter>")));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(clipped +
+      "<parameter name='kfac_clip_mode'>hard_mean</parameter>"
+      "<parameter name='kfac_exclude_width'>2</parameter>")));
 }
 
 TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers][wf_train][kfac]")

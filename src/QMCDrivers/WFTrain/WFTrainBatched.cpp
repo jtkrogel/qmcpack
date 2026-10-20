@@ -2146,7 +2146,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         dynamic_cast<PsiFormerWF*>(selected_provider_) && student_prototype_.getOrbitals().size() == 1 &&
         population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
+        !population_.get_golden_hamiltonian().ecpModelProvenance() &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
     hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
@@ -2155,11 +2155,16 @@ void WFTrainBatched::process(xmlNodePtr node)
         !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #endif
-    if (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
+    int policy_failure = explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
         (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !complex_training_component_) ||
-        training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF))
+        training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF);
+    int hybrid_ranks = hybrid_score_kfac ? 1 : 0;
+    // Every rank agrees admission before placement and later optimizer collectives.
+    myComm->allreduce(policy_failure);
+    myComm->allreduce(hybrid_ranks);
+    if (policy_failure || (hybrid_ranks != 0 && hybrid_ranks != myComm->size()))
       throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or a qualified sole AE FP64 "
-          "GPU rank1 PBYP/no-drift covariance profile with finite retained cap; line_search=off is required");
+          "GPU PBYP/no-drift covariance profile with finite retained cap on every rank; line_search=off is required");
     if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
         (training_input_.getKFACClipMode() != WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN ||
@@ -2184,10 +2189,13 @@ void WFTrainBatched::process(xmlNodePtr node)
     initPopulationAndCrowds(walker_counts);
     if (hybrid_score_kfac)
     {
-      if (crowds_.size() != 1)
-        throw UniformCommunicateError("Hybrid score KFAC requires one actual training crowd before sampling");
+      int invalid_population = crowds_.size() != 1 || crowds_.front()->size() == 0;
+      myComm->allreduce(invalid_population);
+      if (invalid_population)
+        throw UniformCommunicateError("Hybrid score KFAC requires one nonempty training crowd on every rank before sampling");
       app_log() << "WFTrain hybrid score KFAC: evaluation/score/publication=GPU, affine/factors/inverse/state=HOST; "
-                   "parameter authority=HOST, local energy=native Hamiltonian" << std::endl;
+                   "parameter authority=HOST, local energy=native Hamiltonian, reduction=HOST raw sums, ranks="
+                << myComm->size() << std::endl;
     }
     // Each statistical block retains its own samples; one serialized Products
     // lane is shared across those snapshots under the checked S=W*blocks preflight.
@@ -3738,7 +3746,10 @@ void WFTrainBatched::run()
               live = checkedMemoryAdd(live, kfacStatisticsBytes(registry));
               if (kfac_optimizer)
                 live = checkedMemoryAdd(live, kfac_optimizer->retainedNumericBytes());
-              enforceMemoryBudget(*myComm, live, training_input_.getMaximumRetainedBytes());
+              // Local failures join the common preflight below; never enter a
+              // collective from this rank-local allocation/observation try block.
+              if (live > training_input_.getMaximumRetainedBytes())
+                throw std::length_error("Hybrid KFAC HOST affine storage exceeds maximum_retained_bytes");
               logTrainingAllocation("hybrid_kfac_host_affine", 1, schema.parameterCount(), affine_bytes);
             }
             logTrainingAllocation("complex_kfac_transactional_factors", 0, schema.parameterCount(),
