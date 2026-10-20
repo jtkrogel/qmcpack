@@ -2805,6 +2805,33 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
       near(head_response[parameter], leased_orbital_reference.parameter_gradient[parameter],
            "leased orbital-MSE gradient");
+    std::vector<double> leased_orbitals(orbital_count, -913.0);
+    const auto orbital_device_bytes = product_session->deviceWorkspaceBytes();
+    const auto orbital_host_bytes = product_session->hostWorkspaceBytes();
+    product_session->rawOrbitalValues(model.cfg.electrons.x.data(), leased_orbitals.data(),
+                                      leased_orbitals.size(), model.p.version());
+    const auto cpu_orbitals = cpu_score_executor.evaluateOrbitalValues(*cpu_score_workspace);
+    for (std::size_t index = 0; index < orbital_count; ++index)
+      near(leased_orbitals[index], cpu_orbitals.values[index], "leased raw orbital values CPU parity");
+    std::fill(leased_orbitals.begin(), leased_orbitals.end(), -913.0);
+    bool orbital_extent_rejected = false, orbital_stale_rejected = false;
+    try { product_session->rawOrbitalValues(model.cfg.electrons.x.data(), leased_orbitals.data(),
+                                             leased_orbitals.size() - 1, model.p.version()); }
+    catch (const std::invalid_argument&) { orbital_extent_rejected = true; }
+    try { product_session->rawOrbitalValues(model.cfg.electrons.x.data(), leased_orbitals.data(),
+                                             leased_orbitals.size(), model.p.version() + 1); }
+    catch (const std::invalid_argument&) { orbital_stale_rejected = true; }
+    if (!orbital_extent_rejected || !orbital_stale_rejected ||
+        !std::all_of(leased_orbitals.begin(), leased_orbitals.end(), [](double value) { return value == -913.0; }))
+      throw std::runtime_error("Raw orbital rejection published partial or stale values");
+    score_only_session->rawOrbitalValues(model.cfg.electrons.x.data(), leased_orbitals.data(),
+                                         leased_orbitals.size(), model.p.version());
+    for (std::size_t index = 0; index < orbital_count; ++index)
+      near(leased_orbitals[index], cpu_orbitals.values[index], "score-only raw orbital values CPU parity");
+    if (product_session->deviceWorkspaceBytes() != orbital_device_bytes ||
+        product_session->hostWorkspaceBytes() != orbital_host_bytes)
+      throw std::runtime_error("Raw orbital values grew prepared scratch");
+
     const auto accepted_values = model.p.flat_values();
     auto proposed_values = accepted_values;
     proposed_values[0] += .003;

@@ -822,6 +822,26 @@ public:
     return score_response_;
   }
 
+  /// Publish D*Ne*Ne raw orbitals from HOST coordinates without a parameter reverse.
+  /// Reuse the retained factor staging; no determinant/cusp factors enter the product.
+  void rawOrbitalValues(const double* positions, double* output, std::size_t count, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    if (!output || count != orbital_backflow_.size())
+      throw std::invalid_argument("Device raw orbital output extent mismatch");
+    executeUnderControl(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      values_.evaluate(positions_);
+      values_.downloadValueOrbitalFactors(orbital_backflow_, orbital_envelope_);
+      for (std::size_t index = 0; index < count; ++index)
+      {
+        orbital_backflow_[index] *= orbital_envelope_[index];
+        if (!device_math::isFiniteBinary64(orbital_backflow_[index]))
+          throw std::runtime_error("Device raw orbital value is nonfinite");
+      }
+    });
+    std::copy(orbital_backflow_.begin(), orbital_backflow_.end(), output);
+  }
+
   /// Reverse the per-spin normalized raw-orbital MSE against a supplied teacher target.
   /// Teacher construction is external; neither a determinant-sum nor cusp loss is added.
   double orbitalMse(const double* positions, const double* target, std::size_t count,
