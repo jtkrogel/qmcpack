@@ -19,6 +19,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,13 @@ class TrainingWaveFunctionBinding;
 namespace qmcplusplus
 {
 class PsiFormerComplexWF;
+class PsiFormerWF;
+
+namespace wftrain
+{
+/// Validate and fingerprint only the selected real pair native AE Ewald physics row.
+std::string realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian);
+}
 
 namespace psiformer
 {

@@ -46,10 +46,8 @@
 #include "QMCHamiltonians/CoulombPotential.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "Estimators/LocalEnergyEstimator.h"
-#ifdef QMC_COMPLEX
 #include "QMCHamiltonians/CoulombPBCAA.h"
 #include "QMCHamiltonians/CoulombPBCAB.h"
-#endif
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -1945,6 +1943,68 @@ std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons,
 
 } // namespace
 
+/// Bind the selected pair stage to actual full-cell AE Ewald physics, not a model label alone.
+std::string wftrain::realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
+{
+  if (!component.matchesRealDevicePairTarget(electrons) || component.isPseudopotentialSystem() ||
+      hamiltonian.hasPhysicalNLPP() || hamiltonian.ecpModelProvenance())
+    throw std::invalid_argument("Real pair GPU training requires selected Gamma all-electron two-cell metadata");
+  const auto& species = electrons.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  const auto& masses = electrons.get_mass_by_group();
+  if (charge < 0 || species.getTotalNum() < electrons.groups() ||
+      masses.size() < static_cast<std::size_t>(electrons.groups()))
+    throw std::invalid_argument("Real pair GPU training requires initialized electron charges and masses");
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  for (int group = 0; group < electrons.groups(); ++group)
+  {
+    if (species(charge, group) != -1 || !wftrain::isFiniteTrainingReal(masses[group]) ||
+        std::abs(masses[group] - 1) > 64 * std::numeric_limits<double>::epsilon())
+      throw std::invalid_argument("Real pair GPU training requires unit-mass electrons of charge minus one");
+    extendStageFingerprint(hash, species(charge, group));
+    extendStageFingerprint(hash, masses[group]);
+  }
+  const CoulombPBCAA* ee = nullptr;
+  const CoulombPBCAA* ii = nullptr;
+  const CoulombPBCAB* ei = nullptr;
+  std::size_t kinetic = 0;
+  for (int term = 0; term < hamiltonian.size(); ++term)
+  {
+    const auto* current = hamiltonian.getComponent(term);
+    if (const auto* kinetic_term = dynamic_cast<const BareKineticEnergy*>(current))
+    {
+      if (&kinetic_term->getTargetPSet() != &electrons)
+        throw std::invalid_argument("Real pair GPU training kinetic target differs from its electron set");
+      ++kinetic;
+      extendStageFingerprint(hash, std::string("unit-mass-kinetic"));
+    }
+    else if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(current))
+    {
+      auto*& selected = aa->is_active ? ee : ii;
+      if (selected || aa->usesOffload() || aa->ewaldModelDefinition().empty())
+        throw std::invalid_argument("Real pair GPU training requires unique native 3D Ewald ee/ii operators");
+      selected = aa;
+      extendStageFingerprint(hash, aa->ewaldModelDefinition());
+    }
+    else if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(current))
+    {
+      if (ei || &ab->Peln != &electrons || ab->ewaldModelDefinition().empty())
+        throw std::invalid_argument("Real pair GPU training requires one native 3D Ewald electron-ion operator");
+      ei = ab;
+      extendStageFingerprint(hash, ab->ewaldModelDefinition());
+    }
+    else
+      throw std::invalid_argument("Real pair GPU training initially supports only kinetic plus 3D Ewald Coulomb physics");
+  }
+  if (kinetic != 1 || !ee || !ii || !ei || &ee->Ps != &electrons || &ii->Ps != &ei->getSourcePSet())
+    throw std::invalid_argument("Real pair GPU training requires actual matching electron/ion Ewald sources");
+  component.validateSystem(electrons, ei->getSourcePSet(), "all_electron");
+  extendStageFingerprint(hash, component.trainingConfigurationFingerprint());
+  std::ostringstream identity;
+  identity << "real-gpu-pair-coulomb-v1/" << std::hex << hash;
+  return identity.str();
+}
+
 WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                                QMCDriverInput&& qmcdriver_input,
                                UPtr<EstimatorManagerNew>&& estimator_manager,
@@ -2704,12 +2764,32 @@ void WFTrainBatched::run()
 #endif
 
 #ifndef QMC_COMPLEX
-  // Older real CPU/legacy fingerprints remain unchanged. Only this new profile
-  // binds actual PP content/species in the existing optional physical identity.
-  if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
-      wftrain::supportsHybridKFACPolicy(training_input_) && population_.get_golden_hamiltonian().hasPhysicalNLPP())
-    complex_physical_identity = realScoreECPIdentity(*device_provider, population_.get_golden_electrons(),
-        population_.get_golden_hamiltonian());
+  // Older real CPU/legacy fingerprints remain unchanged. Only new explicit GPU
+  // score profiles bind their actual physical operators here. Public pair GPU
+  // admission remains independently gated before run().
+  std::exception_ptr physical_identity_failure;
+  try
+  {
+    if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
+        wftrain::supportsHybridKFACPolicy(training_input_))
+    {
+      if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
+        complex_physical_identity = realScoreECPIdentity(*device_provider, population_.get_golden_electrons(),
+            population_.get_golden_hamiltonian());
+      else if (device_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()))
+        complex_physical_identity = wftrain::realPairCoulombIdentity(*device_provider, population_.get_golden_electrons(),
+            population_.get_golden_hamiltonian());
+    }
+  }
+  catch (...) { physical_identity_failure = std::current_exception(); }
+  int physical_identity_failed = physical_identity_failure ? 1 : 0;
+  myComm->allreduce(physical_identity_failed);
+  if (physical_identity_failed)
+  {
+    if (physical_identity_failure)
+      std::rethrow_exception(physical_identity_failure);
+    throw UniformCommunicateError("WFTrainBatched: another rank failed GPU physical identity preflight");
+  }
 #endif
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);

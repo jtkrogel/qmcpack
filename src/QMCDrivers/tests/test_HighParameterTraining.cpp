@@ -17,6 +17,15 @@
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
+#include "QMCDrivers/WFTrain/WFTrainBatched.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/tests/psiformer_test_utils.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCHamiltonians/CoulombPBCAB.h"
+#include "QMCHamiltonians/HarmonicExternalPotential.h"
+#include "LongRange/LRCoulombSingleton.h"
 
 #include <algorithm>
 #include <array>
@@ -390,6 +399,131 @@ private:
 };
 
 } // namespace
+
+TEST_CASE("Selected real pair physics identity binds actual native Ewald sources and targets",
+          "[drivers][wftrain][pair_physics]")
+{
+  namespace ps = psiformer;
+  namespace fixture = testing::psiformer;
+  // Isolate the handler cache/policy so this fixture cannot relabel other tests' Ewald physics.
+  struct RestoreHandler
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) saved = std::move(LRCoulombSingleton::CoulombHandler);
+    const LRCoulombSingleton::lr_type saved_type = LRCoulombSingleton::this_lr_type;
+    ~RestoreHandler()
+    {
+      LRCoulombSingleton::CoulombHandler = std::move(saved);
+      LRCoulombSingleton::this_lr_type = saved_type;
+    }
+  } restore;
+  LRCoulombSingleton::this_lr_type = LRCoulombSingleton::EWALD;
+  // Construct neutral physical particles and their structure factors in the full simulation cell.
+  Lattice lattice;
+  lattice.R = {8, 0, 0, 0, 6, 0, 0, 0, 6};
+  lattice.BoxBConds = {true, true, true};
+  lattice.LR_dim_cutoff = 15;
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  ParticleSet electrons(simulation_cell), ions(simulation_cell);
+  electrons.setName("e");
+  electrons.create({1, 1});
+  auto& species = electrons.getSpeciesSet();
+  species.addSpecies("u");
+  species.addSpecies("d");
+  const int mass = species.addAttribute("mass"), charge = species.addAttribute("charge");
+  species(mass, 0) = species(mass, 1) = 1;
+  species(charge, 0) = species(charge, 1) = -1;
+  electrons.resetGroups();
+  electrons.R[0] = {.3, .4, .5};
+  electrons.R[1] = {2.1, 1.5, 2.3};
+  ions.setName("ion0");
+  ions.create({2});
+  ions.getSpeciesSet().addSpecies("H");
+  ions.getSpeciesSet()(ions.getSpeciesSet().addAttribute("charge"), 0) = 1;
+  ions.resetGroups();
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {4, 0, 0};
+  electrons.createSK();
+  ions.createSK();
+  electrons.update();
+  ions.update();
+  // Import a tiny complete descriptor; the production Gaussian initializer keeps its fixed architecture.
+  ps::InitializedPsiFormerParameters parameters;
+  parameters.model_shape = {1, 1, 1, 1, 4, 1, 1};
+  parameters.profile = ps::PSIFORMER_PERIODIC_PAIR_V1;
+  parameters.seed = 17;
+  auto leaves = fixture::makeLayout(2, 1, false, 1, 7);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256) extent = 4;
+      else if (extent == 32) extent = 2;
+  parameters.values = fixture::makeParameters("h2", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto end = cursor + fixture::product(leaf.shape);
+    parameters.layouts.push_back({leaf.module, leaf.name, leaf.shape, cursor, end});
+    cursor = end;
+  }
+  for (bool bias : {false, true})
+  {
+    const auto begin = parameters.values.size();
+    parameters.values.resize(begin + (bias ? 1 : 8), .02);
+    parameters.layouts.push_back({"periodic/electron_gnn_layer/pair_attention", bias ? "b" : "w",
+        bias ? std::vector<std::size_t>{1} : std::vector<std::size_t>{8, 1}, begin, parameters.values.size()});
+  }
+  // The ion features use one primitive motif while physical Coulomb operators use both replicas.
+  auto& environment = parameters.environment;
+  environment.boundary = ps::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+  environment.periodic_axes = {true, true, true};
+  for (int a = 0; a < 3; ++a)
+    for (int d = 0; d < 3; ++d) environment.lattice_vectors[a][d] = lattice.R(a, d);
+  auto profile = std::make_shared<ps::PeriodicProfileMetadata>();
+  profile->cells.simulation = profile->cells.primitive =
+      {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+  profile->cells.primitive.lattice_vectors[0][0] = 4;
+  profile->cells.tiling[0][0] = 2;
+  profile->primitive_motif = {{0, 0, 0}};
+  profile->motif_species = {0};
+  profile->occupied_columns = {{{}, 0, 0, 1}, {{}, 0, 1, 1}};
+  environment.periodic_profile = profile;
+  PsiFormerWF component("pair_physics", parameters, electrons, ions, true, {}, true);
+  component.validateSystem(electrons, ions, "all_electron");
+  ParticleSet other(electrons);
+  other.setName("other_e");
+  other.update();
+  // Assemble actual typed native T+ee+ei+ii operators, including their constructed Ewald definitions.
+  const auto makeHamiltonian = [&](ParticleSet& kinetic_target, ParticleSet& aa_target, ParticleSet& ab_target) {
+    auto result = std::make_unique<QMCHamiltonian>();
+    result->addOperator(std::make_unique<BareKineticEnergy>(kinetic_target), "Kinetic");
+    result->addOperator(std::make_unique<CoulombPBCAA>(aa_target, true, false, false), "ee");
+    result->addOperator(std::make_unique<CoulombPBCAB>(ions, ab_target), "ei");
+    result->addOperator(std::make_unique<CoulombPBCAA>(ions, false, false, false), "ii");
+    return result;
+  };
+  auto physical = makeHamiltonian(electrons, electrons, electrons);
+  const auto identity = realPairCoulombIdentity(component, electrons, *physical);
+  CHECK_FALSE(identity.empty());
+  // Reject misbound targets and changed physics while ignoring later singleton policy changes.
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *makeHamiltonian(other, electrons, electrons)));
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *makeHamiltonian(electrons, other, electrons)));
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *makeHamiltonian(electrons, electrons, other)));
+  LRCoulombSingleton::this_lr_type = LRCoulombSingleton::ESLER;
+  CHECK(realPairCoulombIdentity(component, electrons, *physical) == identity);
+  species(charge, 0) = -.5;
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *physical));
+  species(charge, 0) = -1;
+  QMCHamiltonian missing;
+  missing.addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, missing));
+  ions.R[1][0] += .01;
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *physical));
+  ions.R[1][0] -= .01;
+  CHECK(realPairCoulombIdentity(component, electrons, *physical) == identity);
+  physical->addOperator(std::make_unique<HarmonicExternalPotential>(electrons), "extra");
+  CHECK_THROWS(realPairCoulombIdentity(component, electrons, *physical));
+}
 
 TEST_CASE("Energy gradient streaming matches both finite-sample estimators",
           "[drivers][training]")
