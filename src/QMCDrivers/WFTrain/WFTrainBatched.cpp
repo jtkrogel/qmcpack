@@ -2300,6 +2300,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     const bool explicit_kfac_policy = wftrain::hasExplicitKFACPolicy(training_input_);
     const bool score_policy = complex_training_component_ || explicit_kfac_policy;
     bool hybrid_score_kfac = false;
+    bool selected_pair_accelerator = false;
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
     const auto* real_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     const auto& hamiltonian = population_.get_golden_hamiltonian();
@@ -2309,9 +2310,12 @@ void WFTrainBatched::process(xmlNodePtr node)
     const bool scalar_pp = real_provider && real_provider->isPseudopotentialSystem() &&
         hamiltonian.hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
         !provenance->scientific_definition.empty() && myComm->size() == 1;
+    selected_pair_accelerator = real_provider && selected_provider_->usesAcceleratorParameterProducts() &&
+        real_provider->matchesRealDevicePairTarget(population_.get_golden_electrons());
     hybrid_score_kfac = wftrain::supportsHybridKFACPolicy(training_input_) && selected_provider_->usesAcceleratorParameterProducts() &&
         real_provider && student_prototype_.getOrbitals().size() == 1 &&
-        population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+        (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN ||
+         (ae && myComm->size() == 1 && selected_pair_accelerator)) &&
         (ae || scalar_pp) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
@@ -2321,9 +2325,10 @@ void WFTrainBatched::process(xmlNodePtr node)
         !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #endif
-    int policy_failure = explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
+    int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
+        (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
         (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !complex_training_component_) ||
-        training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF);
+        training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF));
     int hybrid_ranks = hybrid_score_kfac ? 1 : 0;
     // Every rank agrees admission before placement and later optimizer collectives.
     myComm->allreduce(policy_failure);
@@ -2362,6 +2367,11 @@ void WFTrainBatched::process(xmlNodePtr node)
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
           (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
         throw UniformCommunicateError("GPU score-only ECP requires MPI1/block1/step1 before sampling");
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+      if (real_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()) &&
+          (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
+        throw UniformCommunicateError("Selected real pair GPU KFAC requires MPI1/block1/step1 before sampling");
+#endif
       app_log() << "WFTrain hybrid score KFAC: evaluation/score/publication=GPU, affine/factors/inverse/state=HOST; "
                    "parameter authority=HOST, local energy=native Hamiltonian, reduction=HOST raw sums, ranks="
                 << myComm->size() << std::endl;

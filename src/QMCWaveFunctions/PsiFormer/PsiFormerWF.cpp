@@ -1180,7 +1180,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
 std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
     const pf::PsiFormer& model, const psiformer::PsiFormerExecutionPlan& plan,
     const psiformer::PsiFormerAcceleratorResolution& resolution,
-    psiformer::PsiFormerPrecisionPolicy precision)
+    psiformer::PsiFormerPrecisionPolicy precision, bool outer_twist)
 {
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
@@ -1189,13 +1189,18 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
     throw std::invalid_argument("Explicit mixed PsiFormer precision requires an open-real GPU inference model");
   if (resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU)
     return {};
+  if (plan.environment().periodic_profile &&
+      (outer_twist || !psiformer::matchesRealDevicePairMetadata(plan.environment())))
+    throw std::invalid_argument("GPU real pair numerical tiles require selected metadata and Gamma twist");
 #ifdef ENABLE_CUDA
   using namespace psiformer::device;
   if (resolution.backend != PreparedDeviceCrowdHooks::backend())
     throw std::invalid_argument("PsiFormer numerical tile request does not match the compiled device backend");
   const auto preparation = configuredGpuTargetPreparation(plan, precision);
   reportCurrentDeviceMemoryAdmission(app_log());
-  auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
+  std::shared_ptr<const PreparedDeviceModel> image = plan.environment().periodic_profile
+      ? PreparedDeviceModel::prepareRealTwoCellProfile(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version())
+      : std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
   const auto backend = resolution.backend;
   const auto version = model.p.version();
   return std::make_shared<PreparedDeviceBatchBackend>(std::move(image), [backend, version, preparation]() {
@@ -1318,7 +1323,8 @@ public:
              /*attention_blocks=*/model.blocks}, std::move(environment))),
         direct_value_executor(model, execution_plan),
         direct_spatial_executor(model, direct_value_executor, execution_plan),
-        numerical_tile_backend(makePsiFormerNumericalTiles(model, execution_plan, this->accelerator_resolution, precision)),
+        numerical_tile_backend(makePsiFormerNumericalTiles(model, execution_plan, this->accelerator_resolution,
+                                                         precision, this->twist_phase.active())),
         direct_batch_executor(direct_value_executor, direct_spatial_executor, numerical_tile_backend),
         direct_score_executor(model, execution_plan),
         direct_kinetic_executor(model, execution_plan),
@@ -1332,10 +1338,11 @@ public:
                                                     *direct_value_executor.layout()))
   {
     if (execution_plan.environment().periodic_profile &&
-        (numerical_tile_backend || direct_value_mode != DirectBackendMode::DIRECT ||
+        ((numerical_tile_backend && !psiformer::matchesRealDevicePairMetadata(execution_plan.environment())) ||
+         direct_value_mode != DirectBackendMode::DIRECT ||
          direct_spatial_mode != DirectBackendMode::DIRECT || direct_score_mode != DirectBackendMode::DIRECT ||
          direct_kinetic_mode != DirectBackendMode::DIRECT))
-      throw std::invalid_argument("Periodic real profile requires direct CPU value, spatial, score and kinetic products");
+      throw std::invalid_argument("Periodic real profile requires qualified direct value, spatial, score and kinetic products");
     if (cpu_target_kinetic.targets &&
         (direct_score_mode != DirectBackendMode::DIRECT || direct_kinetic_mode != DirectBackendMode::DIRECT))
       throw std::invalid_argument("PsiFormer CPU target streaming products require DIRECT score/kinetic backends");

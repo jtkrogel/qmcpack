@@ -281,10 +281,16 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
+  const auto pair_request = normalizedAcceleratorRequest(gpu);
+  bool selected_pair_gpu = false;
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  selected_pair_gpu = pair_profile && !complex_profile && system == "all_electron" &&
+      (pair_request == "cuda" || pair_request == "hip");
+#endif
   if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
-      (normalizedAcceleratorRequest(gpu) != "no" && normalizedAcceleratorRequest(gpu) != "cpu") ||
+      (pair_request != "no" && pair_request != "cpu" && !selected_pair_gpu) ||
       precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE))
-    throw std::invalid_argument("Versioned periodic profiles require explicit qualified CPU fp64_reference physics");
+    throw std::invalid_argument("Versioned periodic profiles require CPU or the selected real GPU AE FP64 profile");
   if (complex_profile)
   {
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
@@ -319,8 +325,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes") || xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
     throw std::invalid_argument("Complex numeric caps belong only to psiformer_complex_periodic_v1");
-  const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
-      resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
+  // Selected pair requests must validate their resolved metadata before consulting a device runtime.
+  psiformer::PsiFormerAcceleratorResolution accelerator_resolution = selected_pair_gpu
+      ? psiformer::PsiFormerAcceleratorResolution{}
+      : resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
           optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
                                : psiformer::psiFormerAcceleratorInferenceOperations());
   if (accelerator_readiness_provider_ && accelerator_resolution.backend !=
@@ -499,6 +507,18 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     if (direct_model)
       psiformer::validatePsiFormerModelFile(*imported_model, parameters, targetPtcl, *source_particles,
                                             system, twist_array);
+    if (selected_pair_gpu && !psiformer::matchesRealDevicePairMetadata(
+            direct_model ? imported_model->parameters.environment : environment))
+      throw std::invalid_argument("GPU periodic pair metadata requires real Gamma log-complement atom-centered cusp physics");
+    if (selected_pair_gpu)
+    {
+      accelerator_resolution = resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
+          optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
+                               : psiformer::psiFormerAcceleratorInferenceOperations());
+      if (accelerator_readiness_provider_ &&
+          accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU)
+        throw std::runtime_error("PsiFormer numerical dispatch cannot be enabled by an injected test readiness provider");
+    }
     psiformer::InitializedPsiFormerParameters initialized = direct_model
         ? std::move(imported_model->parameters)
         : psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization, environment);
