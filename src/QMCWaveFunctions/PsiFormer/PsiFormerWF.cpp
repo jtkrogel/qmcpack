@@ -11887,6 +11887,7 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
   return result;
 }
 
+/// Validate imported physical metadata against XML; only legacy bulk ions may differ by cell images/roundoff.
 void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, const std::string& path,
     const ParticleSet& electrons, const ParticleSet& ions, const std::string& system,
     const std::array<double, 3>& twist)
@@ -11953,9 +11954,53 @@ void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, cons
   {
     if (charges[atom] != species(charge, ions.GroupID[atom]))
       throw std::invalid_argument("Standalone PsiFormer ionic charges differ from XML");
+    bool identical = true;
+    std::array<double, 3> displacement{}, images{};
     for (int d = 0; d < 3; ++d)
-      if (positions[3 * atom + d] != ions.R[atom][d])
+    {
+      const double expected = positions[3 * atom + d], actual = ions.R[atom][d];
+      if (!psiformer::determinant::isFiniteReal(expected) || !psiformer::determinant::isFiniteReal(actual))
+        throw std::invalid_argument("Standalone PsiFormer ordered ionic geometry is nonfinite");
+      identical = identical && expected == actual;
+      displacement[d] = actual - expected;
+    }
+    if (!identical)
+    {
+      if (!model.periodic || ions.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
         throw std::invalid_argument("Standalone PsiFormer ordered ionic geometry differs from XML");
+      // Bulk XML parsing wraps Cartesian ions. Match each ordered ion modulo
+      // full simulation-cell vectors, allowing only arithmetic roundoff.
+      // Accepted aliases materialize in the actual XML ion frame; producer
+      // coordinate fingerprints are not preserved or used to relax restart identity.
+      const auto& cell = ions.getLattice();
+      for (int d = 0; d < 3; ++d)
+      {
+        for (int a = 0; a < 3; ++a)
+        {
+          if (!psiformer::determinant::isFiniteReal(cell.G(a, d)) ||
+              !psiformer::determinant::isFiniteReal(cell.R(a, d)))
+            throw std::invalid_argument("Standalone PsiFormer periodic ionic cell is nonfinite");
+          images[d] += displacement[a] * cell.G(a, d);
+        }
+        images[d] = std::round(images[d]);
+        if (!psiformer::determinant::isFiniteReal(images[d]))
+          throw std::invalid_argument("Standalone PsiFormer periodic ionic image is nonfinite");
+      }
+      for (int d = 0; d < 3; ++d)
+      {
+        double residual = displacement[d];
+        double scale = 1 + std::abs(positions[3 * atom + d]) + std::abs(ions.R[atom][d]);
+        for (int a = 0; a < 3; ++a)
+        {
+          const double image = images[a] * cell.R(a, d);
+          residual -= image;
+          scale += std::abs(image);
+        }
+        if (!psiformer::determinant::isFiniteReal(residual) || !psiformer::determinant::isFiniteReal(scale) ||
+            std::abs(residual) > 128 * std::numeric_limits<double>::epsilon() * scale)
+          throw std::invalid_argument("Standalone PsiFormer ordered ionic geometry differs from XML");
+      }
+    }
   }
   if (model.periodic)
     for (int a = 0; a < 3; ++a)

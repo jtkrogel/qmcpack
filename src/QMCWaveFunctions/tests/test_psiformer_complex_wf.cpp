@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/ParticleIO/XMLParticleIO.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
@@ -54,9 +55,11 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <system_error>
 #include <tuple>
 #include <vector>
@@ -154,9 +157,10 @@ const std::string coulombTerms =
 
 /// Small descriptor fixture exercises the same numerical owners without another Native TU.
 /// This is not a new public XML architecture; initializer production dimensions stay fixed.
-ps::InitializedPsiFormerParameters parameters(bool paired = true, bool zero_imaginary = false)
+ps::InitializedPsiFormerParameters parameters(bool paired = true, bool zero_imaginary = false,
+                                             std::size_t channels_per_nucleus = 7)
 {
-  auto leaves = fixture::makeLayout(4, 2, true, 2, 7);
+  auto leaves = fixture::makeLayout(4, 2, true, 2, channels_per_nucleus);
   for (auto& leaf : leaves)
     for (auto& extent : leaf.shape)
       if (extent == 256)
@@ -1288,6 +1292,9 @@ TEST_CASE("Real Gamma pair components retain complete physical ions and profile 
     CHECK(imported.parameters.model_shape.nuclei == 2);
     CHECK(imported.parameters.environment.periodic_profile->cells.tiling[0][0] == (two_cells ? 2 : 1));
     ps::validatePsiFormerModelFile(imported, path, clone_p, source, "all_electron", {});
+    source.R[0][0] += 8;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, clone_p, source, "all_electron", {}));
+    source.R[0][0] -= 8;
     PsiFormerWF loaded("real_pair", imported.parameters, clone_p, source, true, {}, true);
     loaded.validateSystem(clone_p, source, "all_electron");
     close(evaluate(loaded, clone_p), center);
@@ -1315,6 +1322,144 @@ TEST_CASE("Real Gamma pair components retain complete physical ions and profile 
     CHECK(fingerprint(*typed) == original_identity);
     CHECK(fingerprint(loaded) == original_identity);
     CHECK(std::filesystem::remove(path));
+  }
+}
+
+TEST_CASE("Legacy standalone periodic import accepts only equivalent ordered ionic images",
+          "[wavefunction][psiformer][complex_wf][legacy_import_images]")
+{
+  for (bool paired : {false, true})
+  {
+    const SimulationCell simulation_cell(cell());
+    auto p = electrons(simulation_cell), raw = ions(simulation_cell);
+    const std::array<double, 3> twist = paired ? std::array<double, 3>{.17, -.11, .07} : std::array<double, 3>{};
+    char pattern[] = "/tmp/qmcpack_import_images_XXXXXX";
+    fixture::GeneratedFiles files;
+    const auto* directory = mkdtemp(pattern);
+    REQUIRE(directory);
+    files.directory = directory;
+    const auto path = (files.directory / "model.h5").string();
+
+    // Actual XML parsing wraps the exact exported Cartesian coordinates in the skew cell.
+    std::ostringstream text;
+    text << std::setprecision(17) << "<particleset name='ion0' size='2'>"
+         << "<group name='Li'><parameter name='charge'>3</parameter></group>"
+         << "<group name='H'><parameter name='charge'>1</parameter></group>"
+         << "<attrib name='ionid' datatype='stringArray'>Li H</attrib>"
+         << "<attrib name='position' datatype='posArray'>";
+    for (const auto& position : raw.R)
+      for (int d = 0; d < 3; ++d) text << position[d] << ' ';
+    text << "</attrib></particleset>";
+    Libxml2Document xml;
+    REQUIRE(xml.parseFromString(text.str()));
+    ParticleSet wrapped(simulation_cell);
+    XMLParticleParser parser(wrapped);
+    REQUIRE(parser.readXML(xml.getRoot()));
+    CHECK(raw.R[0] != wrapped.R[0]);
+    const auto make = [&](const ps::InitializedPsiFormerParameters& initial, ParticleSet& source)
+        -> std::unique_ptr<WaveFunctionComponent> {
+      if (paired)
+        return std::make_unique<PsiFormerComplexWF>("image_model", initial, p, source, clone_cap, twist);
+      auto real = std::make_unique<PsiFormerWF>("image_model", initial, p, source, true, std::vector<std::size_t>{},
+                                               true, "", twist);
+      real->validateSystem(p, source, "all_electron");
+      return real;
+    };
+    auto original = make(parameters(paired), raw);
+    if (paired) dynamic_cast<PsiFormerComplexWF&>(*original).exportModel(path);
+    else dynamic_cast<PsiFormerWF&>(*original).exportModel(path);
+    const auto imported = ps::readPsiFormerModelFile(path);
+    REQUIRE_NOTHROW(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", twist));
+    auto loaded = make(imported.parameters, wrapped);
+    CHECK(original->structuredParameterProvider()->snapshotParameters().values ==
+          loaded->structuredParameterProvider()->snapshotParameters().values);
+
+    // Ionic image changes do not create an ionic Bloch phase: only electron coordinates own that phase.
+    const auto raw_log = evaluate(*original, p);
+    const auto raw_g = p.G;
+    const auto raw_l = p.L;
+    const auto wrapped_log = evaluate(*loaded, p);
+    CHECK(raw_log.real() == Approx(wrapped_log.real()).margin(2e-10));
+    close(std::polar(1.0, raw_log.imag() - wrapped_log.imag()), C{1}, 2e-10);
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      close(raw_l[electron], p.L[electron], 2e-10);
+      for (int d = 0; d < 3; ++d) close(raw_g[electron][d], p.G[electron][d], 2e-10);
+    }
+    // Compare full canonical log-score channels, discarding transient affine rows.
+    class DiscardRows final : public wftrain::AffineScoreObserver
+    {
+      void observe(const wftrain::AffineScoreObservation&) override {}
+    } discard;
+    const auto scores = [&](WaveFunctionComponent& model) {
+      std::vector<double> real, imaginary;
+      if (paired)
+      {
+        auto& complex = dynamic_cast<PsiFormerComplexWF&>(model);
+        complex.prepareAffineScores(complex.affineScoreStorage().required_bytes);
+        complex.observeComplexAffineScores(p, discard, real, imaginary);
+      }
+      else
+      {
+        dynamic_cast<PsiFormerWF&>(model).observeAffineScores(p, discard, real);
+        imaginary.resize(real.size());
+      }
+      std::vector<C> result(real.size());
+      for (std::size_t i = 0; i < real.size(); ++i) result[i] = {real[i], imaginary[i]};
+      return result;
+    };
+    const auto raw_scores = scores(*original), wrapped_scores = scores(*loaded);
+    REQUIRE(raw_scores.size() == wrapped_scores.size());
+    for (std::size_t i = 0; i < raw_scores.size(); ++i) close(raw_scores[i], wrapped_scores[i], 2e-10);
+
+    // Geometry, order, charges, cell and twist remain physical metadata, not loose matching hints.
+    const double saved = wrapped.R[0][0];
+    wrapped.R[0][0] += 1e-4;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", twist));
+    wrapped.R[0][0] = saved;
+    std::swap(wrapped.R[0], wrapped.R[1]);
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", twist));
+    std::swap(wrapped.R[0], wrapped.R[1]);
+    const int charge = wrapped.getSpeciesSet().findAttribute("charge");
+    wrapped.getSpeciesSet()(charge, 0) = 2;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", twist));
+    wrapped.getSpeciesSet()(charge, 0) = 3;
+    auto wrong_twist = twist;
+    wrong_twist[0] += .01;
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", wrong_twist));
+    for (double bad : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()})
+    {
+      wrapped.R[0][0] = bad;
+      CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrapped, "all_electron", twist));
+    }
+    wrapped.R[0][0] = saved;
+    auto changed_cell = cell();
+    changed_cell.R(0, 0) += .1;
+    changed_cell.reset();
+    const SimulationCell other_cell(changed_cell);
+    ParticleSet wrong_cell(other_cell);
+    XMLParticleParser other_parser(wrong_cell);
+    REQUIRE(other_parser.readXML(xml.getRoot()));
+    CHECK_THROWS(ps::validatePsiFormerModelFile(imported, path, p, wrong_cell, "all_electron", twist));
+
+    if (!paired)
+    {
+      // OPEN import keeps exact geometry equality, including a sub-tolerance displacement.
+      Lattice open_cell;
+      open_cell.R = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+      open_cell.BoxBConds = {false, false, false};
+      open_cell.reset();
+      const SimulationCell open_simulation(open_cell);
+      auto open_p = electrons(open_simulation), open_ions = ions(open_simulation);
+      PsiFormerWF open("open_images", parameters(false, false, 4), open_p, open_ions, true, {}, true);
+      open.validateSystem(open_p, open_ions, "all_electron");
+      const auto open_path = (files.directory / "open.h5").string();
+      open.exportModel(open_path);
+      const auto open_import = ps::readPsiFormerModelFile(open_path);
+      REQUIRE_NOTHROW(ps::validatePsiFormerModelFile(open_import, open_path, open_p, open_ions, "all_electron", {}));
+      open_ions.R[0][0] += 1e-15;
+      CHECK_THROWS(ps::validatePsiFormerModelFile(open_import, open_path, open_p, open_ions, "all_electron", {}));
+    }
   }
 }
 
