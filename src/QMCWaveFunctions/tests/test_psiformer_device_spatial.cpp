@@ -1260,6 +1260,8 @@ TEST_CASE("Periodic pair attention preserves ordered CPU jets and partial target
       }
       std::vector<double> logits(psiformer::spatialJetSpanElements(layout.attention), -.9);
       const auto original = logits;
+      std::vector<double> roots(logits.size());
+      for (std::size_t index = 0; index < roots.size(); ++index) roots[index] = .03 * (int(index % 17) - 8);
       for (std::size_t configuration = 0; configuration < 2; ++configuration)
         for (std::size_t head = 0; head < heads; ++head)
           for (std::size_t query = 0; query < ne; ++query)
@@ -1304,6 +1306,31 @@ TEST_CASE("Periodic pair attention preserves ordered CPU jets and partial target
                     derivative += weights[feature * heads + head] * reference.laplacian[feature];
                 CHECK(logits[layout.attention.uncheckedLaplacianOffset(configuration, local, element)] ==
                       Catch::Approx(derivative).margin(1e-13));
+              }
+              if (mode == psiformer::SpatialJetMode::FULL_VGL)
+              {
+                pg::LogComplementPairJet pair;
+                REQUIRE(pg::evaluateLogComplementPair(cell, positions.data() + 3 * query,
+                    positions.data() + 3 * key, (query < 2) == (key < 2) ? 1 : -1, pair));
+                for (std::size_t feature = 0; feature < 9; ++feature)
+                {
+                  const double value_root = roots[layout.attention.uncheckedValueOffset(configuration, element)];
+                  double expected = feature == 8 ? value_root : value_root * reference.value[feature];
+                  if (feature != 8)
+                    for (std::size_t local = 0; local < layout.attention.laplacian_lanes; ++local)
+                    {
+                      const auto target = begin + local;
+                      const double sign = target == query ? 1 : target == key ? -1 : 0;
+                      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+                        expected += sign * reference.gradient[feature][dimension] *
+                            roots[layout.attention.uncheckedGradientOffset(configuration, 3 * local + dimension, element)];
+                      if (sign != 0)
+                        expected += reference.laplacian[feature] *
+                            roots[layout.attention.uncheckedLaplacianOffset(configuration, local, element)];
+                    }
+                  CHECK(pg::logComplementAttentionParameterAdjoint(layout, pair, roots.data(),
+                      configuration, head, query, key, feature) == Catch::Approx(expected).margin(1e-13));
+                }
               }
             }
       for (std::size_t configuration = 0; configuration < 2; ++configuration)

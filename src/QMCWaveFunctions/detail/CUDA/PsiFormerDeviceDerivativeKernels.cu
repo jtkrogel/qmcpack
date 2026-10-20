@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceDerivativeKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDerivativeMath.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceMath.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairFeatures.h"
 
 #include <cmath>
 #include <limits>
@@ -482,6 +483,52 @@ __device__ double softmaxRowReduction(BatchedAttentionForwardLayout layout,
   return reduction;
 }
 
+/// One canonical pair parameter owns its deterministic configuration/pair sum.
+__global__ void periodicPairAttentionParameterReverseKernel(BatchedAttentionForwardLayout layout,
+    periodic_geometry::Cell cell, std::size_t spin_up_count, const double* positions,
+    const double* probabilities, const double* probability_adjoint,
+    double* weight_response, double* bias_response)
+{
+  const auto parameter = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto heads = layout.attention.heads, ne = layout.attention.rows;
+  if (parameter >= 9 * heads)
+    return;
+  const auto feature = parameter / heads, head = parameter % heads;
+  double sum = 0;
+  for (std::size_t configuration = 0; configuration < layout.configuration_count; ++configuration)
+    for (std::size_t query = 0; query < ne; ++query)
+    {
+      const double reduction = softmaxRowReduction(layout, probabilities, probability_adjoint,
+          configuration, head, query);
+      const auto offset = configuration * layout.attention_configuration_stride +
+          head * layout.attention.attention_head_stride + query * layout.attention.attention_row_stride;
+      for (std::size_t key = 0; key < ne; ++key)
+      {
+        if (query == key)
+          continue;
+        double descriptor = 1;
+        if (feature < 8)
+        {
+          periodic_geometry::LogComplementPairJet pair;
+          if (!periodic_geometry::evaluateLogComplementPair(cell,
+              positions + 3 * (configuration * ne + query), positions + 3 * (configuration * ne + key),
+              (query < spin_up_count) == (key < spin_up_count) ? 1 : -1, pair))
+          {
+            sum = __longlong_as_double(0x7ff8000000000000LL);
+            break;
+          }
+          descriptor = pair.value[feature];
+        }
+        sum += descriptor * device_derivative::softmaxLogitAdjoint(probabilities[offset + key],
+            probability_adjoint[offset + key], reduction);
+      }
+    }
+  if (feature < 8)
+    weight_response[parameter] += sum;
+  else
+    bias_response[head] += sum;
+}
+
 __global__ void softmaxScaledQueryReverseKernel(
     BatchedAttentionForwardLayout layout,
     const double* key,
@@ -784,6 +831,32 @@ __global__ void attentionLogitDirectionKernel(BatchedAttentionForwardLayout layo
   }
   direction[directionAttentionOffset(layout, configuration, head, row, column)] =
       sum / std::sqrt(static_cast<double>(layout.attention.head_width));
+}
+
+/// Add the fixed-coordinate pair descriptor's learned-parameter tangent.
+__global__ void periodicPairAttentionDirectionKernel(BatchedAttentionForwardLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* weight_direction,
+    const double* bias_direction, std::size_t spin_up_count, double* direction)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.attention.rows, heads = layout.attention.heads;
+  if (index >= layout.configuration_count * heads * ne * ne)
+    return;
+  const auto column = index % ne, row = (index / ne) % ne;
+  if (row == column)
+    return;
+  const auto head = (index / (ne * ne)) % heads;
+  const auto configuration = index / (heads * ne * ne);
+  periodic_geometry::LogComplementPairJet pair;
+  double tangent = bias_direction[head];
+  if (!periodic_geometry::evaluateLogComplementPair(cell, positions + 3 * (configuration * ne + row),
+      positions + 3 * (configuration * ne + column),
+      (row < spin_up_count) == (column < spin_up_count) ? 1 : -1, pair))
+    tangent = __longlong_as_double(0x7ff8000000000000LL);
+  else
+    for (std::size_t feature = 0; feature < 8; ++feature)
+      tangent += weight_direction[feature * heads + head] * pair.value[feature];
+  direction[directionAttentionOffset(layout, configuration, head, row, column)] += tangent;
 }
 
 /** One thread owns a complete probability row, avoiding read/write reduction races. */
@@ -1429,6 +1502,25 @@ Error launchSoftmaxScaledQkReverse(Stream stream,
   return peekAtLastError();
 }
 
+Error launchPeriodicPairAttentionParameterReverse(Stream stream,
+    const BatchedAttentionForwardLayout& layout, const periodic_geometry::Cell& cell,
+    std::size_t spin_up_count, const double* positions, const double* probabilities,
+    const double* probability_adjoint, double* weight_response, double* bias_response)
+{
+  validateBatchedAttentionForwardLayout(layout);
+  periodic_geometry::validateCell(cell);
+  if (!positions || !probabilities || !probability_adjoint || !weight_response || !bias_response ||
+      !spin_up_count || spin_up_count >= layout.attention.rows || weight_response == bias_response)
+    throw std::invalid_argument("Periodic pair-attention reverse storage or spin partition is invalid");
+  const auto parameters = checkedProduct(9, layout.attention.heads, "Pair-attention response extent overflow");
+  checkedProduct(checkedProduct(layout.configuration_count, layout.attention.rows,
+      "Pair-attention position extent overflow"), 3, "Pair-attention position extent overflow");
+  periodicPairAttentionParameterReverseKernel<<<blockCount(parameters,
+      "Pair-attention response grid exceeds the CUDA/HIP x dimension"), derivative_block_size, 0, stream>>>(
+      layout, cell, spin_up_count, positions, probabilities, probability_adjoint, weight_response, bias_response);
+  return peekAtLastError();
+}
+
 Error launchOrbitalBbarEbar(Stream stream,
                             const OrbitalProductReverseLayout& layout,
                             const double* backflow,
@@ -1645,7 +1737,8 @@ Error launchBiasTanhParameterDirection(Stream stream, const BatchedValueLayout& 
 Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionForwardLayout& layout,
     const double* query, const double* key, const double* value, const double* probabilities,
     const double* query_direction, const double* key_direction, const double* value_direction,
-    double* probability_direction, double* context_direction)
+    double* probability_direction, double* context_direction,
+    const PeriodicPairAttentionDirectionInputs* pair_attention)
 {
   validateBatchedAttentionForwardLayout(layout);
   if (!query || !key || !value || !probabilities || !query_direction || !key_direction || !value_direction ||
@@ -1657,11 +1750,31 @@ Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionFor
   const auto probabilities_count = checkedProduct(rows, layout.attention.rows, "Attention direction extent overflow");
   const auto feature_count = checkedProduct(checkedProduct(layout.configuration_count, layout.attention.rows,
       "Context direction row overflow"), layout.attention.featureWidth(), "Context direction extent overflow");
+  if (pair_attention)
+  {
+    if (!pair_attention->cell || !pair_attention->positions || !pair_attention->weight_direction ||
+        !pair_attention->bias_direction || !pair_attention->spin_up_count ||
+        pair_attention->spin_up_count >= layout.attention.rows)
+      throw std::invalid_argument("Periodic pair-attention direction inputs are incomplete");
+    periodic_geometry::validateCell(*pair_attention->cell);
+    checkedProduct(checkedProduct(layout.configuration_count, layout.attention.rows,
+        "Pair-attention position extent overflow"), 3, "Pair-attention position extent overflow");
+  }
   attentionLogitDirectionKernel<<<blockCount(probabilities_count, "Logit direction grid too large"),
       derivative_block_size, 0, stream>>>(layout, query, key, query_direction, key_direction, probability_direction);
   auto error = peekAtLastError();
   if (error != success)
     return error;
+  if (pair_attention)
+  {
+    periodicPairAttentionDirectionKernel<<<blockCount(probabilities_count, "Pair direction grid too large"),
+        derivative_block_size, 0, stream>>>(layout, *pair_attention->cell, pair_attention->positions,
+        pair_attention->weight_direction, pair_attention->bias_direction, pair_attention->spin_up_count,
+        probability_direction);
+    error = peekAtLastError();
+    if (error != success)
+      return error;
+  }
   attentionProbabilityDirectionKernel<<<blockCount(rows, "Probability direction grid too large"),
       derivative_block_size, 0, stream>>>(layout, probabilities, probability_direction);
   error = peekAtLastError();

@@ -75,6 +75,37 @@ QMC_PF_PAIR_ATTENTION_HD inline bool addLogComplementAttentionJet(
   return true;
 }
 
+/// Contract FULL_VGL target cotangents with one affine pair parameter jet.
+/// VALUE score responses and ACTIVE coordinate reverse use separate contracts.
+QMC_PF_PAIR_ATTENTION_HD inline double logComplementAttentionParameterAdjoint(
+    const SpatialAttentionJetLayout& layout, const LogComplementPairJet& pair,
+    const double* logit_adjoint, std::size_t configuration, std::size_t head,
+    std::size_t query, std::size_t key, std::size_t feature) noexcept
+{
+  if (query == key)
+    return 0;
+  const auto element = head * layout.attention_head_stride + query * layout.attention_row_stride + key;
+  const double value_root = logit_adjoint[layout.attention.uncheckedValueOffset(configuration, element)];
+  if (feature == 8)
+    return value_root;
+  double result = value_root * pair.value[feature];
+  for (std::size_t endpoint = 0; endpoint < 2; ++endpoint)
+  {
+    const auto target = endpoint == 0 ? query : key;
+    if (layout.attention.containsTargetElectron(target))
+    {
+      const auto local = target - layout.attention.target_electron_begin;
+      const double sign = endpoint == 0 ? 1 : -1;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        result += sign * pair.gradient[feature][dimension] *
+            logit_adjoint[layout.attention.uncheckedGradientOffset(configuration, 3 * local + dimension, element)];
+      result += pair.laplacian[feature] *
+          logit_adjoint[layout.attention.uncheckedLaplacianOffset(configuration, local, element)];
+    }
+  }
+  return result;
+}
+
 } // namespace qmcplusplus::psiformer::periodic_geometry
 
 #undef QMC_PF_PAIR_ATTENTION_HD

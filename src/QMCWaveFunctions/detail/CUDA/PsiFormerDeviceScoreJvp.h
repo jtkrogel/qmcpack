@@ -147,9 +147,15 @@ public:
       project(dense, tape.input.data(), feature_.data(), ParameterRole::ATTENTION_QUERY_WEIGHT, layer, query_);
       project(dense, tape.input.data(), feature_.data(), ParameterRole::ATTENTION_KEY_WEIGHT, layer, key_);
       project(dense, tape.input.data(), feature_.data(), ParameterRole::ATTENTION_VALUE_WEIGHT, layer, value_);
+      PeriodicPairAttentionDirectionInputs pair_direction;
+      if (model_->plan().environment().periodic_profile)
+        pair_direction = {model_->periodicCell(), head.positions,
+            direction_.data() + model_->plan().parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, layer).begin,
+            direction_.data() + model_->plan().parameter(ParameterRole::PAIR_ATTENTION_BIAS, layer).begin,
+            shape.spin_up_electrons};
       checkRuntime(launchAttentionParameterDirection(stream, attention, tape.query.data(), tape.key.data(),
           tape.value.data(), tape.probabilities.data(), query_.data(), key_.data(), value_.data(),
-          probability_.data(), context_.data()), "score JVP attention");
+          probability_.data(), context_.data(), pair_direction.cell ? &pair_direction : nullptr), "score JVP attention");
       project(dense, tape.context.data(), context_.data(), ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer, projected_);
       add(feature_, projected_, residual_, feature_count);
       project(dense, tape.residual.data(), residual_.data(), ParameterRole::UPDATE_HIDDEN_WEIGHT, layer, hidden_);

@@ -303,13 +303,13 @@ private:
           "kinetic cusp reverse");
       checkKinetic();
 
-      accumulateTrunk(forward, head.root_layout, head.raw_features, configuration);
+      accumulateTrunk(forward, head.root_layout, head.raw_features, head.positions, configuration);
     }
   }
 
   /// Shared lifted attention/embedding tail; preserves head/cusp contributions in P.
   void accumulateTrunk(const PreparedDeviceInference& forward, const SpatialJetLayout& root_layout,
-      const double* raw_features, std::size_t configuration)
+      const double* raw_features, const double* positions, std::size_t configuration)
   {
     const auto& shape = model_->plan().modelShape();
     const auto ne = shape.electrons(), width = shape.feature_dimension;
@@ -344,6 +344,11 @@ private:
       checkRuntime(launchSoftmaxJetReverse(stream, makeAttentionSoftmaxJetRowLayout(attention_),
           tape.logits.data() + attention_offset, tape.probabilities.data() + attention_offset,
           probability_.data(), logit_.data()), "kinetic softmax reverse");
+      if (model_->plan().environment().periodic_profile)
+        checkRuntime(launchPeriodicPairAttentionJetParameterReverse(stream, attention_, *model_->periodicCell(),
+            positions + configuration * 3 * ne, shape.spin_up_electrons, logit_.data(),
+            response_.data() + offset(ParameterRole::PAIR_ATTENTION_WEIGHT, layer),
+            response_.data() + offset(ParameterRole::PAIR_ATTENTION_BIAS, layer)), "kinetic periodic pair-attention reverse");
       zero(query_);
       zero(key_);
       checkRuntime(launchAttentionLogitJetReverse(stream, attention_, at(tape.query), at(tape.key),
@@ -397,7 +402,7 @@ private:
         model_->sameAlpha(), model_->oppositeAlpha(), root_adjoint_.data(), response_.data(),
         kinetic_status(), model_->periodicCell()), "seeded trunk cusp reverse");
     checkKinetic();
-    accumulateTrunk(*ticket.owner, ticket.cusp, ticket.raw, 0);
+    accumulateTrunk(*ticket.owner, ticket.cusp, ticket.raw, ticket.positions, 0);
   }
 
   /// Admit the final complete P sum only after all target tiles have succeeded.

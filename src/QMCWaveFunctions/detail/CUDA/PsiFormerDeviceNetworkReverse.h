@@ -58,6 +58,8 @@ public:
     if (!model_ || capacity_ == 0)
       throw std::invalid_argument("Network reverse requires a model and nonzero capacity");
     model_->validateCurrentDevice();
+    if (model_->plan().environment().periodic_profile && output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+      throw std::invalid_argument("Periodic pair-attention coordinate reverse is not prepared");
     const auto& shape = model_->plan().modelShape();
     const auto features = multiply(multiply(capacity_, shape.electrons()), shape.feature_dimension);
     for (auto* buffer : {&upstream_, &residual_, &tanh_, &hidden_, &input_, &context_,
@@ -167,6 +169,12 @@ private:
           tape.value.data(), context_.data(), probability_.data(), value_.data()), "network context reverse");
       checkRuntime(launchSoftmaxScaledQkReverse(stream, attention, tape.query.data(), tape.key.data(),
           tape.probabilities.data(), probability_.data(), query_.data(), key_.data()), "network attention reverse");
+      if (model_->plan().environment().periodic_profile)
+        checkRuntime(launchPeriodicPairAttentionParameterReverse(stream, attention, *model_->periodicCell(),
+            shape.spin_up_electrons, forward.valueHeadTape().positions, tape.probabilities.data(),
+            probability_.data(), response_.data() + model_->plan().parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, layer).begin,
+            response_.data() + model_->plan().parameter(ParameterRole::PAIR_ATTENTION_BIAS, layer).begin),
+            "network periodic pair-attention reverse");
       for (const auto& projection : {std::pair{ParameterRole::ATTENTION_QUERY_WEIGHT, &query_},
                                     std::pair{ParameterRole::ATTENTION_KEY_WEIGHT, &key_},
                                     std::pair{ParameterRole::ATTENTION_VALUE_WEIGHT, &value_}})

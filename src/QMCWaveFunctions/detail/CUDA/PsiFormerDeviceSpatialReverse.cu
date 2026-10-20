@@ -10,6 +10,7 @@
  */
 
 #include "PsiFormerDeviceSpatialReverse.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairAttention.h"
 
 #include <limits>
 #include <stdexcept>
@@ -20,6 +21,37 @@ namespace
 {
 
 constexpr unsigned int spatial_reverse_block_size = 128;
+
+/// Each parameter sums all ordered pair jets without atomic response updates.
+__global__ void periodicPairAttentionJetParameterReverseKernel(SpatialAttentionJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, std::size_t spin_up_count,
+    const double* logit_adjoint, double* weight_response, double* bias_response)
+{
+  const auto parameter = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (parameter >= 9 * layout.heads)
+    return;
+  const auto feature = parameter / layout.heads, head = parameter % layout.heads;
+  double response = 0;
+  for (std::size_t query = 0; query < layout.rows; ++query)
+    for (std::size_t key = 0; key < layout.rows; ++key)
+    {
+      if (query == key)
+        continue;
+      periodic_geometry::LogComplementPairJet pair;
+      if (!periodic_geometry::evaluateLogComplementPair(cell, positions + 3 * query, positions + 3 * key,
+          (query < spin_up_count) == (key < spin_up_count) ? 1 : -1, pair) || !pair.differentiable)
+      {
+        response = __longlong_as_double(0x7ff8000000000000LL);
+        break;
+      }
+      response += periodic_geometry::logComplementAttentionParameterAdjoint(layout, pair,
+          logit_adjoint, 0, head, query, key, feature);
+    }
+  if (feature < 8)
+    weight_response[parameter] += response;
+  else
+    bias_response[head] += response;
+}
 
 __global__ void elementwiseProductJetReverseKernel(
     SpatialElementwiseJetLayout layout,
@@ -473,6 +505,28 @@ Error launchAttentionLogitJetReverse(
                     "PsiFormer attention-logit reverse grid exceeds device x dimension"),
       spatial_reverse_block_size, 0, stream>>>(
       layout, query, key, logit_adjoint, key_adjoint);
+  return peekReverseError();
+}
+
+Error launchPeriodicPairAttentionJetParameterReverse(Stream stream,
+    const SpatialAttentionJetLayout& layout, const periodic_geometry::Cell& cell,
+    const double* positions, std::size_t spin_up_count, const double* logit_adjoint,
+    double* weight_response, double* bias_response)
+{
+  validateSpatialAttentionJetLayout(layout);
+  spatial_jet_reverse::validateMatchingFullVglReverseLayouts(layout.features, layout.features, layout.attention);
+  if (layout.attention.configuration_count != 1 || layout.attention.mode != SpatialJetMode::FULL_VGL)
+    throw std::invalid_argument("Periodic pair-attention jet reverse requires one FULL_VGL configuration");
+  periodic_geometry::validateCell(cell);
+  if (!positions || !logit_adjoint || !weight_response || !bias_response ||
+      !spin_up_count || spin_up_count >= layout.rows || weight_response == bias_response ||
+      weight_response == logit_adjoint || bias_response == logit_adjoint)
+    throw std::invalid_argument("Periodic pair-attention jet reverse inputs or outputs are invalid");
+  const auto parameters = spatial_detail::checkedProduct(9, layout.heads, "Pair-attention response extent overflow");
+  spatial_detail::checkedProduct(3, layout.rows, "Pair-attention position extent overflow");
+  periodicPairAttentionJetParameterReverseKernel<<<reverseBlocks(parameters,
+      "Pair-attention jet response grid exceeds device x dimension"), spatial_reverse_block_size, 0, stream>>>(
+      layout, cell, positions, spin_up_count, logit_adjoint, weight_response, bias_response);
   return peekReverseError();
 }
 

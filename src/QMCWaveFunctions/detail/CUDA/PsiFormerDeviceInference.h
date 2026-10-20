@@ -1179,9 +1179,15 @@ private:
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, layer), q_.data());
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_KEY_WEIGHT, layer), k_.data());
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_VALUE_WEIGHT, layer), v_.data());
+      PeriodicPairAttentionInputs pair_attention;
+      if (model_->plan().environment().periodic_profile)
+        pair_attention = {model_->periodicCell(), positions_.data(),
+            parameter(ParameterRole::PAIR_ATTENTION_WEIGHT, layer), parameter(ParameterRole::PAIR_ATTENTION_BIAS, layer),
+            active_.data(), shape_.spin_up_electrons};
       checkRuntime(launchAttentionJetWeights(stream, attention_, q_.data(), k_.data(),
           weights_.data(), jet_status_.data(),
-          !value_tape_.empty() && mode_ == SpatialJetMode::FULL_VGL ? value_tape_[layer]->logits.data() : nullptr),
+          !value_tape_.empty() && mode_ == SpatialJetMode::FULL_VGL ? value_tape_[layer]->logits.data() : nullptr,
+          pair_attention.cell ? &pair_attention : nullptr),
           "model attention VGL");
       checkJets();
       checkRuntime(launchAttentionContextJets(stream, attention_, weights_.data(),

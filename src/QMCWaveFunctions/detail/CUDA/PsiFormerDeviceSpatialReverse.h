@@ -76,6 +76,12 @@ Error launchAttentionLogitJetReverse(
     double* query_adjoint,
     double* key_adjoint);
 
+/// Accumulate one configuration's FULL_VGL value/gradient/Laplacian roots.
+Error launchPeriodicPairAttentionJetParameterReverse(Stream stream,
+    const SpatialAttentionJetLayout& layout, const periodic_geometry::Cell& cell,
+    const double* positions, std::size_t spin_up_count, const double* logit_adjoint,
+    double* weight_response, double* bias_response);
+
 } // namespace qmcplusplus::psiformer::device
 
 #endif // QMCPLUSPLUS_PSIFORMER_DEVICE_SPATIAL_REVERSE_H

@@ -304,6 +304,12 @@ Error launchSoftmaxScaledQkReverse(Stream stream,
                                    double* query_adjoint,
                                    double* key_adjoint);
 
+/// Accumulate the selected periodic pair-bias parameter VJP from softmax roots.
+Error launchPeriodicPairAttentionParameterReverse(Stream stream,
+    const BatchedAttentionForwardLayout& layout, const periodic_geometry::Cell& cell,
+    std::size_t spin_up_count, const double* positions, const double* probabilities,
+    const double* probability_adjoint, double* weight_response, double* bias_response);
+
 /** Prepare Bbar=Abar*E and Ebar=Abar*B for the orbital product A=B*E. */
 Error launchOrbitalBbarEbar(Stream stream,
                             const OrbitalProductReverseLayout& layout,
@@ -349,6 +355,16 @@ Error launchBiasTanhParameterDirection(Stream stream, const BatchedValueLayout& 
     const double* tanh_value, const double* preactivation_direction,
     const double* bias_direction, double* output_direction);
 
+/// Borrow fixed geometry and device parameter tangents until the stream completes.
+struct PeriodicPairAttentionDirectionInputs
+{
+  const periodic_geometry::Cell* cell = nullptr;
+  const double* positions = nullptr;
+  const double* weight_direction = nullptr;
+  const double* bias_direction = nullptr;
+  std::size_t spin_up_count = 0;
+};
+
 /** Differentiate attention probabilities and context along one parameter direction.
  * Buffers are ordinary values/tangents, never coordinate-jet planes. Probability
  * directions are caller-owned scratch and used to form the context tangent.
@@ -356,7 +372,8 @@ Error launchBiasTanhParameterDirection(Stream stream, const BatchedValueLayout& 
 Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionForwardLayout& layout,
     const double* query, const double* key, const double* value, const double* probabilities,
     const double* query_direction, const double* key_direction, const double* value_direction,
-    double* probability_direction, double* context_direction);
+    double* probability_direction, double* context_direction,
+    const PeriodicPairAttentionDirectionInputs* pair_attention = nullptr);
 
 /** Bind the six explicit spin-channel orbital parameter intervals. */
 struct OrbitalDirectionParameters
