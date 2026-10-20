@@ -327,8 +327,9 @@ private:
       : plan_(plan)
   {
     const auto& environment = plan_.environment();
-    if (real_two_cell && !matchesRealDevicePairMetadata(environment))
-      throw std::invalid_argument("Numerical two-cell model requires real atom-centered log-complement metadata");
+    if (real_two_cell && !(paired_value ? matchesPairedDevicePairMetadata(environment)
+                                       : matchesRealDevicePairMetadata(environment)))
+      throw std::invalid_argument("Numerical two-cell model requires selected atom-centered log-complement metadata");
     if (paired_value && (environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
@@ -479,6 +480,16 @@ public:
   {
     auto family = std::shared_ptr<PreparedDeviceModelMetadata>(
         new PreparedDeviceModelMetadata(plan, nuclei, false, true));
+    return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(std::move(family), parameters, version));
+  }
+
+  /// Prepare paired two-cell numerical products without admitting native profiles.
+  static std::shared_ptr<const PreparedDeviceModel> preparePairedTwoCellProfile(
+      const PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
+      const std::vector<double>& nuclei, std::size_t version = 0)
+  {
+    auto family = std::shared_ptr<PreparedDeviceModelMetadata>(
+        new PreparedDeviceModelMetadata(plan, nuclei, true, true));
     return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(std::move(family), parameters, version));
   }
 

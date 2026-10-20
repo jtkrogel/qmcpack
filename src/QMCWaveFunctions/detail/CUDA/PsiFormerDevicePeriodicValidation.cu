@@ -295,6 +295,23 @@ void validate(bool selected_two_cell = false)
 }
 } // namespace
 
+/// Select the numerical paired atom-centered profile, retaining legacy fixtures unchanged.
+void selectPairedTwoCellValidation(ExecutionEnvironment& environment, bool selected)
+{
+  if (!selected)
+    return;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+  auto metadata = std::make_shared<PeriodicProfileMetadata>();
+  metadata->cells.primitive = metadata->cells.simulation =
+      {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+  for (double& entry : metadata->cells.primitive.lattice_vectors[0]) entry *= .5;
+  metadata->cells.tiling[0][0] = 2;
+  metadata->primitive_motif = {{.1, .2, -.1}, {.8, -.3, .7}};
+  metadata->motif_species = {3, 1};
+  metadata->occupied_columns = {{{}, 0, 0, 1}, {{}, 1, 0, 1}, {{}, 0, 1, 1}, {{}, 1, 1, 1}};
+  environment.periodic_profile = std::move(metadata);
+}
+
 #include "PsiFormerDeviceComplexValueValidation.h"
 #include "PsiFormerDeviceComplexSpatialValidation.h"
 #include "PsiFormerDeviceComplexScoreValidation.h"
@@ -494,8 +511,9 @@ int main(int argc, char** argv)
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
         std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only" &&
-        std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only]");
+        std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only" &&
+        std::string_view(argv[1]) != "--paired-two-cell-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -507,7 +525,16 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--two-cell-model-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--paired-two-cell-only")
+    {
+      validateComplexSpatial(true);
+      validateComplexScore(true);
+      validateComplexKineticOwner(true);
+      validateComplexProducts(true);
+      std::cout << "PASS selected paired two-cell numerical products: atom/log/pair8/cusp; "
+                   "value/phase/G/L/score/JVP/kinetic/publication; native admission unchanged\n";
+    }
+    else if (argc == 2 && std::string_view(argv[1]) == "--two-cell-model-only")
       validate(true);
     else if (argc == 2 && std::string_view(argv[1]) == "--periodic-pair-only")
       validatePeriodicPairAttention();

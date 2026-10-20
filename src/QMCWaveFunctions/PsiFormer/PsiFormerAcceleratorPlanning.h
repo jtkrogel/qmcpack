@@ -55,6 +55,32 @@ inline bool matchesRealDevicePairMetadata(const ExecutionEnvironment& environmen
   return true;
 }
 
+/** Match only the numerical paired two-cell atom-centered family.
+ * Native admission, outer Gamma twist and actual backend products remain
+ * separate checks; reciprocal/Fourier profiles are not implied.
+ */
+inline bool matchesPairedDevicePairMetadata(const ExecutionEnvironment& environment) noexcept
+{
+  const auto& profile = environment.periodic_profile;
+  if (!profile || environment.boundary != BoundaryCondition::PERIODIC ||
+      environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1 ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != ScalarDomain::COMPLEX ||
+      environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX || !environment.fixed_nuclei ||
+      profile->version != 1 || profile->feature_transform != PeriodicFeatureTransform::LOG_COMPLEMENT_V1 ||
+      profile->pair_feature_dimension != 8 || !profile->electron_electron_cusp ||
+      profile->envelope_policy != PeriodicEnvelopePolicy::ATOM_CENTERED || !profile->fourier_modes.empty())
+    return false;
+  for (bool periodic : environment.periodic_axes)
+    if (!periodic)
+      return false;
+  for (const auto& column : profile->occupied_columns)
+    if (column.reciprocal != std::array<int, 3>{})
+      return false;
+  return true;
+}
+
 /// Identify the execution backend without exposing vendor runtime types.
 enum class PsiFormerAcceleratorBackend : std::uint8_t
 {

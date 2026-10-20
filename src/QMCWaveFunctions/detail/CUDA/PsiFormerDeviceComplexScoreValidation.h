@@ -127,7 +127,7 @@ void validateComplexScoreWeightedLeaves(qmcplusplus::compute::Queue<qmcplusplus:
 }
 
 /// Complete all-canonical CPU/Wide/FD parity and atomic two-objective publication.
-void validateComplexScore()
+void validateComplexScore(bool selected_two_cell = false)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -140,6 +140,7 @@ void validateComplexScore()
   environment.periodic_axes = {true, true, true};
   environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
   environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  selectPairedTwoCellValidation(environment, selected_two_cell);
   const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
   pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
@@ -158,7 +159,9 @@ void validateComplexScore()
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
   validateComplexScoreWeightedLeaves(queue);
-  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
+  auto image = selected_two_cell
+      ? PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, model.cfg.nuclei.x)
+      : PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
   int ordinal = -1;
 #ifdef QMC_CUDA2HIP
   checkRuntime(hipGetDevice(&ordinal), "complex score device");

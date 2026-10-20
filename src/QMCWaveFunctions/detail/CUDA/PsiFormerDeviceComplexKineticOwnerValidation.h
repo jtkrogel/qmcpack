@@ -91,7 +91,7 @@ struct ComplexKineticOwnerValidationAccess
 } // namespace qmcplusplus::psiformer::device
 
 /// Independent CPU Wide/allP and spatial-energy FD over K1/nondivisor/full/tails.
-void validateComplexKineticOwner()
+void validateComplexKineticOwner(bool selected_two_cell = false)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -104,6 +104,7 @@ void validateComplexKineticOwner()
   environment.periodic_axes = {true, true, true};
   environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
   environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  selectPairedTwoCellValidation(environment, selected_two_cell);
   const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
   pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
@@ -116,14 +117,16 @@ void validateComplexKineticOwner()
   }
   model.p.set_flat_values(parameters);
   const std::vector<double> inverse_masses{1, 1 / 1.3, 1 / 0.8, 1 / 1.7};
-  const std::array<double, 3> kappa{0.13, -0.07, 0.04};
+  const std::array<double, 3> kappa = selected_two_cell ? std::array<double, 3>{} : std::array<double, 3>{.13, -.07, .04};
   pf::DirectComplexKineticExecutor oracle(model, plan, kappa);
   auto workspace = oracle.makeWorkspace(oracle.requiredStorageBytes());
   pf::DirectComplexSpatialExecutor spatial(model, plan);
   auto spatial_workspace = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
-  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
+  auto image = selected_two_cell
+      ? PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, model.cfg.nuclei.x)
+      : PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
   int device = -1;
 #ifdef QMC_CUDA2HIP
   checkRuntime(hipGetDevice(&device), "complex kinetic device");

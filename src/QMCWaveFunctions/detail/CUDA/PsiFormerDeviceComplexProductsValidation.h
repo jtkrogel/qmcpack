@@ -10,7 +10,7 @@
 #include <type_traits>
 
 /// Tiny complete CPU weighted allP oracle, tails/finite/lifecycle/cap/transfer boundaries.
-void validateComplexProducts()
+void validateComplexProducts(bool selected_two_cell = false)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -32,10 +32,11 @@ void validateComplexProducts()
   environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
   environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
   environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
-  const ModelShape shape{3, 1, 2, 4, 16, 2, 2};
+  selectPairedTwoCellValidation(environment, selected_two_cell);
+  const ModelShape shape{selected_two_cell ? 2u : 3u, selected_two_cell ? 2u : 1u, 2, 4, 16, 2, 2};
   auto configuration = configurations(environment);
-  configuration.nup = 3;
-  configuration.ndown = 1;
+  configuration.nup = selected_two_cell ? 2 : 3;
+  configuration.ndown = selected_two_cell ? 2 : 1;
   pf::PsiFormer model(smallParameters(environment), configuration, 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
   auto parameters = model.p.flat_values();
@@ -46,14 +47,16 @@ void validateComplexProducts()
       parameters[i] = .09 * std::sin(double(i - interval.begin + 1));
   }
   model.p.set_flat_values(parameters);
-  const std::array<double, 3> kappa{.13, -.07, .04};
+  const std::array<double, 3> kappa = selected_two_cell ? std::array<double, 3>{} : std::array<double, 3>{.13, -.07, .04};
   pf::DirectComplexScoreExecutor cpu_score(model, plan);
   auto score_work = cpu_score.makeWorkspace();
   pf::DirectComplexKineticExecutor cpu_kinetic(model, plan, kappa);
   auto kinetic_work = cpu_kinetic.makeWorkspace(cpu_kinetic.requiredStorageBytes());
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
-  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
+  auto image = selected_two_cell
+      ? PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, model.cfg.nuclei.x)
+      : PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
   int device = -1;
 #ifdef QMC_CUDA2HIP
   checkRuntime(hipGetDevice(&device), "complex products device");
@@ -322,7 +325,9 @@ void validateComplexProducts()
     const auto& interval = plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK, part);
     std::fill(nodal.begin() + interval.begin, nodal.begin() + interval.end, 0);
   }
-  auto node_image = PreparedDeviceModel::preparePairedComplexValue(plan, nodal, model.cfg.nuclei.x);
+  auto node_image = selected_two_cell
+      ? PreparedDeviceModel::preparePairedTwoCellProfile(plan, nodal, model.cfg.nuclei.x)
+      : PreparedDeviceModel::preparePairedComplexValue(plan, nodal, model.cfg.nuclei.x);
   auto node = Owner::prepare(node_image, targets, b, c, chunk, queue, blas, cost.device_bytes, cost.host_bytes, cost.matrix_work);
   for (auto& row : coefficients) std::fill(row.begin(), row.end(), C{});
   fails([&] { node->evaluate(positions, masses, kappa, channels); });

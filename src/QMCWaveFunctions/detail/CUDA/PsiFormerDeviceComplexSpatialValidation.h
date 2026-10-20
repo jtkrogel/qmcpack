@@ -110,7 +110,7 @@ void validateComplexSpatialWeightedLeaves(qmcplusplus::compute::Queue<qmcplusplu
 }
 
 /// Numerical FULL oracle, ordinary complex kinetic consumer and lifecycle gate.
-void validateComplexSpatial()
+void validateComplexSpatial(bool selected_two_cell = false)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -123,6 +123,7 @@ void validateComplexSpatial()
   environment.periodic_axes = {true, true, true};
   environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
   environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  selectPairedTwoCellValidation(environment, selected_two_cell);
   const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
   pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
@@ -141,7 +142,9 @@ void validateComplexSpatial()
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   validateComplexSpatialWeightedLeaves(queue);
   AcceleratorBlasHandle blas(queue);
-  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
+  auto image = selected_two_cell
+      ? PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, model.cfg.nuclei.x)
+      : PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
   int ordinal = -1;
 #ifdef QMC_CUDA2HIP
   checkRuntime(hipGetDevice(&ordinal), "complex FULL device");
@@ -166,7 +169,10 @@ void validateComplexSpatial()
     throw std::runtime_error("Complex FULL exact owner bytes mismatch");
   std::vector<ComplexValueResult> amplitude(3);
   std::vector<cuDoubleComplex> gradient(36), lap_log(12), lap_ratio(12);
-  const double masses[4]{1, 1.3, 0.8, 1.7}, k[3]{0.13, -0.07, 0.04};
+  const double masses[4]{1, 1.3, 0.8, 1.7};
+  // This separate HOST kinetic-consumer probe uses an external drift, not a model/ParticleSet twist.
+  // Complete selected kinetic-owner/products checks retain Gamma kappa=0 below their own admission.
+  const std::array<double, 3> k{.13, -.07, .04};
   double max_gradient = 0, max_lap = 0, max_kinetic = 0, max_fd = 0;
   std::size_t comparisons = 0;
   // Compare actual complex components, never branch-cut angles or squared moduli.
@@ -331,6 +337,7 @@ void validateComplexSpatial()
             << " max_L_error=" << max_lap << " max_kinetic_error=" << max_kinetic << " max_FD_error=" << max_fd
             << " trunk_bytes=" << cost.trunk_bytes << " owner_device_bytes=" << cost.device_bytes
             << " owner_host_bytes=" << cost.host_bytes
-            << " warm_device_allocations=0 scope=device_wide outer_k=test_consumer_only\n";
+            << " warm_device_allocations=0 scope=device_wide outer_k=test_consumer_only"
+            << " external_drift=HOST_math_probe native_outer_twist_admission=not_implied\n";
 }
 #endif
