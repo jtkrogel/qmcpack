@@ -137,6 +137,27 @@ TEST_CASE("PsiFormer accelerator backend selection fails closed", "[wavefunction
   CHECK(selectPsiFormerAcceleratorBackend("auto", support) == PsiFormerAcceleratorBackend::CUDA);
 }
 
+TEST_CASE("HIP readiness keeps untested runtime and missing training operations closed",
+          "[wavefunction][psiformer][accelerator][hip_readiness]")
+{
+  const auto inference = psiFormerAcceleratorInferenceOperations();
+  PsiFormerAcceleratorReadiness readiness;
+  readiness.hip = {true, true, inference, PsiFormerRuntimeValidation::NOT_RUN};
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("hip", readiness, inference), std::runtime_error);
+  readiness.hip.runtime_validation = PsiFormerRuntimeValidation::PASSED;
+  const auto resolved = resolvePsiFormerAcceleratorRequest("hip", readiness, inference);
+  CHECK(resolved.backend == PsiFormerAcceleratorBackend::HIP);
+  CHECK(resolved.validated_operations == inference);
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("hip", readiness, allPsiFormerAcceleratorOperations()),
+                  std::runtime_error);
+  readiness.hip.runtime_validation = PsiFormerRuntimeValidation::FAILED;
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("hip", readiness, inference), std::runtime_error);
+  readiness.hip.runtime_validation = PsiFormerRuntimeValidation::PASSED;
+  readiness.hip.operation_coverage = allPsiFormerAcceleratorOperations();
+  CHECK(resolvePsiFormerAcceleratorRequest("hip", readiness, allPsiFormerAcceleratorOperations()).backend ==
+        PsiFormerAcceleratorBackend::HIP);
+}
+
 TEST_CASE("PsiFormer production accelerator resolution applies every readiness gate",
           "[wavefunction][psiformer][accelerator]")
 {
