@@ -82,6 +82,10 @@ public:
     return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation.vgl);
   }
 
+  /// Report the immutable prepared limit, independent of later environment changes.
+  std::size_t activeInferenceCrowdCapacity() const noexcept
+  { return preparation_.active_inference_crowds; }
+
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
   std::unique_ptr<PreparedDeviceProductSession> prepareProductSession(
       ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,

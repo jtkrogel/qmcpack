@@ -7179,6 +7179,19 @@ bool PsiFormerWF::usesAcceleratorParameterProducts() const noexcept
   return model_state_->numerical_tile_backend != nullptr;
 }
 
+/// Read the prepared GPU limit without consuming HOST leaves or mutable configuration.
+std::size_t PsiFormerWF::activeAcceleratorInferenceCrowdCapacity() const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+#ifdef ENABLE_CUDA
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  return backend ? backend->activeInferenceCrowdCapacity() : 0;
+#else
+  return 0;
+#endif
+}
+
 const wftrain::StructuredParameterSchema& PsiFormerWF::parameterSchema() const noexcept
 {
   return *structured_parameter_schema_;

@@ -112,6 +112,25 @@ TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policie
       "<parameter name='kfac_exclude_width'>2</parameter>")));
 }
 
+TEST_CASE("Hybrid KFAC crowd admission preserves isolated single-crowd profiles",
+          "[drivers][wf_train][kfac][crowd_policy]")
+{
+  using wftrain::supportsHybridKFACPopulation;
+  CHECK(supportsHybridKFACPopulation(false, 2, 1, true, 0));
+  CHECK_FALSE(supportsHybridKFACPopulation(true, 1, 1, false, 1));
+  for (const auto crowds : {std::size_t{2}, std::size_t{4}})
+  {
+    CHECK(supportsHybridKFACPopulation(true, 1, crowds, true, 1));
+    CHECK_FALSE(supportsHybridKFACPopulation(false, 1, crowds, true, 1));
+    CHECK_FALSE(supportsHybridKFACPopulation(true, 2, crowds, true, 1));
+    CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, false, 1));
+    for (const auto active : {std::size_t{0}, std::size_t{2}, std::size_t{4}})
+      CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, true, active));
+  }
+  for (const auto crowds : {std::size_t{0}, std::size_t{3}, std::size_t{8}})
+    CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, true, 1));
+}
+
 TEST_CASE("Training no-exclusion sentinel is exact under finite-math compilation",
           "[drivers][wf_train][positive_infinity_policy]")
 {

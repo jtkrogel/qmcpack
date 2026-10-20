@@ -371,6 +371,9 @@ public:
   /// Report the prepared numerical backend used for this clone family's products.
   bool usesAcceleratorParameterProducts() const noexcept override;
 
+  /// Report the authoritative prepared GPU inference capacity; CPU reports zero.
+  std::size_t activeAcceleratorInferenceCrowdCapacity() const;
+
   /// Prove exact current FULL cache reuse for a sole-factor retained ENERGY replay.
   bool canReuseFullSpatialReplay(const ParticleSet& live,
                                 const ParticleSet& saved,
