@@ -387,6 +387,18 @@ if(QMC_MPI)
     )
   endif(NOT MPI_FOUND)
 
+  if(ENABLE_CUDA AND TARGET MPI::MPI_CXX)
+    # Host wrappers can hide their MPI headers from a direct device compiler.
+    find_path(QMC_MPI_HEADER_DIR mpi.h
+              HINTS ${MPI_CXX_INCLUDE_DIRS} ${MPI_CXX_COMPILER_INCLUDE_DIRS}
+                    ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES} ${CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES}
+              NO_DEFAULT_PATH)
+    if(NOT QMC_MPI_HEADER_DIR)
+      message(FATAL_ERROR "MPI headers were not found in the detected or host compiler include directories")
+    endif()
+    target_include_directories(MPI::MPI_CXX INTERFACE "${QMC_MPI_HEADER_DIR}")
+  endif()
+
   if(${MPI_CXX_LIBRARY_VERSION_STRING} MATCHES "MVAPICH2")
     string(REGEX REPLACE "\n" ";" ONE_LINE "${MPI_CXX_LIBRARY_VERSION_STRING}")
     string(REGEX REPLACE " +|\t" ";" ONE_LINE "${ONE_LINE}")
@@ -597,6 +609,9 @@ if(HDF5_FOUND)
   target_include_directories(IO::HDF5 INTERFACE ${HDF5_INCLUDE_DIR} ${HDF5_INCLUDE_DIRS} "${QMC_HDF5_HEADER_DIR}")
   target_compile_definitions(IO::HDF5 INTERFACE "H5_USE_110_API")
   target_link_libraries(IO::HDF5 INTERFACE "${HDF5_LIBRARIES}")
+  if(HDF5_IS_PARALLEL AND HAVE_MPI)
+    target_link_libraries(IO::HDF5 INTERFACE MPI::MPI_CXX)
+  endif()
   if(ENABLE_PHDF5)
     target_compile_definitions(IO::HDF5 INTERFACE "ENABLE_PHDF5")
   endif(ENABLE_PHDF5)
