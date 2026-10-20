@@ -48,7 +48,8 @@ std::string normalizedAcceleratorRequest(std::string value)
 
 /** Inspect operation-specific production readiness.
  * CUDA tiles retain their qualified coverage. Actual AMD runtime checks cover
- * HIP REAL products; the paired-complex HIP profile remains separately gated.
+ * HIP REAL and selected paired numerical products; native paired families
+ * remain explicitly profile-gated below.
  */
 psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
 {
@@ -258,8 +259,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
       (imported_model && imported_model->paired_complex) ||
       (pair_profile && profile_head == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX);
-  // Current AMD runtime coverage admits REAL heads only, not paired-complex products.
-  if (complex_profile && normalizedAcceleratorRequest(gpu) == "hip")
+  // Only selected paired two-cell AE metadata may proceed to the later HIP profile checks.
+  // Legacy paired, PP, reciprocal and Fourier families remain independently closed.
+  if (complex_profile && normalizedAcceleratorRequest(gpu) == "hip" &&
+      !(pair_profile && system == "all_electron"))
     throw std::invalid_argument("Paired-complex HIP native profiles require separate runtime qualification");
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
@@ -291,7 +294,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   selected_pair_gpu = pair_profile && !complex_profile && system == "all_electron" &&
       (pair_request == "cuda" || pair_request == "hip");
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
-  selected_pair_gpu = pair_profile && complex_profile && system == "all_electron" && pair_request == "cuda";
+  selected_pair_gpu = pair_profile && complex_profile && system == "all_electron" &&
+      (pair_request == "cuda" || pair_request == "hip");
 #endif
   if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
       (pair_request != "no" && pair_request != "cpu" && !selected_pair_gpu) ||
