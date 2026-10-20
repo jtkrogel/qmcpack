@@ -15,6 +15,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <numeric>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -83,6 +84,37 @@ PsiFormerExecutionPlan makePlan()
 }
 
 } // namespace
+
+TEST_CASE("Real two-cell device metadata matching never implies backend readiness",
+          "[wavefunction][psiformer][accelerator][pair_metadata]")
+{
+  ExecutionEnvironment environment;
+  CHECK_FALSE(matchesRealDevicePairMetadata(environment));
+  environment.boundary = BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+  environment.periodic_axes = {true, true, true};
+  auto profile = std::make_shared<PeriodicProfileMetadata>();
+  profile->occupied_columns = {{{}, 0, 0, 1}, {{}, 0, 1, 1}};
+  environment.periodic_profile = profile;
+  REQUIRE(matchesRealDevicePairMetadata(environment));
+  SECTION("raw features") { profile->feature_transform = PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1; }
+  SECTION("polynomial features") { profile->feature_transform = PeriodicFeatureTransform::POLYNOMIAL_V1; }
+  SECTION("wrong pair arity") { profile->pair_feature_dimension = 4; }
+  SECTION("no cusp") { profile->electron_electron_cusp = false; }
+  SECTION("Fourier envelopes") { profile->envelope_policy = PeriodicEnvelopePolicy::FOURIER; }
+  SECTION("Fourier modes") { profile->fourier_modes = {{0, 0, 0}}; }
+  SECTION("occupied phase") { profile->occupied_columns[0].reciprocal = {1, 0, 0}; }
+  SECTION("paired head") { environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX; }
+  SECTION("complex amplitude") { environment.amplitude_scalar_domain = ScalarDomain::COMPLEX; }
+  SECTION("complex parameters") { environment.parameter_scalar_domain = ScalarDomain::COMPLEX; }
+  SECTION("complex compute") { environment.compute_scalar_domain = ScalarDomain::COMPLEX; }
+  SECTION("moving ions") { environment.fixed_nuclei = false; }
+  SECTION("partial periodicity") { environment.periodic_axes[2] = false; }
+  SECTION("open boundary") { environment.boundary = BoundaryCondition::OPEN; }
+  SECTION("legacy torus") { environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1; }
+  SECTION("unknown version") { profile->version = 2; }
+  CHECK_FALSE(matchesRealDevicePairMetadata(environment));
+}
 
 TEST_CASE("PsiFormer accelerator backend selection fails closed", "[wavefunction][psiformer][accelerator]")
 {
