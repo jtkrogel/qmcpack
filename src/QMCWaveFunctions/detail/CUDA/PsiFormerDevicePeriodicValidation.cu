@@ -23,6 +23,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicFeatures.h"
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
@@ -281,6 +282,160 @@ void validateKineticTrunkPeriodic()
   }
 }
 
+/// Compare pair logits and their parameter VJP with independent native feature jets.
+void validatePeriodicPairAttention()
+{
+  namespace pg = qmcplusplus::psiformer::periodic_geometry;
+  namespace feature = qmcplusplus::psiformer::periodic_feature;
+  constexpr std::size_t batches = 2, ne = 3, heads = 2;
+  const pf::GeometryBoundary boundary{pf::GeometryBoundaryKind::PERIODIC,
+      {{{6.4, .8, -.4}, {.3, 2.8, .5}, {-.1, .6, 3.6}}}, {{true, true, true}}};
+  auto primitive = boundary.lattice_vectors;
+  for (double& value : primitive[0]) value *= .5;
+  const auto cell = pg::makeTwoCell(boundary.lattice_vectors, primitive, boundary.periodic_axes);
+  const std::vector<double> positions{.71, .52, -.41, -.27, 1.18, .84, 1.4, -.3, .6,
+                                      .74, .52, -.41, -.27, 1.16, .84, 1.4, -.3, .61};
+  std::vector<double> weights(8 * heads), bias{.31, -.17};
+  for (std::size_t index = 0; index < weights.size(); ++index)
+    weights[index] = .07 * (static_cast<int>(index) - 6);
+  std::vector<feature::Jet> references(batches * ne * ne);
+  for (std::size_t configuration = 0; configuration < batches; ++configuration)
+  {
+    const std::array<double, 3> nucleus{.12, -.23, .31};
+    pf::PsiFormerGeometryCache geometry(ne,
+        pf::GeometryPositionView::interleaved(nucleus.data(), 1), boundary);
+    geometry.update(pf::GeometryPositionView::interleaved(positions.data() + 3 * ne * configuration, ne));
+    for (std::size_t query = 0; query < ne; ++query)
+      for (std::size_t key = 0; key < ne; ++key)
+        if (query != key)
+        {
+          const auto first = std::min(query, key), second = std::max(query, key);
+          std::size_t pair = second - first - 1;
+          for (std::size_t row = 0; row < first; ++row) pair += ne - row - 1;
+          references[(configuration * ne + query) * ne + key] = feature::evaluate(
+              geometry.electronElectronPairs(), pair, boundary, query < key ? 1 : -1,
+              PeriodicFeatureTransform::LOG_COMPLEMENT_V1, (query < 2) == (key < 2) ? 1 : -1);
+        }
+  }
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  DeviceBuffer<double> device_positions(positions.size()), device_weights(weights.size()), device_bias(bias.size());
+  device_positions.upload(positions.data(), positions.size());
+  device_weights.upload(weights.data(), weights.size()); device_bias.upload(bias.data(), bias.size());
+  const auto forward = makeBatchedAttentionForwardLayout(batches, makeAttentionForwardLayout(ne, heads, 2, 5, 4, 15));
+  std::vector<double> probabilities(forward.attentionElements(), 0), adjoints(probabilities.size(), 0),
+      observed_probabilities(probabilities.size(), 0);
+  std::vector<double> expected_weights(weights.size(), 0), expected_bias(heads, 0);
+  for (std::size_t configuration = 0; configuration < batches; ++configuration)
+    for (std::size_t head = 0; head < heads; ++head)
+      for (std::size_t query = 0; query < ne; ++query)
+      {
+        double normalizer = 0;
+        for (std::size_t key = 0; key < ne; ++key)
+        {
+          double logit = query == key ? 0 : bias[head];
+          if (query != key)
+            for (std::size_t f = 0; f < 8; ++f)
+              logit += weights[f * heads + head] * references[(configuration * ne + query) * ne + key].value[f];
+          const auto offset = forward.attentionOffset(configuration, head, query, key);
+          probabilities[offset] = std::exp(logit); normalizer += probabilities[offset];
+          adjoints[offset] = .02 * (1 + static_cast<int>(configuration + head + 3 * query) - 2 * static_cast<int>(key));
+        }
+        double mean_adjoint = 0;
+        for (std::size_t key = 0; key < ne; ++key)
+        {
+          const auto offset = forward.attentionOffset(configuration, head, query, key);
+          probabilities[offset] /= normalizer;
+          mean_adjoint += probabilities[offset] * adjoints[offset];
+        }
+        for (std::size_t key = 0; key < ne; ++key)
+          if (query != key)
+          {
+            const auto offset = forward.attentionOffset(configuration, head, query, key);
+            const double seed = probabilities[offset] * (adjoints[offset] - mean_adjoint);
+            expected_bias[head] += seed;
+            for (std::size_t f = 0; f < 8; ++f)
+              expected_weights[f * heads + head] += seed * references[(configuration * ne + query) * ne + key].value[f];
+          }
+      }
+  for (auto mode : {SpatialJetMode::VALUE_ONLY, SpatialJetMode::ACTIVE, SpatialJetMode::FULL_VGL})
+    for (std::size_t begin : {std::size_t(0), std::size_t(2)})
+    {
+      auto layout = makeSpatialAttentionJetLayout(batches, ne, heads, 2, ne, mode, 5, 4, 15);
+      if (mode == SpatialJetMode::FULL_VGL)
+      {
+        layout.features = withSpatialTargetRange(layout.features, begin, ne - begin);
+        layout.attention = withSpatialTargetRange(layout.attention, begin, ne - begin);
+      }
+      const std::vector<std::size_t> active{begin, 1};
+      DeviceBuffer<std::size_t> device_active(active.size()); device_active.upload(active.data(), active.size());
+      std::vector<double> zeros(spatialJetSpanElements(layout.features), 0);
+      std::vector<double> attention(spatialJetSpanElements(layout.attention), 9.125), logits(attention.size());
+      DeviceBuffer<double> query(zeros.size()), key(zeros.size()), output(attention.size()), retained(logits.size());
+      DeviceBuffer<device_math::JetMathStatus> status(batches * heads * ne);
+      query.upload(zeros.data(), zeros.size()); key.upload(zeros.data(), zeros.size());
+      output.upload(attention.data(), attention.size());
+      const PeriodicPairAttentionInputs inputs{&cell, device_positions.data(), device_weights.data(),
+          device_bias.data(), device_active.data(), 2};
+      checkRuntime(launchAttentionJetWeights(queue.getNative(), layout, query.data(), key.data(), output.data(),
+          status.data(), retained.data(), &inputs), "pair attention forward");
+      queue.sync(); output.download(attention.data(), attention.size()); retained.download(logits.data(), logits.size());
+      std::vector<device_math::JetMathStatus> statuses(status.capacity()); status.download(statuses.data(), statuses.size());
+      for (const auto value : statuses)
+        if (value != device_math::JetMathStatus::REGULAR) throw std::runtime_error("Pair attention returned nonregular jets");
+      for (std::size_t configuration = 0; configuration < batches; ++configuration)
+        for (std::size_t head = 0; head < heads; ++head)
+          for (std::size_t q = 0; q < ne; ++q)
+            for (std::size_t k = 0; k < ne; ++k)
+            {
+              const auto element = head * layout.attention_head_stride + q * layout.attention_row_stride + k;
+              const auto& reference = references[(configuration * ne + q) * ne + k];
+              double expected = q == k ? 0 : bias[head];
+              if (q != k) for (std::size_t f = 0; f < 8; ++f) expected += weights[f * heads + head] * reference.value[f];
+              near(logits[layout.attention.uncheckedValueOffset(configuration, element)], expected, "pair logit", 3e-11);
+              near(attention[layout.attention.uncheckedValueOffset(configuration, element)],
+                   probabilities[forward.attentionOffset(configuration, head, q, k)], "pair softmax", 3e-11);
+              observed_probabilities[forward.attentionOffset(configuration, head, q, k)] =
+                  attention[layout.attention.uncheckedValueOffset(configuration, element)];
+              for (std::size_t lane = 0; lane < layout.attention.gradient_lanes; ++lane)
+              {
+                const auto target = mode == SpatialJetMode::ACTIVE ? active[configuration] : begin + lane / 3;
+                const double sign = q == k ? 0 : target == q ? 1 : target == k ? -1 : 0;
+                double gradient = 0;
+                for (std::size_t f = 0; f < 8; ++f) gradient += sign * weights[f * heads + head] * reference.gradient[f][lane % 3];
+                near(logits[layout.attention.uncheckedGradientOffset(configuration, lane, element)], gradient, "pair logit gradient", 3e-10);
+              }
+              for (std::size_t target = 0; target < layout.attention.laplacian_lanes; ++target)
+              {
+                const auto physical = mode == SpatialJetMode::ACTIVE ? active[configuration] : begin + target;
+                double laplacian = 0;
+                if (q != k && (physical == q || physical == k))
+                  for (std::size_t f = 0; f < 8; ++f) laplacian += weights[f * heads + head] * reference.laplacian[f];
+                near(logits[layout.attention.uncheckedLaplacianOffset(configuration, target, element)], laplacian,
+                     "pair logit Laplacian", 3e-10);
+              }
+            }
+      for (std::size_t configuration = 0; configuration < batches; ++configuration)
+        for (std::size_t plane = 0; plane < layout.attention.plane_count; ++plane)
+          near(logits[layout.attention.uncheckedPlaneOffset(configuration, plane, 3)], 9.125, "pair padding", 0);
+    }
+  DeviceBuffer<double> device_probabilities(probabilities.size()), device_adjoints(adjoints.size());
+  DeviceBuffer<double> weight_response(weights.size()), bias_response(heads);
+  std::vector<double> weight_result(weights.size(), .125), bias_result(heads, -.25);
+  device_probabilities.upload(observed_probabilities.data(), observed_probabilities.size());
+  device_adjoints.upload(adjoints.data(), adjoints.size());
+  weight_response.upload(weight_result.data(), weight_result.size()); bias_response.upload(bias_result.data(), bias_result.size());
+  for (int repeat = 0; repeat < 2; ++repeat)
+    checkRuntime(launchPeriodicPairAttentionParameterReverse(queue.getNative(), forward, cell, 2,
+        device_positions.data(), device_probabilities.data(), device_adjoints.data(), weight_response.data(), bias_response.data()),
+        "pair parameter reverse");
+  queue.sync(); weight_response.download(weight_result.data(), weight_result.size()); bias_response.download(bias_result.data(), bias_result.size());
+  for (std::size_t index = 0; index < weights.size(); ++index)
+    near(weight_result[index], .125 + 2 * expected_weights[index], "pair weight VJP", 3e-11);
+  for (std::size_t head = 0; head < heads; ++head)
+    near(bias_result[head], -.25 + 2 * expected_bias[head], "pair bias VJP", 3e-11);
+  std::cout << "PASS selected pair attention logits/jets/softmax and accumulated parameter VJP\n";
+}
+
 /// Return a standard unavailable-runtime status without disguising CPU-only work.
 int main(int argc, char** argv)
 {
@@ -293,8 +448,9 @@ int main(int argc, char** argv)
     }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only]");
+        std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only" &&
+        std::string_view(argv[1]) != "--periodic-pair-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -306,7 +462,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-target-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--periodic-pair-only")
+      validatePeriodicPairAttention();
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-target-only")
       validateComplexSpatialTargets();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-products-only")
       validateComplexProducts();
