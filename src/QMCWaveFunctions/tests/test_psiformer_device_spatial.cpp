@@ -19,6 +19,8 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenKineticReverse.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairAttention.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicFeatures.h"
 
 #include <algorithm>
 #include <array>
@@ -1227,6 +1229,108 @@ TEST_CASE("PsiFormer target intervals preserve physical geometry and orbital jet
   CHECK_NOTHROW(psiformer::validateOpenCuspKineticReverseLayout(cusp_reverse));
   cusp_reverse.forward.output = psiformer::withSpatialTargetRange(cusp_reverse.forward.output, 1, 1);
   CHECK_THROWS_AS(psiformer::validateOpenCuspKineticReverseLayout(cusp_reverse), std::invalid_argument);
+}
+
+TEST_CASE("Periodic pair attention preserves ordered CPU jets and partial targets",
+          "[psiformer][device][spatial][pair_attention]")
+{
+  namespace pg = psiformer::periodic_geometry;
+  const pf::GeometryBoundary simulation{pf::GeometryBoundaryKind::PERIODIC,
+      {{{6.4, .8, -.4}, {.3, 2.8, .5}, {-.1, .6, 3.6}}}, {{true, true, true}}};
+  auto primitive = simulation.lattice_vectors;
+  for (double& value : primitive[0]) value *= .5;
+  const auto cell = pg::makeTwoCell(simulation.lattice_vectors, primitive, simulation.periodic_axes);
+  constexpr std::size_t ne = 3, heads = 2;
+  const std::array<double, 9> positions{.71, .52, -.41, -.27, 1.18, .84, 1.4, -.3, .6};
+  const std::array<double, 3> nucleus{.12, -.23, .31};
+  pf::PsiFormerGeometryCache geometry(ne, pf::GeometryPositionView::interleaved(nucleus.data(), 1), simulation);
+  geometry.update(pf::GeometryPositionView::interleaved(positions.data(), ne));
+  std::array<double, 16> weights;
+  for (std::size_t index = 0; index < weights.size(); ++index) weights[index] = .07 * (int(index) - 6);
+  const std::array<double, heads> bias{.31, -.17};
+  for (auto mode : {psiformer::SpatialJetMode::VALUE_ONLY, psiformer::SpatialJetMode::ACTIVE,
+                    psiformer::SpatialJetMode::FULL_VGL})
+    for (std::size_t begin : {std::size_t(0), std::size_t(2)})
+    {
+      auto layout = psiformer::makeSpatialAttentionJetLayout(2, ne, heads, 2, ne, mode, 5, 4, 15);
+      if (mode == psiformer::SpatialJetMode::FULL_VGL)
+      {
+        layout.features = psiformer::withSpatialTargetRange(layout.features, begin, ne - begin);
+        layout.attention = psiformer::withSpatialTargetRange(layout.attention, begin, ne - begin);
+      }
+      std::vector<double> logits(psiformer::spatialJetSpanElements(layout.attention), -.9);
+      const auto original = logits;
+      for (std::size_t configuration = 0; configuration < 2; ++configuration)
+        for (std::size_t head = 0; head < heads; ++head)
+          for (std::size_t query = 0; query < ne; ++query)
+            for (std::size_t key = 0; key < ne; ++key)
+            {
+              REQUIRE(pg::addLogComplementAttentionJet(layout, cell, positions.data(), 2,
+                  weights.data(), bias.data(), configuration, head, query, key, begin, logits.data()));
+              const auto element = head * layout.attention_head_stride + query * layout.attention_row_stride + key;
+              if (query == key)
+              {
+                for (std::size_t plane = 0; plane < layout.attention.plane_count; ++plane)
+                  CHECK(logits[layout.attention.uncheckedPlaneOffset(configuration, plane, element)] == -.9);
+                continue;
+              }
+              std::size_t pair_index = 0;
+              const auto first = std::min(query, key), second = std::max(query, key);
+              for (std::size_t row = 0; row < first; ++row) pair_index += ne - row - 1;
+              pair_index += second - first - 1;
+              const auto reference = psiformer::periodic_feature::evaluate(geometry.electronElectronPairs(),
+                  pair_index, simulation, query < key ? 1 : -1,
+                  psiformer::PeriodicFeatureTransform::LOG_COMPLEMENT_V1, (query < 2) == (key < 2) ? 1 : -1);
+              double value = -.9 + bias[head];
+              for (std::size_t feature = 0; feature < 8; ++feature)
+                value += weights[feature * heads + head] * reference.value[feature];
+              CHECK(logits[layout.attention.uncheckedValueOffset(configuration, element)] ==
+                    Catch::Approx(value).margin(1e-13));
+              for (std::size_t lane = 0; lane < layout.attention.gradient_lanes; ++lane)
+              {
+                const auto target = mode == psiformer::SpatialJetMode::ACTIVE ? begin : begin + lane / 3;
+                double derivative = -.9;
+                const double sign = target == query ? 1 : target == key ? -1 : 0;
+                for (std::size_t feature = 0; feature < 8; ++feature)
+                  derivative += sign * weights[feature * heads + head] * reference.gradient[feature][lane % 3];
+                CHECK(logits[layout.attention.uncheckedGradientOffset(configuration, lane, element)] ==
+                      Catch::Approx(derivative).margin(1e-13));
+              }
+              for (std::size_t local = 0; local < layout.attention.laplacian_lanes; ++local)
+              {
+                double derivative = -.9;
+                if (begin + local == query || begin + local == key)
+                  for (std::size_t feature = 0; feature < 8; ++feature)
+                    derivative += weights[feature * heads + head] * reference.laplacian[feature];
+                CHECK(logits[layout.attention.uncheckedLaplacianOffset(configuration, local, element)] ==
+                      Catch::Approx(derivative).margin(1e-13));
+              }
+            }
+      for (std::size_t configuration = 0; configuration < 2; ++configuration)
+        for (std::size_t plane = 0; plane < layout.attention.plane_count; ++plane)
+          CHECK(logits[layout.attention.uncheckedPlaneOffset(configuration, plane, 3)] ==
+                original[layout.attention.uncheckedPlaneOffset(configuration, plane, 3)]);
+    }
+  auto layout = psiformer::makeSpatialAttentionJetLayout(1, ne, heads, 2, ne,
+      psiformer::SpatialJetMode::FULL_VGL);
+  std::vector<double> logits(psiformer::spatialJetSpanElements(layout.attention), 0);
+  auto invalid_positions = positions;
+  invalid_positions[0] = std::numeric_limits<double>::infinity();
+  CHECK_FALSE(pg::addLogComplementAttentionJet(layout, cell, invalid_positions.data(), 2,
+      weights.data(), bias.data(), 0, 0, 0, 1, 0, logits.data()));
+  auto coincident = positions;
+  std::copy_n(positions.data(), 3, coincident.data() + 3);
+  CHECK_FALSE(pg::addLogComplementAttentionJet(layout, cell, coincident.data(), 2,
+      weights.data(), bias.data(), 0, 0, 0, 1, 0, logits.data()));
+  auto invalid_weights = weights;
+  invalid_weights[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_FALSE(pg::addLogComplementAttentionJet(layout, cell, positions.data(), 2,
+      invalid_weights.data(), bias.data(), 0, 0, 0, 1, 0, logits.data()));
+  layout = psiformer::makeSpatialAttentionJetLayout(1, ne, heads, 2, ne,
+      psiformer::SpatialJetMode::VALUE_ONLY);
+  logits.assign(psiformer::spatialJetSpanElements(layout.attention), 0);
+  CHECK(pg::addLogComplementAttentionJet(layout, cell, coincident.data(), 2,
+      weights.data(), bias.data(), 0, 0, 0, 1, 0, logits.data()));
 }
 
 int main(int argc, char* argv[])

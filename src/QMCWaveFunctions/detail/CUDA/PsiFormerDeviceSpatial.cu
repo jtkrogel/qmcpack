@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalProjection.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairAttention.h"
 
 #include <limits>
 #include <stdexcept>
@@ -88,6 +89,32 @@ __global__ void attentionLogitJetsKernel(SpatialAttentionJetLayout layout,
   spatial_jet::attentionLogitJetElement(
       layout, query, key, configuration, head, row_pair / layout.rows,
       row_pair % layout.rows, attention);
+}
+
+/// Each entry owns the learned pair addition before normalization and tape capture.
+__global__ void periodicPairAttentionJetsKernel(SpatialAttentionJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* weights,
+    const double* bias, const std::size_t* active_electrons, std::size_t spin_up_count,
+    double* attention)
+{
+  const auto entry = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto per_configuration = layout.heads * layout.rows * layout.rows;
+  if (entry >= layout.features.configuration_count * per_configuration)
+    return;
+  const auto configuration = entry / per_configuration;
+  const auto remainder = entry % per_configuration;
+  const auto head = remainder / (layout.rows * layout.rows);
+  const auto query = (remainder / layout.rows) % layout.rows;
+  const auto key = remainder % layout.rows;
+  const auto active = layout.attention.mode == SpatialJetMode::ACTIVE ? active_electrons[configuration] : 0;
+  if (!periodic_geometry::addLogComplementAttentionJet(layout, cell,
+      positions + configuration * 3 * layout.rows, spin_up_count, weights, bias,
+      configuration, head, query, key, active, attention))
+  {
+    union { unsigned long long integer; double floating; } invalid{0x7ff8000000000000ULL};
+    const auto element = head * layout.attention_head_stride + query * layout.attention_row_stride + key;
+    attention[layout.attention.uncheckedValueOffset(configuration, element)] = invalid.floating;
+  }
 }
 
 __global__ void attentionContextJetsKernel(SpatialAttentionJetLayout layout,
@@ -352,7 +379,8 @@ Error launchAttentionJetWeights(
     const double* key,
     double* attention,
     device_math::JetMathStatus* row_status,
-    double* retained_logits)
+    double* retained_logits,
+    const PeriodicPairAttentionInputs* pair_attention)
 {
   if (layout.features.configuration_count == 0 && layout.rows == 0 &&
       layout.heads == 0 && layout.head_width == 0)
@@ -373,6 +401,14 @@ Error launchAttentionJetWeights(
     throw std::invalid_argument("PsiFormer attention jet storage is null");
   if (retained_logits && (retained_logits == attention || retained_logits == query || retained_logits == key))
     throw std::invalid_argument("Retained logit jets require a distinct destination");
+  if (pair_attention)
+  {
+    if (!pair_attention->cell || !pair_attention->positions || !pair_attention->weights || !pair_attention->bias ||
+        pair_attention->spin_up_count == 0 || pair_attention->spin_up_count >= layout.rows ||
+        (layout.attention.mode == SpatialJetMode::ACTIVE && !pair_attention->active_electrons))
+      throw std::invalid_argument("Periodic pair-attention inputs require complete geometry and parameters");
+    periodic_geometry::validateCell(*pair_attention->cell);
+  }
 
   const unsigned int block_count = static_cast<unsigned int>(
       (entry_count + spatial_block_size - 1) / spatial_block_size);
@@ -385,6 +421,19 @@ Error launchAttentionJetWeights(
 #endif
   if (logit_error != success)
     return logit_error;
+  if (pair_attention)
+  {
+    periodicPairAttentionJetsKernel<<<block_count, spatial_block_size, 0, stream>>>(layout,
+        *pair_attention->cell, pair_attention->positions, pair_attention->weights, pair_attention->bias,
+        pair_attention->active_electrons, pair_attention->spin_up_count, attention);
+#ifdef QMC_CUDA2HIP
+    const auto pair_error = hipPeekAtLastError();
+#else
+    const auto pair_error = cudaPeekAtLastError();
+#endif
+    if (pair_error != success)
+      return pair_error;
+  }
   if (retained_logits)
   {
     // Copy before in-place softmax on the same ordered stream; lifted reverse

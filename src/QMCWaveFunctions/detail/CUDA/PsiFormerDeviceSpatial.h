@@ -56,6 +56,18 @@ void projectQkvJetsForward(AcceleratorBlasHandle& handle,
                            double* key,
                            double* value);
 
+/// Borrow host cell metadata and device arrays through the ordered attention launch.
+/// The caller retains every allocation until the selected stream has completed.
+struct PeriodicPairAttentionInputs
+{
+  const periodic_geometry::Cell* cell = nullptr;
+  const double* positions = nullptr;
+  const double* weights = nullptr;
+  const double* bias = nullptr;
+  const std::size_t* active_electrons = nullptr;
+  std::size_t spin_up_count = 0;
+};
+
 /** Form Q*K^T jets and then transform every head/query row with jet softmax. */
 Error launchAttentionJetWeights(
     Stream stream,
@@ -64,7 +76,8 @@ Error launchAttentionJetWeights(
     const double* key,
     double* attention,
     device_math::JetMathStatus* row_status,
-    double* retained_logits = nullptr);
+    double* retained_logits = nullptr,
+    const PeriodicPairAttentionInputs* pair_attention = nullptr);
 
 /** Form context jets from prepared attention probabilities and value jets. */
 Error launchAttentionContextJets(Stream stream,
