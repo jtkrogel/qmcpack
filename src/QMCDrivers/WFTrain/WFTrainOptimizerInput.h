@@ -19,6 +19,18 @@
 namespace qmcplusplus::wftrain
 {
 
+/// Initial real GPU orbital inference uses the qualified teacher-measure Adam loss convention.
+inline bool supportsRealGpuOrbitalInference(const WFTrainDriverInput& input) noexcept
+{
+  using I = WFTrainDriverInput;
+  const auto cap = input.getMaximumRetainedBytes();
+  return input.getObjective() == I::Objective::ORBITAL_MSE && input.getOptimizer() == I::Optimizer::ADAM &&
+      input.getOrbitalSampling() == I::OrbitalSampling::TEACHER &&
+      input.getOrbitalTarget() == I::OrbitalTarget::SINGLE_REFERENCE &&
+      input.getOrbitalNormalization() == OrbitalLossNormalization::SPIN_SECTOR_SUM &&
+      cap != 0 && cap != std::numeric_limits<std::size_t>::max();
+}
+
 /// Explicit score conventions select the same estimator on CPU and GPU providers.
 inline bool hasExplicitKFACPolicy(const WFTrainDriverInput& input) noexcept
 {

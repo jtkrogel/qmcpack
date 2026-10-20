@@ -7754,7 +7754,7 @@ wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
           parameters.flat_values()};
 }
 
-// Copy the current CPU orbital forward through the existing bounded workspace.
+// Copy current CPU/GPU raw orbital values without a reverse or parameter-response download.
 void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
                                        std::vector<double>& orbitals,
                                        std::size_t expected_version) const
@@ -7768,10 +7768,6 @@ void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
   PsiFormerReadTransaction state_lock(*model_state_);
   if (model_state_->model.p.version() != expected_version)
     throw std::runtime_error("PsiFormer orbital forward has a stale parameter version");
-#ifdef ENABLE_CUDA
-  if (scratch->device_products)
-    throw std::invalid_argument("Value-only orbital inference currently requires the CPU backend");
-#endif
   const auto& shape = model_state_->execution_plan.modelShape();
   const auto ne = shape.electrons();
   if (particles.isSpinor() || particles.R.size() != ne || particles.GroupID.size() != ne)
@@ -7786,9 +7782,27 @@ void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
       const double coordinate = particles.R[electron][dimension];
       if (!psiformer::determinant::isFiniteReal(coordinate))
         throw std::invalid_argument("PsiFormer orbital forward coordinates must be finite");
+#ifdef ENABLE_CUDA
+      if (scratch->device_products)
+      {
+        scratch->device_positions[3 * electron + dimension] = coordinate;
+        continue;
+      }
+#endif
       scratch->score->setPosition(electron, dimension, coordinate);
     }
   }
+#ifdef ENABLE_CUDA
+  if (scratch->device_products)
+  {
+    const auto count = checkedBatchMemoryMultiply(shape.determinants,
+        checkedBatchMemoryMultiply(ne, ne, "PsiFormer orbital forward matrix"), "PsiFormer orbital forward extent");
+    orbitals.resize(count);
+    scratch->device_products->rawOrbitalValues(scratch->device_positions.data(), orbitals.data(), count,
+                                               expected_version);
+    return;
+  }
+#endif
   const auto result = model_state_->direct_score_executor.evaluateOrbitalValues(*scratch->score);
   orbitals.assign(result.values, result.values + result.size);
 }

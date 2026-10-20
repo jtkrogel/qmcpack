@@ -34,6 +34,26 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 
 } // namespace
 
+TEST_CASE("Real GPU orbital inference keeps teacher loss and finite memory policy explicit",
+          "[drivers][wf_train][orbital_inference]")
+{
+  const auto parse = [](const std::string& extra, const std::string& optimizer = "adam") {
+    return parseTrainingInput("<qmc><training objective='orbital_mse' optimizer='" + optimizer + "'>"
+        "<parameter name='teacher'>teacher</parameter><parameter name='target_provenance'>fixed-v1</parameter>" +
+        extra + "</training></qmc>");
+  };
+  const std::string cap = "<parameter name='maximum_retained_bytes'>1048576</parameter>";
+  CHECK_FALSE(wftrain::supportsRealGpuOrbitalInference(parse("")));
+  CHECK(wftrain::supportsRealGpuOrbitalInference(parse(cap)));
+  CHECK_FALSE(wftrain::supportsRealGpuOrbitalInference(parse(cap, "sgd")));
+  CHECK_FALSE(wftrain::supportsRealGpuOrbitalInference(parse(cap +
+      "<parameter name='orbital_sampling'>student</parameter>")));
+  CHECK_FALSE(wftrain::supportsRealGpuOrbitalInference(parse(cap +
+      "<parameter name='orbital_normalization'>full_matrix_mean</parameter>")));
+  CHECK_FALSE(wftrain::supportsRealGpuOrbitalInference(parse(cap +
+      "<parameter name='orbital_target'>top_coefficients</parameter>")));
+}
+
 TEST_CASE("KFAC score estimator selection preserves explicit conventions across placements",
           "[drivers][wf_train][kfac][score_policy]")
 {

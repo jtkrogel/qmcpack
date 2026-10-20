@@ -2439,8 +2439,23 @@ void WFTrainBatched::process(xmlNodePtr node)
         admitted = admitted || (complex_orbital_target_ && complex_training_component_ &&
                                  !complex_training_component_->gpuInferenceEnabled());
 #endif
-        if (!admitted || selected_provider_->usesAcceleratorParameterProducts())
-          throw UniformCommunicateError("Orbital inference requires a matching CPU provider and frozen target");
+        const bool gpu = selected_provider_->usesAcceleratorParameterProducts();
+        if (!admitted || (gpu && (!dynamic_cast<PsiFormerWF*>(selected_provider_) ||
+                                 !wftrain::supportsRealGpuOrbitalInference(training_input_))))
+          throw UniformCommunicateError("Orbital inference requires a matching CPU provider or bounded real GPU "
+              "teacher-measure single-reference Adam/spin-sector loss and frozen target");
+        if (gpu)
+        {
+          const auto& descriptor = orbital_target_->descriptor();
+          const auto n = checkedMemoryAdd(descriptor.spinUpElectrons(), descriptor.spinDownElectrons());
+          const auto count = checkedMemoryMultiply(descriptor.terms().size(), checkedMemoryMultiply(n, n));
+          const auto output_bytes = checkedMemoryMultiply(count, sizeof(double));
+          if (checkedMemoryAdd(orbital_target_bytes_, output_bytes) > training_input_.getMaximumRetainedBytes())
+            throw std::length_error("GPU orbital inference target and output exceed maximum_retained_bytes");
+          app_log() << "WFTrain GPU orbital inference: caller output numeric_bytes=" << output_bytes
+                    << "; existing product lane reused, no reverse/parameter response download; "
+                       "excludes inference clones/model/vendor/RSS" << std::endl;
+        }
       }
     }
     catch (...)

@@ -388,7 +388,7 @@ public:
                            std::vector<double>& gradient,
                            std::size_t expected_version) const;
 
-  /// Copy bounded full-matrix CPU orbital values without a reverse or energy evaluation.
+  /// Copy full-matrix CPU/GPU orbital values without a reverse or parameter-response download.
   void evaluateOrbitalValues(const ParticleSet& particles,
                              std::vector<double>& orbitals,
                              std::size_t expected_version) const;
