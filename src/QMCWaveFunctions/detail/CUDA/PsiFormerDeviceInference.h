@@ -27,6 +27,7 @@
 #include "PsiFormerDeviceDerivativeKernels.h"
 #include "PsiFormerDeviceMixedValueDense.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerFoldedDense.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicGeometry.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
@@ -320,11 +321,14 @@ public:
 private:
   friend class PreparedDeviceModel;
 
-  /// A named numerical paired-value factory alone admits complex amplitude metadata.
-  PreparedDeviceModelMetadata(const PsiFormerExecutionPlan& plan, const std::vector<double>& nuclei, bool paired_value)
+  /// Named numerical factories admit only their explicitly checked profile metadata.
+  PreparedDeviceModelMetadata(const PsiFormerExecutionPlan& plan, const std::vector<double>& nuclei, bool paired_value,
+      bool real_two_cell = false)
       : plan_(plan)
   {
     const auto& environment = plan_.environment();
+    if (real_two_cell && !matchesRealDevicePairMetadata(environment))
+      throw std::invalid_argument("Numerical two-cell model requires real atom-centered log-complement metadata");
     if (paired_value && (environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
@@ -336,14 +340,23 @@ private:
       throw std::invalid_argument("Device model supports fixed-ion real FP64 models only");
     if (environment.boundary == BoundaryCondition::PERIODIC)
     {
-      if (environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
+      if (real_two_cell)
+        periodic_cell_ = periodic_geometry::makeTwoCell(environment.lattice_vectors,
+            environment.periodic_profile->cells.primitive.lattice_vectors, environment.periodic_axes);
+      else if (environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
         throw std::invalid_argument("Periodic device metadata requires the torus-v1 feature policy");
-      periodic_cell_ = periodic_geometry::makeCell(environment.lattice_vectors, environment.periodic_axes);
+      else
+        periodic_cell_ = periodic_geometry::makeCell(environment.lattice_vectors, environment.periodic_axes);
     }
     if (nuclei.size() != spatial_detail::checkedProduct(3, plan_.modelShape().nuclei, "Device nuclear extent overflow"))
       throw std::invalid_argument("Device nuclear extent mismatch");
     if (std::any_of(nuclei.begin(), nuclei.end(), [](double value) { return !device_math::isFiniteBinary64(value); }))
       throw std::invalid_argument("Device fixed geometry contains nonfinite values");
+    if (real_two_cell)
+      for (std::size_t ion = 0; ion < environment.periodic_profile->primitive_motif.size(); ++ion)
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          if (nuclei[3 * ion + dimension] != environment.periodic_profile->primitive_motif[ion][dimension])
+            throw std::invalid_argument("Numerical two-cell model nuclei differ from the declared primitive motif");
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipGetDevice(&device_), "model device identity");
 #else
@@ -456,6 +469,16 @@ public:
       const std::vector<double>& nuclei, std::size_t version = 0)
   {
     auto family = std::shared_ptr<PreparedDeviceModelMetadata>(new PreparedDeviceModelMetadata(plan, nuclei, true));
+    return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(std::move(family), parameters, version));
+  }
+
+  /// Prepare a selected numerical profile without changing native builder admission.
+  static std::shared_ptr<const PreparedDeviceModel> prepareRealTwoCellProfile(
+      const PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
+      const std::vector<double>& nuclei, std::size_t version = 0)
+  {
+    auto family = std::shared_ptr<PreparedDeviceModelMetadata>(
+        new PreparedDeviceModelMetadata(plan, nuclei, false, true));
     return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(std::move(family), parameters, version));
   }
 
