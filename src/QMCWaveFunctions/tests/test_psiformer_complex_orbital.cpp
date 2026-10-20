@@ -10,8 +10,8 @@
 #include <iostream>
 #include <string>
 
-namespace pf = qmcplusplus::psiformer;
-namespace det = pf::determinant;
+namespace psif = qmcplusplus::psiformer;
+namespace det = psif::determinant;
 using C = std::complex<double>;
 int checks = 0, failures = 0;
 
@@ -80,14 +80,14 @@ ScalarJet sinusoid(const std::vector<double>& positions, std::size_t configurati
 }
 
 /// Store physical scalar jets through either ACTIVE or compact target-range layouts.
-void store(const pf::SpatialJetLayout& layout, std::vector<double>& storage,
+void store(const psif::SpatialJetLayout& layout, std::vector<double>& storage,
     std::size_t configuration, std::size_t element, const ScalarJet& jet,
     std::size_t active)
 {
   storage[layout.uncheckedValueOffset(configuration, element)] = jet.value;
   for (std::size_t lane = 0; lane < layout.gradient_lanes; ++lane)
   {
-    const std::size_t target = layout.mode == pf::SpatialJetMode::ACTIVE ? active :
+    const std::size_t target = layout.mode == psif::SpatialJetMode::ACTIVE ? active :
         layout.physicalTargetElectron(lane / 3);
     storage[layout.uncheckedGradientOffset(configuration, lane, element)] = jet.gradient[3 * target + lane % 3];
   }
@@ -99,22 +99,22 @@ void store(const pf::SpatialJetLayout& layout, std::vector<double>& storage,
 /// Tiny shared real-trunk fixture: all physical electrons influence each feature row.
 struct Fixture
 {
-  pf::ComplexOrbitalHeadDescriptor descriptor;
-  pf::SpatialJetLayout feature_layout, envelope_layout;
+  psif::ComplexOrbitalHeadDescriptor descriptor;
+  psif::SpatialJetLayout feature_layout, envelope_layout;
   std::vector<double> positions, features, envelopes;
   std::array<std::vector<double>, 2> wr, wi, br, bi;
   std::size_t active = 2;
 
   /// Construct full or spin-blocked matrices, batched and compactly target-tiled.
-  Fixture(bool blocked, pf::SpatialJetMode mode, std::size_t begin = 0, std::size_t count = 3,
+  Fixture(bool blocked, psif::SpatialJetMode mode, std::size_t begin = 0, std::size_t count = 3,
       bool inner_phase = true)
   {
     descriptor.electrons = 3;
     descriptor.spin_up = 2;
     descriptor.determinants = 2;
     descriptor.feature_width = 3;
-    descriptor.structure = blocked ? pf::ComplexOrbitalStructure::SPIN_BLOCKED : pf::ComplexOrbitalStructure::FULL;
-    descriptor.phase = inner_phase ? pf::ComplexOrbitalPhase::RECIPROCAL_ONLY : pf::ComplexOrbitalPhase::NONE;
+    descriptor.structure = blocked ? psif::ComplexOrbitalStructure::SPIN_BLOCKED : psif::ComplexOrbitalStructure::FULL;
+    descriptor.phase = inner_phase ? psif::ComplexOrbitalPhase::RECIPROCAL_ONLY : psif::ComplexOrbitalPhase::NONE;
     for (std::size_t spin = 0; spin < 2; ++spin)
     {
       const std::size_t columns = blocked ? (spin ? 1 : 2) : 3, bias_count = 2 * columns;
@@ -137,24 +137,24 @@ struct Fixture
       }
     }
     const std::size_t orbital_elements = blocked ? 10 : 18;
-    feature_layout = mode == pf::SpatialJetMode::FULL_VGL ?
-        pf::makeSpatialTargetJetLayout(2, 9, 3, begin, count, 11) :
-        pf::makeSpatialJetLayout(2, 9, 3, mode, 11);
-    envelope_layout = mode == pf::SpatialJetMode::FULL_VGL ?
-        pf::makeSpatialTargetJetLayout(2, orbital_elements, 3, begin, count, orbital_elements + 2) :
-        pf::makeSpatialJetLayout(2, orbital_elements, 3, mode, orbital_elements + 2);
+    feature_layout = mode == psif::SpatialJetMode::FULL_VGL ?
+        psif::makeSpatialTargetJetLayout(2, 9, 3, begin, count, 11) :
+        psif::makeSpatialJetLayout(2, 9, 3, mode, 11);
+    envelope_layout = mode == psif::SpatialJetMode::FULL_VGL ?
+        psif::makeSpatialTargetJetLayout(2, orbital_elements, 3, begin, count, orbital_elements + 2) :
+        psif::makeSpatialJetLayout(2, orbital_elements, 3, mode, orbital_elements + 2);
     positions.resize(18);
     for (std::size_t i = 0; i < positions.size(); ++i)
       positions[i] = .17 + .19 * i;
-    features.resize(pf::spatialJetSpanElements(feature_layout));
-    envelopes.resize(pf::spatialJetSpanElements(envelope_layout));
+    features.resize(psif::spatialJetSpanElements(feature_layout));
+    envelopes.resize(psif::spatialJetSpanElements(envelope_layout));
     refresh();
   }
 
   /// Expose paired real arrays with exact per-spin parameter spans.
-  pf::ComplexOrbitalHeadParameters parameters() const
+  psif::ComplexOrbitalHeadParameters parameters() const
   {
-    pf::ComplexOrbitalHeadParameters result;
+    psif::ComplexOrbitalHeadParameters result;
     result.up = {wr[0].data(), wi[0].data(), br[0].data(), bi[0].data(), wr[0].size(), br[0].size()};
     result.down = {wr[1].data(), wi[1].data(), br[1].data(), bi[1].data(), wr[1].size(), br[1].size()};
     return result;
@@ -175,7 +175,7 @@ struct Fixture
           store(feature_layout, features, configuration, row * 3 + f,
                 sinusoid(positions, configuration, coefficients, .3 + .1 * f, 1), active);
         }
-      const bool blocked = descriptor.structure == pf::ComplexOrbitalStructure::SPIN_BLOCKED;
+      const bool blocked = descriptor.structure == psif::ComplexOrbitalStructure::SPIN_BLOCKED;
       const std::size_t stride = envelope_layout.element_count / 2;
       for (std::size_t d = 0; d < 2; ++d)
         for (std::size_t row = 0; row < 3; ++row)
@@ -192,7 +192,7 @@ struct Fixture
   }
 
   /// Execute the production helper on the fixture's current real jets and parameters.
-  void evaluate(pf::ComplexOrbitalHeadWorkspace& head) const
+  void evaluate(psif::ComplexOrbitalHeadWorkspace& head) const
   {
     head.evaluate(features.data(), features.size(), envelopes.data(), envelopes.size(),
                   positions.data(), positions.size(), parameters(), active);
@@ -224,7 +224,7 @@ C permutationDeterminant(const C* matrix, std::size_t n)
 /// Evaluate physical amplitudes through direct scalar projections and permutation sums.
 C referenceValue(const Fixture& f, std::size_t configuration)
 {
-  const bool blocked = f.descriptor.structure == pf::ComplexOrbitalStructure::SPIN_BLOCKED;
+  const bool blocked = f.descriptor.structure == psif::ComplexOrbitalStructure::SPIN_BLOCKED;
   const std::size_t stride = f.envelope_layout.element_count / 2;
   std::vector<C> matrices(f.envelope_layout.element_count);
   for (std::size_t d = 0; d < 2; ++d)
@@ -239,7 +239,7 @@ C referenceValue(const Fixture& f, std::size_t configuration)
           projection += C{f.wr[spin][feature * 2 * columns + index], f.wi[spin][feature * 2 * columns + index]} *
               f.features[f.feature_layout.uncheckedValueOffset(configuration, row * 3 + feature)];
         double phase = 0;
-        if (f.descriptor.phase == pf::ComplexOrbitalPhase::RECIPROCAL_ONLY)
+        if (f.descriptor.phase == psif::ComplexOrbitalPhase::RECIPROCAL_ONLY)
         {
           const auto& momentum = f.descriptor.reciprocal_momenta[(spin ? (blocked ? 4 : 6) : 0) + index];
           for (std::size_t dim = 0; dim < 3; ++dim)
@@ -258,10 +258,10 @@ C referenceValue(const Fixture& f, std::size_t configuration)
 }
 
 /// Compare HEAD->determinant spatial results to independent amplitude differences.
-void spatialFixture(bool blocked, pf::SpatialJetMode mode, std::size_t begin = 0, std::size_t count = 3)
+void spatialFixture(bool blocked, psif::SpatialJetMode mode, std::size_t begin = 0, std::size_t count = 3)
 {
   Fixture f(blocked, mode, begin, count);
-  pf::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
+  psif::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
   f.evaluate(head);
   const auto fingerprint = head.storageFingerprint();
   const auto layout = head.layout();
@@ -272,7 +272,7 @@ void spatialFixture(bool blocked, pf::SpatialJetMode mode, std::size_t begin = 0
     f.evaluate(head);
     const C* matrices = head.data() + configuration * layout.configuration_stride;
     C gradient[9]{}, log[3]{}, ratio[3]{};
-    const auto result = mode == pf::SpatialJetMode::VALUE_ONLY ? determinant.evaluate(matrices) :
+    const auto result = mode == psif::SpatialJetMode::VALUE_ONLY ? determinant.evaluate(matrices) :
         determinant.evaluateSpatial(matrices, matrices + layout.plane_stride, layout.gradient_lanes,
             matrices + (1 + layout.gradient_lanes) * layout.plane_stride, layout.laplacian_lanes,
             gradient, log, ratio);
@@ -281,7 +281,7 @@ void spatialFixture(bool blocked, pf::SpatialJetMode mode, std::size_t begin = 0
     std::array<C, 3> finite_laplacian{}, squared_gradient{};
     for (std::size_t lane = 0; lane < layout.gradient_lanes; ++lane)
     {
-      const std::size_t target = mode == pf::SpatialJetMode::ACTIVE ? f.active : layout.physicalTargetElectron(lane / 3);
+      const std::size_t target = mode == psif::SpatialJetMode::ACTIVE ? f.active : layout.physicalTargetElectron(lane / 3);
       const std::size_t coordinate = configuration * 9 + 3 * target + lane % 3;
       const double original = f.positions[coordinate], step = 2e-5;
       f.positions[coordinate] = original + step;
@@ -310,7 +310,7 @@ void spatialFixture(bool blocked, pf::SpatialJetMode mode, std::size_t begin = 0
 /// Check real head-parameter directions with fixed envelopes and shared real features.
 void parameterDirections()
 {
-  Fixture f(true, pf::SpatialJetMode::FULL_VGL, 1, 2);
+  Fixture f(true, psif::SpatialJetMode::FULL_VGL, 1, 2);
   Fixture direction = f;
   for (std::size_t spin = 0; spin < 2; ++spin)
   {
@@ -325,7 +325,7 @@ void parameterDirections()
       direction.bi[spin][i] = -.09;
     }
   }
-  pf::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
+  psif::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
   f.evaluate(head);
   const auto layout = head.layout();
   det::ComplexDeterminantWorkspace determinant(2, 2, 1);
@@ -335,7 +335,7 @@ void parameterDirections()
   const C baseline = referenceValue(f, 0);
   head.evaluateDirection(f.features.data(), f.features.size(), f.envelopes.data(), f.envelopes.size(),
       f.positions.data(), f.positions.size(), direction.parameters(), f.active);
-  const std::vector<C> delta(head.data(), head.data() + pf::spatialJetSpanElements(layout));
+  const std::vector<C> delta(head.data(), head.data() + psif::spatialJetSpanElements(layout));
   C response{};
   for (std::size_t element = 0; element < layout.element_count; ++element)
     response += seed[element] * delta[element];
@@ -365,15 +365,15 @@ void parameterDirections()
 /// Cover zero factors, real specialization, descriptor copies and failed generations.
 void edgeCases()
 {
-  Fixture f(false, pf::SpatialJetMode::FULL_VGL, 2, 1, false);
+  Fixture f(false, psif::SpatialJetMode::FULL_VGL, 2, 1, false);
   for (auto& weights : f.wi)
     std::fill(weights.begin(), weights.end(), 0);
   for (auto& bias : f.bi)
     std::fill(bias.begin(), bias.end(), 0);
-  pf::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
+  psif::ComplexOrbitalHeadWorkspace head(f.descriptor, f.feature_layout, f.envelope_layout);
   f.evaluate(head);
   bool real = true;
-  for (std::size_t i = 0; i < pf::spatialJetSpanElements(head.layout()); ++i)
+  for (std::size_t i = 0; i < psif::spatialJetSpanElements(head.layout()); ++i)
     real = real && head.data()[i].imag() == 0;
   check(real, "zero imaginary head and no inner phase remain exactly real");
   std::vector<double> matrices(head.layout().element_count);
@@ -385,7 +385,7 @@ void edgeCases()
   std::fill(f.envelopes.begin(), f.envelopes.end(), 0);
   f.evaluate(head);
   bool zero = true;
-  for (std::size_t i = 0; i < pf::spatialJetSpanElements(head.layout()); ++i)
+  for (std::size_t i = 0; i < psif::spatialJetSpanElements(head.layout()); ++i)
     zero = zero && head.data()[i] == C{};
   check(zero, "zero envelope jets require no division");
   f.refresh();
@@ -396,35 +396,35 @@ void edgeCases()
   }
   f.evaluate(head);
   zero = true;
-  for (std::size_t i = 0; i < pf::spatialJetSpanElements(head.layout()); ++i)
+  for (std::size_t i = 0; i < psif::spatialJetSpanElements(head.layout()); ++i)
     zero = zero && head.data()[i] == C{};
   check(zero, "zero projected backflow requires no division");
   throws([&] { head.evaluate(f.features.data(), 1, f.envelopes.data(), f.envelopes.size(),
       f.positions.data(), f.positions.size(), f.parameters()); }, "short feature span rejected");
   throws([&] { head.data(); }, "failed request invalidates preceding head generation");
 
-  Fixture phase(true, pf::SpatialJetMode::ACTIVE);
+  Fixture phase(true, psif::SpatialJetMode::ACTIVE);
   auto descriptor = phase.descriptor;
-  pf::ComplexOrbitalHeadWorkspace immutable(descriptor, phase.feature_layout, phase.envelope_layout);
+  psif::ComplexOrbitalHeadWorkspace immutable(descriptor, phase.feature_layout, phase.envelope_layout);
   descriptor.reciprocal_momenta[0][0] = 123;
   check(immutable.descriptor().reciprocal_momenta[0][0] != 123, "prepared momenta are immutable copies");
   descriptor.reciprocal_momenta.pop_back();
-  throws([&] { pf::ComplexOrbitalHeadWorkspace bad(descriptor, phase.feature_layout, phase.envelope_layout); },
+  throws([&] { psif::ComplexOrbitalHeadWorkspace bad(descriptor, phase.feature_layout, phase.envelope_layout); },
          "momentum extent mismatch rejected before evaluation");
   descriptor = phase.descriptor;
   descriptor.reciprocal_momenta[0][0] = std::numeric_limits<double>::quiet_NaN();
-  throws([&] { pf::ComplexOrbitalHeadWorkspace bad(descriptor, phase.feature_layout, phase.envelope_layout); },
+  throws([&] { psif::ComplexOrbitalHeadWorkspace bad(descriptor, phase.feature_layout, phase.envelope_layout); },
          "nonfinite momentum rejected before evaluation");
 }
 
 /// Exercise bounded CPU math only; no public XML or GPU capability is asserted.
 int main()
 {
-  spatialFixture(false, pf::SpatialJetMode::FULL_VGL);
-  spatialFixture(true, pf::SpatialJetMode::FULL_VGL, 1, 2);
-  spatialFixture(true, pf::SpatialJetMode::FULL_VGL, 2, 1);
-  spatialFixture(true, pf::SpatialJetMode::ACTIVE);
-  spatialFixture(false, pf::SpatialJetMode::VALUE_ONLY);
+  spatialFixture(false, psif::SpatialJetMode::FULL_VGL);
+  spatialFixture(true, psif::SpatialJetMode::FULL_VGL, 1, 2);
+  spatialFixture(true, psif::SpatialJetMode::FULL_VGL, 2, 1);
+  spatialFixture(true, psif::SpatialJetMode::ACTIVE);
+  spatialFixture(false, psif::SpatialJetMode::VALUE_ONLY);
   parameterDirections();
   edgeCases();
   std::cout << checks << " checks, " << failures << " failures\n";

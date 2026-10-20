@@ -13,6 +13,7 @@
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerFourierHead.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
