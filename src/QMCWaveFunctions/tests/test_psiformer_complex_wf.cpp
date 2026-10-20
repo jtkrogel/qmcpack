@@ -1229,11 +1229,12 @@ TEST_CASE("Real Gamma pair components retain complete physical ions and profile 
     selected_metadata->feature_transform = ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1;
     selected_metadata->electron_electron_cusp = true;
     selected.environment.periodic_profile = selected_metadata;
-    PsiFormerWF selected_component("real_pair_metadata", selected, p, source, true, {}, true);
+    PsiFormerWF selected_component("real_pair", selected, p, source, true, {}, true);
     selected_component.validateSystem(p, source, "all_electron");
     CHECK(selected_component.matchesRealDevicePairTarget(p));
     CHECK_FALSE(selected_component.usesAcceleratorParameterProducts());
     const auto training_identity = selected_component.trainingConfigurationFingerprint();
+    CHECK(selected_component.parameterSchema().fingerprint() == component.parameterSchema().fingerprint());
     CHECK(training_identity != component.trainingConfigurationFingerprint());
     auto changed_parameters = selected_component.snapshotParameters();
     changed_parameters.values[0] += .001;
