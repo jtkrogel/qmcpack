@@ -1233,6 +1233,12 @@ TEST_CASE("Real Gamma pair components retain complete physical ions and profile 
     selected_component.validateSystem(p, source, "all_electron");
     CHECK(selected_component.matchesRealDevicePairTarget(p));
     CHECK_FALSE(selected_component.usesAcceleratorParameterProducts());
+    const auto training_identity = selected_component.trainingConfigurationFingerprint();
+    CHECK(training_identity != component.trainingConfigurationFingerprint());
+    auto changed_parameters = selected_component.snapshotParameters();
+    changed_parameters.values[0] += .001;
+    selected_component.publishParameters(changed_parameters, changed_parameters.version);
+    CHECK(selected_component.trainingConfigurationFingerprint() == training_identity);
     p.setTwist(ParticleSet::PosType{.125, 0, 0});
     CHECK_FALSE(selected_component.matchesRealDevicePairTarget(p));
     p.setTwist(ParticleSet::PosType{});

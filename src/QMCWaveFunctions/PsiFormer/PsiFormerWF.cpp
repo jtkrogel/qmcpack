@@ -7690,6 +7690,17 @@ bool PsiFormerWF::matchesRealDevicePairTarget(const ParticleSet& particles) cons
   return true;
 }
 
+/// Reuse persistent physical identity without downloading a device-authoritative parameter image.
+std::string PsiFormerWF::trainingConfigurationFingerprint() const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  const auto& state = transaction.state();
+  return "real-training-model-v1/" + system_kind_ + "/" + parameterSchema().fingerprint() + "/" +
+      modelFingerprint(state.model, state.model_origin, state.initialization_profile, state.initialization_seed,
+                       state.execution_plan.environment(), state.twist_phase.reduced, state.twist_phase.cartesian,
+                       state.physical_source, state.physical_species);
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

@@ -414,6 +414,9 @@ public:
   /// Match selected real pair metadata and the target's full cell/Gamma twist, not GPU readiness.
   bool matchesRealDevicePairTarget(const ParticleSet& particles) const;
 
+  /// Fingerprint immutable physical model semantics, excluding learned parameters and Hamiltonian settings.
+  std::string trainingConfigurationFingerprint() const;
+
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
                            wftrain::AffineScoreObserver& observer,
