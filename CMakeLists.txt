@@ -585,7 +585,16 @@ if(HDF5_FOUND)
   endif()
 
   add_library(IO::HDF5 INTERFACE IMPORTED)
-  target_include_directories(IO::HDF5 INTERFACE "${HDF5_INCLUDE_DIR}")
+  # A Cray host wrapper may make FindHDF5 report no explicit includes. Direct
+  # device compilers still need the same header directory on their command line.
+  find_path(QMC_HDF5_HEADER_DIR hdf5.h
+            HINTS ${HDF5_INCLUDE_DIR} ${HDF5_INCLUDE_DIRS} ${CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES}
+                  ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES}
+            NO_DEFAULT_PATH)
+  if(NOT QMC_HDF5_HEADER_DIR)
+    message(FATAL_ERROR "HDF5 headers were not found in the detected or host compiler include directories")
+  endif()
+  target_include_directories(IO::HDF5 INTERFACE ${HDF5_INCLUDE_DIR} ${HDF5_INCLUDE_DIRS} "${QMC_HDF5_HEADER_DIR}")
   target_compile_definitions(IO::HDF5 INTERFACE "H5_USE_110_API")
   target_link_libraries(IO::HDF5 INTERFACE "${HDF5_LIBRARIES}")
   if(ENABLE_PHDF5)
