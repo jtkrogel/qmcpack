@@ -10,6 +10,8 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicFeatures.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicGeometry.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairFeatures.h"
 
 #include <array>
 #include <cmath>
@@ -521,6 +523,52 @@ TEST_CASE("PsiFormer two-cell skew geometry jets use their respective cells",
                                                     cache.electronElectronPairs().distanceGradients()[0]};
   const std::array<double, 2> laplacian{cache.electronNucleusPairs().distanceLaplacians()[0],
                                          cache.electronElectronPairs().distanceLaplacians()[0]};
+  namespace pg = qmcplusplus::psiformer::periodic_geometry;
+  const auto cells = pg::makeTwoCell(mapping.simulation.lattice_vectors,
+      mapping.primitive.lattice_vectors, mapping.simulation.periodic_axes);
+  CHECK_NOTHROW(pg::validateCell(cells));
+  for (std::size_t channel = 0; channel < 2; ++channel)
+  {
+    const auto& table = channel == 0 ? cache.electronNucleusPairs() : cache.electronElectronPairs();
+    pg::Pair pair;
+    REQUIRE(pg::evaluatePair(cells, positions.data(), channel == 0 ? motif.data() : positions.data() + 3,
+                             pair, channel == 0));
+    checkClose(pair.radius, radius[channel]);
+    checkClose(pair.radius_laplacian, laplacian[channel]);
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      checkClose(pair.radius_gradient[dimension], gradient[channel][dimension]);
+      checkClose(pair.displacement[dimension], table.displacements()[0][dimension]);
+      checkClose(pair.complementary[dimension], table.complementaryDisplacements()[0][dimension]);
+      checkClose(pair.laplacian[dimension], table.displacementLaplacians()[0][dimension]);
+      checkClose(pair.complementary_laplacian[dimension], table.complementaryDisplacementLaplacians()[0][dimension]);
+      for (std::size_t derivative = 0; derivative < 3; ++derivative)
+      {
+        checkClose(pair.jacobian[dimension][derivative], table.displacementJacobians()[0][dimension][derivative]);
+        checkClose(pair.complementary_jacobian[dimension][derivative],
+                   table.complementaryDisplacementJacobians()[0][dimension][derivative]);
+      }
+    }
+  }
+  auto invalid_cells = cells;
+  invalid_cells.ion_reciprocal[0][0] += 0.1;
+  CHECK_THROWS_AS(pg::validateCell(invalid_cells), std::invalid_argument);
+  for (int orientation : {1, -1})
+  {
+    pg::LogComplementPairJet actual;
+    REQUIRE(pg::evaluateLogComplementPair(cells, positions.data() + (orientation == 1 ? 0 : 3),
+        positions.data() + (orientation == 1 ? 3 : 0), -1, actual));
+    const auto expected = qmcplusplus::psiformer::periodic_feature::evaluate(cache.electronElectronPairs(),
+        0, mapping.simulation, orientation, qmcplusplus::psiformer::PeriodicFeatureTransform::LOG_COMPLEMENT_V1, -1);
+    CHECK(actual.differentiable == expected.differentiable);
+    for (std::size_t feature = 0; feature < 8; ++feature)
+    {
+      checkClose(actual.value[feature], expected.value[feature]);
+      checkClose(actual.laplacian[feature], expected.laplacian[feature]);
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        checkClose(actual.gradient[feature][dimension], expected.gradient[feature][dimension]);
+    }
+  }
   for (double step : {2e-4, 1e-4})
   {
     std::array<double, 2> trace{};

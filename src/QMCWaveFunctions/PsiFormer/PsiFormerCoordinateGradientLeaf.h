@@ -25,12 +25,13 @@ namespace qmcplusplus::psiformer::coordinate_gradient
 
 /// Use the same molecular or smooth-torus radius and Cartesian derivative as VGL.
 QMC_PF_COORDINATE_GRADIENT_HD inline OpenSpatialStatus radiusGradient(const double* first,
-    const double* second, double& radius, double* gradient, const periodic_geometry::Cell* cell) noexcept
+    const double* second, double& radius, double* gradient, const periodic_geometry::Cell* cell,
+    bool electron_ion = false) noexcept
 {
   if (cell)
   {
     periodic_geometry::Pair pair;
-    if (!periodic_geometry::evaluatePair(*cell, first, second, pair))
+    if (!periodic_geometry::evaluatePair(*cell, first, second, pair, electron_ion))
       return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
     radius = pair.radius;
     if (radius == 0)
@@ -87,7 +88,7 @@ QMC_PF_COORDINATE_GRADIENT_HD inline OpenSpatialStatus finishElectron(
   for (std::size_t nucleus = 0; nucleus < raw.nucleus_count; ++nucleus)
   {
     double radius, gradient[3];
-    status = radiusGradient(position, nuclei + nucleus * raw.nucleus_row_stride, radius, gradient, cell);
+    status = radiusGradient(position, nuclei + nucleus * raw.nucleus_row_stride, radius, gradient, cell, true);
     if (status != OpenSpatialStatus::REGULAR)
       return status;
     double radial_adjoint = 0;

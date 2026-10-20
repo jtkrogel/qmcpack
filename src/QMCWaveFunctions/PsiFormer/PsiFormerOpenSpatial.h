@@ -356,7 +356,7 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
       if (periodic_cell)
       {
         periodic_geometry::Pair pair;
-        if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, pair))
+        if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, pair, true))
           return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
         if (pair.radius == 0 && layout.output.mode != SpatialJetMode::VALUE_ONLY)
           return OpenSpatialStatus::COALESCENCE;

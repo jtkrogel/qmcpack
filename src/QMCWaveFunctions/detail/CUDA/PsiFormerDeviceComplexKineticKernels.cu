@@ -255,7 +255,7 @@ __global__ void headReverse(ComplexKineticHeadLayout l, periodic_geometry::Cell 
         {
           periodic_geometry::Pair pair;
           if (!periodic_geometry::evaluatePair(cell, positions + row * layout.position_row_stride,
-              nuclei + atom * layout.nucleus_row_stride, pair) || !(pair.radius > 0)) { fail(status); return; }
+              nuclei + atom * layout.nucleus_row_stride, pair, true) || !(pair.radius > 0)) { fail(status); return; }
           const auto index = open_orbital::envelopeOffset(layout, d, orbital, atom);
           const auto z = p[zeta + index], az = fabs(z), sign = z > 0 ? 1.0 : (z < 0 ? -1.0 : 0.0);
           const auto decay = exp(-az * pair.radius), weighted = p[pi + index] * decay;

@@ -668,12 +668,12 @@ __global__ void independentChannelSeedsKernel(OrbitalProductReverseLayout layout
 /// Use the selected physical pair radius for envelope and cusp parameter responses.
 template<bool Periodic>
 __device__ inline double parameterGeometryRadius(const double* target, const double* source,
-    const periodic_geometry::Cell& cell)
+    const periodic_geometry::Cell& cell, bool electron_ion = false)
 {
   if constexpr (Periodic)
   {
     periodic_geometry::Pair pair;
-    return periodic_geometry::evaluatePair(cell, target, source, pair)
+    return periodic_geometry::evaluatePair(cell, target, source, pair, electron_ion)
         ? pair.radius : __longlong_as_double(0x7ff8000000000000LL);
   }
   double squared = 0;
@@ -699,7 +699,7 @@ __global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size
     const auto electron = (index / nuclei_count) % ne;
     const auto configuration = index / (ne * nuclei_count);
     ion_distances[index] = parameterGeometryRadius<Periodic>(
-        positions + (configuration * ne + electron) * 3, nuclei + nucleus * 3, cell);
+        positions + (configuration * ne + electron) * 3, nuclei + nucleus * 3, cell, true);
   }
   const auto pairs = ne * (ne - 1) / 2;
   if (index < batch * pairs)
@@ -863,7 +863,7 @@ __global__ void openOrbitalParameterDirectionKernel(OpenOrbitalJetLayout layout,
   for (std::size_t nucleus = 0; nucleus < layout.nucleus_count; ++nucleus)
   {
     const double radius = parameterGeometryRadius<Periodic>(positions + (configuration * ne + electron) * 3,
-        nuclei + nucleus * 3, cell);
+        nuclei + nucleus * 3, cell, true);
     const auto p = open_orbital::envelopeOffset(layout, determinant, orbital, nucleus);
     const auto partials = device_derivative::envelopeValueAndPartials(radius, pi[p], zeta[p]);
     e_direction += pi_direction[p] * partials.pi_partial + zeta_direction[p] * partials.zeta_partial;

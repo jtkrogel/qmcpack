@@ -296,7 +296,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     double radius = ::sqrt(radius_squared);
     if (periodic_cell)
     {
-      if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair))
+      if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair, true))
         return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
       radius = periodic_pair.radius;
     }

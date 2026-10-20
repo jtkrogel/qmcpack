@@ -55,7 +55,7 @@ QMC_PF_COORDINATE_HOST_DEVICE inline OpenSpatialStatus coordinateAdjointForElect
     if (periodic_cell)
     {
       periodic_geometry::Pair pair;
-      if (!periodic_geometry::evaluatePair(*periodic_cell, position, center, pair))
+      if (!periodic_geometry::evaluatePair(*periodic_cell, position, center, pair, true))
         return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
       if (pair.radius == 0)
         return OpenSpatialStatus::COALESCENCE;

@@ -426,7 +426,7 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseEnvelopeP
   double radius = ::sqrt(radius_squared);
   if (periodic_cell)
   {
-    if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair))
+    if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair, true))
       return OpenKineticReverseStatus::NONFINITE_INPUT_OR_RESULT;
     radius = periodic_pair.radius;
   }

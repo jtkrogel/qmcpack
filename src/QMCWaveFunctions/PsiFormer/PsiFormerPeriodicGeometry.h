@@ -36,6 +36,9 @@ struct Cell
 {
   double lattice[3][3]{};
   double reciprocal[3][3]{};
+  double ion_lattice[3][3]{};
+  double ion_reciprocal[3][3]{};
+  bool separate_ion_cell = false;
 };
 
 static_assert(std::is_trivially_copyable_v<Cell> && std::is_standard_layout_v<Cell>);
@@ -84,6 +87,22 @@ inline Cell makeCell(const std::array<std::array<double, 3>, 3>& lattice,
   return result;
 }
 
+/// Keep simulation electron pairs and primitive ion descriptors in distinct cells.
+inline Cell makeTwoCell(const std::array<std::array<double, 3>, 3>& simulation,
+    const std::array<std::array<double, 3>, 3>& primitive, const std::array<bool, 3>& periodic_axes)
+{
+  auto result = makeCell(simulation, periodic_axes);
+  const auto ions = makeCell(primitive, periodic_axes);
+  result.separate_ion_cell = true;
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    for (std::size_t component = 0; component < 3; ++component)
+    {
+      result.ion_lattice[axis][component] = ions.lattice[axis][component];
+      result.ion_reciprocal[axis][component] = ions.reciprocal[axis][component];
+    }
+  return result;
+}
+
 /// Check externally supplied POD cell coefficients before submitting any kernels.
 inline void validateCell(const Cell& cell)
 {
@@ -97,6 +116,18 @@ inline void validateCell(const Cell& cell)
       if (!device_math::isFiniteBinary64(cell.reciprocal[axis][component]) ||
           cell.reciprocal[axis][component] != expected.reciprocal[axis][component])
         throw std::invalid_argument("Periodic PsiFormer cell has inconsistent reciprocal coefficients");
+  if (cell.separate_ion_cell)
+  {
+    for (std::size_t axis = 0; axis < 3; ++axis)
+      for (std::size_t component = 0; component < 3; ++component)
+        lattice[axis][component] = cell.ion_lattice[axis][component];
+    const auto ions = makeCell(lattice, {true, true, true});
+    for (std::size_t axis = 0; axis < 3; ++axis)
+      for (std::size_t component = 0; component < 3; ++component)
+        if (!device_math::isFiniteBinary64(cell.ion_reciprocal[axis][component]) ||
+            cell.ion_reciprocal[axis][component] != ions.reciprocal[axis][component])
+          throw std::invalid_argument("Periodic PsiFormer ion cell has inconsistent reciprocal coefficients");
+  }
 }
 
 /// Complete torus pair values and Cartesian first/trace-second derivatives.
@@ -111,9 +142,11 @@ struct Pair
 /// Form CPU-equivalent smooth image-periodic geometry without allocations.
 /// A zero radius is a valid value; derivative consumers reject its cusp separately.
 QMC_PF_PERIODIC_HOST_DEVICE inline bool evaluatePair(const Cell& cell,
-    const double* target, const double* source, Pair& pair) noexcept
+    const double* target, const double* source, Pair& pair, bool electron_ion = false) noexcept
 {
   pair = Pair{};
+  const auto& lattice = electron_ion && cell.separate_ion_cell ? cell.ion_lattice : cell.lattice;
+  const auto& reciprocal = electron_ion && cell.separate_ion_cell ? cell.ion_reciprocal : cell.reciprocal;
   double difference[3];
   for (std::size_t dimension = 0; dimension < 3; ++dimension)
   {
@@ -130,7 +163,7 @@ QMC_PF_PERIODIC_HOST_DEVICE inline bool evaluatePair(const Cell& cell,
   {
     double fractional = 0;
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
-      fractional += cell.reciprocal[axis][dimension] * difference[dimension];
+      fractional += reciprocal[axis][dimension] * difference[dimension];
     if (!device_math::isFiniteBinary64(fractional))
       return false;
     double reduced = fractional - ::nearbyint(fractional);
@@ -150,19 +183,19 @@ QMC_PF_PERIODIC_HOST_DEVICE inline bool evaluatePair(const Cell& cell,
   for (std::size_t component = 0; component < 3; ++component)
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-      const double lattice = cell.lattice[axis][component];
-      pair.displacement[component] += lattice * sine[axis];
-      pair.complementary[component] += lattice * cosine[axis];
+      const double direct = lattice[axis][component];
+      pair.displacement[component] += direct * sine[axis];
+      pair.complementary[component] += direct * cosine[axis];
       double reciprocal_norm_squared = 0;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
-        const double reciprocal = cell.reciprocal[axis][dimension];
-        pair.jacobian[component][dimension] += lattice * sine_first[axis] * reciprocal;
-        pair.complementary_jacobian[component][dimension] += lattice * cosine_first[axis] * reciprocal;
-        reciprocal_norm_squared += reciprocal * reciprocal;
+        const double dual = reciprocal[axis][dimension];
+        pair.jacobian[component][dimension] += direct * sine_first[axis] * dual;
+        pair.complementary_jacobian[component][dimension] += direct * cosine_first[axis] * dual;
+        reciprocal_norm_squared += dual * dual;
       }
-      pair.laplacian[component] += lattice * sine_second[axis] * reciprocal_norm_squared;
-      pair.complementary_laplacian[component] += lattice * cosine_second[axis] * reciprocal_norm_squared;
+      pair.laplacian[component] += direct * sine_second[axis] * reciprocal_norm_squared;
+      pair.complementary_laplacian[component] += direct * cosine_second[axis] * reciprocal_norm_squared;
     }
   double squared_radius = 0;
   for (std::size_t component = 0; component < 3; ++component)
