@@ -1100,6 +1100,34 @@ TEST_CASE("Accepted nonlocal tiles reduce complete complex energies without deri
   CHECK(accumulator.storageDiagnostics().retained_numeric_bytes == cap);
   CHECK_THROWS(accumulator.releaseJVPReplay());
   CHECK_THROWS(accumulator.begin(context, {&channel, 1}, sink));
+
+  // Feed the same complete captured energies into a half-covariance objective.
+  // Poisoned dEL rows make an accidental local-energy derivative request fail.
+  const std::vector<double> sample_weights{1, 2};
+  const std::array<DerivativeValue, 2> local{DerivativeValue{.3, 0}, DerivativeValue{-.8, 0}};
+  std::vector<DerivativeValue> total{local[0] + accumulator.energies()[0], local[1] + accumulator.energies()[1]};
+  const ComplexRows scores{{{1.2, .2}, {-.7, .1}, {}}, {{-.4, .6}, {1.1, -.3}, {}}};
+  const DerivativeValue poison{std::numeric_limits<double>::quiet_NaN(), 0};
+  const ComplexRows unused_responses(2, std::vector<DerivativeValue>(3, poison));
+  ToyStreamingOperator derivative(schema, 3, scores, unused_responses, false, nullptr,
+      localEnergyTermBit(LocalEnergyTerm::KINETIC), 7, 11);
+  EnergyGradientAccumulator covariance(schema, 3, EnergyGradientEstimator::HALF_SCORE_COVARIANCE);
+  accumulateEnergyGradientBatch(derivative, {sample_weights.data(), sample_weights.size()},
+      {total.data(), total.size()}, localEnergyTermBit(LocalEnergyTerm::KINETIC), covariance);
+  covariance.completeSingleParticipantReduction();
+  const auto result = covariance.finalize();
+  const auto mean = (total[0] + 2.0 * total[1]) / 3.0;
+  CHECK(result.local_energy_term_mask == 0);
+  CHECK(result.mean_energy.real() == Catch::Approx(mean.real()));
+  CHECK(result.mean_energy.imag() == Catch::Approx(mean.imag()));
+  for (std::size_t parameter = 0; parameter < 3; ++parameter)
+  {
+    double expected_gradient = 0;
+    for (std::size_t sample_index = 0; sample_index < 2; ++sample_index)
+      expected_gradient += sample_weights[sample_index] *
+          std::real(std::conj(scores[sample_index][parameter]) * (total[sample_index] - mean)) / 3.0;
+    CHECK(result.gradient[parameter] == Catch::Approx(expected_gradient).margin(1e-14));
+  }
 }
 
 TEST_CASE("Nonlocal energy transactions reject incomplete or mismatched native tiles",

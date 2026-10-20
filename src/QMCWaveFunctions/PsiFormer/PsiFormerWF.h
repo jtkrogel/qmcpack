@@ -408,6 +408,9 @@ public:
   /// Numeric HOST scratch required by one sequential affine observation.
   std::size_t affineScoreStorageBytes() const;
 
+  /// Report the physical system metadata already validated by the builder.
+  bool isPseudopotentialSystem() const;
+
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
                            wftrain::AffineScoreObserver& observer,

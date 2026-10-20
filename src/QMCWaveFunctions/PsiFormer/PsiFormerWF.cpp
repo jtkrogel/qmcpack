@@ -7657,6 +7657,13 @@ std::size_t PsiFormerWF::affineScoreStorageBytes() const
   return pf::scoreWorkspaceStorageRequirement(makeBatchMemoryPolicyInput().storage_shape);
 }
 
+/// Inspect the already validated physical model kind without rebinding any source.
+bool PsiFormerWF::isPseudopotentialSystem() const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  return system_kind_ == "pseudopotential";
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

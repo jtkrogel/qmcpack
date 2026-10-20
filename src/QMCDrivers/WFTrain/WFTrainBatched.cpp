@@ -590,9 +590,11 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     std::size_t maximum_parameter_chunk_size,
     bool has_nonlocal_ecp,
     bool capture_ecp_jvp_replay,
+    bool score_only,
     bool complex_training = false,
     const WFTrainDriverInput::ComplexGpuTraining* gpu_training = nullptr,
-    wftrain::PairedFixedGridNativeEnergy* fixed_grid = nullptr)
+    wftrain::PairedFixedGridNativeEnergy* fixed_grid = nullptr,
+    std::size_t scalar_ecp_budget = 0)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -809,6 +811,59 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
           twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
           maximum_parameter_chunk_size);
+#ifndef QMC_COMPLEX
+  const auto* real = dynamic_cast<const PsiFormerWF*>(twfs[0].get().getOrbitals()[0].get());
+  if (score_only && real && real->usesAcceleratorParameterProducts())
+  {
+    if (capture_ecp_jvp_replay || batch_ordinal != 0 || sample_offset != 0 ||
+        !real->isPseudopotentialSystem())
+      throw std::invalid_argument("GPU score-only ECP requires one physical PP batch without derivative replay");
+    const auto samples = walkers.size();
+    const auto scalar_bytes = wftrain::NonLocalEnergyAccumulator::requiredBytes(samples);
+    const auto temporary = checkedMemoryMultiply(samples, 3 * sizeof(wftrain::DerivativeValue) + 2 * sizeof(double));
+    const auto named = checkedMemoryAdd(batch.derivative_operator->storageDiagnostics().retained_numeric_bytes, temporary);
+    if (!scalar_ecp_budget || scalar_ecp_budget == std::numeric_limits<std::size_t>::max() || named > scalar_ecp_budget)
+      throw std::length_error("GPU score-only ECP numeric owners exceed remaining maximum_retained_bytes");
+    logTrainingAllocation("score_ecp_scalar_capture", samples,
+        batch.derivative_operator->parameterSchema().parameterCount(), named);
+    const auto& schema = batch.derivative_operator->parameterSchema();
+    const auto version = batch.derivative_operator->parameterVersion();
+    wftrain::NonLocalEnergyAccumulator energy(schema, version, batch_ordinal, sample_offset,
+        samples, electrons[0].get().getTotalNum(), scalar_bytes);
+    std::vector<wftrain::DerivativeValue> ones(samples, {1, 0});
+    const wftrain::VJPCoefficientChannel channel{wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+        wftrain::DerivativeProduct::LOCAL_ENERGY_VJP,
+        {schema.providerId(), schema.fingerprint(), version, batch_ordinal, sample_offset,
+            {ones.data(), ones.size()}}, wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)};
+    ReplayOnlyECPSink sink;
+    const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+        hamiltonian_batch, twf_batch, electron_batch, energy, {&channel, 1}, sink);
+    if (energy.gridFingerprint() != result.grid_fingerprint || result.local_energies.size() != samples)
+      throw std::logic_error("GPU score-only ECP accepted energy/grid identity mismatch");
+    batch.local_energies.reserve(samples);
+    for (std::size_t sample = 0; sample < samples; ++sample)
+    {
+      double reported = 0;
+      const auto& h = hamiltonians[sample].get();
+      for (int term = 0; term < h.size(); ++term)
+        if (const auto* nonlocal = dynamic_cast<const NonLocalECPotential*>(h.getComponent(term)))
+          reported += nonlocal->getValue();
+      const auto captured = energy.energies()[sample];
+      const auto tolerance = 512 * std::numeric_limits<double>::epsilon() * (1 + std::abs(reported) + std::abs(captured));
+      if (!wftrain::isFiniteTrainingReal(reported) || std::abs(captured.imag()) > tolerance ||
+          std::abs(reported - captured.real()) > tolerance ||
+          !wftrain::isFiniteTrainingReal(result.local_energies[sample]))
+        throw std::logic_error("GPU score-only ECP differs from the actual native nonlocal energy");
+      batch.local_energies.emplace_back(result.local_energies[sample], 0);
+    }
+    // Physical EL includes ECP; this owner intentionally advertises no ECP dEL.
+    app_log() << "WFTrain GPU score-only accepted-grid ECP: grid=" << result.grid_fingerprint
+              << " version=" << version << " samples=" << samples
+              << " parameter_response_mask=0 retained_grid_bytes=0; named budget excludes native tile/vendor storage"
+              << std::endl;
+    return batch;
+  }
+#endif
   bool bounded_replay = false;
   for (const auto& component : twfs[0].get().getOrbitals())
     if (const auto* psiformer = dynamic_cast<const PsiFormerWF*>(component.get()))
@@ -1844,6 +1899,50 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   return text.str();
 }
 
+/// Bind only the new GPU score-only PP stage to actual operator content and ion ordering.
+std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
+{
+  const auto& provenance = hamiltonian.ecpModelProvenance();
+  if (!component.isPseudopotentialSystem() || !hamiltonian.hasPhysicalNLPP() ||
+      !provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())
+    throw std::invalid_argument("GPU score-only ECP requires validated physical ordinary-locality PP metadata");
+  const NonLocalECPotential* nonlocal = nullptr;
+  for (int term = 0; term < hamiltonian.size(); ++term)
+    if (const auto* current = dynamic_cast<const NonLocalECPotential*>(hamiltonian.getComponent(term)))
+    {
+      if (nonlocal || current->usesDLA() || !current->usesVirtualParticles())
+        throw std::invalid_argument("GPU score-only ECP requires one ordinary virtual-particle operator");
+      nonlocal = current;
+    }
+  if (!nonlocal)
+    throw std::invalid_argument("GPU score-only ECP has no actual nonlocal operator");
+  const auto& ions = nonlocal->sourceParticles();
+  component.validateSystem(electrons, ions, "pseudopotential");
+  const auto& species = ions.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  if (charge < 0)
+    throw std::invalid_argument("GPU score-only ECP source charges are missing");
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  extendStageFingerprint(hash, provenance->scientific_definition);
+  extendStageFingerprint(hash, ions.getTotalNum());
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+  {
+    if (!wftrain::isFiniteTrainingReal(species(charge, ions.GroupID[ion])))
+      throw std::invalid_argument("GPU score-only ECP source charge is nonfinite");
+    extendStageFingerprint(hash, species.speciesName.at(ions.GroupID[ion]));
+    extendStageFingerprint(hash, species(charge, ions.GroupID[ion]));
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      if (!wftrain::isFiniteTrainingReal(ions.R[ion][dimension]))
+        throw std::invalid_argument("GPU score-only ECP source position is nonfinite");
+      extendStageFingerprint(hash, ions.R[ion][dimension]);
+    }
+  }
+  std::ostringstream identity;
+  identity << "real-gpu-score-ecp-v1/" << std::hex << hash;
+  return identity.str();
+}
+
 } // namespace
 
 WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
@@ -2142,11 +2241,18 @@ void WFTrainBatched::process(xmlNodePtr node)
     const bool score_policy = complex_training_component_ || explicit_kfac_policy;
     bool hybrid_score_kfac = false;
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    const auto* real_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+    const auto& hamiltonian = population_.get_golden_hamiltonian();
+    const auto& provenance = hamiltonian.ecpModelProvenance();
+    const bool ae = real_provider && !real_provider->isPseudopotentialSystem() &&
+        !hamiltonian.hasPhysicalNLPP() && !provenance;
+    const bool scalar_pp = real_provider && real_provider->isPseudopotentialSystem() &&
+        hamiltonian.hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
+        !provenance->scientific_definition.empty() && myComm->size() == 1;
     hybrid_score_kfac = wftrain::supportsHybridKFACPolicy(training_input_) && selected_provider_->usesAcceleratorParameterProducts() &&
-        dynamic_cast<PsiFormerWF*>(selected_provider_) && student_prototype_.getOrbitals().size() == 1 &&
+        real_provider && student_prototype_.getOrbitals().size() == 1 &&
         population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
-        !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        !population_.get_golden_hamiltonian().ecpModelProvenance() &&
+        (ae || scalar_pp) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
     hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
@@ -2163,7 +2269,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     myComm->allreduce(policy_failure);
     myComm->allreduce(hybrid_ranks);
     if (policy_failure || (hybrid_ranks != 0 && hybrid_ranks != myComm->size()))
-      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or a qualified sole AE FP64 "
+      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or a qualified sole AE/PP FP64 "
           "GPU PBYP/no-drift covariance profile with finite retained cap on every rank; line_search=off is required");
     if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
@@ -2193,6 +2299,9 @@ void WFTrainBatched::process(xmlNodePtr node)
       myComm->allreduce(invalid_population);
       if (invalid_population)
         throw UniformCommunicateError("Hybrid score KFAC requires one nonempty training crowd on every rank before sampling");
+      if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+          (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
+        throw UniformCommunicateError("GPU score-only ECP requires MPI1/block1/step1 before sampling");
       app_log() << "WFTrain hybrid score KFAC: evaluation/score/publication=GPU, affine/factors/inverse/state=HOST; "
                    "parameter authority=HOST, local energy=native Hamiltonian, reduction=HOST raw sums, ranks="
                 << myComm->size() << std::endl;
@@ -2577,6 +2686,15 @@ void WFTrainBatched::run()
               << ", conservative snapshot/solve allowance=" << allowance
               << "; excludes shared model, inference clones, opaque ParticleSet caches, allocator/RSS" << std::endl;
   }
+#endif
+
+#ifndef QMC_COMPLEX
+  // Older real CPU/legacy fingerprints remain unchanged. Only this new profile
+  // binds actual PP content/species in the existing optional physical identity.
+  if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
+      wftrain::supportsHybridKFACPolicy(training_input_) && population_.get_golden_hamiltonian().hasPhysicalNLPP())
+    complex_physical_identity = realScoreECPIdentity(*device_provider, population_.get_golden_electrons(),
+        population_.get_golden_hamiltonian());
 #endif
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
@@ -3485,15 +3603,27 @@ void WFTrainBatched::run()
                 num_blocks == 1 && steps_per_block_ == 1;
             replayCrowdSamples(crowd, samples, resident_single_snapshot
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
+            std::size_t scalar_ecp_budget = 0;
+            if (!complex_training && score_kfac_training && has_nonlocal_ecp &&
+                selected_provider_->usesAcceleratorParameterProducts())
+            {
+              const auto live = checkedMemoryAdd(retained_configuration_bytes,
+                  kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0);
+              if (retained_samples.size() != 1 || live >= training_input_.getMaximumRetainedBytes())
+                throw std::length_error("GPU score-only ECP requires one retained batch with remaining numeric budget");
+              scalar_ecp_budget = training_input_.getMaximumRetainedBytes() - live;
+            }
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
-                capture_ecp_jvp_replay, complex_training,
-                complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr
+                capture_ecp_jvp_replay, score_kfac_training, complex_training,
+                complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr,
 #ifdef QMC_COMPLEX
-                , fixed_grid ? &*fixed_grid : nullptr
+                fixed_grid ? &*fixed_grid : nullptr,
+#else
+                nullptr,
 #endif
-                ));
+                scalar_ecp_budget));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
