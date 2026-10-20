@@ -2314,35 +2314,40 @@ int main(int argc, char** argv)
     node_score.downloadResponse(node_raw_response);
     if (std::any_of(node_raw_response.begin(), node_raw_response.end(), [](double value) { return value != 0.0; }))
       throw std::runtime_error("Zero independent-channel objective has a nonzero derivative");
-    auto mixed_parameters = canonical_parameters;
-    // Zero only one determinant column: its cofactor derivative can be nonzero
-    // even though its normalized determinant weight is zero. Inverse-only score
-    // code must reject this rather than silently omit the channel contribution.
-    for (auto role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN})
+    if (model.ndet > 1)
     {
-      const auto begin = plan.parameter(role).begin;
-      std::fill_n(mixed_parameters.begin() + begin, shape.nuclei, 0.0);
+      auto mixed_parameters = canonical_parameters;
+      // Zero only one determinant column: its cofactor derivative can be nonzero
+      // even though its normalized determinant weight is zero. Inverse-only score
+      // code must reject this rather than silently omit the channel contribution.
+      for (auto role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN})
+      {
+        const auto begin = plan.parameter(role).begin;
+        std::fill_n(mixed_parameters.begin() + begin, shape.nuclei, 0.0);
+      }
+      auto mixed_image = std::make_shared<PreparedDeviceModel>(plan, mixed_parameters, model.cfg.nuclei.x, 19);
+      PreparedDeviceInference mixed_tape(mixed_image, model.cfg.nconfig, queue, handle,
+                                         SpatialJetMode::VALUE_ONLY, true);
+      mixed_tape.evaluate(model.cfg.electrons.x);
+      mixed_tape.downloadResults(value_phases, value_logs, no_ratios);
+      if (value_phases[0] == 0)
+        throw std::runtime_error("Mixed singular-channel fixture unexpectedly has a total node");
+      PreparedDeviceScoreReverse mixed_score(mixed_image, model.cfg.nconfig, queue, handle);
+      bool mixed_channel_rejected = false;
+      try { (void)mixed_score.reverse(mixed_tape, score_weights); }
+      catch (const std::runtime_error&) { mixed_channel_rejected = true; }
+      if (!mixed_channel_rejected)
+        throw std::runtime_error("Inverse-only GPU score silently accepted a singular determinant channel");
+      PreparedDeviceScoreJvp mixed_jvp(mixed_image, model.cfg.nconfig, queue, handle);
+      bool mixed_jvp_rejected = false;
+      try { (void)mixed_jvp.evaluate(mixed_tape, product_direction); }
+      catch (const std::runtime_error&) { mixed_jvp_rejected = true; }
+      if (!mixed_jvp_rejected)
+        throw std::runtime_error("Inverse-only GPU JVP accepted a singular determinant channel");
+      std::cout << "PASS score failure guards: total node and singular channel with nonzero total amplitude\n";
     }
-    auto mixed_image = std::make_shared<PreparedDeviceModel>(plan, mixed_parameters, model.cfg.nuclei.x, 19);
-    PreparedDeviceInference mixed_tape(mixed_image, model.cfg.nconfig, queue, handle,
-                                       SpatialJetMode::VALUE_ONLY, true);
-    mixed_tape.evaluate(model.cfg.electrons.x);
-    mixed_tape.downloadResults(value_phases, value_logs, no_ratios);
-    if (value_phases[0] == 0)
-      throw std::runtime_error("Mixed singular-channel fixture unexpectedly has a total node");
-    PreparedDeviceScoreReverse mixed_score(mixed_image, model.cfg.nconfig, queue, handle);
-    bool mixed_channel_rejected = false;
-    try { (void)mixed_score.reverse(mixed_tape, score_weights); }
-    catch (const std::runtime_error&) { mixed_channel_rejected = true; }
-    if (!mixed_channel_rejected)
-      throw std::runtime_error("Inverse-only GPU score silently accepted a singular determinant channel");
-    PreparedDeviceScoreJvp mixed_jvp(mixed_image, model.cfg.nconfig, queue, handle);
-    bool mixed_jvp_rejected = false;
-    try { (void)mixed_jvp.evaluate(mixed_tape, product_direction); }
-    catch (const std::runtime_error&) { mixed_jvp_rejected = true; }
-    if (!mixed_jvp_rejected)
-      throw std::runtime_error("Inverse-only GPU JVP accepted a singular determinant channel");
-    std::cout << "PASS score failure guards: total node and singular channel with nonzero total amplitude\n";
+    else
+      std::cout << "SKIP singular+regular-channel guard: requires at least two determinants; total-node guards tested\n";
     PreparedDeviceInference nodes(node_image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
     nodes.evaluate(model.cfg.electrons.x);
     nodes.downloadResults(value_phases, value_logs, no_ratios);
