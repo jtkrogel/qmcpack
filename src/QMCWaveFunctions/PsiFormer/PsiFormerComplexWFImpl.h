@@ -2932,6 +2932,15 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::affineParameterBl
   return gpuInferenceEnabled() ? std::vector<wftrain::AffineParameterBlock>{} : Impl::affineBlocks(*impl_->state);
 }
 
+/// Expose affine roles only through the explicitly qualified hybrid profile.
+std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::hybridAffineParameterBlocks() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  if (!gpuInferenceEnabled() || impl_->state->environment.periodic_profile)
+    throw std::logic_error("Hybrid affine metadata requires an explicit torus GPU family");
+  return Impl::affineBlocks(*impl_->state);
+}
+
 /// Classify cusp and reciprocal-factor coefficients for exact per-coordinate diagonal statistics.
 std::vector<std::size_t> PsiFormerComplexWF::genericKFACParameterBlocks() const
 {
@@ -2961,11 +2970,25 @@ PsiFormerComplexWF::AffineScoreStorage PsiFormerComplexWF::affineScoreStorage() 
 /// Allocate the complete affine owner only after explicit idle-state and budget admission.
 void PsiFormerComplexWF::prepareAffineScores(std::size_t maximum_bytes)
 {
+  prepareAffineScoresImpl(maximum_bytes, false);
+}
+
+/// Reuse the bounded CPU tape; this preparation allocates no device storage.
+void PsiFormerComplexWF::prepareHybridAffineScores(std::size_t maximum_bytes)
+{
+  prepareAffineScoresImpl(maximum_bytes, true);
+}
+
+/// Require the correct entry point before admitting a reusable HOST owner.
+void PsiFormerComplexWF::prepareAffineScoresImpl(std::size_t maximum_bytes, bool hybrid)
+{
   NativeTimerScope timer(impl_->phase_timers.preparation);
   const auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex affine observations require CPU execution");
+  if (gpuInferenceEnabled() != hybrid)
+    throw std::logic_error("Complex affine preparation requires its selected CPU or hybrid GPU family");
+  if (hybrid && state->environment.periodic_profile)
+    throw std::logic_error("Hybrid affine preparation requires the torus GPU profile");
   impl_->requireIdle(*impl_->particles);
   Impl::validateDerivativeSource(*state);
   const auto required = Impl::AffineLane::required(*state);
@@ -2988,11 +3011,27 @@ void PsiFormerComplexWF::observeComplexAffineScores(const ParticleSet& particles
     wftrain::AffineScoreObserver& observer, std::vector<double>& real_score,
     std::vector<double>& imaginary_score) const
 {
+  observeComplexAffineScoresImpl(particles, observer, real_score, imaginary_score, false);
+}
+
+/// GPU publication and this HOST reverse share the model's parameter read authority.
+void PsiFormerComplexWF::observeHybridComplexAffineScores(const ParticleSet& particles,
+    wftrain::AffineScoreObserver& observer, std::vector<double>& real_score,
+    std::vector<double>& imaginary_score) const
+{
+  observeComplexAffineScoresImpl(particles, observer, real_score, imaginary_score, true);
+}
+
+/// Run the common two-channel reverse without changing inference state or parameters.
+void PsiFormerComplexWF::observeComplexAffineScoresImpl(const ParticleSet& particles,
+    wftrain::AffineScoreObserver& observer, std::vector<double>& real_score,
+    std::vector<double>& imaginary_score, bool hybrid) const
+{
   NativeTimerScope timer(impl_->phase_timers.cpu_reverse);
   const auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex affine observations require CPU execution");
+  if (gpuInferenceEnabled() != hybrid)
+    throw std::logic_error("Complex affine observations require their selected CPU or hybrid GPU family");
   impl_->requireIdle(*impl_->particles);
   Impl::validateDerivativeSource(*state);
   const auto n = state->model.ne, up = state->model.cfg.nup;

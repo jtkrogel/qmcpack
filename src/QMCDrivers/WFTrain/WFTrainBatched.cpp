@@ -479,6 +479,25 @@ public:
     return component_.neuralWeightBlocks();
   }
 
+  /// Factors use the explicitly prepared HOST affine tape of this same model.
+  std::vector<wftrain::AffineParameterBlock> affineParameterBlocks() const override
+  {
+    return component_.hybridAffineParameterBlocks();
+  }
+
+  /// Preserve exact diagonal curvature roles in the component's real schema.
+  std::vector<std::size_t> genericKFACParameterBlocks() const override
+  {
+    return component_.genericKFACParameterBlocks();
+  }
+
+  /// Read both score channels under the same model authority used by publication.
+  void observeComplexAffineScores(const ParticleSet& particles, wftrain::AffineScoreObserver& observer,
+      std::vector<double>& real_score, std::vector<double>& imaginary_score) const override
+  {
+    component_.observeHybridComplexAffineScores(particles, observer, real_score, imaginary_score);
+  }
+
   /// Reuse the qualified old-version transaction and complete new-generation publication.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate, std::size_t version) override
   {
@@ -1898,8 +1917,10 @@ void WFTrainBatched::process(xmlNodePtr node)
             (optimizer == O::ADAM || optimizer == O::SGD);
         const bool supported_optimizer = optimizer == O::ADAM || optimizer == O::SGD ||
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
-            (!complex->gpuInferenceEnabled() && optimizer == O::KFAC &&
-             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF) ||
+            (optimizer == O::KFAC && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
+             (!complex->gpuInferenceEnabled() ||
+              (wftrain::supportsHybridKFACPolicy(training_input_) && !complex->isPseudopotentialSystem() &&
+               !population_.get_golden_hamiltonian().ecpModelProvenance() && !vmcdriver_input_.get_use_drift()))) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
         const bool cpu_scalar_ecp = !complex->gpuInferenceEnabled() &&
             vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP &&
@@ -1936,8 +1957,8 @@ void WFTrainBatched::process(xmlNodePtr node)
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
              !supported_optimizer))
           throw UniformCommunicateError(
-              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY host first-order "
-              "or positively damped host-controlled SR");
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY host first-order, "
+              "AE covariance KFAC/OFF without drift, or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
             (!cpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
             !supported_optimizer ||
@@ -1948,7 +1969,7 @@ void WFTrainBatched::process(xmlNodePtr node)
              (training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
               training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD/CPU covariance KFAC-OFF "
+          throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD/covariance KFAC-OFF "
               "or positively damped SR (GPU also momentumSGD/RMSProp/AMSGrad), no metric-norm/selection controls "
               "except ENERGY reference search with default update controls, "
               "shared scale/shrinkage/Euclidean bounds are GPU-only, "
@@ -2127,12 +2148,18 @@ void WFTrainBatched::process(xmlNodePtr node)
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
         !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+#elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
+        !complex_training_component_->isPseudopotentialSystem() &&
+        !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
+        vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #endif
     if (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
         (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !complex_training_component_) ||
         training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF))
-      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or sole real/open/AE FP64 "
-          "GPU rank1 PBYP/no-drift covariance training with finite retained cap; line_search=off is required");
+      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or a qualified sole AE FP64 "
+          "GPU rank1 PBYP/no-drift covariance profile with finite retained cap; line_search=off is required");
     if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
         (training_input_.getKFACClipMode() != WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN ||
@@ -2424,10 +2451,10 @@ void WFTrainBatched::run()
       else
         derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
       std::size_t complex_kfac_allowance = 0;
-      if (!complex_gpu_provider_ && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
+      if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
       {
         complex_affine_score_bytes = complex->affineScoreStorage().required_bytes;
-        const auto statistics_bytes = kfacStatisticsBytes(makeLiveKFACRegistry(*complex));
+        const auto statistics_bytes = kfacStatisticsBytes(makeLiveKFACRegistry(*selected_provider_));
         // Include committed/pending factor states, inverse caches and solve scratch.
         complex_kfac_allowance = checkedMemoryAdd(complex_affine_score_bytes,
             checkedMemoryMultiply(8, statistics_bytes));
@@ -2531,7 +2558,12 @@ void WFTrainBatched::run()
     }
     enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
     if (complex_affine_score_bytes)
-      complex_training_component_->prepareAffineScores(complex_affine_score_bytes);
+    {
+      if (complex_gpu_provider_)
+        complex_training_component_->prepareHybridAffineScores(complex_affine_score_bytes);
+      else
+        complex_training_component_->prepareAffineScores(complex_affine_score_bytes);
+    }
     app_log() << "WFTrain paired " << (complex_gpu_provider_ ? "GPU" : "CPU")
               << " prospective named numeric bytes plus allowance=" << prospective
               << ", conservative snapshot/solve allowance=" << allowance
@@ -2595,7 +2627,7 @@ void WFTrainBatched::run()
   wftrain::DistributedParameterReduction reduction(*myComm, reduction_policy);
   wftrain::TrainingCapabilities requirements{
       wftrain::TrainingCapability::VALUE_EVALUATION};
-  const bool complex_kfac_training = complex_training && !complex_gpu_provider_ &&
+  const bool complex_kfac_training = complex_training &&
       training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC;
   const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_kfac_training);
   const auto kfac_estimator = wftrain::kfacScoreEstimator(training_input_);

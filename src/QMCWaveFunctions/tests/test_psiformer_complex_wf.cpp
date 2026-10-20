@@ -1487,6 +1487,10 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
   CHECK_THROWS(component.observeComplexAffineScores(p, observer, real, imaginary));
   const auto required = component.affineScoreStorage().required_bytes;
   CHECK(component.affineScoreStorage().prepared_bytes == 0);
+  CHECK_THROWS(component.hybridAffineParameterBlocks());
+  CHECK_THROWS(component.prepareHybridAffineScores(required));
+  CHECK_THROWS(component.observeHybridComplexAffineScores(p, observer, real, imaginary));
+  CHECK(component.affineScoreStorage().prepared_bytes == 0);
   CHECK_THROWS(component.prepareAffineScores(required - 1));
   CHECK(component.affineScoreStorage().prepared_bytes == 0);
   component.prepareAffineScores(required);

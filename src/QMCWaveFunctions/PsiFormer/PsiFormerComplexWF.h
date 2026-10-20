@@ -87,6 +87,15 @@ public:
   /// Admit and prepare one reusable affine workspace before observing any samples.
   void prepareAffineScores(std::size_t maximum_bytes);
 
+  /// Explicit HOST affine bridge for the budgeted GPU training provider.
+  std::vector<wftrain::AffineParameterBlock> hybridAffineParameterBlocks() const;
+  /// Admit the existing HOST affine owner while GPU evaluation remains selected.
+  void prepareHybridAffineScores(std::size_t maximum_bytes);
+  /// Observe real-parameter amplitude/phase responses without borrowing GPU outputs.
+  void observeHybridComplexAffineScores(const ParticleSet&, wftrain::AffineScoreObserver&,
+                                        std::vector<double>& real_score,
+                                        std::vector<double>& imaginary_score) const;
+
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
@@ -406,6 +415,10 @@ public:
 
 private:
   struct Impl;
+  /// CPU and explicit hybrid entry points share one admitted HOST affine owner.
+  void prepareAffineScoresImpl(std::size_t maximum_bytes, bool hybrid);
+  void observeComplexAffineScoresImpl(const ParticleSet&, wftrain::AffineScoreObserver&,
+      std::vector<double>& real_score, std::vector<double>& imaginary_score, bool hybrid) const;
   /// Reuse FULL scatter while the caller already holds exactly one model read transaction.
   LogValue evaluateLogLocked(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&);
   /// Keep explicit unsupported-operation diagnostics independent of legacy fallbacks.
