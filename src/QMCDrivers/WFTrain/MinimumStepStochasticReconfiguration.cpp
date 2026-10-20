@@ -353,7 +353,7 @@ ClippedScoreObjectiveResult prepareClippedScoreObjective(
       !isFiniteTrainingReal(control.quantile) || control.quantile <= 0.0 || control.quantile > 1.0 ||
       control.exclude_width <= 0.0 ||
       (!isFiniteTrainingReal(control.exclude_width) &&
-       control.exclude_width != std::numeric_limits<DerivativeReal>::infinity()))
+       !isPositiveInfinityTrainingReal(control.exclude_width)))
     throw std::invalid_argument("Clipped score objective has invalid inputs or controls");
   if (control.mode != ScoreObjectiveClipMode::SOFT_MEDIAN &&
       control.mode != ScoreObjectiveClipMode::HARD_MEDIAN &&

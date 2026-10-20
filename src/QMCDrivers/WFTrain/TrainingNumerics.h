@@ -32,6 +32,16 @@ inline bool isFiniteTrainingReal(double value) noexcept
   return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
+/// Recognize the explicit no-exclusion sentinel even under finite-math assumptions.
+inline bool isPositiveInfinityTrainingReal(double value) noexcept
+{
+  static_assert(sizeof(double) == sizeof(std::uint64_t));
+  static_assert(std::numeric_limits<double>::is_iec559);
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits == UINT64_C(0x7ff0000000000000);
+}
+
 namespace detail
 {
 /// Bound projected transposed dot products by their actual vector/action norms.

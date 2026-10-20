@@ -14,6 +14,8 @@
 #include "QMCDrivers/WFTrain/WFTrainInferenceInput.h"
 
 #include <array>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -101,11 +103,27 @@ TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policie
       "<parameter name='line_search'>reference</parameter>")));
   const auto clipped = cap + half + "<parameter name='kfac_objective'>clipped_covariance</parameter>";
   CHECK(wftrain::supportsHybridKFACPolicy(parse(clipped)));
+  CHECK(wftrain::supportsHybridKFACPolicy(parse(clipped +
+      "<parameter name='kfac_exclude_width'>none</parameter>")));
   CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(clipped +
       "<parameter name='kfac_clip_mode'>hard_median</parameter>")));
   CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(clipped +
       "<parameter name='kfac_clip_mode'>hard_mean</parameter>"
       "<parameter name='kfac_exclude_width'>2</parameter>")));
+}
+
+TEST_CASE("Training no-exclusion sentinel is exact under finite-math compilation",
+          "[drivers][wf_train][positive_infinity_policy]")
+{
+  const std::array<std::uint64_t, 7> patterns{
+      UINT64_C(0x7ff0000000000000), UINT64_C(0xfff0000000000000), UINT64_C(0x7ff8000000000001),
+      UINT64_C(0xfff8000000000001), UINT64_C(0x7fefffffffffffff), UINT64_C(0), UINT64_C(0x8000000000000000)};
+  for (std::size_t i = 0; i < patterns.size(); ++i)
+  {
+    double value;
+    std::memcpy(&value, &patterns[i], sizeof(value));
+    CHECK(wftrain::isPositiveInfinityTrainingReal(value) == (i == 0));
+  }
 }
 
 TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers][wf_train][kfac]")

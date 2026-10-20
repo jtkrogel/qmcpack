@@ -2334,7 +2334,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
         (training_input_.getKFACClipMode() != WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN ||
-         training_input_.getKFACExcludeWidth() != std::numeric_limits<double>::infinity()))
+         !wftrain::isPositiveInfinityTrainingReal(training_input_.getKFACExcludeWidth())))
       throw UniformCommunicateError("Score-only KFAC soft weighting does not support hard windows or exclusion");
     wftrain::agreeAcceleratorRuntimePlacement(*myComm, selected_provider_->usesAcceleratorParameterProducts());
 
