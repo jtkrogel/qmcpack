@@ -3791,7 +3791,11 @@ void WFTrainBatched::run()
           if (kfac_optimizer)
           {
             std::exception_ptr inverse_failure;
-            try { kfac_optimizer->prepareStatistics(*statistics); }
+            try
+            {
+              NativeTimerScope timer(phase_timers_.kfac_inverse);
+              kfac_optimizer->prepareStatistics(*statistics);
+            }
             catch (...) { inverse_failure = std::current_exception(); }
             try
             {
@@ -3819,6 +3823,7 @@ void WFTrainBatched::run()
             std::exception_ptr inverse_failure;
             try
             {
+              NativeTimerScope timer(phase_timers_.kfac_inverse);
               inverse = std::make_unique<wftrain::KFACPreconditioner>(*statistics,
                   wftrain::KFACPreconditionerControl{training_input_.getDamping(), training_input_.getKFACFallbackDamping(),
                       training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
@@ -4091,6 +4096,7 @@ void WFTrainBatched::run()
             std::exception_ptr observation_failure;
             try
             {
+              NativeTimerScope timer(phase_timers_.affine_observation);
               statistics = std::make_unique<wftrain::KFACFactorAccumulator>(
                   makeLiveKFACRegistry(*selected_provider_), parameters->version,
                   training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
@@ -4114,7 +4120,11 @@ void WFTrainBatched::run()
             if (kfac_optimizer)
             {
               std::exception_ptr preparation_failure;
-              try { kfac_optimizer->prepareStatistics(*statistics); }
+              try
+              {
+                NativeTimerScope timer(phase_timers_.kfac_inverse);
+                kfac_optimizer->prepareStatistics(*statistics);
+              }
               catch (...) { preparation_failure = std::current_exception(); }
               try
               {
@@ -4145,7 +4155,10 @@ void WFTrainBatched::run()
             inverse_control.damping_policy =
                 training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
                     ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT;
-            wftrain::KFACPreconditioner inverse(*statistics, inverse_control);
+            auto inverse = [&]() {
+              NativeTimerScope timer(phase_timers_.kfac_inverse);
+              return wftrain::KFACPreconditioner(*statistics, inverse_control);
+            }();
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                 checkedMemoryAdd(statistics->retainedNumericBytes(), inverse.storageDiagnostics().retained_numeric_bytes));
             enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
