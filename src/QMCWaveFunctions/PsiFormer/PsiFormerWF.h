@@ -405,6 +405,9 @@ public:
   /// Classify generic curvature leaves by typed cusp roles rather than tensor names.
   std::vector<std::size_t> genericKFACParameterBlocks() const override;
 
+  /// Numeric HOST scratch required by one sequential affine observation.
+  std::size_t affineScoreStorageBytes() const;
+
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
                            wftrain::AffineScoreObserver& observer,

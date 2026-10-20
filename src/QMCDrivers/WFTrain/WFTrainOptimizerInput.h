@@ -9,6 +9,7 @@
 #define QMCPLUSPLUS_WFTRAIN_OPTIMIZER_INPUT_H
 
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 
 #include <stdexcept>
@@ -16,6 +17,49 @@
 
 namespace qmcplusplus::wftrain
 {
+
+/// Explicit score conventions select the same estimator on CPU and GPU providers.
+inline bool hasExplicitKFACPolicy(const WFTrainDriverInput& input) noexcept
+{
+  using I = WFTrainDriverInput;
+  return input.getKFACDefaults() != I::KFACDefaults::LEGACY ||
+      input.getKFACGradient() != I::KFACGradient::LEGACY ||
+      input.getKFACUpdateOrder() != I::KFACUpdateOrder::POST_INVERSE_RATE ||
+      input.getKFACScheduleArithmetic() != I::KFACScheduleArithmetic::DIVIDE_RATE;
+}
+
+/// Preserve legacy energy-response routing unless a score convention was selected.
+inline bool usesKFACScoreEstimator(const WFTrainDriverInput& input, bool paired_complex) noexcept
+{
+  return input.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
+      (paired_complex || input.getKFACDefaults() != WFTrainDriverInput::KFACDefaults::LEGACY ||
+       input.getKFACGradient() != WFTrainDriverInput::KFACGradient::LEGACY);
+}
+
+/// Input part of the bounded real/open hybrid contract; the driver checks physics and topology.
+inline bool supportsHybridKFACPolicy(const WFTrainDriverInput& input) noexcept
+{
+  using I = WFTrainDriverInput;
+  const auto objective = input.getKFACObjective();
+  const auto gradient = input.getKFACGradient();
+  return input.getOptimizer() == I::Optimizer::KFAC && input.getObjective() == I::Objective::ENERGY &&
+      input.getLineSearch() == I::LineSearch::OFF && hasExplicitKFACPolicy(input) &&
+      (objective == I::KFACObjective::RAW_COVARIANCE || objective == I::KFACObjective::CLIPPED_COVARIANCE) &&
+      (gradient == I::KFACGradient::HALF_COVARIANCE || gradient == I::KFACGradient::PHYSICAL_COVARIANCE) &&
+      input.getMaximumRetainedBytes() > 0 &&
+      input.getMaximumRetainedBytes() != std::numeric_limits<std::size_t>::max();
+}
+
+/// Choose the finite-sample score convention independently of numerical placement.
+inline EnergyGradientEstimator kfacScoreEstimator(const WFTrainDriverInput& input) noexcept
+{
+  using G = WFTrainDriverInput::KFACGradient;
+  if (input.getKFACGradient() == G::HALF_COVARIANCE)
+    return EnergyGradientEstimator::HALF_SCORE_COVARIANCE;
+  if (input.getKFACGradient() == G::REAL_CENTERED_RESIDUAL)
+    return EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL;
+  return EnergyGradientEstimator::SCORE_COVARIANCE;
+}
 
 /** Return the stable input spelling used in diagnostics and persisted metadata. */
 inline std::string_view optimizerName(WFTrainDriverInput::Optimizer optimizer) noexcept

@@ -7651,6 +7651,12 @@ std::vector<std::size_t> PsiFormerWF::genericKFACParameterBlocks() const
   return result;
 }
 
+std::size_t PsiFormerWF::affineScoreStorageBytes() const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  return pf::scoreWorkspaceStorageRequirement(makeBatchMemoryPolicyInput().storage_shape);
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

@@ -34,6 +34,53 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 
 } // namespace
 
+TEST_CASE("KFAC score estimator selection preserves explicit conventions across placements",
+          "[drivers][wf_train][kfac][score_policy]")
+{
+  using E = wftrain::EnergyGradientEstimator;
+  const auto legacy = parseTrainingInput("<qmc><training optimizer='kfac'/></qmc>");
+  CHECK_FALSE(wftrain::hasExplicitKFACPolicy(legacy));
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(legacy, false));
+  CHECK(wftrain::usesKFACScoreEstimator(legacy, true));
+  const std::array<std::string, 3> conventions{
+      "half_covariance", "physical_covariance", "real_centered_residual"};
+  const std::array<E, 3> estimators{
+      E::HALF_SCORE_COVARIANCE, E::SCORE_COVARIANCE, E::REAL_CENTERED_SCORE_RESIDUAL};
+  for (std::size_t i = 0; i < conventions.size(); ++i)
+  {
+    const auto input = parseTrainingInput("<qmc><training optimizer='kfac'>"
+        "<parameter name='kfac_gradient_convention'>" + conventions[i] + "</parameter></training></qmc>");
+    CHECK(wftrain::hasExplicitKFACPolicy(input));
+    CHECK(wftrain::usesKFACScoreEstimator(input, false));
+    CHECK(wftrain::usesKFACScoreEstimator(input, true));
+    CHECK(wftrain::kfacScoreEstimator(input) == estimators[i]);
+  }
+  const auto adam = parseTrainingInput("<qmc><training optimizer='adam'/></qmc>");
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(adam, false));
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(adam, true));
+}
+
+TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policies",
+          "[drivers][wf_train][kfac][score_policy]")
+{
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training objective='energy' optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  const std::string cap = "<parameter name='maximum_retained_bytes'>10485760</parameter>";
+  const std::string half = "<parameter name='kfac_gradient_convention'>half_covariance</parameter>";
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse("")));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(half)));
+  CHECK(wftrain::supportsHybridKFACPolicy(parse(cap + half)));
+  CHECK(wftrain::supportsHybridKFACPolicy(parse(cap +
+      "<parameter name='kfac_gradient_convention'>physical_covariance</parameter>")));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(cap +
+      "<parameter name='kfac_gradient_convention'>real_centered_residual</parameter>")));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(cap + half +
+      "<parameter name='kfac_objective'>componentwise_mad_covariance</parameter>")));
+  CHECK_FALSE(wftrain::supportsHybridKFACPolicy(parse(cap + half +
+      "<parameter name='line_search'>reference</parameter>")));
+}
+
 TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers][wf_train][kfac]")
 {
   using I = WFTrainDriverInput;

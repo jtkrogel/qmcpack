@@ -1286,17 +1286,6 @@ std::size_t kfacStatisticsBytes(const wftrain::KFACBlockRegistry& registry)
   return checkedMemoryMultiply(elements, sizeof(wftrain::DerivativeReal));
 }
 
-/// Resolve the explicit finite-sample score convention independently of numeric settings.
-wftrain::EnergyGradientEstimator kfacScoreEstimator(const WFTrainDriverInput& input)
-{
-  using G = WFTrainDriverInput::KFACGradient;
-  if (input.getKFACGradient() == G::HALF_COVARIANCE)
-    return wftrain::EnergyGradientEstimator::HALF_SCORE_COVARIANCE;
-  if (input.getKFACGradient() == G::REAL_CENTERED_RESIDUAL)
-    return wftrain::EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL;
-  return wftrain::EnergyGradientEstimator::SCORE_COVARIANCE;
-}
-
 /// Prepare scalar-only complex weighting after every rank has completed product preparation.
 wftrain::EnergyClippingTransform makeComplexKFACClipping(Communicate& communicator,
     const std::vector<wftrain::PreparedEnergyGradientBatch>& batches,
@@ -2128,20 +2117,27 @@ void WFTrainBatched::process(xmlNodePtr node)
 
     // Visible device ordinals may differ under rank-local GPU masks. Agree on
     // physical identities before sampling or entering optimizer collectives.
-    const bool explicit_kfac_policy = training_input_.getKFACDefaults() != WFTrainDriverInput::KFACDefaults::LEGACY ||
-        training_input_.getKFACGradient() != WFTrainDriverInput::KFACGradient::LEGACY ||
-        training_input_.getKFACUpdateOrder() != WFTrainDriverInput::KFACUpdateOrder::POST_INVERSE_RATE ||
-        training_input_.getKFACScheduleArithmetic() != WFTrainDriverInput::KFACScheduleArithmetic::DIVIDE_RATE;
-    const bool cpu_score_policy = complex_training_component_ || explicit_kfac_policy;
-    if (explicit_kfac_policy && (selected_provider_->usesAcceleratorParameterProducts() ||
+    const bool explicit_kfac_policy = wftrain::hasExplicitKFACPolicy(training_input_);
+    const bool score_policy = complex_training_component_ || explicit_kfac_policy;
+    bool hybrid_score_kfac = false;
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    hybrid_score_kfac = wftrain::supportsHybridKFACPolicy(training_input_) && selected_provider_->usesAcceleratorParameterProducts() &&
+        dynamic_cast<PsiFormerWF*>(selected_provider_) && student_prototype_.getOrbitals().size() == 1 &&
+        population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+        !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
+        vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+#endif
+    if (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
         (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !complex_training_component_) ||
         training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF))
-      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider and line_search=off");
-    if (cpu_score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
+      throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or sole real/open/AE FP64 "
+          "GPU rank1 PBYP/no-drift covariance training with finite retained cap; line_search=off is required");
+    if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
         (training_input_.getKFACClipMode() != WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN ||
          training_input_.getKFACExcludeWidth() != std::numeric_limits<double>::infinity()))
-      throw UniformCommunicateError("CPU score-only KFAC soft weighting does not support hard windows or exclusion");
+      throw UniformCommunicateError("Score-only KFAC soft weighting does not support hard windows or exclusion");
     wftrain::agreeAcceleratorRuntimePlacement(*myComm, selected_provider_->usesAcceleratorParameterProducts());
 
     const AdjustedWalkerCounts walker_counts = adjustGlobalWalkerCount(
@@ -2159,6 +2155,13 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
     initPopulationAndCrowds(walker_counts);
+    if (hybrid_score_kfac)
+    {
+      if (crowds_.size() != 1)
+        throw UniformCommunicateError("Hybrid score KFAC requires one actual training crowd before sampling");
+      app_log() << "WFTrain hybrid score KFAC: evaluation/score/publication=GPU, affine/factors/inverse/state=HOST; "
+                   "parameter authority=HOST, local energy=native Hamiltonian" << std::endl;
+    }
     // Each statistical block retains its own samples; one serialized Products
     // lane is shared across those snapshots under the checked S=W*blocks preflight.
     if (complex_gpu_provider_ && (crowds_.size() != 1 || steps_per_block_ != 1))
@@ -2594,12 +2597,8 @@ void WFTrainBatched::run()
       wftrain::TrainingCapability::VALUE_EVALUATION};
   const bool complex_kfac_training = complex_training && !complex_gpu_provider_ &&
       training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC;
-  const bool score_kfac_training = complex_kfac_training ||
-      (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
-       !selected_provider_->usesAcceleratorParameterProducts() &&
-       (training_input_.getKFACDefaults() != WFTrainDriverInput::KFACDefaults::LEGACY ||
-        training_input_.getKFACGradient() != WFTrainDriverInput::KFACGradient::LEGACY));
-  const auto kfac_estimator = kfacScoreEstimator(training_input_);
+  const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_kfac_training);
+  const auto kfac_estimator = wftrain::kfacScoreEstimator(training_input_);
   wftrain::HighParameterTraining trainer(
       requirements, score_kfac_training ? kfac_estimator :
           complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
@@ -3695,6 +3694,21 @@ void WFTrainBatched::run()
             NativeTimerScope timer(phase_timers_.affine_observation);
             parameters.emplace(selected_provider_->snapshotParameters());
             auto registry = makeLiveKFACRegistry(*selected_provider_);
+            if (const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+                real && real->usesAcceleratorParameterProducts())
+            {
+              // Sequential HOST observations borrow no device outputs. Admit their
+              // transient tape and score/snapshot vectors alongside retained owners.
+              const auto affine_bytes = real->affineScoreStorageBytes();
+              const auto vectors = checkedMemoryMultiply(schema.parameterCount(), 3 * sizeof(double));
+              auto live = checkedMemoryAdd(retained_configuration_bytes, storage_diagnostics.retained_numeric_bytes);
+              live = checkedMemoryAdd(live, checkedMemoryAdd(affine_bytes, vectors));
+              live = checkedMemoryAdd(live, kfacStatisticsBytes(registry));
+              if (kfac_optimizer)
+                live = checkedMemoryAdd(live, kfac_optimizer->retainedNumericBytes());
+              enforceMemoryBudget(*myComm, live, training_input_.getMaximumRetainedBytes());
+              logTrainingAllocation("hybrid_kfac_host_affine", 1, schema.parameterCount(), affine_bytes);
+            }
             logTrainingAllocation("complex_kfac_transactional_factors", 0, schema.parameterCount(),
                                   kfacStatisticsBytes(registry));
             statistics = std::make_unique<wftrain::KFACFactorAccumulator>(std::move(registry), parameters->version,
