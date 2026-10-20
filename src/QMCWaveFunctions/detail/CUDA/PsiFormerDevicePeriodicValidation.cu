@@ -52,7 +52,8 @@ void near(double actual, double expected, const char* quantity, double tolerance
 pf::Parameters smallParameters(const ExecutionEnvironment& environment)
 {
   const ModelShape production{2, 2, 2, 16, 256, 4, 4};
-  const auto profile = environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX
+  const auto profile = environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1
+      ? PSIFORMER_PERIODIC_PAIR_V1 : environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX
       ? PSIFORMER_COMPLEX_PERIODIC_V1 : DEEPQMC_PSIFORMER_V1;
   const auto initialized = initializePsiFormerParameters(production, 1729, profile, environment);
   const PsiFormerExecutionPlan production_plan(production, initialized.layouts, environment);
@@ -63,6 +64,8 @@ pf::Parameters smallParameters(const ExecutionEnvironment& environment)
     if (tensor.attention_block != NO_ATTENTION_BLOCK && tensor.attention_block >= 2)
       continue;
     auto shape = tensor.shape;
+    if (tensor.role == ParameterRole::PAIR_ATTENTION_WEIGHT || tensor.role == ParameterRole::PAIR_ATTENTION_BIAS)
+      shape.back() = 2;
     std::size_t count = 1;
     for (auto& extent : shape)
     {
@@ -74,7 +77,9 @@ pf::Parameters smallParameters(const ExecutionEnvironment& environment)
     const bool rescale = tensor.role != ParameterRole::ELECTRON_EMBEDDING_WEIGHT &&
         (tensor.shape.size() == 1 || (tensor.shape.size() == 2 && tensor.shape[0] == 256));
     for (std::size_t index = 0; index < count; ++index)
-      values.push_back(initialized.values[tensor.begin + index] * (rescale ? 4.0 : 1.0));
+      values.push_back(tensor.role == ParameterRole::PAIR_ATTENTION_WEIGHT || tensor.role == ParameterRole::PAIR_ATTENTION_BIAS
+          ? .03 * (static_cast<int>((index + 3 * tensor.attention_block) % 11) - 5)
+          : initialized.values[tensor.begin + index] * (rescale ? 4.0 : 1.0));
     layouts.push_back({tensor.module, tensor.name, shape, begin, values.size()});
   }
   return pf::Parameters(std::move(values), std::move(layouts));
@@ -99,13 +104,26 @@ pf::ConfigData configurations(const ExecutionEnvironment& environment)
 }
 
 /// Validate one skew-cell model using real numerical GPU roots, never fallback.
-void validate()
+void validate(bool selected_two_cell = false)
 {
   ExecutionEnvironment environment;
   environment.boundary = BoundaryCondition::PERIODIC;
   environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
   environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
   environment.periodic_axes = {true, true, true};
+  if (selected_two_cell)
+  {
+    environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    auto metadata = std::make_shared<PeriodicProfileMetadata>();
+    metadata->cells.primitive = metadata->cells.simulation =
+        {pf::GeometryBoundaryKind::PERIODIC, environment.lattice_vectors, environment.periodic_axes};
+    for (double& entry : metadata->cells.primitive.lattice_vectors[0]) entry *= .5;
+    metadata->cells.tiling[0][0] = 2;
+    metadata->primitive_motif = {{.1, .2, -.1}, {.8, -.3, .7}};
+    metadata->motif_species = {3, 1};
+    metadata->occupied_columns = {{{}, 0, 0, 1}, {{}, 1, 0, 1}, {{}, 0, 1, 1}, {{}, 1, 1, 1}};
+    environment.periodic_profile = std::move(metadata);
+  }
   const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
   pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
@@ -119,7 +137,9 @@ void validate()
 
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
-  auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+  std::shared_ptr<const PreparedDeviceModel> image = selected_two_cell
+      ? PreparedDeviceModel::prepareRealTwoCellProfile(plan, model.p.flat_values(), model.cfg.nuclei.x)
+      : std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
   PreparedDeviceInference value(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY, true);
   PreparedDeviceInference spatial(image, 3, queue, blas, SpatialJetMode::FULL_VGL, false, true);
   value.evaluate(model.cfg.electrons.x);
@@ -180,7 +200,8 @@ void validate()
     near(jets[layout.uncheckedPlaneOffset(2, plane, 0)], jets[layout.uncheckedPlaneOffset(0, plane, 0)], "integer-image VGL");
 
   PreparedDeviceScoreReverse reverse(image, 3, queue, blas);
-  validateTargetKinetic(model, plan, image, queue, blas);
+  if (!selected_two_cell)
+    validateTargetKinetic(model, plan, image, queue, blas);
   PreparedDeviceScoreJvp jvp(image, 3, queue, blas);
   PreparedDeviceKineticReverse kinetic(image, 3, queue, blas);
   std::vector<double> response(direction.size()), products(3);
@@ -199,6 +220,29 @@ void validate()
   kinetic.downloadResponse(response);
   for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
     near(response[parameter], cpu_kinetic_response[parameter], "complete-drift/mass kinetic response", 2e-7);
+
+  if (selected_two_cell)
+  {
+    const auto cost = estimateTargetVglCost(plan, 3, 2);
+    PreparedDeviceInference tiled(image, 3, queue, blas, SpatialJetMode::FULL_VGL, false, false,
+        InferenceStatusPolicy::SYNCHRONOUS_DEBUG,
+        {2, cost.device_workspace_bytes, cost.charged_scalar_work_units});
+    tiled.evaluate(model.cfg.electrons.x);
+    std::vector<double> tiled_phases(3), tiled_jets(jets.size()), tiled_ratios(lap_ratio.size());
+    tiled.downloadResults(tiled_phases, tiled_jets, tiled_ratios);
+    for (std::size_t index = 0; index < jets.size(); ++index) near(tiled_jets[index], jets[index], "explicit K2/full VGL");
+    for (std::size_t index = 0; index < lap_ratio.size(); ++index) near(tiled_ratios[index], lap_ratio[index], "explicit K2/full ratio");
+    for (std::size_t index = 0; index < phases.size(); ++index) near(tiled_phases[index], phases[index], "explicit K2/full phase");
+    const auto successor = image->makeUpdatedImage(model.p.flat_values(), image->version() + 1);
+    tiled.rebindModel(successor);
+    bool unavailable = false;
+    try { tiled.downloadResults(tiled_phases, tiled_jets, tiled_ratios); }
+    catch (const std::logic_error&) { unavailable = true; }
+    if (!unavailable) throw std::runtime_error("Selected two-cell rebind exposed old VGL");
+    tiled.evaluate(model.cfg.electrons.x);
+    tiled.downloadResults(tiled_phases, tiled_jets, tiled_ratios);
+    for (std::size_t index = 0; index < jets.size(); ++index) near(tiled_jets[index], jets[index], "successor K2/full VGL");
+  }
 
   const auto kinetic_bytes = kinetic.deviceWorkspaceBytes();
   kinetic.evaluateGradientResponse(spatial, weights, masses, imaginary_drift);
@@ -244,7 +288,8 @@ void validate()
   model.p.set_flat_values(minus);
   const auto minus_log = cpu_value.evaluate(*value_workspace).logabs;
   near(products[0], (plus_log - minus_log) / (2 * h), "directional log-value finite difference", 2e-7);
-  std::cout << "PASS Gamma-periodic skew-cell GPU: native initialized small model; value/VGL, image invariance, "
+  std::cout << (selected_two_cell ? "PASS selected two-cell real/log/atom/cusp GPU: " : "PASS Gamma-periodic skew-cell GPU: ")
+            << "native initialized small model; value/VGL, image invariance, "
                "canonical VJP, resident JVP/adjoint/finite-difference, complete-drift/mass kinetic and fixed-twist gradient-only responses; P="
             << direction.size() << '\n';
 }
@@ -449,8 +494,8 @@ int main(int argc, char** argv)
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
         std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only" &&
-        std::string_view(argv[1]) != "--periodic-pair-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only]");
+        std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -462,7 +507,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--periodic-pair-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--two-cell-model-only")
+      validate(true);
+    else if (argc == 2 && std::string_view(argv[1]) == "--periodic-pair-only")
       validatePeriodicPairAttention();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-target-only")
       validateComplexSpatialTargets();
