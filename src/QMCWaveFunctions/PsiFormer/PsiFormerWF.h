@@ -411,6 +411,9 @@ public:
   /// Report the physical system metadata already validated by the builder.
   bool isPseudopotentialSystem() const;
 
+  /// Match selected real pair metadata and the target's full cell/Gamma twist, not GPU readiness.
+  bool matchesRealDevicePairTarget(const ParticleSet& particles) const;
+
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
                            wftrain::AffineScoreObserver& observer,

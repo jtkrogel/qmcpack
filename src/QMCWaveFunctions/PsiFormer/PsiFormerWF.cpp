@@ -7664,6 +7664,32 @@ bool PsiFormerWF::isPseudopotentialSystem() const
   return system_kind_ == "pseudopotential";
 }
 
+/// Check immutable pair geometry against a native target without copying parameter leaves.
+bool PsiFormerWF::matchesRealDevicePairTarget(const ParticleSet& particles) const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  const auto& state = transaction.state();
+  const auto& environment = state.execution_plan.environment();
+  if (!psiformer::matchesRealDevicePairMetadata(environment) || state.twist_phase.active() ||
+      particles.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+    return false;
+  constexpr double tolerance = 128 * std::numeric_limits<double>::epsilon();
+  for (std::size_t axis = 0; axis < 3; ++axis)
+  {
+    if (!std::isfinite(particles.getTwist()[axis]) || particles.getTwist()[axis] != 0.0)
+      return false;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double actual = particles.getLattice().R(axis, dimension);
+      const double expected = environment.lattice_vectors[axis][dimension];
+      if (!std::isfinite(actual) || !std::isfinite(expected) ||
+          std::abs(actual - expected) > tolerance * (1 + std::abs(expected)))
+        return false;
+    }
+  }
+  return true;
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

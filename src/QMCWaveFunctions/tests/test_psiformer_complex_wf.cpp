@@ -1223,6 +1223,25 @@ TEST_CASE("Real Gamma pair components retain complete physical ions and profile 
       }
     PsiFormerWF component("real_pair", initialized, p, source, true, {}, true);
     component.validateSystem(p, source, "all_electron");
+    CHECK_FALSE(component.matchesRealDevicePairTarget(p)); // Raw/no-cusp family is not the selected device contract.
+    auto selected = initialized;
+    auto selected_metadata = std::make_shared<ps::PeriodicProfileMetadata>(*metadata);
+    selected_metadata->feature_transform = ps::PeriodicFeatureTransform::LOG_COMPLEMENT_V1;
+    selected_metadata->electron_electron_cusp = true;
+    selected.environment.periodic_profile = selected_metadata;
+    PsiFormerWF selected_component("real_pair_metadata", selected, p, source, true, {}, true);
+    selected_component.validateSystem(p, source, "all_electron");
+    CHECK(selected_component.matchesRealDevicePairTarget(p));
+    CHECK_FALSE(selected_component.usesAcceleratorParameterProducts());
+    p.setTwist(ParticleSet::PosType{.125, 0, 0});
+    CHECK_FALSE(selected_component.matchesRealDevicePairTarget(p));
+    p.setTwist(ParticleSet::PosType{});
+    auto mismatched_cell = cell();
+    mismatched_cell.R(0, 0) += .25;
+    mismatched_cell.reset();
+    const SimulationCell different_cell(mismatched_cell);
+    auto different_target = electrons(different_cell);
+    CHECK_FALSE(selected_component.matchesRealDevicePairTarget(different_target));
     const auto center = evaluate(component, p);
     const auto gradient = p.G;
     const auto laplacian = p.L;
