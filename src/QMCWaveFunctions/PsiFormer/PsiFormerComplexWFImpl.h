@@ -159,7 +159,9 @@ struct PsiFormerComplexWF::Impl
         std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image)
         : capacity(capacity), electrons(plan.modelShape().electrons()), blas(queue),
           image(shared_image ? std::move(shared_image) :
-              psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version)),
+              (plan.environment().periodic_profile
+                  ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
+                  : psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version))),
           value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas, value_cost.device_bytes)),
           full(preparation.max_targets
               ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation)
@@ -2586,6 +2588,23 @@ bool PsiFormerComplexWF::isPseudopotentialSystem() const
   return impl_->state->system_kind == "pseudopotential";
 }
 
+/// Validate the fixed physical source and selected Gamma geometry without copying learned parameters.
+bool PsiFormerComplexWF::matchesPairedDevicePairTarget(const ParticleSet& electrons) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto& state = *impl_->state;
+  if (!psiformer::matchesPairedDevicePairMetadata(state.environment) ||
+      electrons.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+    return false;
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    if (!psiformer::determinant::isFiniteReal(electrons.getTwist()[axis]) ||
+        electrons.getTwist()[axis] != 0 || state.reduced_twist[axis] != 0 || state.cartesian_twist[axis] != 0)
+      return false;
+  validateRuntimeLattice(electrons, state.environment, "Paired GPU selected target");
+  Impl::validateDerivativeSource(state);
+  return true;
+}
+
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {
@@ -2936,8 +2955,9 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::affineParameterBl
 std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::hybridAffineParameterBlocks() const
 {
   std::shared_lock read(impl_->state->mutex);
-  if (!gpuInferenceEnabled() || impl_->state->environment.periodic_profile)
-    throw std::logic_error("Hybrid affine metadata requires an explicit torus GPU family");
+  if (!gpuInferenceEnabled() || (impl_->state->environment.periodic_profile &&
+      !psiformer::matchesPairedDevicePairMetadata(impl_->state->environment)))
+    throw std::logic_error("Hybrid affine metadata requires a qualified torus or selected paired GPU family");
   return Impl::affineBlocks(*impl_->state);
 }
 
@@ -2987,8 +3007,9 @@ void PsiFormerComplexWF::prepareAffineScoresImpl(std::size_t maximum_bytes, bool
   std::shared_lock read(state->mutex);
   if (gpuInferenceEnabled() != hybrid)
     throw std::logic_error("Complex affine preparation requires its selected CPU or hybrid GPU family");
-  if (hybrid && state->environment.periodic_profile)
-    throw std::logic_error("Hybrid affine preparation requires the torus GPU profile");
+  if (hybrid && state->environment.periodic_profile &&
+      !psiformer::matchesPairedDevicePairMetadata(state->environment))
+    throw std::logic_error("Hybrid affine preparation requires the torus or selected paired GPU profile");
   impl_->requireIdle(*impl_->particles);
   Impl::validateDerivativeSource(*state);
   const auto required = Impl::AffineLane::required(*state);

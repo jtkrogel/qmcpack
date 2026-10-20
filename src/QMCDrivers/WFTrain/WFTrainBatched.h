@@ -39,6 +39,10 @@ namespace wftrain
 {
 /// Validate and fingerprint only the selected real pair native AE Ewald physics row.
 std::string realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian);
+#ifdef QMC_COMPLEX
+/// Fingerprint the selected paired AE full-cell Ewald physics after exact native-source validation.
+std::string pairedPairCoulombIdentity(const PsiFormerComplexWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian);
+#endif
 }
 
 namespace psiformer

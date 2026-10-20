@@ -1943,12 +1943,13 @@ std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons,
 
 } // namespace
 
-/// Bind the selected pair stage to actual full-cell AE Ewald physics, not a model label alone.
-std::string wftrain::realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
+namespace
 {
-  if (!component.matchesRealDevicePairTarget(electrons) || component.isPseudopotentialSystem() ||
-      hamiltonian.hasPhysicalNLPP() || hamiltonian.ecpModelProvenance())
-    throw std::invalid_argument("Real pair GPU training requires selected Gamma all-electron two-cell metadata");
+/// Reuse only typed full-cell Ewald checks; component-specific source validation stays explicit.
+template<class ValidateSource>
+std::string pairCoulombIdentity(ParticleSet& electrons, QMCHamiltonian& hamiltonian,
+    const std::string& model_identity, const char* prefix, ValidateSource validate_source)
+{
   const auto& species = electrons.getSpeciesSet();
   const int charge = species.findAttribute("charge");
   const auto& masses = electrons.get_mass_by_group();
@@ -1998,12 +1999,41 @@ std::string wftrain::realPairCoulombIdentity(PsiFormerWF& component, ParticleSet
   }
   if (kinetic != 1 || !ee || !ii || !ei || &ee->Ps != &electrons || &ii->Ps != &ei->getSourcePSet())
     throw std::invalid_argument("Real pair GPU training requires actual matching electron/ion Ewald sources");
-  component.validateSystem(electrons, ei->getSourcePSet(), "all_electron");
-  extendStageFingerprint(hash, component.trainingConfigurationFingerprint());
+  validate_source(ei->getSourcePSet());
+  extendStageFingerprint(hash, model_identity);
   std::ostringstream identity;
-  identity << "real-gpu-pair-coulomb-v1/" << std::hex << hash;
+  identity << prefix << std::hex << hash;
   return identity.str();
 }
+} // namespace
+
+/// Preserve the existing real profile's physical checks and restart identity exactly.
+std::string wftrain::realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
+{
+  if (!component.matchesRealDevicePairTarget(electrons) || component.isPseudopotentialSystem() ||
+      hamiltonian.hasPhysicalNLPP() || hamiltonian.ecpModelProvenance())
+    throw std::invalid_argument("Real pair GPU training requires selected Gamma all-electron two-cell metadata");
+  return pairCoulombIdentity(electrons, hamiltonian, component.trainingConfigurationFingerprint(),
+      "real-gpu-pair-coulomb-v1/", [&](const ParticleSet& ions) {
+        component.validateSystem(electrons, ions, "all_electron");
+      });
+}
+
+#ifdef QMC_COMPLEX
+/// Bind paired selected training to the actual target and full physical ionic source.
+std::string wftrain::pairedPairCoulombIdentity(const PsiFormerComplexWF& component, ParticleSet& electrons,
+    QMCHamiltonian& hamiltonian)
+{
+  if (!component.matchesPairedDevicePairTarget(electrons) || component.isPseudopotentialSystem() ||
+      hamiltonian.hasPhysicalNLPP() || hamiltonian.ecpModelProvenance() || &component.targetParticles() != &electrons)
+    throw std::invalid_argument("Paired pair GPU training requires selected Gamma all-electron two-cell metadata");
+  return pairCoulombIdentity(electrons, hamiltonian, component.trainingConfigurationFingerprint(),
+      "paired-gpu-pair-coulomb-v1/", [&](const ParticleSet& ions) {
+        if (&component.sourceParticles() != &ions)
+          throw std::invalid_argument("Paired pair GPU Ewald source differs from its actual fixed source");
+      });
+}
+#endif
 
 WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                                QMCDriverInput&& qmcdriver_input,
@@ -2319,6 +2349,8 @@ void WFTrainBatched::process(xmlNodePtr node)
         (ae || scalar_pp) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    selected_pair_accelerator = complex_gpu_provider_ &&
+        complex_training_component_->matchesPairedDevicePairTarget(population_.get_golden_electrons());
     hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
         !complex_training_component_->isPseudopotentialSystem() &&
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
@@ -2367,11 +2399,9 @@ void WFTrainBatched::process(xmlNodePtr node)
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
           (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
         throw UniformCommunicateError("GPU score-only ECP requires MPI1/block1/step1 before sampling");
-#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
-      if (real_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()) &&
+      if (selected_pair_accelerator &&
           (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
-        throw UniformCommunicateError("Selected real pair GPU KFAC requires MPI1/block1/step1 before sampling");
-#endif
+        throw UniformCommunicateError("Selected pair GPU KFAC requires MPI1/block1/step1 before sampling");
       app_log() << "WFTrain hybrid score KFAC: evaluation/score/publication=GPU, affine/factors/inverse/state=HOST; "
                    "parameter authority=HOST, local energy=native Hamiltonian, reduction=HOST raw sums, ranks="
                 << myComm->size() << std::endl;
@@ -2729,6 +2759,9 @@ void WFTrainBatched::run()
         }
       }
       complex_physical_identity = complex->trainingConfigurationFingerprint();
+      if (complex_gpu_provider_ && complex->matchesPairedDevicePairTarget(population_.get_golden_electrons()))
+        complex_physical_identity = wftrain::pairedPairCoulombIdentity(*complex,
+            population_.get_golden_electrons(), population_.get_golden_hamiltonian());
       if (const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance())
       {
         complex_physical_identity += provenance->scientific_definition;

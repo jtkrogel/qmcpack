@@ -29,7 +29,7 @@ struct InitializedPsiFormerParameters;
 }
 
 #ifdef QMC_COMPLEX
-/// Full/G-free inference with prepared structured state; GPU training discovery remains closed.
+/// Full/G-free inference with prepared CPU training and explicitly bounded hybrid GPU training.
 class PsiFormerComplexWF final : public WaveFunctionComponent, public wftrain::StructuredParameterProvider
 {
 public:
@@ -58,6 +58,9 @@ public:
 
   /// Stable physical restart identity, independent of parameter values/version and runtime addresses.
   std::string trainingConfigurationFingerprint() const;
+
+  /// Match only selected Gamma two-cell metadata and the actual immutable target/source.
+  bool matchesPairedDevicePairTarget(const ParticleSet& electrons) const;
 
   /// Match immutable model physics metadata to the native Hamiltonian route.
   bool isPseudopotentialSystem() const;

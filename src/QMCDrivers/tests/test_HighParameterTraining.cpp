@@ -19,6 +19,7 @@
 #include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
 #include "QMCDrivers/WFTrain/WFTrainBatched.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/tests/psiformer_test_utils.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
@@ -523,6 +524,40 @@ TEST_CASE("Selected real pair physics identity binds actual native Ewald sources
   CHECK(realPairCoulombIdentity(component, electrons, *physical) == identity);
   physical->addOperator(std::make_unique<HarmonicExternalPotential>(electrons), "extra");
   CHECK_THROWS(realPairCoulombIdentity(component, electrons, *physical));
+#ifdef QMC_COMPLEX
+  // The paired descriptor keeps the same neutral physical source and adds independent imaginary heads.
+  auto paired = parameters;
+  paired.environment.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+  paired.environment.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+  const auto real_layouts = paired.layouts;
+  for (const auto& leaf : real_layouts)
+    if (leaf.module.find("Backflow") != std::string::npos)
+    {
+      const auto begin = paired.values.size();
+      const auto count = leaf.end - leaf.begin;
+      paired.values.resize(begin + count, .03);
+      paired.layouts.push_back({leaf.module, "w_imag", leaf.shape, begin, begin + count});
+    }
+  PsiFormerComplexWF paired_component("paired_pair_physics", paired, electrons, ions, 16777216);
+  REQUIRE(paired_component.matchesPairedDevicePairTarget(electrons));
+  auto paired_physical = makeHamiltonian(electrons, electrons, electrons);
+  const auto paired_identity = pairedPairCoulombIdentity(paired_component, electrons, *paired_physical);
+  CHECK_FALSE(paired_identity.empty());
+  CHECK(paired_identity != identity);
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *makeHamiltonian(other, electrons, electrons)));
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *makeHamiltonian(electrons, other, electrons)));
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *makeHamiltonian(electrons, electrons, other)));
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, other, *paired_physical));
+  species(charge, 0) = -.5;
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *paired_physical));
+  species(charge, 0) = -1;
+  ions.R[1][0] += .01;
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *paired_physical));
+  ions.R[1][0] -= .01;
+  CHECK(pairedPairCoulombIdentity(paired_component, electrons, *paired_physical) == paired_identity);
+  paired_physical->addOperator(std::make_unique<HarmonicExternalPotential>(electrons), "extra");
+  CHECK_THROWS(pairedPairCoulombIdentity(paired_component, electrons, *paired_physical));
+#endif
 }
 
 TEST_CASE("Energy gradient streaming matches both finite-sample estimators",

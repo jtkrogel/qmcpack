@@ -290,6 +290,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
   selected_pair_gpu = pair_profile && !complex_profile && system == "all_electron" &&
       (pair_request == "cuda" || pair_request == "hip");
+#elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  selected_pair_gpu = pair_profile && complex_profile && system == "all_electron" && pair_request == "cuda";
 #endif
   if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
       (pair_request != "no" && pair_request != "cpu" && !selected_pair_gpu) ||
@@ -310,7 +312,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&
         optimization_enabled && optimize_scope == "all" && optimize_indices.empty() &&
         (system == "all_electron" || cpu_ecp);
-    if ((!explicit_gpu && request != "no" && request != "cpu") || (optimization_enabled && !cpu_training) ||
+    const bool selected_gpu_training = selected_pair_gpu && optimization_enabled &&
+        optimize_scope == "all" && optimize_indices.empty();
+    if ((!explicit_gpu && request != "no" && request != "cpu") ||
+        (optimization_enabled && !cpu_training && !selected_gpu_training) ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Complex PsiFormer requires qualified CPU optimize_scope=all training or "
                                  "CPU/strict cuda/hip inference, and fp64_reference");
@@ -319,7 +324,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         (system != "all_electron" && !gpu_ecp && !cpu_ecp) ||
         !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() ||
-        optimize_scope != (cpu_training ? "all" : "indices"))
+        optimize_scope != ((cpu_training || selected_gpu_training) ? "all" : "indices"))
       throw std::invalid_argument("Complex PsiFormer requires explicit qualified periodic native metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
     if (explicit_gpu)
@@ -389,6 +394,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
   if (pair_profile && !complex_profile && (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Real versioned periodic profiles currently require Gamma twist");
+  if (pair_profile && complex_profile && selected_pair_gpu && (nonzero_twist || !particle_twist_is_zero))
+    throw std::invalid_argument("Selected paired GPU periodic profiles require Gamma twist");
   if (complex_profile && system == "pseudopotential" &&
       accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
       (nonzero_twist || !particle_twist_is_zero))
@@ -511,9 +518,13 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     if (direct_model)
       psiformer::validatePsiFormerModelFile(*imported_model, parameters, targetPtcl, *source_particles,
                                             system, twist_array);
-    if (selected_pair_gpu && !psiformer::matchesRealDevicePairMetadata(
-            direct_model ? imported_model->parameters.environment : environment))
-      throw std::invalid_argument("GPU periodic pair metadata requires real Gamma log-complement atom-centered cusp physics");
+    if (selected_pair_gpu)
+    {
+      const auto& selected_environment = direct_model ? imported_model->parameters.environment : environment;
+      if (!(complex_profile ? psiformer::matchesPairedDevicePairMetadata(selected_environment)
+                            : psiformer::matchesRealDevicePairMetadata(selected_environment)))
+        throw std::invalid_argument("GPU periodic pair metadata requires Gamma log-complement atom-centered cusp physics");
+    }
     if (selected_pair_gpu)
     {
       accelerator_resolution = resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
