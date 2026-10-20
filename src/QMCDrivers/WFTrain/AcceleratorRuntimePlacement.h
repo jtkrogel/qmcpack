@@ -34,10 +34,19 @@ struct AcceleratorRuntimePlacement
  */
 void validateAcceleratorRuntimePlacements(const std::vector<AcceleratorRuntimePlacement>& ranks);
 
+/** Check exclusive native GPU consumers across calculation groups, ignoring inactive ranks.
+ * Inactive records do not identify legacy GPU consumers; mixed legacy GPU use
+ * is outside this native-only check.
+ */
+void validateNativeAcceleratorRuntimePlacements(const std::vector<AcceleratorRuntimePlacement>& ranks);
+
 /** Probe the selected runtime device and agree on placement before throwing.
  * Every rank must call once, including host providers; no scheduling is performed.
  */
 void agreeAcceleratorRuntimePlacement(Communicate& communicator, bool accelerator);
+
+/// One common startup census, with actual native GPU participation on every WORLD rank.
+void agreeNativeAcceleratorRuntimePlacement(Communicate& communicator, bool native_accelerator);
 
 } // namespace qmcplusplus::wftrain
 

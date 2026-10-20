@@ -9,6 +9,7 @@
  */
 
 #include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
+#include "Message/Communicate.h"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <string>
@@ -29,6 +30,33 @@ AcceleratorRuntimePlacement devicePlacement(const std::string& host, const std::
 }
 
 } // namespace
+
+TEST_CASE("Job-wide native placement permits CPU groups but rejects cross-group collisions",
+          "[drivers][wftrain][accelerator][placement][native_job]")
+{
+  AcceleratorRuntimePlacement inactive;
+  const auto first = devicePlacement("node-a", "0000:01:00.0");
+  const auto second = devicePlacement("node-a", "0000:02:00.0");
+  CHECK_NOTHROW(validateNativeAcceleratorRuntimePlacements({inactive, first, inactive, second}));
+  CHECK_NOTHROW(validateNativeAcceleratorRuntimePlacements({inactive, inactive}));
+  CHECK_THROWS(validateNativeAcceleratorRuntimePlacements({}));
+  CHECK_THROWS(validateNativeAcceleratorRuntimePlacements({first, inactive, first}));
+  auto failed = first;
+  failed.probe_succeeded = false;
+  CHECK_THROWS(validateNativeAcceleratorRuntimePlacements({inactive, failed}));
+  failed.accelerator = false; // Inactive ranks do not probe or reserve a GPU.
+  CHECK_NOTHROW(validateNativeAcceleratorRuntimePlacements({first, failed}));
+  auto malformed = first;
+  malformed.pci_bus_id.back() = 'x';
+  CHECK_THROWS(validateNativeAcceleratorRuntimePlacements({inactive, malformed}));
+  CHECK_NOTHROW(validateNativeAcceleratorRuntimePlacements({first, devicePlacement("node-b", "0000:01:00.0")}));
+}
+
+TEST_CASE("Native job census gathers inactive CPU ranks without a device probe",
+          "[drivers][wftrain][accelerator][placement][native_job]")
+{
+  CHECK_NOTHROW(agreeNativeAcceleratorRuntimePlacement(*OHMMS::Controller, false));
+}
 
 TEST_CASE("Accelerator physical placement is independent of visible ordinals",
           "[drivers][wftrain][accelerator][placement]")

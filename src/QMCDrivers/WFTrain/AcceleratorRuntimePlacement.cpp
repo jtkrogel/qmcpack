@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -51,8 +52,34 @@ void validateAcceleratorRuntimePlacements(const std::vector<AcceleratorRuntimePl
   }
 }
 
+/// Validate only constructed native consumers; CPU and unknown legacy routes are inactive.
+void validateNativeAcceleratorRuntimePlacements(const std::vector<AcceleratorRuntimePlacement>& ranks)
+{
+  if (ranks.empty())
+    throw std::invalid_argument("Native accelerator placement requires at least one participant");
+  std::map<std::pair<std::string, std::string>, std::size_t> device_ranks;
+  for (std::size_t rank = 0; rank < ranks.size(); ++rank)
+  {
+    const auto& current = ranks[rank];
+    if (!current.accelerator)
+      continue;
+    if (!current.probe_succeeded)
+      throw std::runtime_error("Native accelerator placement probe failed on WORLD rank " + std::to_string(rank));
+    if (current.hostname.front() == '\0' || current.pci_bus_id.front() == '\0' ||
+        current.hostname.back() != '\0' || current.pci_bus_id.back() != '\0')
+      throw std::invalid_argument("Native accelerator placement contains an invalid physical identifier");
+    const auto inserted = device_ranks.emplace(
+        std::make_pair(std::string(current.hostname.data()), std::string(current.pci_bus_id.data())), rank);
+    if (!inserted.second)
+      throw std::runtime_error("Native GPU consumers across calculation groups require distinct physical GPUs; WORLD ranks " +
+                               std::to_string(inserted.first->second) + " and " + std::to_string(rank) + " share a device");
+  }
+}
+
+namespace
+{
 /// Gather probe status even after a local runtime failure, avoiding stranded peers.
-void agreeAcceleratorRuntimePlacement(Communicate& communicator, bool accelerator)
+std::vector<AcceleratorRuntimePlacement> gatherRuntimePlacements(Communicate& communicator, bool accelerator)
 {
   // Explicit fields avoid transmitting struct padding or assuming a vendor UUID ABI.
   constexpr std::size_t hostname_words = 256 / sizeof(std::uint64_t);
@@ -96,7 +123,20 @@ void agreeAcceleratorRuntimePlacement(Communicate& communicator, bool accelerato
     std::memcpy(ranks[rank].hostname.data(), record + 2, placement.hostname.size());
     std::memcpy(ranks[rank].pci_bus_id.data(), record + 2 + hostname_words, placement.pci_bus_id.size());
   }
-  validateAcceleratorRuntimePlacements(ranks);
+  return ranks;
+}
+} // namespace
+
+/// Preserve calculation-local uniform host/device admission.
+void agreeAcceleratorRuntimePlacement(Communicate& communicator, bool accelerator)
+{
+  validateAcceleratorRuntimePlacements(gatherRuntimePlacements(communicator, accelerator));
+}
+
+/// Agree once across the job before independently scheduled calculation groups run.
+void agreeNativeAcceleratorRuntimePlacement(Communicate& communicator, bool native_accelerator)
+{
+  validateNativeAcceleratorRuntimePlacements(gatherRuntimePlacements(communicator, native_accelerator));
 }
 
 } // namespace qmcplusplus::wftrain

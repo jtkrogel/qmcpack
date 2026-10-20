@@ -36,7 +36,11 @@
 #include "ParticleBase/RandomSeqGenerator.h"
 #include "QMCDrivers/QMCDriver.h"
 #include "QMCDrivers/CloneManager.h"
+#include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "Message/Communicate.h"
+#include "Message/CommOperators.h"
 #include "Message/UniformCommunicateError.h"
 #include "Concurrency/OpenMP.h"
 #include "Estimators/EstimatorInputDelegates.h"
@@ -192,6 +196,13 @@ bool QMCMain::execute()
     simType.put(cur);
   }
 
+  // All groups must reach the same startup census; AFQMC returns before the
+  // realspace object pools exist. Reject mixed families before that divergence.
+  int afqmc_ranks = simulationType == "afqmc" ? 1 : 0;
+  OHMMS::Controller->allreduce(afqmc_ranks);
+  if (afqmc_ranks != 0 && afqmc_ranks != OHMMS::Controller->size())
+    throw UniformCommunicateError("One ensemble job cannot mix AFQMC and realspace simulation families");
+
 #ifdef BUILD_AFQMC
   if (simulationType == "afqmc")
   {
@@ -247,6 +258,20 @@ bool QMCMain::execute()
   particle_set_pool_->get(app_log());
   ham_pool_->get(app_log());
   OHMMS::Controller->barrier();
+  // Constructed native GPU components are real consumers even before the first
+  // QMC action. Do not infer legacy/CPU consumption from compiled GPU support.
+  bool native_accelerator = false;
+  for (const auto& entry : psi_pool_->getPool())
+    for (const auto& component : entry.second->getOrbitals())
+    {
+      if (const auto* real = dynamic_cast<const PsiFormerWF*>(component.get()))
+        native_accelerator = native_accelerator || real->usesAcceleratorParameterProducts();
+#ifdef QMC_COMPLEX
+      if (const auto* paired = dynamic_cast<const PsiFormerComplexWF*>(component.get()))
+        native_accelerator = native_accelerator || paired->gpuInferenceEnabled();
+#endif
+    }
+  wftrain::agreeNativeAcceleratorRuntimePlacement(*OHMMS::Controller, native_accelerator);
   t3.stop();
   if (qmc_common.dryrun)
   {
