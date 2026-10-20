@@ -259,10 +259,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
       (imported_model && imported_model->paired_complex) ||
       (pair_profile && profile_head == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX);
-  // Only selected paired two-cell AE metadata may proceed to the later HIP profile checks.
-  // Legacy paired, PP, reciprocal and Fourier families remain independently closed.
+  // AE paired families proceed to the existing bulk/FP64/profile/twist checks.
+  // PP remains independently closed on HIP pending physical inference qualification.
   if (complex_profile && normalizedAcceleratorRequest(gpu) == "hip" &&
-      !(pair_profile && system == "all_electron"))
+      system != "all_electron")
     throw std::invalid_argument("Paired-complex HIP native profiles require separate runtime qualification");
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
