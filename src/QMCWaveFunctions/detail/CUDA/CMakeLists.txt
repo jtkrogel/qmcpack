@@ -66,7 +66,8 @@ target_link_libraries(psiformer_device PUBLIC platform_LA)
 
 # Explicit developer target: it is not a runtime CTest and may be built safely on
 # driverless development hosts to force the backend device-link step.
-add_executable(psiformer_device_link_check EXCLUDE_FROM_ALL PsiFormerDeviceLinkCheck.cu)
+add_executable(psiformer_device_link_check EXCLUDE_FROM_ALL PsiFormerDeviceLinkCheck.cu
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp)
 if(QMC_CUDA2HIP)
   set_source_files_properties(PsiFormerDeviceLinkCheck.cu PROPERTIES LANGUAGE HIP)
 else()
