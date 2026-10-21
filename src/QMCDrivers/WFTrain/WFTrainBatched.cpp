@@ -52,6 +52,7 @@
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
@@ -2097,6 +2098,10 @@ void WFTrainBatched::process(xmlNodePtr node)
       if (auto* complex = dynamic_cast<PsiFormerComplexWF*>(orbital.get()))
       {
         complex_training_component_ = complex;
+        if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
+            psiformer::compiledPsiFormerAcceleratorSupport().hip)
+          throw UniformCommunicateError("WFTrainBatched: paired HIP pseudopotential profiles are inference-only");
+
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
         const auto optimizer = training_input_.getOptimizer();
