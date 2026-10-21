@@ -8,7 +8,9 @@
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 #include <cstdint>
+#include <array>
 #include <memory>
 
 namespace qmcplusplus::wftrain
@@ -102,6 +104,8 @@ private:
   std::string configuration_fingerprint_;
   std::unique_ptr<State> state_;
   std::unique_ptr<Pending> pending_;
+  void traceStorage() noexcept;
+  std::array<psiformer::memory::HostCapacity, 4> trace_storage_;
   DerivativeReal last_metric_ = 0.0;
   DerivativeReal last_scale_ = 1.0;
 };

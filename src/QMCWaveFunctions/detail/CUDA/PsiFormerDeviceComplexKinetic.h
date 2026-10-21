@@ -140,12 +140,23 @@ private:
         layout_(makeOpenOrbitalJetLayout(1, image->plan().modelShape().determinants, image->plan().modelShape().electrons(),
             image->plan().modelShape().nuclei, image->plan().modelShape().feature_dimension,
             image->plan().modelShape().spin_up_electrons, SpatialJetMode::FULL_VGL)),
-        envelope_(cost.head_elements), projections_(2 * cost.head_elements), head_(cost.head_elements), roots_(cost.head_elements),
-        inverse_(cost.matrices), solve_(image->plan().modelShape().determinants * image->plan().modelShape().electrons()),
-        scratch_(3 * image->plan().modelShape().electrons() * image->plan().modelShape().electrons()),
-        outputs_(5 * targets), coefficients_(4 * targets), response_(image->plan().parameterCount()),
-        masses_(image->plan().modelShape().electrons()), kappa_(3), energy_(1), permutation_(solve_.capacity()),
-        channels_(image->plan().modelShape().determinants), amplitude_(1), status_(1)
+        envelope_(cost.head_elements, "ComplexKinetic::envelope_", __FILE__, __LINE__),
+        projections_(2 * cost.head_elements, "ComplexKinetic::projections_", __FILE__, __LINE__),
+        head_(cost.head_elements, "ComplexKinetic::head_", __FILE__, __LINE__),
+        roots_(cost.head_elements, "ComplexKinetic::roots_", __FILE__, __LINE__),
+        inverse_(cost.matrices, "ComplexKinetic::inverse_", __FILE__, __LINE__),
+        solve_(image->plan().modelShape().determinants * image->plan().modelShape().electrons(), "ComplexKinetic::solve_", __FILE__, __LINE__),
+        scratch_(3 * image->plan().modelShape().electrons() * image->plan().modelShape().electrons(), "ComplexKinetic::scratch_", __FILE__, __LINE__),
+        outputs_(5 * targets, "ComplexKinetic::outputs_", __FILE__, __LINE__),
+        coefficients_(4 * targets, "ComplexKinetic::coefficients_", __FILE__, __LINE__),
+        response_(image->plan().parameterCount(), "ComplexKinetic::response_", __FILE__, __LINE__),
+        masses_(image->plan().modelShape().electrons(), "ComplexKinetic::masses_", __FILE__, __LINE__),
+        kappa_(3, "ComplexKinetic::kappa_", __FILE__, __LINE__),
+        energy_(1, "ComplexKinetic::energy_", __FILE__, __LINE__),
+        permutation_(solve_.capacity(), "ComplexKinetic::permutation_", __FILE__, __LINE__),
+        channels_(image->plan().modelShape().determinants, "ComplexKinetic::channels_", __FILE__, __LINE__),
+        amplitude_(1, "ComplexKinetic::amplitude_", __FILE__, __LINE__),
+        status_(1, "ComplexKinetic::status_", __FILE__, __LINE__)
   {
     layout_.features = withSpatialTargetRange(layout_.features, 0, targets);
     layout_.orbitals = withSpatialTargetRange(layout_.orbitals, 0, targets);

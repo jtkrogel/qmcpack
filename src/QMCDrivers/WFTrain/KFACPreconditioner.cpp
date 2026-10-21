@@ -871,6 +871,9 @@ KFACPreconditioner::KFACPreconditioner(
       }
     }
   }
+  if (psiformer::memory::enabled())
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
+        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 KFACFactorAccumulator KFACPreconditioner::statisticsFromState(
@@ -972,6 +975,9 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
                    [](auto value) { return value > 0.0; }))
     throw std::invalid_argument("KFAC inverse state has invalid fallback inverse");
   prepareScratch();
+  if (psiformer::memory::enabled())
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
+        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 void KFACPreconditioner::refreshFallbackDiagonal(const KFACFactorState& state, DerivativeReal damping)
@@ -990,6 +996,9 @@ void KFACPreconditioner::refreshFallbackDiagonal(const KFACFactorState& state, D
   }
   fallback_inverse_diagonal_.swap(inverse);
   control_.fallback_damping = damping;
+  if (psiformer::memory::enabled())
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
+        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 KFACStorageDiagnostics KFACPreconditioner::storageDiagnostics() const noexcept

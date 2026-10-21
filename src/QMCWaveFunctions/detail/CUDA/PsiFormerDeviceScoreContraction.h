@@ -49,10 +49,11 @@ public:
       throw std::invalid_argument("Device score contraction requires positive capacity");
     const auto extent = spatial_detail::checkedProduct(parameters, channels,
         "Device score contraction channel extent overflow");
-    sums_.reserve(spatial_detail::checkedProduct(extent, 2, "Device score contraction complex extent overflow"));
+    sums_.reserveNamed(spatial_detail::checkedProduct(extent, 2, "Device score contraction complex extent overflow"),
+        "ScoreContraction::sums_", __FILE__, __LINE__);
     finite_layout_ = {sums_.capacity(), 4096,
         sums_.capacity() / 4096 + (sums_.capacity() % 4096 != 0), 0, 1};
-    finite_status_.reserve(finite_layout_.status_capacity);
+    finite_status_.reserveNamed(finite_layout_.status_capacity, "ScoreContraction::finite_status_", __FILE__, __LINE__);
     host_status_.resize(finite_layout_.status_capacity);
   }
 

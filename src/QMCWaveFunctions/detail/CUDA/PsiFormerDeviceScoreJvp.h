@@ -39,21 +39,28 @@ public:
     model_->validateCurrentDevice();
     const auto& shape = model_->plan().modelShape();
     const auto features = multiply(multiply(capacity_, shape.electrons()), shape.feature_dimension);
-    for (auto* buffer : {&feature_, &query_, &key_, &value_, &context_, &residual_,
-                         &hidden_, &projected_, &work_left_, &work_right_})
-      buffer->reserve(features);
-    probability_.reserve(multiply(multiply(multiply(capacity_, shape.attention_heads),
-                                            shape.electrons()), shape.electrons()));
+    feature_.reserveNamed(features, "ScoreJvp::feature_", __FILE__, __LINE__);
+    query_.reserveNamed(features, "ScoreJvp::query_", __FILE__, __LINE__);
+    key_.reserveNamed(features, "ScoreJvp::key_", __FILE__, __LINE__);
+    value_.reserveNamed(features, "ScoreJvp::value_", __FILE__, __LINE__);
+    context_.reserveNamed(features, "ScoreJvp::context_", __FILE__, __LINE__);
+    residual_.reserveNamed(features, "ScoreJvp::residual_", __FILE__, __LINE__);
+    hidden_.reserveNamed(features, "ScoreJvp::hidden_", __FILE__, __LINE__);
+    projected_.reserveNamed(features, "ScoreJvp::projected_", __FILE__, __LINE__);
+    work_left_.reserveNamed(features, "ScoreJvp::work_left_", __FILE__, __LINE__);
+    work_right_.reserveNamed(features, "ScoreJvp::work_right_", __FILE__, __LINE__);
+    probability_.reserveNamed(multiply(multiply(multiply(capacity_, shape.attention_heads),
+                                            shape.electrons()), shape.electrons()), "ScoreJvp::probability_", __FILE__, __LINE__);
     const auto matrices = multiply(multiply(multiply(capacity_, shape.determinants),
                                             shape.electrons()), shape.electrons());
-    seeds_.reserve(matrices);
-    orbital_.reserve(matrices);
-    direction_.reserve(model_->plan().parameterCount());
-    products_.reserve(capacity_);
-    status_.reserve(capacity_);
+    seeds_.reserveNamed(matrices, "ScoreJvp::seeds_", __FILE__, __LINE__);
+    orbital_.reserveNamed(matrices, "ScoreJvp::orbital_", __FILE__, __LINE__);
+    direction_.reserveNamed(model_->plan().parameterCount(), "ScoreJvp::direction_", __FILE__, __LINE__);
+    products_.reserveNamed(capacity_, "ScoreJvp::products_", __FILE__, __LINE__);
+    status_.reserveNamed(capacity_, "ScoreJvp::status_", __FILE__, __LINE__);
     host_status_.resize(capacity_);
     host_factors_.resize(multiply(capacity_, shape.determinants));
-    finite_status_.reserve(1);
+    finite_status_.reserveNamed(1, "ScoreJvp::finite_status_", __FILE__, __LINE__);
     host_finite_status_.resize(1);
   }
 

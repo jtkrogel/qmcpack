@@ -117,11 +117,13 @@ private:
   PreparedDeviceComplexScore(std::shared_ptr<const PreparedDeviceModel> image, compute::Queue<PlatformKind::CUDA>& queue,
       AcceleratorBlasHandle& blas, ComplexScoreCost cost)
       : cost_(cost), forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true)),
-        network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices),
-        feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension),
-        ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei),
-        pair_(forward_->trunk_->ne_ * (forward_->trunk_->ne_ - 1) / 2), same_(pair_.capacity()), unit_(1),
-        score_(forward_->trunk_->plan_.parameterCount())
+        network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
+        feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension, "ComplexScore::feature_", __FILE__, __LINE__),
+        ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei, "ComplexScore::ion_", __FILE__, __LINE__),
+        pair_(forward_->trunk_->ne_ * (forward_->trunk_->ne_ - 1) / 2, "ComplexScore::pair_", __FILE__, __LINE__),
+        same_(pair_.capacity(), "ComplexScore::same_", __FILE__, __LINE__),
+        unit_(1, "ComplexScore::unit_", __FILE__, __LINE__),
+        score_(forward_->trunk_->plan_.parameterCount(), "ComplexScore::score_", __FILE__, __LINE__)
   {
     const double one = 1;
     unit_.upload(&one, 1);

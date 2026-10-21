@@ -356,13 +356,14 @@ PreparedDeviceSpatialTraces::PreparedDeviceSpatialTraces(SpatialLayout capacity,
   checkRuntime(cudaGetDevice(&device_ordinal_), "spatial trace owning device");
 #endif
   const auto targets = multiply(plan_.capacity.configuration_count, plan_.capacity.electron_count);
-  products_.reserve(plan_.product_bytes / sizeof(double));
-  stats_.reserve(multiply(multiply(targets, plan_.capacity.determinant_count), 7));
-  gradient_.reserve(multiply(targets, 3));
-  lap_ratio_.reserve(targets);
-  lap_log_.reserve(targets);
-  failure_.reserve(plan_.capacity.configuration_count);
-  status_.reserve(plan_.capacity.configuration_count);
+  products_.reserveNamed(plan_.product_bytes / sizeof(double), "SpatialTraces::products", __FILE__, __LINE__);
+  stats_.reserveNamed(multiply(multiply(targets, plan_.capacity.determinant_count), 7),
+      "SpatialTraces::stats", __FILE__, __LINE__);
+  gradient_.reserveNamed(multiply(targets, 3), "SpatialTraces::gradient", __FILE__, __LINE__);
+  lap_ratio_.reserveNamed(targets, "SpatialTraces::lap_ratio", __FILE__, __LINE__);
+  lap_log_.reserveNamed(targets, "SpatialTraces::lap_log", __FILE__, __LINE__);
+  failure_.reserveNamed(plan_.capacity.configuration_count, "SpatialTraces::failure", __FILE__, __LINE__);
+  status_.reserveNamed(plan_.capacity.configuration_count, "SpatialTraces::status", __FILE__, __LINE__);
 }
 
 PreparedDeviceSpatialTraces::~PreparedDeviceSpatialTraces()

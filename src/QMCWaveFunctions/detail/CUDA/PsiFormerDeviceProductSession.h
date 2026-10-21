@@ -75,7 +75,10 @@ class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
     std::shared_ptr<const std::size_t> token = std::make_shared<const std::size_t>(0);
     std::size_t epoch = 0;
     ResidentOpenWorkspace(const std::vector<double>& m, const std::vector<double>& z)
-        : masses(m), charges(z), device_masses(m.size()), device_charges(z.size()), energy(5), status(1)
+        : masses(m), charges(z), device_masses(m.size(), "ProductSession::device_masses", __FILE__, __LINE__),
+        device_charges(z.size(), "ProductSession::device_charges", __FILE__, __LINE__),
+        energy(5, "ProductSession::energy", __FILE__, __LINE__),
+        status(1, "ProductSession::status", __FILE__, __LINE__)
     { device_masses.upload(masses.data(), masses.size()); device_charges.upload(charges.data(), charges.size()); }
   };
 

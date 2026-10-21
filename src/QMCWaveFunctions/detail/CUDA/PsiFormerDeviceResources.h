@@ -19,6 +19,7 @@
 
 #include "PsiFormerDeviceRuntime.h"
 #include "PsiFormerDeviceMetrics.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 
 #include <limits>
 #include <stdexcept>
@@ -92,6 +93,11 @@ class DeviceBuffer
 public:
   explicit DeviceBuffer(std::size_t capacity = 0) { reserve(capacity); }
 
+  DeviceBuffer(std::size_t capacity, const char* owner, const char* file, int line)
+  {
+    reserveNamed(capacity, owner, file, line);
+  }
+
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(DeviceBuffer&&) = delete;
@@ -100,7 +106,14 @@ public:
   DeviceBuffer(DeviceBuffer&& other) noexcept
       : data_(std::exchange(other.data_, nullptr)), capacity_(std::exchange(other.capacity_, 0)),
         device_ordinal_(std::exchange(other.device_ordinal_, -1)), metrics_(std::exchange(other.metrics_, nullptr))
-  {}
+  {
+    trace_id_ = std::exchange(other.trace_id_, 0);
+    trace_owner_ = other.trace_owner_;
+    trace_file_ = other.trace_file_;
+    trace_line_ = other.trace_line_;
+    trace_device_ = other.trace_device_;
+    trace("ownership", trace_id_, capacity_ * sizeof(T));
+  }
 
   /// Release storage without throwing during exception unwinding.
   ~DeviceBuffer()
@@ -113,14 +126,26 @@ public:
       const auto result = cudaFree(data_);
 #endif
       if (result == success)
+      {
         metrics_->freed(capacity_ * sizeof(T));
+        trace("release", trace_id_, capacity_ * sizeof(T));
+      }
       else
+      {
         metrics_->failedFree();
+        trace("free_failed", trace_id_, capacity_ * sizeof(T));
+      }
     }
   }
 
   /// Grow only during preparation; requests within capacity perform no runtime call.
   void reserve(std::size_t capacity)
+  {
+    reserveNamed(capacity, "unlabelled DeviceBuffer", "unknown", 0);
+  }
+
+  /// C++17 caller identity, borrowed literals only; admission still precedes malloc.
+  void reserveNamed(std::size_t capacity, const char* owner, const char* file, int line)
   {
     if (capacity <= capacity_)
       return;
@@ -134,16 +159,42 @@ public:
     if (data_ && device_ordinal != device_ordinal_)
       throw std::logic_error("PsiFormer device buffer cannot grow on a different owning device");
     auto& metrics = deviceMemoryMetrics(device_ordinal);
+    const auto replacement_id = memory::nextIdentity();
+    const auto previous_id = trace_id_;
+    const auto request_event = [&](const char* kind) noexcept {
+      traceAt(kind, replacement_id, bytes, owner, file, line, device_ordinal, previous_id, &metrics);
+    };
+    request_event("request");
     // Charge old and replacement capacities together. Failed malloc rolls back
     // the reservation; a failed old-buffer free keeps both allocations charged.
-    auto reservation = metrics.reserveAllocation(bytes);
+    auto reservation = [&] {
+      try
+      {
+        return metrics.reserveAllocation(bytes);
+      }
+      catch (...)
+      {
+        request_event("rejected");
+        throw;
+      }
+    }();
+    request_event("admitted");
     void* replacement = nullptr;
+    try
+    {
 #ifdef QMC_CUDA2HIP
-    checkRuntime(hipMalloc(&replacement, bytes), "hipMalloc");
+      checkRuntime(hipMalloc(&replacement, bytes), "hipMalloc");
 #else
-    checkRuntime(cudaMalloc(&replacement, bytes), "cudaMalloc");
+      checkRuntime(cudaMalloc(&replacement, bytes), "cudaMalloc");
 #endif
+    }
+    catch (...)
+    {
+      request_event("allocation_failed");
+      throw;
+    }
     reservation.commit();
+    request_event("allocated");
     // Publish new ownership only after allocation succeeds.
     T* previous = data_;
     const auto previous_bytes = capacity_ * sizeof(T);
@@ -151,6 +202,7 @@ public:
     capacity_   = capacity;
     device_ordinal_ = device_ordinal;
     metrics_ = &metrics;
+    trace_id_ = replacement_id;
     if (previous)
     {
 #ifdef QMC_CUDA2HIP
@@ -159,13 +211,25 @@ public:
       const auto result = cudaFree(previous);
 #endif
       if (result == success)
+      {
         metrics.freed(previous_bytes);
+        trace("release", previous_id, previous_bytes);
+      }
       else
       {
         metrics.failedFree();
+        trace("free_failed", previous_id, previous_bytes);
+        trace_owner_ = owner;
+        trace_file_ = file;
+        trace_line_ = line;
+        trace_device_ = device_ordinal;
         checkRuntime(result, "free previous PsiFormer device buffer after growth");
       }
     }
+    trace_owner_ = owner;
+    trace_file_ = file;
+    trace_line_ = line;
+    trace_device_ = device_ordinal;
   }
 
   /// Copy a bounded host interval into already prepared storage.
@@ -268,7 +332,66 @@ public:
   /// Identify the preparation-time owner without another runtime query.
   int deviceOrdinal() const noexcept { return device_ordinal_; }
 
+  std::uint64_t memoryTraceIdentity() const noexcept { return trace_id_; }
+
+  void traceContext(std::uint64_t generation, std::uintptr_t resource, std::uint64_t parent = 0) const noexcept
+  {
+    if (!trace_id_)
+      return;
+    memory::Event event{"context", trace_id_, trace_owner_, "resource", "device", device_ordinal_};
+    event.generation = generation;
+    event.resource = resource;
+    event.parent = parent;
+    memory::emit(event);
+  }
+
+  /// A packed view is descriptive and never acquires additional capacity.
+  void traceView(const char* name, std::size_t offset, std::size_t count,
+                 const char* shape, const char* dtype = "fp64") const noexcept
+  {
+    if (!trace_id_)
+      return;
+    const bool valid = offset <= capacity_ && count <= capacity_ - offset;
+    memory::Event event{valid ? "view" : "invalid_view", memory::nextIdentity(), name,
+                        "packed_view", "device", device_ordinal_, valid ? count * sizeof(T) : 0};
+    event.parent = trace_id_;
+    event.offset = valid ? offset * sizeof(T) : 0;
+    event.dtype = dtype;
+    event.shape = shape;
+    memory::emit(event);
+  }
+
 private:
+  void trace(const char* kind, std::uint64_t id, std::size_t bytes) const noexcept
+  {
+    traceAt(kind, id, bytes, trace_owner_, trace_file_, trace_line_, trace_device_);
+  }
+
+  void traceAt(const char* kind, std::uint64_t id, std::size_t bytes, const char* owner,
+               const char* file, int line, int ordinal, std::uint64_t parent = 0,
+               const DeviceMemoryMetrics* native_metrics = nullptr) const noexcept
+  {
+    if (!id)
+      return;
+#ifdef QMC_CUDA2HIP
+    constexpr const char* backend = "hip";
+#else
+    constexpr const char* backend = "cuda";
+#endif
+    memory::Event event{kind, id, owner, "device_capacity", backend, ordinal, bytes, bytes, file, line};
+    event.parent = parent;
+    event.resource = reinterpret_cast<std::uintptr_t>(this);
+    event.dtype = std::is_same_v<T, double> ? "fp64" : std::is_same_v<T, float> ? "fp32" : "opaque_pod";
+    if (const auto* native = native_metrics ? native_metrics : metrics_)
+    {
+      const auto counters = native->snapshot();
+      event.native_snapshot = true;
+      event.native_live = counters.live_bytes;
+      event.native_peak = counters.peak_bytes;
+    }
+    memory::emit(event);
+  }
+
   /// Check destination bounds and null host pointers before any vendor call.
   void validateTransfer(const void* pointer, std::size_t count) const
   {
@@ -282,6 +405,11 @@ private:
   std::size_t capacity_ = 0;
   int device_ordinal_ = -1;
   DeviceMemoryMetrics* metrics_ = nullptr;
+  std::uint64_t trace_id_ = 0;
+  const char* trace_owner_ = "unknown";
+  const char* trace_file_ = "unknown";
+  int trace_line_ = 0;
+  int trace_device_ = -1;
 };
 
 } // namespace qmcplusplus::psiformer::device

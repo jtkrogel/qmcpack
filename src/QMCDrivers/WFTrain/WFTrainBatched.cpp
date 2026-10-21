@@ -50,6 +50,7 @@
 #include "QMCHamiltonians/CoulombPBCAB.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
@@ -102,6 +103,8 @@ struct RetainedCrowdSamples
   /// Optional current-version/value evidence only for the admitted resident single snapshot.
   std::optional<std::size_t> replay_version;
   std::vector<std::array<double, 2>> replay_log_phase;
+  psiformer::memory::HostCapacity trace_scalar_capacity;
+  psiformer::memory::HostCapacity trace_particle_capacity;
 };
 
 /// One scalar private evaluator reused by every retained conventional replay view.
@@ -157,6 +160,20 @@ RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool ov
                                          walkers[sample].get().Properties(WalkerProperties::SIGN)});
     if (overlap)
       result.teachers.push_back(wavefunctions[sample].get().makeClone(*result.particles.back()));
+  }
+  if (psiformer::memory::enabled())
+    result.trace_scalar_capacity.snapshotAt(__FILE__, __LINE__, "RetainedCrowdSamples::scalar_vectors",
+        result.local_energies.capacity() * sizeof(double) +
+        result.replay_log_phase.capacity() * sizeof(result.replay_log_phase[0]),
+        reinterpret_cast<std::uintptr_t>(&crowd), index);
+  if (psiformer::memory::enabled())
+  {
+    std::size_t bytes = 0;
+    for (const auto& particles : result.particles)
+      bytes += particles->R.capacity() * sizeof(particles->R[0]) +
+          particles->G.capacity() * sizeof(particles->G[0]) + particles->L.capacity() * sizeof(particles->L[0]);
+    result.trace_particle_capacity.snapshotAt(__FILE__, __LINE__, "RetainedCrowdSamples::particle_R_G_L", bytes,
+        reinterpret_cast<std::uintptr_t>(&crowd), index);
   }
   return result;
 }
@@ -1272,6 +1289,13 @@ std::size_t currentResidentBytes()
 void logTrainingMemoryPhase(Communicate& communicator, std::size_t iteration, const char* phase)
 {
   double local[2]{static_cast<double>(currentResidentBytes()), 0};
+  if (psiformer::memory::enabled())
+  {
+    psiformer::memory::Event event{"boundary", 0, phase, "rss_sample", "host", -1,
+                                  static_cast<std::size_t>(local[0])};
+    event.generation = iteration;
+    psiformer::memory::emit(event);
+  }
 #ifdef __linux__
   struct rusage usage;
   if (getrusage(RUSAGE_SELF, &usage) == 0)
@@ -3310,6 +3334,7 @@ void WFTrainBatched::run()
       device_provider->residentDeviceAuthorityTransferWindow("sampling_through_refresh", true);
     }
     logTrainingMemoryPhase(*myComm, iteration, "before_sampling");
+    psiformer::memory::Phase memory_phase("sampling");
     app_log() << "WFTrain allocation before owner=retained_sample_snapshots iteration=" << iteration
               << " scope=rank0_local blocks=" << num_blocks << " steps_per_block=" << steps_per_block_
               << " crowds=" << crowds_.size() << " parameters=" << selected_provider_->parameterSchema().parameterCount()
@@ -3418,6 +3443,7 @@ void WFTrainBatched::run()
       throw UniformCommunicateError("WFTrainBatched: failed to write scalar iteration output");
     const double sampling_seconds = iteration_wall.elapsed();
     logTrainingMemoryPhase(*myComm, iteration, "after_sampling_before_preparation");
+    memory_phase.transition("retained_configuration_and_product_preparation");
     logTrainingAllocation("prepared_derivative_owners_and_shared_workspace", retained_samples.size(),
         selected_provider_->parameterSchema().parameterCount());
     wftrain::TrainingIterationResult iteration_result;
@@ -3515,6 +3541,7 @@ void WFTrainBatched::run()
                     : crowds_[samples.crowd_index]->get_walker_twfs()[i].get());
               }
             NativeTimerScope candidate_timer(phase_timers_.candidate);
+            psiformer::memory::Phase memory_candidate_timer("candidate");
             selected_alpha = wftrain::selectNativeStep(training_input_, *myComm,
                 student_prototype_, population_.get_golden_hamiltonian(), selected_provider_id_,
                 configurations, chain_ids, teachers, rngs_[0], qmcdriver_input_.get_tau(), old, full,
@@ -3607,6 +3634,7 @@ void WFTrainBatched::run()
         try
         {
           NativeTimerScope preparation_timer(phase_timers_.preparation);
+          psiformer::memory::Phase memory_preparation_timer("preparation");
           parameters.emplace(selected_provider_->snapshotParameters());
 #ifdef QMC_COMPLEX
           if (complex_orbital_target_)
@@ -3771,6 +3799,7 @@ void WFTrainBatched::run()
         try
         {
           NativeTimerScope preparation_timer(phase_timers_.preparation);
+          psiformer::memory::Phase memory_preparation_timer("preparation");
           batches.reserve(retained_samples.size());
           std::size_t sample_offset = 0;
           std::size_t batch_ordinal = 0;
@@ -3881,6 +3910,7 @@ void WFTrainBatched::run()
         enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
         logTrainingMemoryPhase(*myComm, iteration, "after_preparation_before_update");
+        memory_phase.transition("objective_gradients_and_optimizer_update");
         logTrainingAllocation("optimizer_reductions_and_proposal", storage_diagnostics.sample_count,
             selected_provider_->parameterSchema().parameterCount());
 
@@ -3944,6 +3974,7 @@ void WFTrainBatched::run()
           try
           {
             NativeTimerScope proposal_timer(phase_timers_.proposal);
+            psiformer::memory::Phase memory_proposal_timer("proposal");
             if (resident_device_authority_ && resident_sr_budget.first)
             {
               // The component owns all SR vectors and the finite shared successor;
@@ -3978,6 +4009,7 @@ void WFTrainBatched::run()
               catch (...) { failure = std::current_exception(); }
               reduction.validatePublicationReadiness(source_version, true, failure);
               NativeTimerScope publication_timer(phase_timers_.publication);
+              psiformer::memory::Phase memory_publication_timer("publication");
               const auto version = publication->commit();
               resident_committed = true;
               pending.parameter_version = reduction.completePublication(version);
@@ -4009,6 +4041,7 @@ void WFTrainBatched::run()
               catch (...) { failure = std::current_exception(); }
               reduction.validatePublicationReadiness(source_version, true, failure);
               NativeTimerScope publication_timer(phase_timers_.publication);
+              psiformer::memory::Phase memory_publication_timer("publication");
               const auto version = publication->commit();
               resident_committed = true;
               first_order_optimizer->acceptResidentDeviceAdam(version);
@@ -4046,6 +4079,7 @@ void WFTrainBatched::run()
                 throw std::overflow_error("Resident ENERGY candidate displacement norm is nonfinite");
               {
                 NativeTimerScope publication_timer(phase_timers_.publication);
+                psiformer::memory::Phase memory_publication_timer("publication");
                 pending.parameter_version = selected_provider_->publishParameters(candidate, parameters->version);
               }
             }
@@ -4070,11 +4104,13 @@ void WFTrainBatched::run()
           const auto& schema = selected_provider_->parameterSchema();
           std::optional<wftrain::StructuredParameterSnapshot> parameters;
           std::unique_ptr<wftrain::KFACFactorAccumulator> statistics;
+          psiformer::memory::HostCapacity memory_statistics;
           std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
           std::exception_ptr preparation_failure;
           try
           {
             NativeTimerScope timer(phase_timers_.affine_observation);
+            psiformer::memory::Phase memory_timer("affine_observation");
             parameters.emplace(selected_provider_->snapshotParameters());
             auto registry = makeLiveKFACRegistry(*selected_provider_);
             if (const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_);
@@ -4101,6 +4137,9 @@ void WFTrainBatched::run()
                 training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
                     ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
                     : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
+            if (psiformer::memory::enabled())
+              memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",
+                  statistics->retainedNumericBytes(), reinterpret_cast<std::uintptr_t>(statistics.get()), -1, parameters->version);
             LiveAffineObserver observer(*statistics);
             std::vector<double> real_score, imaginary_score;
             for (const auto& samples : retained_samples)
@@ -4137,6 +4176,7 @@ void WFTrainBatched::run()
             try
             {
               NativeTimerScope timer(phase_timers_.kfac_inverse);
+              psiformer::memory::Phase memory_timer("kfac_inverse");
               kfac_optimizer->prepareStatistics(*statistics);
             }
             catch (...) { inverse_failure = std::current_exception(); }
@@ -4167,6 +4207,7 @@ void WFTrainBatched::run()
             try
             {
               NativeTimerScope timer(phase_timers_.kfac_inverse);
+              psiformer::memory::Phase memory_timer("kfac_inverse");
               inverse = std::make_unique<wftrain::KFACPreconditioner>(*statistics,
                   wftrain::KFACPreconditionerControl{training_input_.getDamping(), training_input_.getKFACFallbackDamping(),
                       training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
@@ -4436,15 +4477,20 @@ void WFTrainBatched::run()
           else if (optimizer_kind == WFTrainDriverInput::Optimizer::KFAC)
           {
             std::unique_ptr<wftrain::KFACFactorAccumulator> statistics;
+            psiformer::memory::HostCapacity memory_statistics;
             std::exception_ptr observation_failure;
             try
             {
               NativeTimerScope timer(phase_timers_.affine_observation);
+              psiformer::memory::Phase memory_timer("affine_observation");
               statistics = std::make_unique<wftrain::KFACFactorAccumulator>(
                   makeLiveKFACRegistry(*selected_provider_), parameters->version,
                   training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
                       ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
                       : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
+              if (psiformer::memory::enabled())
+                memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",
+                    statistics->retainedNumericBytes(), reinterpret_cast<std::uintptr_t>(statistics.get()), -1, parameters->version);
               LiveAffineObserver observer(*statistics);
               std::vector<double> score;
               for (const auto& samples : retained_samples)
@@ -4466,6 +4512,7 @@ void WFTrainBatched::run()
               try
               {
                 NativeTimerScope timer(phase_timers_.kfac_inverse);
+                psiformer::memory::Phase memory_timer("kfac_inverse");
                 kfac_optimizer->prepareStatistics(*statistics);
               }
               catch (...) { preparation_failure = std::current_exception(); }
@@ -4500,6 +4547,7 @@ void WFTrainBatched::run()
                     ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT;
             auto inverse = [&]() {
               NativeTimerScope timer(phase_timers_.kfac_inverse);
+              psiformer::memory::Phase memory_timer("kfac_inverse");
               return wftrain::KFACPreconditioner(*statistics, inverse_control);
             }();
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
@@ -4602,6 +4650,7 @@ void WFTrainBatched::run()
       }
     }
 
+    memory_phase.transition("candidate_publication_and_refresh");
     // All derivative owners for the old version are gone before cache replacement.
     if (!cache_observer.dirty() ||
         cache_observer.publishedVersion() != iteration_result.parameter_version)
@@ -4765,6 +4814,7 @@ void WFTrainBatched::run()
     if (periodic_checkpoint || final_block || stop_requested)
     {
       ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
+      psiformer::memory::Phase memory_checkpoint("checkpoint");
       if (resident_open_observation_ && resident_host_dirty)
       {
         // Explicit cold boundary: coordinates first, then complete native tables,
@@ -5213,6 +5263,7 @@ void WFTrainBatched::validateHamiltonianForTraining()
 void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
 {
   NativeTimerScope timer(phase_timers_.refresh);
+  psiformer::memory::Phase memory_timer("refresh");
   // Publication modifies shared model state. Fence ranks before any clone evaluates it.
   myComm->barrier();
 

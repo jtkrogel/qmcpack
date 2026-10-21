@@ -62,24 +62,32 @@ public:
       throw std::invalid_argument("Periodic pair-attention coordinate reverse is not prepared");
     const auto& shape = model_->plan().modelShape();
     const auto features = multiply(multiply(capacity_, shape.electrons()), shape.feature_dimension);
-    for (auto* buffer : {&upstream_, &residual_, &tanh_, &hidden_, &input_, &context_,
-                         &query_, &key_, &value_, &discard_})
-      buffer->reserve(features);
-    probability_.reserve(multiply(multiply(multiply(capacity_, shape.attention_heads),
-                                            shape.electrons()), shape.electrons()));
+    upstream_.reserveNamed(features, "NetworkReverse::upstream_", __FILE__, __LINE__);
+    residual_.reserveNamed(features, "NetworkReverse::residual_", __FILE__, __LINE__);
+    tanh_.reserveNamed(features, "NetworkReverse::tanh_", __FILE__, __LINE__);
+    hidden_.reserveNamed(features, "NetworkReverse::hidden_", __FILE__, __LINE__);
+    input_.reserveNamed(features, "NetworkReverse::input_", __FILE__, __LINE__);
+    context_.reserveNamed(features, "NetworkReverse::context_", __FILE__, __LINE__);
+    query_.reserveNamed(features, "NetworkReverse::query_", __FILE__, __LINE__);
+    key_.reserveNamed(features, "NetworkReverse::key_", __FILE__, __LINE__);
+    value_.reserveNamed(features, "NetworkReverse::value_", __FILE__, __LINE__);
+    discard_.reserveNamed(features, "NetworkReverse::discard_", __FILE__, __LINE__);
+    probability_.reserveNamed(multiply(multiply(multiply(capacity_, shape.attention_heads),
+                                            shape.electrons()), shape.electrons()), "NetworkReverse::probability_", __FILE__, __LINE__);
     if (output_ == NetworkReverseOutput::PARAMETER_SCORE)
-      response_.reserve(model_->plan().parameterCount());
+      response_.reserveNamed(model_->plan().parameterCount(), "NetworkReverse::response_", __FILE__, __LINE__);
     else if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
     {
       const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
-      raw_feature_.reserve(multiply(multiply(capacity_, shape.electrons()), embedding.shape[0]));
+      raw_feature_.reserveNamed(multiply(multiply(capacity_, shape.electrons()), embedding.shape[0]),
+          "NetworkReverse::raw_feature_", __FILE__, __LINE__);
     }
     else
       throw std::invalid_argument("Network reverse output selection is invalid");
     const auto destination_capacity = response_.capacity() + raw_feature_.capacity();
     finite_layout_ = {destination_capacity, 4096,
         destination_capacity / 4096 + (destination_capacity % 4096 != 0), 0, 1};
-    finite_status_.reserve(finite_layout_.status_capacity);
+    finite_status_.reserveNamed(finite_layout_.status_capacity, "NetworkReverse::finite_status_", __FILE__, __LINE__);
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
 

@@ -201,6 +201,19 @@ if(ENABLE_OFFLOAD)
   set(DETERMINANT_SRC ${DETERMINANT_SRC} test_DiracMatrixInverterOMPTarget.cpp)
 endif(ENABLE_OFFLOAD)
 
+find_package(Threads REQUIRED)
+add_executable(test_psiformer_memory_trace test_psiformer_memory_trace.cpp)
+target_include_directories(test_psiformer_memory_trace PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_psiformer_memory_trace PRIVATE Threads::Threads)
+add_test(NAME deterministic-unit_test_psiformer_memory_trace COMMAND test_psiformer_memory_trace)
+if(Python3_EXECUTABLE)
+  add_test(NAME deterministic-unit_test_psiformer_memory_report
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_psiformer_memory_report.py
+      $<TARGET_FILE:test_psiformer_memory_trace>)
+  set_tests_properties(deterministic-unit_test_psiformer_memory_report
+    PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+endif()
+
 set(CATEGORY_MPI sposet)
 
 foreach(CATEGORY common trialwf sposet jastrow determinant)

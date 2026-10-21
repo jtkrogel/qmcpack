@@ -788,9 +788,10 @@ PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
       environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
     throw std::invalid_argument("Mixed value affine projections currently support fixed-ion open-real models only");
   const auto count = model_->plan().parameterCount();
-  weights_.reserve(count);
+  weights_.reserveNamed(count, "MixedDenseParameters::fp32_weights", __FILE__, __LINE__);
   clearMixedDeviceStorage(queue.getNative(), weights_.data(), checkedDeviceBytes<float>(count));
-  DeviceBuffer<PsiFormerParameterConversionDiagnostics> diagnostics(1);
+  DeviceBuffer<PsiFormerParameterConversionDiagnostics> diagnostics(1,
+      "MixedDenseParameters::conversion_diagnostics", __FILE__, __LINE__);
   clearMixedDeviceStorage(queue.getNative(), diagnostics.data(), sizeof(PsiFormerParameterConversionDiagnostics));
 
   // Convert typed affine matrices only. Their canonical offsets remain stable,
@@ -843,9 +844,10 @@ PreparedDeviceMixedValueDense::PreparedDeviceMixedValueDense(
   const auto& plan = modelImage()->plan();
   const auto width = plan.modelShape().feature_dimension;
   const auto input_width = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
-  source_.reserve(mixedCheckedMultiply(maximum_rows_, std::max(input_width, width)));
-  target_.reserve(mixedCheckedMultiply(maximum_rows_, width));
-  device_diagnostics_.reserve(1);
+  source_.reserveNamed(mixedCheckedMultiply(maximum_rows_, std::max(input_width, width)),
+      "MixedValueDense::fp32_source", __FILE__, __LINE__);
+  target_.reserveNamed(mixedCheckedMultiply(maximum_rows_, width), "MixedValueDense::fp32_target", __FILE__, __LINE__);
+  device_diagnostics_.reserveNamed(1, "MixedValueDense::diagnostics", __FILE__, __LINE__);
 }
 
 void PreparedDeviceMixedValueDense::beginEvaluation(const std::shared_ptr<const PreparedDeviceModel>& image)

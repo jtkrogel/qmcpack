@@ -183,10 +183,15 @@ private:
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost, bool retain_score = false)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true)),
-        envelope_(cost.matrices), projections_(2 * cost.matrices), matrix_(cost.matrices),
-        channels_(capacity * trunk_->shape_.determinants), results_(capacity), status_(1),
-        inverse_(retain_score ? cost.matrices : 0), solve_(retain_score ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0),
-        permutation_(solve_.capacity())
+        envelope_(cost.matrices, "ComplexValue::envelope_", __FILE__, __LINE__),
+        projections_(2 * cost.matrices, "ComplexValue::projections_", __FILE__, __LINE__),
+        matrix_(cost.matrices, "ComplexValue::matrix_", __FILE__, __LINE__),
+        channels_(capacity * trunk_->shape_.determinants, "ComplexValue::channels_", __FILE__, __LINE__),
+        results_(capacity, "ComplexValue::results_", __FILE__, __LINE__),
+        status_(1, "ComplexValue::status_", __FILE__, __LINE__),
+        inverse_(retain_score ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
+        solve_(retain_score ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
+        permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__)
   {
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +

@@ -17,6 +17,7 @@
 #define QMCPLUSPLUS_KFAC_PRECONDITIONER_H
 
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 
 #include <cstddef>
 #include <limits>
@@ -298,6 +299,7 @@ private:
   std::vector<DerivativeReal> fallback_inverse_diagonal_;
   mutable std::vector<DerivativeReal> matrix_scratch_;
   mutable std::vector<DerivativeReal> solve_scratch_;
+  psiformer::memory::HostCapacity trace_capacity_;
 };
 
 } // namespace qmcplusplus::wftrain

@@ -386,7 +386,7 @@ private:
 #else
     checkRuntime(cudaGetDevice(&device_), "model device identity");
 #endif
-    nuclei_.reserve(nuclei.size());
+    nuclei_.reserveNamed(nuclei.size(), "Inference::nuclei_", __FILE__, __LINE__);
     nuclei_.upload(nuclei.data(), nuclei.size());
   }
 
@@ -475,7 +475,8 @@ public:
         const std::shared_ptr<const PreparedDeviceModel>& source)
         : control_(control), metadata_(source->metadata_), source_version_(source->version_),
           generation_(control->generation),
-          parameters_(std::make_shared<DeviceBuffer<double>>(source->plan().parameterCount())) {}
+          parameters_(std::make_shared<DeviceBuffer<double>>(source->plan().parameterCount(),
+              "CandidateSnapshot::parameters", __FILE__, __LINE__)) {}
 
     std::weak_ptr<CandidateControl> control_;
     std::shared_ptr<const PreparedDeviceModelMetadata> metadata_;
@@ -622,6 +623,8 @@ public:
         metadata_->deviceStorageBytes(), "Device model storage overflow");
   }
 
+  std::uint64_t memoryTraceIdentity() const noexcept { return parameterStorage().memoryTraceIdentity(); }
+
 private:
   /// Keep identical provenance and device checks for copying and sharing factories.
   void validateCandidate(const CandidateSnapshot& candidate) const
@@ -653,12 +656,13 @@ private:
       shared_parameters_ = candidate.parameters_;
     else
     {
-      parameters_.reserve(plan().parameterCount());
+      parameters_.reserveNamed(plan().parameterCount(), "Inference::parameters_", __FILE__, __LINE__);
       parameters_.copyFromDevice(*candidate.parameters_, plan().parameterCount());
     }
     if (const auto* same = plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
       parameterStorage().download(&same_alpha_, 1, same->begin);
     parameterStorage().download(&opposite_alpha_, 1, plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin);
+    parameterStorage().traceContext(version_, reinterpret_cast<std::uintptr_t>(this));
   }
 
   /// Upload only canonical parameters after the immutable family is established.
@@ -671,8 +675,9 @@ private:
       throw std::invalid_argument("Device model parameter extent mismatch");
     if (std::any_of(parameters.begin(), parameters.end(), [](double value) { return !device_math::isFiniteBinary64(value); }))
       throw std::invalid_argument("Device parameter image contains nonfinite values");
-    parameters_.reserve(parameters.size());
+    parameters_.reserveNamed(parameters.size(), "Inference::parameters_", __FILE__, __LINE__);
     parameters_.upload(parameters.data(), parameters.size());
+    parameters_.traceContext(version_, reinterpret_cast<std::uintptr_t>(this));
     if (const auto* same = plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
       same_alpha_ = parameters[same->begin];
     opposite_alpha_ = parameters[plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
@@ -713,14 +718,20 @@ public:
     /// Reserve fixed-capacity value storage once, before any graph launch.
     RetainedBlockTape(std::size_t feature_count, std::size_t probability_count, bool spatial)
     {
-      for (auto* buffer : {&input, &query, &key, &value, &context, &residual, &hidden, &projected})
-        buffer->reserve(feature_count);
-      probabilities.reserve(probability_count);
+      input.reserveNamed(feature_count, "RetainedBlockTape::input", __FILE__, __LINE__);
+      query.reserveNamed(feature_count, "RetainedBlockTape::query", __FILE__, __LINE__);
+      key.reserveNamed(feature_count, "RetainedBlockTape::key", __FILE__, __LINE__);
+      value.reserveNamed(feature_count, "RetainedBlockTape::value", __FILE__, __LINE__);
+      context.reserveNamed(feature_count, "RetainedBlockTape::context", __FILE__, __LINE__);
+      residual.reserveNamed(feature_count, "RetainedBlockTape::residual", __FILE__, __LINE__);
+      hidden.reserveNamed(feature_count, "RetainedBlockTape::hidden", __FILE__, __LINE__);
+      projected.reserveNamed(feature_count, "RetainedBlockTape::projected", __FILE__, __LINE__);
+      probabilities.reserveNamed(probability_count, "Inference::probabilities", __FILE__, __LINE__);
       if (spatial)
       {
-        hidden_pre.reserve(feature_count);
-        projected_pre.reserve(feature_count);
-        logits.reserve(probability_count);
+        hidden_pre.reserveNamed(feature_count, "Inference::hidden_pre", __FILE__, __LINE__);
+        projected_pre.reserveNamed(feature_count, "Inference::projected_pre", __FILE__, __LINE__);
+        logits.reserveNamed(probability_count, "Inference::logits", __FILE__, __LINE__);
       }
     }
 
@@ -917,26 +928,39 @@ private:
     if (target_preparation_.max_targets)
       setTargetRange(0, target_preparation_.max_targets);
 
-    positions_.reserve(product(batch_, product(ne_, 3)));
-    active_.reserve(batch_);
+    positions_.reserveNamed(product(batch_, product(ne_, 3)), "Inference::positions_", __FILE__, __LINE__);
+    active_.reserveNamed(batch_, "Inference::active_", __FILE__, __LINE__);
     const std::vector<std::size_t> zero_active(batch_, 0);
     active_.upload(zero_active.data(), batch_);
-    raw_.reserve(spatialJetSpanElements(features_.output));
+    raw_.reserveNamed(spatialJetSpanElements(features_.output), "Inference::raw_", __FILE__, __LINE__);
     const auto feature_elements = spatialJetSpanElements(dense_.source);
-    for (DeviceBuffer<double>* buffer : {&a_, &b_, &q_, &k_, &v_, &context_, &hidden_, &projected_})
-      buffer->reserve(feature_elements);
-    weights_.reserve(spatialJetSpanElements(attention_.attention));
+    a_.reserveNamed(feature_elements, "Inference::a_", __FILE__, __LINE__);
+    b_.reserveNamed(feature_elements, "Inference::b_", __FILE__, __LINE__);
+    q_.reserveNamed(feature_elements, "Inference::q_", __FILE__, __LINE__);
+    k_.reserveNamed(feature_elements, "Inference::k_", __FILE__, __LINE__);
+    v_.reserveNamed(feature_elements, "Inference::v_", __FILE__, __LINE__);
+    context_.reserveNamed(feature_elements, "Inference::context_", __FILE__, __LINE__);
+    hidden_.reserveNamed(feature_elements, "Inference::hidden_", __FILE__, __LINE__);
+    projected_.reserveNamed(feature_elements, "Inference::projected_", __FILE__, __LINE__);
+    weights_.reserveNamed(spatialJetSpanElements(attention_.attention), "Inference::weights_", __FILE__, __LINE__);
+    traceJet(raw_, features_.output, "Inference::raw_");
+    for (auto* buffer : {&a_, &b_, &q_, &k_, &v_, &context_, &hidden_, &projected_})
+      traceJet(*buffer, dense_.source, "feature_planes");
+    traceJet(weights_, attention_.attention, "Inference::weights_");
     if (!real_trunk_only)
     {
-      orbital_jets_.reserve(spatialJetSpanElements(orbitals_.orbitals));
-      matrices_.reserve(product(batch_, matrices_per_configuration_));
-      lu_.reserve(matrices_.capacity());
+      orbital_jets_.reserveNamed(spatialJetSpanElements(orbitals_.orbitals),
+          "Inference::orbital_jets_", __FILE__, __LINE__);
+      traceJet(orbital_jets_, orbitals_.orbitals, "Inference::orbital_jets_");
+      matrices_.reserveNamed(product(batch_, matrices_per_configuration_), "Inference::matrices_", __FILE__, __LINE__);
+      lu_.reserveNamed(matrices_.capacity(), "Inference::lu_", __FILE__, __LINE__);
       if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
-        inverse_.reserve(matrices_.capacity());
-      permutations_.reserve(product(product(batch_, shape_.determinants), ne_));
+        inverse_.reserveNamed(matrices_.capacity(), "Inference::inverse_", __FILE__, __LINE__);
+      permutations_.reserveNamed(product(product(batch_, shape_.determinants), ne_),
+          "Inference::permutations_", __FILE__, __LINE__);
       if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
-        solve_.reserve(permutations_.capacity());
-      factors_.reserve(product(batch_, shape_.determinants));
+        solve_.reserveNamed(permutations_.capacity(), "Inference::solve_", __FILE__, __LINE__);
+      factors_.reserveNamed(product(batch_, shape_.determinants), "Inference::factors_", __FILE__, __LINE__);
       // Host admission copies complete POD records. Initialize their padding once
       // so those transfers never read unwritten bytes; numerical fields are still
       // set by the factorization kernel for every live determinant.
@@ -949,34 +973,44 @@ private:
           checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
           "factorization metadata storage initialization");
 #endif
-      combinations_.reserve(batch_);
-      for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
-        buffer->reserve(factors_.capacity());
+      combinations_.reserveNamed(batch_, "Inference::combinations_", __FILE__, __LINE__);
+      term_phase_.reserveNamed(factors_.capacity(), "Inference::term_phase_", __FILE__, __LINE__);
+      term_log_.reserveNamed(factors_.capacity(), "Inference::term_log_", __FILE__, __LINE__);
+      scaled_.reserveNamed(factors_.capacity(), "Inference::scaled_", __FILE__, __LINE__);
+      normalized_.reserveNamed(factors_.capacity(), "Inference::normalized_", __FILE__, __LINE__);
     }
     if (mode_ == SpatialJetMode::FULL_VGL && !real_trunk_only)
     {
-      matrix_product_.reserve(product(batch_, product(ne_, ne_)));
-      det_gradient_.reserve(product(batch_, gradient_lanes_));
-      det_lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
-      det_lap_log_.reserve(product(batch_, final_.output.laplacian_lanes));
-      det_status_.reserve(batch_);
+      matrix_product_.reserveNamed(product(batch_, product(ne_, ne_)),
+          "Inference::matrix_product_", __FILE__, __LINE__);
+      det_gradient_.reserveNamed(product(batch_, gradient_lanes_), "Inference::det_gradient_", __FILE__, __LINE__);
+      det_lap_ratio_.reserveNamed(product(batch_, final_.output.laplacian_lanes),
+          "Inference::det_lap_ratio_", __FILE__, __LINE__);
+      det_lap_log_.reserveNamed(product(batch_, final_.output.laplacian_lanes),
+          "Inference::det_lap_log_", __FILE__, __LINE__);
+      det_status_.reserveNamed(batch_, "Inference::det_status_", __FILE__, __LINE__);
     }
-    cusp_jets_.reserve(spatialJetSpanElements(cusp_.output));
+    cusp_jets_.reserveNamed(spatialJetSpanElements(cusp_.output), "Inference::cusp_jets_", __FILE__, __LINE__);
     if (!real_trunk_only)
     {
-      phase_.reserve(batch_); output_.reserve(spatialJetSpanElements(final_.output));
-      lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
+      phase_.reserveNamed(batch_,
+          "Inference::phase_", __FILE__, __LINE__); output_.reserveNamed(spatialJetSpanElements(final_.output),
+          "Inference::output_", __FILE__, __LINE__);
+      lap_ratio_.reserveNamed(product(batch_, final_.output.laplacian_lanes),
+          "Inference::lap_ratio_", __FILE__, __LINE__);
     }
     const auto status_count = std::max(product(batch_, product(ne_, width)), matrices_.capacity());
-    open_status_.reserve(status_count); host_status_.resize(status_count);
-    jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
+    open_status_.reserveNamed(status_count,
+        "Inference::open_status_", __FILE__, __LINE__); host_status_.resize(status_count);
+    jet_status_.reserveNamed(product(batch_, product(shape_.attention_heads, ne_)),
+        "Inference::jet_status_", __FILE__, __LINE__);
     host_jet_status_.resize(jet_status_.capacity());
-    sticky_status_.reserve(1);
+    sticky_status_.reserveNamed(1, "Inference::sticky_status_", __FILE__, __LINE__);
     if (target_preparation_.max_targets && !head_free_targets)
     {
-      full_phase_.reserve(batch_);
-      full_output_.reserve(spatialJetSpanElements(result_layout_));
-      full_lap_ratio_.reserve(product(batch_, ne_));
+      full_phase_.reserveNamed(batch_, "Inference::full_phase_", __FILE__, __LINE__);
+      full_output_.reserveNamed(spatialJetSpanElements(result_layout_), "Inference::full_output_", __FILE__, __LINE__);
+      full_lap_ratio_.reserveNamed(product(batch_, ne_), "Inference::full_lap_ratio_", __FILE__, __LINE__);
       tile_phase_.resize(batch_); tile_log_.resize(batch_);
       canonical_phase_.resize(batch_); canonical_log_.resize(batch_);
       host_combinations_.resize(batch_);
@@ -995,8 +1029,10 @@ private:
     {
       if (!real_trunk_only)
       {
-        retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
-        retained_envelope_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+        retained_backflow_.reserveNamed(spatialJetSpanElements(orbitals_.orbitals),
+            "Inference::retained_backflow_", __FILE__, __LINE__);
+        retained_envelope_.reserveNamed(spatialJetSpanElements(orbitals_.orbitals),
+            "Inference::retained_envelope_", __FILE__, __LINE__);
       }
       for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
         value_tape_.push_back(std::make_unique<RetainedBlockTape>(feature_elements, weights_.capacity(), retain_spatial_tape));
@@ -1015,6 +1051,16 @@ private:
       std::clog << "PsiFormer OPEN feature preparation: selected="
                 << (usesCooperativeOpenFeatures() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_control_bytes=4; no extra global owner\n";
+    if (memory::enabled())
+    {
+      const auto resource = reinterpret_cast<std::uintptr_t>(this);
+      const auto image = model_->memoryTraceIdentity();
+      for (const auto* buffer : {&positions_, &raw_, &a_, &b_, &q_, &k_, &v_, &weights_, &context_, &hidden_,
+          &projected_, &orbital_jets_, &matrices_, &lu_, &inverse_, &solve_, &term_phase_, &term_log_, &scaled_,
+          &normalized_, &matrix_product_, &det_gradient_, &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_,
+          &output_, &lap_ratio_, &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_})
+        buffer->traceContext(model_->version(), resource, image);
+    }
   }
 
 public:
@@ -1968,6 +2014,38 @@ private:
                                            open_status_.data()), "model residual");
     // Admission can defer only for the initialized destinations checked above.
     checkOpen(batch_ * ne_ * shape_.feature_dimension, true);
+  }
+
+  /// Describe the already prepared strided slab without charging its views.
+  static void traceJet(const DeviceBuffer<double>& buffer, const SpatialJetLayout& layout,
+                       const char* name) noexcept
+  {
+    if (!memory::enabled() || !layout.configuration_count || !layout.element_count)
+      return;
+    try
+    {
+      const auto shape = [&](std::size_t planes) {
+        return std::to_string(layout.configuration_count) + "," + std::to_string(planes) + "," +
+            std::to_string(layout.element_count) + ";strides=" + std::to_string(layout.configuration_stride) +
+            "," + std::to_string(layout.plane_stride) + ",1";
+      };
+      buffer.traceView(name, 0, spatialJetSpanElements(layout), shape(layout.plane_count).c_str());
+      // Plane-family views are strided across configurations; shape records that stride.
+      const auto base = (layout.configuration_count - 1) * layout.configuration_stride;
+      buffer.traceView("value_planes", 0, base + layout.element_count, shape(1).c_str());
+      if (layout.gradient_lanes)
+        buffer.traceView("gradient_planes", layout.plane_stride,
+            base + (layout.gradient_lanes - 1) * layout.plane_stride + layout.element_count,
+            shape(layout.gradient_lanes).c_str());
+      if (layout.laplacian_lanes)
+        buffer.traceView("laplacian_planes", (1 + layout.gradient_lanes) * layout.plane_stride,
+            base + (layout.laplacian_lanes - 1) * layout.plane_stride + layout.element_count,
+            shape(layout.laplacian_lanes).c_str());
+    }
+    catch (...)
+    {
+      memory::emit({"manifest_failed", buffer.memoryTraceIdentity(), name});
+    }
   }
 
   /// Pack one contiguous jet interval into already prepared determinant storage.

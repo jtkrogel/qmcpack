@@ -263,10 +263,17 @@ private:
       TargetVglPreparation preparation = {})
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), preparation, false, true)),
-        capacity_electrons_(capacity * trunk_->ne_), envelope_(cost.head_elements), projections_(2 * cost.head_elements),
-        head_(cost.head_elements), inverse_(cost.matrices), solve_(capacity_electrons_ * trunk_->shape_.determinants),
-        product_(capacity_electrons_ * trunk_->ne_), outputs_(5 * capacity_electrons_), permutation_(solve_.capacity()),
-        channels_(capacity * trunk_->shape_.determinants), amplitude_(capacity), status_(1),
+        capacity_electrons_(capacity * trunk_->ne_), envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
+        projections_(2 * cost.head_elements, "ComplexSpatial::projections_", __FILE__, __LINE__),
+        head_(cost.head_elements, "ComplexSpatial::head_", __FILE__, __LINE__),
+        inverse_(cost.matrices, "ComplexSpatial::inverse_", __FILE__, __LINE__),
+        solve_(capacity_electrons_ * trunk_->shape_.determinants, "ComplexSpatial::solve_", __FILE__, __LINE__),
+        product_(capacity_electrons_ * trunk_->ne_, "ComplexSpatial::product_", __FILE__, __LINE__),
+        outputs_(5 * capacity_electrons_, "ComplexSpatial::outputs_", __FILE__, __LINE__),
+        permutation_(solve_.capacity(), "ComplexSpatial::permutation_", __FILE__, __LINE__),
+        channels_(capacity * trunk_->shape_.determinants, "ComplexSpatial::channels_", __FILE__, __LINE__),
+        amplitude_(capacity, "ComplexSpatial::amplitude_", __FILE__, __LINE__),
+        status_(1, "ComplexSpatial::status_", __FILE__, __LINE__),
         canonical_(preparation.max_targets ? new ComplexValueResult : nullptr)
   {
     auto actual = trunk_->deviceWorkspaceBytes() + (envelope_.capacity() + projections_.capacity()) * sizeof(double);

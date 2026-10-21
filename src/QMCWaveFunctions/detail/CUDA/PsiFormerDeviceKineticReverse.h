@@ -121,19 +121,29 @@ private:
     if (max_targets)
       setTargetRange(0, max_targets);
     const auto features = spatialJetSpanElements(dense_.source);
-    for (auto* buffer : {&feature_, &residual_, &pre_, &hidden_, &input_, &context_, &query_, &key_, &value_})
-      buffer->reserve(features);
-    probability_.reserve(spatialJetSpanElements(attention_.attention));
-    logit_.reserve(probability_.capacity());
-    root_adjoint_.reserve(spatialJetSpanElements(root_));
-    response_.reserve(model_->plan().parameterCount());
-    dummy_bias_.reserve(width);
-    kinetic_status_.reserve(1);
+    feature_.reserveNamed(features, "KineticReverse::feature_", __FILE__, __LINE__);
+    residual_.reserveNamed(features, "KineticReverse::residual_", __FILE__, __LINE__);
+    pre_.reserveNamed(features, "KineticReverse::pre_", __FILE__, __LINE__);
+    hidden_.reserveNamed(features, "KineticReverse::hidden_", __FILE__, __LINE__);
+    input_.reserveNamed(features, "KineticReverse::input_", __FILE__, __LINE__);
+    context_.reserveNamed(features, "KineticReverse::context_", __FILE__, __LINE__);
+    query_.reserveNamed(features, "KineticReverse::query_", __FILE__, __LINE__);
+    key_.reserveNamed(features, "KineticReverse::key_", __FILE__, __LINE__);
+    value_.reserveNamed(features, "KineticReverse::value_", __FILE__, __LINE__);
+    probability_.reserveNamed(spatialJetSpanElements(attention_.attention),
+        "KineticReverse::probability_", __FILE__, __LINE__);
+    logit_.reserveNamed(probability_.capacity(), "KineticReverse::logit_", __FILE__, __LINE__);
+    root_adjoint_.reserveNamed(spatialJetSpanElements(root_), "KineticReverse::root_adjoint_", __FILE__, __LINE__);
+    response_.reserveNamed(model_->plan().parameterCount(), "KineticReverse::response_", __FILE__, __LINE__);
+    dummy_bias_.reserveNamed(width, "KineticReverse::dummy_bias_", __FILE__, __LINE__);
+    kinetic_status_.reserveNamed(1, "KineticReverse::kinetic_status_", __FILE__, __LINE__);
     if (!trunk_only)
     {
       const auto matrices = spatialJetSpanElements(orbitals_.orbitals);
-      for (auto* buffer : {&factor_, &orbital_, &backflow_, &envelope_})
-        buffer->reserve(matrices);
+      factor_.reserveNamed(matrices, "KineticReverse::factor_", __FILE__, __LINE__);
+      orbital_.reserveNamed(matrices, "KineticReverse::orbital_", __FILE__, __LINE__);
+      backflow_.reserveNamed(matrices, "KineticReverse::backflow_", __FILE__, __LINE__);
+      envelope_.reserveNamed(matrices, "KineticReverse::envelope_", __FILE__, __LINE__);
       // The optional target backend owns its matrix products; never retain both.
       if (lifted_channel_slots)
       {
@@ -141,23 +151,25 @@ private:
             std::numeric_limits<std::size_t>::max());
         lifted_products_ = std::make_unique<PreparedDeviceLiftedDeterminantProducts>(ne, lifted_channel_slots,
             products.device_workspace_bytes, queue_, blas_);
-        orbital_failure_.reserve(1);
+        orbital_failure_.reserveNamed(1, "KineticReverse::orbital_failure_", __FILE__, __LINE__);
       }
       else
-        matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
-      weights_.reserve(capacity_);
-      masses_.reserve(ne);
-      total_gradient_.reserve(multiply(capacity_, multiply(3, ne)));
-      determinant_status_.reserve(1);
-      reverse_status_.reserve(1);
-      open_status_.reserve(1);
+        matrix_scratch_.reserveNamed(multiply(3, multiply(ne, ne)),
+            "KineticReverse::matrix_scratch_", __FILE__, __LINE__);
+      weights_.reserveNamed(capacity_, "KineticReverse::weights_", __FILE__, __LINE__);
+      masses_.reserveNamed(ne, "KineticReverse::masses_", __FILE__, __LINE__);
+      total_gradient_.reserveNamed(multiply(capacity_, multiply(3, ne)),
+          "KineticReverse::total_gradient_", __FILE__, __LINE__);
+      determinant_status_.reserveNamed(1, "KineticReverse::determinant_status_", __FILE__, __LINE__);
+      reverse_status_.reserveNamed(1, "KineticReverse::reverse_status_", __FILE__, __LINE__);
+      open_status_.reserveNamed(1, "KineticReverse::open_status_", __FILE__, __LINE__);
       host_determinant_status_.resize(1);
       host_open_status_.resize(1);
       host_factors_.resize(multiply(capacity_, shape.determinants));
     }
     finite_layout_ = {response_.capacity(), 4096,
         response_.capacity() / 4096 + (response_.capacity() % 4096 != 0), 0, 1};
-    finite_status_.reserve(finite_layout_.status_capacity);
+    finite_status_.reserveNamed(finite_layout_.status_capacity, "KineticReverse::finite_status_", __FILE__, __LINE__);
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
 

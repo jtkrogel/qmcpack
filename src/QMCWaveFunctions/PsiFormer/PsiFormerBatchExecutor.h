@@ -25,6 +25,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 
 #include <algorithm>
 #include <array>
@@ -290,6 +291,7 @@ public:
     if (fail_preparation_before_publish_for_testing_)
       throw std::bad_alloc();
 
+    replacement.traceCapacity();
     *this = std::move(replacement);
   }
 
@@ -328,6 +330,7 @@ public:
     growVector(position_ready_, position_count);
     reserveOutputs(size, gradient_count, laplacian_count);
     prepareScratch(mode, effective_capacity);
+    traceCapacity();
 
     // All potentially throwing preparation is complete.  Invalidate any view
     // from the previous same-shaped request before publishing this new packing
@@ -1044,6 +1047,26 @@ public:
 private:
   friend class DirectBatchExecutor;
   friend struct DirectBatchWorkspaceTestAccess;
+
+  void traceCapacity() noexcept
+  {
+    namespace memory = qmcplusplus::psiformer::memory;
+    if (!memory::enabled()) return;
+    try
+    {
+      const auto storage = actualStorage();
+      trace_capacity_[0].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::dense_logical", storage.dense_logical);
+      trace_capacity_[1].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::sparse_logical", storage.sparse_logical);
+      trace_capacity_[2].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::logical_outputs", storage.logical_outputs);
+      trace_capacity_[3].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::sparse_tile_positions", storage.sparse_tile_positions);
+      trace_capacity_[4].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::value_tile", storage.value_tile);
+      trace_capacity_[5].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::full_vgl_tile", storage.full_vgl_tile);
+      trace_capacity_[6].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::active_gradient_tile", storage.active_gradient_tile);
+      trace_capacity_[7].snapshotAt(__FILE__, __LINE__, "DirectBatchWorkspace::shared_spatial_arena", storage.shared_spatial_arena);
+    }
+    catch (...) { memory::emit({"snapshot_failed", 0, "DirectBatchWorkspace", "host_capacity", "host"}); }
+  }
+  std::array<qmcplusplus::psiformer::memory::HostCapacity, 8> trace_capacity_;
 
   static std::size_t modeIndex(DirectBatchMode mode) noexcept
   {

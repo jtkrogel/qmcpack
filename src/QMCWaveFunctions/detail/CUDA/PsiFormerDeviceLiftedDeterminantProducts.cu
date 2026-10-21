@@ -282,9 +282,13 @@ PreparedDeviceLiftedDeterminantProducts::PreparedDeviceLiftedDeterminantProducts
 #else
   checkRuntime(cudaGetDevice(&device_ordinal_), "lifted product owning device");
 #endif
-  matrices_.reserve(plan_.matrix_storage_elements); statistics_.reserve(7 * slots);
-  left_.reserve(3 * slots); right_.reserve(3 * slots); target_.reserve(3 * slots);
-  failure_.reserve(1); status_.reserve(1);
+  matrices_.reserveNamed(plan_.matrix_storage_elements, "LiftedDeterminantProducts::matrices", __FILE__, __LINE__);
+  statistics_.reserveNamed(7 * slots, "LiftedDeterminantProducts::statistics", __FILE__, __LINE__);
+  left_.reserveNamed(3 * slots, "LiftedDeterminantProducts::left", __FILE__, __LINE__);
+  right_.reserveNamed(3 * slots, "LiftedDeterminantProducts::right", __FILE__, __LINE__);
+  target_.reserveNamed(3 * slots, "LiftedDeterminantProducts::target", __FILE__, __LINE__);
+  failure_.reserveNamed(1, "LiftedDeterminantProducts::failure", __FILE__, __LINE__);
+  status_.reserveNamed(1, "LiftedDeterminantProducts::status", __FILE__, __LINE__);
   zeroMatrix<<<blocks(plan_.matrix_elements), threads, 0, queue_.getNative()>>>(
       matrices_.data() + 6 * slots * plan_.matrix_elements, plan_.matrix_elements);
   checkLaunch();

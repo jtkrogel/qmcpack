@@ -2298,6 +2298,7 @@ struct PsiFormerDerivativeScratch
   bool reported_device_jvp_tiles = false;
 #endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
+  psiformer::memory::HostCapacity trace_host_capacity;
 };
 
 /** Serialize competing calls, but reject re-entry from a sink callback.
@@ -3948,6 +3949,31 @@ private:
 
     const auto fallback_allowance = hasDeviceProducts() ? checkedBatchMemoryMultiply(schema_->parameterCount(),
         MAXIMUM_VJP_CHANNELS * sizeof(wftrain::DerivativeValue), "GPU HOST fallback allowance") : 0;
+    if (psiformer::memory::enabled())
+    {
+      const auto resource = reinterpret_cast<std::uintptr_t>(shared_scratch_.get());
+      trace_sample_capacity_[0].snapshotAt(__FILE__, __LINE__, "StreamingDerivative::positions", position_bytes,
+          resource, batch_ordinal_, parameter_version_);
+      trace_sample_capacity_[1].snapshotAt(__FILE__, __LINE__, "StreamingDerivative::gradients_and_masses", auxiliary_bytes,
+          resource, batch_ordinal_, parameter_version_);
+      trace_sample_capacity_[2].snapshotAt(__FILE__, __LINE__, "StreamingDerivative::sample_products", sample_product_bytes,
+          resource, batch_ordinal_, parameter_version_);
+      auto shared_host_bytes = workspace_bytes + channel_bytes;
+      bool shared_capacity_valid = true;
+#ifdef ENABLE_CUDA
+      if (hasDeviceProducts())
+      {
+        // Both values are current owned capacities of this exact session, not peaks or forecasts.
+        const auto device_bytes = shared_scratch_->device_products->deviceWorkspaceBytes();
+        shared_capacity_valid = device_bytes <= shared_host_bytes;
+        if (shared_capacity_valid) shared_host_bytes -= device_bytes;
+        else psiformer::memory::emit({"snapshot_failed", 0, "StreamingDerivative::shared_host_lane"});
+      }
+#endif
+      if (shared_capacity_valid)
+        shared_scratch_->trace_host_capacity.snapshotAt(__FILE__, __LINE__, "StreamingDerivative::shared_host_lane", shared_host_bytes,
+            resource, -1, parameter_version_);
+    }
     return {schema_->parameterCount(),
             sample_count_,
             hasDeviceProducts() ? std::size_t{8} + 2 * deviceScoreContractionCapacity() : std::size_t{3},
@@ -3995,6 +4021,7 @@ private:
   std::unique_ptr<wftrain::NonLocalECPJVPReplay> ecp_replay_;
   mutable std::atomic<bool> has_evaluated_{false};
   wftrain::StreamingDerivativeStorageDiagnostics storage_diagnostics_;
+  mutable std::array<psiformer::memory::HostCapacity, 3> trace_sample_capacity_;
 };
 
 /** Contract live ECP tiles and optionally freeze their traversal for exact replay.

@@ -825,10 +825,14 @@ private:
         score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
         kinetic_(cost.scope == ComplexProductsScope::COMPLETE ? PreparedDeviceComplexKinetic::prepare(
             image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work) : nullptr),
-        accumulated_(cost.channels * cost.parameters), status_(cost.statuses), host_status_(cost.statuses),
+        accumulated_(cost.channels * cost.parameters, "ComplexProducts::accumulated_", __FILE__, __LINE__),
+        status_(cost.statuses, "ComplexProducts::status_", __FILE__, __LINE__),
+        host_status_(cost.statuses),
         completed_(cost.host_output == ComplexProductsHostOutput::RETAINED ? cost.channels * cost.parameters : cost.chunk),
         staging_(cost.chunk), positions_(3 * cost.electrons), masses_(cost.electrons),
-        direction_(cost.parameters), dot_workspace_(cost.dot_partials + 2), dot_status_(cost.dot_partials + 1),
+        direction_(cost.parameters, "ComplexProducts::direction_", __FILE__, __LINE__),
+        dot_workspace_(cost.dot_partials + 2, "ComplexProducts::dot_workspace_", __FILE__, __LINE__),
+        dot_status_(cost.dot_partials + 1, "ComplexProducts::dot_status_", __FILE__, __LINE__),
         direction_host_(cost.parameters), sample_products_(cost.maximum_samples), dot_host_status_(1)
   {
     const auto device = score_->cost().device_bytes + (kinetic_ ? kinetic_->cost().device_bytes : 0) +

@@ -37,25 +37,30 @@ public:
     const auto& shape = model_->plan().modelShape();
     const auto ne = shape.electrons();
     const auto matrices = multiply(multiply(multiply(capacity_, shape.determinants), ne), ne);
-    for (auto* buffer : {&seeds_, &up_, &down_, &envelope_})
-      buffer->reserve(matrices);
-    feature_.reserve(multiply(multiply(capacity_, ne), shape.feature_dimension));
-    ion_distances_.reserve(multiply(multiply(capacity_, ne), shape.nuclei));
+    seeds_.reserveNamed(matrices, "ScoreReverse::seeds_", __FILE__, __LINE__);
+    up_.reserveNamed(matrices, "ScoreReverse::up_", __FILE__, __LINE__);
+    down_.reserveNamed(matrices, "ScoreReverse::down_", __FILE__, __LINE__);
+    envelope_.reserveNamed(matrices, "ScoreReverse::envelope_", __FILE__, __LINE__);
+    feature_.reserveNamed(multiply(multiply(capacity_, ne), shape.feature_dimension),
+        "ScoreReverse::feature_", __FILE__, __LINE__);
+    ion_distances_.reserveNamed(multiply(multiply(capacity_, ne), shape.nuclei),
+        "ScoreReverse::ion_distances_", __FILE__, __LINE__);
     pair_count_ = multiply(ne, ne - 1) / 2;
-    pair_distances_.reserve(multiply(capacity_, pair_count_));
-    same_spin_.reserve(pair_count_);
-    weights_.reserve(capacity_);
-    channel_weights_.reserve(multiply(capacity_, shape.determinants));
+    pair_distances_.reserveNamed(multiply(capacity_, pair_count_), "ScoreReverse::pair_distances_", __FILE__, __LINE__);
+    same_spin_.reserveNamed(pair_count_, "ScoreReverse::same_spin_", __FILE__, __LINE__);
+    weights_.reserveNamed(capacity_, "ScoreReverse::weights_", __FILE__, __LINE__);
+    channel_weights_.reserveNamed(multiply(capacity_, shape.determinants),
+        "ScoreReverse::channel_weights_", __FILE__, __LINE__);
     unit_weights_.resize(capacity_, 1.0);
     cusp_weights_.resize(capacity_);
-    head_response_.reserve(model_->plan().parameterCount());
-    response_.reserve(model_->plan().parameterCount());
-    status_.reserve(capacity_);
+    head_response_.reserveNamed(model_->plan().parameterCount(), "ScoreReverse::head_response_", __FILE__, __LINE__);
+    response_.reserveNamed(model_->plan().parameterCount(), "ScoreReverse::response_", __FILE__, __LINE__);
+    status_.reserveNamed(capacity_, "ScoreReverse::status_", __FILE__, __LINE__);
     host_status_.resize(capacity_);
     host_factors_.resize(multiply(capacity_, shape.determinants));
     finite_layout_ = {response_.capacity(), 4096,
         response_.capacity() / 4096 + (response_.capacity() % 4096 != 0), 0, 1};
-    finite_status_.reserve(finite_layout_.status_capacity);
+    finite_status_.reserveNamed(finite_layout_.status_capacity, "ScoreReverse::finite_status_", __FILE__, __LINE__);
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
 

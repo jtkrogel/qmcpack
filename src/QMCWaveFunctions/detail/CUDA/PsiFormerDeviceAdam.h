@@ -41,7 +41,8 @@ class PreparedDeviceAdam
   struct Moments
   {
     /// Allocate exactly one first/second pair.
-    explicit Moments(std::size_t count) : first(count), second(count) {}
+    explicit Moments(std::size_t count) : first(count, "Adam::first", __FILE__, __LINE__),
+    second(count, "Adam::second", __FILE__, __LINE__) {}
 
     DeviceBuffer<double> first, second;
   };
@@ -73,7 +74,7 @@ public:
     if (bytes > budget)
       throw std::length_error("Device Adam ENERGY norm scratch exceeds its byte budget");
     norm_host_.resize(bytes / sizeof(double));
-    norm_partials_.reserve(norm_host_.size());
+    norm_partials_.reserveNamed(norm_host_.size(), "Adam::norm_partials_", __FILE__, __LINE__);
   }
 
   /// Report only the optional norm owner's exact allocated device payload.
@@ -373,8 +374,10 @@ private:
   /// Allocate admitted buffers and upload only compact immutable metadata.
   PreparedDeviceAdam(std::size_t count, const std::vector<AdamBlock>& blocks, std::size_t bytes)
       : count_(count), bytes_(bytes), committed_(std::make_unique<Moments>(count)),
-        staged_(std::make_unique<Moments>(count)), parameters_(count), gradient_candidate_(count),
-        blocks_(blocks.size()), status_(1)
+        staged_(std::make_unique<Moments>(count)), parameters_(count, "Adam::parameters_", __FILE__, __LINE__),
+        gradient_candidate_(count, "Adam::gradient_candidate_", __FILE__, __LINE__),
+        blocks_(blocks.size(), "Adam::blocks_", __FILE__, __LINE__),
+        status_(1, "Adam::status_", __FILE__, __LINE__)
   {
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipGetDevice(&device_), "Adam owning device");

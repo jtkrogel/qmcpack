@@ -115,6 +115,8 @@ DerivativeReal KFACOptimizer::effectiveLearningRate() const noexcept
 
 void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
 {
+  psiformer::memory::Phase phase("kfac_factor_update_and_inverse");
+  traceStorage();
   if (pending_) throw std::logic_error("KFAC already has a speculative update");
   if (statistics.registry().fingerprint() != registry_.fingerprint() ||
       statistics.curvatureConvention() != control_.convention ||
@@ -147,11 +149,13 @@ void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
   }
   pending->state->inverse = pending->inverse->exportInverseState();
   pending_ = std::move(pending);
+  traceStorage();
 }
 
 StructuredParameterSnapshot KFACOptimizer::propose(const StructuredParameterSchema& schema,
     const StructuredParameterSnapshot& parameters, ParameterGradientView objective)
 {
+  psiformer::memory::Phase phase("kfac_solve_and_candidate");
   if (!pending_ || pending_->proposed || schema.fingerprint() != registry_.parameterSchema().fingerprint() ||
       parameters.version != pending_->parameter_version || parameters.schema_fingerprint != schema.fingerprint() ||
       parameters.values.size() != schema.parameterCount() || objective.schema_fingerprint != schema.fingerprint() ||
@@ -162,6 +166,9 @@ StructuredParameterSnapshot KFACOptimizer::propose(const StructuredParameterSche
   if (!isFiniteTrainingReal(rate) || rate <= 0.0)
     throw std::runtime_error("KFAC scheduled learning rate is invalid");
   std::vector<DerivativeValue> gradient(objective.gradient.size()), direction(gradient.size());
+  psiformer::memory::HostCapacity trace_vectors;
+  if (psiformer::memory::enabled()) trace_vectors.snapshotAt(__FILE__, __LINE__, "KFACOptimizer::gradient_and_direction",
+      (gradient.capacity() + direction.capacity()) * sizeof(DerivativeValue));
   const bool pre_scaled = control_.update_order == KFACUpdateOrder::PRE_INVERSE_RATE;
   for (std::size_t i = 0; i < gradient.size(); ++i)
     gradient[i] = (pre_scaled ? rate : 1.0) * objective.gradient[i];
@@ -194,9 +201,32 @@ void KFACOptimizer::proposalAccepted(const StructuredParameterSchema&, const Str
 {
   if (pending_ && pending_->proposed) state_.swap(pending_->state);
   pending_.reset();
+  traceStorage();
 }
 
-void KFACOptimizer::proposalRejected() noexcept { pending_.reset(); }
+void KFACOptimizer::proposalRejected() noexcept
+{
+  pending_.reset();
+  traceStorage();
+}
+
+void KFACOptimizer::traceStorage() noexcept
+{
+  if (!psiformer::memory::enabled()) return;
+  // The same vector-capacity ownership used by retainedNumericBytes(), separated
+  // by acceptance lifetime. Exported inverse banks own distinct vectors.
+  // Retire pending observations before publishing accepted capacities so a
+  // successful ownership transfer cannot manufacture a double-counted peak.
+  trace_storage_[2].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::pending_factors",
+      pending_ && pending_->state->factors ? pending_->state->factors->values.capacity() * sizeof(DerivativeReal) : 0);
+  trace_storage_[3].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::pending_inverse",
+      pending_ && pending_->state->inverse ? pending_->state->inverse->values.capacity() * sizeof(DerivativeReal) : 0);
+  // The prepared preconditioner reports its own capacity, also for stateless KFAC.
+  trace_storage_[0].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::accepted_factors",
+      state_->factors ? state_->factors->values.capacity() * sizeof(DerivativeReal) : 0);
+  trace_storage_[1].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::accepted_inverse",
+      state_->inverse ? state_->inverse->values.capacity() * sizeof(DerivativeReal) : 0);
+}
 
 std::size_t KFACOptimizer::retainedNumericBytes() const noexcept
 {

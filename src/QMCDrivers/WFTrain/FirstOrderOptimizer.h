@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_FIRST_ORDER_OPTIMIZER_H
 
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -208,6 +209,7 @@ private:
   std::size_t resident_source_version_ = 0;
   mutable bool moment_mirrors_stale_ = false;
   std::size_t cold_moment_host_allowance_ = 0;
+  mutable psiformer::memory::HostCapacity trace_host_moments_;
 #ifdef ENABLE_CUDA
   std::shared_ptr<psiformer::device::PreparedDeviceAdam> device_adam_;
 #endif

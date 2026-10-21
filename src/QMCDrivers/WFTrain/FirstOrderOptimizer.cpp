@@ -267,6 +267,7 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
     extendFingerprint(hash, &rate, sizeof(double));
   }
   configuration_fingerprint_ = formatFingerprint(hash);
+  if (psiformer::memory::enabled()) trace_host_moments_.snapshotAt(__FILE__, __LINE__, "FirstOrderOptimizer::host_moments", hostMomentMirrorBytes());
 }
 
 /// Preserve old CPU destruction while allowing the optional owner to stay opaque.
@@ -510,6 +511,7 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
     const StructuredParameterSnapshot& parameters,
     ParameterGradientView objective)
 {
+  psiformer::memory::Phase phase("first_order_candidate");
   validateInputs(schema, parameters, objective);
   StructuredParameterSnapshot candidate = parameters;
   const std::uint64_t next_iteration = accepted_update_count_ + 1;
@@ -663,6 +665,8 @@ void FirstOrderOptimizer::proposalRejected() noexcept
 /// Capacity, not logical freshness; no HOST read transaction or DEVICE query is needed.
 std::size_t FirstOrderOptimizer::hostMomentMirrorBytes() const noexcept
 {
+  if (psiformer::memory::enabled()) trace_host_moments_.snapshotAt(__FILE__, __LINE__, "FirstOrderOptimizer::host_moments",
+      (first_moment_.capacity() + second_moment_.capacity()) * sizeof(double));
   return (first_moment_.capacity() + second_moment_.capacity()) * sizeof(double);
 }
 

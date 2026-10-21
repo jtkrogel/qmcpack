@@ -1308,6 +1308,11 @@ struct PsiFormerComplexWF::Impl
     {
       for (auto& channel : channels)
         channel.resize(s.model.p.size());
+      if (psiformer::memory::enabled())
+      {
+        try { trace_capacity.snapshotAt(__FILE__, __LINE__, "ComplexDerivative::shared_host_lane", bytes(), reinterpret_cast<std::uintptr_t>(this)); }
+        catch (...) { psiformer::memory::emit({"snapshot_failed", 0, "ComplexDerivative::shared_host_lane"}); }
+      }
     }
 
     /// Count capacities, including executor metadata that is outside the two workspaces.
@@ -1339,6 +1344,7 @@ struct PsiFormerComplexWF::Impl
     std::unique_ptr<pf::DirectComplexKineticWorkspace> kinetic_work;
     std::array<std::vector<C>, 3> channels;
     std::mutex execution_mutex;
+    psiformer::memory::HostCapacity trace_capacity;
   };
 
   /// Orbital pretraining needs no kinetic workspace or three derivative-channel P buffers.
@@ -1537,7 +1543,15 @@ struct PsiFormerComplexWF::Impl
         : state(std::move(model)), lane(std::move(scratch)), version(state->model.p.version()),
           ordinal(ordinal), offset(offset), samples(samples), chunks(*state->schema, version, chunk),
           positions(3 * samples * state->model.ne), inverse_masses(samples * state->model.ne), sample_products(samples)
-    {}
+    {
+      if (psiformer::memory::enabled())
+      {
+        const auto storage = storageDiagnostics();
+        trace_capacity.snapshotAt(__FILE__, __LINE__, "ComplexDerivative::sample_positions_and_products",
+            storage.sample_position_bytes + storage.sample_auxiliary_bytes + storage.sample_product_bytes,
+            reinterpret_cast<std::uintptr_t>(lane.get()), ordinal, version);
+      }
+    }
 
     /// Real tangents have complex score products; both adjoints cover score AND complete kinetic VJPs.
     wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
@@ -1696,6 +1710,7 @@ struct PsiFormerComplexWF::Impl
     const wftrain::ParameterChunkPlan chunks;
     std::vector<double> positions, inverse_masses;
     mutable std::vector<C> sample_products;
+    psiformer::memory::HostCapacity trace_capacity;
   };
 
   /// Override initializer values before parameter-dependent identity or device image construction.
@@ -1787,6 +1802,9 @@ struct PsiFormerComplexWF::Impl
     own_laplacian.resize(model.ne);
     if (numericStorage().allocated_bytes != numeric_required)
       throw std::logic_error("Complex PsiFormer numeric capacity differs from its admitted exact requirement");
+    if (psiformer::memory::enabled())
+      trace_clone_capacity.snapshotAt(__FILE__, __LINE__, "ComplexWF::clone_host_workspace", numericStorage().allocated_bytes,
+          reinterpret_cast<std::uintptr_t>(this));
   }
 
   /// Sum live capacities and allocation identities, excluding immutable shared model storage.
@@ -2378,6 +2396,7 @@ struct PsiFormerComplexWF::Impl
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
   std::vector<GradType> own_gradient;
+  psiformer::memory::HostCapacity trace_clone_capacity;
   std::vector<ValueType> own_laplacian;
   ResourceHandle<MultiWalkerResource> multiwalker;
   const PsiFormerComplexWF* acquired_leader = nullptr;
