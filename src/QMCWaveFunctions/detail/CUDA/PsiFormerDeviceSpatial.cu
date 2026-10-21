@@ -156,6 +156,113 @@ __global__ void boundaryFeatureJetsKernel(OpenFeatureJetLayout layout,
         periodic ? &cell : nullptr);
 }
 
+/// Write one OPEN EI pair with the canonical scalar expressions and disjoint output columns.
+__device__ bool writeOpenFeaturePair(OpenFeatureJetLayout layout, const double* positions,
+    const double* nuclei, std::size_t configuration, std::size_t active_electron,
+    std::size_t electron, std::size_t nucleus, double* output)
+{
+  const double* electron_position = positions + configuration * layout.position_configuration_stride +
+      electron * layout.position_row_stride;
+  const double* nucleus_position = nuclei + nucleus * layout.nucleus_row_stride;
+  double displacement[3];
+  double radius_squared = 0.0;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    if (!device_math::isFiniteBinary64(electron_position[dimension]) ||
+        !device_math::isFiniteBinary64(nucleus_position[dimension]))
+      return false;
+    displacement[dimension] = electron_position[dimension] - nucleus_position[dimension];
+    radius_squared += displacement[dimension] * displacement[dimension];
+  }
+  const double radius = ::sqrt(radius_squared);
+  if (!(radius > 0.0) && layout.output.mode != SpatialJetMode::VALUE_ONLY)
+    return false;
+  const device_math::SoftenedRadial<double> radial = device_math::softenedRadial(radius);
+  const std::size_t base = electron * layout.feature_width + 4 * nucleus;
+  output[layout.output.uncheckedValueOffset(configuration, base)] = radial.log1p_radius;
+  for (std::size_t component = 0; component < 3; ++component)
+    output[layout.output.uncheckedValueOffset(configuration, base + 1 + component)] =
+        displacement[component] * radial.log1p_over_radius;
+
+  const bool differentiated = (layout.output.mode == SpatialJetMode::FULL_VGL &&
+      layout.output.containsTargetElectron(electron)) ||
+      (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
+  if (differentiated)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const std::size_t lane = layout.output.mode == SpatialJetMode::FULL_VGL
+          ? 3 * (electron - layout.output.target_electron_begin) + dimension : dimension;
+      const double direction = displacement[dimension] / radius;
+      output[layout.output.uncheckedGradientOffset(configuration, lane, base)] =
+          radial.log1p_first * direction;
+      for (std::size_t component = 0; component < 3; ++component)
+        output[layout.output.uncheckedGradientOffset(configuration, lane, base + 1 + component)] =
+            (component == dimension ? radial.log1p_over_radius : 0.0) +
+            displacement[component] * radial.log1p_over_radius_first * direction;
+    }
+  if (layout.output.mode == SpatialJetMode::FULL_VGL && differentiated)
+  {
+    output[layout.output.uncheckedLaplacianOffset(configuration,
+        electron - layout.output.target_electron_begin, base)] =
+        radial.log1p_second + 2.0 * radial.log1p_first / radius;
+    for (std::size_t component = 0; component < 3; ++component)
+      output[layout.output.uncheckedLaplacianOffset(configuration,
+          electron - layout.output.target_electron_begin, base + 1 + component)] =
+          2.0 * radial.log1p_over_radius_first * displacement[component] / radius +
+          displacement[component] *
+              (radial.log1p_over_radius_second + 2.0 * radial.log1p_over_radius_first / radius);
+  }
+  return true;
+}
+
+/** One block per configuration; failure-only device replay preserves exact scalar diagnostics.
+ * All numerical writes are pair-disjoint. Shared control never scales with the model.
+ */
+__global__ void openFeatureJetsCooperativeKernel(OpenFeatureJetLayout layout,
+    const double* positions, const double* nuclei, const std::size_t* active_electrons,
+    std::size_t logical_elements, std::size_t pairs, double* output, OpenSpatialStatus* status)
+{
+  const std::size_t configuration = blockIdx.x;
+  const std::size_t active = active_electrons[configuration];
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = 0;
+  // Zero only logical elements; padded strides remain caller-owned and untouched.
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)] = 0.0;
+  __syncthreads();
+  if (active >= layout.output.electron_count)
+  {
+    if (threadIdx.x == 0)
+      status[configuration] = open_spatial::buildOpenFeatureJetsForConfiguration(
+          layout, positions, nuclei, configuration, active, output);
+    return; // Uniform branch after the cooperative clear.
+  }
+  for (std::size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x)
+    if (!writeOpenFeaturePair(layout, positions, nuclei, configuration, active,
+        pair / layout.nucleus_count, pair % layout.nucleus_count, output))
+      atomicOr(&failed, 1U);
+  // Exactly one thread writes each electron's spin value; derivative planes stay zero.
+  for (std::size_t electron = threadIdx.x; electron < layout.output.electron_count; electron += blockDim.x)
+    output[layout.output.uncheckedValueOffset(configuration,
+        electron * layout.feature_width + layout.feature_width - 1)] =
+        electron < layout.spin_up_count ? 1.0 : -1.0;
+  __syncthreads();
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    if (!device_math::isFiniteBinary64(output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)]))
+      atomicOr(&failed, 1U);
+  __syncthreads();
+  if (threadIdx.x == 0)
+  {
+    // Reconstruct even partial failed scratch in scalar order. In particular a
+    // later pair's geometric failure precedes the final computed-finite scan.
+    status[configuration] = failed ? open_spatial::buildOpenFeatureJetsForConfiguration(
+        layout, positions, nuclei, configuration, active, output) : OpenSpatialStatus::REGULAR;
+  }
+}
+
 __global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
                                    const double* input,
                                    const double* bias,
@@ -520,6 +627,29 @@ Error launchOpenFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
       layout.output.configuration_count, "PsiFormer open feature grid exceeds device x dimension");
   boundaryFeatureJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, nuclei, active_electrons, output, status, {});
+  return peekSpatialLaunchError();
+}
+
+Error launchOpenFeatureJetsCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const double* positions, const double* nuclei, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.nucleus_count == 0)
+    return success;
+  validateOpenFeatureJetLayout(layout);
+  if (!positions || !nuclei || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer cooperative open feature storage is null");
+  if (layout.output.electron_count < 64)
+    return launchOpenFeatureJets(stream, layout, positions, nuclei, active_electrons, output, status);
+  if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer cooperative feature grid exceeds portable device x dimension");
+  const auto logical_elements = spatial_detail::checkedProduct(layout.output.plane_count,
+      layout.output.element_count, "PsiFormer cooperative feature logical extent overflow");
+  const auto pairs = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.nucleus_count, "PsiFormer cooperative feature pair extent overflow");
+  openFeatureJetsCooperativeKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      spatial_block_size, 0, stream>>>(layout, positions, nuclei, active_electrons,
+          logical_elements, pairs, output, status);
   return peekSpatialLaunchError();
 }
 

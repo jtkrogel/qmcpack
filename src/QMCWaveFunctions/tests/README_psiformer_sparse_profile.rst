@@ -126,3 +126,22 @@ sum; ``usesCooperativeValueLu()`` exposes actual graph eligibility/selection.
 This experimental switch does not change defaults or advertise a new product
 profile.  ``psiformer_device_runtime_validation --value-lu-only`` exercises the
 raw LU, metadata, permutation, edge and scalar-fallback contracts on hardware.
+
+Experimental large OPEN spatial feature map
+------------------------------------------
+
+``PSIFORMER_GPU_OPEN_FEATURE_COOPERATIVE=1`` opts into one 128-thread block
+per configuration for non-retained REAL OPEN FP64 FULL spatial feature jets
+with at least 64 electrons. Unset or ``0`` preserves scalar dispatch; malformed
+values reject preparation. VALUE, retained tapes/targets, kinetic-trunk-only,
+complex, periodic and mixed requests (including FP64 recovery) remain scalar.
+The switch is independent of the VALUE-only cooperative LU switch.
+
+The existing output layout, target ranges and status contract are unchanged.
+The map adds no global numeric owner and uses four bytes of static block control.
+Failed work replays the canonical scalar device helper, preserving its first
+status and unpublished partial scratch. Existing memory/work limits still apply.
+``usesCooperativeOpenFeatures()`` reports actual eligibility/selection; messages
+are process-scoped, not a whole-job sum. Defaults and admitted products are
+unchanged. ``psiformer_device_runtime_validation --open-feature-only`` checks
+the bounded raw layout, padding, failure/recovery and small-size fallback cases.

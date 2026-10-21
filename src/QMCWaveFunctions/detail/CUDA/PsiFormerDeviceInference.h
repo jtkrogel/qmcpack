@@ -318,6 +318,17 @@ inline bool configuredCooperativeValueLu()
   throw std::invalid_argument("PSIFORMER_GPU_VALUE_COOPERATIVE_LU must be 0 or 1");
 }
 
+/// Freeze the opt-in OPEN feature execution map before graph allocation.
+inline bool configuredCooperativeOpenFeatures()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_OPEN_FEATURE_COOPERATIVE");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_OPEN_FEATURE_COOPERATIVE must be 0 or 1");
+}
+
 /** Own immutable layout/fixed geometry independently of retiring parameter images.
  * Successor images share this family, keeping prepared plan references valid
  * without retaining every previous O(P) parameter allocation.
@@ -819,7 +830,8 @@ private:
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets),
-        cooperative_value_lu_requested_(configuredCooperativeValueLu()), kinetic_trunk_only_(kinetic_trunk_only)
+        cooperative_value_lu_requested_(configuredCooperativeValueLu()),
+        cooperative_open_features_requested_(configuredCooperativeOpenFeatures()), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -999,6 +1011,10 @@ private:
       std::clog << "PsiFormer VALUE LU preparation: selected="
                 << (usesCooperativeValueLu() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_control_bytes<=64; no inverse or extra global owner\n";
+    if (cooperative_open_features_requested_)
+      std::clog << "PsiFormer OPEN feature preparation: selected="
+                << (usesCooperativeOpenFeatures() ? "cooperative" : "scalar")
+                << " Ne=" << ne_ << " static_shared_control_bytes=4; no extra global owner\n";
   }
 
 public:
@@ -1216,6 +1232,9 @@ private:
     if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicFeatureJets(stream, features_, *cell, positions_.data(), model_->nuclei(),
           active_.data(), raw_.data(), open_status_.data()), "model periodic feature VGL");
+    else if (usesCooperativeOpenFeatures())
+      checkRuntime(launchOpenFeatureJetsCooperative(stream, features_, positions_.data(), model_->nuclei(),
+          active_.data(), raw_.data(), open_status_.data()), "model cooperative open feature VGL");
     else
       checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), model_->nuclei(),
           active_.data(), raw_.data(), open_status_.data()), "model open feature VGL");
@@ -1439,7 +1458,10 @@ public:
       throw std::invalid_argument("Mixed affine adapter cannot hold every requested spatial plane");
     mixed_dense_ = std::move(adapter);
     if (mixed_dense_)
+    {
       excludeCooperativeValueLuForMixedRequest();
+      excludeCooperativeOpenFeaturesForMixedRequest();
+    }
     value_tape_valid_ = false;
     result_valid_ = false;
   }
@@ -1488,6 +1510,28 @@ public:
     mixed_value_lu_excluded_ = true;
     if (cooperative_value_lu_requested_)
       std::clog << "PsiFormer VALUE LU preparation: selected=scalar (mixed request/replay excluded)\n";
+  }
+
+  /// Limit the new map to non-retained FP64 REAL OPEN spatial inference graphs.
+  bool usesCooperativeOpenFeatures() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return cooperative_open_features_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::FULL_VGL &&
+        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+        !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
+  /// Permanently retain the old map for mixed reference, approximate and retry graphs.
+  void excludeCooperativeOpenFeaturesForMixedRequest()
+  {
+    if (mixed_open_features_excluded_)
+      return;
+    mixed_open_features_excluded_ = true;
+    if (cooperative_open_features_requested_)
+      std::clog << "PsiFormer OPEN feature preparation: selected=scalar (mixed request/replay excluded)\n";
   }
 
   /// Report immutable explicit target preparation and its admitted capacity costs.
@@ -1948,6 +1992,8 @@ private:
   const bool retained_targets_;
   const bool cooperative_value_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
+  const bool cooperative_open_features_requested_;
+  bool mixed_open_features_excluded_ = false;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;
@@ -2003,6 +2049,7 @@ public:
   {
     // Exclude the reference before conversion can fail and select FP64-only recovery.
     reference_.excludeCooperativeValueLuForMixedRequest();
+    reference_.excludeCooperativeOpenFeaturesForMixedRequest();
     try
     {
       parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model, queue);
@@ -2013,6 +2060,7 @@ public:
           queue, blas);
       approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode);
       approximate_->excludeCooperativeValueLuForMixedRequest();
+      approximate_->excludeCooperativeOpenFeaturesForMixedRequest();
       approximate_->setMixedDense(adapter_);
     }
     catch (const MixedPrecisionRetryRequired& error)
@@ -2087,6 +2135,13 @@ public:
   {
     return selected_ ? selected_->usesCooperativeValueLu() :
         reference_.usesCooperativeValueLu() || (approximate_ && approximate_->usesCooperativeValueLu());
+  }
+
+  /// Report actual feature execution selection, or any eligible prepared route before evaluation.
+  bool usesCooperativeOpenFeatures() const noexcept
+  {
+    return selected_ ? selected_->usesCooperativeOpenFeatures() :
+        reference_.usesCooperativeOpenFeatures() || (approximate_ && approximate_->usesCooperativeOpenFeatures());
   }
 
   /// Describe the last numerical or preparation hazard selecting the reference route.

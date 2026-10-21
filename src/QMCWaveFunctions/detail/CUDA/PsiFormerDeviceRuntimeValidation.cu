@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -239,6 +240,139 @@ void valueLuCases(Queue& queue)
     std::cout << "PASS cooperative_VALUE_LU Ne=" << n << " matrices=" << count
               << " all_LU_permutation_metadata CPU_scalar_reference exact_alias_fallback\n";
   }
+}
+
+/// Preserve rejected GPU scratch exactly; compare only valid CPU products numerically.
+void compareOpenFeature(double actual, double expected, bool exact)
+{
+  if (exact)
+  {
+    if (std::memcmp(&actual, &expected, sizeof(double)))
+      throw std::runtime_error("OPEN feature fallback/replay/padding bit mismatch");
+  }
+  else
+    near(actual, expected, "OPEN feature CPU product");
+}
+
+/// Compare one padded two-configuration feature layout across good/failure/recovery cases.
+void openFeatureCooperativeOne(Queue& queue, std::size_t ne, std::size_t nuclei_count, SpatialJetMode mode,
+         std::size_t begin, std::size_t targets, bool hazards)
+{
+  constexpr std::size_t batch = 2;
+  const std::size_t width = 4 * nuclei_count + 1, elements = ne * width;
+  const std::size_t planes = mode == SpatialJetMode::FULL_VGL ? 1 + 4 * targets :
+      mode == SpatialJetMode::ACTIVE ? 4 : 1;
+  auto layout = makeOpenFeatureJetLayout(batch, ne, nuclei_count, ne / 2, mode,
+      5, ne * 5 + 11, 7);
+  layout.output = mode == SpatialJetMode::FULL_VGL ?
+      makeSpatialTargetJetLayout(batch, elements, ne, begin, targets,
+          elements + 13, planes * (elements + 13) + 19) :
+      makeSpatialJetLayout(batch, elements, ne, mode,
+          elements + 13, planes * (elements + 13) + 19);
+  validateOpenFeatureJetLayout(layout);
+  std::vector<double> positions(batch * layout.position_configuration_stride, 17.0);
+  std::vector<double> nuclei(nuclei_count * layout.nucleus_row_stride, 23.0);
+  for (std::size_t b = 0; b < batch; ++b)
+    for (std::size_t e = 0; e < ne; ++e)
+      for (std::size_t d = 0; d < 3; ++d)
+        positions[b * layout.position_configuration_stride + 5 * e + d] = .4 + .025 * e + .1 * d + .03 * b;
+  for (std::size_t n = 0; n < nuclei_count; ++n)
+    for (std::size_t d = 0; d < 3; ++d)
+      nuclei[7 * n + d] = -.3 - .04 * n + .07 * d;
+  const auto original_positions = positions, original_nuclei = nuclei;
+  auto coordinates = upload(positions), ions = upload(nuclei);
+  std::vector<std::size_t> active{ne - 1, 0};
+  auto active_device = upload(active);
+  const std::size_t span = spatialJetSpanElements(layout.output) + 7;
+  std::vector<unsigned char> logical_output(span, 0);
+  for (std::size_t b = 0; b < batch; ++b)
+    for (std::size_t plane = 0; plane < layout.output.plane_count; ++plane)
+      for (std::size_t element = 0; element < elements; ++element)
+        logical_output[layout.output.uncheckedPlaneOffset(b, plane, element)] = 1;
+  std::vector<double> initial(span, 97.0), actual(span), scalar(span), cpu(span);
+  auto candidate_output = upload(initial), scalar_output = upload(initial);
+  DeviceBuffer<OpenSpatialStatus> candidate_status(batch), scalar_status(batch);
+  std::vector<OpenSpatialStatus> actual_status(batch), old_status(batch), expected_status(batch);
+  // Good/bad/good uses the same owners and padded output span throughout.
+  const int variants = hazards ? 7 : 1;
+  for (int variant = 0; variant < variants; ++variant)
+  {
+    positions = original_positions;
+    nuclei = original_nuclei;
+    active = {ne - 1, 0};
+    if (variant == 1) active[1] = ne;
+    if (variant == 2) positions[5 * 3 + 1] = std::numeric_limits<double>::quiet_NaN();
+    if (variant == 3) nuclei[7 + 2] = std::numeric_limits<double>::infinity();
+    if (variant == 4 || variant == 5)
+      for (std::size_t d = 0; d < 3; ++d) positions[5 * (ne - 1) + d] = nuclei[d];
+    // Earlier computed nonfinite must NOT mask the later pair's coalescence.
+    if (variant == 5) positions[0] = 1e308;
+    coordinates.upload(positions.data(), positions.size());
+    ions.upload(nuclei.data(), nuclei.size());
+    active_device.upload(active.data(), active.size());
+    candidate_output.upload(initial.data(), initial.size());
+    scalar_output.upload(initial.data(), initial.size());
+    cpu = initial;
+    for (std::size_t b = 0; b < batch; ++b)
+      expected_status[b] = open_spatial::buildOpenFeatureJetsForConfiguration(
+          layout, positions.data(), nuclei.data(), b, active[b], cpu.data());
+    const auto before = deviceMemoryMetrics(0).snapshot();
+    checkRuntime(launchOpenFeatureJets(queue.getNative(), layout, coordinates.data(), ions.data(),
+        active_device.data(), scalar_output.data(), scalar_status.data()), "scalar OPEN feature oracle");
+    checkRuntime(launchOpenFeatureJetsCooperative(queue.getNative(), layout, coordinates.data(), ions.data(),
+        active_device.data(), candidate_output.data(), candidate_status.data()), "cooperative OPEN features");
+    queue.sync();
+    const auto after = deviceMemoryMetrics(0).snapshot();
+    if (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls ||
+        before.live_bytes != after.live_bytes)
+      throw std::runtime_error("OPEN feature launch changed tracked owners");
+    candidate_output.download(actual.data(), actual.size());
+    scalar_output.download(scalar.data(), scalar.size());
+    candidate_status.download(actual_status.data(), batch);
+    scalar_status.download(old_status.data(), batch);
+    if (actual_status != old_status || actual_status != expected_status)
+      throw std::runtime_error("OPEN feature canonical status differs");
+    if (variant == 1 && actual_status[1] != OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT)
+      throw std::runtime_error("Invalid-active fixture lost premise");
+    if (variant == 5 && actual_status[0] != OpenSpatialStatus::COALESCENCE)
+      throw std::runtime_error("Earlier overflow masked later geometric failure");
+    for (std::size_t i = 0; i < span; ++i)
+    {
+      // Failed configurations replay the identical scalar device helper; compare ALL partial scratch.
+      bool failed_configuration = false;
+      for (std::size_t b = 0; b < batch; ++b)
+        if (i >= b * layout.output.configuration_stride &&
+            i < b * layout.output.configuration_stride +
+                (layout.output.plane_count - 1) * layout.output.plane_stride + elements)
+          failed_configuration = actual_status[b] != OpenSpatialStatus::REGULAR;
+      if (!logical_output[i])
+      {
+        compareOpenFeature(actual[i], initial[i], true);
+        compareOpenFeature(scalar[i], initial[i], true);
+      }
+      compareOpenFeature(actual[i], scalar[i], !logical_output[i] || ne < 64 || failed_configuration);
+      // Rejected scratch is unpublished: preserve the old GPU bits, not a
+      // cross-backend NaN/Inf class from already-invalid host arithmetic.
+      if (!failed_configuration)
+        compareOpenFeature(actual[i], cpu[i], false);
+    }
+  }
+  std::cout << "PASS OPEN_feature_cooperative Ne=" << ne << " nuclei=" << nuclei_count
+            << " B=2 mode=" << static_cast<int>(mode) << " target_begin=" << begin
+            << " target_count=" << targets << " variants=" << variants
+            << " all_planes_padding_status_partial_scratch_zero_tracked_alloc\n";
+}
+
+/// Bound coverage to the reviewed seven OPEN raw execution-map cases.
+void openFeatureCooperativeCases(Queue& queue)
+{
+  openFeatureCooperativeOne(queue, 63, 3, SpatialJetMode::ACTIVE, 0, 0, false);
+  openFeatureCooperativeOne(queue, 64, 5, SpatialJetMode::FULL_VGL, 63, 1, false);
+  openFeatureCooperativeOne(queue, 129, 3, SpatialJetMode::FULL_VGL, 127, 2, false);
+  openFeatureCooperativeOne(queue, 100, 100, SpatialJetMode::FULL_VGL, 37, 1, false);
+  openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::VALUE_ONLY, 0, 0, false);
+  openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::ACTIVE, 0, 0, false);
+  openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::FULL_VGL, 63, 1, true);
 }
 
 /// Validate open pair features, including zero and small-radius Taylor limits.
@@ -994,8 +1128,9 @@ int main(int argc, char** argv)
     }
     const bool vectors_only = argc == 2 && std::string(argv[1]) == "--real-vectors-only";
     const bool value_lu_only = argc == 2 && std::string(argv[1]) == "--value-lu-only";
-    if (argc != 1 && !vectors_only && !value_lu_only)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only]");
+    const bool open_feature_only = argc == 2 && std::string(argv[1]) == "--open-feature-only";
+    if (argc != 1 && !vectors_only && !value_lu_only && !open_feature_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--open-feature-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -1011,6 +1146,11 @@ int main(int argc, char** argv)
     }
     std::cout << "Actual-device FP64 validation backend=" << backend << " visible_devices=" << count << "\n";
     Queue queue;
+    if (open_feature_only)
+    {
+      openFeatureCooperativeCases(queue);
+      return 0;
+    }
     if (value_lu_only)
     {
       valueLuCases(queue);
@@ -1024,6 +1164,7 @@ int main(int argc, char** argv)
     AcceleratorBlasHandle handle(queue);
     features(queue);
     featureVGL(queue);
+    openFeatureCooperativeCases(queue);
     targetRangePrimitives(queue);
     nonlinearJets(queue);
     denseAndReverse(queue, handle);

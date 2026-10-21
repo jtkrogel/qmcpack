@@ -94,6 +94,13 @@ Error launchOpenFeatureJets(Stream stream,
                             double* output,
                             OpenSpatialStatus* status);
 
+/** Explicit OPEN pair-parallel alternative; small Ne keeps the scalar path.
+ * Reuses output/status owners and canonical failure replay without new global scratch.
+ */
+Error launchOpenFeatureJetsCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const double* positions, const double* nuclei, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status);
+
 /// Build smooth-torus feature jets with seven inputs per nucleus plus spin.
 Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
