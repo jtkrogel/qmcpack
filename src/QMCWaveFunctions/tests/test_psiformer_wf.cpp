@@ -28,6 +28,7 @@
 #include "QMCDrivers/WFTrain/TrainingTimers.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
+#include "Utilities/BatchResourcePreparation.h"
 #include "Utilities/RuntimeOptions.h"
 #include "io/hdf/hdf_archive.h"
 #include "psiformer_test_utils.h"
@@ -3541,6 +3542,163 @@ TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before
 }
 
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted products",
+          "[wavefunction][psiformer][cpu_target_crowd]")
+{
+  ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
+  auto files = generateFiles("lih", 4, 4);
+  const SimulationCell simulation_cell;
+  auto p0 = makeLiHElectrons(simulation_cell);
+  auto p1 = makeLiHElectrons(simulation_cell);
+  p1.R[0][0] += 0.013;
+  auto ions = makeLiHIons(simulation_cell);
+  PsiFormerWF reference("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "1");
+  ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  PsiFormerWF leader("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
+  leader.validateSystem(p0, *ions, "all_electron");
+  auto clone = leader.makeClone(p1);
+  auto& follower = dynamic_cast<PsiFormerWF&>(*clone);
+  RefVectorWithLeader<WaveFunctionComponent> components(leader, {leader, follower});
+  RefVectorWithLeader<ParticleSet> particles(p0, {p0, p1});
+  RefVector<ParticleSet::ParticleGradient> gradients{p0.G, p1.G};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{p0.L, p1.L};
+  ResourceCollection resource_template("target_shared");
+  leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  const auto evaluate_crowd = [&](ResourceCollection& selected) {
+    p0.G = ValueType(0);
+    p0.L = ValueType(0);
+    p1.G = ValueType(0);
+    p1.L = ValueType(0);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(selected, components);
+    leader.mw_evaluateLog(components, particles, gradients, laplacians);
+    return testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components);
+  };
+  const auto compare_full = [&]() {
+    for (auto* p : {&p0, &p1})
+    {
+      ParticleSet::ParticleGradient expected_g(4);
+      ParticleSet::ParticleLaplacian expected_l(4);
+      expected_g = ValueType(0);
+      expected_l = ValueType(0);
+      const auto expected_log = reference.evaluateLog(*p, expected_g, expected_l);
+      const auto actual = testing::TestPsiFormerWF::scalarStateSnapshot(p == &p0 ? leader : follower);
+      CHECK(std::abs(actual.log_value - expected_log) < 2e-11);
+      CHECK(actual.current_sign == testing::TestPsiFormerWF::scalarStateSnapshot(reference).current_sign);
+      for (int e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          CHECK(std::abs(p->G[e][d] - expected_g[e][d]) < 2e-10);
+        CHECK(std::abs(p->L[e] - expected_l[e]) < 2e-10);
+      }
+    }
+  };
+
+  const auto first = evaluate_crowd(resource);
+  REQUIRE(first.target_spatial_workspace_identity != nullptr);
+  CHECK(first.target_spatial_bytes > 0);
+  CHECK(first.accountedBytes() >= first.target_spatial_bytes);
+  CHECK(first.batch_bytes == 0);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader).full_spatial_bytes == 0);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(follower).full_spatial_bytes == 0);
+  compare_full();
+  const auto repeated = evaluate_crowd(resource);
+  CHECK(repeated.target_spatial_workspace_identity == first.target_spatial_workspace_identity);
+  CHECK(repeated.target_spatial_bytes == first.target_spatial_bytes);
+  compare_full();
+
+  // Resource copies retain model provenance, never mutable numerical ownership.
+  ResourceCollection independent(resource);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(independent, components);
+    const auto empty = testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components);
+    CHECK(empty.target_spatial_workspace_identity == nullptr);
+    CHECK(empty.target_spatial_bytes == 0);
+    CHECK(empty.accountedBytes() == 0);
+  }
+  const auto separate = evaluate_crowd(independent);
+  CHECK(separate.target_spatial_workspace_identity != first.target_spatial_workspace_identity);
+  CHECK(separate.target_spatial_bytes == first.target_spatial_bytes);
+
+  auto candidate = leader.snapshotParameters();
+  const auto old_version = candidate.version;
+  candidate.values[0] += 0.01;
+  leader.publishParameters(candidate, old_version);
+  reference.publishParameters(candidate, old_version);
+  const auto refreshed = evaluate_crowd(resource);
+  CHECK(refreshed.target_spatial_workspace_identity == first.target_spatial_workspace_identity);
+  CHECK(refreshed.target_spatial_parameter_version == old_version + 1);
+  compare_full();
+  const auto accepted0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+  const auto accepted1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  const auto caller_g0 = p0.G;
+  const auto caller_g1 = p1.G;
+  const auto caller_l0 = p0.L;
+  const auto caller_l1 = p1.L;
+  CHECK_THROWS(leader.publishParameters(candidate, old_version));
+  const auto saved_position = p1.R[3][0];
+  p1.R[3][0] = std::numeric_limits<double>::quiet_NaN();
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    CHECK_THROWS(leader.mw_evaluateLog(components, particles, gradients, laplacians));
+  }
+  p1.R[3][0] = saved_position;
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted0));
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted1));
+  const auto after0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+  const auto after1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  CHECK(after0.log_value == accepted0.log_value);
+  CHECK(after1.log_value == accepted1.log_value);
+  CHECK(after0.current_sign == accepted0.current_sign);
+  CHECK(after1.current_sign == accepted1.current_sign);
+  CHECK(after0.accepted_configuration_identity == accepted0.accepted_configuration_identity);
+  CHECK(after1.accepted_configuration_identity == accepted1.accepted_configuration_identity);
+  CHECK(after0.accepted_parameter_version == accepted0.accepted_parameter_version);
+  CHECK(after1.accepted_parameter_version == accepted1.accepted_parameter_version);
+  for (int e = 0; e < 4; ++e)
+  {
+    for (int d = 0; d < 3; ++d)
+    {
+      CHECK(sameScalarBits(p0.G[e][d], caller_g0[e][d]));
+      CHECK(sameScalarBits(p1.G[e][d], caller_g1[e][d]));
+    }
+    CHECK(sameScalarBits(p0.L[e], caller_l0[e]));
+    CHECK(sameScalarBits(p1.L[e], caller_l1[e]));
+  }
+  compare_full(); // Caller G/L were not partly published by the successful first lane.
+
+  // A later scalar call owns a separate tape. Crowd reuse must not erase it.
+  ParticleSet::ParticleGradient scalar_g(4);
+  ParticleSet::ParticleLaplacian scalar_l(4);
+  scalar_g = ValueType(0);
+  scalar_l = ValueType(0);
+  leader.evaluateLog(p0, scalar_g, scalar_l);
+  const auto scalar = testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader);
+  CHECK(scalar.full_spatial_bytes == first.target_spatial_bytes);
+  evaluate_crowd(resource);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader).full_spatial_fingerprint ==
+        scalar.full_spatial_fingerprint);
+  auto fresh_clone = leader.makeClone(p1);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(
+      dynamic_cast<PsiFormerWF&>(*fresh_clone)).ownedWorkspaceCount() == 0);
+
+  // Explicit null preparation releases the crowd owner, not scalar fallback state.
+  resource.prepareBatchResources({nullptr, 0});
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    const auto empty = testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components);
+    CHECK(empty.target_spatial_workspace_identity == nullptr);
+    CHECK(empty.accountedBytes() == 0);
+  }
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader).full_spatial_fingerprint ==
+        scalar.full_spatial_fingerprint);
+  const auto rebuilt = evaluate_crowd(resource);
+  CHECK(rebuilt.target_spatial_bytes == first.target_spatial_bytes);
+  compare_full();
+}
+
 TEST_CASE("PsiFormer optimized CPU target FULL refreshes changed leaves across warm clones",
           "[wavefunction][psiformer][cpu_target_training]")
 {

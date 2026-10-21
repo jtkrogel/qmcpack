@@ -231,17 +231,20 @@ struct PsiFormerRatioArenaDiagnostics
  * storage or implementation types. */
 struct PsiFormerCrowdWorkspaceDiagnostics
 {
-  const void* shared_model_identity      = nullptr;
-  const void* resource_identity          = nullptr;
-  const void* batch_workspace_identity   = nullptr;
-  const void* score_workspace_identity   = nullptr;
-  const void* kinetic_workspace_identity = nullptr;
-  std::uint64_t persistent_model_identity = 0;
-  std::size_t parameter_version           = 0;
-  std::size_t batch_bytes                 = 0;
-  std::size_t score_bytes                 = 0;
-  std::size_t kinetic_bytes               = 0;
-  std::size_t transient_bytes             = 0;
+  const void* shared_model_identity             = nullptr;
+  const void* resource_identity                 = nullptr;
+  const void* batch_workspace_identity          = nullptr;
+  const void* score_workspace_identity          = nullptr;
+  const void* kinetic_workspace_identity        = nullptr;
+  const void* target_spatial_workspace_identity = nullptr;
+  std::uint64_t persistent_model_identity       = 0;
+  std::size_t parameter_version                = 0;
+  std::size_t batch_bytes                      = 0;
+  std::size_t score_bytes                      = 0;
+  std::size_t kinetic_bytes                    = 0;
+  std::size_t target_spatial_bytes             = 0;
+  std::size_t target_spatial_parameter_version = 0;
+  std::size_t transient_bytes                  = 0;
   /// Numerical-result generation; lifecycle-only calls must not advance it.
   std::size_t successful_batch_generation = 0;
   /// Sparse counters from the most recent completed direct crowd batch.
@@ -274,7 +277,7 @@ struct PsiFormerCrowdWorkspaceDiagnostics
 
   /// Return all explicitly accounted numeric storage owned by the resource.
   std::size_t accountedBytes() const noexcept
-  { return batch_bytes + score_bytes + kinetic_bytes + transient_bytes; }
+  { return batch_bytes + score_bytes + kinetic_bytes + target_spatial_bytes + transient_bytes; }
 };
 
 /// Test-only copy of the live selected-proposal compaction prefixes.
@@ -1284,6 +1287,10 @@ private:
 
   /// Stage a complete target FULL product without publishing accepted state.
   void stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles);
+
+  /// Stage into clone-owned outputs using an already leased numerical tape.
+  void stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles,
+                             pf::DirectSpatialWorkspace& workspace);
 
   /// Prove all additive outputs are finite before a scalar or crowd publication.
   void validateCpuTargetFullVGLPublication(const ParticleSet::ParticleGradient& gradients,

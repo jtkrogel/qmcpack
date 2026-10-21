@@ -4952,6 +4952,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   bool acquired_from_prepared_collection            = false;
 
   std::unique_ptr<pf::DirectBatchWorkspace> batch_workspace;
+  /// One exclusively leased target tape; scalar fallback tapes remain clone-owned.
+  std::unique_ptr<pf::DirectSpatialWorkspace> target_spatial_workspace;
   /// Lazily allocated score tape serialized across component-major crowd calls.
   std::unique_ptr<pf::DirectScoreWorkspace> score_workspace;
   /// Lazily allocated kinetic tape serialized across component-major crowd calls.
@@ -5589,6 +5591,9 @@ private:
     if (kinetic_workspace)
       add(kinetic_workspace->vectorStorageBytes(),
           "PsiFormer retained kinetic bytes overflowed");
+    if (target_spatial_workspace)
+      add(target_spatial_workspace->vectorStorageBytes(),
+          "PsiFormer retained target spatial bytes overflowed");
     add(actualStagingStorage().totalBytes(),
         "PsiFormer retained staging bytes overflowed");
     add(vectorBytes(total_log_gradient, "PsiFormer retained drift bytes overflowed"),
@@ -5925,6 +5930,7 @@ private:
         candidate.prepared_staged_log_ratios_capacity;
     prepared_ratio_arena_kind = candidate.prepared_ratio_arena_kind;
     batch_workspace                = std::move(candidate.batch_workspace);
+    target_spatial_workspace       = std::move(candidate.target_spatial_workspace);
     score_workspace                = std::move(candidate.score_workspace);
     kinetic_workspace              = std::move(candidate.kinetic_workspace);
     total_log_gradient             = std::move(candidate.total_log_gradient);
@@ -5964,6 +5970,7 @@ private:
     std::unique_ptr<pf::DirectBatchWorkspace> empty_batch =
         model_state->direct_batch_executor.makeWorkspace();
     batch_workspace = std::move(empty_batch);
+    target_spatial_workspace.reset();
     score_workspace.reset();
     kinetic_workspace.reset();
     releaseVector(total_log_gradient);
@@ -9735,6 +9742,7 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
   diagnostics.batch_workspace_identity   = resource.batch_workspace.get();
   diagnostics.score_workspace_identity   = resource.score_workspace.get();
   diagnostics.kinetic_workspace_identity = resource.kinetic_workspace.get();
+  diagnostics.target_spatial_workspace_identity = resource.target_spatial_workspace.get();
   diagnostics.persistent_model_identity  = transaction.state().persistent_model_identity;
   diagnostics.parameter_version          = transaction.parameterVersion();
   diagnostics.batch_bytes                = resource.batch_workspace->vectorStorageBytes();
@@ -9744,6 +9752,11 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
     diagnostics.score_bytes = resource.score_workspace->vectorStorageBytes();
   if (resource.kinetic_workspace)
     diagnostics.kinetic_bytes = resource.kinetic_workspace->vectorStorageBytes();
+  if (resource.target_spatial_workspace)
+  {
+    diagnostics.target_spatial_bytes = resource.target_spatial_workspace->vectorStorageBytes();
+    diagnostics.target_spatial_parameter_version = resource.target_spatial_workspace->observedParameterVersion();
+  }
   diagnostics.transient_bytes =
       resource.total_log_gradient.capacity() * sizeof(double) +
       resource.configuration_identities.capacity() * sizeof(std::uint64_t) +
@@ -12549,11 +12562,20 @@ pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
 // Stage physical G/L in existing proposal products while keeping accepted state untouched.
 void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles)
 {
+  if (&transaction.state() != model_state_.get() || !model_state_->cpu_target_vgl.targets || has_proposal_)
+    throw std::logic_error("PsiFormer CPU target FULL requires its own model and no pending proposal");
+  auto& workspace = requireDirectSpatialWorkspace(EvaluationPurpose::FULL_SPATIAL);
+  stageCpuTargetFullVGL(transaction, particles, workspace);
+}
+
+// Reuse a leased numerical tape without moving per-clone accepted/staged products.
+void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles,
+                                      pf::DirectSpatialWorkspace& workspace)
+{
   NativeTimerScope timer(phase_timers_.vgl);
   NativeTimerScope numerical_timer(phase_timers_.cpu_spatial);
   if (&transaction.state() != model_state_.get() || !model_state_->cpu_target_vgl.targets || has_proposal_)
     throw std::logic_error("PsiFormer CPU target FULL requires its own model and no pending proposal");
-  auto& workspace = requireDirectSpatialWorkspace(EvaluationPurpose::FULL_SPATIAL);
   resizeProposedSpatialStorage(model_state_->model.ne);
   const auto value = streamCpuTargetVGL(model_state_->direct_spatial_executor, workspace,
       model_state_->cpu_target_vgl.targets, transaction.parameterVersion(), particles, -1, nullptr,
@@ -14177,14 +14199,31 @@ void PsiFormerWF::mw_evaluateLog(
 
     if (transaction.state().cpu_target_vgl.targets)
     {
-      // The resource batch remains free of FULL tapes; every clone owns one target tape.
-      const auto owner_bytes = pf::checkedStorageProduct(wfc_list.size(),
+      // Only the REAL FP64 OPEN no-plan route changes ownership. Preserve other
+      // admitted inference profiles and every scalar fallback tape unchanged.
+      bool shared_target = false;
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+      shared_target = transaction.state().precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+          transaction.state().execution_plan.environment().boundary == psiformer::BoundaryCondition::OPEN &&
+          transaction.state().execution_plan.environment().amplitude_scalar_domain == psiformer::ScalarDomain::REAL;
+#endif
+      if (shared_target && !resource.target_spatial_workspace)
+      {
+        auto candidate = transaction.state().direct_spatial_executor.makeTargetWorkspace(
+            transaction.state().cpu_target_vgl.targets, transaction.state().cpu_target_vgl.owner_budget);
+        if (candidate->vectorStorageBytes() != transaction.state().cpu_target_vgl.owner_bytes)
+          throw std::logic_error("PsiFormer crowd target owner differs from admitted numeric bytes");
+        resource.target_spatial_workspace = std::move(candidate);
+      }
+      const auto owner_bytes = pf::checkedStorageProduct(shared_target ? 1 : wfc_list.size(),
           transaction.state().cpu_target_vgl.owner_bytes, "PsiFormer CPU target crowd byte extent overflow");
       if (!resource.cpu_target_vgl_reported)
       {
         app_log() << "    CPU target VGL crowd: live_clones=" << wfc_list.size()
-                  << ", W*target_owner_bytes=" << owner_bytes
-                  << "; owner cap is per clone, not an aggregate feasibility claim"
+                  << ", target_tapes=" << (shared_target ? 1 : wfc_list.size())
+                  << ", target_owner_bytes=" << owner_bytes
+                  << "; legacy PER_CLONE cap spelling bounds each actual tape, not multiplicity"
+                  << "; scalar fallback tapes remain separate; no aggregate feasibility claim"
                   << "; typed G/L outputs and other lazy owners are excluded" << std::endl;
         resource.cpu_target_vgl_reported = true;
       }
@@ -14205,7 +14244,13 @@ void PsiFormerWF::mw_evaluateLog(
             throw std::invalid_argument("PsiFormer CPU target crowd outputs overlap between walkers");
         }
       for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
-        wfc_list.getCastedElement<PsiFormerWF>(lane).stageCpuTargetFullVGL(transaction, p_list[lane]);
+      {
+        auto& component = wfc_list.getCastedElement<PsiFormerWF>(lane);
+        if (shared_target)
+          component.stageCpuTargetFullVGL(transaction, p_list[lane], *resource.target_spatial_workspace);
+        else
+          component.stageCpuTargetFullVGL(transaction, p_list[lane]);
+      }
       for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
         wfc_list.getCastedElement<PsiFormerWF>(lane).validateCpuTargetFullVGLPublication(
             gradient_list[lane].get(), laplacian_list[lane].get());
