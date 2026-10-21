@@ -3328,6 +3328,9 @@ TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycl
   const auto expected_log = reference.evaluateLog(reference_electrons, reference_electrons.G, reference_electrons.L);
   ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "3");
   ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  if (periodic)
+    CHECK_THROWS_AS(PsiFormerWF("pf_cpu_target_periodic_training", files.parameters.string(),
+        files.configuration.string(), electrons, *ions, true, {0}, false, {}, twist), std::invalid_argument);
   PsiFormerWF target("pf_cpu_target", files.parameters.string(), files.configuration.string(),
       electrons, *ions, false, {}, false, {}, twist);
   CHECK_FALSE(target.supportsMultiParticleMoves());
@@ -3520,14 +3523,91 @@ TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before
     ScopedEnvironmentVariable cap("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", invalid.c_str());
     CHECK_THROWS_AS(make_component(), std::invalid_argument);
   }
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
   CHECK_THROWS_AS(PsiFormerWF("pf_cpu_target_optimization", files.parameters.string(), files.configuration.string(),
                             true, {0}), std::invalid_argument);
+#else
+  PsiFormerWF optimized("pf_cpu_target_optimization", files.parameters.string(), files.configuration.string(),
+                       true, {0});
+  CHECK(optimized.usesCpuTargetVGL());
+  auto ions = makeLiHIons(simulation_cell);
+  CHECK_THROWS_AS(optimized.validateSystem(particles, *ions, "pseudopotential"), std::invalid_argument);
+#endif
   BatchExecutionRequirements requirements;
   exact->contributeBatchExecutionRequirements(requirements);
   const auto plan = makeClonePreparationTestPlan(*exact, requirements, "cpu-target", "cpu-target-hard-plan");
   const auto participant = makeBatchExecutionParticipantPlan(plan, "cpu-target");
   CHECK_THROWS_AS(exact->validateBatchExecutionPlanBinding(participant), std::invalid_argument);
 }
+
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("PsiFormer optimized CPU target FULL refreshes changed leaves across warm clones",
+          "[wavefunction][psiformer][cpu_target_training]")
+{
+  ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
+  auto files = generateFiles("lih", 4, 4);
+  const SimulationCell simulation_cell;
+  auto particles = makeLiHElectrons(simulation_cell);
+  auto clone_particles = makeLiHElectrons(simulation_cell);
+  auto reference_particles = makeLiHElectrons(simulation_cell);
+  auto ions = makeLiHIons(simulation_cell);
+  PsiFormerWF reference("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "1");
+  ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  PsiFormerWF target("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
+  target.validateSystem(particles, *ions, "all_electron");
+  auto clone = target.makeClone(clone_particles);
+  auto& follower = dynamic_cast<PsiFormerWF&>(*clone);
+  const auto evaluate = [](PsiFormerWF& component, ParticleSet& p) {
+    p.G = ValueType(0);
+    p.L = ValueType(0);
+    return component.evaluateLog(p, p.G, p.L);
+  };
+  const auto old_log = evaluate(target, particles);
+  evaluate(follower, clone_particles);
+  const auto old_state = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  const auto old_storage = testing::TestPsiFormerWF::directWorkspaceDiagnostics(follower);
+  const auto original = target.snapshotParameters();
+  auto candidate = original;
+  candidate.values[0] += 0.01; // Change a variational leaf, not just its version stamp.
+  const auto version = target.publishParameters(candidate, original.version);
+  reference.publishParameters(candidate, original.version);
+  CHECK(version == original.version + 1);
+  CHECK(target.snapshotParameters().values == candidate.values);
+  const auto expected_log = evaluate(reference, reference_particles);
+  CHECK(std::abs(expected_log - old_log) > 1e-10);
+  CHECK(std::abs(evaluate(target, particles) - expected_log) < 2e-11);
+  CHECK(std::abs(evaluate(follower, clone_particles) - expected_log) < 2e-11);
+  for (int e = 0; e < particles.getTotalNum(); ++e)
+  {
+    for (int d = 0; d < 3; ++d)
+    {
+      CHECK(std::abs(particles.G[e][d] - reference_particles.G[e][d]) < 2e-10);
+      CHECK(std::abs(clone_particles.G[e][d] - reference_particles.G[e][d]) < 2e-10);
+    }
+    CHECK(std::abs(particles.L[e] - reference_particles.L[e]) < 2e-10);
+    CHECK(std::abs(clone_particles.L[e] - reference_particles.L[e]) < 2e-10);
+  }
+  const auto refreshed = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  CHECK(refreshed.accepted_parameter_version == version);
+  CHECK(refreshed.accepted_parameter_version != old_state.accepted_parameter_version);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(follower).full_spatial_fingerprint ==
+        old_storage.full_spatial_fingerprint);
+
+  // Invalid candidates must not mutate leaves or either clone's accepted products.
+  const auto stable = target.snapshotParameters();
+  const auto leader_state = testing::TestPsiFormerWF::scalarStateSnapshot(target);
+  auto invalid = stable;
+  invalid.values[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(target.publishParameters(invalid, stable.version));
+  CHECK_THROWS(target.publishParameters(candidate, original.version));
+  CHECK(target.snapshotParameters().values == stable.values);
+  CHECK(target.parameterVersion() == stable.version);
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(target, leader_state));
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, refreshed));
+}
+#endif
 
 TEST_CASE("PsiFormer CPU target streaming profile admits exact owner and rejects legacy tapes",
           "[wavefunction][psiformer][streaming][target]")

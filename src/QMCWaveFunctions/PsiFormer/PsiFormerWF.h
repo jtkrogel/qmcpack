@@ -414,6 +414,9 @@ public:
   /// Report the physical system metadata already validated by the builder.
   bool isPseudopotentialSystem() const;
 
+  /// Report immutable CPU target spatial ownership, independently of derivative tapes.
+  bool usesCpuTargetVGL() const;
+
   /// Match selected real pair metadata and the target's full cell/Gamma twist, not GPU readiness.
   bool matchesRealDevicePairTarget(const ParticleSet& particles) const;
 

@@ -6417,7 +6417,16 @@ PsiFormerWF::PsiFormerWF(std::string name,
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
   if (model_state_->cpu_target_vgl.targets && enable_optimization)
-    throw std::invalid_argument("PsiFormer CPU target VGL is inference-only and requires optimize=no");
+  {
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
+    throw std::invalid_argument("PsiFormer CPU target VGL training requires a REAL FP64 build");
+#else
+    if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        model_state_->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
+        model_state_->execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+      throw std::invalid_argument("PsiFormer CPU target VGL training requires REAL FP64 OPEN metadata");
+#endif
+  }
   if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && enable_optimization)
     throw std::invalid_argument("Mixed PsiFormer precision is inference-only; optimize=yes is unsupported");
   if (!enable_optimization && !selected_flat_indices.empty())
@@ -7682,6 +7691,12 @@ bool PsiFormerWF::isPseudopotentialSystem() const
 {
   PsiFormerReadTransaction transaction(*model_state_, true);
   return system_kind_ == "pseudopotential";
+}
+
+// Expose the immutable spatial policy for narrow native training admission.
+bool PsiFormerWF::usesCpuTargetVGL() const
+{
+  return model_state_->cpu_target_vgl.targets != 0;
 }
 
 /// Check immutable pair geometry against a native target without copying parameter leaves.
@@ -12053,6 +12068,8 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
     throw std::invalid_argument("PsiFormer system must be all_electron or pseudopotential");
   if (electrons.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electrons or spin-orbit pseudopotentials");
+  if (usesCpuTargetVGL() && isOptimizable() && system_kind != "all_electron")
+    throw std::invalid_argument("PsiFormer CPU target VGL training requires an all-electron system");
   validateMatchingLattices(electrons, ions);
 
   PsiFormerReadTransaction state_lock(*model_state_);

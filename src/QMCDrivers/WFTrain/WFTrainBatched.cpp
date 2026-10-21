@@ -2405,6 +2405,23 @@ void WFTrainBatched::process(xmlNodePtr node)
     steps_per_block_ = determineStepsPerBlock(walker_counts.global_walkers, qmcdriver_input_.get_requested_samples(),
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
+    // Target spatial tapes do not replace score/complete local-energy products.
+    // Bound native energy training independently of the spatial owner budget.
+    if (const auto* target_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+        target_provider && target_provider->usesCpuTargetVGL())
+    {
+      const bool admitted_optimizer = training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM ||
+          (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
+           wftrain::supportsHybridKFACPolicy(training_input_));
+      if (!admitted_optimizer || training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+          student_prototype_.getOrbitals().size() != 1 || myComm->size() != 1 ||
+          walker_counts.walkers_per_crowd.size() != 1 || steps_per_block_ != 1 ||
+          target_provider->isPseudopotentialSystem() || population_.get_golden_hamiltonian().hasPhysicalNLPP() ||
+          population_.get_golden_hamiltonian().ecpModelProvenance() ||
+          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift())
+        throw UniformCommunicateError("CPU target VGL training requires sole REAL OPEN AE energy Adam or explicit-policy "
+            "KFAC, MPI1/crowd1/step1 and PBYP/no drift; derivative products remain independent");
+    }
     initPopulationAndCrowds(walker_counts);
     if (hybrid_score_kfac)
     {
