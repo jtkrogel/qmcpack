@@ -540,6 +540,7 @@ TEST_CASE("Selected real pair physics identity binds actual native Ewald sources
     }
   PsiFormerComplexWF paired_component("paired_pair_physics", paired, electrons, ions, 16777216);
   REQUIRE(paired_component.matchesPairedDevicePairTarget(electrons));
+  CHECK_FALSE(paired_component.matchesLegacyTorusAllElectronTarget(electrons));
   auto paired_physical = makeHamiltonian(electrons, electrons, electrons);
   const auto paired_identity = pairedPairCoulombIdentity(paired_component, electrons, *paired_physical);
   CHECK_FALSE(paired_identity.empty());

@@ -62,6 +62,9 @@ public:
   /// Match only selected Gamma two-cell metadata and the actual immutable target/source.
   bool matchesPairedDevicePairTarget(const ParticleSet& electrons) const;
 
+  /// Match legacy AE metadata and an actual BULK target, excluding selected/PP families.
+  bool matchesLegacyTorusAllElectronTarget(const ParticleSet& electrons) const;
+
   /// Match immutable model physics metadata to the native Hamiltonian route.
   bool isPseudopotentialSystem() const;
 

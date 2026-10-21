@@ -2605,6 +2605,17 @@ bool PsiFormerComplexWF::matchesPairedDevicePairTarget(const ParticleSet& electr
   return true;
 }
 
+/// Match immutable legacy metadata and the actual target boundary without parameter copies.
+bool PsiFormerComplexWF::matchesLegacyTorusAllElectronTarget(const ParticleSet& electrons) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto& state = *impl_->state;
+  return electrons.getLattice().SuperCellEnum == SUPERCELL_BULK &&
+      state.system_kind == "all_electron" && !state.environment.periodic_profile &&
+      state.environment.boundary == psiformer::BoundaryCondition::PERIODIC &&
+      state.environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+}
+
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {

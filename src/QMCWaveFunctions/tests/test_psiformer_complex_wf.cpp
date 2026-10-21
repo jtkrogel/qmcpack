@@ -570,11 +570,17 @@ TEST_CASE("PsiFormer paired system metadata survives private ownership",
   PsiFormerComplexWF explicit_ae("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "all_electron");
   CHECK(explicit_ae.trainingConfigurationFingerprint() == implicit_ae.trainingConfigurationFingerprint());
   CHECK_FALSE(explicit_ae.isPseudopotentialSystem());
+  CHECK(implicit_ae.matchesLegacyTorusAllElectronTarget(particles));
+  CHECK(explicit_ae.matchesLegacyTorusAllElectronTarget(particles));
+  const SimulationCell open_cell;
+  auto open_particles = electrons(open_cell);
+  CHECK_FALSE(implicit_ae.matchesLegacyTorusAllElectronTarget(open_particles));
   CHECK_THROWS_AS(PsiFormerComplexWF("psiformer", parameters(), particles, source, clone_cap,
       {}, 0, {}, "invalid"), std::invalid_argument);
   // Metadata-only roundtrip: this does not admit a native pseudopotential Hamiltonian/profile.
   PsiFormerComplexWF pp("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "pseudopotential");
   CHECK(pp.isPseudopotentialSystem());
+  CHECK_FALSE(pp.matchesLegacyTorusAllElectronTarget(particles));
   const auto fingerprint = pp.trainingConfigurationFingerprint();
   CHECK(fingerprint != explicit_ae.trainingConfigurationFingerprint());
   auto clone = pp.makeClone(clone_particles);

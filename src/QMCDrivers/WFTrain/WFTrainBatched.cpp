@@ -2094,6 +2094,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
 #ifdef QMC_COMPLEX
+    bool legacy_paired_mpi2_kfac = false;
     for (const auto& orbital : student_prototype_.getOrbitals())
       if (auto* complex = dynamic_cast<PsiFormerComplexWF*>(orbital.get()))
       {
@@ -2105,6 +2106,14 @@ void WFTrainBatched::process(xmlNodePtr node)
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
         const auto optimizer = training_input_.getOptimizer();
+        // Widen only the already qualified legacy AE score-covariance lane.
+        // Its complex chunks and affine factors remain HOST-staged raw sums.
+        legacy_paired_mpi2_kfac = complex->gpuInferenceEnabled() && myComm->size() == 2 &&
+            complex->matchesLegacyTorusAllElectronTarget(population_.get_golden_electrons()) &&
+            wftrain::supportsHybridKFACPolicy(training_input_) &&
+            !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+            !population_.get_golden_hamiltonian().ecpModelProvenance() &&
+            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
         const bool cpu_orbital_mse = !complex->gpuInferenceEnabled() &&
             training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
             training_input_.getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE &&
@@ -2147,11 +2156,12 @@ void WFTrainBatched::process(xmlNodePtr node)
               training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
               training_input_.getMaximumUpdateNorm() == 0));
         if (complex->gpuInferenceEnabled() &&
-            (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
+            (!training_input_.getComplexGpuTraining().enabled() || (myComm->size() != 1 && !legacy_paired_mpi2_kfac) ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
              !supported_optimizer))
           throw UniformCommunicateError(
-              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY host first-order, "
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1 (or legacy AE score KFAC MPI2), "
+              "PBYP ENERGY host first-order, "
               "AE covariance KFAC/OFF without drift, or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
             (!cpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
@@ -2359,7 +2369,8 @@ void WFTrainBatched::process(xmlNodePtr node)
     hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
         !complex_training_component_->isPseudopotentialSystem() &&
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        !population_.get_golden_hamiltonian().ecpModelProvenance() && myComm->size() == 1 &&
+        !population_.get_golden_hamiltonian().ecpModelProvenance() &&
+        (myComm->size() == 1 || legacy_paired_mpi2_kfac) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #endif
     int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
@@ -2823,10 +2834,28 @@ void WFTrainBatched::run()
     enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
     if (complex_affine_score_bytes)
     {
-      if (complex_gpu_provider_)
-        complex_training_component_->prepareHybridAffineScores(complex_affine_score_bytes);
-      else
-        complex_training_component_->prepareAffineScores(complex_affine_score_bytes);
+      std::exception_ptr affine_preparation_failure;
+      try
+      {
+        if (complex_gpu_provider_)
+          complex_training_component_->prepareHybridAffineScores(complex_affine_score_bytes);
+        else
+          complex_training_component_->prepareAffineScores(complex_affine_score_bytes);
+      }
+      catch (...)
+      {
+        affine_preparation_failure = std::current_exception();
+      }
+      // A failed rank-local HOST tape allocation must not strand peers in the
+      // subsequent model/gradient/checkpoint collectives.
+      int affine_preparation_failed = affine_preparation_failure ? 1 : 0;
+      myComm->allreduce(affine_preparation_failed);
+      if (affine_preparation_failed)
+      {
+        if (affine_preparation_failure)
+          std::rethrow_exception(affine_preparation_failure);
+        throw UniformCommunicateError("WFTrainBatched: another rank failed paired affine preparation");
+      }
     }
     app_log() << "WFTrain paired " << (complex_gpu_provider_ ? "GPU" : "CPU")
               << " prospective named numeric bytes plus allowance=" << prospective
