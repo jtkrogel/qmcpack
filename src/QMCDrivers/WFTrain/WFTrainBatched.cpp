@@ -2394,20 +2394,32 @@ void WFTrainBatched::process(xmlNodePtr node)
     {
       bool real_open_ae = false;
       std::size_t active_gpu_capacity = 0;
+      int capacity_failure = 0;
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
       real_open_ae = ae && real_provider &&
           population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN;
-      if (real_open_ae && myComm->size() == 1 && (crowds_.size() == 2 || crowds_.size() == 4))
-        active_gpu_capacity = real_provider->activeAcceleratorInferenceCrowdCapacity();
+      if (real_open_ae && (myComm->size() == 1 || myComm->size() == 2) &&
+          (crowds_.size() == 2 || crowds_.size() == 4))
+      {
+        // Vote a local validation failure before any rank leaves population admission.
+        try
+        {
+          active_gpu_capacity = real_provider->activeAcceleratorInferenceCrowdCapacity();
+        }
+        catch (...)
+        {
+          capacity_failure = 1;
+        }
+      }
 #endif
       const bool all_nonempty = std::all_of(crowds_.begin(), crowds_.end(),
           [](const auto& crowd) { return crowd->size() != 0; });
-      int invalid_population = !wftrain::supportsHybridKFACPopulation(real_open_ae,
+      int invalid_population = capacity_failure || !wftrain::supportsHybridKFACPopulation(real_open_ae,
           static_cast<std::size_t>(myComm->size()), crowds_.size(), all_nonempty, active_gpu_capacity);
       myComm->allreduce(invalid_population);
       if (invalid_population)
         throw UniformCommunicateError("Hybrid score KFAC requires nonempty crowds; C2/C4 require "
-            "REAL OPEN AE FP64 MPI1 and one prepared GPU inference lease before sampling");
+            "REAL OPEN AE FP64 MPI1/MPI2 and one prepared GPU inference lease per rank before sampling");
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
           (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
         throw UniformCommunicateError("GPU score-only ECP requires MPI1/block1/step1 before sampling");

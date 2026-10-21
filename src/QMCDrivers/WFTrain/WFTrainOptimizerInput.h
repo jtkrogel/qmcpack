@@ -50,12 +50,12 @@ inline bool usesKFACScoreEstimator(const WFTrainDriverInput& input, bool paired_
        input.getKFACGradient() != WFTrainDriverInput::KFACGradient::LEGACY);
 }
 
-/// Preserve C1 admission and bound additional crowds to one serialized real-open AE rank.
+/// Preserve C1 admission and bound additional crowds to one or two serialized real-open AE ranks.
 inline bool supportsHybridKFACPopulation(bool real_open_ae, std::size_t ranks, std::size_t crowds,
                                         bool all_nonempty, std::size_t active_gpu_capacity) noexcept
 {
   return all_nonempty && (crowds == 1 ||
-      (real_open_ae && ranks == 1 && active_gpu_capacity == 1 && (crowds == 2 || crowds == 4)));
+      (real_open_ae && (ranks == 1 || ranks == 2) && active_gpu_capacity == 1 && (crowds == 2 || crowds == 4)));
 }
 
 /// Input part of the bounded real/open hybrid contract; the driver checks physics and topology.

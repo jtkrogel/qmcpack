@@ -122,10 +122,17 @@ TEST_CASE("Hybrid KFAC crowd admission preserves isolated single-crowd profiles"
   {
     CHECK(supportsHybridKFACPopulation(true, 1, crowds, true, 1));
     CHECK_FALSE(supportsHybridKFACPopulation(false, 1, crowds, true, 1));
-    CHECK_FALSE(supportsHybridKFACPopulation(true, 2, crowds, true, 1));
+    CHECK(supportsHybridKFACPopulation(true, 2, crowds, true, 1));
+    CHECK_FALSE(supportsHybridKFACPopulation(false, 2, crowds, true, 1));
+    CHECK_FALSE(supportsHybridKFACPopulation(true, 2, crowds, false, 1));
+    for (const auto ranks : {std::size_t{0}, std::size_t{3}})
+      CHECK_FALSE(supportsHybridKFACPopulation(true, ranks, crowds, true, 1));
     CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, false, 1));
     for (const auto active : {std::size_t{0}, std::size_t{2}, std::size_t{4}})
+    {
       CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, true, active));
+      CHECK_FALSE(supportsHybridKFACPopulation(true, 2, crowds, true, active));
+    }
   }
   for (const auto crowds : {std::size_t{0}, std::size_t{3}, std::size_t{8}})
     CHECK_FALSE(supportsHybridKFACPopulation(true, 1, crowds, true, 1));
