@@ -118,11 +118,28 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
   return leaves;
 }
 
+/// Resolve exact neutral cluster sizes without changing molecular fixture recipes.
+inline std::size_t hydrogenClusterElectronCount(const std::string& system)
+{
+  if (system == "hydrogen20")
+    return 20;
+  if (system == "hydrogen50")
+    return 50;
+  if (system == "hydrogen100")
+    return 100;
+  if (system == "hydrogen200")
+    return 200;
+  if (system == "hydrogen300")
+    return 300;
+  return 0;
+}
+
 /// Fill every parameter region with deterministic values appropriate to its role.
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
-  const std::size_t electron_count = system == "hydrogen50" ? 50 : (system == "hydrogen100" ? 100 : (system == "lih" ? 4 :
-      (system == "lih_pair" ? 8 : (system == "oh" ? 7 : (system == "unequal" ? 3 : 2)))));
+  const std::size_t cluster_count = hydrogenClusterElectronCount(system);
+  const std::size_t electron_count = cluster_count ? cluster_count : (system == "lih" ? 4 :
+      (system == "lih_pair" ? 8 : (system == "oh" ? 7 : (system == "unequal" ? 3 : 2))));
   SplitMix64 random(PARAMETER_RECIPE_SEED + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
@@ -199,10 +216,9 @@ inline Geometry makeGeometry(const std::string& system)
     centers          = {0, 1, 0};
     geometry.nup     = 2;
   }
-  else if (system == "hydrogen50" || system == "hydrogen100")
+  else if (const std::size_t count = hydrogenClusterElectronCount(system); count != 0)
   {
     // Neutral open hydrogen clusters for shape smoke tests, not trained models.
-    const std::size_t count = system == "hydrogen50" ? 50 : 100;
     geometry.nup = count / 2;
     for (std::size_t nucleus = 0; nucleus < count; ++nucleus)
     {

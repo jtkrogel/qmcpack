@@ -747,6 +747,80 @@ TEST_CASE("PsiFormer rejects incompatible observable requests", "[wavefunction][
   CHECK_THROWS_AS(model.evaluate(electrons, invalid_seed), std::invalid_argument);
 }
 
+TEST_CASE("PsiFormer exact-size cluster fixtures retain the common layout",
+          "[wavefunction][psiformer][fixture_recipe]")
+{
+  for (const std::size_t count : {20, 50, 100, 200, 300})
+  {
+    const std::string system = "hydrogen" + std::to_string(count);
+    INFO(system);
+    const Geometry geometry = makeGeometry(system);
+    CHECK(geometry.nup == count / 2);
+    CHECK(geometry.nuclei.size() == 3 * count);
+    CHECK(geometry.electrons.size() == 3 * count);
+    CHECK(geometry.charges == std::vector<double>(count, 1.0));
+    const auto repeated = makeGeometry(system);
+    CHECK(geometry.nuclei == repeated.nuclei);
+    CHECK(geometry.electrons == repeated.electrons);
+    for (std::size_t electron = 0; electron < count; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double offset = std::abs(geometry.electrons[lane] - geometry.nuclei[lane]);
+        CHECK(offset >= 0.35);
+        CHECK(offset <= 1.25);
+      }
+    const auto leaves = makeLayout(count, count);
+    CHECK(leaves.size() == 41);
+    std::size_t parameter_count = 0;
+    for (const auto& leaf : leaves)
+      parameter_count += product(leaf.shape);
+    CHECK(parameter_count == 64 * count * count + 9216 * count + 1575170);
+    const auto values = makeParameters(system, leaves);
+    CHECK(values.size() == parameter_count);
+    const auto repeated_values = makeParameters(system, leaves);
+    CHECK(std::equal(values.begin(), values.end(), repeated_values.begin()));
+  }
+  CHECK_THROWS_AS(makeGeometry("hydrogen21"), std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer legacy cluster parameter streams preserve their original seeds",
+          "[wavefunction][psiformer][fixture_recipe]")
+{
+  // Independently replay the pre-extension per-leaf recipe for the old sizes.
+  for (const std::size_t count : {50, 100})
+  {
+    INFO(count);
+    const auto leaves = makeLayout(count, count);
+    const auto values = makeParameters("hydrogen" + std::to_string(count), leaves);
+    SplitMix64 random(0xC0FFEE1234000000ULL + count);
+    std::size_t index = 0;
+    bool unchanged = true;
+    for (const auto& leaf : leaves)
+      for (std::size_t entry = 0; entry < product(leaf.shape); ++entry)
+      {
+        double expected;
+        if (leaf.name.size() >= 5 && leaf.name.substr(leaf.name.size() - 5) == "alpha")
+          expected = 0.8 + 0.4 * random.uniform();
+        else if (leaf.name.rfind("zetas", 0) == 0)
+          expected = 0.6 + 0.8 * random.uniform();
+        else if (leaf.name.rfind("pi_", 0) == 0)
+          expected = 0.15 + 0.2 * random.symmetric();
+        else if (leaf.name == "b")
+          expected = 0.02 * random.symmetric();
+        else if (leaf.module.find("electron_embedding") != std::string::npos)
+          expected = 0.08 * random.symmetric();
+        else if (leaf.module.find("Backflow") != std::string::npos)
+          expected = 0.06 * random.symmetric();
+        else
+          expected = 0.04 * random.symmetric();
+        unchanged = (values[index++] == expected) && unchanged;
+      }
+    CHECK(index == values.size());
+    CHECK(unchanged);
+  }
+}
+
 TEST_CASE("PsiFormer rejects malformed or non-finite HDF5 exports", "[wavefunction][psiformer]")
 {
   auto overwrite_scalar = [](const std::filesystem::path& path,

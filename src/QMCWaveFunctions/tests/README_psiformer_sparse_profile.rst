@@ -9,13 +9,20 @@ Generate deterministic fixtures in a separate process before freezing inputs:
 
 .. code-block:: text
 
+   benchmark_psiformer_native_memory --generate-fixture hydrogen20 NEW_DIRECTORY
    benchmark_psiformer_native_memory --generate-fixture hydrogen50 NEW_DIRECTORY
    benchmark_psiformer_native_memory --generate-fixture hydrogen100 NEW_DIRECTORY
+   benchmark_psiformer_native_memory --generate-fixture hydrogen200 NEW_DIRECTORY
+   benchmark_psiformer_native_memory --generate-fixture hydrogen300 NEW_DIRECTORY
 
 These are neutral open hydrogen clusters with balanced spins and the existing
 D16/width256/head4/depth4 test layout. Random parameters and non-equilibrated
 positions provide shape smoke tests, not production physics or scaling claims.
 Existing LiH/OH recipes and seeds are unchanged. Hash all generated files.
+The H50/H100 recipes and RNG consumption are unchanged. The five exact sizes
+share the same trunk but not the same parameter count. Check every determinant
+channel's conditioning and finite complete products before profiling; generation
+alone does not qualify the random model or authorize larger resource caps.
 
 Complete-request examples, using identical immutable inputs for each pair:
 
