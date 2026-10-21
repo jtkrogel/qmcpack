@@ -108,3 +108,21 @@ vendor/runtime allocations, unwrapped QMCPACK/offload buffers, other processes,
 external allocations and kernel memory traffic are excluded. Keep aggregate
 admission caps, external reserves, observed counters and actual HBM/RSS evidence
 as separate fields; a byte cap is not a measured peak.
+
+Experimental large VALUE-only cooperative LU
+-------------------------------------------
+
+``PSIFORMER_GPU_VALUE_COOPERATIVE_LU=1`` opts into one-block-per-matrix LU for
+REAL OPEN FP64 VALUE-only graphs with at least 64 electrons and no retained
+score tape.  Unset or ``0`` preserves scalar dispatch; malformed values reject
+graph preparation.  FULL spatial, retained score/inverse, complex, periodic,
+and mixed requests (including their FP64 recovery) remain scalar.  A training
+workflow may still opt in its separate non-retained VALUE proposal graph.
+
+This adds no global numeric owner; static block control is at most 64 bytes.
+Existing memory/work limits and numerical acceptance requirements still apply.
+The preparation messages are process-scoped diagnostic output, not a job-wide
+sum; ``usesCooperativeValueLu()`` exposes actual graph eligibility/selection.
+This experimental switch does not change defaults or advertise a new product
+profile.  ``psiformer_device_runtime_validation --value-lu-only`` exercises the
+raw LU, metadata, permutation, edge and scalar-fallback contracts on hardware.

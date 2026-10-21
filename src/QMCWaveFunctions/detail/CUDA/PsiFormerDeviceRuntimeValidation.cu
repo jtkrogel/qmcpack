@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -98,6 +99,146 @@ void hostChecks()
   catch (const std::runtime_error&) { rejected_nonfinite = true; }
   if (!rejected_nonfinite)
     throw std::runtime_error("nonfinite comparison guard was optimized away");
+}
+
+/// Check VALUE-only launch admission without dereferencing host dummy addresses.
+void valueLuHostChecks()
+{
+  using device_determinant::FactorizationMetadata;
+  double value = 1;
+  std::size_t permutation = 0;
+  FactorizationMetadata metadata;
+  auto invoke = [&](std::size_t b, std::size_t d, std::size_t n, const double* input,
+                    double* lu, std::size_t* perm, FactorizationMetadata* meta) {
+    return launchDeterminantValueFactorizationCooperative(nullptr, input, b, d, n, lu, perm, meta);
+  };
+  checkRuntime(invoke(0, 1, 0, nullptr, nullptr, nullptr, nullptr), "zero VALUE batch");
+  checkRuntime(invoke(1, 0, 0, nullptr, nullptr, nullptr, nullptr), "zero VALUE determinants");
+  auto invalid = [&](auto call) {
+    bool rejected = false;
+    try { call(); } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("VALUE launch failed to reject invalid arguments");
+  };
+  invalid([&] { invoke(1, 1, 0, &value, &value, &permutation, &metadata); });
+  invalid([&] { invoke(1, 1, 2, nullptr, &value, &permutation, &metadata); });
+  invalid([&] { invoke(1, 1, 2, &value, nullptr, &permutation, &metadata); });
+  invalid([&] { invoke(1, 1, 2, &value, &value, nullptr, &metadata); });
+  invalid([&] { invoke(1, 1, 2, &value, &value, &permutation, nullptr); });
+  auto overflow = [&](std::size_t b, std::size_t d, std::size_t n) {
+    bool rejected = false;
+    double separate_lu = 0;
+    try { invoke(b, d, n, &value, &separate_lu, &permutation, &metadata); }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("VALUE launch failed to reject layout overflow");
+  };
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  overflow(maximum, 2, 64);
+  overflow(1, 1, maximum);
+  overflow(maximum / 4096 + 1, 1, 64);
+  overflow(static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1, 1, 64);
+}
+
+/// Compare every LU entry, permutation and metadata field, including singular partial LU.
+void valueLuCases(Queue& queue)
+{
+  using namespace device_determinant;
+  auto same = [](double actual, double expected, const char* field, bool exact) {
+    if (exact)
+    {
+      if (std::memcmp(&actual, &expected, sizeof(double)) != 0)
+        throw std::runtime_error(std::string(field) + " bitwise fallback mismatch");
+    }
+    else if (!device_math::isFiniteBinary64(expected))
+    {
+      if (std::memcmp(&actual, &expected, sizeof(double)) != 0)
+        throw std::runtime_error(std::string(field) + " nonfinite metadata mismatch");
+    }
+    else
+      near(actual, expected, field);
+  };
+  for (const std::size_t n : {2u, 63u, 64u, 65u, 100u, 200u, 300u})
+  {
+    // Ne300 cheaply exercises row/multiplier loops striding past all 128 threads.
+    const std::size_t b = n == 300 ? 1 : 2, d = n == 300 ? 1 : 6, count = b * d;
+    std::vector<double> input(count * n * n);
+    for (std::size_t m = 0; m < count; ++m)
+    {
+      double* a = input.data() + m * n * n;
+      for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < n; ++j)
+          a[i * n + j] = i == j ? 4.0 + (i % 3) / 8.0 :
+              (static_cast<int>((i * 7 + j * 3) % 9) - 4) / (16.0 * n);
+      if (m == 1)
+        for (std::size_t j = 0; j < n; ++j) std::swap(a[j], a[(n - 1) * n + j]);
+      if (m == 2 || m == 3 || m == 11)
+      {
+        std::fill(a, a + n * n, 0.0);
+        for (std::size_t i = 0; i < n; ++i) a[i * n + i] = 1;
+        if (m == 2) { a[n] = 1; if (n > 2) a[2 * n] = -1; }
+        if (m == 3) a[0] = -1;
+        if (m == 11) a[(n - 1) * n + n - 1] = std::ldexp(1.0, -40);
+      }
+      if (m == 4) std::copy(a, a + n, a + (n - 1) * n);
+      if (m == 5) std::fill(a, a + n * n, 0.0);
+      if (m == 6) a[n + 1] = std::numeric_limits<double>::quiet_NaN();
+      if (m == 7) a[n + 1] = std::numeric_limits<double>::infinity();
+      if (m == 8) a[n + 1] = -std::numeric_limits<double>::infinity();
+      if (m == 9 || m == 10)
+        for (std::size_t i = 0; i < n * n; ++i) a[i] *= m == 9 ? 1e250 : 1e-250;
+    }
+    std::vector<double> cpu_lu(input.size());
+    std::vector<std::size_t> cpu_perm(count * n);
+    std::vector<FactorizationMetadata> cpu_meta(count);
+    for (std::size_t m = 0; m < count; ++m)
+      cpu_meta[m] = factorizeScaledReal(input.data() + m * n * n, n,
+          cpu_lu.data() + m * n * n, cpu_perm.data() + m * n, false, nullptr, nullptr);
+    auto matrices = upload(input);
+    DeviceBuffer<double> scalar_lu(input.size()), cooperative_lu(input.size());
+    DeviceBuffer<std::size_t> scalar_perm(count * n), cooperative_perm(count * n);
+    DeviceBuffer<FactorizationMetadata> scalar_meta(count), cooperative_meta(count);
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), matrices.data(), b, d, n, false,
+        scalar_lu.data(), nullptr, scalar_perm.data(), nullptr, scalar_meta.data()), "scalar VALUE reference");
+    checkRuntime(launchDeterminantValueFactorizationCooperative(queue.getNative(), matrices.data(), b, d, n,
+        cooperative_lu.data(), cooperative_perm.data(), cooperative_meta.data()), "cooperative VALUE");
+    queue.sync();
+    const auto old_lu = download(scalar_lu);
+    const auto old_perm = download(scalar_perm);
+    const auto old_meta = download(scalar_meta);
+    auto compare = [&](const auto& lu, const auto& perm, const auto& meta,
+                       const auto& reference_lu, const auto& reference_perm, const auto& reference_meta,
+                       bool exact) {
+      for (std::size_t i = 0; i < lu.size(); ++i) same(lu[i], reference_lu[i], "VALUE LU", exact);
+      if (perm != reference_perm) throw std::runtime_error("VALUE permutation mismatch");
+      for (std::size_t m = 0; m < count; ++m)
+      {
+        const auto& actual = meta[m]; const auto& expected = reference_meta[m];
+        if (actual.status != expected.status || actual.inverse_available != expected.inverse_available ||
+            actual.phase != expected.phase)
+          throw std::runtime_error("VALUE status/phase/inverse mismatch");
+        same(actual.log_abs, expected.log_abs, "VALUE logabs", exact);
+        same(actual.matrix_scale, expected.matrix_scale, "VALUE scale", exact);
+        same(actual.minimum_scaled_pivot, expected.minimum_scaled_pivot, "VALUE min pivot", exact);
+        same(actual.maximum_scaled_pivot, expected.maximum_scaled_pivot, "VALUE max pivot", exact);
+      }
+    };
+    const auto new_lu = download(cooperative_lu);
+    const auto new_perm = download(cooperative_perm);
+    const auto new_meta = download(cooperative_meta);
+    compare(new_lu, new_perm, new_meta, old_lu, old_perm, old_meta, n < 64);
+    compare(new_lu, new_perm, new_meta, cpu_lu, cpu_perm, cpu_meta, false);
+    if (count > 1 && (new_perm[n] != n - 1 || new_perm[2 * n] != 0 || new_meta[3].phase != -1 ||
+        new_meta[4].status != FactorizationStatus::SINGULAR || new_lu[4 * n * n] == 0))
+      throw std::runtime_error("VALUE edge fixture lost swap/tie/sign/partial singular premise");
+    // Exact input/output alias must select the unchanged scalar implementation.
+    auto alias = upload(input);
+    checkRuntime(launchDeterminantValueFactorizationCooperative(queue.getNative(), alias.data(), b, d, n,
+        alias.data(), cooperative_perm.data(), cooperative_meta.data()), "aliased scalar VALUE fallback");
+    queue.sync();
+    compare(download(alias), download(cooperative_perm), download(cooperative_meta),
+            old_lu, old_perm, old_meta, true);
+    std::cout << "PASS cooperative_VALUE_LU Ne=" << n << " matrices=" << count
+              << " all_LU_permutation_metadata CPU_scalar_reference exact_alias_fallback\n";
+  }
 }
 
 /// Validate open pair features, including zero and small-radius Taylor limits.
@@ -845,14 +986,16 @@ int main(int argc, char** argv)
   try
   {
     hostChecks();
+    valueLuHostChecks();
     if (argc == 2 && std::string(argv[1]) == "--host-check")
     {
       std::cout << "PASS host-only ownership checks; GPU numerical tests NOT_RUN\n";
       return 0;
     }
     const bool vectors_only = argc == 2 && std::string(argv[1]) == "--real-vectors-only";
-    if (argc != 1 && !vectors_only)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only]");
+    const bool value_lu_only = argc == 2 && std::string(argv[1]) == "--value-lu-only";
+    if (argc != 1 && !vectors_only && !value_lu_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -868,6 +1011,11 @@ int main(int argc, char** argv)
     }
     std::cout << "Actual-device FP64 validation backend=" << backend << " visible_devices=" << count << "\n";
     Queue queue;
+    if (value_lu_only)
+    {
+      valueLuCases(queue);
+      return 0;
+    }
     if (vectors_only)
     {
       validateDerivativeRealVectors(queue);
@@ -881,6 +1029,7 @@ int main(int argc, char** argv)
     denseAndReverse(queue, handle);
     softmax(queue);
     determinants(queue);
+    valueLuCases(queue);
     determinantTargetReuse(queue);
     boundedResponses(queue);
     batchedScoreLeaves(queue);

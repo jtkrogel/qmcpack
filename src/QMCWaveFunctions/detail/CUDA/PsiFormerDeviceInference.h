@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -304,6 +305,17 @@ inline InferenceStatusPolicy configuredInferenceStatusPolicy()
   if (std::string_view(value) == "deferred")
     return InferenceStatusPolicy::DEFERRED_NEURAL;
   throw std::invalid_argument("PSIFORMER_GPU_STATUS_CHECKS must be synchronous or deferred");
+}
+
+/** Freeze the experimental VALUE-only LU opt-in before allocating graph owners. */
+inline bool configuredCooperativeValueLu()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_VALUE_COOPERATIVE_LU");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_VALUE_COOPERATIVE_LU must be 0 or 1");
 }
 
 /** Own immutable layout/fixed geometry independently of retiring parameter images.
@@ -806,7 +818,8 @@ private:
                           bool kinetic_trunk_only = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
-        target_preparation_(target_preparation), retained_targets_(retained_targets), kinetic_trunk_only_(kinetic_trunk_only)
+        target_preparation_(target_preparation), retained_targets_(retained_targets),
+        cooperative_value_lu_requested_(configuredCooperativeValueLu()), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -982,6 +995,10 @@ private:
     if (head_free_targets && !kinetic_trunk_only && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
         hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
       throw std::logic_error("Head-free target prefix differs from exact preflight");
+    if (cooperative_value_lu_requested_)
+      std::clog << "PsiFormer VALUE LU preparation: selected="
+                << (usesCooperativeValueLu() ? "cooperative" : "scalar")
+                << " Ne=" << ne_ << " static_shared_control_bytes<=64; no inverse or extra global owner\n";
   }
 
 public:
@@ -1299,9 +1316,13 @@ private:
         const auto origin = configuration * orbitals_.orbitals.configuration_stride;
         copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
       }
-      checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
-          mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
-          permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+      if (usesCooperativeValueLu())
+        checkRuntime(launchDeterminantValueFactorizationCooperative(stream, matrices_.data(), batch_,
+            shape_.determinants, ne_, lu_.data(), permutations_.data(), factors_.data()), "model cooperative VALUE determinants");
+      else
+        checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
+            mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
+            permutations_.data(), solve_.data(), factors_.data()), "model determinants");
     }
     checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
         term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
@@ -1417,6 +1438,8 @@ public:
     if (adapter && adapter->maximumRows() < product(product(batch_capacity_, ne_), dense_.source.plane_count))
       throw std::invalid_argument("Mixed affine adapter cannot hold every requested spatial plane");
     mixed_dense_ = std::move(adapter);
+    if (mixed_dense_)
+      excludeCooperativeValueLuForMixedRequest();
     value_tape_valid_ = false;
     result_valid_ = false;
   }
@@ -1444,6 +1467,28 @@ public:
 
   /// Expose the fixed output layout for result comparison, not internal scratch.
   const SpatialJetLayout& resultLayout() const noexcept { return result_layout_; }
+
+  /// Expose actual dispatch, not merely the requested flag; mixed/retained graphs coexist.
+  bool usesCooperativeValueLu() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return cooperative_value_lu_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+        value_tape_.empty() && !mixed_value_lu_excluded_ && !mixed_dense_ && !kinetic_trunk_only_ &&
+        environment.boundary == BoundaryCondition::OPEN &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
+  /// Permanently preserve scalar VALUE LU for both sides of a mixed request/replay.
+  void excludeCooperativeValueLuForMixedRequest()
+  {
+    if (mixed_value_lu_excluded_)
+      return;
+    mixed_value_lu_excluded_ = true;
+    if (cooperative_value_lu_requested_)
+      std::clog << "PsiFormer VALUE LU preparation: selected=scalar (mixed request/replay excluded)\n";
+  }
 
   /// Report immutable explicit target preparation and its admitted capacity costs.
   const TargetVglPreparation& targetVglPreparation() const noexcept { return target_preparation_; }
@@ -1901,6 +1946,8 @@ private:
   const SpatialJetMode mode_;
   const TargetVglPreparation target_preparation_;
   const bool retained_targets_;
+  const bool cooperative_value_lu_requested_;
+  bool mixed_value_lu_excluded_ = false;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;
@@ -1954,6 +2001,8 @@ public:
                                     bool allow_fp64_retry = true)
       : reference_(model, capacity, queue, blas, mode), allow_retry_(allow_fp64_retry)
   {
+    // Exclude the reference before conversion can fail and select FP64-only recovery.
+    reference_.excludeCooperativeValueLuForMixedRequest();
     try
     {
       parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model, queue);
@@ -1963,6 +2012,7 @@ public:
               reference_.resultLayout().plane_count, "Mixed spatial row overflow"),
           queue, blas);
       approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode);
+      approximate_->excludeCooperativeValueLuForMixedRequest();
       approximate_->setMixedDense(adapter_);
     }
     catch (const MixedPrecisionRetryRequired& error)
@@ -2031,6 +2081,13 @@ public:
 
   /// Report a whole-graph retry explicitly rather than presenting it as mixed throughput.
   bool usedFp64Retry() const noexcept { return used_retry_; }
+
+  /// Expose actual selected LU dispatch, or any eligible prepared route before evaluation.
+  bool usesCooperativeValueLu() const noexcept
+  {
+    return selected_ ? selected_->usesCooperativeValueLu() :
+        reference_.usesCooperativeValueLu() || (approximate_ && approximate_->usesCooperativeValueLu());
+  }
 
   /// Describe the last numerical or preparation hazard selecting the reference route.
   const std::string& retryReason() const noexcept { return retry_reason_; }

@@ -21,6 +21,133 @@ namespace
 
 constexpr unsigned int determinant_block_size = 128;
 
+/** One block per VALUE matrix, preserving scalar pivot order and per-cell arithmetic.
+ * Shared control is POD; global LU/permutation/metadata are the existing owners.
+ */
+__global__ void determinantValueCooperativeKernel(
+    const double* matrices, std::size_t matrix_size, double* all_lu,
+    std::size_t* all_permutations, device_determinant::FactorizationMetadata* metadata)
+{
+  const std::size_t matrix = blockIdx.x;
+  const std::size_t elements = matrix_size * matrix_size;
+  const double* input = matrices + matrix * elements;
+  double* lu = all_lu + matrix * elements;
+  std::size_t* permutation = all_permutations + matrix * matrix_size;
+  __shared__ double scale, phase, log_abs, min_pivot, max_pivot, pivot;
+  __shared__ std::size_t pivot_row;
+  __shared__ int state; // 0 regular-in-progress, 1 zero/singular, 2 nonfinite input.
+  // Match the serial global scale scan, including first nonfinite-input handling.
+  if (threadIdx.x == 0)
+  {
+    scale = 0.0;
+    state = 0;
+    for (std::size_t element = 0; element < elements; ++element)
+    {
+      if (!device_determinant::isFiniteBinary64(input[element]))
+      {
+        state = 2;
+        break;
+      }
+      const double magnitude = ::fabs(input[element]);
+      scale = magnitude > scale ? magnitude : scale;
+    }
+    if (state == 0 && scale == 0.0)
+      state = 1;
+    phase = 1.0;
+    log_abs = state == 0 ? static_cast<double>(matrix_size) * ::log(scale) : 0.0;
+    min_pivot = DBL_MAX;
+    max_pivot = 0.0;
+  }
+  __syncthreads();
+  for (std::size_t row = threadIdx.x; row < matrix_size; row += blockDim.x)
+    permutation[row] = row;
+  for (std::size_t element = threadIdx.x; element < elements; element += blockDim.x)
+    lu[element] = state == 0 ? input[element] / scale : 0.0;
+  __syncthreads();
+  if (state != 0)
+  {
+    if (threadIdx.x == 0)
+    {
+      device_determinant::FactorizationMetadata result;
+      if (state == 2)
+        result.status = device_determinant::FactorizationStatus::NONFINITE_INPUT;
+      else
+        result.matrix_scale = scale;
+      metadata[matrix] = result;
+    }
+    return; // Uniform block return after initialization and clear.
+  }
+  for (std::size_t column = 0; column < matrix_size; ++column)
+  {
+    // One thread preserves strict-greater earliest-row pivot and metadata order.
+    if (threadIdx.x == 0)
+    {
+      pivot_row = column;
+      for (std::size_t row = column + 1; row < matrix_size; ++row)
+        if (::fabs(lu[row * matrix_size + column]) > ::fabs(lu[pivot_row * matrix_size + column]))
+          pivot_row = row;
+      if (lu[pivot_row * matrix_size + column] == 0.0)
+        state = 1;
+    }
+    __syncthreads();
+    if (state != 0)
+      break; // Preserve the same partially factored LU at a zero pivot.
+    if (pivot_row != column)
+    {
+      for (std::size_t entry = threadIdx.x; entry < matrix_size; entry += blockDim.x)
+      {
+        const double temporary = lu[column * matrix_size + entry];
+        lu[column * matrix_size + entry] = lu[pivot_row * matrix_size + entry];
+        lu[pivot_row * matrix_size + entry] = temporary;
+      }
+      if (threadIdx.x == 0)
+      {
+        const std::size_t temporary = permutation[column];
+        permutation[column] = permutation[pivot_row];
+        permutation[pivot_row] = temporary;
+        phase = -phase;
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+      pivot = lu[column * matrix_size + column];
+      const double pivot_abs = ::fabs(pivot);
+      phase = pivot < 0.0 ? -phase : phase;
+      log_abs += ::log(pivot_abs);
+      min_pivot = pivot_abs < min_pivot ? pivot_abs : min_pivot;
+      max_pivot = pivot_abs > max_pivot ? pivot_abs : max_pivot;
+    }
+    __syncthreads();
+    for (std::size_t row = column + 1 + threadIdx.x; row < matrix_size; row += blockDim.x)
+      lu[row * matrix_size + column] /= pivot;
+    __syncthreads();
+    // Each trailing cell has exactly the scalar update, after all multipliers exist.
+    const std::size_t remaining = matrix_size - column - 1;
+    for (std::size_t cell = threadIdx.x; cell < remaining * remaining; cell += blockDim.x)
+    {
+      const std::size_t row = column + 1 + cell / remaining;
+      const std::size_t entry = column + 1 + cell % remaining;
+      lu[row * matrix_size + entry] -= lu[row * matrix_size + column] * lu[column * matrix_size + entry];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+  {
+    device_determinant::FactorizationMetadata result;
+    result.matrix_scale = scale;
+    result.maximum_scaled_pivot = max_pivot;
+    if (state == 0)
+    {
+      result.phase = phase;
+      result.log_abs = log_abs;
+      result.minimum_scaled_pivot = min_pivot;
+      result.status = device_determinant::FactorizationStatus::REGULAR;
+    }
+    metadata[matrix] = result;
+  }
+}
+
 __global__ void determinantFactorizationKernel(
     const double* matrices,
     std::size_t matrix_count,
@@ -292,6 +419,39 @@ Error launchDeterminantFactorization(
   determinantFactorizationKernel<<<block_count, determinant_block_size, 0, stream>>>(
       matrices, matrix_count, matrix_size, prepare_inverse, lu, inverse,
       permutation, solve, metadata);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+/// Validate all owners before selecting cooperative VALUE or the legacy fallback.
+Error launchDeterminantValueFactorizationCooperative(
+    Stream stream, const double* matrices, std::size_t configuration_count,
+    std::size_t determinant_count, std::size_t matrix_size, double* lu,
+    std::size_t* permutation, device_determinant::FactorizationMetadata* metadata)
+{
+  const auto count = checkedProduct(configuration_count, determinant_count,
+      "PsiFormer cooperative VALUE matrix-count overflow");
+  if (!count)
+    return success;
+  if (!matrix_size)
+    throw std::invalid_argument("PsiFormer cooperative VALUE matrix size must be positive");
+  const auto elements = checkedProduct(matrix_size, matrix_size,
+      "PsiFormer cooperative VALUE matrix extent overflow");
+  (void)checkedProduct(count, elements, "PsiFormer cooperative VALUE batch extent overflow");
+  (void)checkedProduct(count, matrix_size, "PsiFormer cooperative VALUE permutation extent overflow");
+  if (!matrices || !lu || !permutation || !metadata)
+    throw std::invalid_argument("PsiFormer cooperative VALUE requires matrix/LU/permutation/metadata storage");
+  // Keep small matrices and the pre-existing in-place contract on the scalar path.
+  if (matrix_size < 64 || matrices == lu)
+    return launchDeterminantFactorization(stream, matrices, configuration_count,
+        determinant_count, matrix_size, false, lu, nullptr, permutation, nullptr, metadata);
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer cooperative VALUE grid exceeds the portable CUDA/HIP x dimension");
+  determinantValueCooperativeKernel<<<static_cast<unsigned int>(count), determinant_block_size, 0, stream>>>(
+      matrices, matrix_size, lu, permutation, metadata);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else

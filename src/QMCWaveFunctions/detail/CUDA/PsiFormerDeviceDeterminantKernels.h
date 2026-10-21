@@ -20,6 +20,12 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** VALUE-only cooperative alternative; no inverse/solve owners or alias expansion. */
+Error launchDeterminantValueFactorizationCooperative(
+    Stream stream, const double* matrices, std::size_t configuration_count,
+    std::size_t determinant_count, std::size_t matrix_size, double* lu,
+    std::size_t* permutation, device_determinant::FactorizationMetadata* metadata);
+
 /** Checked wrapper-facing layout for lifted determinant matrix jets. */
 struct LiftedDeterminantLayout
 {
