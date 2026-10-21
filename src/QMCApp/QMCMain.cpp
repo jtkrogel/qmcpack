@@ -39,6 +39,9 @@
 #include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
+#endif
 #include "Message/Communicate.h"
 #include "Message/CommOperators.h"
 #include "Message/UniformCommunicateError.h"
@@ -712,6 +715,11 @@ bool QMCMain::executeQMCSection(xmlNodePtr cur, bool reuse)
   if (qmc_system_ == nullptr)
     qmc_system_ = particle_set_pool_->getWalkerSet(target);
   bool success = runQMC(cur, reuse);
+#ifdef ENABLE_CUDA
+  // A successful section return is quiescent; loops use this same boundary once per section.
+  if (success && DeviceManager::getGlobal().getNumDevices() > 0)
+    psiformer::device::reportCurrentDeviceMemorySnapshot(app_log(), myComm->rank(), "post_qmc_section");
+#endif
   first_qmc_   = false;
   return success;
 }

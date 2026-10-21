@@ -87,3 +87,24 @@ Run the cheap controller tests without Slurm or model data:
 .. code-block:: text
 
    python3 -m unittest discover -s src/QMCWaveFunctions/tests -p test_psiformer_sparse_profile.py
+
+Optional native device ownership summary
+---------------------------------------
+
+Set ``PSIFORMER_GPU_MEMORY_SUMMARY=1`` to print a native ownership summary after
+each successfully completed QMC section. Loop sections use the same boundary;
+there is no extra device synchronization or MPI collective. Other values leave
+this reporting disabled without a device-runtime query. GPU-less ranks skip it.
+
+The summary names the communicator rank and vendor-local device ordinal and
+reports existing ``DeviceBuffer`` live/peak bytes, allocation/free counts and
+successful explicit upload/download/device-copy counts and bytes. Counters are
+cumulative since their last explicit reset; reporting itself never resets them.
+The normal application log may emit only selected ranks, so these lines are not
+a whole-job sum or a maximum across ranks/devices.
+
+Tracked ownership is not runtime HBM consumption or a sampled HBM peak. HOST,
+vendor/runtime allocations, unwrapped QMCPACK/offload buffers, other processes,
+external allocations and kernel memory traffic are excluded. Keep aggregate
+admission caps, external reserves, observed counters and actual HBM/RSS evidence
+as separate fields; a byte cap is not a measured peak.

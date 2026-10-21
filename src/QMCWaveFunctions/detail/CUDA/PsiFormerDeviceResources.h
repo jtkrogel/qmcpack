@@ -54,6 +54,21 @@ inline void reportCurrentDeviceMemoryAdmission(std::ostream& out)
   deviceMemoryMetrics(ordinal).reportAdmission(out, ordinal);
 }
 
+/// Observe completed native ownership at an opt-in driver boundary, without synchronization.
+inline void reportCurrentDeviceMemorySnapshot(std::ostream& out, int communicator_rank,
+                                              std::string_view boundary)
+{
+  if (!configuredDeviceMemorySummaryEnabled())
+    return;
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "hipGetDevice for native memory summary");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "cudaGetDevice for native memory summary");
+#endif
+  deviceMemoryMetrics(ordinal).reportSnapshot(out, ordinal, communicator_rank, boundary);
+}
+
 /// Reject byte-count overflow before any allocation or transfer is submitted.
 template<class T>
 inline std::size_t checkedDeviceBytes(std::size_t count)

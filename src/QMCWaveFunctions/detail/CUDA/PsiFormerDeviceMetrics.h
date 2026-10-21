@@ -25,10 +25,18 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Opt in explicitly without consulting the device runtime on the disabled path.
+inline bool configuredDeviceMemorySummaryEnabled() noexcept
+{
+  const char* value = std::getenv("PSIFORMER_GPU_MEMORY_SUMMARY");
+  return value && std::string_view(value) == "1";
+}
 
 /** Describe explicit live/peak ownership and successful interval operations. */
 struct DeviceMemorySnapshot
@@ -226,6 +234,25 @@ public:
             uploaded_bytes_.load(std::memory_order_relaxed), download_calls_.load(std::memory_order_relaxed),
             downloaded_bytes_.load(std::memory_order_relaxed), device_copy_calls_.load(std::memory_order_relaxed),
             device_copied_bytes_.load(std::memory_order_relaxed)};
+  }
+
+  /// Format existing counters at a quiescent boundary without resetting their interval.
+  void reportSnapshot(std::ostream& out, int device_ordinal, int communicator_rank,
+                      std::string_view boundary) const
+  {
+    const auto state = snapshot();
+    out << "  PsiFormer native device memory summary: boundary=" << boundary
+        << ", communicator_rank=" << communicator_rank << ", vendor_local_device=" << device_ordinal
+        << ", scope=one_process_one_device, counters=since_last_explicit_reset"
+        << ", allocation_calls=" << state.allocation_calls << ", free_calls=" << state.free_calls
+        << ", failed_frees=" << state.failed_frees << ", tracked_live_bytes=" << state.live_bytes
+        << ", tracked_peak_bytes=" << state.peak_bytes << ", upload_calls=" << state.upload_calls
+        << ", uploaded_bytes=" << state.uploaded_bytes << ", download_calls=" << state.download_calls
+        << ", downloaded_bytes=" << state.downloaded_bytes << ", device_copy_calls=" << state.device_copy_calls
+        << ", device_copied_bytes=" << state.device_copied_bytes
+        << "; covers DeviceBuffer ownership and explicit successful transfers"
+        << "; excludes HOST, other processes, unwrapped QMCPACK/offload, vendor/runtime, external allocations"
+        << " and kernel memory traffic; runtime_HBM_peak=no; reset_performed=no\n";
   }
 
   /// Start a quiescent measurement interval without forgetting resident images.

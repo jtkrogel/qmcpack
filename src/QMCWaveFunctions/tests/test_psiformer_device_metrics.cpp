@@ -19,6 +19,72 @@
 
 using namespace qmcplusplus::psiformer::device;
 
+/// Reporting observes the existing interval and never changes ownership or counters.
+TEST_CASE("PsiFormer native memory snapshot formatting", "[psiformer][accelerator][memory_summary]")
+{
+  DeviceMemoryMetrics metrics;
+  metrics.allocated(16);
+  metrics.allocated(32);
+  metrics.freed(16);
+  metrics.failedFree();
+  metrics.uploaded(24);
+  metrics.downloaded(8);
+  metrics.copied(12);
+  std::ostringstream out;
+  metrics.reportSnapshot(out, 3, 7, "post_qmc_section");
+  const auto text = out.str();
+  for (const auto field : {"boundary=post_qmc_section", "communicator_rank=7", "vendor_local_device=3",
+                          "scope=one_process_one_device", "counters=since_last_explicit_reset",
+                          "allocation_calls=2", "free_calls=1", "failed_frees=1", "tracked_live_bytes=32",
+                          "tracked_peak_bytes=48", "upload_calls=1", "uploaded_bytes=24", "download_calls=1",
+                          "downloaded_bytes=8", "device_copy_calls=1", "device_copied_bytes=12",
+                          "excludes HOST", "runtime_HBM_peak=no", "reset_performed=no"})
+    CHECK(text.find(field) != std::string::npos);
+  const auto unchanged = metrics.snapshot();
+  CHECK(unchanged.live_bytes == 32);
+  CHECK(unchanged.peak_bytes == 48);
+  CHECK(unchanged.allocation_calls == 2);
+  CHECK(unchanged.uploaded_bytes == 24);
+  metrics.allocated(8);
+  std::ostringstream second;
+  metrics.reportSnapshot(second, 3, 7, "next_section");
+  CHECK(second.str().find("allocation_calls=3") != std::string::npos);
+  CHECK(second.str().find("tracked_peak_bytes=48") != std::string::npos);
+}
+
+/// Only the exact opt-in enables summaries; checking the policy needs no GPU.
+TEST_CASE("PsiFormer memory summary opt in", "[psiformer][accelerator][memory_summary]")
+{
+  const char* previous = std::getenv("PSIFORMER_GPU_MEMORY_SUMMARY");
+  const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+  // Keep the caller's profiling policy unchanged after this environment-only test.
+  struct Restore
+  {
+    const std::optional<std::string>& saved;
+    // Restore even when a test assertion exits this scope early.
+    ~Restore()
+    {
+      if (saved)
+      {
+        setenv("PSIFORMER_GPU_MEMORY_SUMMARY", saved->c_str(), 1);
+      }
+      else
+      {
+        unsetenv("PSIFORMER_GPU_MEMORY_SUMMARY");
+      }
+    }
+  } restore{saved};
+  unsetenv("PSIFORMER_GPU_MEMORY_SUMMARY");
+  CHECK_FALSE(configuredDeviceMemorySummaryEnabled());
+  for (const char* value : {"", "0", "true", "01", "1x"})
+  {
+    setenv("PSIFORMER_GPU_MEMORY_SUMMARY", value, 1);
+    CHECK_FALSE(configuredDeviceMemorySummaryEnabled());
+  }
+  setenv("PSIFORMER_GPU_MEMORY_SUMMARY", "1", 1);
+  CHECK(configuredDeviceMemorySummaryEnabled());
+}
+
 /// Constrain ownership/interval semantics without a GPU or vendor runtime.
 TEST_CASE("PsiFormer explicit device memory accounting", "[psiformer][accelerator]")
 {
