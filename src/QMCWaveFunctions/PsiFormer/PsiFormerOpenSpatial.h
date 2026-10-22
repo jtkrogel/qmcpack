@@ -610,6 +610,37 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
       : OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
 }
 
+/** Gather a requested cusp range only from an admitted complete-state jet.
+ * A failed complete cache cannot widen the requested derivative failure domain:
+ * replay the original target leaf, including its clear/partial-output semantics.
+ */
+QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus gatherCuspTargetsForConfiguration(
+    const OpenCuspJetLayout& complete, const OpenCuspJetLayout& target,
+    const double* positions, std::size_t configuration, std::size_t active_electron,
+    double same_spin_alpha, double opposite_spin_alpha, const double* cached,
+    OpenSpatialStatus cached_status, double* output,
+    const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
+{
+  if (cached_status != OpenSpatialStatus::REGULAR || active_electron >= target.output.electron_count)
+    return buildOpenCuspJetsForConfiguration(target, positions, configuration, active_electron,
+        same_spin_alpha, opposite_spin_alpha, output, periodic_cell);
+  clearConfiguration(target.output, configuration, output);
+  output[target.output.uncheckedValueOffset(configuration, 0)] =
+      cached[complete.output.uncheckedValueOffset(configuration, 0)];
+  for (std::size_t local = 0; local < target.output.laplacian_lanes; ++local)
+  {
+    const auto physical = target.output.physicalTargetElectron(local);
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      output[target.output.uncheckedGradientOffset(configuration, 3 * local + dimension, 0)] =
+          cached[complete.output.uncheckedGradientOffset(configuration, 3 * physical + dimension, 0)];
+    output[target.output.uncheckedLaplacianOffset(configuration, local, 0)] =
+        cached[complete.output.uncheckedLaplacianOffset(configuration, physical, 0)];
+  }
+  return configurationIsFinite(target.output, configuration, output) ? OpenSpatialStatus::REGULAR
+      : buildOpenCuspJetsForConfiguration(target, positions, configuration, active_electron,
+          same_spin_alpha, opposite_spin_alpha, output, periodic_cell);
+}
+
 QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus combineFinalSpatialForConfiguration(
     const FinalSpatialJetLayout& layout,
     const device_determinant::CombinationMetadata* determinant_metadata,

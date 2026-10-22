@@ -1075,6 +1075,81 @@ TEST_CASE("PsiFormer open orbital jets match active and full finite differences"
                   std::invalid_argument);
 }
 
+TEST_CASE("PsiFormer cusp cache preserves target status and padded storage", "[psiformer][cusp_cache]")
+{
+  constexpr std::size_t batch = 2, ne = 5;
+  const auto full = psiformer::makeOpenCuspJetLayout(batch, ne, 2,
+      psiformer::SpatialJetMode::FULL_VGL, 4, 24, 3, 70);
+  const auto cell = psiformer::periodic_geometry::makeCell(
+      {{{5.1, .2, .1}, {.4, 4.8, .3}, {.2, .5, 5.3}}}, {{true, true, true}});
+  std::vector<double> positions(48, 913.0);
+  for (std::size_t b = 0; b < batch; ++b)
+    for (std::size_t e = 0; e < ne; ++e)
+      for (std::size_t d = 0; d < 3; ++d)
+        positions[24 * b + 4 * e + d] = .27 + .31 * e + .13 * b + .17 * d;
+  for (const bool periodic : {false, true})
+  {
+    std::vector<double> cache(psiformer::spatialJetSpanElements(full.output) + 1, 791.0);
+    for (std::size_t b = 0; b < batch; ++b)
+      REQUIRE(open_spatial::buildOpenCuspJetsForConfiguration(full, positions.data(), b, 0,
+          .8, 1.1, cache.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+    for (const auto interval : {std::pair<std::size_t, std::size_t>{0, 2}, {2, 2}, {4, 1}, {1, 1}, {0, ne}})
+    {
+      auto target = full;
+      target.output = psiformer::withSpatialTargetRange(full.output, interval.first, interval.second);
+      std::vector<double> expected(psiformer::spatialJetSpanElements(target.output) + 1, 791.0);
+      for (std::size_t b = 0; b < batch; ++b)
+        REQUIRE(open_spatial::buildOpenCuspJetsForConfiguration(target, positions.data(), b, 0,
+            .8, 1.1, expected.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+      for (const auto cached_status : {psiformer::OpenSpatialStatus::REGULAR,
+                                      psiformer::OpenSpatialStatus::COALESCENCE,
+                                      psiformer::OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT})
+      {
+        std::vector<double> actual(expected.size(), 791.0);
+        for (std::size_t b = 0; b < batch; ++b)
+          REQUIRE(open_spatial::gatherCuspTargetsForConfiguration(full, target, positions.data(), b, 0,
+              .8, 1.1, cache.data(), cached_status, actual.data(), periodic ? &cell : nullptr) ==
+              psiformer::OpenSpatialStatus::REGULAR);
+        CHECK(actual == expected);
+      }
+    }
+    // A cache failure must replay the canonical target's failure and partial clearing.
+    positions[4] = positions[0]; positions[5] = positions[1]; positions[6] = positions[2];
+    auto target = full;
+    target.output = psiformer::withSpatialTargetRange(full.output, 4, 1);
+    std::vector<double> expected(psiformer::spatialJetSpanElements(target.output) + 1, 791.0);
+    auto actual = expected;
+    const auto status = open_spatial::buildOpenCuspJetsForConfiguration(target, positions.data(), 0, 0,
+        .8, 1.1, expected.data(), periodic ? &cell : nullptr);
+    REQUIRE(status == psiformer::OpenSpatialStatus::COALESCENCE);
+    REQUIRE(open_spatial::gatherCuspTargetsForConfiguration(full, target, positions.data(), 0, 0,
+        .8, 1.1, cache.data(), status, actual.data(), periodic ? &cell : nullptr) == status);
+    CHECK(actual == expected);
+    for (std::size_t d = 0; d < 3; ++d) positions[4 + d] = .27 + .31 + .17 * d;
+  }
+}
+
+TEST_CASE("PsiFormer failed full cusp cache does not widen target derivative domain", "[psiformer][cusp_cache]")
+{
+  const auto full = psiformer::makeOpenCuspJetLayout(1, 3, 1, psiformer::SpatialJetMode::FULL_VGL);
+  auto target = full;
+  target.output = psiformer::withSpatialTargetRange(full.output, 2, 1);
+  // The near pair has a nonfinite radial second derivative, but neither endpoint
+  // is requested. The original target leaf's value and electron2 derivatives are finite.
+  const std::array<double, 9> positions{0, 0, 0, 1e-150, 0, 0, 1, .2, .3};
+  std::vector<double> cache(psiformer::spatialJetSpanElements(full.output));
+  std::vector<double> expected(psiformer::spatialJetSpanElements(target.output));
+  auto actual = expected;
+  const auto status = open_spatial::buildOpenCuspJetsForConfiguration(full, positions.data(), 0, 0,
+      1e-200, 1e-200, cache.data());
+  REQUIRE(status == psiformer::OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT);
+  REQUIRE(open_spatial::buildOpenCuspJetsForConfiguration(target, positions.data(), 0, 0,
+      1e-200, 1e-200, expected.data()) == psiformer::OpenSpatialStatus::REGULAR);
+  REQUIRE(open_spatial::gatherCuspTargetsForConfiguration(full, target, positions.data(), 0, 0,
+      1e-200, 1e-200, cache.data(), status, actual.data()) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(actual == expected);
+}
+
 TEST_CASE("PsiFormer target intervals preserve physical geometry and orbital jets",
           "[psiformer][device][spatial][targets]")
 {
@@ -1143,6 +1218,16 @@ TEST_CASE("PsiFormer target intervals preserve physical geometry and orbital jet
       }
       compare(full_cusp.output, tile_cusp.output, cusp, local_cusp);
       CHECK(local_cusp.back() == 791.0);
+      std::vector<double> gathered_cusp(local_cusp.size(), 791.0);
+      for (const auto cached_status : {psiformer::OpenSpatialStatus::REGULAR,
+                                      psiformer::OpenSpatialStatus::COALESCENCE})
+      {
+        for (std::size_t b = 0; b < batch; ++b)
+          REQUIRE(open_spatial::gatherCuspTargetsForConfiguration(full_cusp, tile_cusp,
+              positions.data(), b, 0, .8, 1.1, cusp.data(), cached_status, gathered_cusp.data(),
+              periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+        CHECK(gathered_cusp == local_cusp);
+      }
 
       const auto orbital = psiformer::makeOpenOrbitalJetLayout(batch, determinants, ne, nuclei_count, width, 2, mode);
       auto target = orbital;

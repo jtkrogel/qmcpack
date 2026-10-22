@@ -403,6 +403,21 @@ __global__ void boundaryCuspJetsKernel(OpenCuspJetLayout layout,
         same_spin_alpha, opposite_spin_alpha, output, periodic ? &cell : nullptr);
 }
 
+template<bool periodic>
+__global__ void gatherCuspTargetsKernel(OpenCuspJetLayout complete, OpenCuspJetLayout target,
+    const double* positions, const std::size_t* active_electrons,
+    double same_spin_alpha, double opposite_spin_alpha, const double* cached,
+    const OpenSpatialStatus* cached_status, double* output, OpenSpatialStatus* status,
+    periodic_geometry::Cell cell)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < target.output.configuration_count)
+    status[configuration] = open_spatial::gatherCuspTargetsForConfiguration(
+        complete, target, positions, configuration, active_electrons[configuration],
+        same_spin_alpha, opposite_spin_alpha, cached, cached_status[configuration],
+        output, periodic ? &cell : nullptr);
+}
+
 __global__ void finalSpatialCombinationKernel(
     FinalSpatialJetLayout layout,
     const device_determinant::CombinationMetadata* determinant_metadata,
@@ -857,6 +872,40 @@ Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
   boundaryCuspJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
       output, status, cell);
+  return peekSpatialLaunchError();
+}
+
+Error launchGatherCuspTargets(Stream stream, const OpenCuspJetLayout& complete,
+    const OpenCuspJetLayout& target, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    const double* cached, const OpenSpatialStatus* cached_status,
+    double* output, OpenSpatialStatus* status, const periodic_geometry::Cell* cell)
+{
+  validateOpenCuspJetLayout(complete);
+  validateOpenCuspJetLayout(target);
+  if (complete.output.mode != SpatialJetMode::FULL_VGL || target.output.mode != SpatialJetMode::FULL_VGL ||
+      complete.output.target_electron_begin != 0 ||
+      complete.output.laplacian_lanes != complete.output.electron_count ||
+      complete.output.electron_count != target.output.electron_count ||
+      complete.output.configuration_count != target.output.configuration_count ||
+      complete.spin_up_count != target.spin_up_count ||
+      complete.position_row_stride != target.position_row_stride ||
+      complete.position_configuration_stride != target.position_configuration_stride)
+    throw std::invalid_argument("PsiFormer cusp cache/target layouts are incompatible");
+  if (!positions || !active_electrons || !cached || !cached_status || !output || !status ||
+      cached == output || cached_status == status)
+    throw std::invalid_argument("PsiFormer cusp cache gather storage is null or aliases");
+  if (cell) periodic_geometry::validateCell(*cell);
+  const auto blocks = checkedSpatialBlockCount(target.output.configuration_count,
+      "PsiFormer cusp gather grid exceeds device x dimension");
+  if (cell)
+    gatherCuspTargetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(complete, target,
+        positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+        cached, cached_status, output, status, *cell);
+  else
+    gatherCuspTargetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(complete, target,
+        positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+        cached, cached_status, output, status, {});
   return peekSpatialLaunchError();
 }
 

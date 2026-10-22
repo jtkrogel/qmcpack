@@ -22,6 +22,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "PsiFormerDeviceInference.h"
+#include "PsiFormerDeviceCuspStateValidation.h"
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceRawFeatureReverseValidation.h"
 #include "PsiFormerDeviceCoordinateGradientValidation.h"
@@ -682,6 +683,7 @@ int main(int argc, char** argv)
     inference.downloadResults(phases, jets, ratios);
     verify();
 
+    validateCuspStateGather(queue);
     // Explicit non-retained target tiling must preserve one physical result and
     // one geometry upload/generation while keeping max-K scratch stable.
     {
@@ -700,9 +702,12 @@ int main(int argc, char** argv)
 #endif
       auto& metrics = deviceMemoryMetrics(ordinal);
       const auto policy = InferenceStatusPolicy::DEFERRED_NEURAL;
-      const auto admitted = [&](std::size_t count) {
-        const auto cost = estimateTargetVglCost(plan, capacity, count);
-        return TargetVglPreparation{count, cost.device_workspace_bytes, cost.charged_scalar_work_units};
+      const auto admitted = [&](std::size_t count, bool reuse_cusp = false) {
+        TargetVglPreparation preparation{count, 0, 0, 0, reuse_cusp};
+        const auto cost = estimatePreparedTargetVglCost(plan, capacity, preparation);
+        preparation.device_workspace_budget_bytes = cost.device_workspace_bytes;
+        preparation.scalar_work_budget = cost.charged_scalar_work_units;
+        return preparation;
       };
       const auto expect_invalid = [&](TargetVglPreparation preparation, SpatialJetMode mode,
                                       bool score_tape, bool spatial_tape) {
@@ -756,13 +761,14 @@ int main(int argc, char** argv)
 
       PreparedDeviceInference full_target_reference(image, capacity, queue, handle);
       std::size_t smallest_target_bytes = 0;
+      for (const bool reuse_cusp : {false, true})
       for (const auto target_count : {std::size_t{1}, std::min<std::size_t>(2, model.ne),
                                      std::min<std::size_t>(3, model.ne), model.ne})
       {
         PreparedDeviceInference target_graph(image, capacity, queue, handle, SpatialJetMode::FULL_VGL,
-                                              false, false, policy, admitted(target_count));
+                                              false, false, policy, admitted(target_count, reuse_cusp));
         const auto prepared_bytes = target_graph.deviceWorkspaceBytes();
-        const auto cost = estimateTargetVglCost(plan, capacity, target_count);
+        const auto cost = estimatePreparedTargetVglCost(plan, capacity, admitted(target_count, reuse_cusp));
         if (prepared_bytes != cost.device_workspace_bytes ||
             target_graph.hostWorkspaceBytes() != cost.host_workspace_bytes ||
             target_graph.targetVglCost().tile_count != cost.tile_count)
@@ -880,12 +886,15 @@ int main(int argc, char** argv)
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
         positions[6 * model.ne + dimension] += environment.lattice_vectors[0][dimension] -
             2 * environment.lattice_vectors[2][dimension];
+      for (const bool reuse_cusp : {false, true})
       for (const auto target_count : {std::size_t{1}, std::min<std::size_t>(3, model.ne)})
       {
-        const auto cost = estimateTargetVglCost(periodic_plan, 3, target_count);
+        TargetVglPreparation preparation{target_count, 0, 0, 0, reuse_cusp};
+        const auto cost = estimatePreparedTargetVglCost(periodic_plan, 3, preparation);
+        preparation.device_workspace_budget_bytes = cost.device_workspace_bytes;
+        preparation.scalar_work_budget = cost.charged_scalar_work_units;
         PreparedDeviceInference target(periodic_image, 3, queue, handle, SpatialJetMode::FULL_VGL, false, false,
-            InferenceStatusPolicy::DEFERRED_NEURAL,
-            {target_count, cost.device_workspace_bytes, cost.charged_scalar_work_units});
+            InferenceStatusPolicy::DEFERRED_NEURAL, preparation);
         const auto bytes = target.deviceWorkspaceBytes();
         for (const std::size_t count : {std::size_t{3}, std::size_t{1}, std::size_t{2}, std::size_t{3}})
         {

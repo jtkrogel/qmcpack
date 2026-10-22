@@ -136,6 +136,13 @@ Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
     const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
     double* output, OpenSpatialStatus* status);
 
+/// Gather a compact physical target interval, replaying the canonical cusp on cached failure.
+Error launchGatherCuspTargets(Stream stream, const OpenCuspJetLayout& complete,
+    const OpenCuspJetLayout& target, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    const double* cached, const OpenSpatialStatus* cached_status,
+    double* output, OpenSpatialStatus* status, const periodic_geometry::Cell* cell = nullptr);
+
 Error launchFinalSpatialCombination(
     Stream stream,
     const FinalSpatialJetLayout& layout,

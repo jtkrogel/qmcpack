@@ -53,6 +53,15 @@ enum class InferenceStatusPolicy
   DEFERRED_NEURAL
 };
 
+/// Read the opt-in once when constructing an explicit preparation descriptor.
+inline bool configuredCuspStateReuse()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_CUSP_STATE_REUSE");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_CUSP_STATE_REUSE requires 0 or 1");
+}
+
 /** Explicit numerical-only target preparation; all-zero keeps the reference graph.
  * Budgets charge this graph's device storage and a deterministic scalar-work
  * proxy. Shared model images/vendor storage and total runtime need separate admission.
@@ -64,6 +73,8 @@ struct TargetVglPreparation
   std::size_t scalar_work_budget = 0;
   /// Default zero preserves scalar traces; positive cap admits an additional bounded real/open leaf.
   std::size_t parallel_trace_workspace_budget_bytes = 0;
+  /// Only non-retained explicit FULL_VGL targets may own the O(B*Ne) cusp cache.
+  bool reuse_cusp_state = configuredCuspStateReuse();
 };
 
 struct TargetVglCost
@@ -170,6 +181,17 @@ inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan&
         preparation.parallel_trace_workspace_budget_bytes);
     cost.device_workspace_bytes = spatial_detail::checkedAdd(cost.device_workspace_bytes,
         trace.total_device_bytes, "Parallel VGL composite bytes overflow");
+  }
+  if (preparation.reuse_cusp_state && preparation.max_targets < plan.modelShape().electrons())
+  {
+    const auto planes = spatial_detail::checkedAdd(1,
+        spatial_detail::checkedProduct(4, plan.modelShape().electrons(), "Cusp cache planes overflow"),
+        "Cusp cache planes overflow");
+    const auto count = spatial_detail::checkedProduct(batch, planes, "Cusp cache extent overflow");
+    cost.device_workspace_bytes = spatial_detail::checkedAdd(cost.device_workspace_bytes,
+        checkedDeviceBytes<double>(count), "Cusp cache bytes overflow");
+    cost.device_workspace_bytes = spatial_detail::checkedAdd(cost.device_workspace_bytes,
+        checkedDeviceBytes<OpenSpatialStatus>(batch), "Cusp cache status bytes overflow");
   }
   return cost;
 }
@@ -921,6 +943,10 @@ private:
     orbitals_ = makeOpenOrbitalJetLayout(batch_, shape_.determinants, ne_, shape_.nuclei,
                                          width, shape_.spin_up_electrons, mode_);
     cusp_ = makeOpenCuspJetLayout(batch_, ne_, shape_.spin_up_electrons, mode_);
+    cusp_state_enabled_ = target_preparation_.reuse_cusp_state &&
+        target_preparation_.max_targets && target_preparation_.max_targets < ne_ &&
+        mode_ == SpatialJetMode::FULL_VGL && !retained_targets_ && !real_trunk_only;
+    if (cusp_state_enabled_) cusp_state_layout_ = cusp_;
     final_ = makeFinalSpatialJetLayout(batch_, ne_, mode_);
     result_layout_ = final_.output;
     matrices_per_configuration_ = orbitals_.orbitals.element_count;
@@ -991,6 +1017,12 @@ private:
       det_status_.reserveNamed(batch_, "Inference::det_status_", __FILE__, __LINE__);
     }
     cusp_jets_.reserveNamed(spatialJetSpanElements(cusp_.output), "Inference::cusp_jets_", __FILE__, __LINE__);
+    if (cusp_state_enabled_)
+    {
+      cusp_state_.reserveNamed(spatialJetSpanElements(cusp_state_layout_.output),
+          "Inference::cusp_state_", __FILE__, __LINE__);
+      cusp_state_status_.reserveNamed(batch_capacity_, "Inference::cusp_state_status_", __FILE__, __LINE__);
+    }
     if (!real_trunk_only)
     {
       phase_.reserveNamed(batch_,
@@ -1058,7 +1090,8 @@ private:
       for (const auto* buffer : {&positions_, &raw_, &a_, &b_, &q_, &k_, &v_, &weights_, &context_, &hidden_,
           &projected_, &orbital_jets_, &matrices_, &lu_, &inverse_, &solve_, &term_phase_, &term_log_, &scaled_,
           &normalized_, &matrix_product_, &det_gradient_, &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_,
-          &output_, &lap_ratio_, &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_})
+          &output_, &lap_ratio_, &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_,
+          &cusp_state_})
         buffer->traceContext(model_->version(), resource, image);
     }
   }
@@ -1090,6 +1123,7 @@ private:
   /// Revoke every previous output before validating or copying replacement input.
   void beginCoordinateEvaluation()
   {
+    cusp_state_valid_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -1616,6 +1650,7 @@ private:
    */
   void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
   {
+    cusp_state_valid_ = false;
     model_ = successor;
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -1769,7 +1804,7 @@ public:
         &hidden_, &projected_, &orbital_jets_, &matrices_, &lu_, &inverse_,
         &solve_, &term_phase_, &term_log_, &scaled_, &normalized_, &matrix_product_, &det_gradient_,
         &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_,
-        &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_})
+        &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_, &cusp_state_})
       add(checkedDeviceBytes<double>(buffer->capacity()));
     add(checkedDeviceBytes<std::size_t>(active_.capacity()));
     add(checkedDeviceBytes<std::size_t>(permutations_.capacity()));
@@ -1777,6 +1812,7 @@ public:
     add(checkedDeviceBytes<device_determinant::CombinationMetadata>(combinations_.capacity()));
     add(checkedDeviceBytes<device_determinant::DerivativeStatus>(det_status_.capacity()));
     add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
+    add(checkedDeviceBytes<OpenSpatialStatus>(cusp_state_status_.capacity()));
     add(checkedDeviceBytes<InferenceStatusWord>(sticky_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
     if (parallel_traces_) add(parallel_traces_->deviceWorkspaceBytes());
@@ -1824,6 +1860,7 @@ private:
         &cusp_.output, &final_.output})
       layout->configuration_count = count;
     result_layout_.configuration_count = count;
+    if (cusp_state_enabled_) cusp_state_layout_.output.configuration_count = count;
   }
 
   /// Select physical targets while all intermediate tensors use compact local planes.
@@ -1881,6 +1918,31 @@ private:
   /// Evaluate the same physical cusp geometry used by feature and orbital layers.
   void evaluateCusp()
   {
+    if (cusp_state_enabled_)
+    {
+      // Queue ordering protects the immutable per-request cache; no cross-state reuse.
+      if (!cusp_state_valid_ || cusp_state_generation_ != evaluation_generation_ ||
+          cusp_state_model_ != model_.get() || cusp_state_batch_ != batch_)
+      {
+        if (const auto* cell = model_->periodicCell())
+          checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_state_layout_, *cell,
+              positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
+              cusp_state_.data(), cusp_state_status_.data()), "model periodic cusp state");
+        else
+          checkRuntime(launchOpenCuspJets(queue_.getNative(), cusp_state_layout_, positions_.data(),
+              active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
+              cusp_state_.data(), cusp_state_status_.data()), "model open cusp state");
+        cusp_state_generation_ = evaluation_generation_;
+        cusp_state_model_ = model_.get();
+        cusp_state_batch_ = batch_;
+        cusp_state_valid_ = true;
+      }
+      checkRuntime(launchGatherCuspTargets(queue_.getNative(), cusp_state_layout_, cusp_,
+          positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
+          cusp_state_.data(), cusp_state_status_.data(), cusp_jets_.data(), open_status_.data(),
+          model_->periodicCell()), "model cusp state targets");
+      return;
+    }
     if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *cell, positions_.data(), active_.data(),
           model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
@@ -2081,6 +2143,12 @@ private:
   SpatialAttentionJetLayout attention_;
   OpenOrbitalJetLayout orbitals_;
   OpenCuspJetLayout cusp_;
+  OpenCuspJetLayout cusp_state_layout_;
+  bool cusp_state_enabled_ = false, cusp_state_valid_ = false;
+  std::size_t cusp_state_generation_ = 0, cusp_state_batch_ = 0;
+  const PreparedDeviceModel* cusp_state_model_ = nullptr;
+  DeviceBuffer<double> cusp_state_;
+  DeviceBuffer<OpenSpatialStatus> cusp_state_status_;
   FinalSpatialJetLayout final_;
   SpatialJetLayout result_layout_;
   DeviceBuffer<double> positions_, raw_, a_, b_, q_, k_, v_, weights_, context_, hidden_, projected_;
