@@ -43,6 +43,7 @@
 #include "PsiFormerDeviceMetropolisValidation.h"
 #include "PsiFormerDeviceResidentAdamValidation.h"
 #include "PsiFormerDeviceVglOwnershipValidation.h"
+#include "PsiFormerDeviceLazyVglValidation.h"
 #include "PsiFormerDeviceSrMetricValidation.h"
 #include "PsiFormerDevicePcgValidation.h"
 #include "PsiFormerDeviceEnergySrValidation.h"
@@ -1923,6 +1924,7 @@ int main(int argc, char** argv)
     std::cout << "PASS complete open coordinate gradient: CPU full VGL, FD, lifecycle, exact storage\n";
 
     validateDeviceAffineStatistics(model, image, queue, handle);
+    validateLazyVglPreparation(image, model.cfg.electrons.x);
 
     // Complete canonical score contraction against the independent CPU evaluator.
     std::vector<double> score_weights(model.cfg.nconfig);

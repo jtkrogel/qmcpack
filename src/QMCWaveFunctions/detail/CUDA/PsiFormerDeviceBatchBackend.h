@@ -29,6 +29,17 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Freeze the bounded released-context FULL preparation opt-in before allocation.
+inline bool configuredLazyVglPreparation()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_LAZY_VGL_PREPARATION");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_LAZY_VGL_PREPARATION requires 0 or 1");
+}
+
 /** Supply exclusive GPU scratch per batch workspace and one shared model image.
  * The control mutex protects non-atomic model leases. The first synchronous
  * default serializes submissions. Explicit bounded FP64 inference leases allow
@@ -41,14 +52,22 @@ public:
   explicit PreparedDeviceBatchBackend(std::shared_ptr<const PreparedDeviceModel> image,
                                       std::function<void()> first_dispatch_reporter = {},
                                       PsiFormerPrecisionPolicy precision = PsiFormerPrecisionPolicy::FP64_REFERENCE,
-                                      DeviceExecutionPreparation preparation = {})
+                                      DeviceExecutionPreparation preparation = {},
+                                      bool lazy_spatial = configuredLazyVglPreparation())
       : image_(checkedImage(std::move(image))),
-        preparation_(validatedPreparation(image_->plan(), precision, preparation)),
+        preparation_(validatedPreparation(image_->plan(), precision, preparation)), lazy_spatial_(lazy_spatial),
         inference_concurrency_(preparation_.active_inference_crowds),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
         first_dispatch_reporter_(std::move(first_dispatch_reporter))
   {
+    const auto& environment = image_->plan().environment();
+    if (lazy_spatial_ && (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        preparation_.active_inference_crowds != 1 || preparation_.metropolis_workspace_budget_bytes ||
+        preparation_.metropolis_drift_budget_bytes || environment.boundary != BoundaryCondition::OPEN ||
+        environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+        environment.parameter_scalar_domain != ScalarDomain::REAL || environment.compute_scalar_domain != ScalarDomain::REAL))
+      throw std::invalid_argument("Lazy VGL preparation requires single-crowd real/open FP64 without device sampling");
     if (precision == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
     {
       preparation_queue_ = std::make_unique<compute::Queue<PlatformKind::CUDA>>();
@@ -71,15 +90,10 @@ public:
     // B=1 startup admission cannot authorize a later larger numerical owner.
     const auto preparation = resolveDeviceTargetSelection(image_->plan(), preparation_, capacity);
     validateDeviceExecutionPreparation(image_->plan(), preparation, capacity);
-    if (preparation.vgl.parallel_trace_workspace_budget_bytes)
-      reportDeviceTargetSelection(std::cout, "VGL_parallel_actual_owner", image_->plan(), capacity,
-          preparation.vgl.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation.vgl),
-          preparation.vgl.device_workspace_budget_bytes, preparation.vgl.scalar_work_budget);
-    if (preparation_.select_vgl_targets)
-      reportDeviceTargetSelection(std::cout, "VGL_actual_owner", image_->plan(), capacity,
-          preparation.vgl.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation.vgl),
-          preparation.vgl.device_workspace_budget_bytes, preparation.vgl.scalar_work_budget);
-    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation.vgl);
+    if (!lazy_spatial_)
+      reportSpatialPreparation(preparation.vgl, capacity);
+    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(),
+                                     preparation.vgl, lazy_spatial_);
   }
 
   /// Report the immutable prepared limit, independent of later environment changes.
@@ -120,6 +134,11 @@ public:
     const bool spatial = mode != pf::DirectBatchMode::VALUE_ONLY;
     const auto operations = acceleratorOperationBit(spatial ? PsiFormerAcceleratorOperation::VGL
                                                            : PsiFormerAcceleratorOperation::VALUES);
+    // Publication and same-context exclusion remain held throughout cold preparation.
+    if (context->hooks.modelVersion() != image_->version())
+      context->hooks.rebindModel(image_, mixed_parameters_);
+    if (spatial && context->hooks.prepareSpatialGraph())
+      reportSpatialPreparation(context->hooks.target_preparation_, context->capacity);
     const auto count = spatial_detail::checkedProduct(size,
         spatial_detail::checkedProduct(3, image_->plan().modelShape().electrons(), "Device tile coordinates overflow"),
         "Device tile coordinate extent overflow");
@@ -131,8 +150,6 @@ public:
 
     // Publication stays excluded by the shared inference permit. Only lease
     // mutations need the control mutex in explicit concurrent inference mode.
-    if (context->hooks.modelVersion() != image_->version())
-      context->hooks.rebindModel(image_, mixed_parameters_);
     const auto previous_mixed_retries = context->hooks.mixedRetries();
     context->executor.acquire(owner_, context->crowd, context->hooks);
     if (preparation_.active_inference_crowds > 1)
@@ -558,10 +575,10 @@ private:
     Context(const PreparedDeviceBatchBackend* backend, std::shared_ptr<const PreparedDeviceModel> image,
             std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters,
             const PsiFormerAcceleratorSharedModel& model,
-            std::size_t capacity, std::uint64_t identity, TargetVglPreparation target_preparation)
+            std::size_t capacity, std::uint64_t identity, TargetVglPreparation target_preparation, bool lazy_spatial)
         : owner(backend), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
             PreparedDeviceCrowdHooks::coverage()), crowd(identity),
-          hooks(image, model, identity, std::move(mixed_parameters), target_preparation)
+          hooks(image, model, identity, std::move(mixed_parameters), target_preparation, lazy_spatial)
     {
       positions.reserve(spatial_detail::checkedProduct(capacity,
           spatial_detail::checkedProduct(3, image->plan().modelShape().electrons(), "Device tile coordinates overflow"),
@@ -584,6 +601,19 @@ private:
     std::size_t coordinate_generation = 0;
     bool parallel_batch_reported = false;
   };
+
+  /// Report the exact capacity authority only when a FULL graph is actually prepared.
+  void reportSpatialPreparation(const TargetVglPreparation& preparation, std::size_t capacity) const
+  {
+    if (preparation.parallel_trace_workspace_budget_bytes)
+      reportDeviceTargetSelection(std::cout, "VGL_parallel_actual_owner", image_->plan(), capacity,
+          preparation.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation),
+          preparation.device_workspace_budget_bytes, preparation.scalar_work_budget);
+    if (preparation_.select_vgl_targets)
+      reportDeviceTargetSelection(std::cout, "VGL_actual_owner", image_->plan(), capacity,
+          preparation.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation),
+          preparation.device_workspace_budget_bytes, preparation.scalar_work_budget);
+  }
 
   /// Reject absent images before model provenance construction.
   static std::shared_ptr<const PreparedDeviceModel> checkedImage(std::shared_ptr<const PreparedDeviceModel> image)
@@ -636,6 +666,7 @@ private:
 
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
   const DeviceExecutionPreparation preparation_;
+  const bool lazy_spatial_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;

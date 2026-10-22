@@ -37,9 +37,10 @@ public:
                           const PsiFormerAcceleratorSharedModel& owner,
                           std::uint64_t crowd_identity,
                           std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters = {},
-                          TargetVglPreparation target_preparation = {})
+                          TargetVglPreparation target_preparation = {}, bool lazy_spatial = false)
       : image_(std::move(image)), mixed_parameters_(std::move(mixed_parameters)),
-        target_preparation_(target_preparation), owner_(owner), crowd_identity_(crowd_identity), blas_(queue_)
+        target_preparation_(target_preparation), lazy_spatial_(lazy_spatial), owner_(owner),
+        crowd_identity_(crowd_identity), blas_(queue_)
   {
     if (!image_ || crowd_identity_ == 0)
       throw std::invalid_argument("Numerical crowd hooks require an image and nonzero identity");
@@ -47,6 +48,8 @@ public:
     validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}});
     if (mixed_parameters_ && target_preparation_.max_targets)
       throw std::invalid_argument("Mixed precision does not support target VGL preparation");
+    if (lazy_spatial_ && mixed_parameters_)
+      throw std::invalid_argument("Lazy VGL preparation requires FP64 crowd resources");
     const auto provenance = owner_.activeProvenance();
     if (provenance.backend != backend() || provenance.model_version != image_->version())
       throw std::invalid_argument("Numerical crowd model/backend does not match active provenance");
@@ -125,6 +128,8 @@ public:
         positions.empty() || positions.size() % coordinates_per_configuration != 0 ||
         positions.size() / coordinates_per_configuration > capacity_)
       throw std::invalid_argument("Numerical crowd request has invalid operations, coordinates or generation");
+    if (!values_ || ((operations & acceleratorOperationBit(PsiFormerAcceleratorOperation::VGL)) && !spatial_))
+      throw std::logic_error("Numerical request has no prepared graph for its operation");
     source_ = &positions;
     request_operations_ = operations;
     executed_operations_ = 0;
@@ -150,7 +155,7 @@ public:
       return;
     case PsiFormerAcceleratorEventKind::CROWD_ACQUIRE:
       validateModel(event);
-      if (!values_ || !spatial_ || acquired_)
+      if (!values_ || (!spatial_ && !lazy_spatial_) || acquired_)
         throw std::logic_error("Numerical crowd acquire has unprepared or borrowed storage");
       acquired_ = true;
       acquisition_generation_ = event.acquisition_generation;
@@ -179,7 +184,7 @@ public:
       // must know that earlier work exists before it enters poison/recovery.
       try
       {
-        if (!values_ || !spatial_)
+        if (!values_ || (event.operation == PsiFormerAcceleratorOperation::VGL && !spatial_))
           throw std::logic_error("Numerical dispatch has incomplete graphs after failed preparation; rebuild before retry");
         if (event.operation == PsiFormerAcceleratorOperation::VGL)
         {
@@ -274,6 +279,27 @@ private:
   // The named sampler borrows this crowd's existing VALUE graph under its lease.
   friend class PreparedDeviceBatchBackend;
 
+  /// Cold-upgrade released VALUE storage without replacing its graph or borrowers.
+  bool prepareSpatialGraph()
+  {
+    if (acquired_ || recorded_ || source_ || failure_ || !values_)
+      throw std::logic_error("Spatial preparation requires released, completed VALUE resources");
+    if (spatial_)
+      return false;
+    last_graph_ = nullptr;
+    ready_ = false;
+    auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity_, queue_, blas_,
+        SpatialJetMode::FULL_VGL, false, false, values_->statusPolicy(), target_preparation_);
+    std::vector<double> jets, ratios;
+    jets.reserve(spatialJetSpanElements(spatial->resultLayout()));
+    ratios.reserve(spatial_detail::checkedProduct(capacity_, image_->plan().modelShape().electrons(),
+                                                 "Numerical ratio staging overflow"));
+    spatial_ = std::move(spatial);
+    jets_.swap(jets);
+    ratios_.swap(ratios);
+    return true;
+  }
+
   /// Preserve atomic result publication while applying the explicitly selected numerical policy.
   void evaluateGraph(PreparedDeviceInference& graph)
   {
@@ -307,7 +333,7 @@ private:
     retain_values_ = true;
   }
 
-  /// Allocate all crowd scratch/staging before any request can borrow it.
+  /// Allocate admitted graphs/staging before acquisition; preserve a completed FULL upgrade on recovery.
   void prepare(std::size_t capacity)
   {
     if (acquired_ || capacity == 0)
@@ -316,8 +342,10 @@ private:
     const auto status_policy = configuredInferenceStatusPolicy();
     auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY,
         retain_values_, false, status_policy);
-    auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
-        SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_);
+    std::unique_ptr<PreparedDeviceInference> spatial;
+    if (!lazy_spatial_ || spatial_)
+      spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
+          SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_);
     if (mixed_parameters_)
     {
       const auto rows = spatial_detail::checkedProduct(
@@ -332,9 +360,10 @@ private:
     positions.reserve(spatial_detail::checkedProduct(capacity, coordinatesPerConfiguration(),
                                                    "Numerical coordinate staging overflow"));
     phases.reserve(capacity);
-    jets.reserve(spatialJetSpanElements(spatial->resultLayout()));
-    ratios.reserve(spatial_detail::checkedProduct(capacity, image_->plan().modelShape().electrons(),
-                                                "Numerical ratio staging overflow"));
+    jets.reserve(spatialJetSpanElements(spatial ? spatial->resultLayout() : values->resultLayout()));
+    if (spatial)
+      ratios.reserve(spatial_detail::checkedProduct(capacity, image_->plan().modelShape().electrons(),
+                                                   "Numerical ratio staging overflow"));
     values_ = std::move(values);
     spatial_ = std::move(spatial);
     positions_.swap(positions);
@@ -382,6 +411,7 @@ private:
   std::shared_ptr<const PreparedDeviceModel> image_;
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   const TargetVglPreparation target_preparation_;
+  const bool lazy_spatial_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   std::size_t mixed_batches_ = 0, mixed_retries_ = 0;
   std::string mixed_retry_reason_;
