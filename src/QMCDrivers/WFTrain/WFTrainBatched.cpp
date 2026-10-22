@@ -3021,6 +3021,16 @@ void WFTrainBatched::run()
   const bool complex_kfac_training = complex_training &&
       training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC;
   const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_kfac_training);
+  // Admit only a scope that can still be the live chain; replay proves FULL again.
+  const char* kfac_replay_optin = std::getenv("PSIFORMER_GPU_KFAC_SINGLE_REPLAY");
+  const bool kfac_single_replay = kfac_replay_optin && std::string(kfac_replay_optin) == "1" &&
+      score_kfac_training && !complex_training && device_provider &&
+      device_provider->usesAcceleratorParameterProducts() &&
+      population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+      crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
+  if (kfac_replay_optin && std::string(kfac_replay_optin) == "1")
+    app_log() << "KFAC single-snapshot FULL replay: eligible=" << kfac_single_replay
+              << "; exact current version/coordinate/spatial cache checks remain required" << std::endl;
   const auto kfac_estimator = wftrain::kfacScoreEstimator(training_input_);
   wftrain::HighParameterTraining trainer(
       requirements, score_kfac_training ? kfac_estimator :
@@ -3429,7 +3439,7 @@ void WFTrainBatched::run()
             {
               retained_samples.push_back(retainCrowdSamples(
                   *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training,
-                  (resident_adam_budget || resident_sr_budget.first)
+                  (resident_adam_budget || resident_sr_budget.first || kfac_single_replay)
                       ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
               const auto& snapshot = retained_samples.back();
               if (snapshot.replay_version)
@@ -3867,8 +3877,11 @@ void WFTrainBatched::run()
               continue;
             }
             Crowd& crowd = *crowds_[samples.crowd_index];
-            const bool resident_single_snapshot = (resident_adam_budget || resident_sr_budget.first) &&
-                !complex_training && (!has_nonlocal_ecp || resident_device_authority_) &&
+            // KFAC reuses only FULL wavefunction state; ECP capture below still
+            // evaluates its complete Hamiltonian and draws its accepted grid.
+            const bool resident_single_snapshot = (kfac_single_replay ||
+                ((resident_adam_budget || resident_sr_budget.first) &&
+                 (!has_nonlocal_ecp || resident_device_authority_))) && !complex_training &&
                 retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
             replayCrowdSamples(crowd, samples, resident_single_snapshot
