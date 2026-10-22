@@ -114,8 +114,9 @@ inline void validateCuspStateGather(compute::Queue<PlatformKind::CUDA>& queue)
     for (std::size_t e = 0; e < 5; ++e)
       for (std::size_t d = 0; d < 3; ++d)
         positions[24 * b + 4 * e + d] = .27 + .31 * e + .13 * b + .17 * d;
+  const std::pair<std::size_t, std::size_t> intervals[]{{0, 2}, {2, 2}, {4, 1}, {1, 1}, {0, 5}};
   for (const bool periodic : {false, true})
-    for (const auto interval : {std::pair<std::size_t, std::size_t>{0, 2}, {2, 2}, {4, 1}, {1, 1}, {0, 5}})
+    for (const auto interval : intervals)
       exercise(full, positions, periodic ? &cell : nullptr, .8, interval.first, interval.second, false);
   // The unrequested near pair's radial second derivative is nonfinite, while
   // the original requested electron2 value/derivatives are still regular.
