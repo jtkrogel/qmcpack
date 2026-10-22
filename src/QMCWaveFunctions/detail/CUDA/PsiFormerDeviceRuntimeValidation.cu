@@ -22,6 +22,7 @@
 #include "PsiFormerDeviceRealVectorValidation.h"
 #include "PsiFormerDeviceAttentionJetValidation.h"
 #include "PsiFormerDeviceValueCuspValidation.h"
+#include "PsiFormerDeviceValueOrbitalValidation.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceValueScaleValidation.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
@@ -1386,6 +1387,7 @@ int main(int argc, char** argv)
     featureVGL(queue);
     openFeatureCooperativeCases(queue);
     validateCooperativeValueCusp(queue);
+    validateTiledValueOrbitals(queue);
     targetRangePrimitives(queue);
     nonlinearJets(queue);
     denseAndReverse(queue, handle);

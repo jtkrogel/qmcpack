@@ -342,6 +342,15 @@ inline bool configuredCooperativeValueLu()
   throw std::invalid_argument("PSIFORMER_GPU_VALUE_COOPERATIVE_LU must be 0 or 1");
 }
 
+/// Freeze the opt-in OPEN VALUE orbital execution map before graph allocation.
+inline bool configuredTiledValueOrbitals()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_ORBITAL_VALUE_TILED");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_ORBITAL_VALUE_TILED must be 0 or 1");
+}
+
 /// Freeze the opt-in OPEN VALUE cusp execution map before graph allocation.
 inline bool configuredCooperativeValueCusp()
 {
@@ -878,7 +887,8 @@ private:
         target_preparation_(target_preparation), retained_targets_(retained_targets),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
-        cooperative_value_cusp_requested_(configuredCooperativeValueCusp()), kinetic_trunk_only_(kinetic_trunk_only)
+        cooperative_value_cusp_requested_(configuredCooperativeValueCusp()),
+        tiled_value_orbitals_requested_(configuredTiledValueOrbitals()), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -1404,6 +1414,12 @@ private:
           active_.data(), orbital_jets_.data(), open_status_.data(),
           value_tape_.empty() ? nullptr : retained_backflow_.data(),
           value_tape_.empty() ? nullptr : retained_envelope_.data()), "model periodic orbital VGL");
+    else if (usesTiledValueOrbitals())
+      checkRuntime(launchOpenOrbitalValuesTiled(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
+        parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
+        parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
+        parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
+        active_.data(), orbital_jets_.data(), open_status_.data()), "model tiled OPEN orbital VALUE");
     else
       checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
@@ -1633,6 +1649,18 @@ public:
   {
     const auto& environment = plan_.environment();
     return cooperative_value_cusp_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+        !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
+  /// Tile only ordinary real OPEN VALUE heads, never retained or mixed paths.
+  bool usesTiledValueOrbitals() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return tiled_value_orbitals_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
         value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
         !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
@@ -2175,6 +2203,7 @@ private:
   const bool cooperative_open_features_requested_;
   bool mixed_open_features_excluded_ = false;
   const bool cooperative_value_cusp_requested_;
+  const bool tiled_value_orbitals_requested_;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;

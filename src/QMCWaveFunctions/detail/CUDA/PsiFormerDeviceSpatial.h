@@ -193,6 +193,13 @@ Error launchOpenOrbitalJets(Stream stream,
                             double* retained_envelope = nullptr,
                             const double* projected_backflow = nullptr);
 
+/// Tile ordinary OPEN VALUE feature contractions without global projection storage.
+Error launchOpenOrbitalValuesTiled(Stream stream, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* positions, const double* nuclei,
+    const double* backflow_up, const double* backflow_down,
+    const double* pi_up, const double* pi_down, const double* zeta_up, const double* zeta_down,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
+
 /// Build real Gamma-periodic orbital jets and optional retained product factors.
 Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* features,

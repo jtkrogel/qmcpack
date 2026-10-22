@@ -245,12 +245,16 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     std::size_t orbital, double* output,
     double* retained_backflow = nullptr, double* retained_envelope = nullptr,
     const periodic_geometry::Cell* periodic_cell = nullptr,
-    const double* projected_backflow = nullptr, bool envelope_only = false) noexcept
+    const double* projected_backflow = nullptr, bool envelope_only = false,
+    const double* precontracted_value = nullptr) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
   for (std::size_t plane = 0; plane < layout.orbitals.plane_count; ++plane)
     output[layout.orbitals.uncheckedPlaneOffset(configuration, plane, element)] = 0.0;
+  if (precontracted_value && (layout.features.mode != SpatialJetMode::VALUE_ONLY ||
+      projected_backflow || envelope_only))
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
   if (active_electron >= layout.features.electron_count)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
 
@@ -259,10 +263,11 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
   const double* pi       = spin_up ? pi_up : pi_down;
   const double* zeta     = spin_up ? zeta_up : zeta_down;
   // A constant unit backflow yields only the shared envelope and its physical jets.
-  double backflow_value  = envelope_only ? 1.0 : (projected_backflow
-      ? projected_backflow[layout.orbitals.uncheckedValueOffset(configuration, element)] : 0.0);
+  double backflow_value  = precontracted_value ? *precontracted_value :
+      (envelope_only ? 1.0 : (projected_backflow
+      ? projected_backflow[layout.orbitals.uncheckedValueOffset(configuration, element)] : 0.0));
   const std::size_t feature_begin = row_electron * layout.feature_row_stride;
-  for (std::size_t feature = 0; !envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
+  for (std::size_t feature = 0; !precontracted_value && !envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
   {
     const double feature_value = features[layout.features.uncheckedValueOffset(
         configuration, feature_begin + feature)];

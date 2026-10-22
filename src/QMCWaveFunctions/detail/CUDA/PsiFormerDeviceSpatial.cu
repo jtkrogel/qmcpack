@@ -580,6 +580,92 @@ __global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
       retained_backflow, retained_envelope, periodic ? &cell : nullptr, projected_backflow);
 }
 
+/// Share native feature/weight loads while retaining each increasing-feature sum.
+__global__ void openOrbitalValuesTiledKernel(OpenOrbitalJetLayout layout,
+    const double* features, const double* positions, const double* nuclei,
+    const double* backflow_up, const double* backflow_down,
+    const double* pi_up, const double* pi_down, const double* zeta_up, const double* zeta_down,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status,
+    std::size_t tiles)
+{
+  constexpr unsigned int tile = 8;
+  __shared__ double feature_tile[tile][tile];
+  __shared__ double up_weight_tile[tile][tile];
+  __shared__ double down_weight_tile[tile][tile];
+  __shared__ unsigned int hazard;
+  const auto x = threadIdx.x, y = threadIdx.y;
+  std::size_t index = blockIdx.x;
+  const std::size_t column = (index % tiles) * tile + x;
+  index /= tiles;
+  const std::size_t row = (index % tiles) * tile + y;
+  index /= tiles;
+  const std::size_t determinant = index % layout.determinant_count;
+  const std::size_t configuration = index / layout.determinant_count;
+  const std::size_t ne = layout.features.electron_count;
+  if (x == 0 && y == 0)
+    hazard = active_electrons[configuration] >= ne;
+  __syncthreads();
+  double value = 0.0;
+  double absolute_sum = 0.0;
+  for (std::size_t begin = 0; begin < layout.feature_width;)
+  {
+    const std::size_t width = layout.feature_width - begin < tile ? layout.feature_width - begin : tile;
+    double feature = 0.0, up = 0.0, down = 0.0;
+    if (row < ne && x < width)
+      feature = features[layout.features.uncheckedValueOffset(
+          configuration, row * layout.feature_row_stride + begin + x)];
+    if (column < ne && y < width)
+    {
+      const auto weight = open_orbital::weightOffset(layout, begin + y, determinant, column);
+      // Row tiles may cross the spin boundary; never assume one shared spin bank.
+      if (layout.spin_up_count) up = backflow_up[weight];
+      if (layout.spin_up_count != ne) down = backflow_down[weight];
+    }
+    feature_tile[y][x] = feature;
+    up_weight_tile[y][x] = up;
+    down_weight_tile[y][x] = down;
+    if (!device_math::isFiniteBinary64(feature) || !device_math::isFiniteBinary64(up) ||
+        !device_math::isFiniteBinary64(down))
+      atomicExch(&hazard, 1u);
+    __syncthreads();
+    if (row < ne && column < ne)
+      for (std::size_t feature_index = 0; feature_index < width; ++feature_index)
+      {
+        const double feature_value = feature_tile[y][feature_index];
+        const double weight = row < layout.spin_up_count
+            ? up_weight_tile[feature_index][x] : down_weight_tile[feature_index][x];
+        const double product = feature_value * weight;
+        value += product;
+        absolute_sum += ::fabs(product);
+        if (feature_value != 0.0 && weight != 0.0 &&
+            ::fabs(product) < 0x1p-1022)
+          atomicExch(&hazard, 1u);
+      }
+    __syncthreads();
+    begin += width;
+  }
+  // Reassociation/FMA can distinguish a tiny cancellation residue from native signed zero.
+  // Replay those sensitive sums instead of relaxing the scalar signed-zero contract.
+  if (!device_math::isFiniteBinary64(value) || !device_math::isFiniteBinary64(absolute_sum) ||
+      ::fabs(value) <= 8.0 * 0x1p-52 * layout.feature_width * absolute_sum)
+    atomicExch(&hazard, 1u);
+  __syncthreads();
+  if (row < ne && column < ne)
+  {
+    const auto logical = configuration * layout.determinant_count * ne * ne +
+        determinant * ne * ne + row * ne + column;
+    if (hazard)
+      status[logical] = open_orbital::buildElement(layout, features, positions, nuclei,
+          backflow_up, backflow_down, pi_up, pi_down, zeta_up, zeta_down,
+          configuration, active_electrons[configuration], determinant, row, column, output);
+    else
+      status[logical] = open_orbital::buildElement(layout, features, positions, nuclei,
+          backflow_up, backflow_down, pi_up, pi_down, zeta_up, zeta_down,
+          configuration, active_electrons[configuration], determinant, row, column,
+          output, nullptr, nullptr, nullptr, nullptr, false, &value);
+  }
+}
+
 } // namespace
 
 Error launchSoftmaxJetRows(Stream stream,
@@ -1128,6 +1214,35 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
       retained_backflow, retained_envelope, {}, projected_backflow);
+  return peekSpatialLaunchError();
+}
+
+Error launchOpenOrbitalValuesTiled(Stream stream, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* positions, const double* nuclei,
+    const double* backflow_up, const double* backflow_down,
+    const double* pi_up, const double* pi_down, const double* zeta_up, const double* zeta_down,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status)
+{
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || layout.features.electron_count < 64)
+    return launchOpenOrbitalJets(stream, layout, features, positions, nuclei, backflow_up, backflow_down,
+        pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status);
+  validateOpenOrbitalJetLayout(layout);
+  const auto ne = layout.features.electron_count;
+  if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
+      (layout.spin_up_count && (!backflow_up || !pi_up || !zeta_up)) ||
+      (layout.spin_up_count != ne && (!backflow_down || !pi_down || !zeta_down)))
+    throw std::invalid_argument("PsiFormer tiled orbital value device storage is null");
+  const auto tiles = ne / 8 + (ne % 8 != 0);
+  const auto count = spatial_detail::checkedProduct(layout.features.configuration_count,
+      spatial_detail::checkedProduct(layout.determinant_count,
+          spatial_detail::checkedProduct(tiles, tiles, "PsiFormer orbital tile grid overflow"),
+          "PsiFormer orbital tile grid overflow"), "PsiFormer orbital tile grid overflow");
+  if (count > std::numeric_limits<int>::max())
+    return launchOpenOrbitalJets(stream, layout, features, positions, nuclei, backflow_up, backflow_down,
+        pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status);
+  openOrbitalValuesTiledKernel<<<static_cast<unsigned int>(count), dim3(8, 8), 0, stream>>>(layout,
+      features, positions, nuclei, backflow_up, backflow_down, pi_up, pi_down, zeta_up, zeta_down,
+      active_electrons, output, status, tiles);
   return peekSpatialLaunchError();
 }
 
