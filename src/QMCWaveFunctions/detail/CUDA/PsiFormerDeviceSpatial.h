@@ -130,6 +130,11 @@ Error launchOpenCuspJets(Stream stream,
                          double* output,
                          OpenSpatialStatus* status);
 
+/// Opt-in OPEN VALUE pair chunks with canonical ordered summation and failure replay.
+Error launchOpenCuspValuesCooperative(Stream stream, const OpenCuspJetLayout& layout,
+    const double* positions, const std::size_t* active_electrons,
+    double same_spin_alpha, double opposite_spin_alpha, double* output, OpenSpatialStatus* status);
+
 /// Build periodic radial cusp jets, including the non-Euclidean radial trace rule.
 Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* positions,

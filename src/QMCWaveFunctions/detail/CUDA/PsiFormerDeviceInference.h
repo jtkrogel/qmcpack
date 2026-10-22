@@ -342,6 +342,17 @@ inline bool configuredCooperativeValueLu()
   throw std::invalid_argument("PSIFORMER_GPU_VALUE_COOPERATIVE_LU must be 0 or 1");
 }
 
+/// Freeze the opt-in OPEN VALUE cusp execution map before graph allocation.
+inline bool configuredCooperativeValueCusp()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_CUSP_VALUE_COOPERATIVE");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_CUSP_VALUE_COOPERATIVE must be 0 or 1");
+}
+
 /// Freeze the opt-in OPEN feature execution map before graph allocation.
 inline bool configuredCooperativeOpenFeatures()
 {
@@ -866,7 +877,8 @@ private:
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
-        cooperative_open_features_requested_(configuredCooperativeOpenFeatures()), kinetic_trunk_only_(kinetic_trunk_only)
+        cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
+        cooperative_value_cusp_requested_(configuredCooperativeValueCusp()), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -1085,6 +1097,10 @@ private:
       std::clog << "PsiFormer OPEN feature preparation: selected="
                 << (usesCooperativeOpenFeatures() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_control_bytes=4; no extra global owner\n";
+    if (cooperative_value_cusp_requested_)
+      std::clog << "PsiFormer VALUE cusp preparation: selected="
+                << (usesCooperativeValueCusp() ? "cooperative" : "scalar")
+                << " Ne=" << ne_ << " static_shared_payload_bytes=4100; no extra global owner\n";
     if (memory::enabled())
     {
       const auto resource = reinterpret_cast<std::uintptr_t>(this);
@@ -1612,6 +1628,18 @@ public:
         environment.compute_scalar_domain == ScalarDomain::REAL;
   }
 
+  /// Bound cusp pair parallelism to ordinary real OPEN VALUE consumers, not retained score tapes.
+  bool usesCooperativeValueCusp() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return cooperative_value_cusp_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+        !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
   /// Permanently retain the old map for mixed reference, approximate and retry graphs.
   void excludeCooperativeOpenFeaturesForMixedRequest()
   {
@@ -1955,6 +1983,10 @@ private:
       checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *cell, positions_.data(), active_.data(),
           model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
           "model periodic cusp");
+    else if (usesCooperativeValueCusp())
+      checkRuntime(launchOpenCuspValuesCooperative(queue_.getNative(), cusp_, positions_.data(), active_.data(),
+          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
+          "model cooperative open VALUE cusp");
     else
       checkRuntime(launchOpenCuspJets(queue_.getNative(), cusp_, positions_.data(), active_.data(),
           model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
@@ -2142,6 +2174,7 @@ private:
   bool mixed_value_lu_excluded_ = false;
   const bool cooperative_open_features_requested_;
   bool mixed_open_features_excluded_ = false;
+  const bool cooperative_value_cusp_requested_;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;
