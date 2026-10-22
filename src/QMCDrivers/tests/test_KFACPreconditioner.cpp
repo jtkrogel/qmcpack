@@ -101,6 +101,9 @@ TEST_CASE("KFAC precomputed raw factors preserve fallback transactions and inver
     const auto registry = makeRegistry();
     KFACFactorAccumulator reference(registry, 7, convention);
     KFACFactorAccumulator imported(registry, 7, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+    const auto before_import_bytes = imported.retainedNumericBytes();
+    const auto factor_bytes = (3 * 3 + 2 * 2) * sizeof(DerivativeReal);
+    CHECK(reference.retainedNumericBytes() == before_import_bytes + 2 * factor_bytes);
     CHECK_THROWS(imported.beginSample(0.5));
     const std::array<double, 4> activations{1, 2, -3, 4}, sensitivities{0.5, -1, 2, 3};
     const std::array<double, 9> score{0, 0, 0, 0, 0, 0, -2, 3, 0};
@@ -126,6 +129,15 @@ TEST_CASE("KFAC precomputed raw factors preserve fallback transactions and inver
     CHECK_THROWS(reduceKFACFactorStatistics(imported));
     CHECK_THROWS(KFACPreconditioner(imported));
     auto bad = reference.factors();
+    bad[0].activation_outer_sum.pop_back();
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    bad = reference.factors();
+    bad[0].sensitivity_outer_sum.push_back(0);
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    bad = reference.factors();
+    ++bad[0].activation_dimension;
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    bad = reference.factors();
     bad[0].activation_outer_sum[0] = std::numeric_limits<double>::quiet_NaN();
     CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
     CHECK_THROWS(imported.importAffineStatistics("wrong-registry", 7, reference.factors()));
@@ -141,7 +153,9 @@ TEST_CASE("KFAC precomputed raw factors preserve fallback transactions and inver
     bad[0].row_weight_sum += 1;
     CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
     CHECK(imported.sampleCount() == 2);
+    CHECK(imported.retainedNumericBytes() == before_import_bytes);
     imported.importAffineStatistics(registry.fingerprint(), 7, reference.factors());
+    CHECK(imported.retainedNumericBytes() == before_import_bytes + factor_bytes);
     CHECK(imported.affineStatisticsComplete());
     CHECK_THROWS(imported.beginSample(1));
     CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, reference.factors()));
@@ -888,6 +902,37 @@ TEST_CASE("KFAC inverse snapshots rebind exactly and refresh only current diagon
 }
 
 #ifdef HAVE_MPI
+TEST_CASE("Distributed precomputed KFAC rejects incomplete rank-local imports collectively",
+          "[drivers][wftrain][kfac][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const auto registry = makeRegistry();
+  KFACFactorAccumulator reference(registry, 11);
+  KFACFactorAccumulator imported(registry, 11, KFACCurvatureConvention::NATIVE_SCORE,
+      KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+  const std::array<DerivativeReal, 4> activations{1, 2, -3, 4}, sensitivities{0.5, -1, 2, 3};
+  const std::array<DerivativeReal, 9> score{0, 0, 0, 0, 0, 0, -2, 3, 0};
+  addSample(reference, 1, activations, sensitivities, score);
+  imported.beginSample(1);
+  imported.addFallbackScores({score.data(), score.size()});
+  imported.endSample();
+  if (communicator.rank() + 1 == communicator.size())
+  {
+    auto invalid = reference.factors();
+    invalid[0].sensitivity_outer_sum.pop_back();
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 11, std::move(invalid)));
+  }
+  else
+    imported.importAffineStatistics(registry.fingerprint(), 11, reference.factors());
+  CHECK_THROWS_AS(reduceKFACFactorStatistics(imported, &communicator, 2), std::runtime_error);
+  CHECK(imported.sampleCount() == 1);
+  if (!imported.affineStatisticsComplete())
+    imported.importAffineStatistics(registry.fingerprint(), 11, reference.factors());
+  CHECK_NOTHROW(reduceKFACFactorStatistics(imported, &communicator, 2));
+  CHECK(imported.sampleCount() == static_cast<std::size_t>(communicator.size()));
+  CHECK(imported.factors()[0].sample_weight_sum == communicator.size());
+}
+
 TEST_CASE("Distributed registered generic curvature squares the global signed sum",
           "[drivers][wftrain][kfac][mpi]")
 {

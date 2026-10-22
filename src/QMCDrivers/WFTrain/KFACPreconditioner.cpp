@@ -85,8 +85,8 @@ bool finite(DerivativeReal value) noexcept
   return isFiniteTrainingReal(value);
 }
 
-/// Construct zeroed factor storage with validated dimensions.
-KFACFactorStatistics makeStatistics(const KFACAffineBlockDescriptor& block)
+/// Validate factor dimensions and optionally allocate zeroed numeric storage.
+KFACFactorStatistics makeStatistics(const KFACAffineBlockDescriptor& block, bool allocate = true)
 {
   const std::size_t activation_dimension =
       block.input_width + (block.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
@@ -95,8 +95,8 @@ KFACFactorStatistics makeStatistics(const KFACAffineBlockDescriptor& block)
   const std::size_t sensitivity_size =
       checkedProduct(block.output_width, block.output_width, "KFAC sensitivity factor");
   return {activation_dimension, block.output_width, 0.0, 0.0, 0,
-          std::vector<DerivativeReal>(activation_size),
-          std::vector<DerivativeReal>(sensitivity_size)};
+          std::vector<DerivativeReal>(allocate ? activation_size : 0),
+          std::vector<DerivativeReal>(allocate ? sensitivity_size : 0)};
 }
 
 /// Compute an in-place lower Cholesky factor, rejecting a non-SPD matrix.
@@ -260,7 +260,8 @@ KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
   pending_.reserve(registry_.affineBlocks().size());
   for (const KFACAffineBlockDescriptor& block : registry_.affineBlocks())
   {
-    factors_.push_back(makeStatistics(block));
+    // Imported factors replace this descriptor; do not allocate an unused bank.
+    factors_.push_back(makeStatistics(block, affine_source_ == KFACAffineStatisticsSource::OBSERVATION_ROWS));
     if (affine_source_ == KFACAffineStatisticsSource::OBSERVATION_ROWS)
       pending_.push_back(makeStatistics(block));
   }
@@ -527,8 +528,10 @@ void KFACFactorAccumulator::importAffineStatistics(const std::string& registry_f
     const auto& destination = factors_[block];
     if (source.activation_dimension != destination.activation_dimension ||
         source.sensitivity_dimension != destination.sensitivity_dimension ||
-        source.activation_outer_sum.size() != destination.activation_outer_sum.size() ||
-        source.sensitivity_outer_sum.size() != destination.sensitivity_outer_sum.size() ||
+        source.activation_outer_sum.size() != checkedProduct(destination.activation_dimension,
+            destination.activation_dimension, "KFAC imported activation factor") ||
+        source.sensitivity_outer_sum.size() != checkedProduct(destination.sensitivity_dimension,
+            destination.sensitivity_dimension, "KFAC imported sensitivity factor") ||
         source.sample_weight_sum != static_cast<DerivativeReal>(sample_count_) ||
         source.sample_weight_sum != fallback_weight_sum_ || source.row_count < sample_count_ ||
         source.row_count % sample_count_ != 0 || source.row_weight_sum != static_cast<DerivativeReal>(source.row_count) ||
