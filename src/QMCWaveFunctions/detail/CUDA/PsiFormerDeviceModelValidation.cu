@@ -44,6 +44,7 @@
 #include "PsiFormerDeviceResidentAdamValidation.h"
 #include "PsiFormerDeviceVglOwnershipValidation.h"
 #include "PsiFormerDeviceLazyVglValidation.h"
+#include "PsiFormerDeviceSoftmaxColumnValidation.h"
 #include "PsiFormerDeviceSrMetricValidation.h"
 #include "PsiFormerDevicePcgValidation.h"
 #include "PsiFormerDeviceEnergySrValidation.h"
@@ -1925,6 +1926,7 @@ int main(int argc, char** argv)
 
     validateDeviceAffineStatistics(model, image, queue, handle);
     validateLazyVglPreparation(image, model.cfg.electrons.x);
+    validateSoftmaxColumnReverse(queue);
 
     // Complete canonical score contraction against the independent CPU evaluator.
     std::vector<double> score_weights(model.cfg.nconfig);

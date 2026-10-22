@@ -89,6 +89,166 @@ __global__ void tanhJetReverseKernel(SpatialElementwiseJetLayout layout,
       layout.jets, input, tanh_output, output_adjoint, element, input_adjoint);
 }
 
+/// One column owns all its jet adjoints; retain the original serial inner sums.
+__device__ inline void softmaxJetColumnReverseElement(
+    const double* logits_row,
+    const double* probabilities_row,
+    const double* probability_adjoint_row,
+    std::size_t width,
+    std::size_t plane_stride,
+    std::size_t gradient_lanes,
+    std::size_t electron_count,
+    double* logit_adjoint_row,
+    std::size_t differentiated) noexcept
+{
+  // Value cotangents retain the original row reduction and column accumulation.
+  const double value_mean = spatial_jet_reverse::detail::weightedMean(
+      probabilities_row, probability_adjoint_row, width);
+  const double probability = probabilities_row[differentiated];
+  double value_result = probability *
+      (probability_adjoint_row[differentiated] - value_mean);
+
+  // Each gradient plane keeps its serial means and Laplacian coupling order.
+  for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+  {
+    const double* logit_gradient = logits_row + (1 + lane) * plane_stride;
+    const double* probability_gradient_adjoint =
+        probability_adjoint_row + (1 + lane) * plane_stride;
+    const double gradient_mean = spatial_jet_reverse::detail::weightedMean(
+        probabilities_row, logit_gradient, width);
+    const double adjoint_mean = spatial_jet_reverse::detail::weightedMean(
+        probabilities_row, probability_gradient_adjoint, width);
+    double centered_product_mean = 0.0;
+    for (std::size_t index = 0; index < width; ++index)
+      centered_product_mean += probabilities_row[index] *
+          (probability_gradient_adjoint[index] - adjoint_mean) *
+          (logit_gradient[index] - gradient_mean);
+    value_result += probability *
+        ((probability_gradient_adjoint[differentiated] - adjoint_mean) *
+             (logit_gradient[differentiated] - gradient_mean) -
+         centered_product_mean);
+
+    double gradient_result = probability *
+        (probability_gradient_adjoint[differentiated] - adjoint_mean);
+    const std::size_t electron = lane / 3;
+    const double* laplacian_adjoint = probability_adjoint_row +
+        (1 + gradient_lanes + electron) * plane_stride;
+    const double laplacian_adjoint_mean = spatial_jet_reverse::detail::weightedMean(
+        probabilities_row, laplacian_adjoint, width);
+    double coupling = 0.0;
+    for (std::size_t index = 0; index < width; ++index)
+      coupling += probabilities_row[index] *
+          (laplacian_adjoint[index] - laplacian_adjoint_mean) *
+          (logit_gradient[index] - gradient_mean);
+    gradient_result += 2.0 * probability *
+        ((laplacian_adjoint[differentiated] - laplacian_adjoint_mean) *
+             (logit_gradient[differentiated] - gradient_mean) -
+         coupling);
+    logit_adjoint_row[(1 + lane) * plane_stride + differentiated] +=
+        gradient_result;
+  }
+
+  // Laplacian cotangents update this column's value and electron plane only.
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    const double* logit_laplacian =
+        logits_row + (1 + gradient_lanes + electron) * plane_stride;
+    const double* laplacian_adjoint = probability_adjoint_row +
+        (1 + gradient_lanes + electron) * plane_stride;
+    const double laplacian_mean = spatial_jet_reverse::detail::weightedMean(
+        probabilities_row, logit_laplacian, width);
+    const double adjoint_mean = spatial_jet_reverse::detail::weightedMean(
+        probabilities_row, laplacian_adjoint, width);
+
+    double gradient_square_mean = 0.0;
+    for (std::size_t index = 0; index < width; ++index)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double* gradient = logits_row + (1 + lane) * plane_stride;
+        const double gradient_mean = spatial_jet_reverse::detail::weightedMean(
+            probabilities_row, gradient, width);
+        const double centered = gradient[index] - gradient_mean;
+        gradient_square_mean += probabilities_row[index] * centered * centered;
+      }
+
+    double differentiated_gradient_square = 0.0;
+    double coupling_dot = 0.0;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const std::size_t lane = 3 * electron + dimension;
+      const double* gradient = logits_row + (1 + lane) * plane_stride;
+      const double gradient_mean = spatial_jet_reverse::detail::weightedMean(
+          probabilities_row, gradient, width);
+      const double differentiated_centered =
+          gradient[differentiated] - gradient_mean;
+      differentiated_gradient_square +=
+          differentiated_centered * differentiated_centered;
+      double coupling = 0.0;
+      for (std::size_t index = 0; index < width; ++index)
+        coupling += probabilities_row[index] *
+            (laplacian_adjoint[index] - adjoint_mean) *
+            (gradient[index] - gradient_mean);
+      coupling_dot += coupling * differentiated_centered;
+    }
+    const double b = logit_laplacian[differentiated] - laplacian_mean +
+        differentiated_gradient_square - gradient_square_mean;
+    const double r =
+        (laplacian_adjoint[differentiated] - adjoint_mean) * b -
+        2.0 * coupling_dot;
+    double r_mean = 0.0;
+    for (std::size_t index = 0; index < width; ++index)
+    {
+      double square = 0.0;
+      double index_coupling_dot = 0.0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double* gradient = logits_row + (1 + lane) * plane_stride;
+        const double gradient_mean = spatial_jet_reverse::detail::weightedMean(
+            probabilities_row, gradient, width);
+        const double centered = gradient[index] - gradient_mean;
+        square += centered * centered;
+        double coupling = 0.0;
+        for (std::size_t reduced = 0; reduced < width; ++reduced)
+          coupling += probabilities_row[reduced] *
+              (laplacian_adjoint[reduced] - adjoint_mean) *
+              (gradient[reduced] - gradient_mean);
+        index_coupling_dot += coupling * centered;
+      }
+      const double index_b = logit_laplacian[index] - laplacian_mean +
+          square - gradient_square_mean;
+      r_mean += probabilities_row[index] *
+          ((laplacian_adjoint[index] - adjoint_mean) * index_b -
+           2.0 * index_coupling_dot);
+    }
+    value_result += probability * (r - r_mean);
+    logit_adjoint_row[(1 + gradient_lanes + electron) * plane_stride +
+                      differentiated] +=
+        probability * (laplacian_adjoint[differentiated] - adjoint_mean);
+  }
+  logit_adjoint_row[differentiated] += value_result;
+}
+
+/// Flatten disjoint row/column outputs without atomics or extra numerical owners.
+__global__ void softmaxJetColumnReverseKernel(SoftmaxJetRowLayout layout,
+    const double* logits, const double* probabilities,
+    const double* probability_adjoint, double* logit_adjoint)
+{
+  const auto logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto row = logical / layout.row_width;
+  if (row >= layout.row_count)
+    return;
+  const auto differentiated = logical % layout.row_width;
+  const auto group = row / layout.rows_per_group;
+  const auto row_in_group = row % layout.rows_per_group;
+  const auto offset = group * layout.row_group_stride + row_in_group * layout.row_stride;
+  softmaxJetColumnReverseElement(logits + offset, probabilities + offset,
+      probability_adjoint + offset, layout.row_width, layout.jets.plane_stride,
+      layout.jets.gradient_lanes, layout.jets.laplacian_lanes,
+      logit_adjoint + offset, differentiated);
+}
+
 __global__ void softmaxJetReverseKernel(SoftmaxJetRowLayout layout,
                                         const double* logits,
                                         const double* probabilities,
@@ -386,7 +546,8 @@ Error launchSoftmaxJetReverse(Stream stream,
                               const double* logits,
                               const double* probabilities,
                               const double* probability_adjoint,
-                              double* logit_adjoint)
+                              double* logit_adjoint,
+                              bool differentiated_columns)
 {
   if (layout.jets.configuration_count == 0 && layout.row_count == 0 &&
       layout.row_width == 0)
@@ -399,6 +560,16 @@ Error launchSoftmaxJetReverse(Stream stream,
       logit_adjoint == probability_adjoint)
     throw std::invalid_argument(
         "PsiFormer softmax-jet reverse input/output storage aliases");
+  if (differentiated_columns)
+  {
+    const auto count = spatial_detail::checkedProduct(layout.row_count, layout.row_width,
+        "PsiFormer softmax column reverse extent overflow");
+    softmaxJetColumnReverseKernel<<<
+        reverseBlocks(count, "PsiFormer softmax column reverse grid exceeds device x dimension"),
+        spatial_reverse_block_size, 0, stream>>>(
+        layout, logits, probabilities, probability_adjoint, logit_adjoint);
+    return peekReverseError();
+  }
   softmaxJetReverseKernel<<<
       reverseBlocks(layout.row_count,
                     "PsiFormer softmax-jet reverse grid exceeds device x dimension"),

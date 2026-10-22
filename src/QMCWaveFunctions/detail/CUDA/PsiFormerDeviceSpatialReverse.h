@@ -15,9 +15,23 @@
 #include "PsiFormerDeviceDense.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetReverse.h"
+#include <cstdlib>
+#include <stdexcept>
+#include <string_view>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Select independent-column GPU work only by an explicit bounded opt-in.
+inline bool configuredSoftmaxColumnReverse()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE requires 0 or 1");
+}
 
 /** Reverse a one-configuration full-VGL dense jet.
  *
@@ -56,7 +70,8 @@ Error launchSoftmaxJetReverse(Stream stream,
                               const double* logits,
                               const double* probabilities,
                               const double* probability_adjoint,
-                              double* logit_adjoint);
+                              double* logit_adjoint,
+                              bool differentiated_columns = configuredSoftmaxColumnReverse());
 
 Error launchAttentionContextJetReverse(
     Stream stream,
