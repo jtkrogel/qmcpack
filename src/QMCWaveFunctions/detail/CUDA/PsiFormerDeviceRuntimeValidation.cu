@@ -335,8 +335,11 @@ void openFeatureCooperativeOne(Queue& queue, std::size_t ne, std::size_t nuclei_
       throw std::runtime_error("OPEN feature canonical status differs");
     if (variant == 1 && actual_status[1] != OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT)
       throw std::runtime_error("Invalid-active fixture lost premise");
-    if (variant == 5 && actual_status[0] != OpenSpatialStatus::COALESCENCE)
-      throw std::runtime_error("Earlier overflow masked later geometric failure");
+    if (variant == 4 && mode == SpatialJetMode::VALUE_ONLY && actual_status[0] != OpenSpatialStatus::REGULAR)
+      throw std::runtime_error("VALUE feature coalescence must remain regular");
+    if (variant == 5 && actual_status[0] != (mode == SpatialJetMode::VALUE_ONLY ?
+        OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT : OpenSpatialStatus::COALESCENCE))
+      throw std::runtime_error("Feature overflow/coalescence failure precedence differs");
     for (std::size_t i = 0; i < span; ++i)
     {
       // Failed configurations replay the identical scalar device helper; compare ALL partial scratch.
@@ -364,7 +367,7 @@ void openFeatureCooperativeOne(Queue& queue, std::size_t ne, std::size_t nuclei_
             << " all_planes_padding_status_partial_scratch_zero_tracked_alloc\n";
 }
 
-/// Bound coverage to the reviewed seven OPEN raw execution-map cases.
+/// Bound raw execution-map coverage, including ECP VALUE tails and failure/recovery.
 void openFeatureCooperativeCases(Queue& queue)
 {
   openFeatureCooperativeOne(queue, 63, 3, SpatialJetMode::ACTIVE, 0, 0, false);
@@ -372,6 +375,9 @@ void openFeatureCooperativeCases(Queue& queue)
   openFeatureCooperativeOne(queue, 129, 3, SpatialJetMode::FULL_VGL, 127, 2, false);
   openFeatureCooperativeOne(queue, 100, 100, SpatialJetMode::FULL_VGL, 37, 1, false);
   openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::VALUE_ONLY, 0, 0, false);
+  openFeatureCooperativeOne(queue, 63, 3, SpatialJetMode::VALUE_ONLY, 0, 0, true);
+  openFeatureCooperativeOne(queue, 100, 40, SpatialJetMode::VALUE_ONLY, 0, 0, true);
+  openFeatureCooperativeOne(queue, 129, 3, SpatialJetMode::VALUE_ONLY, 0, 0, true);
   openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::ACTIVE, 0, 0, false);
   openFeatureCooperativeOne(queue, 64, 2, SpatialJetMode::FULL_VGL, 63, 1, true);
 }

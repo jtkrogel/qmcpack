@@ -1599,11 +1599,12 @@ public:
       std::clog << "PsiFormer VALUE LU preparation: selected=scalar (mixed request/replay excluded)\n";
   }
 
-  /// Limit the new map to non-retained FP64 REAL OPEN spatial inference graphs.
+  /// Share the opt-in pair map across non-retained FP64 REAL OPEN VGL and ECP VALUE graphs.
   bool usesCooperativeOpenFeatures() const noexcept
   {
     const auto& environment = plan_.environment();
-    return cooperative_open_features_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::FULL_VGL &&
+    return cooperative_open_features_requested_ && ne_ >= 64 &&
+        (mode_ == SpatialJetMode::FULL_VGL || mode_ == SpatialJetMode::VALUE_ONLY) &&
         value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
         !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
