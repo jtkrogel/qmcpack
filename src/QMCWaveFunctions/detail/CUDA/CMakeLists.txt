@@ -44,7 +44,8 @@ add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
 # Compensation and injected proposal parity require rounded products/additions,
 # not reassociation or fused coordinate updates.
 # Keep this leaf strict even when a parent Release policy enables fast math.
-set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceLiftedDeterminantProducts.cu
+set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceMetropolisKernels.cu PsiFormerDeviceAdamKernels.cu
     PsiFormerDeviceComplexValueKernels.cu PsiFormerDeviceComplexSpatialKernels.cu
     PsiFormerDeviceComplexScoreKernels.cu PsiFormerDeviceComplexKineticKernels.cu APPEND PROPERTY COMPILE_OPTIONS

@@ -287,6 +287,27 @@ struct DeviceFixture
   }
 };
 
+Results directTraces(const Fixture& fixture, SpatialTraceInputs input, Stream stream)
+{
+  Results output(fixture.layout);
+  DeviceBuffer<double> scratch(fixture.layout.configuration_count * fixture.layout.matrix_size * fixture.layout.matrix_size),
+      gradient(output.gradient.size()), ratio(output.ratio.size()), log(output.log.size());
+  DeviceBuffer<determinant::DerivativeStatus> status(output.status.size());
+  checkRuntime(launchDeterminantSpatialTraces(stream, fixture.layout, input.factorizations,
+      input.combinations, input.normalized_weights, input.inverses, input.gradients, input.laplacians,
+      scratch.data(), gradient.data(), ratio.data(), log.data(), status.data()), "direct determinant traces");
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipStreamSynchronize(stream), "direct determinant trace completion");
+#else
+  checkRuntime(cudaStreamSynchronize(stream), "direct determinant trace completion");
+#endif
+  gradient.download(output.gradient.data(), output.gradient.size());
+  ratio.download(output.ratio.data(), output.ratio.size());
+  log.download(output.log.data(), output.log.size());
+  status.download(output.status.data(), output.status.size());
+  return output;
+}
+
 void hostChecks()
 {
   for (const auto n : {std::size_t{100}, std::size_t{200}, std::size_t{300}})
@@ -346,6 +367,7 @@ void numericalChecks(Stream stream, DeviceMemoryMetrics& metrics)
       engine.evaluate(live.layout, input);
       engine.downloadResults(output.gradient, output.ratio, output.log, output.status);
       compare(output, reference(live));
+      compare(directTraces(live, input, stream), reference(live));
       const auto before = metrics.snapshot();
       engine.evaluate(live.layout, input);
       engine.downloadResults(output.gradient, output.ratio, output.log, output.status);
@@ -357,9 +379,11 @@ void numericalChecks(Stream stream, DeviceMemoryMetrics& metrics)
 
     auto check = [&](const Fixture& fixture) {
       Results output(fixture.layout);
-      engine.evaluate(fixture.layout, device.upload(fixture));
+      const auto input = device.upload(fixture);
+      engine.evaluate(fixture.layout, input);
       engine.downloadResults(output.gradient, output.ratio, output.log, output.status);
       compare(output, reference(fixture));
+      compare(directTraces(fixture, input, stream), reference(fixture));
     };
     {
       PreparedDeviceSpatialTraces one_slot(capacity.layout, stream, metadata + n * n * sizeof(double));
@@ -388,6 +412,7 @@ void numericalChecks(Stream stream, DeviceMemoryMetrics& metrics)
     engine.downloadResults(conditioned_output.gradient, conditioned_output.ratio, conditioned_output.log,
                            conditioned_output.status);
     compareCancellationScale(conditioned, conditioned_output);
+    compareCancellationScale(conditioned, directTraces(conditioned, device.upload(conditioned), stream));
     // The same inverse with balanced derivative rows remains well scaled and
     // must also pass the ordinary strict scalar-parity tolerance.
     for (std::size_t lane = 0; lane < conditioned.layout.gradient_lanes; ++lane)
@@ -449,6 +474,11 @@ void numericalChecks(Stream stream, DeviceMemoryMetrics& metrics)
             "Trace failed replacement exposed an older result");
     check(capacity);
     require(engine.result().generation > old_generation, "Trace recovery failed to advance its generation");
+  }
+  {
+    Fixture large(100, 1, 1, 2);
+    DeviceFixture device(large);
+    compare(directTraces(large, device.upload(large), stream), reference(large));
   }
   std::cout << "PASS parallel compensated traces: nonsymmetric/signed channels, B/K/slot tails, padding, "
                "zero-weight inverse/nonfinite rules, node priority, overflow, failure/recovery, zero warm allocations\n";
