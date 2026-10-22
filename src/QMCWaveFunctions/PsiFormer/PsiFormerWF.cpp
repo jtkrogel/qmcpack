@@ -7788,31 +7788,33 @@ std::size_t PsiFormerWF::deviceAffineStatisticsStorageBytes(const wftrain::KFACB
 #endif
 }
 
+/// Collect raw device affine factors while the driver controls HOST sample publication.
 void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,
-    wftrain::KFACFactorAccumulator& statistics, std::size_t maximum_numeric_bytes) const
+    const wftrain::KFACBlockRegistry& registry, std::size_t expected_version, bool gaussian_curvature,
+    DeviceAffineStatisticsSink& sink, std::size_t maximum_numeric_bytes) const
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
-  if (!usesDeviceAffineStatistics() || samples.empty() || statistics.sampleCount() || statistics.affineStatisticsComplete())
-    throw std::invalid_argument("Device affine collection requires fresh precomputed statistics and samples");
+  if (!usesDeviceAffineStatistics() || samples.empty())
+    throw std::invalid_argument("Device affine collection requires enabled statistics and samples");
   auto scratch = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount());
   PsiFormerDerivativeLease scratch_lease(*scratch);
   PsiFormerReadTransaction transaction(*model_state_);
   const auto& state = transaction.state();
-  if (!scratch->device_products || statistics.parameterVersion() != transaction.parameterVersion() ||
-      statistics.registry().parameterSchema().fingerprint() != parameterSchema().fingerprint())
+  if (!scratch->device_products || expected_version != transaction.parameterVersion() ||
+      registry.parameterSchema().fingerprint() != parameterSchema().fingerprint())
     throw std::invalid_argument("Device affine collection has an incompatible model generation");
-  const auto descriptors = deviceAffineDescriptors(state.execution_plan, statistics.registry());
+  const auto descriptors = deviceAffineDescriptors(state.execution_plan, registry);
   const auto required = deviceAffineNumericBytes(descriptors);
   if (!maximum_numeric_bytes || required > maximum_numeric_bytes)
     throw std::length_error("Device affine collection exceeds its remaining numeric budget");
   using Owner = psiformer::device::PreparedDeviceAffineStatistics;
   auto factors = scratch->device_products->prepareAffineStatistics(descriptors,
-      statistics.curvatureConvention() == wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN,
+      gaussian_curvature,
       Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), transaction.parameterVersion());
   std::vector<std::pair<std::size_t, std::size_t>> fallback_ranges;
-  for (const auto block : statistics.registry().fallbackBlocks())
+  for (const auto block : registry.fallbackBlocks())
   {
-    const auto& tensor = statistics.registry().parameterSchema().blocks()[block];
+    const auto& tensor = registry.parameterSchema().blocks()[block];
     fallback_ranges.emplace_back(tensor.offset, tensor.count);
   }
   const auto& shape = state.execution_plan.modelShape();
@@ -7838,19 +7840,19 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
         scratch->device_positions[3 * electron + dimension] = coordinate;
       }
     }
-    statistics.beginSample(1);
+    sink.beginSample();
     try
     {
       const auto& score = scratch->device_products->affineFallbackScore(scratch->device_positions.data(),
           *factors, fallback_ranges, transaction.parameterVersion());
-      statistics.addFallbackScores({score.data(), score.size()});
+      sink.addFallbackScore(score);
       auto prepared = factors->prepareSampleCommit();
-      statistics.endSample();
+      sink.endSample();
       prepared.commit();
     }
     catch (...)
     {
-      statistics.abortSample();
+      sink.abortSample();
       factors->abortSample();
       throw;
     }
@@ -7870,7 +7872,7 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
         descriptors[block].output_width, downloaded[block].sample_weight_sum, downloaded[block].row_weight_sum,
         downloaded[block].row_count, std::move(downloaded[block].activation_outer_sum),
         std::move(downloaded[block].sensitivity_outer_sum)});
-  statistics.importAffineStatistics(statistics.registry().fingerprint(), transaction.parameterVersion(), std::move(imported));
+  sink.import(std::move(imported));
   app_log() << "PsiFormer KFAC affine statistics: samples=" << factors->sampleCount()
             << " device_numeric_bytes=" << factors->deviceWorkspaceBytes()
             << " host_numeric_bytes=" << factors->hostWorkspaceBytes()

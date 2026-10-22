@@ -363,6 +363,34 @@ private:
   wftrain::KFACFactorAccumulator& accumulator_;
 };
 
+/// Keep optimizer calls in the driver library while DEVICE collection owns its banks.
+class LiveDeviceAffineSink final : public PsiFormerWF::DeviceAffineStatisticsSink
+{
+public:
+  explicit LiveDeviceAffineSink(wftrain::KFACFactorAccumulator& statistics) : statistics_(statistics)
+  {
+    if (statistics_.sampleActive() || statistics_.sampleCount() || statistics_.globallyReduced() ||
+        statistics_.affineStatisticsComplete())
+      throw std::invalid_argument("Device affine sink requires fresh precomputed statistics");
+  }
+
+  void beginSample() override { statistics_.beginSample(1); }
+  void addFallbackScore(const std::vector<double>& score) override
+  {
+    statistics_.addFallbackScores({score.data(), score.size()});
+  }
+  void endSample() override { statistics_.endSample(); }
+  void abortSample() noexcept override { statistics_.abortSample(); }
+  void import(std::vector<wftrain::KFACFactorStatistics> factors) override
+  {
+    statistics_.importAffineStatistics(statistics_.registry().fingerprint(), statistics_.parameterVersion(),
+        std::move(factors));
+  }
+
+private:
+  wftrain::KFACFactorAccumulator& statistics_;
+};
+
 wftrain::KFACBlockRegistry makeLiveKFACRegistry(const wftrain::StructuredParameterProvider& provider)
 {
   const auto& schema = provider.parameterSchema();
@@ -4156,7 +4184,11 @@ void WFTrainBatched::run()
               for (const auto& retained : retained_samples)
                 for (const auto& particles : retained.particles)
                   samples.push_back(particles.get());
-              affine_provider->accumulateDeviceAffineStatistics(samples, *statistics, device_affine_budget);
+              LiveDeviceAffineSink sink(*statistics);
+              affine_provider->accumulateDeviceAffineStatistics(samples, statistics->registry(),
+                  statistics->parameterVersion(),
+                  statistics->curvatureConvention() == wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN,
+                  sink, device_affine_budget);
               // Precomputed descriptors acquire their HOST numeric bank only at import.
               if (psiformer::memory::enabled())
                 memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",
