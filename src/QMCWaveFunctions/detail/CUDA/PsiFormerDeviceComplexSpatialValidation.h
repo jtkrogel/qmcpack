@@ -7,6 +7,77 @@
 #include "PsiFormerDeviceComplexSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialExecutor.h"
 
+/// A matrix with more entries than block threads constrains product-stride tails.
+void validateComplexSpatialProductTails(qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA>& queue)
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  using C = std::complex<double>;
+  constexpr std::size_t n = 17, channels = 2, nn = n * n, m = channels * nn;
+  auto layout = makeOpenOrbitalJetLayout(1, channels, n, 1, 1, n / 2, SpatialJetMode::FULL_VGL);
+  layout.features = withSpatialTargetRange(layout.features, n - 1, 1);
+  layout.orbitals = withSpatialTargetRange(layout.orbitals, n - 1, 1);
+  std::vector<C> matrices(m), inverses(m), jets(5 * m), expected_g(3), expected_l(1), expected_r(1);
+  for (std::size_t channel = 0; channel < channels; ++channel)
+    for (std::size_t row = 0; row < n; ++row)
+      matrices[channel * nn + row * n + row] = inverses[channel * nn + row * n + row] = 1;
+  matrices[nn] = C(0, 1);
+  inverses[nn] = C(0, -1);
+  std::copy(matrices.begin(), matrices.end(), jets.begin());
+  for (std::size_t entry = m; entry < jets.size(); ++entry)
+    jets[entry] = C(.03 * std::sin(double(entry + 1)), .02 * std::cos(double(2 * entry + 3)));
+  // Ordinary signed products must differ from a conjugated square norm.
+  jets[m + 1] = C(2, 1);
+  jets[m + n] = C(-3, .5);
+  determinant::ComplexDeterminantWorkspace oracle(channels, n, 0, 3, 1);
+  oracle.evaluateSpatial(matrices.data(), jets.data() + m, 3, jets.data() + 4 * m, 1,
+      expected_g.data(), expected_l.data(), expected_r.data());
+  const std::vector<double> cusp{0, .1, -.2, .3, -.04};
+  expected_l[0] += cusp[4];
+  expected_r[0] = expected_l[0];
+  for (std::size_t mu = 0; mu < 3; ++mu)
+  {
+    expected_g[mu] += cusp[1 + mu];
+    expected_r[0] += expected_g[mu] * expected_g[mu];
+  }
+  const auto pack = [](C z) { return make_cuDoubleComplex(z.real(), z.imag()); };
+  std::vector<cuDoubleComplex> packed_jets(jets.size()), packed_inverse(inverses.size());
+  std::transform(jets.begin(), jets.end(), packed_jets.begin(), pack);
+  std::transform(inverses.begin(), inverses.end(), packed_inverse.begin(), pack);
+  DeviceBuffer<cuDoubleComplex> head(jets.size()), inverse(inverses.size()), product(nn), g(3), l(1), r(1);
+  DeviceBuffer<ComplexValueChannel> records(channels);
+  DeviceBuffer<ComplexValueResult> amplitude(1);
+  DeviceBuffer<double> device_cusp(cusp.size());
+  DeviceBuffer<std::uint64_t> status(1);
+  const std::vector<ComplexValueChannel> channel_records{{pack(C(1, 0)), 0, 0}, {pack(C(0, 1)), 0, 0}};
+  const ComplexValueResult root{pack(C(1, 1) / std::sqrt(2.0)), .5 * std::log(2.0), 1 / std::sqrt(2.0), 0, 0};
+  const auto clear = std::numeric_limits<std::uint64_t>::max();
+  head.upload(packed_jets.data(), packed_jets.size());
+  inverse.upload(packed_inverse.data(), packed_inverse.size());
+  records.upload(channel_records.data(), channels);
+  amplitude.upload(&root, 1);
+  device_cusp.upload(cusp.data(), cusp.size());
+  status.upload(&clear, 1);
+  checkRuntime(launchComplexSpatialTraces(queue.getNative(), layout, records.data(), amplitude.data(),
+      inverse.data(), head.data(), device_cusp.data(), product.data(), g.data(), l.data(), r.data(), status.data()),
+      "complex product stride tails");
+  queue.sync();
+  std::uint64_t result_status;
+  status.download(&result_status, 1);
+  if (result_status != clear)
+    throw std::runtime_error("Complex product-tail fixture rejected");
+  std::vector<cuDoubleComplex> actual_g(3), actual_l(1), actual_r(1);
+  g.download(actual_g.data(), 3); l.download(actual_l.data(), 1); r.download(actual_r.data(), 1);
+  const auto compare = [](cuDoubleComplex actual, C expected, const char* field) {
+    near(std::abs(C(cuCreal(actual), cuCimag(actual)) - expected), 0, field, 2e-11);
+  };
+  for (std::size_t mu = 0; mu < 3; ++mu)
+    compare(actual_g[mu], expected_g[mu], "complex product-tail gradient");
+  compare(actual_l[0], expected_l[0], "complex product-tail log Laplacian");
+  compare(actual_r[0], expected_r[0], "complex product-tail ratio Laplacian");
+  std::cout << "PASS complex spatial product tails: N17 K1 signed_nonsymmetric=1 complex_weights=1 cusp=1\n";
+}
+
 /// Tiny normalized weights must retain finite representable spatial terms, never overflow admission.
 void validateComplexSpatialWeightedLeaves(qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA>& queue)
 {
@@ -107,6 +178,7 @@ void validateComplexSpatialWeightedLeaves(qmcplusplus::compute::Queue<qmcplusplu
   }
   std::cout << "PASS finite weighted complex spatial: tiny_G_L_nonzero=1 max_scaled_error=" << max_scaled
       << " complex_phase=1 raw_inverse_unchanged=1 unweighted_overflow_rejected=1 node_denominator_rejected=1\n";
+  validateComplexSpatialProductTails(queue);
 }
 
 /// Numerical FULL oracle, ordinary complex kinetic consumer and lifecycle gate.

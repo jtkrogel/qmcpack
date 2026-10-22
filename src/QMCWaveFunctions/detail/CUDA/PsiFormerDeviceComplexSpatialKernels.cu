@@ -6,6 +6,7 @@
 #include "PsiFormerDeviceComplexWeightedProducts.h"
 #include <limits>
 #include <cfloat>
+#include <cstdlib>
 #include <stdexcept>
 
 // Keep unmapped vendor arithmetic names private to this translation unit.
@@ -223,6 +224,166 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
   }
 }
 
+/// Preserve the scalar channel normalization before admitting a cooperative block.
+__device__ bool cooperativeSpatialCombination(std::size_t determinants,
+    const ComplexValueChannel* records, const ComplexValueResult& amplitude,
+    double& shift, double& log_total, cuDoubleComplex& phase)
+{
+  shift = -DBL_MAX;
+  for (std::size_t d = 0; d < determinants; ++d)
+  {
+    if (records[d].status != 0 || amplitude.status != 0 || !finite(records[d].phase) ||
+        !device_math::isFiniteBinary64(records[d].log_abs) || !finite(amplitude.phase) ||
+        !device_math::isFiniteBinary64(amplitude.log_abs) ||
+        fmax(fabs(cuCreal(amplitude.phase)), fabs(cuCimag(amplitude.phase))) == 0)
+      return false;
+    shift = fmax(shift, records[d].log_abs);
+  }
+  ComplexSum total;
+  for (std::size_t d = 0; d < determinants; ++d)
+  {
+    const auto scale = exp(records[d].log_abs - shift);
+    total.add(make_cuDoubleComplex(scale * cuCreal(records[d].phase), scale * cuCimag(records[d].phase)));
+  }
+  const auto denominator = total.value();
+  const auto scale = fmax(fabs(cuCreal(denominator)), fabs(cuCimag(denominator)));
+  if (!finite(denominator) || !(scale > 0))
+    return false;
+  const auto re = cuCreal(denominator) / scale, im = cuCimag(denominator) / scale;
+  const auto norm = hypot(re, im);
+  log_total = log(scale) + log(norm);
+  phase = make_cuDoubleComplex(re / norm, im / norm);
+  return device_math::isFiniteBinary64(log_total) && finite(phase);
+}
+
+/// Parallel independent complex product entries; ordinary signed traces keep scalar order.
+__global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determinants,
+    std::size_t n, std::size_t targets, const ComplexValueChannel* channels,
+    const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
+    const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
+    cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio,
+    std::uint64_t* status)
+{
+  const auto b = std::size_t(blockIdx.x);
+  const auto nn = n * n, matrix_span = determinants * nn, m = batch * matrix_span, planes = 1 + 4 * targets;
+  const auto* records = channels + b * determinants;
+  auto* scratch = product + b * nn;
+  __shared__ double shift, log_total;
+  __shared__ cuDoubleComplex phase;
+  __shared__ int rejected;
+  if (threadIdx.x == 0)
+  {
+    rejected = !cooperativeSpatialCombination(determinants, records, amplitude[b], shift, log_total, phase);
+    if (rejected)
+      fail(status, b);
+  }
+  __syncthreads();
+  if (rejected)
+    return;
+
+  if (threadIdx.x == 0)
+    for (std::size_t lane = 0; lane < 3 * targets; ++lane)
+    {
+      ComplexSum sum;
+      for (std::size_t d = 0; d < determinants; ++d)
+      {
+        const auto term = trace(inverse + b * matrix_span + d * nn,
+            head + (1 + lane) * m + b * matrix_span + d * nn, n);
+        cuDoubleComplex weighted;
+        if (!finite(term) || !complex_detail::weightedProduct((records[d].log_abs - shift) - log_total,
+            QMC_PF_DIV(records[d].phase, phase), term, weighted))
+        {
+          fail(status, b);
+          rejected = 1;
+          break;
+        }
+        sum.add(weighted);
+      }
+      if (rejected)
+        break;
+      gradient[3 * b * targets + lane] = sum.value();
+    }
+  __syncthreads();
+  if (rejected)
+    return;
+
+  for (std::size_t e = 0; e < targets; ++e)
+  {
+    ComplexSum ratio;
+    for (std::size_t d = 0; d < determinants; ++d)
+    {
+      const auto offset = b * matrix_span + d * nn;
+      const auto* matrix_inverse = inverse + offset;
+      ComplexSum channel;
+      if (threadIdx.x == 0)
+        channel.add(trace(matrix_inverse, head + (1 + 3 * targets + e) * m + offset, n));
+      for (std::size_t mu = 0; mu < 3; ++mu)
+      {
+        const auto* derivative = head + (1 + 3 * e + mu) * m + offset;
+        for (std::size_t entry = threadIdx.x; entry < nn; entry += blockDim.x)
+        {
+          const auto row = entry / n, column = entry % n;
+          ComplexSum sum;
+          for (std::size_t k = 0; k < n; ++k)
+            sum.add(QMC_PF_MUL(matrix_inverse[row * n + k], derivative[k * n + column]));
+          scratch[entry] = sum.value();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+          const auto t = trace(matrix_inverse, derivative, n);
+          channel.add(QMC_PF_SUB(QMC_PF_MUL(t, t), trace(scratch, scratch, n)));
+        }
+        // Finish the signed-square read before another direction overwrites it.
+        __syncthreads();
+      }
+      if (threadIdx.x == 0)
+      {
+        cuDoubleComplex weighted;
+        if (!finite(channel.value()) || !complex_detail::weightedProduct((records[d].log_abs - shift) - log_total,
+            QMC_PF_DIV(records[d].phase, phase), channel.value(), weighted))
+        {
+          fail(status, b);
+          rejected = 1;
+        }
+        else
+          ratio.add(weighted);
+      }
+      __syncthreads();
+      if (rejected)
+        return;
+    }
+    if (threadIdx.x == 0)
+    {
+      ComplexSum core_square, physical_square;
+      for (std::size_t mu = 0; mu < 3; ++mu)
+      {
+        auto& g = gradient[3 * (b * targets + e) + mu];
+        core_square.add(QMC_PF_MUL(g, g));
+        g = make_cuDoubleComplex(cuCreal(g) + cusp[b * planes + 1 + 3 * e + mu], cuCimag(g));
+        physical_square.add(QMC_PF_MUL(g, g));
+        if (!finite(g))
+          fail(status, b);
+      }
+      auto l = QMC_PF_SUB(ratio.value(), core_square.value());
+      l = make_cuDoubleComplex(cuCreal(l) + cusp[b * planes + 1 + 3 * targets + e], cuCimag(l));
+      const auto r = physical_square.value();
+      lap_log[b * targets + e] = l;
+      lap_ratio[b * targets + e] = make_cuDoubleComplex(cuCreal(l) + cuCreal(r), cuCimag(l) + cuCimag(r));
+      if (!finite(l) || !finite(lap_ratio[b * targets + e]))
+        fail(status, b);
+    }
+    __syncthreads();
+  }
+}
+
+/// Preserve the scalar default unless the cooperative trace experiment is selected.
+bool cooperativeSpatialTracesRequested()
+{
+  const char* option = std::getenv("PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES");
+  return option && option[0] == '1' && option[1] == '\0';
+}
+
 /// Check launch/index admission independently of the owner's checked preflight.
 unsigned blocks(std::size_t count)
 {
@@ -266,8 +427,13 @@ Error launchComplexSpatialTraces(Stream stream, std::size_t batch, std::size_t d
   if (!determinants || !n || !channels || !amplitude || !inverse || !head || !cusp || !product ||
       !gradient || !lap_log || !lap_ratio || !status)
     throw std::invalid_argument("Complex FULL trace inputs are invalid");
-  tracesKernel<<<blocks(batch), 128, 0, stream>>>(batch, determinants, n, n, channels, amplitude,
-      inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+  const auto block_count = blocks(batch);
+  if (cooperativeSpatialTracesRequested() && batch <= std::numeric_limits<int>::max())
+    tracesCooperativeKernel<<<static_cast<unsigned int>(batch), 128, 0, stream>>>(
+        batch, determinants, n, n, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+  else
+    tracesKernel<<<block_count, 128, 0, stream>>>(batch, determinants, n, n, channels, amplitude,
+        inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
   return launched();
 }
 
@@ -288,8 +454,12 @@ Error launchComplexSpatialTraces(Stream stream, OpenOrbitalJetLayout layout,
       !channels || !amplitude || !inverse ||
       !head || !cusp || !product || !gradient || !lap_log || !lap_ratio || !status)
     throw std::invalid_argument("Complex target traces require packed B1 current jets");
-  tracesKernel<<<1, 128, 0, stream>>>(1, layout.determinant_count, layout.features.electron_count,
-      layout.orbitals.laplacian_lanes, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+  if (cooperativeSpatialTracesRequested())
+    tracesCooperativeKernel<<<1, 128, 0, stream>>>(1, layout.determinant_count, layout.features.electron_count,
+        layout.orbitals.laplacian_lanes, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+  else
+    tracesKernel<<<1, 128, 0, stream>>>(1, layout.determinant_count, layout.features.electron_count,
+        layout.orbitals.laplacian_lanes, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
   return launched();
 }
 } // namespace qmcplusplus::psiformer::device
