@@ -28,6 +28,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -240,6 +241,170 @@ void valueLuCases(Queue& queue)
             old_lu, old_perm, old_meta, true);
     std::cout << "PASS cooperative_VALUE_LU Ne=" << n << " matrices=" << count
               << " all_LU_permutation_metadata CPU_scalar_reference exact_alias_fallback\n";
+  }
+}
+
+/// Compare the independent-column inverse with the scalar path and native math.
+void inverseLuCases(Queue& queue)
+{
+  using namespace device_determinant;
+  constexpr const char* selector = "PSIFORMER_GPU_COOPERATIVE_LU_INVERSE";
+
+  /// Restore the caller's dispatch policy after exercising both inverse routes.
+  struct RestoreSelector
+  {
+    const char* name;
+    bool present;
+    std::string value;
+
+    explicit RestoreSelector(const char* key)
+        : name(key), present(std::getenv(key) != nullptr), value(present ? std::getenv(key) : "")
+    {
+    }
+
+    ~RestoreSelector()
+    {
+      if (present)
+        setenv(name, value.c_str(), 1);
+      else
+        unsetenv(name);
+    }
+  } restore(selector);
+
+  for (const std::size_t n : {2u, 63u, 64u, 65u, 100u, 200u, 300u})
+  {
+    constexpr std::size_t batch = 2, channels = 7, count = batch * channels;
+    const auto elements = n * n;
+    std::vector<double> input(count * elements);
+    for (std::size_t m = 0; m < count; ++m)
+    {
+      double* a = input.data() + m * elements;
+      for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < n; ++j)
+          a[i * n + j] = i == j ? 4.0 + (i % 3) / 8.0 :
+              (static_cast<int>((i * 7 + j * 3) % 9) - 4) / (16.0 * n);
+      if (m == 1)
+        for (std::size_t j = 0; j < n; ++j)
+          std::swap(a[j], a[(n - 1) * n + j]);
+      if (m == 2 || m == 3 || m == 11 || m == 13)
+      {
+        std::fill(a, a + elements, 0.0);
+        for (std::size_t i = 0; i < n; ++i)
+          a[i * n + i] = 1.0;
+        if (m == 2)
+        {
+          a[n] = 1.0;
+          if (n > 2)
+            a[2 * n] = -1.0;
+        }
+        if (m == 3)
+          a[0] = -1.0;
+        if (m == 11)
+          a[(n - 1) * n + n - 1] = std::ldexp(1.0, -40);
+        if (m == 13)
+          a[(n - 1) * n + n - 1] = 0.0;
+      }
+      if (m == 4)
+        std::copy(a, a + n, a + (n - 1) * n);
+      if (m == 5)
+        std::fill(a, a + elements, 0.0);
+      if (m == 6)
+        a[n + 1] = std::numeric_limits<double>::quiet_NaN();
+      if (m == 7)
+        a[n + 1] = std::numeric_limits<double>::infinity();
+      if (m == 8)
+        a[n + 1] = -std::numeric_limits<double>::infinity();
+      if (m == 9 || m == 10)
+        for (std::size_t i = 0; i < elements; ++i)
+          a[i] *= m == 9 ? 1e250 : 1e-250;
+      if (m == 12)
+      {
+        // Normal input coefficients, finite LU, but an overflowing inverse.
+        std::fill(a, a + elements, 0.0);
+        const double base = std::ldexp(1.0, -830);
+        for (std::size_t i = 0; i < n; ++i)
+          a[i * n + i] = base;
+        for (std::size_t i = 1; i < std::min(n, std::size_t(64)); ++i)
+          a[i * n + i - 1] = -16 * base;
+      }
+    }
+    auto matrices = upload(input);
+    DeviceBuffer<double> scalar_lu(input.size()), parallel_lu(input.size()), scalar_inverse(input.size()),
+        parallel_inverse(input.size()), solve(count * n);
+    DeviceBuffer<std::size_t> scalar_perm(count * n), parallel_perm(count * n);
+    DeviceBuffer<FactorizationMetadata> scalar_meta(count), parallel_meta(count);
+    const auto before = deviceMemoryMetrics(0).snapshot();
+    setenv(selector, "0", 1);
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), matrices.data(), batch, channels, n, true,
+                     scalar_lu.data(), scalar_inverse.data(), scalar_perm.data(), solve.data(), scalar_meta.data()),
+                 "scalar inverse reference");
+    setenv(selector, "1", 1);
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), matrices.data(), batch, channels, n, true,
+                     parallel_lu.data(), parallel_inverse.data(), parallel_perm.data(), solve.data(), parallel_meta.data()),
+                 "parallel inverse");
+    queue.sync();
+    const auto after = deviceMemoryMetrics(0).snapshot();
+    if (before.allocation_calls != after.allocation_calls || before.live_bytes != after.live_bytes)
+      throw std::runtime_error("Cooperative inverse allocated hidden workspace");
+    const auto old_lu = download(scalar_lu), new_lu = download(parallel_lu);
+    const auto old_inverse = download(scalar_inverse), new_inverse = download(parallel_inverse);
+    const auto old_perm = download(scalar_perm), new_perm = download(parallel_perm);
+    const auto old_meta = download(scalar_meta), new_meta = download(parallel_meta);
+    if (std::memcmp(old_lu.data(), new_lu.data(), old_lu.size() * sizeof(double)) ||
+        std::memcmp(old_inverse.data(), new_inverse.data(), old_inverse.size() * sizeof(double)) || old_perm != new_perm)
+      throw std::runtime_error("Cooperative inverse changed scalar LU/inverse/permutation bits");
+    std::vector<double> cpu_lu(elements), cpu_inverse(elements), cpu_solve(n);
+    std::vector<std::size_t> cpu_perm(n);
+    for (std::size_t m = 0; m < count; ++m)
+    {
+      const auto& a = new_meta[m];
+      const auto& b = old_meta[m];
+      if (a.status != b.status || a.inverse_available != b.inverse_available ||
+          std::memcmp(&a.phase, &b.phase, sizeof(double)) || std::memcmp(&a.log_abs, &b.log_abs, sizeof(double)) ||
+          std::memcmp(&a.matrix_scale, &b.matrix_scale, sizeof(double)) ||
+          std::memcmp(&a.minimum_scaled_pivot, &b.minimum_scaled_pivot, sizeof(double)) ||
+          std::memcmp(&a.maximum_scaled_pivot, &b.maximum_scaled_pivot, sizeof(double)))
+        throw std::runtime_error("Cooperative inverse changed scalar metadata bits");
+      const auto cpu = factorizeScaledReal(input.data() + m * elements, n, cpu_lu.data(), cpu_perm.data(),
+          true, cpu_inverse.data(), cpu_solve.data());
+      if (a.status != cpu.status || a.inverse_available != cpu.inverse_available)
+        throw std::runtime_error("Cooperative inverse changed native CPU admission");
+      for (std::size_t i = 0; i < elements; ++i)
+        near(new_inverse[m * elements + i], cpu_inverse[i], "native CPU inverse");
+    }
+    if (n >= 64 && (new_meta[12].status != FactorizationStatus::REGULAR || new_meta[12].inverse_available))
+      throw std::runtime_error("Inverse overflow fixture lost its finite-LU premise");
+    auto failed_input = input;
+    failed_input[0] = std::numeric_limits<double>::quiet_NaN();
+    matrices.upload(failed_input.data(), failed_input.size());
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), matrices.data(), batch, channels, n, true,
+                     parallel_lu.data(), parallel_inverse.data(), parallel_perm.data(), solve.data(), parallel_meta.data()),
+                 "inverse failure refresh");
+    queue.sync();
+    const auto failed_meta = download(parallel_meta);
+    const auto failed_inverse = download(parallel_inverse);
+    if (failed_meta[0].status != FactorizationStatus::NONFINITE_INPUT || failed_meta[0].inverse_available ||
+        std::any_of(failed_inverse.begin(), failed_inverse.begin() + elements, [](double x) { return x != 0.0; }))
+      throw std::runtime_error("Cooperative inverse failure retained old inverse admission");
+    matrices.upload(input.data(), input.size());
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), matrices.data(), batch, channels, n, true,
+                     parallel_lu.data(), parallel_inverse.data(), parallel_perm.data(), solve.data(), parallel_meta.data()),
+                 "inverse recovery");
+    queue.sync();
+    const auto recovered_inverse = download(parallel_inverse);
+    if (std::memcmp(old_inverse.data(), recovered_inverse.data(), old_inverse.size() * sizeof(double)))
+      throw std::runtime_error("Cooperative inverse recovery changed scalar output");
+    auto alias = upload(input);
+    checkRuntime(launchDeterminantFactorization(queue.getNative(), alias.data(), batch, channels, n, true,
+                     alias.data(), parallel_inverse.data(), parallel_perm.data(), solve.data(), parallel_meta.data()),
+                 "in-place inverse fallback");
+    queue.sync();
+    const auto alias_lu = download(alias), alias_inverse = download(parallel_inverse);
+    if (std::memcmp(old_lu.data(), alias_lu.data(), old_lu.size() * sizeof(double)) ||
+        std::memcmp(old_inverse.data(), alias_inverse.data(), old_inverse.size() * sizeof(double)))
+      throw std::runtime_error("Cooperative inverse changed exact in-place fallback");
+    std::cout << "PASS cooperative_LU_inverse Ne=" << n << " matrices=" << count
+              << " exact_GPU_LU_inverse_permutation_metadata native_CPU_inverse zero_hidden_alloc alias_fallback\n";
   }
 }
 
@@ -1169,9 +1334,10 @@ int main(int argc, char** argv)
     }
     const bool vectors_only = argc == 2 && std::string(argv[1]) == "--real-vectors-only";
     const bool value_lu_only = argc == 2 && std::string(argv[1]) == "--value-lu-only";
+    const bool inverse_lu_only = argc == 2 && std::string(argv[1]) == "--inverse-lu-only";
     const bool open_feature_only = argc == 2 && std::string(argv[1]) == "--open-feature-only";
-    if (argc != 1 && !vectors_only && !value_lu_only && !open_feature_only)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--open-feature-only]");
+    if (argc != 1 && !vectors_only && !value_lu_only && !inverse_lu_only && !open_feature_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--inverse-lu-only|--open-feature-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -1187,6 +1353,11 @@ int main(int argc, char** argv)
     }
     std::cout << "Actual-device FP64 validation backend=" << backend << " visible_devices=" << count << "\n";
     Queue queue;
+    if (inverse_lu_only)
+    {
+      inverseLuCases(queue);
+      return 0;
+    }
     if (open_feature_only)
     {
       openFeatureCooperativeCases(queue);
@@ -1213,6 +1384,7 @@ int main(int argc, char** argv)
     validateAttentionJetTiles(queue);
     determinants(queue);
     valueLuCases(queue);
+    inverseLuCases(queue);
     determinantTargetReuse(queue);
     boundedResponses(queue);
     batchedScoreLeaves(queue);

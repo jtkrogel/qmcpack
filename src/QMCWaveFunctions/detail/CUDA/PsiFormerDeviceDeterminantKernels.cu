@@ -149,6 +149,60 @@ __global__ void determinantValueCooperativeKernel(
   }
 }
 
+/** Independent inverse RHS columns reuse their existing output as solve scratch.
+ * Each column retains the scalar forward/backward inner order and final scale.
+ */
+__global__ void determinantInverseCooperativeKernel(
+    std::size_t matrix_size, const double* all_lu, const std::size_t* all_permutations,
+    double* all_inverses, device_determinant::FactorizationMetadata* metadata)
+{
+  const std::size_t matrix = blockIdx.x;
+  const std::size_t elements = matrix_size * matrix_size;
+  const double* lu = all_lu + matrix * elements;
+  const std::size_t* permutation = all_permutations + matrix * matrix_size;
+  double* inverse = all_inverses + matrix * elements;
+  __shared__ unsigned int nonfinite_inverse;
+  if (threadIdx.x == 0)
+    nonfinite_inverse = 0;
+  for (std::size_t entry = threadIdx.x; entry < elements; entry += blockDim.x)
+    inverse[entry] = 0.0;
+  __syncthreads();
+  if (metadata[matrix].status != device_determinant::FactorizationStatus::REGULAR)
+    return; // Uniform; the preceding LU kernel already revoked inverse admission.
+  for (std::size_t rhs = threadIdx.x; rhs < matrix_size; rhs += blockDim.x)
+  {
+    for (std::size_t row = 0; row < matrix_size; ++row)
+    {
+      double value = permutation[row] == rhs ? 1.0 : 0.0;
+      for (std::size_t inner = 0; inner < row; ++inner)
+        value -= lu[row * matrix_size + inner] * inverse[inner * matrix_size + rhs];
+      inverse[row * matrix_size + rhs] = value;
+    }
+    for (std::size_t reverse = matrix_size; reverse > 0; --reverse)
+    {
+      const std::size_t row = reverse - 1;
+      double value = inverse[row * matrix_size + rhs];
+      for (std::size_t inner = row + 1; inner < matrix_size; ++inner)
+        value -= lu[row * matrix_size + inner] * inverse[inner * matrix_size + rhs];
+      inverse[row * matrix_size + rhs] = value / lu[row * matrix_size + row];
+    }
+  }
+  __syncthreads(); // No thread may scale another column before its solve finishes.
+  const double scale = metadata[matrix].matrix_scale;
+  for (std::size_t entry = threadIdx.x; entry < elements; entry += blockDim.x)
+  {
+    inverse[entry] /= scale;
+    if (!device_determinant::isFiniteBinary64(inverse[entry]))
+      atomicExch(&nonfinite_inverse, 1u);
+  }
+  __syncthreads();
+  if (nonfinite_inverse)
+    for (std::size_t entry = threadIdx.x; entry < elements; entry += blockDim.x)
+      inverse[entry] = 0.0;
+  if (threadIdx.x == 0)
+    metadata[matrix].inverse_available = nonfinite_inverse == 0;
+}
+
 __global__ void determinantFactorizationKernel(
     const double* matrices,
     std::size_t matrix_count,
@@ -555,11 +609,25 @@ Error launchDeterminantFactorization(
   if (prepare_inverse && (!inverse || !solve))
     throw std::invalid_argument("PsiFormer determinant inverse requires inverse and solve storage");
 
-  const unsigned int block_count = static_cast<unsigned int>(
-      (matrix_count + determinant_block_size - 1) / determinant_block_size);
-  determinantFactorizationKernel<<<block_count, determinant_block_size, 0, stream>>>(
-      matrices, matrix_count, matrix_size, prepare_inverse, lu, inverse,
-      permutation, solve, metadata);
+  const char* cooperative_inverse = std::getenv("PSIFORMER_GPU_COOPERATIVE_LU_INVERSE");
+  if (prepare_inverse && cooperative_inverse && cooperative_inverse[0] == '1' &&
+      cooperative_inverse[1] == '\0' && matrix_size >= 64 && matrices != lu &&
+      matrix_count <= static_cast<std::size_t>(std::numeric_limits<int>::max()))
+  {
+    const auto error = launchDeterminantValueFactorizationCooperative(stream, matrices,
+        configuration_count, determinant_count, matrix_size, lu, permutation, metadata);
+    if (error != success) return error;
+    determinantInverseCooperativeKernel<<<static_cast<unsigned int>(matrix_count), determinant_block_size, 0, stream>>>(
+        matrix_size, lu, permutation, inverse, metadata);
+  }
+  else
+  {
+    const unsigned int block_count = static_cast<unsigned int>(
+        (matrix_count + determinant_block_size - 1) / determinant_block_size);
+    determinantFactorizationKernel<<<block_count, determinant_block_size, 0, stream>>>(
+        matrices, matrix_count, matrix_size, prepare_inverse, lu, inverse,
+        permutation, solve, metadata);
+  }
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
