@@ -4157,6 +4157,11 @@ void WFTrainBatched::run()
                 for (const auto& particles : retained.particles)
                   samples.push_back(particles.get());
               affine_provider->accumulateDeviceAffineStatistics(samples, *statistics, device_affine_budget);
+              // Precomputed descriptors acquire their HOST numeric bank only at import.
+              if (psiformer::memory::enabled())
+                memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",
+                    statistics->retainedNumericBytes(), reinterpret_cast<std::uintptr_t>(statistics.get()),
+                    -1, parameters->version);
             }
             else
             {
