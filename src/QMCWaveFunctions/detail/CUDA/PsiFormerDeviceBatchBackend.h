@@ -100,6 +100,10 @@ public:
   std::size_t activeInferenceCrowdCapacity() const noexcept
   { return preparation_.active_inference_crowds; }
 
+  /// Report the immutable preparation policy, never a later environment value.
+  bool lazySpatialPreparation() const noexcept
+  { return lazy_spatial_; }
+
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
   std::unique_ptr<PreparedDeviceProductSession> prepareProductSession(
       ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,

@@ -4980,6 +4980,53 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   bool acquired_from_prepared_collection            = false;
 
   std::unique_ptr<pf::DirectBatchWorkspace> batch_workspace;
+  /// ECP-only VALUE context; never upgrades the ordinary sampler/FULL capacity.
+  std::unique_ptr<pf::DirectBatchWorkspace> ecp_value_workspace;
+  bool ecp_value_reported = false;
+
+  /// Keep virtual-only batching independent of ordinary spatial/sampler owners.
+  pf::DirectBatchWorkspace& virtualValueWorkspace(const VirtualParticleBatch& virtual_batch)
+  {
+    const char* flag = std::getenv("PSIFORMER_GPU_ECP_VALUE_TILE16");
+    if (!flag || std::strcmp(flag, "0") == 0)
+      return *batch_workspace;
+    if (std::strcmp(flag, "1") != 0)
+      throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_TILE16 must be 0 or 1");
+
+    for (const auto& segment : virtual_batch.segments())
+      if (!segment.isOnSphere() || segment.sourceCenterId() == VirtualParticleBatch::NO_SOURCE)
+        throw std::invalid_argument("PsiFormer ECP VALUE16 requires source-centered spherical virtual segments");
+
+    // Reject unsupported owners before constructing a second backend context.
+    if (expected_plan || prepared_plan || acquired_from_prepared_collection ||
+        model_state->resident_device_authority_requested ||
+        model_state->resident_device_authority_enabled ||
+        !model_state->numerical_tile_backend ||
+        model_state->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        model_state->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
+        model_state->execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+      throw std::invalid_argument("PsiFormer ECP VALUE16 requires unplanned real open FP64 GPU execution");
+#ifdef ENABLE_CUDA
+    const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+        model_state->numerical_tile_backend.get());
+    if (!backend || !backend->lazySpatialPreparation())
+      throw std::invalid_argument("PsiFormer ECP VALUE16 requires frozen lazy spatial preparation");
+    if (backend->metropolisBudget())
+      throw std::invalid_argument("PsiFormer ECP VALUE16 does not support device-resident sampling");
+#else
+    throw std::invalid_argument("PsiFormer ECP VALUE16 requires GPU execution");
+#endif
+    if (virtual_batch.size() == 0)
+      return *batch_workspace;
+    if (!ecp_value_workspace)
+    {
+      auto candidate = model_state->direct_batch_executor.makeWorkspace();
+      candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, 16);
+      ecp_value_workspace = std::move(candidate);
+    }
+    return *ecp_value_workspace;
+  }
+
   /// One exclusively leased target tape; scalar fallback tapes remain clone-owned.
   std::unique_ptr<pf::DirectSpatialWorkspace> target_spatial_workspace;
   /// Lazily allocated score tape serialized across component-major crowd calls.
@@ -5613,6 +5660,9 @@ private:
     auto add = [&bytes](std::size_t value, const char* description) {
       pf::addStorageBytes(bytes, value, description);
     };
+    if (ecp_value_workspace)
+      add(ecp_value_workspace->actualStorage().executionBytes(),
+          "PsiFormer retained ECP VALUE bytes overflowed");
     if (score_workspace)
       add(score_workspace->vectorStorageBytes(),
           "PsiFormer retained score bytes overflowed");
@@ -5958,6 +6008,8 @@ private:
         candidate.prepared_staged_log_ratios_capacity;
     prepared_ratio_arena_kind = candidate.prepared_ratio_arena_kind;
     batch_workspace                = std::move(candidate.batch_workspace);
+    ecp_value_workspace            = std::move(candidate.ecp_value_workspace);
+    ecp_value_reported             = candidate.ecp_value_reported;
     target_spatial_workspace       = std::move(candidate.target_spatial_workspace);
     score_workspace                = std::move(candidate.score_workspace);
     kinetic_workspace              = std::move(candidate.kinetic_workspace);
@@ -5998,6 +6050,8 @@ private:
     std::unique_ptr<pf::DirectBatchWorkspace> empty_batch =
         model_state->direct_batch_executor.makeWorkspace();
     batch_workspace = std::move(empty_batch);
+    ecp_value_workspace.reset();
+    ecp_value_reported = false;
     target_spatial_workspace.reset();
     score_workspace.reset();
     kinetic_workspace.reset();
@@ -19022,10 +19076,10 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
 
   const DirectBackendMode value_mode = transaction.state().direct_value_mode;
   const std::size_t reference_count = resource.active_virtual_walkers.size();
+  pf::DirectBatchWorkspace& workspace = resource.virtualValueWorkspace(virtual_batch);
   pf::DirectBatchValueResultView sparse_result;
   if (value_mode != DirectBackendMode::ORACLE)
   {
-    pf::DirectBatchWorkspace& workspace = *resource.batch_workspace;
     workspace.resizeSparseValues(reference_count, virtual_batch.size());
 
     // Pack accepted references once without assuming a ParticleSet precision or
@@ -19068,6 +19122,18 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
       if (sparse_result.parameter_version[configuration] != parameter_version)
         throw std::logic_error(
             "PsiFormer sparse virtual batch observed inconsistent parameters");
+
+    if (resource.ecp_value_workspace.get() == &workspace &&
+        !resource.ecp_value_reported)
+    {
+      app_log() << "  PsiFormer ECP VALUE16 completed: logical_configurations="
+                << sparse_result.size << ", references=" << reference_count
+                << ", virtual_points=" << virtual_batch.size()
+                << ", tile_capacity=" << workspace.tileCapacity(pf::DirectBatchMode::VALUE_ONLY)
+                << ", maximum_tile_occupancy=" << workspace.executionStatistics().max_tile_occupancy
+                << "; independent VALUE-only context, ordinary FULL/sampler capacity unchanged\n";
+      resource.ecp_value_reported = true;
+    }
 
     for (std::size_t segment_index = 0;
          segment_index < virtual_batch.segmentCount(); ++segment_index)

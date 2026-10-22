@@ -18,6 +18,12 @@
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
+#include "Message/Communicate.h"
+#include "OhmmsData/Libxml2Doc.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
+#endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
 #include "Utilities/BatchResourcePreparation.h"
@@ -1933,6 +1939,167 @@ TEST_CASE("PsiFormer all-to-one and ragged virtual batches are state isolated",
                         crowd.wfc_list, virtual_list, unused_spin_multipliers, actual),
                     std::invalid_argument);
   }
+}
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
+          "[wavefunction][psiformer][multiwalker][ecp][gpu]")
+{
+  for (const char* frozen_lazy : {"0", "1"})
+  {
+    ScopedEnvironmentVariable lazy("PSIFORMER_GPU_LAZY_VGL_PREPARATION", frozen_lazy);
+    ScopedEnvironmentVariable selected("PSIFORMER_GPU_ECP_VALUE_TILE16", "1");
+    GeneratedFiles files = generateFiles("lih");
+    const Geometry geometry = makeGeometry("lih");
+    const SimulationCell simulation_cell;
+    auto particles = makeWalker(simulation_cell, 0);
+    auto ions = std::make_unique<ParticleSet>(simulation_cell);
+    ions->setName("ion0");
+    ions->create(std::vector<int>(geometry.charges.size(), 1));
+    SpeciesSet& species = ions->getSpeciesSet();
+    const int charge = species.addAttribute("charge");
+    for (std::size_t nucleus = 0; nucleus < geometry.charges.size(); ++nucleus)
+    {
+      species.addSpecies("ion_" + std::to_string(nucleus));
+      species(charge, nucleus) = geometry.charges[nucleus];
+      for (int dimension = 0; dimension < 3; ++dimension)
+        ions->R[nucleus][dimension] = geometry.nuclei[3 * nucleus + dimension];
+    }
+    ions->resetGroups();
+    ions->update();
+    WaveFunctionComponentBuilder::PSetMap sources;
+    sources.emplace("ion0", std::move(ions));
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, *particles, sources);
+    Libxml2Document document;
+#ifdef QMC_CUDA2HIP
+    const std::string backend = "hip";
+#else
+    const std::string backend = "cuda";
+#endif
+    REQUIRE(document.parseFromString("<psiformer name='value16_guard' parameters='" +
+        files.parameters.string() + "' configuration='" + files.configuration.string() +
+        "' source='ion0' system='all_electron' gpu='" + backend + "'/>"));
+    auto component = builder.buildComponent(document.getRoot());
+    auto* wavefunction = dynamic_cast<PsiFormerWF*>(component.get());
+    REQUIRE(wavefunction != nullptr);
+    testing::TestPsiFormerVirtualBatch::bindParticleSet(*wavefunction, *particles);
+    RefVectorWithLeader<WaveFunctionComponent> components(*wavefunction);
+    components.push_back(*wavefunction);
+    RefVectorWithLeader<ParticleSet> references(*particles);
+    references.push_back(*particles);
+    VirtualParticleSet scratch(*particles);
+    RefVectorWithLeader<VirtualParticleSet> scratches(scratch);
+    scratches.push_back(scratch);
+    std::vector<std::size_t> offsets{0, 17};
+    std::vector<VirtualParticleBatch::Segment> segments{{0, 0, true, 0}};
+    std::vector<ParticleSet::PosType> positions;
+    for (int point = 0; point < 17; ++point)
+      positions.push_back(particles->R[0] +
+          ParticleSet::PosType{0.001 * (point + 1), -0.002, 0.003});
+    const VirtualParticleBatch batch(1, offsets, segments, positions);
+    ResourceCollection resource_template("psiformer_value16_eager_guard");
+    wavefunction->createResource(resource_template);
+    ResourceCollection resource(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+    REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+    auto& metrics = psiformer::device::deviceMemoryMetrics(ordinal);
+    const auto before = metrics.snapshot();
+    // Admission follows immutable backend metadata, not subsequent environment changes.
+    ScopedEnvironmentVariable changed_lazy("PSIFORMER_GPU_LAZY_VGL_PREPARATION",
+                                           frozen_lazy[0] == '0' ? "1" : "0");
+    std::vector<Value> ratios(batch.size(), Value(-23));
+    if (frozen_lazy[0] == '0')
+    {
+      CHECK_THROWS_WITH(wavefunction->mw_evaluateVirtualRatios(
+                            components, references, scratches, batch, ratios),
+                        Catch::Matchers::ContainsSubstring("requires frozen lazy spatial preparation"));
+      CHECK(ratios.front() == Value(-23));
+      const auto after = metrics.snapshot();
+      CHECK(after.allocation_calls == before.allocation_calls);
+      CHECK(after.free_calls == before.free_calls);
+      CHECK(after.live_bytes == before.live_bytes);
+      CHECK(after.uploaded_bytes == before.uploaded_bytes);
+      CHECK(after.downloaded_bytes == before.downloaded_bytes);
+    }
+    else
+    {
+      std::vector<Value> expected(batch.size(), Value(-29));
+      {
+        ScopedEnvironmentVariable scalar_tiles("PSIFORMER_GPU_ECP_VALUE_TILE16", "0");
+        wavefunction->mw_evaluateVirtualRatios(components, references, scratches, batch, expected);
+      }
+      const auto ordinary = testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          *wavefunction, components);
+      wavefunction->mw_evaluateVirtualRatios(components, references, scratches, batch, ratios);
+      // Different GEMM batch shapes inherit the public ratio accuracy contract.
+      Crowd cpu_crowd(files, simulation_cell, 1);
+      const auto cpu_ratios = evaluateScalarVirtualBatch(cpu_crowd, batch);
+      for (std::size_t point = 0; point < ratios.size(); ++point)
+      {
+        CHECK(std::isfinite(ratios[point]));
+        checkValue(ratios[point], expected[point]);
+        checkValue(expected[point], cpu_ratios[point]);
+        checkValue(ratios[point], cpu_ratios[point]);
+      }
+      const auto isolated = testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          *wavefunction, components);
+      CHECK(isolated.batch_workspace_identity == ordinary.batch_workspace_identity);
+      CHECK(isolated.batch_bytes == ordinary.batch_bytes);
+      const auto warm_before = metrics.snapshot();
+      const auto warm_ratios = ratios;
+      wavefunction->mw_evaluateVirtualRatios(components, references, scratches, batch, ratios);
+      // Replaying the same shape and inputs must remain bitwise repeatable.
+      CHECK(sameVectorBits(ratios, warm_ratios));
+      CHECK(metrics.snapshot().allocation_calls == warm_before.allocation_calls);
+    }
+  }
+}
+#endif
+
+TEST_CASE("PsiFormer ECP VALUE16 rejects unsupported controls without publishing ratios",
+          "[wavefunction][psiformer][multiwalker][ecp][sparse]")
+{
+  ScopedEnvironmentVariable backend("PSIFORMER_VALUE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2);
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(crowd, 1, 0,
+                       {{0.012, -0.007, 0.005}, {-0.009, 0.011, 0.004}},
+                       offsets, segments, positions);
+  segments.front() = VirtualParticleBatch::Segment(1, 0, true, 0);
+  const VirtualParticleBatch batch(crowd.walkers.size(), offsets, segments, positions);
+  const std::vector<Value> expected = evaluateScalarVirtualBatch(crowd, batch);
+  VirtualScratchCrowd scratch(crowd);
+  ResourceCollection resource_template("psiformer_value16_rejection_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource, crowd.wfc_list);
+
+  for (const char* flag : {"", "true", "16", "1"})
+  {
+    ScopedEnvironmentVariable control("PSIFORMER_GPU_ECP_VALUE_TILE16", flag);
+    std::vector<Value> actual(batch.size(), Value(-23));
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateVirtualRatios(
+                        crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual),
+                    std::invalid_argument);
+    CHECK(std::all_of(actual.begin(), actual.end(),
+                      [](Value value) { return value == Value(-23); }));
+  }
+
+  ScopedEnvironmentVariable control("PSIFORMER_GPU_ECP_VALUE_TILE16", "0");
+  std::vector<Value> actual(batch.size(), Value(-23));
+  crowd.leader.mw_evaluateVirtualRatios(
+      crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+  for (std::size_t point = 0; point < actual.size(); ++point)
+    CHECK(std::abs(actual[point] - expected[point]) < 1e-11);
 }
 
 TEST_CASE("PsiFormer flattened virtual batches share sparse references and preserve state",
