@@ -15,6 +15,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairAttention.h"
 
 #include <limits>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace qmcplusplus::psiformer::device
@@ -89,6 +90,75 @@ __global__ void attentionLogitJetsKernel(SpatialAttentionJetLayout layout,
   spatial_jet::attentionLogitJetElement(
       layout, query, key, configuration, head, row_pair / layout.rows,
       row_pair % layout.rows, attention);
+}
+
+// An 8x8 output tile reuses each loaded Q/K feature across eight products.
+// Jet planes are independent blocks; padded shared rows bound storage to 5760 bytes.
+__global__ void attentionLogitJetsTiledKernel(SpatialAttentionJetLayout layout,
+    const double* query, const double* key, double* attention)
+{
+  constexpr std::size_t tile = 8;
+  __shared__ double q[5][tile][tile + 1];
+  __shared__ double k[5][tile][tile + 1];
+  const std::size_t x = threadIdx.x;
+  const std::size_t y = threadIdx.y;
+  const std::size_t tiles = (layout.rows + tile - 1) / tile;
+  std::size_t index = blockIdx.x;
+  const std::size_t key_base = (index % tiles) * tile;
+  index /= tiles;
+  const std::size_t query_base = (index % tiles) * tile;
+  index /= tiles;
+  const std::size_t head = index % layout.heads;
+  const std::size_t configuration = index / layout.heads;
+  const std::size_t plane = blockIdx.y;
+  const bool gradient = plane > 0 && plane <= layout.features.gradient_lanes;
+  const bool laplacian = plane > layout.features.gradient_lanes;
+  const std::size_t electron = laplacian ? plane - 1 - layout.features.gradient_lanes : 0;
+  // Slot zero holds values, slot one the requested first derivative or trace.
+  // A trace additionally needs its three first derivatives in slots two to four.
+  const std::size_t planes = laplacian ? 5 : gradient ? 2 : 1;
+  const std::size_t configuration_offset = configuration * layout.features.configuration_stride;
+  const double scale = 1.0 / ::sqrt(static_cast<double>(layout.head_width));
+  double result = 0.0;
+  for (std::size_t feature_base = 0; feature_base < layout.head_width; feature_base += tile)
+  {
+    const std::size_t feature = feature_base + x;
+    // Neighboring threads stage adjacent features from each query/key row.
+    for (std::size_t p = 0; p < planes; ++p)
+    {
+      const std::size_t source_plane = p == 0 ? 0 : p == 1 ? plane : 1 + 3 * electron + p - 2;
+      const std::size_t offset = configuration_offset + source_plane * layout.features.plane_stride +
+          head * layout.head_width + feature;
+      q[p][y][x] = query_base + y < layout.rows && feature < layout.head_width
+          ? query[offset + (query_base + y) * layout.feature_row_stride] : 0.0;
+      k[p][y][x] = key_base + y < layout.rows && feature < layout.head_width
+          ? key[offset + (key_base + y) * layout.feature_row_stride] : 0.0;
+    }
+    __syncthreads();
+    const std::size_t remaining = layout.head_width - feature_base;
+    const std::size_t width = remaining < tile ? remaining : tile;
+    for (std::size_t f = 0; f < width; ++f)
+    {
+      if (laplacian)
+      {
+        double gradient_dot = 0.0;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          gradient_dot += q[2 + dimension][y][f] * k[2 + dimension][x][f];
+        result += scale * (q[1][y][f] * k[0][x][f] + 2.0 * gradient_dot +
+                           q[0][y][f] * k[1][x][f]);
+      }
+      else if (gradient)
+        result += scale * (q[1][y][f] * k[0][x][f] + q[0][y][f] * k[1][x][f]);
+      else
+        result += scale * q[0][y][f] * k[0][x][f];
+    }
+    __syncthreads();
+  }
+  // Partial-row threads participate in every barrier before suppressing stores.
+  if (query_base + y < layout.rows && key_base + x < layout.rows)
+    attention[configuration * layout.attention.configuration_stride +
+        plane * layout.attention.plane_stride + head * layout.attention_head_stride +
+        (query_base + y) * layout.attention_row_stride + key_base + x] = result;
 }
 
 /// Each entry owns the learned pair addition before normalization and tape capture.
@@ -519,8 +589,27 @@ Error launchAttentionJetWeights(
 
   const unsigned int block_count = static_cast<unsigned int>(
       (entry_count + spatial_block_size - 1) / spatial_block_size);
-  attentionLogitJetsKernel<<<block_count, spatial_block_size, 0, stream>>>(
-      layout, query, key, attention);
+  const char* tiled_option = std::getenv("PSIFORMER_GPU_ATTENTION_JET_TILED");
+  bool launched_tiled = false;
+  if (tiled_option && tiled_option[0] == '1' && tiled_option[1] == '\0')
+  {
+    const std::size_t tiles = (layout.rows + 7) / 8;
+    const std::size_t tile_count = spatial_detail::checkedProduct(
+        spatial_detail::checkedProduct(layout.features.configuration_count, layout.heads,
+            "PsiFormer attention tile batch overflow"),
+        spatial_detail::checkedProduct(tiles, tiles, "PsiFormer attention tile count overflow"),
+        "PsiFormer attention tile grid overflow");
+    const std::size_t planes = layout.features.plane_count;
+    if (tile_count <= std::numeric_limits<int>::max() && planes <= 65535)
+    {
+      attentionLogitJetsTiledKernel<<<dim3(static_cast<unsigned int>(tile_count),
+          static_cast<unsigned int>(planes)), dim3(8, 8), 0, stream>>>(layout, query, key, attention);
+      launched_tiled = true;
+    }
+  }
+  if (!launched_tiled)
+    attentionLogitJetsKernel<<<block_count, spatial_block_size, 0, stream>>>(
+        layout, query, key, attention);
 #ifdef QMC_CUDA2HIP
   const Error logit_error = hipPeekAtLastError();
 #else

@@ -20,6 +20,7 @@
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
 #include "PsiFormerDeviceRealVectorValidation.h"
+#include "PsiFormerDeviceAttentionJetValidation.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
@@ -1169,6 +1170,7 @@ int main(int argc, char** argv)
     nonlinearJets(queue);
     denseAndReverse(queue, handle);
     softmax(queue);
+    validateAttentionJetTiles(queue);
     determinants(queue);
     valueLuCases(queue);
     determinantTargetReuse(queue);
