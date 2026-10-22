@@ -23,10 +23,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+#include <string_view>
 #include <type_traits>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Freeze the borrowed row-mean optimization only for an explicit strict opt-in.
+inline bool configuredSoftmaxKeySharedMeans()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS requires 0 or 1");
+}
 
 /** Compact first-failure record: 16-bit stage, 40-bit index, 8-bit typed status.
  * All-one bits mean success; ordered launches and atomic minimum retain the earliest failure. */
@@ -294,7 +308,10 @@ Error launchAttentionContextReverse(Stream stream,
                                     double* attention_adjoint,
                                     double* value_adjoint);
 
-/** Reverse row softmax and scaled Q/K products directly into Q and K adjoints. */
+/** Reverse row softmax and scaled Q/K products directly into Q and K adjoints.
+ * Borrow an optional contiguous B*heads*rows mean prefix; capacity is doubles.
+ * The caller retains its storage/stream lifetime through both Q/K consumers.
+ * Null, short, overlapping or unsupported workspace keeps the legacy route. */
 Error launchSoftmaxScaledQkReverse(Stream stream,
                                    const BatchedAttentionForwardLayout& layout,
                                    const double* query,
@@ -302,7 +319,9 @@ Error launchSoftmaxScaledQkReverse(Stream stream,
                                    const double* probabilities,
                                    const double* probability_adjoint,
                                    double* query_adjoint,
-                                   double* key_adjoint);
+                                   double* key_adjoint,
+                                   double* row_mean_workspace = nullptr,
+                                   std::size_t row_mean_capacity = 0);
 
 /// Accumulate the selected periodic pair-bias parameter VJP from softmax roots.
 Error launchPeriodicPairAttentionParameterReverse(Stream stream,

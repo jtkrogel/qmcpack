@@ -54,7 +54,8 @@ public:
                                compute::Queue<PlatformKind::CUDA>& queue,
                                AcceleratorBlasHandle& blas,
                                NetworkReverseOutput output = NetworkReverseOutput::PARAMETER_SCORE)
-      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas), output_(output)
+      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas), output_(output),
+        shared_softmax_means_(configuredSoftmaxKeySharedMeans())
   {
     if (!model_ || capacity_ == 0)
       throw std::invalid_argument("Network reverse requires a model and nonzero capacity");
@@ -189,8 +190,21 @@ private:
           parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), context_.data());
       checkRuntime(launchAttentionContextReverse(stream, attention, tape.probabilities.data(),
           tape.value.data(), context_.data(), probability_.data(), value_.data()), "network context reverse");
+      // Both context-reverse kernels have consumed context_ on this stream.
+      // Projection/affine/raw-input consumers below use Q/K/V, never context_.
+      // valueTapeBatchCount/valueBlockTape requires a valid retained VALUE tape;
+      // setMixedDense rejects such a tape and revokes tape admission on attachment.
+      const auto& environment = model_->plan().environment();
+      const bool shared_means = shared_softmax_means_ &&
+          environment.boundary == BoundaryCondition::OPEN && environment.fixed_nuclei &&
+          environment.parameter_scalar_domain == ScalarDomain::REAL &&
+          environment.compute_scalar_domain == ScalarDomain::REAL &&
+          environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+          environment.head_representation == HeadRepresentation::REAL && !environment.periodic_profile;
       checkRuntime(launchSoftmaxScaledQkReverse(stream, attention, tape.query.data(), tape.key.data(),
-          tape.probabilities.data(), probability_.data(), query_.data(), key_.data()), "network attention reverse");
+          tape.probabilities.data(), probability_.data(), query_.data(), key_.data(),
+          shared_means ? context_.data() : nullptr, shared_means ? context_.capacity() : 0),
+          "network attention reverse");
       if (model_->plan().environment().periodic_profile)
         checkRuntime(launchPeriodicPairAttentionParameterReverse(stream, attention, *model_->periodicCell(),
             shape.spin_up_electrons, forward.valueHeadTape().positions, tape.probabilities.data(),
@@ -359,6 +373,7 @@ private:
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
   const NetworkReverseOutput output_;
+  const bool shared_softmax_means_;
   DeviceBuffer<double> upstream_, residual_, tanh_, hidden_, input_, context_;
   DeviceBuffer<double> query_, key_, value_, probability_, discard_, response_, raw_feature_;
   DerivativeFiniteScanLayout finite_layout_;

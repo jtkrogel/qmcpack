@@ -608,6 +608,135 @@ __global__ void softmaxScaledKeyReverseKernel(
   key_adjoint[output_offset] = sum;
 }
 
+/// Compute each shared row mean with the unchanged serial reduction helper.
+__global__ void softmaxOrderedRowMeansKernel(BatchedAttentionForwardLayout layout,
+                                             const double* probabilities,
+                                             const double* probability_adjoint,
+                                             double* row_means)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto rows = layout.attention.rows;
+  const auto per_configuration = layout.attention.heads * rows;
+  if (index >= layout.configuration_count * per_configuration)
+    return;
+  const auto configuration = index / per_configuration;
+  const auto head = (index % per_configuration) / rows;
+  const auto query_index = index % rows;
+  row_means[index] = softmaxRowReduction(layout, probabilities, probability_adjoint,
+      configuration, head, query_index);
+}
+
+/// Reuse the already-rounded mean while retaining each query output's key order.
+__global__ void softmaxCachedQueryReverseKernel(BatchedAttentionForwardLayout layout,
+    const double* key, const double* probabilities, const double* probability_adjoint,
+    const double* row_means, double* query_adjoint)
+{
+  const auto logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto width = layout.attention.heads * layout.attention.head_width;
+  const auto per_configuration = layout.attention.rows * width;
+  if (logical >= layout.configuration_count * per_configuration)
+    return;
+  const auto configuration = logical / per_configuration;
+  const auto local = logical % per_configuration;
+  const auto feature_in_width = local % width;
+  const auto query_index = local / width;
+  const auto head = feature_in_width / layout.attention.head_width;
+  const double reduction = row_means[(configuration * layout.attention.heads + head) *
+      layout.attention.rows + query_index];
+  const double scale = 1.0 / ::sqrt(static_cast<double>(layout.attention.head_width));
+  const auto row_offset = configuration * layout.attention_configuration_stride +
+      head * layout.attention.attention_head_stride + query_index * layout.attention.attention_row_stride;
+  double sum = 0.0;
+  for (std::size_t key_index = 0; key_index < layout.attention.rows; ++key_index)
+  {
+    const double logit_adjoint = device_derivative::softmaxLogitAdjoint(
+        probabilities[row_offset + key_index], probability_adjoint[row_offset + key_index], reduction);
+    const auto key_offset = configuration * layout.feature_configuration_stride +
+        key_index * layout.attention.feature_row_stride + feature_in_width;
+    sum += device_derivative::scaledQkAdjointContribution(logit_adjoint, key[key_offset], scale);
+  }
+  const auto output_offset = configuration * layout.feature_configuration_stride +
+      query_index * layout.attention.feature_row_stride + feature_in_width;
+  query_adjoint[output_offset] = sum;
+}
+
+/// Each key output keeps its original increasing-query accumulation and helpers.
+__global__ void softmaxCachedKeyReverseKernel(BatchedAttentionForwardLayout layout,
+    const double* query, const double* probabilities, const double* probability_adjoint,
+    const double* row_means, double* key_adjoint)
+{
+  const auto logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto width = layout.attention.heads * layout.attention.head_width;
+  const auto per_configuration = layout.attention.rows * width;
+  if (logical >= layout.configuration_count * per_configuration)
+    return;
+  const auto configuration = logical / per_configuration;
+  const auto local = logical % per_configuration;
+  const auto feature_in_width = local % width;
+  const auto key_index = local / width;
+  const auto head = feature_in_width / layout.attention.head_width;
+  const double scale = 1.0 / ::sqrt(static_cast<double>(layout.attention.head_width));
+  double sum = 0.0;
+  for (std::size_t query_index = 0; query_index < layout.attention.rows; ++query_index)
+  {
+    const double reduction = row_means[(configuration * layout.attention.heads + head) *
+        layout.attention.rows + query_index];
+    const auto probability_offset = configuration * layout.attention_configuration_stride +
+        head * layout.attention.attention_head_stride + query_index * layout.attention.attention_row_stride + key_index;
+    const double logit_adjoint = device_derivative::softmaxLogitAdjoint(
+        probabilities[probability_offset], probability_adjoint[probability_offset], reduction);
+    const auto query_offset = configuration * layout.feature_configuration_stride +
+        query_index * layout.attention.feature_row_stride + feature_in_width;
+    sum += device_derivative::scaledQkAdjointContribution(logit_adjoint, query[query_offset], scale);
+  }
+  const auto output_offset = configuration * layout.feature_configuration_stride +
+      key_index * layout.attention.feature_row_stride + feature_in_width;
+  key_adjoint[output_offset] = sum;
+}
+
+/// Optional scratch may not change legacy input/output alias schedules.
+bool admitsSoftmaxRowMeans(const BatchedAttentionForwardLayout& layout,
+    const double* query, const double* key, const double* probabilities, const double* probability_adjoint,
+    double* query_adjoint, double* key_adjoint, double* workspace, std::size_t capacity,
+    std::size_t feature_count)
+{
+  if (!workspace || layout.attention.rows < 64)
+    return false;
+  const auto count = checkedProduct(layout.configuration_count, layout.attention.softmaxRowCount(),
+      "PsiFormer softmax mean extent overflow");
+  const auto portable = [](std::size_t elements) {
+    return elements / derivative_block_size + (elements % derivative_block_size != 0) <=
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+  };
+  if (capacity < count || !portable(count) || !portable(feature_count))
+    return false;
+  try
+  {
+    const auto features = checkedSpan(layout.configuration_count, layout.feature_configuration_stride,
+        layout.attention.featureElements(), "PsiFormer softmax feature span overflow");
+    const auto attention = checkedSpan(layout.configuration_count, layout.attention_configuration_stride,
+        layout.attention.attentionElements(), "PsiFormer softmax attention span overflow");
+    const auto scratch = vectorByteSpan(workspace, count, 0, 1);
+    const auto q_output = vectorByteSpan(query_adjoint, features, 0, 1);
+    const auto k_output = vectorByteSpan(key_adjoint, features, 0, 1);
+    const auto overlaps = [](const auto& left, const auto& right) {
+      return left.first < right.second && right.first < left.second;
+    };
+    if (overlaps(q_output, k_output) || overlaps(scratch, q_output) || overlaps(scratch, k_output))
+      return false;
+    for (const auto input : {vectorByteSpan(query, features, 0, 1), vectorByteSpan(key, features, 0, 1),
+                            vectorByteSpan(probabilities, attention, 0, 1),
+                            vectorByteSpan(probability_adjoint, attention, 0, 1)})
+      if (overlaps(scratch, input) || overlaps(q_output, input) || overlaps(k_output, input))
+        return false;
+  }
+  catch (const std::length_error&)
+  {
+    return false;
+  }
+  return true;
+}
+
 __global__ void orbitalBbarEbarKernel(OrbitalProductReverseLayout layout,
                                       const double* backflow,
                                       const double* envelope,
@@ -1470,7 +1599,9 @@ Error launchSoftmaxScaledQkReverse(Stream stream,
                                    const double* probabilities,
                                    const double* probability_adjoint,
                                    double* query_adjoint,
-                                   double* key_adjoint)
+                                   double* key_adjoint,
+                                   double* row_mean_workspace,
+                                   std::size_t row_mean_capacity)
 {
   if (layout.configuration_count == 0 && layout.attention.rows == 0 &&
       layout.attention.heads == 0 && layout.attention.head_width == 0 &&
@@ -1488,6 +1619,27 @@ Error launchSoftmaxScaledQkReverse(Stream stream,
       checkedProduct(layout.attention.rows, layout.attention.featureWidth(),
                      "PsiFormer softmax Q/K feature extent overflow"),
       "PsiFormer softmax Q/K feature batch extent overflow");
+  // Decide all optional admission before the first query write or scratch launch.
+  if (admitsSoftmaxRowMeans(layout, query, key, probabilities, probability_adjoint,
+          query_adjoint, key_adjoint, row_mean_workspace, row_mean_capacity, feature_count))
+  {
+    const auto mean_count = layout.configuration_count * layout.attention.softmaxRowCount();
+    softmaxOrderedRowMeansKernel<<<blockCount(mean_count, "PsiFormer softmax mean grid overflow"),
+        derivative_block_size, 0, stream>>>(layout, probabilities, probability_adjoint, row_mean_workspace);
+    Error error = peekAtLastError();
+    if (error != success)
+      return error;
+    softmaxCachedQueryReverseKernel<<<blockCount(feature_count, "PsiFormer cached softmax query grid overflow"),
+        derivative_block_size, 0, stream>>>(layout, key, probabilities, probability_adjoint,
+        row_mean_workspace, query_adjoint);
+    error = peekAtLastError();
+    if (error != success)
+      return error;
+    softmaxCachedKeyReverseKernel<<<blockCount(feature_count, "PsiFormer cached softmax key grid overflow"),
+        derivative_block_size, 0, stream>>>(layout, query, probabilities, probability_adjoint,
+        row_mean_workspace, key_adjoint);
+    return peekAtLastError();
+  }
   softmaxScaledQueryReverseKernel<<<blockCount(
       feature_count, "PsiFormer softmax query grid exceeds the CUDA/HIP x dimension"),
       derivative_block_size, 0, stream>>>(
