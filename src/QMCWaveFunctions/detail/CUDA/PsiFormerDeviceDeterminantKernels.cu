@@ -25,6 +25,7 @@ constexpr unsigned int determinant_block_size = 128;
 /** One block per VALUE matrix, preserving scalar pivot order and per-cell arithmetic.
  * Shared control is POD; global LU/permutation/metadata are the existing owners.
  */
+template<bool parallel_scale>
 __global__ void determinantValueCooperativeKernel(
     const double* matrices, std::size_t matrix_size, double* all_lu,
     std::size_t* all_permutations, device_determinant::FactorizationMetadata* metadata)
@@ -37,9 +38,54 @@ __global__ void determinantValueCooperativeKernel(
   __shared__ double scale, phase, log_abs, min_pivot, max_pivot, pivot;
   __shared__ std::size_t pivot_row;
   __shared__ int state; // 0 regular-in-progress, 1 zero/singular, 2 nonfinite input.
-  // Match the serial global scale scan, including first nonfinite-input handling.
-  if (threadIdx.x == 0)
+  if constexpr (parallel_scale)
   {
+    // Finite absolute maxima are exact and order independent. Nonfinite input
+    // has no exposed first-index state: every such matrix clears LU identically.
+    constexpr unsigned int scan_lanes = determinant_block_size / 2;
+    __shared__ double maxima[scan_lanes];
+    __shared__ unsigned int nonfinite_input;
+    if (threadIdx.x == 0)
+      nonfinite_input = 0;
+    __syncthreads();
+    if (threadIdx.x < scan_lanes)
+    {
+      double maximum = 0.0;
+      bool finite = true;
+      for (std::size_t element = threadIdx.x; element < elements; element += scan_lanes)
+      {
+        const double value = input[element];
+        if (!device_determinant::isFiniteBinary64(value))
+        {
+          finite = false;
+          break;
+        }
+        const double magnitude = ::fabs(value);
+        maximum = magnitude > maximum ? magnitude : maximum;
+      }
+      maxima[threadIdx.x] = maximum;
+      if (!finite)
+        atomicExch(&nonfinite_input, 1u);
+    }
+    __syncthreads();
+    for (unsigned int stride = scan_lanes / 2; stride != 0; stride /= 2)
+    {
+      if (threadIdx.x < stride)
+      {
+        const double other = maxima[threadIdx.x + stride];
+        maxima[threadIdx.x] = other > maxima[threadIdx.x] ? other : maxima[threadIdx.x];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+      scale = maxima[0];
+      state = nonfinite_input ? 2 : (scale == 0.0 ? 1 : 0);
+    }
+  }
+  else if (threadIdx.x == 0)
+  {
+    // Keep the default scan and its first nonfinite-input handling unchanged.
     scale = 0.0;
     state = 0;
     for (std::size_t element = 0; element < elements; ++element)
@@ -54,6 +100,9 @@ __global__ void determinantValueCooperativeKernel(
     }
     if (state == 0 && scale == 0.0)
       state = 1;
+  }
+  if (threadIdx.x == 0)
+  {
     phase = 1.0;
     log_abs = state == 0 ? static_cast<double>(matrix_size) * ::log(scale) : 0.0;
     min_pivot = DBL_MAX;
@@ -659,8 +708,13 @@ Error launchDeterminantValueFactorizationCooperative(
         determinant_count, matrix_size, false, lu, nullptr, permutation, nullptr, metadata);
   if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::length_error("PsiFormer cooperative VALUE grid exceeds the portable CUDA/HIP x dimension");
-  determinantValueCooperativeKernel<<<static_cast<unsigned int>(count), determinant_block_size, 0, stream>>>(
-      matrices, matrix_size, lu, permutation, metadata);
+  const char* parallel_scale = std::getenv("PSIFORMER_GPU_VALUE_LU_PARALLEL_SCALE");
+  if (parallel_scale && parallel_scale[0] == '1' && parallel_scale[1] == '\0')
+    determinantValueCooperativeKernel<true><<<static_cast<unsigned int>(count), determinant_block_size, 0, stream>>>(
+        matrices, matrix_size, lu, permutation, metadata);
+  else
+    determinantValueCooperativeKernel<false><<<static_cast<unsigned int>(count), determinant_block_size, 0, stream>>>(
+        matrices, matrix_size, lu, permutation, metadata);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
