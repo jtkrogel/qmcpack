@@ -122,7 +122,8 @@ inline DeviceExecutionPreparation resolveDeviceTargetSelection(const PsiFormerEx
   if (preparation.select_kinetic_targets)
     preparation.kinetic.max_targets = selectDeviceTargetCapacity(ne, preparation.kinetic.device_workspace_budget_bytes,
         preparation.kinetic.scalar_work_budget, [&](std::size_t k) {
-          return estimateTargetKineticCost(plan, k, preparation.kinetic.lifted_channel_slots);
+          return estimateTargetKineticCost(plan, k, preparation.kinetic.lifted_channel_slots,
+              preparation.kinetic.parallel_trace_workspace_budget_bytes);
         });
   return preparation;
 }
@@ -171,6 +172,9 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
       preparation.kinetic.scalar_work_budget);
   if (preparation.kinetic.lifted_channel_slots && !preparation.kinetic.max_targets)
     throw std::invalid_argument("Lifted GEMM channels require explicit kinetic targets");
+  if (preparation.kinetic.parallel_trace_workspace_budget_bytes &&
+      (!preparation.kinetic.max_targets || preparation.active_inference_crowds != 1))
+    throw std::invalid_argument("Retained parallel traces require kinetic targets and one active inference crowd");
   if (preparation.vgl.max_targets)
   {
     const auto cost = estimatePreparedTargetVglCost(plan, vgl_capacity, preparation.vgl);
@@ -181,7 +185,7 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
   if (preparation.kinetic.max_targets)
   {
     const auto cost = estimateTargetKineticCost(plan, preparation.kinetic.max_targets,
-        preparation.kinetic.lifted_channel_slots);
+        preparation.kinetic.lifted_channel_slots, preparation.kinetic.parallel_trace_workspace_budget_bytes);
     if (cost.device_workspace_bytes > preparation.kinetic.device_workspace_budget_bytes ||
         cost.charged_scalar_work_units > preparation.kinetic.scalar_work_budget)
       throw std::length_error("Device target kinetic exceeds its per-owner workspace/request work limit");

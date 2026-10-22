@@ -14,6 +14,8 @@
 #include <boost/multiprecision/cpp_bin_float.hpp>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -484,6 +486,130 @@ void numericalChecks(Stream stream, DeviceMemoryMetrics& metrics)
                "zero-weight inverse/nonfinite rules, node priority, overflow, failure/recovery, zero warm allocations\n";
 }
 
+// Compare retained statistics to the unchanged serial GPU arithmetic, not merely
+// a tolerance that could hide optimizer-sensitive trace rounding differences.
+void compareCanonical(const Results& actual, const Results& expected)
+{
+  require(actual.status == expected.status, "Canonical trace typed statuses differ");
+  for (const auto pair : {std::pair{&actual.gradient, &expected.gradient},
+                          std::pair{&actual.ratio, &expected.ratio},
+                          std::pair{&actual.log, &expected.log}})
+    require(pair.first->size() == pair.second->size() &&
+                std::memcmp(pair.first->data(), pair.second->data(), pair.first->size() * sizeof(double)) == 0,
+            "Canonical trace differs bitwise from the original GPU oracle");
+}
+
+// Preserve the caller's ordinary trace selector while forcing the old GPU oracle.
+struct RestoreCanonicalTraceSelector
+{
+  const char* name = "PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES";
+  bool present;
+  std::string value;
+
+  RestoreCanonicalTraceSelector() : present(std::getenv(name) != nullptr),
+      value(present ? std::getenv(name) : "")
+  {
+    setenv(name, "0", 1);
+  }
+
+  ~RestoreCanonicalTraceSelector()
+  {
+    if (present)
+      setenv(name, value.c_str(), 1);
+    else
+      unsetenv(name);
+  }
+};
+
+// Exercise exact retained statistics, immutable owners, failures and warm leases.
+void canonicalChecks(Stream stream, DeviceMemoryMetrics& metrics)
+{
+  RestoreCanonicalTraceSelector selector;
+  std::size_t cases = 0;
+  const auto run = [&](const Fixture& capacity, bool hazards) {
+    DeviceFixture device(capacity);
+    const auto metadata = planSpatialTraceWorkspace(capacity.layout).metadata_bytes;
+    const auto budget = metadata + 5 * capacity.layout.matrix_size * capacity.layout.matrix_size * sizeof(double);
+    const auto expected_slots = std::min(std::size_t(5), capacity.layout.configuration_count *
+        capacity.layout.gradient_lanes * capacity.layout.determinant_count);
+    const auto expected_bytes = metadata + expected_slots * capacity.layout.matrix_size *
+        capacity.layout.matrix_size * sizeof(double);
+    const auto before_prepare = metrics.snapshot();
+    PreparedDeviceSpatialTraces engine(capacity.layout, stream, budget, true);
+    require(metrics.snapshot().live_bytes - before_prepare.live_bytes == engine.deviceWorkspaceBytes() &&
+                engine.deviceWorkspaceBytes() == expected_bytes && engine.hostWorkspaceBytes() == 0 &&
+                engine.workspacePlan().product_slots == expected_slots,
+            "Canonical statistics changed exact prepared owner accounting");
+    const auto check = [&](const Fixture& fixture) {
+      const auto input = device.upload(fixture);
+      Results output(fixture.layout);
+      engine.evaluate(fixture.layout, input);
+      engine.downloadResults(output.gradient, output.ratio, output.log, output.status);
+      compareCanonical(output, directTraces(fixture, input, stream));
+      compare(output, reference(fixture)); // Independent native CPU bound is unchanged.
+      const auto before_warm = metrics.snapshot();
+      engine.evaluate(fixture.layout, input);
+      engine.downloadResults(output.gradient, output.ratio, output.log, output.status);
+      const auto after_warm = metrics.snapshot();
+      require(before_warm.allocation_calls == after_warm.allocation_calls &&
+                  before_warm.free_calls == after_warm.free_calls &&
+                  before_warm.live_bytes == after_warm.live_bytes &&
+                  before_warm.upload_calls == after_warm.upload_calls,
+              "Canonical warmed trace request changed owners or uploaded inputs");
+      ++cases;
+    };
+    check(capacity); // Signed channels, nonsymmetric products, NaN padding, odd slot tails.
+    if (hazards)
+    {
+      const auto n = capacity.layout.matrix_size;
+      Fixture cancellation = capacity;
+      cancellation.weights[0] = 1000;
+      cancellation.weights[1] = -999;
+      std::copy_n(cancellation.inverses.data(), n * n, cancellation.inverses.data() + n * n);
+      for (std::size_t lane = 0; lane < capacity.layout.gradient_lanes; ++lane)
+        std::copy_n(cancellation.gradients.data() + lane * 2 * n * n, n * n,
+                    cancellation.gradients.data() + (lane * 2 + 1) * n * n);
+      for (std::size_t target = 0; target < capacity.layout.electron_count; ++target)
+        std::copy_n(cancellation.laplacians.data() + target * 2 * n * n, n * n,
+                    cancellation.laplacians.data() + (target * 2 + 1) * n * n);
+      check(cancellation);
+      Fixture broken = capacity;
+      broken.weights[1] = -0.0;
+      broken.factors[1].status = determinant::FactorizationStatus::SINGULAR;
+      broken.factors[1].inverse_available = false;
+      std::fill_n(broken.inverses.data() + n * n, n * n, std::numeric_limits<double>::quiet_NaN());
+      check(broken); // Zero-weight inverse is ignored, but its derivative inputs are not.
+      broken.gradients[n * n] = std::numeric_limits<double>::quiet_NaN();
+      check(broken);
+      broken = capacity;
+      broken.laplacians[0] = std::numeric_limits<double>::infinity();
+      check(broken);
+      broken = capacity;
+      broken.inverses[0] = std::numeric_limits<double>::max();
+      broken.gradients[0] = std::numeric_limits<double>::max();
+      check(broken);
+      broken.combinations[0].phase = 0;
+      check(broken); // Existing node precedence and configuration-wide clearing.
+      check(capacity);
+      bool rejected = false, stale = false;
+      try { engine.evaluate(capacity.layout, {}); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      try { (void)engine.result(); }
+      catch (const std::logic_error&) { stale = true; }
+      require(rejected && stale, "Canonical failed replacement exposed a borrowed result");
+      check(capacity);
+    }
+  };
+  for (std::size_t n : {std::size_t(64), std::size_t(65), std::size_t(100)})
+    for (std::size_t channels : {std::size_t(1), std::size_t(16)})
+      for (std::size_t targets : {std::size_t(1), std::size_t(3)})
+        run(Fixture(n, targets, 1, channels), false);
+  run(Fixture(64, 3, 2, 2), true);
+  std::cout << "PASS canonical retained statistics: " << cases
+            << " exact old-GPU/CPU-bound cases Ne64/65/100 D1/16 K1/3, signed cancellation, "
+               "zero-weight/nonfinite/node/overflow/recovery/padding, exact owners and warm allocations=0\n";
+}
+
 void benchmark(Stream stream, DeviceMemoryMetrics& metrics, const std::string& path, bool large_probes)
 {
   std::ofstream report(path);
@@ -577,7 +703,7 @@ int main(int argc, char** argv)
 {
   try
   {
-    bool host_only = false, large_probes = false;
+    bool host_only = false, large_probes = false, canonical_only = false;
     std::string report;
     for (int argument = 1; argument < argc; ++argument)
     {
@@ -586,10 +712,12 @@ int main(int argc, char** argv)
         host_only = true;
       else if (option == "--large-probes")
         large_probes = true;
+      else if (option == "--canonical-retained-only")
+        canonical_only = true;
       else if (option == "--benchmark" && argument + 1 < argc)
         report = argv[++argument];
       else
-        throw std::invalid_argument("Usage: psiformer_device_spatial_trace_validation [--host-check] [--benchmark CSV] [--large-probes]");
+        throw std::invalid_argument("Usage: psiformer_device_spatial_trace_validation [--host-check] [--benchmark CSV] [--large-probes] [--canonical-retained-only]");
     }
     hostChecks();
     if (host_only)
@@ -602,6 +730,11 @@ int main(int argc, char** argv)
     checkRuntime(cudaGetDevice(&ordinal), "trace metrics device");
 #endif
     auto& metrics = deviceMemoryMetrics(ordinal);
+    if (canonical_only)
+    {
+      canonicalChecks(owner.stream, metrics);
+      return 0;
+    }
     numericalChecks(owner.stream, metrics);
     if (!report.empty())
       benchmark(owner.stream, metrics, report, large_probes);

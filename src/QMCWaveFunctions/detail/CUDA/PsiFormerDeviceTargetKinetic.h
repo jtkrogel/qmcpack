@@ -28,6 +28,8 @@ struct TargetKineticPreparation
   std::size_t scalar_work_budget = 0;
   // Zero preserves reference factors; 1..16 explicitly admits GEMM channel scratch.
   std::size_t lifted_channel_slots = 0;
+  /// Separate default-off cap; ordinary VGL trace settings never activate this owner.
+  std::size_t parallel_trace_workspace_budget_bytes = 0;
 };
 
 /// Predicted persistent host/device storage and complete-request scalar work.
@@ -46,9 +48,10 @@ struct TargetKineticCost
  */
 inline TargetKineticCost estimateTargetKineticCost(const PsiFormerExecutionPlan& plan,
                                                    std::size_t targets,
-                                                   std::size_t lifted_channel_slots = 0)
+                                                   std::size_t lifted_channel_slots = 0,
+                                                   std::size_t parallel_trace_budget_bytes = 0)
 {
-  const auto forward = estimateRetainedTargetForwardCost(plan, targets);
+  const auto forward = estimateRetainedTargetForwardCost(plan, targets, parallel_trace_budget_bytes);
   const auto reverse = estimateTargetKineticReverseCost(plan, targets, lifted_channel_slots);
   const auto add = [](std::size_t a, std::size_t b) {
     return spatial_detail::checkedAdd(a, b, "Target kinetic storage/work overflow");
@@ -177,7 +180,7 @@ private:
       throw std::invalid_argument("Target kinetic requires a model and positive explicit capacities/budgets");
     model->validateCurrentDevice();
     const auto cost = estimateTargetKineticCost(model->plan(), preparation.max_targets,
-        preparation.lifted_channel_slots);
+        preparation.lifted_channel_slots, preparation.parallel_trace_workspace_budget_bytes);
     if (cost.device_workspace_bytes > preparation.device_workspace_budget_bytes ||
         cost.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Target kinetic exceeds its combined owned-device or whole-request work budget");
@@ -191,11 +194,16 @@ private:
                               InferenceStatusPolicy policy, TargetKineticCost cost)
       : preparation_(preparation), cost_(cost),
         forward_(model, 1, queue, blas, SpatialJetMode::FULL_VGL, false, true, policy,
-            TargetVglPreparation{preparation.max_targets, cost.device_workspace_bytes, cost.charged_scalar_work_units}, true),
+            TargetVglPreparation{preparation.max_targets, cost.device_workspace_bytes, cost.charged_scalar_work_units,
+                preparation.parallel_trace_workspace_budget_bytes, false}, true),
         reverse_(std::move(model), 1, queue, blas, preparation.max_targets, preparation.lifted_channel_slots)
   {
     if (deviceWorkspaceBytes() != cost_.device_workspace_bytes || hostWorkspaceBytes() != cost_.host_workspace_bytes)
       throw std::logic_error("Target kinetic combined storage differs from its pre-allocation estimate");
+    if (forward_.parallel_traces_)
+      std::clog << "PsiFormer retained kinetic parallel trace owner: K=" << preparation_.max_targets
+                << " leaf_device_bytes=" << forward_.parallel_traces_->deviceWorkspaceBytes()
+                << " combined_device_bytes=" << cost_.device_workspace_bytes << '\n';
   }
 
   const TargetKineticPreparation preparation_;

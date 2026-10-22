@@ -1099,6 +1099,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto vgl = positive("PSIFORMER_GPU_VGL_TARGETS");
   const auto parallel_trace_bytes = positive("PSIFORMER_GPU_VGL_PARALLEL_TRACE_BYTES");
   const auto kinetic = positive("PSIFORMER_GPU_KINETIC_TARGETS");
+  const auto kinetic_trace_bytes = positive("PSIFORMER_GPU_KINETIC_PARALLEL_TRACE_BYTES");
   const auto lifted = positive("PSIFORMER_GPU_LIFTED_CHANNELS");
   const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
@@ -1127,6 +1128,8 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     throw std::invalid_argument("Parallel GPU VGL traces require VGL-only targets/selection and one active inference crowd");
   if (lifted && !kinetic && !select_kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
+  if (kinetic_trace_bytes && ((!kinetic && !select_kinetic) || active_inference_crowds > 1))
+    throw std::invalid_argument("Parallel kinetic traces require kinetic targets/selection and one inference crowd");
   if ((vgl || kinetic || select_vgl || select_kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
   if ((vgl || kinetic || select_vgl || select_kinetic || retained_coordinates || metropolis || adam) &&
@@ -1145,7 +1148,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   if (vgl || select_vgl)
     preparation.vgl = {vgl, bytes, work, parallel_trace_bytes};
   if (kinetic || select_kinetic)
-    preparation.kinetic = {kinetic, bytes, work, lifted};
+    preparation.kinetic = {kinetic, bytes, work, lifted, kinetic_trace_bytes};
   preparation = psiformer::device::resolveDeviceTargetSelection(plan, preparation);
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
   if (parallel_trace_bytes)
@@ -1157,10 +1160,16 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     psiformer::device::reportDeviceTargetSelection(app_log(), "VGL_B1_preflight", plan, 1,
         preparation.vgl.max_targets, psiformer::device::estimatePreparedTargetVglCost(plan, 1, preparation.vgl),
         bytes, work);
+  if (kinetic_trace_bytes)
+    app_log() << "  PsiFormer retained kinetic trace preallocation: trace_workspace_limit_bytes="
+              << kinetic_trace_bytes << ", composite_owner_device_bytes="
+              << psiformer::device::estimateTargetKineticCost(plan, preparation.kinetic.max_targets,
+                     lifted, kinetic_trace_bytes).device_workspace_bytes
+              << "; excludes shared image and vendor/private reserve" << std::endl;
   if (select_kinetic)
     psiformer::device::reportDeviceTargetSelection(app_log(), "KINETIC", plan, 1,
         preparation.kinetic.max_targets, psiformer::device::estimateTargetKineticCost(plan,
-            preparation.kinetic.max_targets, lifted), bytes, work);
+            preparation.kinetic.max_targets, lifted, kinetic_trace_bytes), bytes, work);
   app_log() << "  PsiFormer GPU target preparation: "
             << (select_vgl ? "vgl_B1_preflight_targets=" : "vgl_targets=") << preparation.vgl.max_targets
             << ", kinetic_targets=" << preparation.kinetic.max_targets

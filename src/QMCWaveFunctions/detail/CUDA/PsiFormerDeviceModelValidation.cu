@@ -32,6 +32,7 @@
 #include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceKineticTrunkValidation.h"
 #include "PsiFormerDeviceTargetKineticValidation.h"
+#include "PsiFormerDeviceRetainedTraceValidation.h"
 #include "PsiFormerDeviceTargetKineticSpotValidation.h"
 #include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
@@ -49,6 +50,8 @@
 #include "PsiFormerDevicePcgValidation.h"
 #include "PsiFormerDeviceEnergySrValidation.h"
 #include "PsiFormerDeviceRetainedEnergySrValidation.h"
+#include "PsiFormerDeviceRetainedOpenFeatureValidation.h"
+#include "PsiFormerDeviceRetainedValueCuspValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -289,6 +292,28 @@ int main(int argc, char** argv)
 {
   try
   {
+    if (argc == 2 && (std::string(argv[1]) == "--retained-open-features-only" ||
+                     std::string(argv[1]) == "--retained-value-cusp-only" ||
+                     std::string(argv[1]) == "--retained-traces-only"))
+    {
+      int device_count = 0;
+#ifdef QMC_CUDA2HIP
+      const auto discovered = hipGetDeviceCount(&device_count);
+#else
+      const auto discovered = cudaGetDeviceCount(&device_count);
+#endif
+      if (discovered != success || device_count == 0)
+        return 77;
+      qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+      AcceleratorBlasHandle handle(queue);
+      if (std::string(argv[1]) == "--retained-open-features-only")
+        RetainedOpenFeatureValidationAccess::run(queue, handle);
+      else if (std::string(argv[1]) == "--retained-value-cusp-only")
+        RetainedValueCuspValidationAccess::run(queue, handle);
+      else
+        validateRetainedParallelTraceFixtures(queue, handle);
+      return 0;
+    }
     // Keep metadata qualification before fixtures and every device/runtime query.
     if (argc == 2 && std::string(argv[1]) == "--target-cost-check")
     {
@@ -1315,6 +1340,7 @@ int main(int argc, char** argv)
       near(gpu_kinetic[parameter], cpu_kinetic[parameter], "mass/external-drift kinetic response CPU parity");
     std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
     validateTargetKinetic(model, plan, image, queue, handle);
+    validateRetainedParallelTraceFixtures(queue, handle);
     validateKineticContractions(model, plan, image);
     validateDeviceCoordinates(model, image, queue, handle);
     validateRetainedCoordinateReplays(model, image);

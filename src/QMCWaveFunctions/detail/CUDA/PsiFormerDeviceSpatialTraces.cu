@@ -260,6 +260,63 @@ __global__ void laplacianStatistics(SpatialLayout layout, SpatialTraceInputs inp
   }
 }
 
+// Retained derivatives feed optimizer updates: preserve the canonical row-major
+// compensated trace order while keeping independent products and outputs parallel.
+__global__ void canonicalGradientStatistics(SpatialLayout layout, SpatialTraceInputs input,
+                                            std::size_t first_task, const double* products,
+                                            double* stats,
+                                            const device_determinant::DerivativeStatus* admission,
+                                            unsigned int* failure)
+{
+  const auto slot = std::size_t(blockIdx.x);
+  const auto task = first_task + slot;
+  const auto channel = task % layout.determinant_count;
+  const auto lane = (task / layout.determinant_count) % layout.gradient_lanes;
+  const auto configuration = task / (layout.determinant_count * layout.gradient_lanes);
+  const auto matrix_elements = layout.matrix_size * layout.matrix_size;
+  double direct = 0.0, square = 0.0;
+  if (admission[configuration] == device_determinant::DerivativeStatus::AVAILABLE &&
+      input.normalized_weights[configuration * layout.determinant_count + channel] != 0.0)
+  {
+    const auto* inverse = input.inverses + (configuration * layout.determinant_count + channel) * matrix_elements;
+    const auto* gradient = input.gradients + configuration * layout.gradient_configuration_stride +
+        (lane * layout.determinant_count + channel) * matrix_elements;
+    const auto* product = products + slot * matrix_elements;
+    direct = device_determinant::traceProductBinary64(inverse, gradient, layout.matrix_size);
+    square = device_determinant::traceProductBinary64(product, product, layout.matrix_size);
+  }
+  if (!device_determinant::isFiniteBinary64(direct) || !device_determinant::isFiniteBinary64(square))
+    markNonfinite(failure + configuration);
+  const auto offset = ((configuration * layout.electron_count + lane / 3) * layout.determinant_count + channel) * 7;
+  stats[offset + lane % 3] = device_determinant::isFiniteBinary64(direct) ? direct : 0.0;
+  stats[offset + 3 + lane % 3] = device_determinant::isFiniteBinary64(square) ? square : 0.0;
+}
+
+// Preserve the canonical compensated inverse/Laplacian trace for each output.
+__global__ void canonicalLaplacianStatistics(SpatialLayout layout, SpatialTraceInputs input,
+                                             double* stats,
+                                             const device_determinant::DerivativeStatus* admission,
+                                             unsigned int* failure)
+{
+  const auto task = std::size_t(blockIdx.x);
+  const auto channel = task % layout.determinant_count;
+  const auto target = (task / layout.determinant_count) % layout.electron_count;
+  const auto configuration = task / (layout.determinant_count * layout.electron_count);
+  const auto matrix_elements = layout.matrix_size * layout.matrix_size;
+  double value = 0.0;
+  if (admission[configuration] == device_determinant::DerivativeStatus::AVAILABLE &&
+      input.normalized_weights[configuration * layout.determinant_count + channel] != 0.0)
+  {
+    const auto* inverse = input.inverses + (configuration * layout.determinant_count + channel) * matrix_elements;
+    const auto* laplacian = input.laplacians + configuration * layout.laplacian_configuration_stride +
+        (target * layout.determinant_count + channel) * matrix_elements;
+    value = device_determinant::traceProductBinary64(inverse, laplacian, layout.matrix_size);
+  }
+  if (!device_determinant::isFiniteBinary64(value))
+    markNonfinite(failure + configuration);
+  stats[task * 7 + 6] = device_determinant::isFiniteBinary64(value) ? value : 0.0;
+}
+
 __global__ void combineStatistics(SpatialLayout layout, SpatialTraceInputs input, const double* stats,
                                   const unsigned int* failure, double* gradient, double* lap_ratio,
                                   double* lap_log, device_determinant::DerivativeStatus* status)
@@ -347,8 +404,10 @@ SpatialTraceWorkspacePlan planSpatialTraceWorkspace(SpatialLayout capacity, std:
           2 * trace_block_size * sizeof(double)};
 }
 
-PreparedDeviceSpatialTraces::PreparedDeviceSpatialTraces(SpatialLayout capacity, Stream stream, std::size_t budget_bytes)
-    : plan_(planSpatialTraceWorkspace(capacity, budget_bytes)), stream_(stream)
+PreparedDeviceSpatialTraces::PreparedDeviceSpatialTraces(SpatialLayout capacity, Stream stream,
+                                                       std::size_t budget_bytes, bool canonical_statistics)
+    : plan_(planSpatialTraceWorkspace(capacity, budget_bytes)), stream_(stream),
+      canonical_statistics_(canonical_statistics)
 {
 #ifdef QMC_CUDA2HIP
   checkRuntime(hipGetDevice(&device_ordinal_), "spatial trace owning device");
@@ -418,13 +477,21 @@ SpatialTraceDeviceResult PreparedDeviceSpatialTraces::evaluate(SpatialLayout lay
                      trace_block_size, 0, stream_>>>(
         layout, input, first, count, products_.data(), status_.data(), failure_.data());
     checkRuntime(peekError(), "spatial trace parallel compensated product");
-    gradientStatistics<<<static_cast<unsigned int>(count), trace_block_size, 0, stream_>>>(
-        layout, input, first, products_.data(), stats_.data(), status_.data(), failure_.data());
+    if (canonical_statistics_)
+      canonicalGradientStatistics<<<static_cast<unsigned int>(count), 1, 0, stream_>>>(
+          layout, input, first, products_.data(), stats_.data(), status_.data(), failure_.data());
+    else
+      gradientStatistics<<<static_cast<unsigned int>(count), trace_block_size, 0, stream_>>>(
+          layout, input, first, products_.data(), stats_.data(), status_.data(), failure_.data());
     checkRuntime(peekError(), "spatial trace gradient and signed square reductions");
   }
   const auto laplacian_tasks = multiply(multiply(layout.configuration_count, layout.electron_count), layout.determinant_count);
-  laplacianStatistics<<<static_cast<unsigned int>(laplacian_tasks), trace_block_size, 0, stream_>>>(
-      layout, input, stats_.data(), status_.data(), failure_.data());
+  if (canonical_statistics_)
+    canonicalLaplacianStatistics<<<static_cast<unsigned int>(laplacian_tasks), 1, 0, stream_>>>(
+        layout, input, stats_.data(), status_.data(), failure_.data());
+  else
+    laplacianStatistics<<<static_cast<unsigned int>(laplacian_tasks), trace_block_size, 0, stream_>>>(
+        layout, input, stats_.data(), status_.data(), failure_.data());
   checkRuntime(peekError(), "spatial trace Laplacian reduction");
   combineStatistics<<<blocks(layout.configuration_count), trace_block_size, 0, stream_>>>(
       layout, input, stats_.data(), failure_.data(), gradient_.data(), lap_ratio_.data(), lap_log_.data(), status_.data());

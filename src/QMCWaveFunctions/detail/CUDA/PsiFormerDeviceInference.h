@@ -41,6 +41,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace qmcplusplus::psiformer::device
@@ -202,9 +203,15 @@ inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan&
  * This private-owner estimate does not relax the public non-retained VGL contract.
  */
 inline TargetVglCost estimateRetainedTargetForwardCost(const PsiFormerExecutionPlan& plan,
-                                                       std::size_t targets)
+                                                       std::size_t targets,
+                                                       std::size_t parallel_trace_budget_bytes = 0)
 {
-  auto cost = estimateTargetVglCost(plan, 1, targets);
+  if (parallel_trace_budget_bytes && plan.environment().boundary != BoundaryCondition::OPEN)
+    throw std::invalid_argument("Retained parallel traces require fixed-ion real FP64 open geometry");
+  // The retained owner never uses the non-retained cusp cache. Reuse the leaf's
+  // checked admission and exact storage charge, independently of ordinary VGL.
+  auto cost = estimatePreparedTargetVglCost(plan, 1,
+      TargetVglPreparation{targets, 0, 0, parallel_trace_budget_bytes, false});
   const auto& shape = plan.modelShape();
   const auto mul = [](std::size_t a, std::size_t b) {
     return spatial_detail::checkedProduct(a, b, "Retained target forward extent overflow");
@@ -362,6 +369,17 @@ inline bool configuredCooperativeValueCusp()
   throw std::invalid_argument("PSIFORMER_GPU_CUSP_VALUE_COOPERATIVE must be 0 or 1");
 }
 
+/// Keep ordinary and retained VALUE cusp admission independent and immutable.
+inline bool configuredRetainedValueCusp()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_RETAINED_VALUE_CUSP");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_RETAINED_VALUE_CUSP must be 0 or 1");
+}
+
 /// Freeze the opt-in OPEN feature execution map before graph allocation.
 inline bool configuredCooperativeOpenFeatures()
 {
@@ -371,6 +389,17 @@ inline bool configuredCooperativeOpenFeatures()
   if (std::string_view(value) == "1")
     return true;
   throw std::invalid_argument("PSIFORMER_GPU_OPEN_FEATURE_COOPERATIVE must be 0 or 1");
+}
+
+/// Freeze retained OPEN feature admission independently of ordinary inference.
+inline bool configuredRetainedOpenFeatures()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_RETAINED_OPEN_FEATURES");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_RETAINED_OPEN_FEATURES must be 0 or 1");
 }
 
 /** Own immutable layout/fixed geometry independently of retiring parameter images.
@@ -872,6 +901,9 @@ private:
   friend class PreparedDeviceComplexScore;
   friend class PreparedDeviceKineticTrunk;
   friend struct KineticTrunkValidationAccess;
+  friend struct RetainedOpenFeatureValidationAccess;
+  friend struct RetainedTraceValidationAccess;
+  friend struct RetainedValueCuspValidationAccess;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -887,7 +919,9 @@ private:
         target_preparation_(target_preparation), retained_targets_(retained_targets),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
+        retained_open_features_requested_(configuredRetainedOpenFeatures()),
         cooperative_value_cusp_requested_(configuredCooperativeValueCusp()),
+        retained_value_cusp_requested_(configuredRetainedValueCusp()),
         tiled_value_orbitals_requested_(configuredTiledValueOrbitals()), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
@@ -899,9 +933,9 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     if (target_preparation_.parallel_trace_workspace_budget_bytes &&
-        (real_trunk_only || retained_targets || retain_score_tape || retain_spatial_tape ||
+        (real_trunk_only || retain_score_tape || (retain_spatial_tape && !retained_targets) ||
          mode_ != SpatialJetMode::FULL_VGL || !target_preparation_.max_targets))
-      throw std::invalid_argument("Parallel VGL traces reject trunks, retained tapes and implicit targets");
+      throw std::invalid_argument("Parallel traces reject trunks, score tapes and implicit targets");
     const auto& environment = plan_.environment();
     const bool head_free_targets = real_trunk_only && target_preparation_.max_targets;
     if (kinetic_trunk_only && (!real_trunk_only || batch_size != 1 || !retain_spatial_tape ||
@@ -946,7 +980,8 @@ private:
       if (retained_targets_ && (batch_capacity_ != 1 || !retain_spatial_tape))
         throw std::invalid_argument("Retained targets require one configuration and spatial tapes");
       target_cost_ = retained_targets_
-          ? estimateRetainedTargetForwardCost(plan_, target_preparation_.max_targets)
+          ? estimateRetainedTargetForwardCost(plan_, target_preparation_.max_targets,
+                target_preparation_.parallel_trace_workspace_budget_bytes)
           : estimatePreparedTargetVglCost(plan_, batch_capacity_, target_preparation_);
       if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
           target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
@@ -1074,7 +1109,7 @@ private:
         parallel_traces_ = std::make_unique<PreparedDeviceSpatialTraces>(
             device_determinant::SpatialLayout{batch_, shape_.determinants, ne_,
                 3 * target_preparation_.max_targets, target_preparation_.max_targets}, queue_.getNative(),
-            target_preparation_.parallel_trace_workspace_budget_bytes);
+            target_preparation_.parallel_trace_workspace_budget_bytes, retained_targets_);
       // Keep the pre-allocation accounting an executable invariant. Model image
       // and vendor storage are deliberately not charged to this owned workspace.
       if (!retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
@@ -1107,9 +1142,18 @@ private:
       std::clog << "PsiFormer OPEN feature preparation: selected="
                 << (usesCooperativeOpenFeatures() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_control_bytes=4; no extra global owner\n";
+    if (retained_open_features_requested_)
+      std::clog << "PsiFormer retained OPEN feature preparation: selected="
+                << ((!value_tape_.empty() || retained_targets_) && usesCooperativeOpenFeatures()
+                        ? "cooperative" : "scalar")
+                << " Ne=" << ne_ << " static_shared_control_bytes=4; no extra global owner\n";
     if (cooperative_value_cusp_requested_)
       std::clog << "PsiFormer VALUE cusp preparation: selected="
                 << (usesCooperativeValueCusp() ? "cooperative" : "scalar")
+                << " Ne=" << ne_ << " static_shared_payload_bytes=4100; no extra global owner\n";
+    if (retained_value_cusp_requested_)
+      std::clog << "PsiFormer retained VALUE cusp preparation: selected="
+                << (!value_tape_.empty() && usesCooperativeValueCusp() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_payload_bytes=4100; no extra global owner\n";
     if (memory::enabled())
     {
@@ -1288,6 +1332,7 @@ private:
   void evaluateRetainedTargets(const std::vector<double>& positions, Consumer&& consume)
   {
     value_tape_valid_ = result_valid_ = target_tape_valid_ = false;
+    if (parallel_traces_) parallel_traces_->invalidate();
     admitted_target_tiles_ = 0;
     if (!retained_targets_ || positions.size() != product(3, ne_))
       throw std::invalid_argument("Retained target request requires one complete physical configuration");
@@ -1311,6 +1356,7 @@ private:
         target_tape_valid_ = true;
         consume(SpatialTargetTapeView{this, model_.get(), evaluation_generation_, admitted_target_tiles_, head});
         target_tape_valid_ = false;
+        if (parallel_traces_) parallel_traces_->invalidate();
         ++admitted_target_tiles_;
         begin += count;
       }
@@ -1318,6 +1364,7 @@ private:
     catch (...)
     {
       target_tape_valid_ = false;
+      if (parallel_traces_) parallel_traces_->invalidate();
       throw;
     }
   }
@@ -1438,7 +1485,7 @@ private:
         target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
         !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
         plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
-    if (parallel_traces_ || request_local_factor_reuse)
+    if ((parallel_traces_ && !retained_targets_) || request_local_factor_reuse)
     {
       // Only later tiles of this request may reuse successful bitwise-equal bases.
       // Every public/direct tile call and every new coordinate attempt starts fresh.
@@ -1486,7 +1533,8 @@ private:
     const auto* trace_status = det_status_.data();
     const auto* trace_gradient = det_gradient_.data();
     const auto* trace_lap_log = det_lap_log_.data();
-    // Borrow leaf outputs only on this queue; no host staging or extra device copy.
+    // Ordinary VGL borrows leaf outputs only on this queue. Retained reverse
+    // consumers keep their original determinant-buffer ABI and lease authority.
     if (parallel_traces_)
     {
       const auto result = parallel_traces_->evaluate(determinant_layout,
@@ -1496,6 +1544,27 @@ private:
       trace_status = result.status;
       trace_gradient = result.log_gradient;
       trace_lap_log = result.lap_log;
+      if (retained_targets_)
+      {
+        const auto copy_result = [&](auto* destination, const auto* source, std::size_t count) {
+          const auto bytes = checkedDeviceBytes<std::remove_pointer_t<decltype(destination)>>(count);
+#ifdef QMC_CUDA2HIP
+          checkRuntime(hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice, stream),
+              "retained trace D2D copy");
+#else
+          checkRuntime(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream),
+              "retained trace D2D copy");
+#endif
+          deviceMemoryMetrics(det_gradient_.deviceOrdinal()).copied(bytes);
+        };
+        copy_result(det_gradient_.data(), result.log_gradient, product(batch_, gradient_lanes_));
+        copy_result(det_lap_ratio_.data(), result.lap_ratio, product(batch_, final_.output.laplacian_lanes));
+        copy_result(det_lap_log_.data(), result.lap_log, product(batch_, final_.output.laplacian_lanes));
+        copy_result(det_status_.data(), result.status, batch_);
+        trace_status = det_status_.data();
+        trace_gradient = det_gradient_.data();
+        trace_lap_log = det_lap_log_.data();
+      }
     }
     else
       checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
@@ -1631,25 +1700,28 @@ public:
       std::clog << "PsiFormer VALUE LU preparation: selected=scalar (mixed request/replay excluded)\n";
   }
 
-  /// Share the opt-in pair map across non-retained FP64 REAL OPEN VGL and ECP VALUE graphs.
+  /// Admit the existing pair map with independent ordinary and retained selectors.
   bool usesCooperativeOpenFeatures() const noexcept
   {
     const auto& environment = plan_.environment();
-    return cooperative_open_features_requested_ && ne_ >= 64 &&
+    const bool retained = !value_tape_.empty() || retained_targets_;
+    const bool requested = retained ? retained_open_features_requested_ : cooperative_open_features_requested_;
+    return requested && ne_ >= 64 &&
         (mode_ == SpatialJetMode::FULL_VGL || mode_ == SpatialJetMode::VALUE_ONLY) &&
-        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+        !kinetic_trunk_only_ &&
         !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
         environment.parameter_scalar_domain == ScalarDomain::REAL &&
         environment.compute_scalar_domain == ScalarDomain::REAL;
   }
 
-  /// Bound cusp pair parallelism to ordinary real OPEN VALUE consumers, not retained score tapes.
+  /// Reuse ordered VALUE sums with independent ordinary and retained admission.
   bool usesCooperativeValueCusp() const noexcept
   {
     const auto& environment = plan_.environment();
-    return cooperative_value_cusp_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
-        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+    const bool requested = value_tape_.empty() ? cooperative_value_cusp_requested_ : retained_value_cusp_requested_;
+    return requested && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+        !retained_targets_ && !kinetic_trunk_only_ &&
         !mixed_open_features_excluded_ && !mixed_dense_ && environment.boundary == BoundaryCondition::OPEN &&
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
         environment.parameter_scalar_domain == ScalarDomain::REAL &&
@@ -1674,7 +1746,7 @@ public:
     if (mixed_open_features_excluded_)
       return;
     mixed_open_features_excluded_ = true;
-    if (cooperative_open_features_requested_)
+    if (cooperative_open_features_requested_ || retained_open_features_requested_)
       std::clog << "PsiFormer OPEN feature preparation: selected=scalar (mixed request/replay excluded)\n";
   }
 
@@ -2201,8 +2273,10 @@ private:
   const bool cooperative_value_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
   const bool cooperative_open_features_requested_;
+  const bool retained_open_features_requested_;
   bool mixed_open_features_excluded_ = false;
   const bool cooperative_value_cusp_requested_;
+  const bool retained_value_cusp_requested_;
   const bool tiled_value_orbitals_requested_;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;

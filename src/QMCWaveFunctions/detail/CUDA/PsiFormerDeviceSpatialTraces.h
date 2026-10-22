@@ -72,7 +72,8 @@ class PreparedDeviceSpatialTraces
 {
 public:
   PreparedDeviceSpatialTraces(device_determinant::SpatialLayout capacity, Stream stream,
-                               std::size_t budget_bytes = 8 * 1024 * 1024);
+                               std::size_t budget_bytes = 8 * 1024 * 1024,
+                               bool canonical_statistics = false);
 
   ~PreparedDeviceSpatialTraces();
 
@@ -105,6 +106,7 @@ private:
 
   SpatialTraceWorkspacePlan plan_;
   Stream stream_;
+  const bool canonical_statistics_;
   int device_ordinal_ = -1;
   // Stats store [gradient xyz, square-trace xyz, Laplacian] per [B,K,D].
   DeviceBuffer<double> products_, gradient_, lap_ratio_, lap_log_, stats_;
