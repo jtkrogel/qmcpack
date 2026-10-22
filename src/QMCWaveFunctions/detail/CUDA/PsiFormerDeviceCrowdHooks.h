@@ -300,8 +300,10 @@ private:
       throw std::logic_error("Drift VALUE upgrade needs released FP64 resources");
     last_graph_ = nullptr;
     ready_ = false;
+    const auto status_policy = values_ ? values_->statusPolicy() : configuredInferenceStatusPolicy();
     values_.reset(); // Never overlap ordinary and retained VALUE graphs.
-    values_ = std::make_unique<PreparedDeviceInference>(image_, capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true);
+    values_ = std::make_unique<PreparedDeviceInference>(image_, capacity_, queue_, blas_,
+        SpatialJetMode::VALUE_ONLY, true, false, status_policy);
     retain_values_ = true;
   }
 
@@ -311,10 +313,11 @@ private:
     if (acquired_ || capacity == 0)
       throw std::logic_error("Numerical crowd preparation requires released positive capacity");
     validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}}, capacity);
+    const auto status_policy = configuredInferenceStatusPolicy();
     auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY,
-        retain_values_);
+        retain_values_, false, status_policy);
     auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
-        SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), target_preparation_);
+        SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_);
     if (mixed_parameters_)
     {
       const auto rows = spatial_detail::checkedProduct(
