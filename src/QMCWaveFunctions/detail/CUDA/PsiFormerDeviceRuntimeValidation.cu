@@ -25,6 +25,8 @@
 #include "PsiFormerDeviceValueOrbitalValidation.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceValueScaleValidation.h"
+#include "PsiFormerDeviceMatrixReverseSeedValidation.h"
+#include "PsiFormerDeviceJetReverseValidation.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
@@ -1339,9 +1341,11 @@ int main(int argc, char** argv)
     const bool value_lu_only = argc == 2 && std::string(argv[1]) == "--value-lu-only";
     const bool inverse_lu_only = argc == 2 && std::string(argv[1]) == "--inverse-lu-only";
     const bool value_scale_only = argc == 2 && std::string(argv[1]) == "--value-scale-only";
+    const bool reverse_seeds_only = argc == 2 && std::string(argv[1]) == "--matrix-reverse-seeds-only";
+    const bool jet_reverse_only = argc == 2 && std::string(argv[1]) == "--jet-reverse-only";
     const bool open_feature_only = argc == 2 && std::string(argv[1]) == "--open-feature-only";
-    if (argc != 1 && !vectors_only && !value_lu_only && !inverse_lu_only && !open_feature_only && !value_scale_only)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--inverse-lu-only|--open-feature-only|--value-scale-only]");
+    if (argc != 1 && !vectors_only && !value_lu_only && !inverse_lu_only && !open_feature_only && !value_scale_only && !reverse_seeds_only && !jet_reverse_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--inverse-lu-only|--open-feature-only|--value-scale-only|--matrix-reverse-seeds-only|--jet-reverse-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -1357,6 +1361,16 @@ int main(int argc, char** argv)
     }
     std::cout << "Actual-device FP64 validation backend=" << backend << " visible_devices=" << count << "\n";
     Queue queue;
+    if (jet_reverse_only)
+    {
+      validateCooperativeDeterminantJetReverse(queue);
+      return 0;
+    }
+    if (reverse_seeds_only)
+    {
+      validateCooperativeMatrixReverseSeeds(queue);
+      return 0;
+    }
     if (value_scale_only)
     {
       validateCooperativeValueScale(queue);
@@ -1397,6 +1411,8 @@ int main(int argc, char** argv)
     valueLuCases(queue);
     inverseLuCases(queue);
     validateCooperativeValueScale(queue);
+    validateCooperativeMatrixReverseSeeds(queue);
+    validateCooperativeDeterminantJetReverse(queue);
     determinantTargetReuse(queue);
     boundedResponses(queue);
     batchedScoreLeaves(queue);

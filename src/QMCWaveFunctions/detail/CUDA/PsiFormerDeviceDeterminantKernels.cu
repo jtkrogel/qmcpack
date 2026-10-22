@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceDeterminantKernels.h"
 
 #include <cstdlib>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -353,6 +354,74 @@ __global__ void determinantMatrixReverseSeedsKernel(
       determinant_count, matrix_size, reverse_seeds + matrix_offset);
 }
 
+/** Map independent real reverse-seed cells without changing their arithmetic.
+ * Only the shared failure flag is atomic. Canonical failure replay retains
+ * status precedence, whole-output clearing, and zero-weight inverse admission.
+ */
+__global__ void determinantMatrixReverseSeedsCooperativeKernel(
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    std::size_t determinant_count,
+    std::size_t matrix_size,
+    double* reverse_seeds,
+    device_determinant::DerivativeStatus* status)
+{
+  const std::size_t configuration = blockIdx.x;
+  const std::size_t matrix_elements = matrix_size * matrix_size;
+  const std::size_t channel_elements = determinant_count * matrix_elements;
+  const std::size_t channel_offset = configuration * determinant_count;
+  const std::size_t matrix_offset = configuration * channel_elements;
+  const auto* factors = factorization_metadata + channel_offset;
+  const auto& combination = combination_metadata[configuration];
+  const double* weights = normalized_weights + channel_offset;
+  const double* inverse = inverses + matrix_offset;
+  double* seeds = reverse_seeds + matrix_offset;
+  __shared__ unsigned int failed;
+
+  for (std::size_t cell = threadIdx.x; cell < channel_elements; cell += blockDim.x)
+    seeds[cell] = 0.0;
+  if (threadIdx.x == 0)
+    failed = device_determinant::derivativeAvailability(
+        factors, combination, weights, determinant_count) !=
+        device_determinant::DerivativeStatus::AVAILABLE;
+  __syncthreads();
+
+  const bool available = failed == 0;
+  // Freeze admission in registers before any lane updates the shared flag.
+  __syncthreads();
+  if (available)
+  {
+    for (std::size_t cell = threadIdx.x; cell < channel_elements; cell += blockDim.x)
+    {
+      const std::size_t channel = cell / matrix_elements;
+      const double weight = weights[channel];
+      if (weight == 0.0)
+        continue; // Ignore every inverse cell, including nonfinite ignored storage.
+      const std::size_t element = cell % matrix_elements;
+      const std::size_t row = element / matrix_size;
+      const std::size_t column = element % matrix_size;
+      const double value = inverse[channel * matrix_elements + column * matrix_size + row];
+      if (!device_determinant::isFiniteBinary64(value))
+      {
+        atomicExch(&failed, 1u);
+        continue;
+      }
+      const double product = weight * value;
+      if (!device_determinant::isFiniteBinary64(product))
+        atomicExch(&failed, 1u);
+      else
+        seeds[cell] = product;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    status[configuration] = failed ? device_determinant::fillMatrixReverseSeeds(
+        factors, combination, weights, inverse, determinant_count, matrix_size, seeds)
+        : device_determinant::DerivativeStatus::AVAILABLE;
+}
+
 __global__ void determinantSpatialTracesKernel(
     device_determinant::SpatialLayout layout,
     const device_determinant::FactorizationMetadata* factorization_metadata,
@@ -572,6 +641,82 @@ __global__ void determinantJetReverseKernel(
   status[configuration] = device_determinant::reverseLiftedDeterminant(
       layout.matrices, layout.roots, configuration, factor_status[configuration],
       factor_jets, root_jets, orbital_adjoint_jets);
+}
+
+/** Independent matrix entries retain their scalar compensated jet contraction.
+ * One shared failure word is block-local; canonical replay owns every failure.
+ */
+__global__ void determinantJetReverseCooperativeKernel(
+    LiftedDeterminantLayout layout,
+    const device_determinant::DerivativeStatus* factor_status,
+    const double* factor_jets,
+    const double* root_jets,
+    double* orbital_adjoint_jets,
+    device_determinant::DerivativeStatus* status)
+{
+  using device_determinant::DerivativeStatus;
+  const auto configuration = std::size_t(blockIdx.x);
+  const auto& matrices = layout.matrices;
+  const auto& roots = layout.roots;
+  __shared__ unsigned int failure;
+  if (threadIdx.x == 0)
+  {
+    failure = factor_status[configuration] != DerivativeStatus::AVAILABLE;
+    for (std::size_t plane = 0; !failure && plane < roots.plane_count; ++plane)
+      if (!device_determinant::isFiniteBinary64(
+              root_jets[roots.uncheckedPlaneOffset(configuration, plane, 0)]))
+        failure = 1;
+  }
+  for (std::size_t plane = 0; plane < matrices.plane_count; ++plane)
+    for (std::size_t element = threadIdx.x; element < matrices.element_count; element += blockDim.x)
+      orbital_adjoint_jets[matrices.uncheckedPlaneOffset(configuration, plane, element)] = 0.0;
+  __syncthreads();
+  const bool admitted = failure == 0;
+  __syncthreads(); // Every lane snapshots admission before atomic failure writes.
+  if (admitted)
+    for (std::size_t element = threadIdx.x; element < matrices.element_count; element += blockDim.x)
+    {
+      const double root_value = root_jets[roots.uncheckedValueOffset(configuration, 0)];
+      const double factor_value = factor_jets[matrices.uncheckedValueOffset(configuration, element)];
+      bool finite = device_determinant::isFiniteBinary64(factor_value);
+      device_determinant::CompensatedSumBinary64 value_adjoint;
+      value_adjoint.add(root_value * factor_value);
+      for (std::size_t lane = 0; lane < matrices.gradient_lanes; ++lane)
+      {
+        const double factor_gradient = factor_jets[
+            matrices.uncheckedGradientOffset(configuration, lane, element)];
+        finite = finite && device_determinant::isFiniteBinary64(factor_gradient);
+        const double root_gradient = root_jets[roots.uncheckedGradientOffset(configuration, lane, 0)];
+        const double root_laplacian = root_jets[
+            roots.uncheckedLaplacianOffset(configuration, lane / 3, 0)];
+        value_adjoint.add(root_gradient * factor_gradient);
+        orbital_adjoint_jets[matrices.uncheckedGradientOffset(configuration, lane, element)] =
+            root_gradient * factor_value + 2.0 * root_laplacian * factor_gradient;
+      }
+      for (std::size_t electron = 0; electron < matrices.laplacian_lanes; ++electron)
+      {
+        const double factor_laplacian = factor_jets[
+            matrices.uncheckedLaplacianOffset(configuration, electron, element)];
+        finite = finite && device_determinant::isFiniteBinary64(factor_laplacian);
+        const double root_laplacian = root_jets[
+            roots.uncheckedLaplacianOffset(configuration, electron, 0)];
+        value_adjoint.add(root_laplacian * factor_laplacian);
+        orbital_adjoint_jets[matrices.uncheckedLaplacianOffset(configuration, electron, element)] =
+            root_laplacian * factor_value;
+      }
+      orbital_adjoint_jets[matrices.uncheckedValueOffset(configuration, element)] = value_adjoint.value();
+      for (std::size_t plane = 0; plane < matrices.plane_count; ++plane)
+        finite = finite && device_determinant::isFiniteBinary64(
+            orbital_adjoint_jets[matrices.uncheckedPlaneOffset(configuration, plane, element)]);
+      if (!finite)
+        atomicExch(&failure, 1U);
+    }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    status[configuration] = failure
+        ? device_determinant::reverseLiftedDeterminant(matrices, roots, configuration,
+              factor_status[configuration], factor_jets, root_jets, orbital_adjoint_jets)
+        : DerivativeStatus::AVAILABLE;
 }
 
 std::size_t checkedProduct(std::size_t left, std::size_t right, const char* description)
@@ -816,9 +961,9 @@ Error launchDeterminantMatrixReverseSeeds(
       matrix_size, matrix_size, "PsiFormer determinant reverse matrix extent overflow");
   const std::size_t channel_elements = checkedProduct(
       determinant_count, matrix_elements, "PsiFormer determinant reverse channel extent overflow");
-  (void)checkedProduct(configuration_count, determinant_count,
+  const auto metadata_elements = checkedProduct(configuration_count, determinant_count,
                        "PsiFormer determinant reverse metadata extent overflow");
-  (void)checkedProduct(configuration_count, channel_elements,
+  const auto output_elements = checkedProduct(configuration_count, channel_elements,
                        "PsiFormer determinant reverse output extent overflow");
   if (configuration_count > std::numeric_limits<unsigned int>::max())
     throw std::length_error("PsiFormer determinant reverse grid exceeds the CUDA/HIP x dimension");
@@ -826,11 +971,43 @@ Error launchDeterminantMatrixReverseSeeds(
       !inverses || !reverse_seeds || !status)
     throw std::invalid_argument("PsiFormer determinant reverse storage is null");
 
-  const unsigned int block_count = static_cast<unsigned int>(
-      (configuration_count + determinant_block_size - 1) / determinant_block_size);
-  determinantMatrixReverseSeedsKernel<<<block_count, determinant_block_size, 0, stream>>>(
-      factorization_metadata, combination_metadata, normalized_weights, inverses,
-      configuration_count, determinant_count, matrix_size, reverse_seeds, status);
+  const char* option = std::getenv("PSIFORMER_GPU_COOPERATIVE_MATRIX_REVERSE_SEEDS");
+  if (option && !((option[0] == '0' || option[0] == '1') && option[1] == '\0'))
+    throw std::invalid_argument("PSIFORMER_GPU_COOPERATIVE_MATRIX_REVERSE_SEEDS requires 0 or 1");
+
+  // Preserve the legacy route for overlapping views, including in-place clears.
+  const auto overlaps = [](const void* a, std::size_t count_a, std::size_t size_a,
+                           const void* b, std::size_t count_b, std::size_t size_b) {
+    if (count_a > std::numeric_limits<std::size_t>::max() / size_a ||
+        count_b > std::numeric_limits<std::size_t>::max() / size_b)
+      return true;
+    const auto aa = reinterpret_cast<std::uintptr_t>(a);
+    const auto bb = reinterpret_cast<std::uintptr_t>(b);
+    return aa <= bb ? bb - aa < count_a * size_a : aa - bb < count_b * size_b;
+  };
+  const auto touches_output = [&](const void* data, std::size_t count, std::size_t size) {
+    return overlaps(reverse_seeds, output_elements, sizeof(double), data, count, size) ||
+        overlaps(status, configuration_count, sizeof(*status), data, count, size);
+  };
+  const bool independent = option && option[0] == '1' && matrix_size >= 64 &&
+      configuration_count <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+      !touches_output(factorization_metadata, metadata_elements, sizeof(*factorization_metadata)) &&
+      !touches_output(combination_metadata, configuration_count, sizeof(*combination_metadata)) &&
+      !touches_output(normalized_weights, metadata_elements, sizeof(double)) &&
+      !touches_output(inverses, output_elements, sizeof(double)) &&
+      !overlaps(reverse_seeds, output_elements, sizeof(double), status, configuration_count, sizeof(*status));
+  if (independent)
+    determinantMatrixReverseSeedsCooperativeKernel<<<static_cast<unsigned int>(configuration_count),
+        determinant_block_size, 0, stream>>>(factorization_metadata, combination_metadata,
+        normalized_weights, inverses, determinant_count, matrix_size, reverse_seeds, status);
+  else
+  {
+    const unsigned int block_count = static_cast<unsigned int>(
+        (configuration_count + determinant_block_size - 1) / determinant_block_size);
+    determinantMatrixReverseSeedsKernel<<<block_count, determinant_block_size, 0, stream>>>(
+        factorization_metadata, combination_metadata, normalized_weights, inverses,
+        configuration_count, determinant_count, matrix_size, reverse_seeds, status);
+  }
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
@@ -962,12 +1139,34 @@ Error launchDeterminantJetReverse(
       !orbital_adjoint_jets || !status)
     throw std::invalid_argument("PsiFormer lifted determinant reverse storage is null");
 
-  const unsigned int block_count = static_cast<unsigned int>(
-      (layout.matrices.configuration_count + determinant_block_size - 1) /
-      determinant_block_size);
-  determinantJetReverseKernel<<<block_count, determinant_block_size, 0, stream>>>(
-      layout, factor_status, factor_jets, root_jets, orbital_adjoint_jets,
-      status);
+  const char* cooperative = std::getenv("PSIFORMER_GPU_COOPERATIVE_DETERMINANT_JET_REVERSE");
+  bool independent_outputs = false;
+  if (cooperative && cooperative[0] == '1' && cooperative[1] == '\0' && layout.matrix_size >= 64)
+  {
+    const auto matrix_bytes = checkedProduct(spatialJetSpanElements(layout.matrices), sizeof(double),
+        "Cooperative determinant reverse matrix bytes overflow");
+    const auto root_bytes = checkedProduct(spatialJetSpanElements(layout.roots), sizeof(double),
+        "Cooperative determinant reverse root bytes overflow");
+    const auto overlaps = [](const void* left, std::size_t left_bytes,
+                             const void* right, std::size_t right_bytes) {
+      const auto a = reinterpret_cast<std::uintptr_t>(left), b = reinterpret_cast<std::uintptr_t>(right);
+      return a <= b ? b - a < left_bytes : a - b < right_bytes;
+    };
+    independent_outputs = !overlaps(factor_jets, matrix_bytes, orbital_adjoint_jets, matrix_bytes) &&
+        !overlaps(root_jets, root_bytes, orbital_adjoint_jets, matrix_bytes);
+  }
+  if (independent_outputs && layout.matrices.configuration_count <= 2147483647u)
+    determinantJetReverseCooperativeKernel<<<
+        static_cast<unsigned int>(layout.matrices.configuration_count), determinant_block_size, 0, stream>>>(
+        layout, factor_status, factor_jets, root_jets, orbital_adjoint_jets, status);
+  else
+  {
+    const unsigned int block_count = static_cast<unsigned int>(
+        (layout.matrices.configuration_count + determinant_block_size - 1) /
+        determinant_block_size);
+    determinantJetReverseKernel<<<block_count, determinant_block_size, 0, stream>>>(
+        layout, factor_status, factor_jets, root_jets, orbital_adjoint_jets, status);
+  }
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
