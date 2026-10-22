@@ -92,6 +92,78 @@ std::array<DerivativeReal, 2> solve2(const std::array<DerivativeReal, 4>& matrix
 
 } // namespace
 
+TEST_CASE("KFAC precomputed raw factors preserve fallback transactions and inverse",
+          "[drivers][wftrain][kfac]")
+{
+  for (const auto convention : {KFACCurvatureConvention::NATIVE_SCORE,
+                                KFACCurvatureConvention::REGISTERED_GAUSSIAN})
+  {
+    const auto registry = makeRegistry();
+    KFACFactorAccumulator reference(registry, 7, convention);
+    KFACFactorAccumulator imported(registry, 7, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+    CHECK_THROWS(imported.beginSample(0.5));
+    const std::array<double, 4> activations{1, 2, -3, 4}, sensitivities{0.5, -1, 2, 3};
+    const std::array<double, 9> score{0, 0, 0, 0, 0, 0, -2, 3, 0};
+    for (int sample = 0; sample < 2; ++sample)
+    {
+      addSample(reference, 1, activations, sensitivities, score);
+      imported.beginSample(1);
+      CHECK_THROWS(imported.addObservation({0, {activations.data(), 4}, {sensitivities.data(), 4}, 2}));
+      imported.addFallbackScores({score.data(), score.size()});
+      imported.endSample();
+    }
+    CHECK(imported.sampleCount() == 2);
+    CHECK_FALSE(imported.affineStatisticsComplete());
+    auto overflowing_score = score;
+    overflowing_score[6] = std::numeric_limits<double>::max();
+    imported.beginSample(1);
+    imported.addFallbackScores({overflowing_score.data(), overflowing_score.size()});
+    CHECK_THROWS(imported.endSample());
+    CHECK(imported.sampleCount() == 2);
+    for (std::size_t p = 0; p < reference.fallbackDiagonalSum().size(); ++p)
+      CHECK(imported.fallbackDiagonalSum()[p] == reference.fallbackDiagonalSum()[p]);
+    CHECK_THROWS(imported.factors());
+    CHECK_THROWS(reduceKFACFactorStatistics(imported));
+    CHECK_THROWS(KFACPreconditioner(imported));
+    auto bad = reference.factors();
+    bad[0].activation_outer_sum[0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    CHECK_THROWS(imported.importAffineStatistics("wrong-registry", 7, reference.factors()));
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 8, reference.factors()));
+    bad = reference.factors();
+    bad[0].sample_weight_sum += 1;
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    CHECK_FALSE(imported.affineStatisticsComplete());
+    bad = reference.factors();
+    bad[0].row_count += 1;
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    bad = reference.factors();
+    bad[0].row_weight_sum += 1;
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, std::move(bad)));
+    CHECK(imported.sampleCount() == 2);
+    imported.importAffineStatistics(registry.fingerprint(), 7, reference.factors());
+    CHECK(imported.affineStatisticsComplete());
+    CHECK_THROWS(imported.beginSample(1));
+    CHECK_THROWS(imported.importAffineStatistics(registry.fingerprint(), 7, reference.factors()));
+    CHECK(imported.factors()[0].activation_outer_sum == reference.factors()[0].activation_outer_sum);
+    CHECK(imported.factors()[0].sensitivity_outer_sum == reference.factors()[0].sensitivity_outer_sum);
+    CHECK(imported.factors()[0].row_count == reference.factors()[0].row_count);
+    for (std::size_t p = 0; p < reference.fallbackDiagonalSum().size(); ++p)
+      CHECK(imported.fallbackDiagonalSum()[p] == reference.fallbackDiagonalSum()[p]);
+    reduceKFACFactorStatistics(reference);
+    reduceKFACFactorStatistics(imported);
+    const auto expected_state = updateKFACFactorState(nullptr, reference, 0.95);
+    const auto imported_state = updateKFACFactorState(nullptr, imported, 0.95);
+    CHECK(imported_state.values == expected_state.values);
+    KFACPreconditioner expected_inverse(reference), imported_inverse(imported);
+    std::vector<DerivativeValue> gradient(9, {1, 0}), expected(9), actual(9);
+    const StructuredParameterVectorConstView view(registry.parameterSchema(), 7, {gradient.data(), gradient.size()});
+    expected_inverse.apply(view, {expected.data(), expected.size()});
+    imported_inverse.apply(view, {actual.data(), actual.size()});
+    CHECK(actual == expected);
+  }
+}
+
 TEST_CASE("KFAC registry validates complete real block coverage",
           "[drivers][wftrain][kfac]")
 {

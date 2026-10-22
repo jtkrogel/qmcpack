@@ -18,6 +18,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_NETWORK_REVERSE_H
 
 #include "PsiFormerDeviceInference.h"
+#include "PsiFormerDeviceAffineStatistics.h"
 #include <utility>
 
 namespace qmcplusplus::psiformer::device
@@ -118,10 +119,23 @@ public:
 
 private:
   friend class PreparedDeviceComplexScore;
+  friend class PreparedDeviceScoreReverse;
+
+  /// The score composer admits the final head-plus-trunk response on this stream.
+  /// Keep this owner's public result revoked while its device output is unchecked.
+  const double* reverseUnadmitted(const PreparedDeviceInference& forward, const double* device_seed,
+      DeviceAffineObservationSink* affine = nullptr)
+  {
+    if (output_ != NetworkReverseOutput::PARAMETER_SCORE)
+      throw std::logic_error("Unchecked trunk response requires parameter-score preparation");
+    reverseImpl(forward, {}, device_seed, true, false, affine);
+    return response_.data();
+  }
 
   /// Execute the shared algebra; only the private score composer preserves seeded P.
   void reverseImpl(const PreparedDeviceInference& forward, const std::vector<double>& seed,
-                   const double* device_seed, bool clear_response = true)
+                   const double* device_seed, bool clear_response = true, bool admit_response = true,
+                   DeviceAffineObservationSink* affine = nullptr)
   {
     result_ready_ = false;
     model_->validateCurrentDevice();
@@ -155,21 +169,21 @@ private:
       const auto& tape = forward.valueBlockTape(layer);
       checkRuntime(launchTanhOutputResidualReverse(stream, values, tape.projected.data(),
           upstream_.data(), tanh_.data(), residual_.data()), "network output tanh reverse");
-      weightReverse(dense, tape.hidden.data(), tanh_.data(), ParameterRole::UPDATE_OUTPUT_WEIGHT, layer);
+      weightReverse(dense, tape.hidden.data(), tanh_.data(), ParameterRole::UPDATE_OUTPUT_WEIGHT, layer, affine);
       biasReverse(dense, tanh_.data(), ParameterRole::UPDATE_OUTPUT_BIAS, layer);
       zero(hidden_, elements);
       accumulateDenseInputAdjoint(blas_, dense, tanh_.data(),
           parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), hidden_.data());
       checkRuntime(launchTanhOutputResidualReverse(stream, values, tape.hidden.data(),
           hidden_.data(), tanh_.data(), discard_.data()), "network hidden tanh reverse");
-      weightReverse(dense, tape.residual.data(), tanh_.data(), ParameterRole::UPDATE_HIDDEN_WEIGHT, layer);
+      weightReverse(dense, tape.residual.data(), tanh_.data(), ParameterRole::UPDATE_HIDDEN_WEIGHT, layer, affine);
       biasReverse(dense, tanh_.data(), ParameterRole::UPDATE_HIDDEN_BIAS, layer);
       accumulateDenseInputAdjoint(blas_, dense, tanh_.data(),
           parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer), residual_.data());
 
       // The attention residual contributes directly to the preceding block input.
       copy(residual_, input_, elements);
-      weightReverse(dense, tape.context.data(), residual_.data(), ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer);
+      weightReverse(dense, tape.context.data(), residual_.data(), ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer, affine);
       zero(context_, elements);
       accumulateDenseInputAdjoint(blas_, dense, residual_.data(),
           parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), context_.data());
@@ -187,7 +201,7 @@ private:
                                     std::pair{ParameterRole::ATTENTION_KEY_WEIGHT, &key_},
                                     std::pair{ParameterRole::ATTENTION_VALUE_WEIGHT, &value_}})
       {
-        weightReverse(dense, tape.input.data(), projection.second->data(), projection.first, layer);
+        weightReverse(dense, tape.input.data(), projection.second->data(), projection.first, layer, affine);
         accumulateDenseInputAdjoint(blas_, dense, projection.second->data(),
             parameter(projection.first, layer), input_.data());
       }
@@ -200,7 +214,7 @@ private:
     const DenseForwardLayout feature_dense{count * ne, embedding.shape[0], width,
                                           embedding.shape[0], width, width};
     weightReverse(feature_dense, forward.valueRawFeatures(), upstream_.data(),
-                  ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK);
+                  ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK, affine);
     const double* result = response_.data();
     auto scan = finite_layout_;
     if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
@@ -214,6 +228,10 @@ private:
       scan.status_capacity = raw_elements / scan.elements_per_status +
           (raw_elements % scan.elements_per_status != 0);
     }
+
+    // The composing score owner checks the final sum before making it public.
+    if (!admit_response)
+      return;
 
     // Reject invalid contractions before publishing the borrowed accumulator.
     checkRuntime(launchDerivativeFiniteScan(stream, scan, result,
@@ -316,10 +334,12 @@ private:
 
   /// Fold configurations/electrons into one canonical shared-weight contraction.
   void weightReverse(const DenseForwardLayout& layout, const double* source, const double* adjoint,
-                     ParameterRole role, std::size_t layer)
+                     ParameterRole role, std::size_t layer, DeviceAffineObservationSink* affine = nullptr)
   {
     if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
       return;
+    if (affine)
+      affine->observe(role, layer, source, adjoint, layout.rows, layout.input_width, layout.output_width);
     accumulateDenseWeightAdjoint(blas_, layout, source, adjoint,
         response_.data() + model_->plan().parameter(role, layer).begin);
   }

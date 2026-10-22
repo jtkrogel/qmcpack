@@ -30,7 +30,13 @@
 #include <vector>
 
 namespace qmcplusplus::psiformer::device { class PreparedDeviceAdam; }
-namespace qmcplusplus::wftrain { struct KrylovSolverControl; struct ResidentEnergySRDiagnostics; }
+namespace qmcplusplus::wftrain
+{
+struct KrylovSolverControl;
+struct ResidentEnergySRDiagnostics;
+class KFACBlockRegistry;
+class KFACFactorAccumulator;
+}
 
 namespace pf
 {
@@ -413,6 +419,12 @@ public:
 
   /// Numeric HOST scratch required by one sequential affine observation.
   std::size_t affineScoreStorageBytes() const;
+
+  /// Explicit experimental real/open route; ordinary observations remain available.
+  bool usesDeviceAffineStatistics() const noexcept;
+  std::size_t deviceAffineStatisticsStorageBytes(const wftrain::KFACBlockRegistry& registry) const;
+  void accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,
+      wftrain::KFACFactorAccumulator& statistics, std::size_t maximum_numeric_bytes) const;
 
   /// Report the physical system metadata already validated by the builder.
   bool isPseudopotentialSystem() const;

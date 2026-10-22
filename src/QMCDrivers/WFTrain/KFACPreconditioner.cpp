@@ -245,9 +245,14 @@ KFACBlockRegistry::KFACBlockRegistry(
 
 KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
                                              std::size_t parameter_version,
-                                             KFACCurvatureConvention convention)
-    : registry_(std::move(registry)), convention_(convention), parameter_version_(parameter_version)
+                                             KFACCurvatureConvention convention,
+                                             KFACAffineStatisticsSource source)
+    : registry_(std::move(registry)), convention_(convention), affine_source_(source),
+      parameter_version_(parameter_version)
 {
+  if (source != KFACAffineStatisticsSource::OBSERVATION_ROWS &&
+      source != KFACAffineStatisticsSource::PRECOMPUTED_SUMS)
+    throw std::invalid_argument("KFAC affine statistics source is unsupported");
   if (convention_ != KFACCurvatureConvention::NATIVE_SCORE &&
       convention_ != KFACCurvatureConvention::REGISTERED_GAUSSIAN)
     throw std::invalid_argument("KFAC curvature convention is unsupported");
@@ -256,7 +261,8 @@ KFACFactorAccumulator::KFACFactorAccumulator(KFACBlockRegistry registry,
   for (const KFACAffineBlockDescriptor& block : registry_.affineBlocks())
   {
     factors_.push_back(makeStatistics(block));
-    pending_.push_back(makeStatistics(block));
+    if (affine_source_ == KFACAffineStatisticsSource::OBSERVATION_ROWS)
+      pending_.push_back(makeStatistics(block));
   }
   observed_.assign(factors_.size(), false);
   std::size_t fallback_parameter_count = 0;
@@ -288,10 +294,14 @@ void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
     throw std::logic_error("KFAC sample transaction is already active");
   if (globally_reduced_)
     throw std::logic_error("KFAC globally reduced statistics cannot accept new samples");
+  if (imported_affine_)
+    throw std::logic_error("KFAC imported affine statistics cannot accept new samples");
+  if (affine_source_ == KFACAffineStatisticsSource::PRECOMPUTED_SUMS && sample_weight != 1.0)
+    throw std::invalid_argument("KFAC precomputed affine statistics require unit sample weights");
   if (!finite(sample_weight) || sample_weight < 0.0)
     throw std::invalid_argument("KFAC sample weight must be finite and nonnegative");
   sample_weight_ = convention_ == KFACCurvatureConvention::REGISTERED_GAUSSIAN ? 1.0 : sample_weight;
-  std::fill(observed_.begin(), observed_.end(), false);
+  std::fill(observed_.begin(), observed_.end(), affine_source_ == KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
   for (KFACFactorStatistics& factor : pending_)
   {
     factor.sample_weight_sum = 0.0;
@@ -309,6 +319,8 @@ void KFACFactorAccumulator::beginSample(DerivativeReal sample_weight)
 
 void KFACFactorAccumulator::addObservation(const KFACLayerObservation& observation)
 {
+  if (affine_source_ != KFACAffineStatisticsSource::OBSERVATION_ROWS)
+    throw std::logic_error("KFAC precomputed factors cannot mix with observation rows");
   if (!sample_active_)
     throw std::logic_error("KFAC observation requires an active sample transaction");
   if (observation.affine_block >= pending_.size() || observed_[observation.affine_block])
@@ -436,7 +448,7 @@ void KFACFactorAccumulator::endSample()
   // catches finite inputs whose products or accumulated sums overflowed.
   bool valid = sample_count_ != std::numeric_limits<std::size_t>::max() &&
       finite(fallback_weight_sum_ + sample_weight_);
-  for (std::size_t block = 0; valid && block < factors_.size(); ++block)
+  for (std::size_t block = 0; valid && block < pending_.size(); ++block)
   {
     const KFACFactorStatistics& destination = factors_[block];
     const KFACFactorStatistics& source = pending_[block];
@@ -464,7 +476,7 @@ void KFACFactorAccumulator::endSample()
     throw std::overflow_error("KFAC sample statistics overflowed during accumulation");
   }
 
-  for (std::size_t block = 0; block < factors_.size(); ++block)
+  for (std::size_t block = 0; block < pending_.size(); ++block)
   {
     KFACFactorStatistics& destination = factors_[block];
     const KFACFactorStatistics& source = pending_[block];
@@ -500,6 +512,36 @@ void KFACFactorAccumulator::abortSample() noexcept
   fallback_observed_ = false;
 }
 
+void KFACFactorAccumulator::importAffineStatistics(const std::string& registry_fingerprint,
+    std::size_t parameter_version, std::vector<KFACFactorStatistics> factors)
+{
+  if (affine_source_ != KFACAffineStatisticsSource::PRECOMPUTED_SUMS || imported_affine_ ||
+      sample_active_ || globally_reduced_ || !sample_count_)
+    throw std::logic_error("KFAC affine import requires completed local fallback collection");
+  if (registry_fingerprint != registry_.fingerprint() || parameter_version != parameter_version_ ||
+      factors.size() != factors_.size())
+    throw std::invalid_argument("KFAC imported affine identity does not match the accumulator");
+  for (std::size_t block = 0; block < factors.size(); ++block)
+  {
+    const auto& source = factors[block];
+    const auto& destination = factors_[block];
+    if (source.activation_dimension != destination.activation_dimension ||
+        source.sensitivity_dimension != destination.sensitivity_dimension ||
+        source.activation_outer_sum.size() != destination.activation_outer_sum.size() ||
+        source.sensitivity_outer_sum.size() != destination.sensitivity_outer_sum.size() ||
+        source.sample_weight_sum != static_cast<DerivativeReal>(sample_count_) ||
+        source.sample_weight_sum != fallback_weight_sum_ || source.row_count < sample_count_ ||
+        source.row_count % sample_count_ != 0 || source.row_weight_sum != static_cast<DerivativeReal>(source.row_count) ||
+        !finite(source.sample_weight_sum) || !finite(source.row_weight_sum) ||
+        source.sample_weight_sum <= 0 || source.row_weight_sum <= 0 ||
+        !std::all_of(source.activation_outer_sum.begin(), source.activation_outer_sum.end(), finite) ||
+        !std::all_of(source.sensitivity_outer_sum.begin(), source.sensitivity_outer_sum.end(), finite))
+      throw std::invalid_argument("KFAC imported raw factor sums are incompatible or nonfinite");
+  }
+  factors_.swap(factors);
+  imported_affine_ = true;
+}
+
 std::size_t KFACFactorAccumulator::retainedNumericBytes() const noexcept
 {
   std::size_t elements = 0;
@@ -522,6 +564,8 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
   std::uint64_t failure = 0;
   if (accumulator.sample_active_)
     failure = 1;
+  else if (!accumulator.affineStatisticsComplete())
+    failure = 5;
   else if (accumulator.globally_reduced_)
     failure = 2;
   else if (maximum_chunk_size == 0 ||
@@ -578,6 +622,8 @@ void reduceKFACFactorStatistics(KFACFactorAccumulator& accumulator,
     throw std::logic_error("KFAC statistics have already been globally reduced");
   else if (failure == 3)
     throw std::invalid_argument("KFAC reduction chunk size is invalid");
+  else if (failure == 5)
+    throw std::logic_error("KFAC reduction requires complete imported affine statistics");
   else if (failure != 0)
     throw std::invalid_argument("KFAC reduction received non-finite local statistics");
 
@@ -762,7 +808,7 @@ KFACPreconditioner::KFACPreconditioner(
       control_(control),
       convention_(statistics.curvatureConvention())
 {
-  if (statistics.sampleActive() || statistics.sampleCount() == 0)
+  if (statistics.sampleActive() || statistics.sampleCount() == 0 || !statistics.affineStatisticsComplete())
     throw std::invalid_argument("KFAC preconditioner requires complete nonempty statistics");
   if (!finite(control_.damping) || control_.damping <= 0.0 ||
       !finite(control_.fallback_damping) || control_.fallback_damping <= 0.0)

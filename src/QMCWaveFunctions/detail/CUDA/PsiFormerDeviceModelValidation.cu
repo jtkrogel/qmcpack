@@ -26,6 +26,7 @@
 #include "PsiFormerDeviceRawFeatureReverseValidation.h"
 #include "PsiFormerDeviceCoordinateGradientValidation.h"
 #include "PsiFormerDeviceScoreReverse.h"
+#include "PsiFormerDeviceAffineStatisticsValidation.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceKineticTrunkValidation.h"
@@ -1911,6 +1912,8 @@ int main(int argc, char** argv)
     std::cout << "PASS raw-feature-only trunk VJP: bounded input adjoints, no P response, coordinate-direction difference\n";
     validateCoordinateGradient(image, model, model.cfg.electrons.x, queue, handle);
     std::cout << "PASS complete open coordinate gradient: CPU full VGL, FD, lifecycle, exact storage\n";
+
+    validateDeviceAffineStatistics(model, image, queue, handle);
 
     // Complete canonical score contraction against the independent CPU evaluator.
     std::vector<double> score_weights(model.cfg.nconfig);

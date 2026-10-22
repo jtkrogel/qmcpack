@@ -304,6 +304,47 @@ public:
 
   std::size_t weightedScoreConfigurations() const noexcept { return weighted_score_configurations_; }
 
+  /// Prepare bounded factors against this session's currently adopted image.
+  std::unique_ptr<PreparedDeviceAffineStatistics> prepareAffineStatistics(
+      std::vector<DeviceAffineFactorDescriptor> blocks, bool gaussian_curvature,
+      std::size_t device_budget, std::size_t host_budget, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    validateContractionControl(version);
+    return std::make_unique<PreparedDeviceAffineStatistics>(image_, std::move(blocks),
+        gaussian_curvature, device_budget, host_budget, queue_, blas_);
+  }
+
+  /// Caller holds the provider scratch lease through factor admission/download.
+  /// Only requested fallback intervals are downloaded; other HOST entries are
+  /// unspecified and may be read only by a fallback-aware accumulator.
+  const std::vector<double>& affineFallbackScore(const double* positions,
+      PreparedDeviceAffineStatistics& statistics,
+      const std::vector<std::pair<std::size_t, std::size_t>>& fallback_ranges, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      if (statistics.modelIdentity() != image_.get())
+        throw std::invalid_argument("Device affine statistics belong to another model generation");
+      for (const auto& range : fallback_ranges)
+        if (range.first > score_response_.size() || range.second > score_response_.size() - range.first)
+          throw std::invalid_argument("Device affine fallback interval exceeds the canonical score");
+      statistics.beginSample(version);
+      try
+      {
+        values_.evaluate(positions_);
+        score_.observeAffine(values_, statistics);
+        for (const auto& range : fallback_ranges)
+          score_.downloadResponseChunk(range.first, score_response_.data() + range.first, range.second);
+      }
+      catch (...)
+      {
+        statistics.abortSample();
+        throw;
+      }
+    });
+    return score_response_;
+  }
+
   /// Return a canonical real score, valid until this session's next score call.
   const std::vector<double>& score(const double* positions, std::size_t version)
   {

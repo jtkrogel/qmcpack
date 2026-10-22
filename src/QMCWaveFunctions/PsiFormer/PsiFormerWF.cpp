@@ -21,6 +21,7 @@
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include <cstdio>
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
@@ -7718,6 +7719,165 @@ std::size_t PsiFormerWF::affineScoreStorageBytes() const
 {
   PsiFormerReadTransaction transaction(*model_state_);
   return pf::scoreWorkspaceStorageRequirement(makeBatchMemoryPolicyInput().storage_shape);
+}
+
+bool PsiFormerWF::usesDeviceAffineStatistics() const noexcept
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const char* enabled = std::getenv("PSIFORMER_GPU_KFAC_AFFINE");
+  return enabled && std::strcmp(enabled, "1") == 0 && usesAcceleratorParameterProducts() &&
+      !model_state_->execution_plan.environment().periodic_profile;
+#else
+  return false;
+#endif
+}
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+namespace
+{
+/// Resolve registered affine leaves against immutable canonical tensor identity.
+std::vector<psiformer::device::DeviceAffineFactorDescriptor> deviceAffineDescriptors(
+    const psiformer::PsiFormerExecutionPlan& plan, const wftrain::KFACBlockRegistry& registry)
+{
+  std::vector<psiformer::device::DeviceAffineFactorDescriptor> result;
+  for (const auto& block : registry.affineBlocks())
+  {
+    const auto& weight = registry.parameterSchema().blocks().at(block.weight_block);
+    const auto& tensors = plan.parameterTensors();
+    const auto found = std::find_if(tensors.begin(), tensors.end(), [&](const auto& tensor) {
+      return tensor.begin == weight.offset && tensor.size() == weight.count &&
+          tensor.module + "/" + tensor.name == weight.id && tensor.shape == weight.shape;
+    });
+    if (found == tensors.end())
+      throw std::invalid_argument("Device affine registry differs from the immutable parameter plan");
+    result.push_back({found->role, found->attention_block, block.input_width, block.output_width,
+        block.bias_block != wftrain::NO_KFAC_BIAS_BLOCK});
+  }
+  return result;
+}
+
+/// Budget DEVICE banks, HOST staging and augmented output arrays together.
+std::size_t deviceAffineNumericBytes(const std::vector<psiformer::device::DeviceAffineFactorDescriptor>& blocks)
+{
+  using Owner = psiformer::device::PreparedDeviceAffineStatistics;
+  auto bytes = checkedBatchMemoryAdd(Owner::requiredDeviceBytes(blocks), Owner::requiredHostBytes(blocks),
+      "Device affine owner bytes");
+  for (const auto& block : blocks)
+  {
+    const auto input = checkedBatchMemoryAdd(block.input_width, block.bias_augmented, "Device affine bias extent");
+    const auto elements = checkedBatchMemoryAdd(checkedBatchMemoryMultiply(input, input, "Device affine A extent"),
+        checkedBatchMemoryMultiply(block.output_width, block.output_width, "Device affine G extent"),
+        "Device affine output elements");
+    bytes = checkedBatchMemoryAdd(bytes, checkedBatchMemoryMultiply(elements, sizeof(double),
+        "Device affine HOST output bytes"), "Device affine total numeric bytes");
+  }
+  return bytes;
+}
+} // namespace
+#endif
+
+std::size_t PsiFormerWF::deviceAffineStatisticsStorageBytes(const wftrain::KFACBlockRegistry& registry) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  PsiFormerReadTransaction transaction(*model_state_);
+  if (!usesDeviceAffineStatistics() || registry.parameterSchema().fingerprint() != parameterSchema().fingerprint())
+    throw std::invalid_argument("Device affine statistics require the enabled matching real provider");
+  return deviceAffineNumericBytes(deviceAffineDescriptors(transaction.state().execution_plan, registry));
+#else
+  throw std::logic_error("Device affine statistics are unavailable in this build");
+#endif
+}
+
+void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,
+    wftrain::KFACFactorAccumulator& statistics, std::size_t maximum_numeric_bytes) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  if (!usesDeviceAffineStatistics() || samples.empty() || statistics.sampleCount() || statistics.affineStatisticsComplete())
+    throw std::invalid_argument("Device affine collection requires fresh precomputed statistics and samples");
+  auto scratch = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount());
+  PsiFormerDerivativeLease scratch_lease(*scratch);
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto& state = transaction.state();
+  if (!scratch->device_products || statistics.parameterVersion() != transaction.parameterVersion() ||
+      statistics.registry().parameterSchema().fingerprint() != parameterSchema().fingerprint())
+    throw std::invalid_argument("Device affine collection has an incompatible model generation");
+  const auto descriptors = deviceAffineDescriptors(state.execution_plan, statistics.registry());
+  const auto required = deviceAffineNumericBytes(descriptors);
+  if (!maximum_numeric_bytes || required > maximum_numeric_bytes)
+    throw std::length_error("Device affine collection exceeds its remaining numeric budget");
+  using Owner = psiformer::device::PreparedDeviceAffineStatistics;
+  auto factors = scratch->device_products->prepareAffineStatistics(descriptors,
+      statistics.curvatureConvention() == wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN,
+      Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), transaction.parameterVersion());
+  std::vector<std::pair<std::size_t, std::size_t>> fallback_ranges;
+  for (const auto block : statistics.registry().fallbackBlocks())
+  {
+    const auto& tensor = statistics.registry().parameterSchema().blocks()[block];
+    fallback_ranges.emplace_back(tensor.offset, tensor.count);
+  }
+  const auto& shape = state.execution_plan.modelShape();
+  const auto electrons = shape.electrons();
+  for (const auto* particles : samples)
+  {
+    if (!particles || particles->R.getUnit() != PosUnit::Cartesian || particles->isSpinor() ||
+        particles->getTotalNum() < 0 || static_cast<std::size_t>(particles->getTotalNum()) != electrons ||
+        particles->R.size() != electrons || particles->GroupID.size() != electrons || particles->groups() != 2 ||
+        particles->groupsize(0) != static_cast<int>(shape.spin_up_electrons) ||
+        particles->groupsize(1) != static_cast<int>(shape.spin_down_electrons))
+      throw std::invalid_argument("Device affine sample has incompatible coordinates or spin sectors");
+    validateRuntimeLattice(*particles, state.execution_plan.environment(), "Device affine sample");
+    for (std::size_t electron = 0; electron < electrons; ++electron)
+    {
+      if (particles->GroupID[electron] != (electron < shape.spin_up_electrons ? 0 : 1))
+        throw std::invalid_argument("Device affine sample has noncanonical spin ordering");
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double coordinate = particles->R[electron][dimension];
+        if (!psiformer::determinant::isFiniteReal(coordinate))
+          throw std::invalid_argument("Device affine sample contains nonfinite coordinates");
+        scratch->device_positions[3 * electron + dimension] = coordinate;
+      }
+    }
+    statistics.beginSample(1);
+    try
+    {
+      const auto& score = scratch->device_products->affineFallbackScore(scratch->device_positions.data(),
+          *factors, fallback_ranges, transaction.parameterVersion());
+      statistics.addFallbackScores({score.data(), score.size()});
+      auto prepared = factors->prepareSampleCommit();
+      statistics.endSample();
+      prepared.commit();
+    }
+    catch (...)
+    {
+      statistics.abortSample();
+      factors->abortSample();
+      throw;
+    }
+  }
+  std::vector<psiformer::device::DeviceAffineFactorSums> downloaded(descriptors.size());
+  for (std::size_t block = 0; block < descriptors.size(); ++block)
+  {
+    const auto input = descriptors[block].input_width + descriptors[block].bias_augmented;
+    downloaded[block].activation_outer_sum.resize(input * input);
+    downloaded[block].sensitivity_outer_sum.resize(descriptors[block].output_width * descriptors[block].output_width);
+  }
+  factors->download(downloaded);
+  std::vector<wftrain::KFACFactorStatistics> imported;
+  imported.reserve(descriptors.size());
+  for (std::size_t block = 0; block < descriptors.size(); ++block)
+    imported.push_back({descriptors[block].input_width + descriptors[block].bias_augmented,
+        descriptors[block].output_width, downloaded[block].sample_weight_sum, downloaded[block].row_weight_sum,
+        downloaded[block].row_count, std::move(downloaded[block].activation_outer_sum),
+        std::move(downloaded[block].sensitivity_outer_sum)});
+  statistics.importAffineStatistics(statistics.registry().fingerprint(), transaction.parameterVersion(), std::move(imported));
+  app_log() << "PsiFormer KFAC affine statistics: samples=" << factors->sampleCount()
+            << " device_numeric_bytes=" << factors->deviceWorkspaceBytes()
+            << " host_numeric_bytes=" << factors->hostWorkspaceBytes()
+            << "; raw factor sums=DEVICE, fallback intervals/factor boundary=HOST" << std::endl;
+#else
+  throw std::logic_error("Device affine statistics are unavailable in this build");
+#endif
 }
 
 /// Inspect the already validated physical model kind without rebinding any source.

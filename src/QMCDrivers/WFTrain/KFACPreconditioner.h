@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,8 @@ inline constexpr std::size_t NO_KFAC_BIAS_BLOCK =
 /// Curvature registration is independent of the energy objective's weights.
 enum class KFACCurvatureConvention { NATIVE_SCORE, REGISTERED_GAUSSIAN };
 enum class KFACDampingPolicy { EQUAL_SPLIT, TRACE_BALANCED };
+/// Select streamed rows or externally prepared unit-weight raw factor sums.
+enum class KFACAffineStatisticsSource { OBSERVATION_ROWS, PRECOMPUTED_SUMS };
 
 /** Map one affine layer to canonical schema blocks and factor dimensions. */
 struct KFACAffineBlockDescriptor
@@ -123,17 +126,19 @@ struct KFACFactorState
 
 /** Stream complete samples into layer-sized Kronecker factors.
  *
- * A sample transaction must observe every affine block exactly once.  Failed or
- * incomplete transactions are discarded without modifying the published sums.
+ * Row-based samples observe every affine block exactly once. Precomputed mode
+ * streams unit-weight fallback samples, then imports their matching raw factors.
+ * Failed transactions do not modify the previously published sums.
  */
 class KFACFactorAccumulator
 {
 public:
   KFACFactorAccumulator(KFACBlockRegistry registry,
                         std::size_t parameter_version,
-                        KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE);
+                        KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE,
+                        KFACAffineStatisticsSource source = KFACAffineStatisticsSource::OBSERVATION_ROWS);
 
-  /// Begin one sample with a finite nonnegative statistical weight.
+  /// Begin one sample with a finite nonnegative weight; precomputed mode requires one.
   void beginSample(DerivativeReal sample_weight);
 
   /// Add one block's repeated dense rows to the current sample transaction.
@@ -149,6 +154,16 @@ public:
   /// Discard an incomplete current sample while retaining completed statistics.
   void abortSample() noexcept;
 
+  /// Admit raw factor sums once after streamed fallback sample transactions.
+  /// All metadata and arrays are validated before any published factor changes.
+  void importAffineStatistics(const std::string& registry_fingerprint, std::size_t parameter_version,
+                              std::vector<KFACFactorStatistics> factors);
+
+  bool affineStatisticsComplete() const noexcept
+  {
+    return affine_source_ == KFACAffineStatisticsSource::OBSERVATION_ROWS || imported_affine_;
+  }
+
   /// Return the immutable registry that controls observation order and dimensions.
   const KFACBlockRegistry& registry() const noexcept { return registry_; }
 
@@ -159,7 +174,12 @@ public:
   std::size_t sampleCount() const noexcept { return sample_count_; }
 
   /// Return completed factor sums in registry order.
-  const std::vector<KFACFactorStatistics>& factors() const noexcept { return factors_; }
+  const std::vector<KFACFactorStatistics>& factors() const
+  {
+    if (!affineStatisticsComplete())
+      throw std::logic_error("KFAC precomputed affine statistics have not been admitted");
+    return factors_;
+  }
 
   /// Return diagonal numerators in fallback-block/canonical-entry order.
   /// Registered generic entries contain twice the sum of squared signed channel sums;
@@ -189,6 +209,8 @@ private:
 
   KFACBlockRegistry registry_;
   KFACCurvatureConvention convention_;
+  KFACAffineStatisticsSource affine_source_;
+  bool imported_affine_ = false;
   std::size_t parameter_version_ = 0;
   std::size_t sample_count_ = 0;
   DerivativeReal sample_weight_ = 0.0;

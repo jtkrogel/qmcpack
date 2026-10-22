@@ -1026,7 +1026,41 @@ void boundedResponses(Queue& queue)
   for (const auto& flag : flags) nonfinite_count += flag.nonfinite_count;
   if (nonfinite_count != 1 || flags[1].first_nonfinite != 7)
     throw std::runtime_error("finite scan must locate exactly one bad element");
-  std::cout << "PASS bounded_response_dot_finite_scan_ecp_contraction\n";
+  // Composed score admission must detect every nonfinite trunk contribution,
+  // opposite infinities and finite-input overflow using the actual sum kernel.
+  const double infinity = std::numeric_limits<double>::infinity();
+  const double maximum = std::numeric_limits<double>::max();
+  const std::vector<double> trunk{1.0, infinity, -infinity, infinity,
+      -infinity, std::numeric_limits<double>::quiet_NaN(), maximum};
+  const std::vector<double> head{2.0, 1.0, -1.0, -infinity, infinity, 3.0, maximum};
+  auto device_trunk = upload(trunk), device_head = upload(head);
+  DeviceBuffer<double> composed(trunk.size());
+  DeviceBuffer<DerivativeFiniteStatus> composed_status(trunk.size());
+  DerivativeFiniteScanLayout composed_scan{trunk.size(), 1, trunk.size(), 0, 1};
+  checkRuntime(launchAddParameterResponses(queue.getNative(), trunk.size(),
+      device_trunk.data(), device_head.data(), composed.data()), "composed response sum");
+  checkRuntime(launchDerivativeFiniteScan(queue.getNative(), composed_scan, composed.data(),
+      composed_status.data()), "composed response finite scan");
+  queue.sync();
+  const auto composed_flags = download(composed_status);
+  near(download(composed)[0], 3.0, "finite composed response");
+  for (std::size_t element = 0; element < trunk.size(); ++element)
+    if (composed_flags[element].nonfinite_count != (element == 0 ? 0 : 1))
+      throw std::runtime_error("composed response scan lost nonfinite trunk or sum overflow");
+
+  // Reusing the exact status owner for a valid sum must clear prior failures.
+  std::vector<double> valid(trunk.size(), 2.0);
+  device_trunk.upload(valid.data(), valid.size());
+  device_head.upload(valid.data(), valid.size());
+  checkRuntime(launchAddParameterResponses(queue.getNative(), valid.size(),
+      device_trunk.data(), device_head.data(), composed.data()), "valid response recomposition");
+  checkRuntime(launchDerivativeFiniteScan(queue.getNative(), composed_scan, composed.data(),
+      composed_status.data()), "valid composed response finite scan");
+  queue.sync();
+  for (const auto& flag : download(composed_status))
+    if (flag.nonfinite_count != 0)
+      throw std::runtime_error("composed response scan retained stale failure status");
+  std::cout << "PASS bounded_response_dot_finite_scan_ecp_contraction composed_score_admission_recovery\n";
 }
 /// Check output-owned batched score leaves against independent scalar formulas.
 void batchedScoreLeaves(Queue& queue)

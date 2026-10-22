@@ -73,6 +73,18 @@ public:
     return reverseSeeded(forward, weights, nullptr, nullptr, nullptr);
   }
 
+  /// Curvature observes one unweighted real/open sample before scratch reuse.
+  const double* observeAffine(const PreparedDeviceInference& forward, DeviceAffineObservationSink& affine)
+  {
+    ready_ = false;
+    if (forward.valueTapeBatchCount() != 1 || model_->plan().environment().periodic_profile ||
+        model_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL)
+      throw std::invalid_argument("Device affine score observations require one real open sample");
+    unit_weights_.resize(1);
+    unit_weights_[0] = 1.0;
+    return reverseSeeded(forward, unit_weights_, nullptr, nullptr, nullptr, &affine);
+  }
+
   /// Reverse independent determinant log amplitudes, rather than log of their sum.
   const double* reverseChannels(const PreparedDeviceInference& forward, const std::vector<double>& coefficients)
   {
@@ -121,7 +133,7 @@ private:
   /// Share the head/trunk reverse while preserving each objective's seed rules.
   const double* reverseSeeded(const PreparedDeviceInference& forward, const std::vector<double>& weights,
       const std::vector<double>* channels, const std::vector<double>* raw_seeds,
-      const std::vector<double>* cusp_weights)
+      const std::vector<double>* cusp_weights, DeviceAffineObservationSink* affine = nullptr)
   {
     ready_ = false;
     model_->validateCurrentDevice();
@@ -186,6 +198,15 @@ private:
       const auto offset = model_->plan().parameter(spin.first).begin;
       accumulateDenseWeightAdjoint(blas_, backflow, forward.valueFinalFeatures(), spin.second->data(),
                                    head_response_.data() + offset);
+      if (affine)
+      {
+        const auto begin = spin.first == ParameterRole::BACKFLOW_UP_WEIGHT ? 0 : shape.spin_up_electrons;
+        const auto rows = spin.first == ParameterRole::BACKFLOW_UP_WEIGHT ? shape.spin_up_electrons :
+            shape.spin_down_electrons;
+        if (rows)
+          affine->observe(spin.first, NO_ATTENTION_BLOCK, forward.valueFinalFeatures() + begin * width,
+              spin.second->data() + begin * determinants * ne, rows, width, determinants * ne);
+      }
       accumulateDenseInputAdjoint(blas_, backflow, spin.second->data(), model_->parameters() + offset,
                                   feature_.data());
     }
@@ -206,7 +227,10 @@ private:
 
     // Remaining trunk and feature layer: one device cotangent drives the explicit
     // shared-weight reverse. Add independent head/trunk intervals canonically.
-    const double* trunk = network_.reverse(forward, {}, feature_.data());
+    // Same-stream composition needs no intermediate HOST status round trip.
+    // Any nonfinite trunk element remains nonfinite after adding the head,
+    // including opposite infinities, so the final scan admits both together.
+    const double* trunk = network_.reverseUnadmitted(forward, feature_.data(), affine);
     checkRuntime(launchAddParameterResponses(stream, response_.capacity(), trunk,
         head_response_.data(), response_.data()), "score canonical response sum");
     checkRuntime(launchDerivativeFiniteScan(stream, finite_layout_, response_.data(), finite_status_.data()),

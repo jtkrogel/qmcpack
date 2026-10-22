@@ -4102,6 +4102,9 @@ void WFTrainBatched::run()
         else if (score_kfac_training)
         {
           const auto& schema = selected_provider_->parameterSchema();
+          const auto* affine_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+          bool device_affine = false;
+          std::size_t device_affine_budget = 0;
           std::optional<wftrain::StructuredParameterSnapshot> parameters;
           std::unique_ptr<wftrain::KFACFactorAccumulator> statistics;
           psiformer::memory::HostCapacity memory_statistics;
@@ -4113,12 +4116,16 @@ void WFTrainBatched::run()
             psiformer::memory::Phase memory_timer("affine_observation");
             parameters.emplace(selected_provider_->snapshotParameters());
             auto registry = makeLiveKFACRegistry(*selected_provider_);
+            device_affine = affine_provider && affine_provider->usesDeviceAffineStatistics() &&
+                !registry.affineBlocks().empty();
             if (const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_);
                 real && real->usesAcceleratorParameterProducts())
             {
-              // Sequential HOST observations borrow no device outputs. Admit their
-              // transient tape and score/snapshot vectors alongside retained owners.
-              const auto affine_bytes = real->affineScoreStorageBytes();
+              // Admit the selected transient affine owner beside retained products
+              // and the existing HOST parameter/snapshot channels before allocation.
+              const auto affine_bytes = device_affine ? real->deviceAffineStatisticsStorageBytes(registry) :
+                  real->affineScoreStorageBytes();
+              device_affine_budget = device_affine ? affine_bytes : 0;
               const auto vectors = checkedMemoryMultiply(schema.parameterCount(), 3 * sizeof(double));
               auto live = checkedMemoryAdd(retained_configuration_bytes, storage_diagnostics.retained_numeric_bytes);
               live = checkedMemoryAdd(live, checkedMemoryAdd(affine_bytes, vectors));
@@ -4128,29 +4135,43 @@ void WFTrainBatched::run()
               // Local failures join the common preflight below; never enter a
               // collective from this rank-local allocation/observation try block.
               if (live > training_input_.getMaximumRetainedBytes())
-                throw std::length_error("Hybrid KFAC HOST affine storage exceeds maximum_retained_bytes");
-              logTrainingAllocation("hybrid_kfac_host_affine", 1, schema.parameterCount(), affine_bytes);
+                throw std::length_error("Hybrid KFAC affine storage exceeds maximum_retained_bytes");
+              logTrainingAllocation(device_affine ? "hybrid_kfac_device_affine_statistics" : "hybrid_kfac_host_affine",
+                  1, schema.parameterCount(), affine_bytes);
             }
             logTrainingAllocation("complex_kfac_transactional_factors", 0, schema.parameterCount(),
                                   kfacStatisticsBytes(registry));
             statistics = std::make_unique<wftrain::KFACFactorAccumulator>(std::move(registry), parameters->version,
                 training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::REGISTERED_GAUSSIAN
                     ? wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN
-                    : wftrain::KFACCurvatureConvention::NATIVE_SCORE);
+                    : wftrain::KFACCurvatureConvention::NATIVE_SCORE,
+                device_affine ? wftrain::KFACAffineStatisticsSource::PRECOMPUTED_SUMS :
+                    wftrain::KFACAffineStatisticsSource::OBSERVATION_ROWS);
             if (psiformer::memory::enabled())
               memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",
                   statistics->retainedNumericBytes(), reinterpret_cast<std::uintptr_t>(statistics.get()), -1, parameters->version);
-            LiveAffineObserver observer(*statistics);
-            std::vector<double> real_score, imaginary_score;
-            for (const auto& samples : retained_samples)
-              for (const auto& particles : samples.particles)
-              {
-                statistics->beginSample(1);
-                selected_provider_->observeComplexAffineScores(*particles, observer, real_score, imaginary_score);
-                statistics->addFallbackScores({real_score.data(), real_score.size()},
-                                               {imaginary_score.data(), imaginary_score.size()});
-                statistics->endSample();
-              }
+            if (device_affine)
+            {
+              std::vector<const ParticleSet*> samples;
+              for (const auto& retained : retained_samples)
+                for (const auto& particles : retained.particles)
+                  samples.push_back(particles.get());
+              affine_provider->accumulateDeviceAffineStatistics(samples, *statistics, device_affine_budget);
+            }
+            else
+            {
+              LiveAffineObserver observer(*statistics);
+              std::vector<double> real_score, imaginary_score;
+              for (const auto& samples : retained_samples)
+                for (const auto& particles : samples.particles)
+                {
+                  statistics->beginSample(1);
+                  selected_provider_->observeComplexAffineScores(*particles, observer, real_score, imaginary_score);
+                  statistics->addFallbackScores({real_score.data(), real_score.size()},
+                                                 {imaginary_score.data(), imaginary_score.size()});
+                  statistics->endSample();
+                }
+            }
             // Physical local energies and score products share the same accepted samples.
             // These explicit score-only estimators need no local-energy parameter responses.
           }
