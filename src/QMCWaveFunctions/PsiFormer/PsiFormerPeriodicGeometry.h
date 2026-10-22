@@ -43,10 +43,24 @@ struct Cell
 
 static_assert(std::is_trivially_copyable_v<Cell> && std::is_standard_layout_v<Cell>);
 
+// Cell coefficients cross translation units with different Release policies.
+// Keep their host-only construction reproducible without changing hot jet math.
+#if defined(__clang__)
+#if !defined(__HIP_DEVICE_COMPILE__)
+#pragma float_control(precise, on, push)
+#endif
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("no-fast-math", "fp-contract=off")
+#endif
+
 /// Build the same validated reciprocal rows used by the CPU geometry cache.
 inline Cell makeCell(const std::array<std::array<double, 3>, 3>& lattice,
                      const std::array<bool, 3>& periodic_axes)
 {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
   Cell result;
   double scale = 0;
   for (std::size_t axis = 0; axis < 3; ++axis)
@@ -86,6 +100,13 @@ inline Cell makeCell(const std::array<std::array<double, 3>, 3>& lattice,
     }
   return result;
 }
+#if defined(__clang__)
+#if !defined(__HIP_DEVICE_COMPILE__)
+#pragma float_control(pop)
+#endif
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 
 /// Keep simulation electron pairs and primitive ion descriptors in distinct cells.
 inline Cell makeTwoCell(const std::array<std::array<double, 3>, 3>& simulation,

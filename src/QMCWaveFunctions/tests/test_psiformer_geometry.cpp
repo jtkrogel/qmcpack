@@ -427,6 +427,29 @@ TEST_CASE("PsiFormer periodic torus geometry is image invariant and differentiab
   checkClose(finite_radius_laplacian, analytic_radius_laplacian, 2e-6);
 }
 
+TEST_CASE("PsiFormer skew-cell coefficients retain strict host rounding",
+          "[wavefunction][psiformer][periodic]")
+{
+  namespace pg = qmcplusplus::psiformer::periodic_geometry;
+  const std::array<std::array<double, 3>, 3> lattice{{
+      {3.8370888961, -7.6741777921, -11.5112666882},
+      {11.5112666882, 7.6741777921, 3.8370888961},
+      {3.8370888961, -11.5112666882, 7.6741777921}}};
+  // IEEE binary64, separately rounded products/additions and division. This
+  // caller may use Release fast math; construction has its own strict policy.
+  const double expected[3][3]{
+      {0x1.2ae4ac885eda7p-5, -0x1.aafd88c2c2fdfp-6, -0x1.d5b07cd650023p-5},
+      {0x1.158b327e9f839p-4, 0x1.aafd88c2dfab1p-6, 0x1.5597a09bf56dbp-8},
+      {0x1.5597a09bcf318p-6, -0x1.aafd88c2d61cp-5, 0x1.5597a09bd8c0ap-5}};
+  auto cell = pg::makeCell(lattice, {true, true, true});
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    for (std::size_t component = 0; component < 3; ++component)
+      CHECK(cell.reciprocal[axis][component] == expected[axis][component]);
+  CHECK_NOTHROW(pg::validateCell(cell));
+  cell.reciprocal[0][0] = std::nextafter(cell.reciprocal[0][0], std::numeric_limits<double>::infinity());
+  CHECK_THROWS_AS(pg::validateCell(cell), std::invalid_argument);
+}
+
 TEST_CASE("PsiFormer periodic geometry validates bulk cells", "[wavefunction][psiformer][periodic]")
 {
   CHECK(pf::supportsGeometryBoundary(pf::GeometryBoundaryKind::OPEN));
