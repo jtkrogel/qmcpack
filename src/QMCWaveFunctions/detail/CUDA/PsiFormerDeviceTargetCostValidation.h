@@ -200,6 +200,25 @@ inline void validateTargetSelectionCosts()
       if (resolveDeviceTargetSelection(plan, request, 0).vgl.max_targets != 3)
         throw std::runtime_error("Unset selector changed an explicit noncandidate K");
     }
+  // The optional cusp cache is charged before graph reserves, including its status owner.
+  for (const bool periodic : {false, true})
+  {
+    const auto cusp_plan = makeTargetCostPlan(100, periodic);
+    TargetVglPreparation reference{1, 0, 0, 0, false};
+    auto cached = reference;
+    cached.reuse_cusp_state = true;
+    const auto original = estimatePreparedTargetVglCost(cusp_plan, 4, reference);
+    const auto candidate = estimatePreparedTargetVglCost(cusp_plan, 4, cached);
+    const auto extra = checkedDeviceBytes<double>(4 * 401) + checkedDeviceBytes<OpenSpatialStatus>(4);
+    if (candidate.device_workspace_bytes != original.device_workspace_bytes + extra ||
+        candidate.host_workspace_bytes != original.host_workspace_bytes ||
+        candidate.charged_scalar_work_units != original.charged_scalar_work_units)
+      throw std::runtime_error("Cusp state cache preflight charge disagrees with exact owner storage");
+    cached.max_targets = reference.max_targets = 100;
+    if (estimatePreparedTargetVglCost(cusp_plan, 4, cached).device_workspace_bytes !=
+        estimatePreparedTargetVglCost(cusp_plan, 4, reference).device_workspace_bytes)
+      throw std::runtime_error("Full-target VGL charged an unused cusp cache");
+  }
   // The same whole-owner budget selects K2 at B1 but only K1 at actual B2.
   const auto plan = makeTargetCostPlan(100, false);
   DeviceExecutionPreparation parallel;
@@ -231,7 +250,25 @@ inline void validateTargetSelectionCosts()
   denied.active_inference_crowds = 2;
   invalid([&] { (void)resolveDeviceTargetSelection(plan, denied); });
   invalid([&] { validateDeviceExecutionPreparation(plan, denied); });
-  invalid([&] { (void)resolveDeviceTargetSelection(makeTargetCostPlan(100, true), parallel); });
+  // Geometry is consumed by the orbital jets, not by the bounded trace leaf.
+  // Periodic real admission must still charge every slot before owner creation.
+  const auto periodic_plan = makeTargetCostPlan(100, true);
+  auto periodic = parallel;
+  periodic.vgl = {1, 0, 0, 1024 * 1024};
+  const auto periodic_cost = estimatePreparedTargetVglCost(periodic_plan, 2, periodic.vgl);
+  const auto periodic_base = estimateTargetVglCost(periodic_plan, 2, 1);
+  const auto open_base = estimateTargetVglCost(plan, 2, 1);
+  if (periodic_cost.device_workspace_bytes - periodic_base.device_workspace_bytes !=
+      minimum_b2.device_workspace_bytes - open_base.device_workspace_bytes ||
+      periodic_cost.charged_scalar_work_units != minimum_b2.charged_scalar_work_units)
+    throw std::runtime_error("Periodic parallel traces changed geometry-independent slot or work charging");
+  periodic.vgl.device_workspace_budget_bytes = periodic_cost.device_workspace_bytes;
+  periodic.vgl.scalar_work_budget = periodic_cost.charged_scalar_work_units;
+  periodic.select_vgl_targets = false;
+  validateDeviceExecutionPreparation(periodic_plan, periodic, 2);
+  --periodic.vgl.device_workspace_budget_bytes;
+  infeasible([&] { validateDeviceExecutionPreparation(periodic_plan, periodic, 2); });
+  invalid([&] { (void)resolveDeviceTargetSelection(makeTargetCostPlan(100, true, true), parallel); });
   invalid([&] { (void)resolveDeviceTargetSelection(makeTargetCostPlan(100, false, true), parallel); });
   std::cout << "# PASS parallel_composite_selection exact_B2_budget B1K2_B2K1 capacity_denial profiles\n";
   const auto after = deviceMemoryMetrics(0).snapshot();

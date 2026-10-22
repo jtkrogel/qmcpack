@@ -199,6 +199,53 @@ void validate(bool selected_two_cell = false)
   for (std::size_t plane = 0; plane < layout.plane_count; ++plane)
     near(jets[layout.uncheckedPlaneOffset(2, plane, 0)], jets[layout.uncheckedPlaneOffset(0, plane, 0)], "integer-image VGL");
 
+  // The bounded trace owner consumes ordinary orbital jets in either geometry.
+  // Exercise target tails, changing requests, parameter successors and rollback.
+  if (!selected_two_cell)
+    for (const std::size_t targets : {std::size_t(1), std::size_t(3)})
+    {
+      TargetVglPreparation preparation{targets, 0, 0, 1024 * 1024};
+      const auto cost = estimatePreparedTargetVglCost(plan, 3, preparation);
+      preparation.device_workspace_budget_bytes = cost.device_workspace_bytes;
+      preparation.scalar_work_budget = cost.charged_scalar_work_units;
+      PreparedDeviceInference parallel(image, 3, queue, blas, SpatialJetMode::FULL_VGL, false, false,
+          InferenceStatusPolicy::SYNCHRONOUS_DEBUG, preparation);
+      PreparedDeviceInference reference(image, 3, queue, blas);
+      if (parallel.deviceWorkspaceBytes() != cost.device_workspace_bytes)
+        throw std::runtime_error("Periodic parallel traces changed charged owner bytes");
+      const auto compare = [&](const std::vector<double>& coordinates) {
+        parallel.evaluate(coordinates);
+        reference.evaluate(coordinates);
+        std::vector<double> pp(3), rp(3), pj(jets.size()), rj(jets.size()), pl(lap_ratio.size()), rl(lap_ratio.size());
+        parallel.downloadResults(pp, pj, pl);
+        reference.downloadResults(rp, rj, rl);
+        for (std::size_t i = 0; i < pp.size(); ++i) near(pp[i], rp[i], "periodic parallel phase");
+        for (std::size_t i = 0; i < pj.size(); ++i) near(pj[i], rj[i], "periodic parallel VGL");
+        for (std::size_t i = 0; i < pl.size(); ++i) near(pl[i], rl[i], "periodic parallel ratio");
+      };
+      compare(model.cfg.electrons.x);
+      auto shifted = model.cfg.electrons.x;
+      shifted[0] += .013;
+      compare(shifted);
+      compare(model.cfg.electrons.x);
+      auto invalid = model.cfg.electrons.x;
+      invalid.back() = std::numeric_limits<double>::quiet_NaN();
+      bool rejected = false, revoked = false;
+      try { parallel.evaluate(invalid); } catch (const std::runtime_error&) { rejected = true; }
+      try { parallel.downloadResults(spatial_phases, jets, lap_ratio); }
+      catch (const std::logic_error&) { revoked = true; }
+      if (!rejected || !revoked) throw std::runtime_error("Periodic parallel failure exposed stale VGL");
+      compare(model.cfg.electrons.x);
+      auto changed = model.p.flat_values();
+      changed.front() += .01;
+      const auto updated = image->makeUpdatedImage(changed, image->version() + 1);
+      parallel.rebindModel(updated);
+      reference.rebindModel(updated);
+      compare(model.cfg.electrons.x);
+      std::cout << "PASS periodic real parallel K" << targets
+                << " full-VGL parity, exact owner bytes, positions/reject/retry/parameter successor\n";
+    }
+
   PreparedDeviceScoreReverse reverse(image, 3, queue, blas);
   if (!selected_two_cell)
     validateTargetKinetic(model, plan, image, queue, blas);

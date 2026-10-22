@@ -169,11 +169,13 @@ inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan&
   if (preparation.parallel_trace_workspace_budget_bytes)
   {
     const auto& environment = plan.environment();
-    if (environment.boundary != BoundaryCondition::OPEN ||
+    if ((environment.boundary != BoundaryCondition::OPEN && environment.boundary != BoundaryCondition::PERIODIC) ||
+        (environment.boundary == BoundaryCondition::PERIODIC &&
+         environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1) ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-      throw std::invalid_argument("Parallel VGL traces require fixed-ion real/open FP64");
+      throw std::invalid_argument("Parallel VGL traces require fixed-ion real FP64 open or periodic-torus geometry");
     const auto& shape = plan.modelShape();
     const auto k = preparation.max_targets;
     const auto trace = planSpatialTraceWorkspace({batch, shape.determinants, shape.electrons(),
@@ -1399,7 +1401,12 @@ private:
     // Only values need compact packing for factorization and the score-head ABI.
     // Spatial traces borrow the existing orbital planes with a configuration stride,
     // avoiding a second B*4Ne*D*Ne^2 derivative tensor and two copies per configuration.
-    if (parallel_traces_)
+    const char* reuse_flag = std::getenv("PSIFORMER_GPU_TARGET_FACTOR_REUSE");
+    const bool request_local_factor_reuse = reuse_flag && reuse_flag[0] == '1' && reuse_flag[1] == '\0' &&
+        target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
+        !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
+        plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
+    if (parallel_traces_ || request_local_factor_reuse)
     {
       // Only later tiles of this request may reuse successful bitwise-equal bases.
       // Every public/direct tile call and every new coordinate attempt starts fresh.
