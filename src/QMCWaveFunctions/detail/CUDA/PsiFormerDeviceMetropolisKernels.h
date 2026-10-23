@@ -22,10 +22,11 @@ __host__ __device__
 inline bool metropolisLogComparison(double log_uniform, double log_acceptance) noexcept
 { return log_uniform < log_acceptance; }
 
-/// Generate all coordinates without touching the accepted source.
+/// Stage a joint proposal, copying unselected coordinates exactly from its accepted source.
 Error launchMetropolisProposal(Stream stream, std::size_t population, std::size_t electrons,
     const double* accepted, const double* gaussian, const double* inverse_mass, double tau,
-    double* proposed, std::uint64_t* status, bool physical_displacement = false);
+    double* proposed, std::uint64_t* status, bool physical_displacement = false,
+    const std::uint32_t* selected = nullptr);
 
 /// Consume a VALUE microtile; optional loggb/loggf arrays require offset=0, seed=false and extent=2*count.
 Error launchMetropolisStageValues(Stream stream, std::size_t count, std::size_t offset, bool seed,

@@ -21,11 +21,17 @@ __device__ void fail(std::uint64_t* status, std::size_t index, unsigned code)
 
 /// Apply the drift-free species-mass diffusion law to one packed coordinate.
 __global__ void propose(std::size_t count, std::size_t ne, const double* accepted, const double* gaussian,
-    const double* inverse_mass, double tau, double* proposed, std::uint64_t* status, bool physical_displacement)
+    const double* inverse_mass, double tau, double* proposed, std::uint64_t* status, bool physical_displacement,
+    const std::uint32_t* selected)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count)
     return;
+  if (selected && !selected[index / 3])
+  {
+    proposed[index] = accepted[index];
+    return;
+  }
   const double variance = tau * inverse_mass[(index / 3) % ne];
   const double result = accepted[index] + (physical_displacement ? gaussian[index] : sqrt(variance) * gaussian[index]);
   proposed[index] = result;
@@ -131,14 +137,14 @@ Error launched()
 /// Launch checked coordinate staging, never an accepted-state update.
 Error launchMetropolisProposal(Stream stream, std::size_t population, std::size_t electrons,
     const double* accepted, const double* gaussian, const double* inverse_mass, double tau,
-    double* proposed, std::uint64_t* status, bool physical_displacement)
+    double* proposed, std::uint64_t* status, bool physical_displacement, const std::uint32_t* selected)
 {
   if (!population || !electrons || population > std::numeric_limits<std::size_t>::max() / 3 / electrons ||
       !accepted || !gaussian || !inverse_mass || !proposed || !status)
     throw std::invalid_argument("Metropolis proposal has invalid extent or device storage");
   const auto count = population * electrons * 3;
   propose<<<blocks(count), 128, 0, stream>>>(count, electrons, accepted, gaussian, inverse_mass, tau, proposed, status,
-      physical_displacement);
+      physical_displacement, selected);
   return launched();
 }
 

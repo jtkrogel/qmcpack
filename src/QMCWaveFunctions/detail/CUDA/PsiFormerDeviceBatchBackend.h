@@ -270,24 +270,30 @@ public:
       const std::function<void(std::vector<double>&)>& gaussian_draw,
       const std::function<double()>& uniform_draw, std::vector<double>& accepted_positions,
       const std::function<void(const std::vector<std::uint32_t>&)>& validation_mask_observer = {},
-      bool use_drift = false, NativeDriftCallback drift = {}, bool retain_device_coordinates = false) const
+      bool use_drift = false, NativeDriftCallback drift = {}, bool retain_device_coordinates = false,
+      std::size_t particles_per_move = 0,
+      const std::function<void(std::vector<std::size_t>&)>& select_indices = {}) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
     const auto ne = image_->plan().modelShape().electrons();
+    const bool selected = particles_per_move != 0;
     if (!context || context->owner != this || !metropolisBudget() || mixed_parameters_ ||
         positions.empty() || positions.size() % (3 * ne) || inverse_mass.size() != ne ||
         !substeps || !gaussian_draw || !uniform_draw || version != image_->version() ||
         !device_math::isFiniteBinary64(tau) || tau <= 0)
       throw std::invalid_argument("Device sampling requires its explicit real/open FP64 crowd profile and current image");
+    if (selected != bool(select_indices) || particles_per_move >= ne)
+      throw std::invalid_argument("Device sampling selected moves require a proper subset and index callback");
     if (use_drift != bool(metropolisDriftBudget()) || (use_drift && !drift))
       throw std::invalid_argument("Device sampling usedrift must match its explicit additions cap and native policy");
     if ((retain_device_coordinates && use_drift) ||
         (context->resident_coordinates && !retain_device_coordinates))
       throw std::invalid_argument("Resident sampling requires no drift and an explicit cold coordinate fence before HOST reuse");
-    if (context->resident_coordinates && context->sampler_masses != inverse_mass)
-      throw std::invalid_argument("Resident sampling cannot reseed changed masses from stale HOST coordinates");
-    const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne);
+    if (context->resident_coordinates && (context->sampler_masses != inverse_mass ||
+        (context->sampler && context->sampler->cost().selected != selected)))
+      throw std::invalid_argument("Resident sampling needs a cold coordinate fence before changing masses or selection workspace");
+    const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne, selected);
     if (cost.device_bytes > metropolisBudget())
       throw std::length_error("Device sampling exceeds its explicit standalone per-crowd budget before draws");
     const auto drift_cost = use_drift ? estimateMetropolisDriftCost(image_->plan(), context->capacity, cost.population)
@@ -313,8 +319,12 @@ public:
       context->hooks.retainValueTape();
     }
     const bool reseed = !context->sampler || (!context->resident_coordinates && context->sampler_positions != positions) ||
-        context->sampler_masses != inverse_mass;
-    context->sampler_gaussian.resize(positions.size());
+        context->sampler_masses != inverse_mass || context->sampler->cost().selected != selected;
+    const auto selected_count = spatial_detail::checkedProduct(cost.population, particles_per_move,
+                                                               "Device sampler selected extent overflow");
+    context->sampler_indices.resize(selected_count);
+    context->sampler_gaussian.resize(selected ? spatial_detail::checkedProduct(selected_count, 3,
+        "Device sampler Gaussian extent overflow") : positions.size());
     context->sampler_uniforms.resize(cost.population);
     std::size_t accepts = 0, uniform_draws = 0;
     try
@@ -328,9 +338,9 @@ public:
         context->sampler_masses = inverse_mass;
         context->sampler = use_drift
             ? PreparedDeviceMetropolis::prepareDrift(*context->hooks.values_, context->hooks.queue_,
-                positions, inverse_mass, metropolisBudget(), metropolisDriftBudget(), drift)
+                positions, inverse_mass, metropolisBudget(), metropolisDriftBudget(), drift, selected)
             : PreparedDeviceMetropolis::prepare(*context->hooks.values_, context->hooks.queue_,
-                positions, inverse_mass, metropolisBudget());
+                positions, inverse_mass, metropolisBudget(), selected);
         context->sampler_version = version;
       }
       else if (context->sampler_version != version)
@@ -345,7 +355,14 @@ public:
       for (std::size_t step = 0; step < substeps; ++step)
       {
         gaussian_draw(context->sampler_gaussian);
-        const auto token = context->sampler->propose(context->sampler_gaussian, tau, version);
+        if (selected)
+        {
+          select_indices(context->sampler_indices);
+          if (context->sampler_indices.size() != selected_count)
+            throw std::invalid_argument("Device sampler index callback changed the selected extent");
+        }
+        const auto token = context->sampler->propose(context->sampler_gaussian, tau, version,
+                                                    context->sampler_indices);
         const auto& eligible = context->sampler->eligibility(token);
         for (std::size_t walker = 0; walker < cost.population; ++walker)
           if (eligible[walker] & METROPOLIS_ELIGIBLE)
@@ -396,10 +413,13 @@ public:
               << ", drift_policy=" << (use_drift ? "native_host_callback_failclosed" : "none")
               << ", VALUE_capacity=" << context->capacity << ", substeps=" << substeps
               << ", parameter_version=" << version << ", per_crowd_budget_bytes=" << metropolisBudget()
-              << ", sampler_device_bytes=" << cost.device_bytes << ", owner_host_mask_bytes=" << cost.host_bytes
+              << ", sampler_device_bytes=" << cost.device_bytes
+              << ", owner_host_mask_bytes=" << checkedDeviceBytes<std::uint32_t>(cost.population)
+              << ", owner_host_bytes=" << cost.host_bytes
+              << ", selected_electrons_per_joint_proposal=" << (selected ? particles_per_move : ne)
               << ", host_scratch_bytes=" << sizeof(double) * (context->sampler_positions.capacity() +
                     context->sampler_gaussian.capacity() + context->sampler_uniforms.capacity() +
-                    context->sampler_masses.capacity())
+                    context->sampler_masses.capacity()) + sizeof(std::size_t) * context->sampler_indices.capacity()
               << ", bridge_host_staging_bytes=" << sizeof(double) * (positions.capacity() +
                     inverse_mass.capacity() + accepted_positions.capacity())
               << ", borrowed_VALUE_graph_bytes=" << context->hooks.values_->deviceWorkspaceBytes()
@@ -599,6 +619,7 @@ private:
     // Declared after hooks: sampler must die before its borrowed graph/queue.
     std::unique_ptr<PreparedDeviceMetropolis> sampler;
     std::vector<double> sampler_positions, sampler_gaussian, sampler_uniforms, sampler_masses;
+    std::vector<std::size_t> sampler_indices;
     std::size_t sampler_version = 0;
     bool resident_coordinates = false;
     std::vector<double> positions;

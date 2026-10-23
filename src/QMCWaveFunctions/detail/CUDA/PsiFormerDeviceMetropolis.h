@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerDeviceMetropolis.h
- * @brief Injected-draw real/open whole-system Metropolis, with opt-in native host drift.
+ * @brief Injected-draw real/open joint Metropolis, with opt-in native host drift.
  * The borrowed VALUE graph and queue MUST outlive this noncopyable owner. Callers
  * hold their existing model/crowd execution lease, exclude competing graph work
  * and publication during a request, and keep the owning device current. This is
@@ -50,10 +50,11 @@ inline CoordinateGradientCost estimateMetropolisDriftCost(const PsiFormerExecuti
 struct MetropolisCost
 {
   std::size_t population, electrons, coordinates, device_bytes, host_bytes;
+  bool selected = false;
 };
 
 /// Check every extent/byte before any owner state or device allocation.
-inline MetropolisCost estimateMetropolisCost(std::size_t population, std::size_t electrons)
+inline MetropolisCost estimateMetropolisCost(std::size_t population, std::size_t electrons, bool selected = false)
 {
   using spatial_detail::checkedAdd;
   using spatial_detail::checkedProduct;
@@ -68,9 +69,14 @@ inline MetropolisCost estimateMetropolisCost(std::size_t population, std::size_t
       electrons, "Metropolis masses overflow"), checkedProduct(6, population, "Metropolis scalar rows overflow"),
       "Metropolis double storage overflow");
   const auto masks = checkedDeviceBytes<std::uint32_t>(population);
+  const auto selection = selected ? checkedDeviceBytes<std::uint32_t>(coordinates / 3) : 0;
+  const auto host_draws = selected ? checkedDeviceBytes<double>(coordinates) : 0;
   return {population, electrons, coordinates,
       checkedAdd(checkedAdd(checkedDeviceBytes<double>(doubles), masks, "Metropolis device bytes overflow"),
-                 sizeof(std::uint64_t), "Metropolis status bytes overflow"), masks};
+                 checkedAdd(sizeof(std::uint64_t), selection, "Metropolis selection bytes overflow"),
+                 "Metropolis status bytes overflow"),
+      checkedAdd(checkedAdd(masks, selection, "Metropolis host mask bytes overflow"), host_draws,
+                 "Metropolis host selection draws overflow"), selected};
 }
 
 /// Owner-issued pending source epoch; weak identity prevents expired-owner reuse.
@@ -87,7 +93,7 @@ private:
 };
 
 /** Own accepted/proposed coordinates and caches, never a parameter image.
- * Whole-system moves are independent of all-electron versus ECP Hamiltonians.
+ * Joint all-electron or selected moves are independent of AE versus ECP Hamiltonians.
  * Draws upload from the host; status/exports download explicitly. No RNG state
  * or opaque derived TWF/Hamiltonian cache is maintained here.
  */
@@ -106,7 +112,7 @@ public:
   /// Admit the entire owner before allocation; VALUE microtile capacity is independent of B.
   static std::unique_ptr<PreparedDeviceMetropolis> prepare(PreparedDeviceInference& graph,
       compute::Queue<PlatformKind::CUDA>& queue, const std::vector<double>& positions,
-      const std::vector<double>& inverse_mass, std::size_t workspace_budget_bytes)
+      const std::vector<double>& inverse_mass, std::size_t workspace_budget_bytes, bool selected = false)
   {
     graph.model_->validateCurrentDevice();
     const auto ne = graph.plan_.modelShape().electrons();
@@ -115,7 +121,7 @@ public:
         graph.plan_.environment().boundary != BoundaryCondition::OPEN || &graph.queue_ != &queue ||
         positions.empty() || positions.size() % (3 * ne) != 0 || inverse_mass.size() != ne)
       throw std::invalid_argument("Device Metropolis needs one borrowed FP64/open VALUE graph and packed physical inputs");
-    const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne);
+    const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne, selected);
     if (cost.device_bytes > workspace_budget_bytes)
       throw std::length_error("Device Metropolis exceeds its standalone owner budget");
     for (const auto value : positions)
@@ -131,7 +137,7 @@ public:
   static std::unique_ptr<PreparedDeviceMetropolis> prepareDrift(PreparedDeviceInference& graph,
       compute::Queue<PlatformKind::CUDA>& queue, const std::vector<double>& positions,
       const std::vector<double>& inverse_mass, std::size_t owner_budget, std::size_t drift_budget,
-      NativeDriftCallback drift)
+      NativeDriftCallback drift, bool selected = false)
   {
     const auto cost = estimateMetropolisDriftCost(graph.plan_, graph.batch_capacity_,
         positions.size() / (3 * graph.plan_.modelShape().electrons()));
@@ -140,7 +146,7 @@ public:
       throw std::invalid_argument("Explicit drift needs a native policy, finite cap and retained VALUE graph");
     if (cost.device_workspace_bytes > drift_budget)
       throw std::length_error("Metropolis drift additions exceed per-crowd device budget");
-    auto result = prepare(graph, queue, positions, inverse_mass, owner_budget);
+    auto result = prepare(graph, queue, positions, inverse_mass, owner_budget, selected);
     result->gradient_ = PreparedDeviceCoordinateGradient::prepare(graph.model_, graph.batch_capacity_, queue, graph.blas_,
         estimateCoordinateGradientCost(graph.plan_, graph.batch_capacity_).device_workspace_bytes);
     result->gradient_version_ = graph.model_->version();
@@ -204,7 +210,8 @@ public:
   }
 
   /// Stage all proposed VALUE microtiles without changing accepted coordinates/cache.
-  MetropolisProposal propose(const std::vector<double>& gaussian, double tau, std::size_t version)
+  MetropolisProposal propose(const std::vector<double>& gaussian, double tau, std::size_t version,
+                               const std::vector<std::size_t>& selected_indices = {})
   {
     std::lock_guard lock(mutex_);
     const bool was_pending = pending_;
@@ -212,23 +219,57 @@ public:
     if (was_pending)
       throw std::logic_error("Resolve the pending Metropolis proposal before replacing it");
     requireCache(version);
-    if (gaussian.size() != cost_.coordinates || !device_math::isFiniteBinary64(tau) || tau <= 0)
+    const auto draw_count = cost_.selected
+        ? spatial_detail::checkedProduct(selected_indices.size(), 3, "Metropolis selected draw extent overflow")
+        : cost_.coordinates;
+    if (gaussian.size() != draw_count || !device_math::isFiniteBinary64(tau) || tau <= 0)
       throw std::invalid_argument("Device Metropolis Gaussian extent or timestep is invalid");
+    if (cost_.selected)
+    {
+      if (selected_indices.empty() || selected_indices.size() % cost_.population ||
+          selected_indices.size() / cost_.population >= cost_.electrons)
+        throw std::invalid_argument("Device Metropolis selected extent must be a proper nonempty subset per walker");
+      const auto count = selected_indices.size() / cost_.population;
+      for (std::size_t walker = 0; walker < cost_.population; ++walker)
+        for (std::size_t local = 0; local < count; ++local)
+        {
+          const auto index = walker * count + local;
+          if (selected_indices[index] >= cost_.electrons ||
+              (local && selected_indices[index - 1] >= selected_indices[index]))
+            throw std::invalid_argument("Device Metropolis selected indices must be sorted, unique and in range");
+        }
+      std::fill(host_selected_.begin(), host_selected_.end(), 0);
+      std::fill(dense_gaussian_.begin(), dense_gaussian_.end(), 0);
+      for (std::size_t walker = 0; walker < cost_.population; ++walker)
+        for (std::size_t local = 0; local < count; ++local)
+        {
+          const auto index = walker * count + local;
+          const auto electron = walker * cost_.electrons + selected_indices[index];
+          host_selected_[electron] = 1;
+          std::copy_n(gaussian.data() + 3 * index, 3, dense_gaussian_.data() + 3 * electron);
+        }
+    }
+    else if (!selected_indices.empty())
+      throw std::invalid_argument("Device Metropolis selected proposals need an admitted selection workspace");
     for (const auto value : gaussian)
       if (!device_math::isFiniteBinary64(value))
         throw std::invalid_argument("Device Metropolis Gaussian draw is nonfinite");
     try
     {
+      const auto& physical_gaussian = cost_.selected ? dense_gaussian_ : gaussian;
       if (gradient_)
-        formDisplacement(gaussian, tau);
-      gaussian_.upload(gradient_ ? displacement_.data() : gaussian.data(), gaussian.size());
+        formDisplacement(physical_gaussian, tau);
+      gaussian_.upload(gradient_ ? displacement_.data() : physical_gaussian.data(), cost_.coordinates);
+      if (cost_.selected)
+        selected_.upload(host_selected_.data(), host_selected_.size());
       {
         std::scoped_lock sources(accepted_->state_->mutex, proposed_->state_->mutex);
         beginMutation(*proposed_->state_);
         resetStatus();
         checkRuntime(launchMetropolisProposal(queue_.getNative(), cost_.population, cost_.electrons,
             accepted_->state_->positions.data(), gaussian_.data(), inverse_mass_.data(), tau,
-            proposed_->state_->positions.data(), status_.data(), bool(gradient_)), "Metropolis proposal");
+            proposed_->state_->positions.data(), status_.data(), bool(gradient_),
+            cost_.selected ? selected_.data() : nullptr), "Metropolis proposal");
         admitStatus();
         proposed_->state_->live = cost_.population;
         proposed_->state_->ready = true;
@@ -361,6 +402,8 @@ private:
     for (std::size_t walker = 0; walker < cost_.population; ++walker)
       for (std::size_t electron = 0; electron < cost_.electrons; ++electron)
       {
+        if (cost_.selected && !host_selected_[walker * cost_.electrons + electron])
+          continue;
         const auto index = (walker * cost_.electrons + electron) * 3;
         const double variance = tau * drift_masses_[electron];
         if (!device_math::isFiniteBinary64(variance) || variance <= 0)
@@ -384,6 +427,8 @@ private:
       double backward = 0;
       for (std::size_t electron = 0; electron < cost_.electrons; ++electron)
       {
+        if (cost_.selected && !host_selected_[walker * cost_.electrons + electron])
+          continue;
         const auto index = (walker * cost_.electrons + electron) * 3;
         const double variance = tau * drift_masses_[electron];
         double drift[3], residual[3];
@@ -408,14 +453,20 @@ private:
         accepted_cache_(std::make_unique<ValueCache>(cost.population)),
         staged_cache_(std::make_unique<ValueCache>(cost.population)), gaussian_(cost.coordinates),
         inverse_mass_(cost.electrons), uniforms_(cost.population), log_acceptance_(cost.population),
-        mask_(cost.population), status_(1), host_mask_(cost.population)
+        mask_(cost.population), selected_(cost.selected ? cost.coordinates / 3 : 0),
+        status_(1), host_mask_(cost.population),
+        host_selected_(cost.selected ? cost.coordinates / 3 : 0),
+        dense_gaussian_(cost.selected ? cost.coordinates : 0)
   {
     std::size_t bytes = accepted_->deviceWorkspaceBytes() + proposed_->deviceWorkspaceBytes();
     for (const auto* buffer : {&accepted_cache_->phase, &accepted_cache_->logabs, &staged_cache_->phase,
         &staged_cache_->logabs, &gaussian_, &inverse_mass_, &uniforms_, &log_acceptance_})
       bytes += checkedDeviceBytes<double>(buffer->capacity());
-    bytes += checkedDeviceBytes<std::uint32_t>(mask_.capacity()) + checkedDeviceBytes<std::uint64_t>(status_.capacity());
-    if (bytes != cost.device_bytes || host_mask_.capacity() * sizeof(std::uint32_t) != cost.host_bytes)
+    bytes += checkedDeviceBytes<std::uint32_t>(mask_.capacity() + selected_.capacity()) +
+        checkedDeviceBytes<std::uint64_t>(status_.capacity());
+    const auto host_bytes = checkedDeviceBytes<std::uint32_t>(host_mask_.capacity() + host_selected_.capacity()) +
+        checkedDeviceBytes<double>(dense_gaussian_.capacity());
+    if (bytes != cost.device_bytes || host_bytes != cost.host_bytes)
       throw std::logic_error("Device Metropolis allocations disagree with exact preflight");
     accepted_->upload(positions);
     inverse_mass_.upload(inverse_mass.data(), inverse_mass.size());
@@ -518,9 +569,11 @@ private:
   std::unique_ptr<PreparedDeviceCoordinates> accepted_, proposed_;
   std::unique_ptr<ValueCache> accepted_cache_, staged_cache_;
   DeviceBuffer<double> gaussian_, inverse_mass_, uniforms_, log_acceptance_;
-  DeviceBuffer<std::uint32_t> mask_;
+  DeviceBuffer<std::uint32_t> mask_, selected_;
   DeviceBuffer<std::uint64_t> status_;
   std::vector<std::uint32_t> host_mask_;
+  std::vector<std::uint32_t> host_selected_;
+  std::vector<double> dense_gaussian_;
   std::unique_ptr<PreparedDeviceCoordinateGradient> gradient_;
   NativeDriftCallback drift_;
   std::size_t gradient_version_ = 0;

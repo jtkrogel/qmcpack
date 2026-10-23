@@ -247,6 +247,148 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
   }
 }
 
+/// Compare checked selected proposals and native drift against complete CPU configurations.
+template<class Model>
+void validateSelectedMetropolis(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image,
+                               compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)
+{
+  const auto ne = image->plan().modelShape().electrons(), stride = 3 * ne;
+  const std::size_t population = 3;
+  std::vector<std::size_t> counts{1, ne / 2, ne - 1};
+  std::sort(counts.begin(), counts.end());
+  counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+  pf::DirectValueExecutor value(model, image->plan());
+  pf::DirectSpatialExecutor spatial(model, value, image->plan());
+  auto reference = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  DriftModifierUNR policy(.37);
+  const NativeDriftCallback drift = [&](double variance, const double* gradient, double* result) {
+    DriftModifierUNR::GradType g;
+    DriftModifierUNR::PosType d;
+    for (int xyz = 0; xyz < 3; ++xyz) g[xyz] = gradient[xyz];
+    policy.getDrift(variance, g, d);
+    for (int xyz = 0; xyz < 3; ++xyz) result[xyz] = d[xyz];
+  };
+  for (const bool use_drift : {false, true})
+    for (const auto count : counts)
+    {
+      if (!count || count >= ne) continue;
+      std::vector<double> seed(population * stride), masses(ne), gaussian(population * count * 3),
+          expected(seed.size()), exported(seed.size()), phases(population), logs(population), uniforms(population);
+      std::vector<std::size_t> selected(population * count);
+      std::vector<std::uint32_t> expected_mask(population);
+      for (std::size_t electron = 0; electron < ne; ++electron) masses[electron] = .7 + .17 * electron;
+      for (std::size_t walker = 0; walker < population; ++walker)
+      {
+        std::copy_n(model.cfg.electrons.x.data() + walker % model.cfg.nconfig * stride, stride,
+                    seed.data() + walker * stride);
+        for (std::size_t local = 0; local < count; ++local)
+        {
+          selected[walker * count + local] = (walker ? ne - count : 0) + local;
+          for (int d = 0; d < 3; ++d)
+            gaussian[(walker * count + local) * 3 + d] = walker == 1 ? 20 : .03 * (1 + local + d);
+        }
+        uniforms[walker] = walker == 1 ? std::nextafter(1., 0.) : 0;
+      }
+      expected = seed;
+      const double tau = .03;
+      for (std::size_t walker = 0; walker < population; ++walker)
+      {
+        reference->setPositions(pf::GeometryPositionView::interleaved(seed.data() + walker * stride, ne));
+        const auto old = spatial.evaluateFull(*reference);
+        const double old_log = old.logabs;
+        std::vector<double> old_gradient(old.gradient.data(), old.gradient.data() + stride);
+        std::vector<double> displacement(count * 3);
+        double forward = 0, backward = 0;
+        for (std::size_t local = 0; local < count; ++local)
+        {
+          const auto electron = selected[walker * count + local];
+          const double variance = tau * masses[electron];
+          double d[3]{};
+          if (use_drift) drift(variance, old_gradient.data() + 3 * electron, d);
+          for (int xyz = 0; xyz < 3; ++xyz)
+          {
+            const auto index = local * 3 + xyz;
+            const double g = std::sqrt(variance) * gaussian[walker * count * 3 + index];
+            displacement[index] = g + d[xyz];
+            expected[walker * stride + 3 * electron + xyz] += displacement[index];
+            forward -= g * g / (2 * variance);
+          }
+        }
+        reference->setPositions(pf::GeometryPositionView::interleaved(expected.data() + walker * stride, ne));
+        const auto proposed = spatial.evaluateFull(*reference);
+        if (use_drift)
+          for (std::size_t local = 0; local < count; ++local)
+          {
+            const auto electron = selected[walker * count + local];
+            const double variance = tau * masses[electron];
+            double d[3]; drift(variance, proposed.gradient.data() + 3 * electron, d);
+            for (int xyz = 0; xyz < 3; ++xyz)
+            {
+              const auto residual = displacement[local * 3 + xyz] + d[xyz];
+              backward -= residual * residual / (2 * variance);
+            }
+          }
+        const auto alpha = 2 * (proposed.logabs - old_log) + (use_drift ? backward - forward : 0);
+        const bool take = proposed.sign != 0 && device_math::isFiniteBinary64(alpha) &&
+            (uniforms[walker] == 0 || std::log(uniforms[walker]) < alpha);
+        expected_mask[walker] = take ? METROPOLIS_ACCEPTED : 0;
+        if (!take) std::copy_n(seed.data() + walker * stride, stride, expected.data() + walker * stride);
+      }
+      PreparedDeviceInference graph(image, 2, queue, blas, SpatialJetMode::VALUE_ONLY, use_drift);
+      const auto cost = estimateMetropolisCost(population, ne, true);
+      auto owner = use_drift
+          ? PreparedDeviceMetropolis::prepareDrift(graph, queue, seed, masses, cost.device_bytes,
+              estimateMetropolisDriftCost(image->plan(), 2, population).device_workspace_bytes, drift, true)
+          : PreparedDeviceMetropolis::prepare(graph, queue, seed, masses, cost.device_bytes, true);
+      int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&ordinal), "Selected Metropolis validation device");
+#else
+      checkRuntime(cudaGetDevice(&ordinal), "Selected Metropolis validation device");
+#endif
+      auto& metrics = deviceMemoryMetrics(ordinal);
+      const auto before = metrics.snapshot();
+      for (int fault = 0; fault < 3; ++fault)
+      {
+        auto invalid = selected;
+        if (fault == 0) invalid[0] = ne;
+        else if (fault == 1) invalid.clear();
+        else if (count > 1) invalid[1] = invalid[0];
+        else continue;
+        bool rejected = false;
+        try { (void)owner->propose(gaussian, tau, image->version(), invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected || metrics.snapshot().upload_calls != before.upload_calls)
+          throw std::runtime_error("Malformed selected descriptor reached device staging");
+      }
+      const auto token = owner->propose(gaussian, tau, image->version(), selected);
+      const auto mask = owner->resolve(token, uniforms);
+      const auto after = metrics.snapshot();
+      if (mask != expected_mask || after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls)
+        throw std::runtime_error("Selected Metropolis joint masks or warm allocation contract differ");
+      owner->exportAccepted(exported);
+      owner->downloadAcceptedValues(phases, logs);
+      for (std::size_t walker = 0; walker < population; ++walker)
+      {
+        for (std::size_t electron = 0; electron < ne; ++electron)
+          for (int d = 0; d < 3; ++d)
+          {
+            const auto index = walker * stride + 3 * electron + d;
+            const bool moved = std::binary_search(selected.begin() + walker * count,
+                selected.begin() + (walker + 1) * count, electron);
+            if ((!moved && exported[index] != seed[index]) || std::abs(exported[index] - expected[index]) > 2e-14)
+              throw std::runtime_error("Selected Metropolis changed unselected or incorrect accepted coordinates");
+          }
+        reference->setPositions(pf::GeometryPositionView::interleaved(expected.data() + walker * stride, ne));
+        const auto result = spatial.evaluateFull(*reference);
+        if (phases[walker] != result.sign || std::abs(logs[walker] - result.logabs) > 2e-9 * (1 + std::abs(result.logabs)))
+          throw std::runtime_error("Selected Metropolis complete accepted value differs from CPU");
+      }
+      std::cout << "PASS selected device Metropolis: B3/tail Ne=" << ne << " n=" << count
+                << " native_drift=" << use_drift << " CPU_joint_masks=yes unselected_exact=yes warm_allocations=0\n";
+    }
+}
+
 /// Qualify the numerical owner with injected draws, not a new production sampler.
 template<class Model>
 void validateDeviceMetropolis(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image,
@@ -496,6 +638,7 @@ void validateDeviceMetropolis(Model& model, const std::shared_ptr<const Prepared
             << " transfer_counter_scope=device_wide; XML/RNG/Hamiltonian NOT_INTEGRATED\n";
   validateNativeMetropolisAdapter(model, image);
   validateNativeMetropolisAdapter(model, image, true);
+  validateSelectedMetropolis(model, image, queue, blas);
 }
 } // namespace qmcplusplus::psiformer::device
 #endif
