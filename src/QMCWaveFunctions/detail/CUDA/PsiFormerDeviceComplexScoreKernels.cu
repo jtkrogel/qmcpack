@@ -97,6 +97,24 @@ __global__ void headSeed(std::size_t d, std::size_t n, std::size_t spin_up,
     fail(status, i);
 }
 
+/// Raw analytic seeds preserve all orbital columns and select only the spin row.
+__global__ void orbitalHeadSeed(std::size_t d, std::size_t n, std::size_t spin_up,
+    const cuDoubleComplex* cotangents, const double* envelope, const double* real, const double* imag,
+    std::size_t component, std::size_t spin, double* seed, std::uint64_t* status)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= d * n * n)
+    return;
+  const auto row = (i / n) % n, column = i % n, channel = i / (n * n);
+  const auto c = cotangents[i];
+  const auto target = component == 2 ? i : (row * d + channel) * n + column;
+  const auto value = component == 2 ? cuCreal(QMC_PF_MUL(c, make_cuDoubleComplex(real[i], imag[i]))) :
+      envelope[i] * (component == 0 ? cuCreal(c) : -cuCimag(c));
+  seed[target] = component != 2 && std::size_t(row >= spin_up) != spin ? 0 : value;
+  if (!device_math::isFiniteBinary64(seed[target]))
+    fail(status, i);
+}
+
 /// First pass clears imaginaryP; second pass completes it, both while unpublished.
 __global__ void pack(std::size_t p, std::size_t component, const double* response,
     cuDoubleComplex* score, std::uint64_t* status)
@@ -136,6 +154,16 @@ Error launchComplexScoreHeadSeed(Stream stream, std::size_t d, std::size_t n, st
 {
   headSeed<<<static_cast<unsigned>((d * n * n + 127) / 128), 128, 0, stream>>>(
       d, n, spin_up, inverse, envelope, real, imag, objective, component, spin, seed, status);
+  return launched();
+}
+
+/// Launch raw head/envelope seeding without any determinant or cusp product.
+Error launchComplexOrbitalHeadSeed(Stream stream, std::size_t d, std::size_t n, std::size_t spin_up,
+    const cuDoubleComplex* cotangents, const double* envelope, const double* real, const double* imag,
+    std::size_t component, std::size_t spin, double* seed, std::uint64_t* status)
+{
+  orbitalHeadSeed<<<static_cast<unsigned>((d * n * n + 127) / 128), 128, 0, stream>>>(
+      d, n, spin_up, cotangents, envelope, real, imag, component, spin, seed, status);
   return launched();
 }
 

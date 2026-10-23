@@ -18,6 +18,11 @@ Error launchComplexScoreHeadSeed(Stream stream, std::size_t determinants, std::s
     const cuDoubleComplex* weighted_inverse, const double* envelope, const double* real, const double* imag,
     std::size_t objective, std::size_t head_component, std::size_t spin, double* seed, std::uint64_t* status);
 
+/// Analytic raw cotangents C obey deltaL=Re sum(C*deltaZ); no inverse or cusp.
+Error launchComplexOrbitalHeadSeed(Stream stream, std::size_t determinants, std::size_t n, std::size_t spin_up,
+    const cuDoubleComplex* cotangents, const double* envelope, const double* real, const double* imag,
+    std::size_t head_component, std::size_t spin, double* seed, std::uint64_t* status);
+
 /// Pack a finite completed real objective without exposing an incomplete complexP.
 Error launchComplexScorePack(Stream stream, std::size_t parameters, std::size_t component,
     const double* response, cuDoubleComplex* score, std::uint64_t* status);

@@ -423,6 +423,7 @@ void selectPairedTwoCellValidation(ExecutionEnvironment& environment, bool selec
 #include "PsiFormerDeviceComplexValueValidation.h"
 #include "PsiFormerDeviceComplexSpatialValidation.h"
 #include "PsiFormerDeviceComplexScoreValidation.h"
+#include "PsiFormerDeviceComplexOrbitalVJPValidation.h"
 #include "PsiFormerDeviceComplexKineticValidation.h"
 #include "PsiFormerDeviceComplexKineticOwnerValidation.h"
 #include "PsiFormerDeviceComplexProductsValidation.h"
@@ -620,8 +621,8 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
         std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only" &&
         std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only" &&
-        std::string_view(argv[1]) != "--paired-two-cell-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
+        std::string_view(argv[1]) != "--paired-two-cell-only" && std::string_view(argv[1]) != "--complex-orbital-vjp-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -633,7 +634,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--paired-two-cell-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--complex-orbital-vjp-only")
+      validateComplexOrbitalVJP();
+    else if (argc == 2 && std::string_view(argv[1]) == "--paired-two-cell-only")
     {
       validateComplexSpatial(true);
       validateComplexScore(true);
