@@ -783,11 +783,8 @@ PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
     throw std::invalid_argument("Mixed dense parameters require an immutable canonical model");
   model_->validateCurrentDevice();
   const auto& environment = model_->plan().environment();
-  if (environment.boundary != BoundaryCondition::OPEN ||
-      environment.parameter_scalar_domain != ScalarDomain::REAL ||
-      environment.compute_scalar_domain != ScalarDomain::REAL ||
-      environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-    throw std::invalid_argument("Mixed value affine projections currently support fixed-ion open-real models only");
+  if (!supportsMixedRealInferenceEnvironment(environment))
+    throw std::invalid_argument("Mixed affine projections require a fixed-ion real open or legacy Gamma model");
   const auto count = model_->plan().parameterCount();
   weights_.reserveNamed(count, "MixedDenseParameters::fp32_weights", __FILE__, __LINE__);
   clearMixedDeviceStorage(queue.getNative(), weights_.data(), checkedDeviceBytes<float>(count));

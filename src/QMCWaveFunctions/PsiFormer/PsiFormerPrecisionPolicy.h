@@ -35,6 +35,22 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
   FP32_DENSE_FP64_ISLANDS
 };
 
+/// Admit the existing real affine adapter only on its qualified geometry families.
+inline bool supportsMixedRealInferenceEnvironment(const ExecutionEnvironment& environment)
+{
+  if (!environment.fixed_nuclei || environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.head_representation != HeadRepresentation::REAL)
+    return false;
+  if (environment.boundary == BoundaryCondition::OPEN)
+    return true;
+  return environment.boundary == BoundaryCondition::PERIODIC &&
+      environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      !environment.periodic_profile && environment.periodic_axes[0] && environment.periodic_axes[1] &&
+      environment.periodic_axes[2];
+}
+
 /// Identify operation classes whose precision is selected independently.
 enum class PsiFormerArithmeticOperation : std::uint8_t
 {

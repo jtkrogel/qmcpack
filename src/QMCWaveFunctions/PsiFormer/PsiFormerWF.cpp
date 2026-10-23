@@ -1195,8 +1195,8 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
        resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
-       plan.environment().boundary != psiformer::BoundaryCondition::OPEN))
-    throw std::invalid_argument("Explicit mixed PsiFormer precision requires an open-real GPU inference model");
+       outer_twist || !psiformer::supportsMixedRealInferenceEnvironment(plan.environment())))
+    throw std::invalid_argument("Explicit mixed PsiFormer precision requires a real open or legacy Gamma GPU inference model");
   if (resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU)
     return {};
   if (plan.environment().periodic_profile &&

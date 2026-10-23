@@ -1638,8 +1638,8 @@ public:
   {
     if (adapter && target_preparation_.max_targets)
       throw std::invalid_argument("Target VGL does not admit mixed affine arithmetic");
-    if (adapter && (!value_tape_.empty() || plan_.environment().boundary != BoundaryCondition::OPEN))
-      throw std::invalid_argument("Mixed affine inference does not admit reverse tapes or periodic geometry");
+    if (adapter && (!value_tape_.empty() || !supportsMixedRealInferenceEnvironment(plan_.environment())))
+      throw std::invalid_argument("Mixed affine inference requires a supported real geometry without reverse tapes");
     if (adapter && adapter->modelImage().get() != model_.get())
       throw std::invalid_argument("Mixed affine adapter has a stale or foreign parameter image");
     if (adapter && adapter->maximumRows() < product(product(batch_capacity_, ne_), dense_.source.plane_count))

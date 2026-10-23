@@ -419,9 +419,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
        accelerator_resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
-       optimization_enabled || periodic || nonzero_twist || !particle_twist_is_zero))
+       optimization_enabled || complex_profile || pair_profile ||
+       (periodic && feature_policy != "periodic_torus_v1") || nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument(
-        "precision=fp32_dense_fp64_islands requires open-real GPU inference, optimize=no and zero twist");
+        "precision=fp32_dense_fp64_islands requires real open or legacy Gamma GPU inference, optimize=no and zero twist");
   if (has_explicit_twist)
   {
     constexpr double twist_tolerance = 128.0 * std::numeric_limits<double>::epsilon();

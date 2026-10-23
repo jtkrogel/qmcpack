@@ -150,6 +150,67 @@ void validate(bool selected_two_cell = false)
   value.downloadResults(phases, logs, no_spatial);
   spatial.downloadResults(spatial_phases, jets, lap_ratio);
 
+  // Reuse the unchanged mixed error contracts on an independent periodic CPU oracle.
+  // Both owners must actually execute mixed arithmetic, not merely pass via FP64 replay.
+  if (!selected_two_cell)
+  {
+    PreparedDeviceMixedInference mixed_value(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
+    PreparedDeviceMixedInference mixed_spatial(image, 3, queue, blas, SpatialJetMode::FULL_VGL);
+    const auto prepared_bytes = mixed_spatial.deviceWorkspaceBytes();
+    std::vector<double> mixed_phases(3), mixed_logs(3), unused;
+    std::vector<double> mixed_spatial_phases(3), mixed_jets(jets.size()), mixed_ratios(lap_ratio.size());
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+      mixed_value.evaluate(model.cfg.electrons.x);
+      mixed_value.downloadResults(mixed_phases, mixed_logs, unused);
+      mixed_spatial.evaluate(model.cfg.electrons.x);
+      mixed_spatial.downloadResults(mixed_spatial_phases, mixed_jets, mixed_ratios);
+      if (mixed_value.usedFp64Retry() || mixed_spatial.usedFp64Retry())
+        throw std::runtime_error("Periodic mixed oracle did not exercise accepted mixed arithmetic");
+      for (std::size_t sample = 0; sample < 3; ++sample)
+      {
+        spatial_workspace->setPositions(
+            pf::GeometryPositionView::interleaved(model.cfg.electrons.x.data() + 12 * sample, 4));
+        const auto reference = cpu_spatial.evaluateFull(*spatial_workspace);
+        near(mixed_phases[sample], reference.sign, "mixed periodic value phase");
+        near(mixed_spatial_phases[sample], reference.sign, "mixed periodic VGL phase");
+        near(mixed_logs[sample], reference.logabs, "mixed periodic value", 5e-5);
+        near(mixed_jets[layout.uncheckedValueOffset(sample, 0)], reference.logabs,
+             "mixed periodic VGL value", 5e-5);
+        for (std::size_t lane = 0; lane < 12; ++lane)
+          near(mixed_jets[layout.uncheckedGradientOffset(sample, lane, 0)], reference.gradient[lane],
+               "mixed periodic gradient", 5e-4);
+        double kinetic = 0;
+        double reference_kinetic = 0;
+        for (std::size_t electron = 0; electron < 4; ++electron)
+        {
+          near(mixed_jets[layout.uncheckedLaplacianOffset(sample, electron, 0)], reference.lap_log[electron],
+               "mixed periodic log Laplacian", 1e-3);
+          near(mixed_ratios[4 * sample + electron], reference.lap_ratio[electron],
+               "mixed periodic Laplacian ratio", 1e-3);
+          kinetic -= .5 * mixed_ratios[4 * sample + electron];
+          reference_kinetic -= .5 * reference.lap_ratio[electron];
+        }
+        near(kinetic, reference_kinetic, "mixed periodic kinetic", 1e-3);
+      }
+      if (mixed_spatial.deviceWorkspaceBytes() != prepared_bytes)
+        throw std::runtime_error("Periodic mixed warm execution changed prepared owner bytes");
+    }
+    auto unsupported = environment;
+    unsupported.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+    if (supportsMixedRealInferenceEnvironment(unsupported))
+      throw std::runtime_error("Real mixed eligibility admitted a paired head");
+    unsupported = environment;
+    unsupported.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    if (supportsMixedRealInferenceEnvironment(unsupported))
+      throw std::runtime_error("Real mixed eligibility admitted a versioned periodic feature contract");
+    unsupported = environment;
+    unsupported.periodic_axes[2] = false;
+    if (supportsMixedRealInferenceEnvironment(unsupported))
+      throw std::runtime_error("Real mixed eligibility admitted a partial-periodic geometry");
+    std::cout << "PASS legacy Gamma mixed VALUE/FULL: independent CPU oracle, actual mixed batches, warm reuse\n";
+  }
+
   const std::vector<double> weights{0.4, -0.3, 0.7}, masses{1.0, 0.8, 1.2, 0.9};
   std::vector<double> drift(36), imaginary_drift(36), direction(plan.parameterCount()), cpu_vjp(direction.size(), 0.0),
       cpu_kinetic_response(direction.size(), 0.0), cpu_gradient_response(direction.size(), 0.0), cpu_products(3, 0.0);
