@@ -30,6 +30,7 @@
 #include "QMCWaveFunctions/WaveFunctionPool.h"
 #include "QMCHamiltonians/HamiltonianPool.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "PsiHamNamePairReader.h"
 #include "QMCDrivers/VMC/VMC.h"
@@ -87,9 +88,9 @@ void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMC
   auto reject = []() { throw UniformCommunicateError(
       "Complex PsiFormer selected-system admission requires a sole component, CPU bare kinetic and "
       "three physical periodic Coulomb terms bound to its actual target/source"); };
-  // Ordinary scalar PP inference uses the same checked batched VMC route on CPU/GPU.
+  // Scalar PP locality retains the same selected physical-system checks in modern drivers.
   const bool ecp_run = run_type == QMCRunType::WF_TRAIN_BATCH ||
-      run_type == QMCRunType::VMC_BATCH;
+      run_type == QMCRunType::VMC_BATCH || run_type == QMCRunType::DMC_BATCH;
   const bool ecp = ecp_run && ham.hasPhysicalNLPP();
   const auto& provenance = ham.ecpModelProvenance();
   if (complex->isPseudopotentialSystem() != ecp || ham.hasPhysicalNLPP() != ecp ||
@@ -362,8 +363,9 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 #ifdef QMC_COMPLEX
     requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system, das.new_run_type);
     if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
-        das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
-      throw UniformCommunicateError("Complex GPU requires PBYP VMC_BATCH or explicitly admitted WF_TRAIN_BATCH");
+        das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH &&
+        das.new_run_type != QMCRunType::DMC_BATCH)
+      throw UniformCommunicateError("Complex GPU requires a supported modern VMC, DMC or WFTrain driver");
 #endif
 
     auto makeEstimatorManager =
@@ -507,6 +509,17 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       {
         throw UniformCommunicateError(e.what());
       }
+
+      if (dmcdriver_input.get_non_local_move() != TmoveKind::OFF)
+        for (const auto& component : primaryPsi.getOrbitals())
+        {
+          bool is_psiformer = dynamic_cast<const PsiFormerWF*>(component.get()) != nullptr;
+#ifdef QMC_COMPLEX
+          is_psiformer = is_psiformer || dynamic_cast<const PsiFormerComplexWF*>(component.get()) != nullptr;
+#endif
+          if (is_psiformer)
+            throw UniformCommunicateError("PsiFormer batched DMC requires nonlocalmoves=no; T-moves are not supported");
+        }
 
       if (dmcdriver_input.get_l2_diffusion())
       {
