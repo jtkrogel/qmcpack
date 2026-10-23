@@ -404,6 +404,82 @@ void validateComplexProducts(bool selected_two_cell = false)
         cpu_nonlocal_jvp[refs[point]] += physical * tangent[i].real();
       }
     }
+    // Inline capture uses accepted B capacity even when the native grid has Q>B.
+    {
+      const auto sc = estimateComplexProductsCost(plan, targets, b, 3, chunk, ComplexProductsHostOutput::CHUNKED);
+      auto streamed = Owner::prepare(image, targets, b, 3, chunk, queue, blas,
+          sc.device_bytes, sc.host_bytes, sc.matrix_work, ComplexProductsHostOutput::CHUNKED);
+      const auto fingerprint = streamed->storageFingerprint();
+      const auto warm = metrics.snapshot();
+      std::array<C, b> sums{};
+      for (std::size_t point = 0; point < q; ++point) sums[refs[point]] += weights[point];
+      for (bool adjoint : {false, true})
+      {
+        const auto replay_before = metrics.snapshot();
+        nonlocal->evaluateNonlocalVJP(positions, virtuals, refs, weights, contractions, adjoint);
+        const auto replay_download = metrics.snapshot().downloaded_bytes - replay_before.downloaded_bytes;
+        const auto stream_before = metrics.snapshot();
+        streamed->beginStreamingNonlocalVJP(q + b, adjoint);
+        fails([&] { (void)streamed->completedResult(); });
+        fails([&] { streamed->beginStreamingNonlocalVJP(q + b, adjoint); });
+        for (std::size_t point = 0; point < q; ++point)
+        {
+          const auto move = replacement(point);
+          streamed->accumulateStreamingNonlocalScore(positions, refs[point], &move,
+              contractions[refs[point]], weights[point]);
+        }
+        for (std::size_t sample = 0; sample < b; ++sample)
+          streamed->accumulateStreamingNonlocalScore(positions, sample, nullptr, contractions[sample], -sums[sample]);
+        streamed->finishStreamingNonlocalVJP();
+        require(metrics.snapshot().downloaded_bytes - stream_before.downloaded_bytes == replay_download,
+            "Streaming response introduced parameter transfers during native quadrature");
+        const auto receipt = streamed->completedResult();
+        for (std::size_t offset = 0; offset < p; offset += chunk)
+        {
+          const auto count = std::min(chunk, p - offset);
+          const auto* values = streamed->downloadCompletedChunk(receipt, 0, offset, count);
+          for (std::size_t i = 0; i < count; ++i)
+          {
+            const auto expected = (adjoint ? conjugate_reference : reference)[offset + i];
+            require(std::abs(values[i] - expected) <= 3e-9 * (1 + std::abs(expected)),
+                "Streaming complete physical nonlocal response differs from CPU allP oracle");
+          }
+          for (std::size_t channel = 1; channel < 3; ++channel)
+          {
+            const auto* unused = streamed->downloadCompletedChunk(receipt, channel, offset, count);
+            for (std::size_t i = 0; i < count; ++i)
+              require(unused[i] == C{}, "Streaming C1 response changed an unused channel");
+          }
+        }
+      }
+      require(streamed->storageFingerprint() == fingerprint && metrics.snapshot().allocation_calls == warm.allocation_calls &&
+          metrics.snapshot().free_calls == warm.free_calls, "Streaming response grew prepared storage");
+      streamed->beginStreamingNonlocalVJP(q + b);
+      fails([&] { streamed->finishStreamingNonlocalVJP(); });
+      fails([&] { (void)streamed->completedResult(); });
+      streamed->beginStreamingNonlocalVJP(1);
+      fails([&] { streamed->evaluateScoreJVP(positions, tangent.data(), p); });
+      streamed->abortStreamingNonlocalVJP();
+      fails([&] { (void)streamed->completedResult(); });
+      streamed->beginStreamingNonlocalVJP(1);
+      streamed->accumulateStreamingNonlocalScore(positions, 0, nullptr, contractions[0], sums[0]);
+      fails([&] { streamed->accumulateStreamingNonlocalScore(positions, 0, nullptr, contractions[0], sums[0]); });
+      fails([&] { (void)streamed->completedResult(); });
+      streamed->beginStreamingNonlocalVJP(1);
+      fails([&] { streamed->accumulateStreamingNonlocalScore(positions, b, nullptr, contractions[0], sums[0]); });
+      fails([&] { streamed->finishStreamingNonlocalVJP(); });
+      streamed->beginStreamingNonlocalVJP(1);
+      const ComplexVirtualReplacement node_move{0, {positions[3], positions[4], positions[5]}};
+      fails([&] { streamed->accumulateStreamingNonlocalScore(positions, 0, &node_move, C{}, C{}); });
+      fails([&] { (void)streamed->completedResult(); });
+      streamed->beginStreamingNonlocalVJP(1);
+      fails([&] { streamed->accumulateStreamingNonlocalScore(positions, 0, nullptr,
+          {std::numeric_limits<double>::quiet_NaN(), 0}, C{}); });
+      fails([&] { (void)streamed->completedResult(); });
+      std::cout << "PASS complex streaming nonlocal accepted_B_capacity=1 Q_gt_B=1 both_adjoints=1 allP=1"
+                << " incomplete_rejected=1 overrun_poisoned=1 interleave_rejected=1 zero_weight_node_rejected=1"
+                << " no_parameter_transfers_per_point=1 warm_allocations=0\n";
+    }
     const auto nw = metrics.snapshot();
     for (bool adjoint : {false, true})
     {

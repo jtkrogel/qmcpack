@@ -163,6 +163,7 @@ public:
   void evaluate(const std::vector<double>& positions, const std::vector<double>& inverse_masses,
       const std::array<double, 3>& kappa, const std::vector<Channel>& channels, bool hermitian = false)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
@@ -223,6 +224,91 @@ public:
     publishCompleted();
   }
 
+  /** Start one native-grid contraction in the existing device accumulators.
+   * expected_scores counts the ACTUAL accepted virtual points plus references,
+   * not a precutoff quadrature capacity. It does not change kinetic matrix_work:
+   * this transaction evaluates only B1 scores, regardless of the point count.
+   * The caller retains the exclusive execution lease through finish or abort.
+   */
+  void beginStreamingNonlocalVJP(std::size_t expected_scores, bool hermitian = false)
+  {
+    requireNoStreamingNonlocal();
+    ready_ = jvp_ready_ = false;
+    if (!expected_scores)
+      throw std::invalid_argument("Complex streaming nonlocal response requires score coverage");
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex products generation exhausted");
+    ++generation_;
+    image_->validateCurrentDevice();
+    checkRuntime(launchDerivativeZero(queue_.getNative(), {2 * accumulated_.capacity(), 0, 0, 0, 1},
+        reinterpret_cast<double*>(accumulated_.data())), "complex streaming nonlocal zero");
+    streaming_expected_scores_ = expected_scores;
+    streaming_scores_ = 0;
+    streaming_hermitian_ = hermitian;
+    streaming_nonlocal_ = true;
+  }
+
+  /** Contract one virtual or accepted score before native tile storage is reused.
+   * A null replacement selects the accepted reference. For the accepted phase,
+   * complete_weight is minus the sample's sum of bare_weight*complete_ratio.
+   * Coefficients are never conjugated; HERMITIAN conjugates both the physical
+   * complete weight and the score, exactly as the immutable replay route does.
+   */
+  void accumulateStreamingNonlocalScore(const std::vector<double>& bases, std::size_t sample,
+      const ComplexVirtualReplacement* replacement, Complex coefficient, Complex complete_weight)
+  {
+    try
+    {
+      if (!streaming_nonlocal_ || streaming_scores_ >= streaming_expected_scores_)
+        throw std::logic_error("Complex streaming nonlocal score coverage is invalid");
+      image_->validateCurrentDevice();
+      const auto stride = positions_.size();
+      const auto b = bases.size() / stride;
+      if (!b || b > cost_.maximum_samples || bases.size() % stride || sample >= b)
+        throw std::invalid_argument("Complex streaming nonlocal reference extent is invalid");
+      if (replacement)
+        loadReplacement(bases, sample, *replacement);
+      else
+        std::copy_n(bases.data() + sample * stride, stride, positions_.data());
+      for (double value : positions_)
+        if (!device_math::isFiniteBinary64(value))
+          throw std::invalid_argument("Complex streaming nonlocal coordinate is nonfinite");
+      const auto finite = [](Complex value) {
+        return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
+      };
+      if (!finite(coefficient) || !finite(complete_weight))
+        throw std::invalid_argument("Complex streaming nonlocal coefficient is nonfinite");
+      const auto weighted = coefficient * (streaming_hermitian_ ? std::conj(complete_weight) : complete_weight);
+      if (!finite(weighted))
+        throw std::overflow_error("Complex streaming nonlocal weighted coefficient overflow");
+      // Zero coefficients still evaluate the score: a node is not a zero response.
+      accumulateLoadedNonlocalScore(weighted, streaming_hermitian_);
+      ++streaming_scores_;
+    }
+    catch (...) { abortStreamingNonlocalVJP(); throw; }
+  }
+
+  /// Publish once, after the producer has supplied every virtual and reference score.
+  void finishStreamingNonlocalVJP()
+  {
+    try
+    {
+      if (!streaming_nonlocal_ || streaming_scores_ != streaming_expected_scores_)
+        throw std::logic_error("Complex streaming nonlocal response is incomplete");
+      image_->validateCurrentDevice();
+      publishCompleted();
+      streaming_nonlocal_ = false;
+    }
+    catch (...) { abortStreamingNonlocalVJP(); throw; }
+  }
+
+  /// Revoke every partial result; a subsequent independent request resets the accumulator.
+  void abortStreamingNonlocalVJP() noexcept
+  {
+    streaming_nonlocal_ = false;
+    ready_ = jvp_ready_ = false;
+  }
+
   /** One regular-node complete nonlocal response, with caller-owned immutable grid/ratios.
    * C1 request only, using slot0 of any admitted channel capacity (other slots become zero).
    * B+Q counts all scalar score evaluations in the prepared request bound.
@@ -246,6 +332,7 @@ public:
       LocalTerms terms, bool hermitian = false, const std::vector<Channel>* channels = nullptr,
       std::size_t energy_channel = 0)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     const auto stride = positions_.size();
     if (virtual_positions.size() % stride)
@@ -277,6 +364,7 @@ private:
       const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
       LocalTerms terms, bool hermitian, const std::vector<Channel>* channels, std::size_t energy_channel)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex products generation exhausted");
@@ -407,6 +495,7 @@ private:
   template<class LoadSample>
   void evaluateScoreJVPSource(std::size_t b, LoadSample load_sample, const Complex* direction, std::size_t count)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     nonlocal_jvp_ = false;
     local_jvp_ = false;
@@ -463,6 +552,7 @@ private:
       const std::vector<std::size_t>& references, const std::vector<Complex>& complete_weights,
       const Complex* direction, std::size_t count)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     if (!cost_.channels || !bases || bases > total || total > cost_.maximum_samples ||
         references.size() != total - bases || complete_weights.size() != references.size())
@@ -543,6 +633,7 @@ private:
       const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
       LocalTerms terms, const Complex* direction, std::size_t count)
   {
+    requireNoStreamingNonlocal();
     ready_ = jvp_ready_ = false;
     const bool kinetic = hasKinetic(terms), nonlocal = hasNonlocal(terms);
     const auto stride = 3 * cost_.electrons;
@@ -772,6 +863,13 @@ private:
     return {result[0], result[1]};
   }
 
+  /// An incomplete native transaction owns the scratch until completion or explicit abort.
+  void requireNoStreamingNonlocal() const
+  {
+    if (streaming_nonlocal_)
+      throw std::logic_error("Complex products have an active streaming nonlocal response");
+  }
+
   /// Share adjoint algebra across ordinary, complete-energy and EO/O channels.
   void accumulateResponse(const cuDoubleComplex* response, Complex coefficient, bool hermitian,
       std::size_t channel = 0)
@@ -867,6 +965,8 @@ private:
   std::size_t generation_ = 0;
   bool ready_ = false, jvp_ready_ = false, nonlocal_jvp_ = false;
   bool local_jvp_ = false;
+  bool streaming_nonlocal_ = false, streaming_hermitian_ = false;
+  std::size_t streaming_expected_scores_ = 0, streaming_scores_ = 0;
   LocalTerms local_terms_ = LocalTerms::NONLOCAL_ECP;
 };
 } // namespace qmcplusplus::psiformer::device
