@@ -29,6 +29,7 @@
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceTargetKineticValidation.h"
+#include "PsiFormerDeviceLazyVglValidation.h"
 
 #include <iostream>
 #include <numeric>
@@ -140,6 +141,8 @@ void validate(bool selected_two_cell = false)
   std::shared_ptr<const PreparedDeviceModel> image = selected_two_cell
       ? PreparedDeviceModel::prepareRealTwoCellProfile(plan, model.p.flat_values(), model.cfg.nuclei.x)
       : std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+  if (!selected_two_cell)
+    validateLazyVglPreparation(image, model.cfg.electrons.x);
   PreparedDeviceInference value(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY, true);
   PreparedDeviceInference spatial(image, 3, queue, blas, SpatialJetMode::FULL_VGL, false, true);
   value.evaluate(model.cfg.electrons.x);

@@ -40,6 +40,21 @@ inline bool configuredLazyVglPreparation()
   throw std::invalid_argument("PSIFORMER_GPU_LAZY_VGL_PREPARATION requires 0 or 1");
 }
 
+/// Keep lazy VALUE ownership on the original OPEN or fixed legacy real torus lane.
+inline bool supportsLazyRealInferenceEnvironment(const ExecutionEnvironment& environment)
+{
+  if (environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL)
+    return false;
+  if (environment.boundary == BoundaryCondition::OPEN)
+    return true;
+  return environment.boundary == BoundaryCondition::PERIODIC && environment.fixed_nuclei &&
+      environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      environment.head_representation == HeadRepresentation::REAL && !environment.periodic_profile &&
+      environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+}
+
 /** Supply exclusive GPU scratch per batch workspace and one shared model image.
  * The control mutex protects non-atomic model leases. The first synchronous
  * default serializes submissions. Explicit bounded FP64 inference leases allow
@@ -70,7 +85,8 @@ public:
                                       std::function<void()> first_dispatch_reporter = {},
                                       PsiFormerPrecisionPolicy precision = PsiFormerPrecisionPolicy::FP64_REFERENCE,
                                       DeviceExecutionPreparation preparation = {},
-                                      bool lazy_spatial = configuredLazyVglPreparation())
+                                      bool lazy_spatial = configuredLazyVglPreparation(),
+                                      bool outer_twist = false)
       : image_(checkedImage(std::move(image))),
         preparation_(validatedPreparation(image_->plan(), precision, preparation)), lazy_spatial_(lazy_spatial),
         inference_concurrency_(preparation_.active_inference_crowds),
@@ -81,10 +97,8 @@ public:
     const auto& environment = image_->plan().environment();
     if (lazy_spatial_ && (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
         preparation_.active_inference_crowds != 1 || preparation_.metropolis_workspace_budget_bytes ||
-        preparation_.metropolis_drift_budget_bytes || environment.boundary != BoundaryCondition::OPEN ||
-        environment.amplitude_scalar_domain != ScalarDomain::REAL ||
-        environment.parameter_scalar_domain != ScalarDomain::REAL || environment.compute_scalar_domain != ScalarDomain::REAL))
-      throw std::invalid_argument("Lazy VGL preparation requires single-crowd real/open FP64 without device sampling");
+        preparation_.metropolis_drift_budget_bytes || outer_twist || !supportsLazyRealInferenceEnvironment(environment)))
+      throw std::invalid_argument("Lazy VGL preparation requires single-crowd real OPEN or fixed legacy Gamma FP64 without device sampling");
     if (precision == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
     {
       preparation_queue_ = std::make_unique<compute::Queue<PlatformKind::CUDA>>();

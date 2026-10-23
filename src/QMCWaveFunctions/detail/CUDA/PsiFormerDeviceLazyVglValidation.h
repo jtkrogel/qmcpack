@@ -14,10 +14,7 @@ inline void validateLazyVglPreparation(const std::shared_ptr<const PreparedDevic
                                       const std::vector<double>& positions)
 {
   const auto& environment = image->plan().environment();
-  if (environment.boundary != BoundaryCondition::OPEN ||
-      environment.amplitude_scalar_domain != ScalarDomain::REAL ||
-      environment.parameter_scalar_domain != ScalarDomain::REAL ||
-      environment.compute_scalar_domain != ScalarDomain::REAL)
+  if (!supportsLazyRealInferenceEnvironment(environment))
     return;
   const auto ne = image->plan().modelShape().electrons();
   const auto batch = positions.size() / (3 * ne);
@@ -40,6 +37,28 @@ inline void validateLazyVglPreparation(const std::shared_ptr<const PreparedDevic
   using Backend = PreparedDeviceBatchBackend;
   const auto version = image->version();
   const auto initial = metrics.snapshot().live_bytes;
+  if (environment.boundary == BoundaryCondition::PERIODIC)
+  {
+    for (int fault = 0; fault < 6; ++fault)
+    {
+      auto invalid = environment;
+      if (fault == 0) invalid.periodic_profile = std::make_shared<PeriodicProfileMetadata>();
+      if (fault == 1) invalid.periodic_axes[1] = false;
+      if (fault == 2) invalid.fixed_nuclei = false;
+      if (fault == 3) invalid.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+      if (fault == 4) invalid.parameter_scalar_domain = ScalarDomain::COMPLEX;
+      if (fault == 5) invalid.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+      if (supportsLazyRealInferenceEnvironment(invalid))
+        throw std::runtime_error("Lazy Gamma admitted unsupported metadata");
+    }
+    bool rejected_twist = false, rejected_mixed = false;
+    try { Backend rejected(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation, true, true); }
+    catch (const std::invalid_argument&) { rejected_twist = true; }
+    try { Backend rejected(image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, {}, true); }
+    catch (const std::invalid_argument&) { rejected_mixed = true; }
+    if (!rejected_twist || !rejected_mixed || metrics.snapshot().live_bytes != initial)
+      throw std::runtime_error("Lazy Gamma negative admission allocated or missed twist/mixed");
+  }
   Backend eager(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation, false);
   auto eager_workspace = eager.prepare(batch);
   const auto eager_bytes = metrics.snapshot().live_bytes - initial;

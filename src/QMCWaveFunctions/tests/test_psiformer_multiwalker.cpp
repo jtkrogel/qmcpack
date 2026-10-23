@@ -1945,13 +1945,22 @@ TEST_CASE("PsiFormer all-to-one and ragged virtual batches are state isolated",
 TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
           "[wavefunction][psiformer][multiwalker][ecp][gpu]")
 {
+  for (const bool periodic : {false, true})
   for (const char* frozen_lazy : {"0", "1"})
   {
+    INFO("legacy Gamma=" << periodic << ", frozen lazy=" << frozen_lazy);
     ScopedEnvironmentVariable lazy("PSIFORMER_GPU_LAZY_VGL_PREPARATION", frozen_lazy);
     ScopedEnvironmentVariable selected("PSIFORMER_GPU_ECP_VALUE_TILE16", "1");
-    GeneratedFiles files = generateFiles("lih");
+    GeneratedFiles files = generateFiles("lih", 4, periodic ? 7 : 4);
     const Geometry geometry = makeGeometry("lih");
-    const SimulationCell simulation_cell;
+    Lattice lattice;
+    if (periodic)
+    {
+      lattice.R = {8, .4, -.2, .7, 7.4, .3, -.1, .8, 8.5};
+      lattice.BoxBConds = {true, true, true};
+      lattice.reset();
+    }
+    const SimulationCell simulation_cell(lattice);
     auto particles = makeWalker(simulation_cell, 0);
     auto ions = std::make_unique<ParticleSet>(simulation_cell);
     ions->setName("ion0");
@@ -1968,6 +1977,7 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
     ions->resetGroups();
     ions->update();
     WaveFunctionComponentBuilder::PSetMap sources;
+    const auto* physical_source = ions.get();
     sources.emplace("ion0", std::move(ions));
     PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, *particles, sources);
     Libxml2Document document;
@@ -1978,11 +1988,19 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
 #endif
     REQUIRE(document.parseFromString("<psiformer name='value16_guard' parameters='" +
         files.parameters.string() + "' configuration='" + files.configuration.string() +
-        "' source='ion0' system='all_electron' gpu='" + backend + "'/>"));
+        "' source='ion0' system='all_electron' gpu='" + backend +
+        (periodic ? "' feature_policy='periodic_torus_v1'/>" : "'/>")));
     auto component = builder.buildComponent(document.getRoot());
     auto* wavefunction = dynamic_cast<PsiFormerWF*>(component.get());
     REQUIRE(wavefunction != nullptr);
     testing::TestPsiFormerVirtualBatch::bindParticleSet(*wavefunction, *particles);
+    particles->G = Value(0);
+    particles->L = Value(0);
+    wavefunction->evaluateLog(*particles, particles->G, particles->L);
+    const auto accepted_before = testing::TestPsiFormerVirtualBatch::cloneState(*wavefunction);
+    const auto coordinates_before = particles->R;
+    const auto gradients_before = particles->G;
+    const auto laplacians_before = particles->L;
     RefVectorWithLeader<WaveFunctionComponent> components(*wavefunction);
     components.push_back(*wavefunction);
     RefVectorWithLeader<ParticleSet> references(*particles);
@@ -1990,13 +2008,59 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
     VirtualParticleSet scratch(*particles);
     RefVectorWithLeader<VirtualParticleSet> scratches(scratch);
     scratches.push_back(scratch);
-    std::vector<std::size_t> offsets{0, 17};
-    std::vector<VirtualParticleBatch::Segment> segments{{0, 0, true, 0}};
+    // Distinct bases, reordered/repeated electron segments and an empty walker
+    // exercise the existing CSR contract without changing its implementation.
+    std::vector<std::unique_ptr<ParticleSet>> extra_particles;
+    std::vector<std::unique_ptr<WaveFunctionComponent>> extra_components;
+    std::vector<std::unique_ptr<VirtualParticleSet>> extra_scratches;
+    for (int walker = 1; walker < 4; ++walker)
+    {
+      extra_particles.push_back(makeWalker(simulation_cell, walker));
+      auto& p = *extra_particles.back();
+      extra_components.push_back(wavefunction->makeClone(p));
+      auto& w = static_cast<PsiFormerWF&>(*extra_components.back());
+      testing::TestPsiFormerVirtualBatch::bindParticleSet(w, p);
+      references.push_back(p);
+      components.push_back(w);
+      extra_scratches.push_back(std::make_unique<VirtualParticleSet>(p));
+      scratches.push_back(*extra_scratches.back());
+    }
+    std::vector<testing::PsiFormerCloneStateSnapshot> extra_states;
+    std::vector<ParticleSet::ParticlePos> extra_coordinates;
+    std::vector<ParticleSet::ParticleGradient> extra_gradients;
+    std::vector<ParticleSet::ParticleLaplacian> extra_laplacians;
+    for (std::size_t walker = 1; walker < 4; ++walker)
+    {
+      auto& p = references[walker];
+      auto& w = static_cast<PsiFormerWF&>(components[walker]);
+      p.G = Value(0);
+      p.L = Value(0);
+      w.evaluateLog(p, p.G, p.L);
+      extra_states.push_back(testing::TestPsiFormerVirtualBatch::cloneState(w));
+      extra_coordinates.push_back(p.R);
+      extra_gradients.push_back(p.G);
+      extra_laplacians.push_back(p.L);
+    }
+    std::vector<std::size_t> offsets{0};
+    std::vector<VirtualParticleBatch::Segment> segments;
     std::vector<ParticleSet::PosType> positions;
-    for (int point = 0; point < 17; ++point)
-      positions.push_back(particles->R[0] +
-          ParticleSet::PosType{0.001 * (point + 1), -0.002, 0.003});
-    const VirtualParticleBatch batch(1, offsets, segments, positions);
+    const auto append = [&](int walker, int electron, int count) {
+      segments.emplace_back(walker, electron, true, 0);
+      const auto base = references[walker].R[electron];
+      for (int point = 0; point < count; ++point)
+        positions.push_back(base + ParticleSet::PosType{
+            point < 2 ? 0.0 : 0.001 * point, point < 2 ? 0.0 : -0.002,
+            point < 2 ? 0.0 : 0.003});
+      offsets.push_back(positions.size());
+    };
+    append(2, 3, 17);
+    append(0, 0, 33);
+    append(2, 1, 31);
+    append(1, 2, 1);
+    if (periodic)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        positions.back()[dimension] += lattice.R(0, dimension) - lattice.R(2, dimension);
+    const VirtualParticleBatch batch(4, offsets, segments, positions);
     ResourceCollection resource_template("psiformer_value16_eager_guard");
     wavefunction->createResource(resource_template);
     ResourceCollection resource(resource_template);
@@ -2037,8 +2101,31 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
           *wavefunction, components);
       wavefunction->mw_evaluateVirtualRatios(components, references, scratches, batch, ratios);
       // Different GEMM batch shapes inherit the public ratio accuracy contract.
-      Crowd cpu_crowd(files, simulation_cell, 1);
-      const auto cpu_ratios = evaluateScalarVirtualBatch(cpu_crowd, batch);
+      std::vector<Value> cpu_ratios;
+      if (periodic)
+      {
+        for (std::size_t segment = 0; segment < segments.size(); ++segment)
+        {
+          const auto& descriptor = segments[segment];
+          auto& p = references[descriptor.walkerId()];
+          PsiFormerWF cpu("value16_periodic_cpu", files.parameters.string(), files.configuration.string(),
+                          p, *physical_source);
+          cpu.validateSystem(p, *physical_source, "all_electron");
+          std::vector<ParticleSet::PosType> displacements;
+          for (auto point = offsets[segment]; point < offsets[segment + 1]; ++point)
+            displacements.push_back(positions[point] - p.R[descriptor.electronId()]);
+          VirtualParticleSet cpu_scratch(p);
+          cpu_scratch.makeMoves(p, descriptor.electronId(), displacements);
+          std::vector<Value> segment_ratios(displacements.size());
+          cpu.evaluateRatios(cpu_scratch, segment_ratios);
+          cpu_ratios.insert(cpu_ratios.end(), segment_ratios.begin(), segment_ratios.end());
+        }
+      }
+      else
+      {
+        Crowd cpu_crowd(files, simulation_cell, 4);
+        cpu_ratios = evaluateScalarVirtualBatch(cpu_crowd, batch);
+      }
       for (std::size_t point = 0; point < ratios.size(); ++point)
       {
         CHECK(std::isfinite(ratios[point]));
@@ -2056,6 +2143,18 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
       // Replaying the same shape and inputs must remain bitwise repeatable.
       CHECK(sameVectorBits(ratios, warm_ratios));
       CHECK(metrics.snapshot().allocation_calls == warm_before.allocation_calls);
+    }
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(*wavefunction, accepted_before));
+    CHECK(sameVectorBits(particles->R, coordinates_before));
+    CHECK(sameVectorBits(particles->G, gradients_before));
+    CHECK(sameVectorBits(particles->L, laplacians_before));
+    for (std::size_t walker = 1; walker < 4; ++walker)
+    {
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+          static_cast<const PsiFormerWF&>(components[walker]), extra_states[walker - 1]));
+      CHECK(sameVectorBits(references[walker].R, extra_coordinates[walker - 1]));
+      CHECK(sameVectorBits(references[walker].G, extra_gradients[walker - 1]));
+      CHECK(sameVectorBits(references[walker].L, extra_laplacians[walker - 1]));
     }
   }
 }

@@ -1223,7 +1223,7 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
               << preparation.vgl.max_targets
               << ", maximum_active_inference_crowds=" << preparation.active_inference_crowds
               << ", CPU fallback=no" << std::endl;
-  }, precision, preparation);
+  }, precision, preparation, configuredLazyVglPreparation(), outer_twist);
 #else
   throw std::invalid_argument("PsiFormer numerical device tiles are not compiled in this executable");
 #endif
@@ -5008,15 +5008,25 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
       if (!segment.isOnSphere() || segment.sourceCenterId() == VirtualParticleBatch::NO_SOURCE)
         throw std::invalid_argument("PsiFormer ECP VALUE16 requires source-centered spherical virtual segments");
 
+    // Admit only fixed legacy Gamma metadata beyond the existing OPEN lane.
+    const auto& environment = model_state->execution_plan.environment();
+    const bool legacy_gamma = environment.boundary == psiformer::BoundaryCondition::PERIODIC &&
+        environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+        environment.fixed_nuclei && !environment.periodic_profile &&
+        environment.head_representation == psiformer::HeadRepresentation::REAL &&
+        environment.parameter_scalar_domain == psiformer::ScalarDomain::REAL &&
+        environment.compute_scalar_domain == psiformer::ScalarDomain::REAL &&
+        environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
     // Reject unsupported owners before constructing a second backend context.
     if (expected_plan || prepared_plan || acquired_from_prepared_collection ||
         model_state->resident_device_authority_requested ||
         model_state->resident_device_authority_enabled ||
         !model_state->numerical_tile_backend ||
         model_state->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
-        model_state->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
-        model_state->execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
-      throw std::invalid_argument("PsiFormer ECP VALUE16 requires unplanned real open FP64 GPU execution");
+        model_state->twist_phase.active() ||
+        (environment.boundary != psiformer::BoundaryCondition::OPEN && !legacy_gamma) ||
+        environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+      throw std::invalid_argument("PsiFormer ECP VALUE16 requires unplanned real OPEN or fixed legacy Gamma FP64 GPU execution");
 #ifdef ENABLE_CUDA
     const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
         model_state->numerical_tile_backend.get());
