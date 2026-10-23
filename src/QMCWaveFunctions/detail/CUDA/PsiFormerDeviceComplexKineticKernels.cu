@@ -6,6 +6,8 @@
 #include "PsiFormerDeviceComplexWeightedProducts.h"
 #include <cfloat>
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 
 // Keep vendor arithmetic selection local; all products below are ordinary complex.
 #ifdef QMC_CUDA2HIP
@@ -186,6 +188,216 @@ __global__ void matrixRoots(OpenOrbitalJetLayout layout, const ComplexValueChann
         }
     }
   }
+}
+
+/// Admit the same scalar channel/physical-root domain before any cooperative mutation.
+__device__ bool rootCombination(std::size_t d, std::size_t m, std::size_t k,
+    const ComplexValueChannel* records, const ComplexValueResult* amplitude, const C* inverse,
+    const C* gradient, const C* laplacian, const C* qg, const C* ql,
+    double& shift, C& phase, double& log_total)
+{
+  if (amplitude->status || !finite(amplitude->phase) || !device_math::isFiniteBinary64(amplitude->log_abs) ||
+      fmax(fabs(cuCreal(amplitude->phase)), fabs(cuCimag(amplitude->phase))) == 0)
+    return false;
+  shift = -DBL_MAX;
+  for (std::size_t channel = 0; channel < d; ++channel)
+  {
+    if (records[channel].status || !finite(records[channel].phase) ||
+        fmax(fabs(cuCreal(records[channel].phase)), fabs(cuCimag(records[channel].phase))) == 0 ||
+        !device_math::isFiniteBinary64(records[channel].log_abs))
+      return false;
+    shift = fmax(shift, records[channel].log_abs);
+  }
+  for (std::size_t i = 0; i < m; ++i)
+    if (!finite(inverse[i]))
+      return false;
+  for (std::size_t i = 0; i < 3 * k; ++i)
+    if (!finite(gradient[i]) || !finite(qg[i]))
+      return false;
+  for (std::size_t i = 0; i < k; ++i)
+    if (!finite(laplacian[i]) || !finite(ql[i]))
+      return false;
+  Sum denominator;
+  for (std::size_t channel = 0; channel < d; ++channel)
+    denominator.push(scale(records[channel].phase, exp(records[channel].log_abs - shift)));
+  const auto total = denominator.value();
+  const auto maximum = fmax(fabs(cuCreal(total)), fabs(cuCimag(total)));
+  if (!finite(total) || !(maximum > 0))
+    return false;
+  const auto re = cuCreal(total) / maximum, im = cuCimag(total) / maximum, norm = hypot(re, im);
+  phase = make_cuDoubleComplex(re / norm, im / norm);
+  log_total = log(maximum) + log(norm);
+  return finite(phase) && device_math::isFiniteBinary64(log_total);
+}
+
+/// Snapshot failure uniformly before any fast lane may mutate the next stage's flag.
+__device__ bool rootStageRejected(const unsigned& rejected)
+{
+  __syncthreads();
+  const bool failed = rejected != 0;
+  __syncthreads();
+  return failed;
+}
+
+/// Independent output entries retain the old increasing-k compensated Cartesian sum.
+/// All threads join before returning the shared failure state to the caller.
+__device__ bool multiplyCooperative(const C* left, const C* right, C* output,
+    std::size_t n, unsigned& rejected)
+{
+  for (auto index = std::size_t(threadIdx.x); index < n * n; index += blockDim.x)
+  {
+    const auto i = index / n, j = index % n;
+    Sum sum;
+    for (std::size_t k = 0; k < n; ++k)
+    {
+      const auto term = QMC_PF_MUL(left[i * n + k], right[k * n + j]);
+      if (!finite(term))
+      {
+        atomicOr(&rejected, 1u);
+        break;
+      }
+      sum.push(term);
+    }
+    output[index] = sum.value();
+    if (!finite(output[index]))
+      atomicOr(&rejected, 1u);
+  }
+  return !rootStageRejected(rejected);
+}
+
+/// One block reuses the SAME three N*N matrices; scalar reductions never change order.
+__global__ void matrixRootsCooperative(OpenOrbitalJetLayout layout, const ComplexValueChannel* records,
+    const ComplexValueResult* amplitude, const C* inverse, const C* head, const C* gradient,
+    const C* laplacian, const C* qg, const C* ql, C* output, C* scratch, std::uint64_t* status)
+{
+  const auto n = layout.features.electron_count, nn = n * n, d = layout.determinant_count;
+  const auto m = layout.orbitals.element_count, k = layout.orbitals.laplacian_lanes;
+  __shared__ unsigned rejected;
+  __shared__ double shift, log_total, log_weight;
+  __shared__ C phase, ratio, alpha, delta;
+  if (threadIdx.x == 0)
+    rejected = !rootCombination(d, m, k, records, amplitude, inverse, gradient, laplacian, qg, ql,
+        shift, phase, log_total);
+  if (rootStageRejected(rejected))
+  {
+    if (threadIdx.x == 0) fail(status);
+    return;
+  }
+  for (auto i = std::size_t(threadIdx.x); i < layout.orbitals.plane_count * m; i += blockDim.x)
+    output[i] = make_cuDoubleComplex(0, 0);
+  __syncthreads();
+  C* a = scratch;
+  C* b = a + nn;
+  C* c = b + nn;
+  for (std::size_t channel = 0; channel < d; ++channel)
+  {
+    const auto begin = channel * nn;
+    const auto* inv = inverse + begin;
+    if (threadIdx.x == 0)
+    {
+      log_weight = (records[channel].log_abs - shift) - log_total;
+      ratio = QMC_PF_DIV(records[channel].phase, phase);
+    }
+    __syncthreads();
+    for (std::size_t e = 0; e < k; ++e)
+    {
+      if (threadIdx.x == 0) alpha = scale(laplacian[e], -1);
+      for (std::size_t mu = 0; mu < 3; ++mu)
+      {
+        const auto lane = 3 * e + mu;
+        if (!multiplyCooperative(inv, head + (1 + lane) * m + begin, a, n, rejected))
+        {
+          if (threadIdx.x == 0) fail(status);
+          return;
+        }
+        if (threadIdx.x == 0)
+        {
+          delta = add(trace(a, n), scale(gradient[lane], -1));
+          const auto square = QMC_PF_MUL(delta, delta);
+          if (!finite(delta) || !finite(square)) rejected = 1;
+          alpha = add(alpha, square);
+          for (std::size_t i = 0; i < n && !rejected; ++i)
+            for (std::size_t j = 0; j < n; ++j)
+            {
+              const auto term = QMC_PF_MUL(a[i * n + j], a[j * n + i]);
+              if (!finite(term))
+              {
+                rejected = 1;
+                break;
+              }
+              alpha = add(alpha, scale(term, -1));
+            }
+          if (!finite(alpha)) rejected = 1;
+        }
+        if (rootStageRejected(rejected) || !multiplyCooperative(a, inv, b, n, rejected) ||
+            !multiplyCooperative(a, b, c, n, rejected))
+        {
+          if (threadIdx.x == 0) fail(status);
+          return;
+        }
+        for (auto ij = std::size_t(threadIdx.x); ij < nn; ij += blockDim.x)
+        {
+          const auto i = ij / n, j = ij % n, index = begin + ij, t = j * n + i;
+          const auto delta_i = QMC_PF_MUL(delta, inv[t]), delta_b = QMC_PF_MUL(delta, b[t]);
+          const auto combined = add(delta_i, scale(b[t], -1)), second = add(c[t], scale(delta_b, -1));
+          const auto value_g = QMC_PF_MUL(qg[lane], combined), value_l = QMC_PF_MUL(ql[e], second);
+          const auto grad_g = QMC_PF_MUL(qg[lane], inv[t]), grad_l = QMC_PF_MUL(ql[e], combined);
+          if (!finite(delta_i) || !finite(delta_b) || !finite(combined) || !finite(second) ||
+              !finite(value_g) || !finite(value_l) || !finite(grad_g) || !finite(grad_l) ||
+              !weightedAdd(log_weight, ratio, add(value_g, scale(value_l, 2)), output[index]) ||
+              !weightedAdd(log_weight, ratio, add(grad_g, scale(grad_l, 2)), output[(1 + lane) * m + index]))
+            atomicOr(&rejected, 1u);
+        }
+        if (rootStageRejected(rejected))
+        {
+          if (threadIdx.x == 0) fail(status);
+          return;
+        }
+      }
+      if (!multiplyCooperative(inv, head + (1 + 3 * k + e) * m + begin, a, n, rejected))
+      {
+        if (threadIdx.x == 0) fail(status);
+        return;
+      }
+      if (threadIdx.x == 0)
+      {
+        alpha = add(alpha, trace(a, n));
+        if (!finite(alpha)) rejected = 1;
+      }
+      if (rootStageRejected(rejected) || !multiplyCooperative(a, inv, b, n, rejected))
+      {
+        if (threadIdx.x == 0) fail(status);
+        return;
+      }
+      for (auto ij = std::size_t(threadIdx.x); ij < nn; ij += blockDim.x)
+      {
+        const auto i = ij / n, j = ij % n, index = begin + ij, t = j * n + i;
+        const auto factor = QMC_PF_MUL(alpha, inv[t]);
+        const auto combined = add(factor, scale(b[t], -1));
+        if (!finite(factor) || !finite(combined) ||
+            !weightedAdd(log_weight, ratio, QMC_PF_MUL(ql[e], combined), output[index]) ||
+            !weightedAdd(log_weight, ratio, QMC_PF_MUL(ql[e], inv[t]), output[(1 + 3 * k + e) * m + index]))
+          atomicOr(&rejected, 1u);
+      }
+      if (rootStageRejected(rejected))
+      {
+        if (threadIdx.x == 0) fail(status);
+        return;
+      }
+    }
+  }
+}
+
+/// A cold opt-in affects only this matrix-root leaf, never inverse/head/trunk work.
+bool cooperativeMatrixRootsRequested()
+{
+  static const bool requested = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COOPERATIVE_COMPLEX_KINETIC_ROOTS");
+    if (!value || std::strcmp(value, "0") == 0) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COOPERATIVE_COMPLEX_KINETIC_ROOTS must be 0 or 1");
+  }();
+  return requested;
 }
 
 /// Select a real objective without conjugating its analytic complex cotangent.
@@ -378,7 +590,10 @@ Error launchComplexKineticMatrixRoots(Stream stream, OpenOrbitalJetLayout layout
   const void* reads[]{channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql};
   const void* outputs[]{roots, scratch, status};
   open_kinetic_reverse_detail::rejectAliasedStorage(reads, outputs, "Complex kinetic root storage aliases");
-  matrixRoots<<<1, 1, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status);
+  if (cooperativeMatrixRootsRequested())
+    matrixRootsCooperative<<<1, 256, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status);
+  else
+    matrixRoots<<<1, 1, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status);
   return launched();
 }
 

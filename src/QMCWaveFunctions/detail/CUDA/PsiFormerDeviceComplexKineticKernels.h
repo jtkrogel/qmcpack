@@ -18,6 +18,7 @@ struct ComplexKineticHeadLayout
 
 /// Reverse ordinary complex CORE G/L roots; caller owns three complex N*N scratch matrices.
 /// Requires finite unweighted A/B/C/combined terms; no Wide-domain fallback.
+/// Cold PSIFORMER_GPU_COOPERATIVE_COMPLEX_KINETIC_ROOTS=1 opts into independent-entry work only.
 Error launchComplexKineticMatrixRoots(Stream stream, OpenOrbitalJetLayout layout,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* orbitals, const cuDoubleComplex* core_gradient, const cuDoubleComplex* core_laplacian,
