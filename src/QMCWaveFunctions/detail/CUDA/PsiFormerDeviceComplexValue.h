@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_VALUE_H
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceComplexValueKernels.h"
+#include <array>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -74,6 +75,13 @@ public:
     const ComplexValueResult* data;
   };
 
+  /// One absolute row replacement; every streamed point starts from the same base.
+  struct Replacement
+  {
+    std::size_t electron;
+    std::array<double, 3> position;
+  };
+
   /// Exact combined preflight precedes constructor/trunk/device allocation.
   static std::unique_ptr<PreparedDeviceComplexValue> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
@@ -122,9 +130,72 @@ public:
       throw std::invalid_argument("Complex VALUE packed physical input exceeds capacity");
     t.setBatchCount(positions.size() / stride);
     t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    evaluateOwnedCoordinates();
+  }
+
+  /** Stream independent single-row replacements through one coordinate upload.
+   * Accessors/consumers are immediate and caller-owned; no per-point tape or
+   * output storage is retained here. The scoped invocation runs the unchanged
+   * VALUE body, allowing the caller to preserve evaluation timer boundaries.
+   */
+  template<class ReplacementAt, class Consume, class ScopedEvaluation>
+  void evaluateReplacementStream(const std::vector<double>& reference, std::size_t count,
+      ReplacementAt&& replacement_at, Consume&& consume, ScopedEvaluation&& evaluate)
+  {
+    invalidate();
+    auto& t = *trunk_;
+    t.beginCoordinateEvaluation();
+    if (!count || reference.size() != t.product(3, t.ne_) ||
+        count - 1 > std::numeric_limits<std::size_t>::max() - generation_)
+      throw std::invalid_argument("Complex VALUE replacement stream has invalid base/count");
+    for (double coordinate : reference)
+      if (!device_math::isFiniteBinary64(coordinate))
+        throw std::invalid_argument("Complex VALUE replacement base is nonfinite");
+    for (std::size_t point = 0; point < count; ++point)
+      validateReplacement(replacement_at(point));
+    t.setBatchCount(1);
+    std::size_t previous = t.ne_;
+    try
+    {
+      for (std::size_t point = 0; point < count; ++point)
+      {
+        if (point)
+        {
+          invalidate();
+          t.beginCoordinateEvaluation();
+        }
+        const Replacement replacement = replacement_at(point);
+        validateReplacement(replacement);
+        evaluate([&] {
+          if (!point)
+            t.positions_.uploadOnStream(reference.data(), reference.size(), t.queue_.getNative());
+          // Restore the preceding row before changing indices; replacements never accumulate.
+          if (previous < t.ne_ && previous != replacement.electron)
+            uploadReplacementRow(previous, reference.data() + 3 * previous);
+          uploadReplacementRow(replacement.electron, replacement.position.data());
+          evaluateOwnedCoordinates();
+        });
+        consume(point, resultView());
+        previous = replacement.electron;
+      }
+    }
+    catch (...)
+    {
+      valid_ = false;
+      t.value_tape_valid_ = false;
+      throw;
+    }
+  }
+
+private:
+  /// Prepare the common paired orbital matrix before any determinant overwrite.
+  void evaluateHeadOwnedCoordinates(bool include_cusp)
+  {
+    auto& t = *trunk_;
     t.resetStatusAdmission();
     t.evaluatePreparedTrunk();
-    t.evaluateCusp();
+    if (include_cusp)
+      t.evaluateCusp();
     t.checkOpen(t.batch_);
 
     // Project both head components from this SAME admitted real trunk generation.
@@ -141,6 +212,13 @@ public:
     checkRuntime(launchComplexValuePack(t.queue_.getNative(), m, envelope_.data(), projections_.data(),
         projections_.data() + cost_.matrices, matrix_.data(), status_.data()), "paired VALUE head");
     admitStatus();
+  }
+
+  /// All coordinate loading paths share exactly the same trunk, head and determinant algebra.
+  void evaluateOwnedCoordinates()
+  {
+    auto& t = *trunk_;
+    evaluateHeadOwnedCoordinates(true);
 
     // The private head epoch ends here: matrix storage now becomes LU IN PLACE.
     checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
@@ -154,6 +232,7 @@ public:
     valid_ = true;
   }
 
+public:
   /// Expose a generation-stamped complete amplitude; never expose the overwritten head.
   ResultView resultView() const
   {
@@ -178,9 +257,51 @@ public:
 private:
   friend class PreparedDeviceComplexScore;
 
+  /// Friend-only raw orbital forward: no cusp, physical phase, solve or determinant inverse.
+  void evaluateOrbitalHead(const std::vector<double>& positions)
+  {
+    invalidate();
+    auto& t = *trunk_;
+    t.beginCoordinateEvaluation();
+    const auto stride = t.product(3, t.ne_);
+    if (positions.empty() || positions.size() % stride || positions.size() > t.positions_.capacity())
+      throw std::invalid_argument("Complex orbital head packed physical input exceeds capacity");
+    t.setBatchCount(positions.size() / stride);
+    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    evaluateHeadOwnedCoordinates(false);
+    t.value_tape_valid_ = !t.value_tape_.empty();
+  }
+
+  /// Row validation precedes every upload, including reentrant accessors.
+  void validateReplacement(const Replacement& replacement) const
+  {
+    if (replacement.electron >= trunk_->ne_)
+      throw std::invalid_argument("Complex VALUE replacement electron is out of range");
+    for (double coordinate : replacement.position)
+      if (!device_math::isFiniteBinary64(coordinate))
+        throw std::invalid_argument("Complex VALUE replacement position is nonfinite");
+  }
+
+  /// Preserve the ordinary synchronous host-input lifetime and transfer accounting contract.
+  void uploadReplacementRow(std::size_t electron, const double* position)
+  {
+    auto& t = *trunk_;
+    constexpr auto bytes = 3 * sizeof(double);
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpyAsync(t.positions_.data() + 3 * electron, position, bytes,
+        hipMemcpyHostToDevice, t.queue_.getNative()), "paired replacement row H2D");
+#else
+    checkRuntime(cudaMemcpyAsync(t.positions_.data() + 3 * electron, position, bytes,
+        cudaMemcpyHostToDevice, t.queue_.getNative()), "paired replacement row H2D");
+#endif
+    t.queue_.sync();
+    deviceMemoryMetrics(t.positions_.deviceOrdinal()).uploaded(bytes);
+  }
+
   /// Prepare no real head/determinant/reverse buffers; assert the exact allocation inventory.
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
-      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost, bool retain_score = false)
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost,
+      bool retain_score = false, bool retain_inverse = true)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true)),
         envelope_(cost.matrices, "ComplexValue::envelope_", __FILE__, __LINE__),
@@ -189,8 +310,8 @@ private:
         channels_(capacity * trunk_->shape_.determinants, "ComplexValue::channels_", __FILE__, __LINE__),
         results_(capacity, "ComplexValue::results_", __FILE__, __LINE__),
         status_(1, "ComplexValue::status_", __FILE__, __LINE__),
-        inverse_(retain_score ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
-        solve_(retain_score ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
+        inverse_(retain_score && retain_inverse ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
+        solve_(retain_score && retain_inverse ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
         permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__)
   {
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +

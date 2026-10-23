@@ -111,6 +111,68 @@ void validateComplexValue()
   const auto after_warm = metrics.snapshot();
   if (after_warm.allocation_calls != warm.allocation_calls || after_warm.free_calls != warm.free_calls)
     throw std::runtime_error("Complex VALUE warmed evaluation allocated device storage");
+
+  // Each observation replaces ONE row of the same base, including index transitions.
+  const std::vector<double> base(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 12);
+  std::vector<PreparedDeviceComplexValue::Replacement> replacements;
+  for (std::size_t electron : {0u, 2u, 1u, 2u})
+    replacements.push_back({electron, {base[3 * electron] + 0.13,
+        base[3 * electron + 1] - 0.07, base[3 * electron + 2] + 0.04}});
+  const auto streamed_before = metrics.snapshot();
+  std::vector<ComplexValueResult> observed(1);
+  const auto check_replacement = [&](std::size_t point, const PreparedDeviceComplexValue::ResultView& view) {
+    gpu->download(view, observed);
+    auto explicit_positions = base;
+    std::copy(replacements[point].position.begin(), replacements[point].position.end(),
+        explicit_positions.begin() + 3 * replacements[point].electron);
+    workspace->setPositions(pf::GeometryPositionView::interleaved(explicit_positions.data(), 4));
+    const auto& expected = oracle.evaluate(*workspace);
+    near(observed[0].log_abs, expected.amplitude.log_abs, "streamed complex log", 2e-10);
+    near(cuCreal(observed[0].phase), expected.amplitude.phase.real(), "streamed complex real", 2e-10);
+    near(cuCimag(observed[0].phase), expected.amplitude.phase.imag(), "streamed complex imag", 2e-10);
+  };
+  const auto at = [&](std::size_t point) { return replacements[point]; };
+  const auto run = [](auto&& evaluation) { evaluation(); };
+  gpu->evaluateReplacementStream(base, replacements.size(), at, check_replacement, run);
+  const auto streamed_after = metrics.snapshot();
+  if (streamed_after.uploaded_bytes - streamed_before.uploaded_bytes != 3 * sizeof(double) * (4 + 4 + 3) ||
+      streamed_after.allocation_calls != streamed_before.allocation_calls)
+    throw std::runtime_error("Complex VALUE replacement stream did not reuse its coordinate owner");
+  auto stream_view = gpu->resultView();
+  rejected = false;
+  try
+  {
+    gpu->evaluateReplacementStream(base, replacements.size(), at,
+        [&](std::size_t point, const PreparedDeviceComplexValue::ResultView& view) {
+          check_replacement(point, view);
+          if (point + 1 == replacements.size())
+            throw std::runtime_error("test late observer failure");
+        }, run);
+  }
+  catch (const std::runtime_error&) { rejected = true; }
+  if (!rejected)
+    throw std::runtime_error("Complex VALUE observer failure was swallowed");
+  rejected = false;
+  try { gpu->download(stream_view, observed); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected)
+    throw std::runtime_error("Complex VALUE failed stream retained an old result");
+  rejected = false;
+  try { (void)gpu->resultView(); }
+  catch (const std::logic_error&) { rejected = true; }
+  if (!rejected)
+    throw std::runtime_error("Complex VALUE failed stream published a partial result");
+  const auto invalid_before = metrics.snapshot();
+  const auto valid_last = replacements.back();
+  replacements.back().electron = 4;
+  rejected = false;
+  try { gpu->evaluateReplacementStream(base, replacements.size(), at, check_replacement, run); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  replacements.back() = valid_last;
+  if (!rejected || metrics.snapshot().uploaded_bytes != invalid_before.uploaded_bytes)
+    throw std::runtime_error("Complex VALUE stream did not preflight every replacement");
+  gpu->evaluateReplacementStream(base, replacements.size(), at, check_replacement, run);
+  compare(model.cfg.electrons.x);
   auto coincident = model.cfg.electrons.x;
   std::copy_n(coincident.data(), 3, coincident.data() + 3);
   compare(coincident);

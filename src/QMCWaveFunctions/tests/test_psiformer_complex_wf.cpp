@@ -5437,7 +5437,31 @@ TEST_CASE("PsiFormer paired all-to-one VALUE observes complete replacements with
       auto point = p.R[0]; point[0] += .037; point[2] -= .019;
       std::vector<C> ratios(p.getTotalNum(), C{71, -9});
       p.makeVirtualMoves(point);
+#ifdef ENABLE_CUDA
+      ps::device::DeviceMemoryMetrics* transfer_metrics = nullptr;
+      ps::device::DeviceMemorySnapshot before_stream;
+      if (device_cap)
+      {
+        int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+        REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+        REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+        transfer_metrics = &ps::device::deviceMemoryMetrics(ordinal);
+        before_stream = transfer_metrics->snapshot();
+      }
+#endif
       component.evaluateRatiosAlltoOne(p, ratios);
+#ifdef ENABLE_CUDA
+      if (transfer_metrics)
+      {
+        const auto after_stream = transfer_metrics->snapshot();
+        const std::size_t n = p.getTotalNum();
+        CHECK(after_stream.uploaded_bytes - before_stream.uploaded_bytes == 3 * sizeof(double) * (3 * n - 1));
+        CHECK(after_stream.allocation_calls == before_stream.allocation_calls);
+      }
+#endif
       for (int electron = 0; electron < p.getTotalNum(); ++electron)
       {
         auto explicit_p = electrons(simulation_cell);
@@ -5466,6 +5490,9 @@ TEST_CASE("PsiFormer paired all-to-one VALUE observes complete replacements with
       CHECK_THROWS(component.evaluateRatiosAlltoOne(p, short_output));
       CHECK(short_output == std::vector<C>(1, C{71, -9}));
       CHECK_THROWS(component.evaluateRatiosAlltoOne(foreign, ratios)); CHECK(ratios == saved);
+      const auto source_x = source.R[0][0]; source.R[0][0] += .01;
+      CHECK_THROWS(component.evaluateRatiosAlltoOne(p, ratios)); CHECK(ratios == saved);
+      source.R[0][0] = source_x;
       // Failed observation preserves the pending proposal so its original acceptance still succeeds.
       p.makeMove(2, ParticleSet::PosType{.01, 0, 0});
       const auto proposal_ratio = component.ratio(p, 2);
@@ -5680,6 +5707,8 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
     auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
     const auto warm = metrics.snapshot();
     gpu.evaluateRatios(gpu_vp, gpu_ratios);
+    CHECK(metrics.snapshot().uploaded_bytes - warm.uploaded_bytes ==
+        3 * sizeof(double) * (gpu_p.getTotalNum() + positions.size()));
     for (std::size_t q = 0; q < gpu_ratios.size(); ++q)
       close(gpu_ratios[q], cpu_ratios[q]);
     CHECK(gpu.get_log_value() == gpu_log);

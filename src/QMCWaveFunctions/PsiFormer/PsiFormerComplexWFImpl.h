@@ -2902,6 +2902,49 @@ struct PsiFormerComplexWF::Impl
     return result;
   }
 
+  /// Retain one base coordinate upload while immediately consuming independent GPU VALUE replacements.
+  template<class ElectronAt, class PositionAt>
+  bool streamVirtualValues(const ParticleSet& p, ElectronAt&& electron_at, PositionAt&& position_at,
+      std::vector<ValueType>& staged)
+  {
+#ifdef ENABLE_CUDA
+    if (state->gpu && staged.size() > 1)
+    {
+      NativeTimerScope timer(phase_timers.value);
+      auto permit = state->inference_concurrency.acquire();
+      const auto owner = selectedGpuLane();
+      auto& lane = *owner;
+      std::unique_lock lease(lane.mutex);
+      bindGpuLane(lane);
+      lane.resizeLive(1);
+      for (int e = 0; e < p.getTotalNum(); ++e)
+        for (int d = 0; d < 3; ++d)
+          lane.positions[3 * e + d] = p.R[e][d];
+      lane.value->evaluateReplacementStream(lane.positions, staged.size(),
+          [&](std::size_t point) {
+            const auto absolute = position_at(point);
+            return psiformer::device::PreparedDeviceComplexValue::Replacement{
+                static_cast<std::size_t>(electron_at(point)), {absolute[0], absolute[1], absolute[2]}};
+          },
+          [&](std::size_t point, const auto& view) {
+            {
+              NativeTimerScope download(phase_timers.gpu_download);
+              lane.value->download(view, lane.amplitude);
+            }
+            const Amplitude amplitude{{lane.amplitude[0].phase.x, lane.amplitude[0].phase.y}, lane.amplitude[0].log_abs};
+            const auto absolute = position_at(point);
+            staged[point] = formRatio(amplitude, p, electron_at(point), &absolute);
+          },
+          [&](auto&& evaluate) {
+            NativeTimerScope numerical(phase_timers.gpu_evaluate);
+            evaluate();
+          });
+      return true;
+    }
+#endif
+    return false;
+  }
+
   /// Reuse one crowd FULL tape, copying each borrowed result before releasing its lease.
   void stageCpuCollective(MultiWalkerResource& resource, const RefVectorWithLeader<ParticleSet>& targets,
       const MCMultiParticleMoves<CoordsType::POS>& moves)
@@ -5119,6 +5162,7 @@ void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vec
   std::shared_lock read(impl_->state->mutex);
   impl_->requireNoCollective();
   impl_->requireIdle(particles);
+  Impl::validateDerivativeSource(*impl_->state);
   if (particles.isSpinor() || ratios.size() != static_cast<std::size_t>(particles.getTotalNum()))
     throw std::invalid_argument("Complex PsiFormer all-to-one VALUE shape/spin mismatch");
   const auto position = particles.getActivePos();
@@ -5130,11 +5174,13 @@ void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vec
   if (ratios.size() > (impl_->numeric_limit - impl_->numeric_required) / sizeof(ValueType))
     throw std::length_error("Complex PsiFormer all-to-one VALUE staging exceeds clone numeric cap");
   std::vector<ValueType> staged(ratios.size());
-  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
-  {
-    const auto evaluated = impl_->core(particles, false, electron, -1, &position);
-    staged[electron] = impl_->formRatio(evaluated.amplitude, particles, electron, &position);
-  }
+  if (!impl_->streamVirtualValues(particles, [](std::size_t point) { return static_cast<int>(point); },
+      [&](std::size_t) { return position; }, staged))
+    for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+    {
+      const auto evaluated = impl_->core(particles, false, electron, -1, &position);
+      staged[electron] = impl_->formRatio(evaluated.amplitude, particles, electron, &position);
+    }
   std::copy(staged.begin(), staged.end(), ratios.begin());
 }
 
@@ -5145,6 +5191,7 @@ void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet& virtuals, std:
   impl_->requireNoCollective();
   const auto& reference = virtuals.getRefPS();
   impl_->requireIdle(reference);
+  Impl::validateDerivativeSource(*impl_->state);
   impl_->validate(reference, virtuals.refPtcl);
   if (reference.isSpinor() || virtuals.isSpinor() || virtuals.refPtcl < 0 ||
       ratios.size() != virtuals.getTotalNum() || virtuals.R.size() != virtuals.getTotalNum())
@@ -5159,11 +5206,13 @@ void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet& virtuals, std:
   if (ratios.size() > (impl_->numeric_limit - impl_->numeric_required) / sizeof(ValueType))
     throw std::length_error("Complex PsiFormer virtual VALUE staging exceeds clone numeric cap");
   std::vector<ValueType> staged(ratios.size());
-  for (std::size_t q = 0; q < staged.size(); ++q)
-  {
-    const auto evaluated = impl_->core(reference, false, virtuals.refPtcl, -1, &virtuals.R[q]);
-    staged[q] = impl_->formRatio(evaluated.amplitude, reference, virtuals.refPtcl, &virtuals.R[q]);
-  }
+  if (!impl_->streamVirtualValues(reference, [&](std::size_t) { return virtuals.refPtcl; },
+      [&](std::size_t point) { return virtuals.R[point]; }, staged))
+    for (std::size_t q = 0; q < staged.size(); ++q)
+    {
+      const auto evaluated = impl_->core(reference, false, virtuals.refPtcl, -1, &virtuals.R[q]);
+      staged[q] = impl_->formRatio(evaluated.amplitude, reference, virtuals.refPtcl, &virtuals.R[q]);
+    }
   // No partial output is visible if a later virtual evaluation fails.
   std::copy(staged.begin(), staged.end(), ratios.begin());
 }
