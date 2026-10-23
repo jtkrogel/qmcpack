@@ -133,7 +133,8 @@ public:
       "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
       "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE",
       "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS",
-      "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "PSIFORMER_GPU_KFAC_AFFINE"};
+      "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "PSIFORMER_GPU_KFAC_AFFINE",
+      "PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -2065,6 +2066,228 @@ TEST_CASE("Shared DEVICE affine sink rejects an unimplemented imaginary fallback
 }
 
 #ifdef ENABLE_CUDA
+TEST_CASE("Paired Ne100 complete score and affine factors preserve ordered shared row means",
+          "[wavefunction][psiformer][complex_wf][complex_shared_row_means]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  const char* input = std::getenv("PSIFORMER_TEST_PAIRED_SHARED_MEANS_INPUT");
+  if (!input) { WARN("NOT_RUN: frozen Ne100 paired input required"); return; }
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  REQUIRE(hipGetDeviceCount(&devices) == hipSuccess);
+  const char* backend = "hip";
+#else
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  const char* backend = "cuda";
+#endif
+  REQUIRE(devices > 0);
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_KFAC_AFFINE", "1");
+  Libxml2Document document;
+  REQUIRE(document.parse(input));
+  const auto node = [&](const char* expression) -> xmlNodePtr {
+    auto* result = xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(expression), document.getXPathContext());
+    REQUIRE(result != nullptr);
+    REQUIRE(result->nodesetval != nullptr);
+    REQUIRE(result->nodesetval->nodeNr == 1);
+    auto* selected = result->nodesetval->nodeTab[0];
+    xmlXPathFreeObject(result);
+    return selected;
+  };
+  const auto content = [](xmlNodePtr selected) {
+    auto* text = xmlNodeGetContent(selected);
+    const std::string value(reinterpret_cast<const char*>(text));
+    xmlFree(text);
+    return value;
+  };
+  Lattice lattice;
+  std::istringstream lattice_values(content(node("//simulationcell/parameter[@name='lattice']")));
+  for (int row = 0; row < 3; ++row)
+    for (int column = 0; column < 3; ++column)
+      REQUIRE(static_cast<bool>(lattice_values >> lattice.R(row, column)));
+  REQUIRE(content(node("//simulationcell/parameter[@name='bconds']")).find("p p p") != std::string::npos);
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  auto source = std::make_unique<ParticleSet>(simulation_cell);
+  XMLParticleParser source_parser(*source);
+  REQUIRE(source_parser.readXML(node("//particleset[@name='ion0']")));
+  REQUIRE(source->getTotalNum() == 100);
+  source->update();
+  ParticleSet p(simulation_cell);
+  p.setName("e");
+  p.create({50, 50});
+  auto& species = p.getSpeciesSet();
+  species.addSpecies("u"); species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, 0) = species(mass, 1) = 1;
+  p.resetGroups();
+  for (int electron = 0; electron < 100; ++electron)
+    p.R[electron] = source->R[electron] + ParticleSet::PosType{
+        .17 + .03 * (electron / 50), .21 + .002 * electron, -.13 + .001 * electron};
+  p.update();
+  const auto positions = p.R;
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::move(source));
+  auto* head = node("//psiformer");
+  const auto property = [&](const char* key, const char* value) {
+    xmlSetProp(head, reinterpret_cast<const xmlChar*>(key), reinterpret_cast<const xmlChar*>(value));
+  };
+  property("optimize", "yes");
+  property("optimize_scope", "all");
+  property("max_clone_numeric_bytes", "4294967296");
+  const auto build = [&](const char* selected_backend) {
+    property("gpu", selected_backend);
+    if (std::string(selected_backend) == "cpu") xmlUnsetProp(head, BAD_CAST "max_gpu_numeric_bytes");
+    else property("max_gpu_numeric_bytes", "8589934592");
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, sources);
+    return builder.buildComponent(head);
+  };
+  auto cpu_storage = build("cpu");
+  auto& cpu = dynamic_cast<PsiFormerComplexWF&>(*cpu_storage);
+  const auto registry_for = [](const PsiFormerComplexWF& component) {
+    const auto metadata = component.gpuInferenceEnabled() ? component.hybridAffineParameterBlocks() : component.affineParameterBlocks();
+    std::vector<KFACAffineBlockDescriptor> blocks;
+    std::vector<bool> covered(component.parameterSchema().blocks().size());
+    for (const auto& block : metadata)
+    {
+      blocks.push_back({block.id, block.weight_block, block.bias_block, block.input_width, block.output_width});
+      covered.at(block.weight_block) = true;
+      if (block.bias_block != NO_KFAC_BIAS_BLOCK) covered.at(block.bias_block) = true;
+    }
+    std::vector<std::size_t> fallback;
+    for (std::size_t i = 0; i < covered.size(); ++i)
+      if (!covered[i] && component.parameterSchema().blocks()[i].trainable) fallback.push_back(i);
+    return KFACBlockRegistry(component.parameterSchema(), std::move(blocks), std::move(fallback), component.genericKFACParameterBlocks());
+  };
+  const auto registry = registry_for(cpu);
+  KFACFactorAccumulator reference(registry, 0);
+  // Independent HOST affine rows form the reference before either GPU route.
+  struct Rows final : AffineScoreObserver
+  {
+    KFACFactorAccumulator& accumulator;
+    explicit Rows(KFACFactorAccumulator& a) : accumulator(a) {}
+    void observe(const AffineScoreObservation& row) override
+    {
+      const auto& block = accumulator.registry().affineBlocks().at(row.affine_block);
+      accumulator.addObservation({row.affine_block, {row.activations, row.row_count * block.input_width},
+          {row.sensitivities, row.row_count * block.output_width}, row.row_count,
+          {row.imaginary_sensitivities, row.row_count * block.output_width}});
+    }
+  } rows(reference);
+  cpu.prepareAffineScores(cpu.affineScoreStorage().required_bytes);
+  std::vector<double> real, imaginary;
+  reference.beginSample(1);
+  cpu.observeComplexAffineScores(p, rows, real, imaginary);
+  reference.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+  reference.endSample();
+  reduceKFACFactorStatistics(reference);
+  std::vector<double> flat_positions(300);
+  for (std::size_t i = 0; i < 100; ++i)
+    for (std::size_t d = 0; d < 3; ++d) flat_positions[3*i+d] = p.R[i][d];
+  std::vector<cuDoubleComplex> original_score;
+  std::vector<KFACFactorStatistics> original_factors;
+  std::vector<double> original_fallback;
+  // Scan all entries, but keep Catch/reporting overhead proportional to fields.
+  const auto compare_field = [](const char* field, const auto& actual,
+      const auto& expected, const std::vector<double>* old) {
+    REQUIRE(actual.size() == expected.size());
+    if (old) REQUIRE(actual.size() == old->size());
+    double max_abs = 0, reference_at_max = 0, max_scaled = 0;
+    bool finite = true, exact = true;
+    for (std::size_t i = 0; i < actual.size(); ++i)
+    {
+      const double error = std::abs(actual[i] - expected[i]);
+      finite = finite && std::isfinite(actual[i]) && std::isfinite(expected[i]);
+      if (error > max_abs) { max_abs = error; reference_at_max = expected[i]; }
+      max_scaled = std::max(max_scaled, error / (3e-10 + 3e-12 * std::abs(expected[i])));
+      if (old) exact = exact && actual[i] == (*old)[i];
+    }
+    CAPTURE(field, actual.size(), max_abs, reference_at_max, max_scaled);
+    CHECK(finite); CHECK(max_scaled <= 1); CHECK(exact);
+    std::printf("PAIRED_SHARED_MEANS_FIELD field=%s entries=%zu max_abs=%.17g reference_at_max=%.17g max_scaled=%.17g old_new_exact=%d\n",
+        field, actual.size(), max_abs, reference_at_max, max_scaled, exact);
+  };
+  for (const char* selector : {"0", "1"})
+  {
+    std::printf("PAIRED_SHARED_MEANS_BEGIN N=100 selector=%s input=%s\n", selector, input);
+    controls.set("PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS", selector);
+    RuntimeOptions options;
+    TrialWaveFunction trial(options);
+    auto storage = build(backend);
+    auto& gpu = dynamic_cast<PsiFormerComplexWF&>(*storage);
+    trial.addComponent(std::move(storage));
+    const auto gpu_registry = registry_for(gpu);
+    REQUIRE(gpu_registry.fingerprint() == registry.fingerprint());
+    const auto* pointer = static_cast<const dev::PreparedDeviceModel*>(gpu.numericStorage().shared_image_identity);
+    std::shared_ptr<const dev::PreparedDeviceModel> image(pointer, [](const auto*) {});
+    REQUIRE(image->plan().modelShape().electrons() == 100);
+    REQUIRE(image->plan().modelShape().feature_dimension >= 50);
+    compute::Queue<PlatformKind::CUDA> queue;
+    dev::AcceleratorBlasHandle blas(queue);
+    auto score = dev::PreparedDeviceComplexScore::prepare(image, queue, blas, 8589934592ULL);
+    score->evaluate(flat_positions);
+    std::vector<cuDoubleComplex> actual(real.size());
+    dev::ComplexValueResult amplitude;
+    score->download(score->resultView(), actual, amplitude);
+    std::vector<double> actual_real(actual.size()), actual_imaginary(actual.size());
+    std::vector<double> old_real(original_score.size()), old_imaginary(original_score.size());
+    for (std::size_t i = 0; i < actual.size(); ++i)
+    { actual_real[i] = cuCreal(actual[i]); actual_imaginary[i] = cuCimag(actual[i]); }
+    for (std::size_t i = 0; i < original_score.size(); ++i)
+    { old_real[i] = cuCreal(original_score[i]); old_imaginary[i] = cuCimag(original_score[i]); }
+    compare_field("score_real", actual_real, real, old_real.empty() ? nullptr : &old_real);
+    compare_field("score_imaginary", actual_imaginary, imaginary, old_imaginary.empty() ? nullptr : &old_imaginary);
+    RefVectorWithLeader<TrialWaveFunction> trials(trial); trials.push_back(trial);
+    RefVectorWithLeader<ParticleSet> particles(p); particles.push_back(p);
+    constexpr auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+    const auto requirement = gpu.gpuDerivativeRequirements(1, 1, 1, 7, scope);
+    auto op = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 0, 0, 1, 1, 7,
+        requirement.device_bytes, requirement.host_bytes, 1, scope);
+    const auto factors_requirement = gpu.deviceAffineStatisticsRequirements(gpu_registry);
+    KFACFactorAccumulator factors(gpu_registry, 0, KFACCurvatureConvention::NATIVE_SCORE,
+        KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+    // Import only complete DEVICE factor transactions into the ordinary ledger.
+    struct Sink final : DeviceAffineStatisticsSink
+    {
+      KFACFactorAccumulator& accumulator;
+      explicit Sink(KFACFactorAccumulator& a) : accumulator(a) {}
+      void beginSample() override { accumulator.beginSample(1); }
+      void addFallbackScore(const std::vector<double>& r) override { accumulator.addFallbackScores({r.data(),r.size()}); }
+      void addComplexFallbackScore(const std::vector<double>& r, const std::vector<double>& i) override
+      { accumulator.addFallbackScores({r.data(),r.size()}, {i.data(),i.size()}); }
+      void endSample() override { accumulator.endSample(); }
+      void abortSample() noexcept override { accumulator.abortSample(); }
+      void import(std::vector<KFACFactorStatistics> f) override
+      { accumulator.importAffineStatistics(accumulator.registry().fingerprint(), 0, std::move(f)); }
+    } sink(factors);
+    gpu.accumulateDeviceAffineStatistics({&p}, gpu_registry, 0, false, sink,
+        factors_requirement.device_bytes + factors_requirement.host_bytes);
+    const auto& expected = reference.factors();
+    const auto& result = factors.factors();
+    REQUIRE(result.size() == expected.size());
+    for (std::size_t block = 0; block < result.size(); ++block)
+      for (bool activation : {true, false})
+      {
+        const auto& a = activation ? result[block].activation_outer_sum : result[block].sensitivity_outer_sum;
+        const auto& e = activation ? expected[block].activation_outer_sum : expected[block].sensitivity_outer_sum;
+        const std::vector<double>* old = nullptr;
+        if (!original_factors.empty()) old = activation ? &original_factors[block].activation_outer_sum :
+            &original_factors[block].sensitivity_outer_sum;
+        compare_field(activation ? "A" : "G", a, e, old);
+      }
+    const auto fallback = factors.fallbackDiagonalSum(), expected_fallback = reference.fallbackDiagonalSum();
+    compare_field("fallback", fallback, expected_fallback, original_fallback.empty() ? nullptr : &original_fallback);
+    original_score = actual; original_factors = result;
+    original_fallback.assign(fallback.data(), fallback.data() + fallback.size());
+    for (std::size_t i = 0; i < p.R.size(); ++i)
+      for (int d = 0; d < 3; ++d) CHECK(p.R[i][d] == positions[i][d]);
+    std::printf("PAIRED_SHARED_MEANS_COMPLETE N=100 selector=%s P=%zu blocks=%zu two_objectives=1 input=%s\n",
+        selector, real.size(), result.size(), input);
+  }
+}
+
 TEST_CASE("Paired DEVICE affine factors match independent CPU two-channel rows",
           "[wavefunction][psiformer][complex_wf][complex_device_affine]")
 {

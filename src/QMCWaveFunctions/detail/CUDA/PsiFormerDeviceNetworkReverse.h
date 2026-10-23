@@ -195,12 +195,23 @@ private:
       // valueTapeBatchCount/valueBlockTape requires a valid retained VALUE tape;
       // setMixedDense rejects such a tape and revokes tape admission on attachment.
       const auto& environment = model_->plan().environment();
-      const bool shared_means = shared_softmax_means_ &&
+      const bool real_open_means =
           environment.boundary == BoundaryCondition::OPEN && environment.fixed_nuclei &&
           environment.parameter_scalar_domain == ScalarDomain::REAL &&
           environment.compute_scalar_domain == ScalarDomain::REAL &&
           environment.amplitude_scalar_domain == ScalarDomain::REAL &&
           environment.head_representation == HeadRepresentation::REAL && !environment.periodic_profile;
+      // Paired FP64 score/affine passes share this real trunk. Retained VALUE
+      // tapes exclude mixed dense; raw-input and new periodic profiles stay out.
+      const bool paired_legacy_means = output_ == NetworkReverseOutput::PARAMETER_SCORE &&
+          environment.boundary == BoundaryCondition::PERIODIC && environment.fixed_nuclei &&
+          environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+          environment.periodic_axes == std::array<bool, 3>{true, true, true} &&
+          environment.parameter_scalar_domain == ScalarDomain::REAL &&
+          environment.compute_scalar_domain == ScalarDomain::REAL &&
+          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX &&
+          environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX && !environment.periodic_profile;
+      const bool shared_means = shared_softmax_means_ && (real_open_means || paired_legacy_means);
       checkRuntime(launchSoftmaxScaledQkReverse(stream, attention, tape.query.data(), tape.key.data(),
           tape.probabilities.data(), probability_.data(), query_.data(), key_.data(),
           shared_means ? context_.data() : nullptr, shared_means ? context_.capacity() : 0),
