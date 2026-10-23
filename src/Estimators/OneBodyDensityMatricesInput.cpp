@@ -34,6 +34,8 @@ OneBodyDensityMatricesInput::OneBodyDensityMatricesInput(xmlNodePtr cur)
   setIfInInput(write_acceptance_ratio_, "acceptance_ratio");
   setIfInInput(integrator_, "integrator");
   setIfInInput(evaluator_, "evaluator");
+  if (evaluator_ != Evaluator::MATRIX)
+    throw UniformCommunicateError("Modern OneBodyDensityMatrices supports evaluator=matrix; loop is not implemented");
   setIfInInput(scale_, "scale");
   center_defined_ = setIfInInput(center_, "center");
   corner_defined_ = setIfInInput(corner_, "corner");

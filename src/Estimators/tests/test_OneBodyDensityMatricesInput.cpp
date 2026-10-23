@@ -71,6 +71,21 @@ TEST_CASE("OneBodyDensityMatricesInput::volume_normed", "[estimators]")
   REQUIRE(doc.parseFromString(input_xml));
   OneBodyDensityMatricesInput obdmi(doc.getRoot());
   CHECK_FALSE(obdmi.get_volume_normalized());
+  CHECK(obdmi.get_evaluator() == OneBodyDensityMatricesInput::Evaluator::MATRIX);
+}
+
+TEST_CASE("OneBodyDensityMatricesInput::unsupported_loop", "[estimators][obdm_evaluator]")
+{
+  constexpr std::string_view input_xml = R"XML(
+<estimator type="OneBodyDensityMatrices" name="rdm">
+  <parameter name="basis">projection</parameter>
+  <parameter name="integrator">uniform</parameter>
+  <parameter name="evaluator">loop</parameter>
+</estimator>
+)XML";
+  Libxml2Document doc;
+  REQUIRE(doc.parseFromString(input_xml));
+  CHECK_THROWS_AS(OneBodyDensityMatricesInput(doc.getRoot()), UniformCommunicateError);
 }
 
 } // namespace qmcplusplus

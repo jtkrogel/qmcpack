@@ -115,7 +115,7 @@ private:
   bool center_defined_   = false;
   bool corner_defined_   = false;
   Integrator integrator_ = Integrator::UNIFORM_GRID;
-  Evaluator evaluator_   = Evaluator::LOOP;
+  Evaluator evaluator_   = Evaluator::MATRIX;
   Real scale_            = 1.0;
   /// center_ does not have a default. The estimator sets if from input Lattice if it isn't set
   Position center_;
