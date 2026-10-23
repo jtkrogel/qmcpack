@@ -59,6 +59,8 @@ struct PsiFormerComplexWF::Impl
    */
   struct CpuLane
   {
+    enum class Mode { VALUE, FULL_VGL, ACTIVE_ELECTRON_GRADIENT };
+
     explicit CpuLane(std::shared_ptr<CpuScratchBudget> authority) : budget(std::move(authority))
     {
       std::lock_guard lock(budget->mutex);
@@ -79,7 +81,7 @@ struct PsiFormerComplexWF::Impl
 
     /// Publish only a complete, exactly sized workspace; failures preserve prior modes.
     template<class Workspace, class Factory>
-    Workspace& prepare(std::unique_ptr<Workspace>& destination, std::size_t bytes, Factory factory)
+    Workspace& prepare(std::unique_ptr<Workspace>& destination, std::size_t bytes, Factory factory, Mode mode)
     {
       if (!destination)
       {
@@ -101,12 +103,21 @@ struct PsiFormerComplexWF::Impl
           budget->release(bytes);
           throw;
         }
+        // No trace work on warm calls; a failed numerical preparation owns no event.
+        // HostCapacity is nonthrowing and keeps optional I/O failure outside science.
+        const auto index = static_cast<std::size_t>(mode);
+        trace_capacity[index].snapshotAt(__FILE__, __LINE__, trace_names[index], bytes,
+                                         reinterpret_cast<std::uintptr_t>(this));
       }
       return *destination;
     }
 
     std::shared_ptr<CpuScratchBudget> budget;
     std::mutex mutex;
+    static constexpr std::array<const char*, 3> trace_names{
+        "ComplexWF::shared_cpu_VALUE", "ComplexWF::shared_cpu_FULL_VGL",
+        "ComplexWF::shared_cpu_ACTIVE_ELECTRON_GRADIENT"};
+    std::array<psiformer::memory::HostCapacity, 3> trace_capacity;
     std::unique_ptr<pf::DirectComplexValueWorkspace> value;
     std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
     std::size_t charged = 0, fingerprint = 0;
@@ -2773,7 +2784,8 @@ struct PsiFormerComplexWF::Impl
       const auto mode = electron < 0 ? pf::DirectSpatialMode::FULL_VGL : pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT;
       auto& workspace = result.cpu_owner
           ? result.cpu_owner->prepare(electron < 0 ? result.cpu_owner->full : result.cpu_owner->active,
-              state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); })
+              state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); },
+              electron < 0 ? CpuLane::Mode::FULL_VGL : CpuLane::Mode::ACTIVE_ELECTRON_GRADIENT)
           : (electron < 0 ? *full : *active);
       positions(workspace, p, replacement, absolute);
       static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
@@ -2783,7 +2795,7 @@ struct PsiFormerComplexWF::Impl
     {
       auto& workspace = result.cpu_owner
           ? result.cpu_owner->prepare(result.cpu_owner->value, state->cpu_requirements[0],
-              [&] { return state->value.makeWorkspace(); }) : *value;
+              [&] { return state->value.makeWorkspace(); }, CpuLane::Mode::VALUE) : *value;
       positions(workspace, p, replacement, absolute);
       const auto evaluated = state->value.evaluate(workspace);
       result.amplitude = evaluated.amplitude;
@@ -3052,7 +3064,7 @@ void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
   if (owner)
     execution = std::unique_lock(owner->mutex);
   auto& workspace = owner ? owner->prepare(owner->value, state->cpu_requirements[0],
-      [&] { return state->value.makeWorkspace(); }) : *impl_->value;
+      [&] { return state->value.makeWorkspace(); }, Impl::CpuLane::Mode::VALUE) : *impl_->value;
   impl_->positions(workspace, particles);
   const auto values = state->value.evaluateOrbitalValues(workspace);
   orbitals.assign(values.values, values.values + values.size);
