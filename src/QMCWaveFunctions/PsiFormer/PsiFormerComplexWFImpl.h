@@ -2425,6 +2425,31 @@ struct PsiFormerComplexWF::Impl
         accepted_version == state->model.p.version();
   }
 
+  /// Validate the entire additive observation before changing any caller product.
+  void validateOwnScatter(const ParticleSet::ParticleGradient& g, const ParticleSet::ParticleLaplacian& l) const
+  {
+    if (g.size() != own_gradient.size() || l.size() != own_laplacian.size())
+      throw std::invalid_argument("Complex PsiFormer accepted FULL scatter extent mismatch");
+    for (std::size_t e = 0; e < own_gradient.size(); ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        if (!isFiniteWavefunctionValue(g[e][d] + own_gradient[e][d]))
+          throw std::overflow_error("Complex PsiFormer accepted FULL gradient scatter overflow");
+      if (!isFiniteWavefunctionValue(l[e] + own_laplacian[e]))
+        throw std::overflow_error("Complex PsiFormer accepted FULL Laplacian scatter overflow");
+    }
+  }
+
+  /// Publish only after every destination in this observation has passed validation.
+  void scatterOwn(ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l) const noexcept
+  {
+    for (std::size_t e = 0; e < own_gradient.size(); ++e)
+    {
+      g[e] += own_gradient[e];
+      l[e] += own_laplacian[e];
+    }
+  }
+
   /// Caller holds Model read authority; preserve ordinary complex squares and actual masses.
   LogValue observeOwnKinetic(const ParticleSet& p) const
   {
@@ -4469,6 +4494,57 @@ void PsiFormerComplexWF::mw_evaluateGL(const RefVectorWithLeader<WaveFunctionCom
     const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacians, bool fromscratch) const
 {
+  if (!fromscratch && !components.empty())
+  {
+    std::shared_lock read(impl_->state->mutex);
+    if (&components.getLeader() != this || targets.size() != components.size() ||
+        gradients.size() != components.size() || laplacians.size() != components.size())
+      throw std::invalid_argument("Complex accepted FULL observation leader/list mismatch");
+    if (impl_->denseEnabled() || impl_->acquired_leader)
+      impl_->requireDenseTeam(components, targets);
+    Impl::validateDerivativeSource(*impl_->state);
+    bool current = true;
+    for (std::size_t i = 0; i < components.size(); ++i)
+    {
+      const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[i]);
+      if (!component || component->impl_->state != impl_->state)
+        throw std::invalid_argument("Complex accepted FULL observation requires one model family");
+      const auto& clone = *component->impl_;
+      clone.requireNoCollective();
+      clone.validate(targets[i]);
+      current = current && !clone.pending && targets[i].getActivePtcl() < 0 && clone.fullMatches(targets[i]);
+      for (std::size_t prior = 0; prior < i; ++prior)
+        if (&components[prior] == &components[i] || &targets[prior] == &targets[i])
+          throw std::invalid_argument("Complex accepted FULL observation aliases walkers");
+    }
+    if (current)
+    {
+      for (std::size_t i = 0; i < components.size(); ++i)
+      {
+        const auto& clone = *static_cast<const PsiFormerComplexWF&>(components[i]).impl_;
+        clone.validateOwnScatter(gradients[i], laplacians[i]);
+        const auto g = checkedMemoryRange(gradients[i].get().data(), gradients[i].get().size(),
+            "Complex accepted gradient output range overflow");
+        const auto l = checkedMemoryRange(laplacians[i].get().data(), laplacians[i].get().size(),
+            "Complex accepted Laplacian output range overflow");
+        if (memoryRangesOverlap(g, l))
+          throw std::invalid_argument("Complex accepted FULL observation outputs overlap");
+        for (std::size_t prior = 0; prior < i; ++prior)
+        {
+          const auto pg = checkedMemoryRange(gradients[prior].get().data(), gradients[prior].get().size(),
+              "Complex accepted gradient output range overflow");
+          const auto pl = checkedMemoryRange(laplacians[prior].get().data(), laplacians[prior].get().size(),
+              "Complex accepted Laplacian output range overflow");
+          if (memoryRangesOverlap(g, pg) || memoryRangesOverlap(g, pl) ||
+              memoryRangesOverlap(l, pg) || memoryRangesOverlap(l, pl))
+            throw std::invalid_argument("Complex accepted FULL observation walker outputs overlap");
+        }
+      }
+      for (std::size_t i = 0; i < components.size(); ++i)
+        static_cast<const PsiFormerComplexWF&>(components[i]).impl_->scatterOwn(gradients[i], laplacians[i]);
+      return;
+    }
+  }
   if (!impl_->denseEnabled())
     WaveFunctionComponent::mw_evaluateGL(components, targets, gradients, laplacians, fromscratch);
   else
@@ -4569,6 +4645,23 @@ void PsiFormerComplexWF::mw_ratioGrad(const RefVectorWithLeader<WaveFunctionComp
     ratios[i] = resource.ratios[i];
     gradients[i] = resource.gradient[i * n + electron];
   }
+}
+
+/// Validate complete scatter before publishing any accepted amplitude or caller G/L.
+PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateGL(const ParticleSet& p,
+    ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l, bool fromscratch)
+{
+  std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
+  impl_->validate(p);
+  Impl::validateDerivativeSource(*impl_->state);
+  if (!fromscratch && !impl_->pending && p.getActivePtcl() < 0 && impl_->fullMatches(p))
+  {
+    impl_->validateOwnScatter(g, l);
+    impl_->scatterOwn(g, l);
+    return log_value_;
+  }
+  return evaluateLogLocked(p, g, l);
 }
 
 /// Validate complete scatter before publishing any accepted amplitude or caller G/L.

@@ -217,6 +217,10 @@ public:
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
   LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&) override;
 
+  /// Add current accepted FULL products, recomputing when forced or invalidated.
+  LogValue evaluateGL(const ParticleSet&, ParticleSet::ParticleGradient&,
+      ParticleSet::ParticleLaplacian&, bool fromscratch) override;
+
   /// Opt-in dense GPU VALUE/FULL tiles; scalar/B1 and CPU routes retain base behavior.
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,

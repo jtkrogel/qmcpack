@@ -43,6 +43,7 @@
 #include "Particle/VirtualParticleSet.h"
 #include "Particle/VirtualParticleBatch.h"
 #include "Utilities/ResourceCollection.h"
+#include "Utilities/TimerManager.h"
 #include "psiformer_test_utils.h"
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
@@ -5224,6 +5225,181 @@ TEST_CASE("PsiFormer paired inference crowds own independent leased lanes",
   CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
 }
 #endif
+TEST_CASE("PsiFormer paired accepted FULL reuse preserves additive products and invalidation",
+          "[wavefunction][psiformer][complex_full_reuse]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  auto& manager = getGlobalTimerManager();
+  struct RestoreThreshold
+  {
+    TimerManager<NewTimer>& manager;
+    std::string threshold;
+    ~RestoreThreshold() { manager.set_timer_threshold(threshold); }
+  } restore{manager, manager.get_timer_threshold_string()};
+  manager.set_timer_threshold(timer_level_fine);
+  auto numerical_calls = [&] {
+    TimerManager<NewTimer>::FlatProfileData profile;
+    manager.collate_flat_profile(nullptr, profile);
+    long calls = 0;
+    for (const auto* name : {"PsiFormer::CPU_spatial_complete", "PsiFormer::GPU_HOST_evaluate_complete"})
+      if (const auto entry = profile.nameList.find(name); entry != profile.nameList.end())
+        calls += profile.callList[entry->second];
+    return calls;
+  };
+  std::vector<std::pair<std::size_t, std::size_t>> backends{{0, 1}};
+#ifdef ENABLE_CUDA
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  const bool available = hipGetDeviceCount(&devices) == hipSuccess && devices;
+#else
+  const bool available = cudaGetDeviceCount(&devices) == cudaSuccess && devices;
+#endif
+  if (available)
+  {
+    backends.emplace_back(64 * 1024 * 1024, 1);
+    if (ps::device::configuredDeviceMemoryAdmission().limit_bytes)
+      backends.emplace_back(64 * 1024 * 1024, 2);
+    else
+      WARN("NOT_RUN: paired dense FULL reuse requires explicit native aggregate device admission");
+  }
+  else WARN("NOT_RUN: paired FULL reuse GPU parity requires an available device");
+  ScopedComplexGpuControls controls;
+#endif
+  for (const auto [device_cap, tile_capacity] : backends)
+    for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+    {
+      CAPTURE(device_cap, tile_capacity, twist);
+#ifdef ENABLE_CUDA
+      controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", std::to_string(tile_capacity));
+#endif
+      auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+      p1.R[0][2] += .039; p1.update();
+      PsiFormerComplexWF family("reuse", initialized, p0, source, clone_cap, twist,
+          device_cap, {}, "all_electron", device_cap ? 0 : clone_cap);
+      auto other = family.makeClone(p1);
+      auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
+      evaluate(family, p0); evaluate(clone, p1);
+      std::array<ParticleSet::ParticleGradient, 2> reference_g{p0.G, p1.G};
+      std::array<ParticleSet::ParticleLaplacian, 2> reference_l{p0.L, p1.L};
+      std::array<C, 2> reference_logs{family.get_log_value(), clone.get_log_value()};
+      RefVectorWithLeader<WaveFunctionComponent> team(family, {family, clone});
+      RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+      ParticleSet::ParticleGradient g0(4), g1(4);
+      ParticleSet::ParticleLaplacian l0(4), l1(4);
+      RefVector<ParticleSet::ParticleGradient> gs{g0, g1};
+      RefVector<ParticleSet::ParticleLaplacian> ls{l0, l1};
+      const C goffset{.3, -.2}, loffset{-.4, .1};
+      auto cached = [&] {
+        g0 = g1 = goffset; l0 = l1 = loffset;
+        const auto before = numerical_calls();
+        family.mw_evaluateGL(team, targets, gs, ls, false);
+        CHECK(numerical_calls() == before);
+        for (int walker = 0; walker < 2; ++walker)
+        {
+          close(team[walker].get_log_value(), reference_logs[walker], 2e-12);
+          for (int e = 0; e < 4; ++e)
+          {
+            close(ls[walker].get()[e], reference_l[walker][e] + loffset, 2e-12);
+            for (int d = 0; d < 3; ++d)
+              close(gs[walker].get()[e][d], reference_g[walker][e][d] + goffset, 2e-12);
+          }
+        }
+      };
+      ResourceCollection resources("accepted FULL reuse");
+      family.createResource(resources);
+      ResourceCollectionTeamLock<WaveFunctionComponent> lease(resources, team);
+      cached();
+      g0 = goffset; l0 = loffset;
+      const auto before_scalar = numerical_calls();
+      close(family.evaluateGL(p0, g0, l0, false), reference_logs[0], 2e-12);
+      CHECK(numerical_calls() == before_scalar);
+      for (int e = 0; e < 4; ++e)
+      {
+        close(l0[e], reference_l[0][e] + loffset, 2e-12);
+        for (int d = 0; d < 3; ++d)
+          close(g0[e][d], reference_g[0][e][d] + goffset, 2e-12);
+      }
+      // VALUE observations reuse numerical scratch but cannot revoke accepted FULL products.
+      p0.makeVirtualMoves(p0.R[0] + ParticleSet::PosType{.01, .02, 0});
+      std::vector<C> virtual_ratios(4);
+      family.evaluateRatiosAlltoOne(p0, virtual_ratios);
+      cached();
+      // Failure in the last walker cannot partially add the first walker's products.
+      g0 = g1 = goffset; l0 = l1 = loffset;
+      l1[3] = C{std::numeric_limits<double>::infinity(), 0};
+      CHECK_THROWS(family.mw_evaluateGL(team, targets, gs, ls, false));
+      CHECK(g0[0][0] == goffset); CHECK(l0[0] == loffset); CHECK(g1[0][0] == goffset);
+      g0 = g1 = goffset; l0 = l1 = loffset;
+      auto alias = gs; alias[1] = std::ref(g0);
+      CHECK_THROWS(family.mw_evaluateGL(team, targets, alias, ls, false));
+      cached();
+      // A selected accepted FULL proposal immediately supplies the next observation.
+      const MCMultiParticleMoves<CoordsType::POS> moves({0, 2, 4}, {1, 2, 1, 2},
+          {p0.R[1] + ParticleSet::PosType{.003, 0, 0}, p0.R[2] + ParticleSet::PosType{0, -.004, 0},
+           p1.R[1] + ParticleSet::PosType{.005, 0, 0}, p1.R[2] + ParticleSet::PosType{0, -.006, 0}});
+      g0 = g1 = C{}; l0 = l1 = C{};
+      std::vector<C> log_ratios(2);
+      family.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, gs, ls);
+      CHECK_THROWS(family.mw_evaluateGL(team, targets, gs, ls, false));
+      reference_g[0] = g0; reference_l[0] = l0; reference_logs[0] += log_ratios[0];
+      p0.R[1] = moves.slice(0).proposedPosition(0); p0.R[2] = moves.slice(0).proposedPosition(1); p0.update();
+      family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false});
+      cached();
+      // Force fresh independently of valid accepted products.
+      g0 = g1 = C{}; l0 = l1 = C{};
+      const auto before_fresh = numerical_calls();
+      family.mw_evaluateGL(team, targets, gs, ls, true);
+      CHECK(numerical_calls() > before_fresh);
+      cached();
+      // Configuration mismatch must recompute, including all output rows.
+      p1.R[3][0] += .023; p1.update();
+      auto oracle_p = electrons(simulation_cell); oracle_p.R = p1.R; oracle_p.update();
+      PsiFormerComplexWF oracle("fresh_reuse", initialized, oracle_p, source, clone_cap, twist);
+      reference_logs[1] = evaluate(oracle, oracle_p); reference_g[1] = oracle_p.G; reference_l[1] = oracle_p.L;
+      g0 = g1 = C{}; l0 = l1 = C{};
+      const auto before_changed = numerical_calls();
+      family.mw_evaluateGL(team, targets, gs, ls, false);
+      CHECK(numerical_calls() > before_changed);
+      close(clone.get_log_value(), reference_logs[1], 2e-12);
+      for (int e = 0; e < 4; ++e)
+      {
+        close(l1[e], reference_l[1][e], 2e-12);
+        for (int d = 0; d < 3; ++d)
+          close(g1[e][d], reference_g[1][e][d], 2e-12);
+      }
+      reference_logs[1] = clone.get_log_value(); reference_g[1] = g1; reference_l[1] = l1;
+      cached();
+      // A scalar VALUE acceptance has no FULL cache and must force a new spatial evaluation.
+      p0.makeMove(0, ParticleSet::PosType{.007, 0, 0}); family.ratio(p0, 0);
+      family.acceptMove(p0, 0); p0.acceptMove(0); p0.donePbyP();
+      g0 = C{}; l0 = C{};
+      const auto before_value = numerical_calls();
+      family.evaluateGL(p0, g0, l0, false);
+      CHECK(numerical_calls() > before_value);
+      reference_logs[0] = family.get_log_value(); reference_g[0] = g0; reference_l[0] = l0;
+      cached();
+      if (!device_cap)
+      {
+        const auto snapshot = family.snapshotParameters(); family.publishParameters(snapshot, snapshot.version);
+        g0 = g1 = C{}; l0 = l1 = C{};
+        const auto before_version = numerical_calls();
+        family.mw_evaluateGL(team, targets, gs, ls, false);
+        CHECK(numerical_calls() > before_version);
+        reference_logs = {family.get_log_value(), clone.get_log_value()};
+        reference_g = {g0, g1}; reference_l = {l0, l1};
+        cached();
+      }
+      const auto source_x = source.R[0][0]; source.R[0][0] += .01;
+      g0 = g1 = goffset; l0 = l1 = loffset;
+      CHECK_THROWS(family.mw_evaluateGL(team, targets, gs, ls, false));
+      CHECK(g0[0][0] == goffset); CHECK(l0[0] == loffset);
+      source.R[0][0] = source_x;
+      cached();
+    }
+}
+
 TEST_CASE("PsiFormer paired all-to-one VALUE observes complete replacements without state publication",
           "[wavefunction][psiformer][complex_all_to_one]")
 {
