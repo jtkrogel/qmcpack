@@ -1744,6 +1744,59 @@ struct PsiFormerComplexWF::Impl
     return result;
   }
 
+#ifdef ENABLE_CUDA
+  /// Bind the trainer's exact ordered registry, including independent imaginary heads.
+  static auto deviceAffineDescriptors(const Model& s, const wftrain::KFACBlockRegistry& registry)
+  {
+    const auto canonical = affineBlocks(s);
+    if (registry.parameterSchema().fingerprint() != s.schema->fingerprint() ||
+        registry.affineBlocks().size() != canonical.size())
+      throw std::invalid_argument("Complex DEVICE affine registry differs from the canonical model");
+    std::vector<psiformer::device::DeviceAffineFactorDescriptor> result;
+    result.reserve(canonical.size());
+    for (std::size_t i = 0; i < canonical.size(); ++i)
+    {
+      const auto& block = registry.affineBlocks()[i];
+      const auto& expected = canonical[i];
+      if (block.id != expected.id || block.weight_block != expected.weight_block ||
+          block.bias_block != expected.bias_block || block.input_width != expected.input_width ||
+          block.output_width != expected.output_width)
+        throw std::invalid_argument("Complex DEVICE affine block order or binding differs");
+      const auto& weight = s.schema->blocks().at(block.weight_block);
+      const auto& tensors = s.plan.parameterTensors();
+      const auto tensor = std::find_if(tensors.begin(), tensors.end(), [&](const auto& candidate) {
+        return candidate.begin == weight.offset && candidate.size() == weight.count &&
+            candidate.module + "/" + candidate.name == weight.id && candidate.shape == weight.shape;
+      });
+      if (tensor == tensors.end())
+        throw std::invalid_argument("Complex DEVICE affine tensor identity differs");
+      result.push_back({tensor->role, tensor->attention_block, block.input_width, block.output_width,
+          block.bias_block != wftrain::NO_KFAC_BIAS_BLOCK, tensor->head_component});
+    }
+    return result;
+  }
+
+  /// Exact DEVICE banks and HOST packed/import outputs, fallback channels and coordinates.
+  static DeviceAffineStatisticsRequirements deviceAffineRequirements(const Model& s,
+      const std::vector<psiformer::device::DeviceAffineFactorDescriptor>& blocks)
+  {
+    using Owner = psiformer::device::PreparedDeviceAffineStatistics;
+    const char* error = "Complex DEVICE affine bytes overflow";
+    auto host = Owner::requiredHostBytes(blocks);
+    for (const auto& block : blocks)
+    {
+      const auto input = pf::checkedStorageSum(block.input_width, block.bias_augmented, error);
+      const auto elements = pf::checkedStorageSum(pf::checkedStorageProduct(input, input, error),
+          pf::checkedStorageProduct(block.output_width, block.output_width, error), error);
+      pf::addStorageBytes(host, pf::checkedStorageBytes<double>(elements, error), error);
+    }
+    const auto host_elements = pf::checkedStorageSum(pf::checkedStorageProduct(2, s.schema->parameterCount(), error),
+        pf::checkedStorageProduct(3, s.model.ne, error), error);
+    pf::addStorageBytes(host, pf::checkedStorageBytes<double>(host_elements, error), error);
+    return {Owner::requiredDeviceBytes(blocks), host};
+  }
+#endif
+
   /// One sample's channel pairing scratch; neither sample count nor parameter count is an axis.
   struct AffineLane
   {
@@ -3966,6 +4019,167 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::hybridAffineParam
       !psiformer::matchesPairedDevicePairMetadata(impl_->state->environment)))
     throw std::logic_error("Hybrid affine metadata requires a qualified torus or selected paired GPU family");
   return Impl::affineBlocks(*impl_->state);
+}
+
+/// Explicit opt-in; unsupported requested profiles fail rather than replaying on HOST.
+bool PsiFormerComplexWF::usesDeviceAffineStatistics() const
+{
+  const char* value = std::getenv("PSIFORMER_GPU_KFAC_AFFINE");
+  if (!gpuInferenceEnabled() || !value || std::strcmp(value, "0") == 0)
+    return false;
+  if (std::strcmp(value, "1") != 0)
+    throw std::invalid_argument("PSIFORMER_GPU_KFAC_AFFINE must be 0 or 1 for paired training");
+#ifdef ENABLE_CUDA
+  const auto& e = impl_->state->environment;
+  if (e.periodic_profile || e.boundary != psiformer::BoundaryCondition::PERIODIC || !e.fixed_nuclei ||
+      e.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+      e.head_representation != psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX ||
+      e.parameter_scalar_domain != psiformer::ScalarDomain::REAL ||
+      e.compute_scalar_domain != psiformer::ScalarDomain::REAL ||
+      e.amplitude_scalar_domain != psiformer::ScalarDomain::COMPLEX)
+    throw std::invalid_argument("Paired DEVICE affine statistics require legacy FP64 torus metadata");
+  return true;
+#else
+  throw std::logic_error("Paired DEVICE affine statistics are unavailable in this build");
+#endif
+}
+
+PsiFormerComplexWF::DeviceAffineStatisticsRequirements PsiFormerComplexWF::deviceAffineStatisticsRequirements(
+    const wftrain::KFACBlockRegistry& registry) const
+{
+#ifdef ENABLE_CUDA
+  if (!usesDeviceAffineStatistics())
+    throw std::logic_error("Paired DEVICE affine statistics are not enabled");
+  std::shared_lock read(impl_->state->mutex);
+  return Impl::deviceAffineRequirements(*impl_->state, Impl::deviceAffineDescriptors(*impl_->state, registry));
+#else
+  throw std::logic_error("Paired DEVICE affine statistics are unavailable in this build");
+#endif
+}
+
+/// Collect raw DEVICE factors and HOST fallback samples without borrowing accepted caches.
+void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,
+    const wftrain::KFACBlockRegistry& registry, std::size_t expected_version, bool gaussian,
+    wftrain::DeviceAffineStatisticsSink& sink, std::size_t maximum_numeric_bytes) const
+{
+#ifdef ENABLE_CUDA
+  if (!usesDeviceAffineStatistics() || samples.empty() || !maximum_numeric_bytes ||
+      maximum_numeric_bytes == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Paired DEVICE affine collection requires samples and a finite numeric bound");
+  const auto state = impl_->state;
+  std::shared_ptr<Impl::GpuDerivativeLane> lane;
+  {
+    std::shared_lock read(state->mutex);
+    std::lock_guard factory(state->derivative_factory_mutex);
+    lane = state->gpu_derivative_lane.lock();
+  }
+  if (!lane)
+    throw std::logic_error("Paired DEVICE affine collection requires an existing prepared score-products lane");
+  // Match derivative streams: execution precedes model read and spans collection.
+  // HOST sinks run outside the model and GPU locks.
+  std::unique_lock execution(lane->execution_mutex);
+  const auto current = [&] {
+    if (impl_->state != state || lane->generation != state->gpu ||
+        expected_version != state->model.p.version() || lane->scope != GpuDerivativeScope::SCORE_ECP_ONLY ||
+        state->pending_proposals.load(std::memory_order_relaxed))
+      throw std::logic_error("Paired DEVICE affine model/version/score scope is stale or busy");
+    impl_->requireIdle(*impl_->particles);
+    Impl::validateDerivativeSource(*state);
+  };
+  using Owner = psiformer::device::PreparedDeviceAffineStatistics;
+  std::vector<psiformer::device::DeviceAffineFactorDescriptor> descriptors;
+  std::unique_ptr<Owner> factors;
+  const auto n = state->model.ne, up = state->model.cfg.nup;
+  const auto p = state->schema->parameterCount();
+  {
+    std::shared_lock read(state->mutex);
+    current();
+    descriptors = Impl::deviceAffineDescriptors(*state, registry);
+    const auto requirement = Impl::deviceAffineRequirements(*state, descriptors);
+    if (pf::checkedStorageSum(requirement.device_bytes, requirement.host_bytes,
+        "Complex DEVICE affine combined bound overflow") > maximum_numeric_bytes)
+      throw std::length_error("Paired DEVICE affine collection exceeds its combined numeric bound");
+    std::unique_lock gpu(lane->generation->mutex);
+    factors = lane->products->prepareAffineStatistics(descriptors, gaussian,
+        Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), expected_version);
+  }
+  std::vector<double> positions(3 * n), real(p), imaginary(p);
+  for (const auto* particles : samples)
+  {
+    if (!particles || particles->getActivePtcl() >= 0 || particles->R.getUnit() != PosUnit::Cartesian ||
+        particles->isSpinor() || particles->getTotalNum() != n || particles->groups() != 2 ||
+        particles->groupsize(0) != up || particles->groupsize(1) != n - up ||
+        particles->R.size() != n || particles->GroupID.size() != n)
+      throw std::invalid_argument("Paired DEVICE affine sample/proposal/spin mismatch");
+    validateRuntimeLattice(*particles, state->environment, "Paired DEVICE affine sample");
+    for (std::size_t electron = 0; electron < n; ++electron)
+      for (std::size_t d = 0; d < 3; ++d)
+      {
+        const auto coordinate = particles->R[electron][d];
+        if (particles->GroupID[electron] != (electron < up ? 0 : 1) ||
+            !psiformer::determinant::isFiniteReal(coordinate))
+          throw std::invalid_argument("Paired DEVICE affine sample coordinate or spin order is invalid");
+        positions[3 * electron + d] = coordinate;
+      }
+    sink.beginSample();
+    try
+    {
+      {
+        std::shared_lock read(state->mutex);
+        current();
+        std::unique_lock gpu(lane->generation->mutex);
+        factors->beginSample(expected_version);
+        lane->products->affineFallbackComplexScore(positions, *factors, real, imaginary);
+      }
+      sink.addComplexFallbackScore(real, imaginary);
+      std::optional<Owner::SampleCommit> prepared;
+      {
+        std::shared_lock read(state->mutex);
+        current();
+        std::unique_lock gpu(lane->generation->mutex);
+        prepared.emplace(factors->prepareSampleCommit());
+      }
+      sink.endSample();
+      // No throwing operation may separate HOST acceptance and DEVICE publication.
+      // A later source/version change rejects the disposable collection before import.
+      prepared->commit();
+    }
+    catch (...)
+    {
+      sink.abortSample();
+      factors->abortSample();
+      throw;
+    }
+  }
+  std::vector<psiformer::device::DeviceAffineFactorSums> downloaded(descriptors.size());
+  for (std::size_t block = 0; block < descriptors.size(); ++block)
+  {
+    const auto input = descriptors[block].input_width + descriptors[block].bias_augmented;
+    downloaded[block].activation_outer_sum.resize(input * input);
+    downloaded[block].sensitivity_outer_sum.resize(descriptors[block].output_width * descriptors[block].output_width);
+  }
+  {
+    std::shared_lock read(state->mutex);
+    current();
+    std::unique_lock gpu(lane->generation->mutex);
+    factors->download(downloaded);
+    current();
+  }
+  std::vector<wftrain::KFACFactorStatistics> imported;
+  imported.reserve(descriptors.size());
+  for (std::size_t block = 0; block < descriptors.size(); ++block)
+    imported.push_back({descriptors[block].input_width + descriptors[block].bias_augmented,
+        descriptors[block].output_width, downloaded[block].sample_weight_sum, downloaded[block].row_weight_sum,
+        downloaded[block].row_count, std::move(downloaded[block].activation_outer_sum),
+        std::move(downloaded[block].sensitivity_outer_sum)});
+  sink.import(std::move(imported));
+  app_log() << "Paired KFAC affine statistics: samples=" << factors->sampleCount()
+            << " device_numeric_bytes=" << factors->deviceWorkspaceBytes()
+            << " host_numeric_bytes=" << factors->hostWorkspaceBytes()
+            << "; raw affine sums=DEVICE; separate score pass; fallback/reduction/solve/update=HOST" << std::endl;
+#else
+  throw std::logic_error("Paired DEVICE affine statistics are unavailable in this build");
+#endif
 }
 
 /// Classify cusp and reciprocal-factor coefficients for exact per-coordinate diagonal statistics.

@@ -376,12 +376,22 @@ public:
   }
 
   void beginSample() override { statistics_.beginSample(1); }
+
   void addFallbackScore(const std::vector<double>& score) override
   {
     statistics_.addFallbackScores({score.data(), score.size()});
   }
+
+  /// Preserve both HOST fallback channels while affine sums remain provider-owned.
+  void addComplexFallbackScore(const std::vector<double>& real, const std::vector<double>& imaginary) override
+  {
+    statistics_.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+  }
+
   void endSample() override { statistics_.endSample(); }
+
   void abortSample() noexcept override { statistics_.abortSample(); }
+
   void import(std::vector<wftrain::KFACFactorStatistics> factors) override
   {
     statistics_.importAffineStatistics(statistics_.registry().fingerprint(), statistics_.parameterVersion(),
@@ -3110,6 +3120,9 @@ void WFTrainBatched::run()
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;
   std::size_t complex_affine_score_bytes = 0;
+  bool complex_device_affine = false;
+  std::size_t complex_device_affine_bytes = 0;
+  std::size_t complex_affine_device_bytes = 0, complex_affine_host_bytes = 0;
   std::size_t complex_expected_prepared_bytes = 0;
   std::size_t complex_fixed_grid_host_bytes = 0;
   std::string complex_physical_identity;
@@ -3136,6 +3149,18 @@ void WFTrainBatched::run()
       const auto n = static_cast<std::size_t>(target.getTotalNum());
       const auto p = selected_provider_->parameterSchema().parameterCount();
       const bool ecp = population_.get_golden_hamiltonian().hasPhysicalNLPP();
+      if (complex_gpu_provider_ && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
+          complex->usesDeviceAffineStatistics())
+      {
+        if (!ecp || !wftrain::usesEnergyScoreEstimator(training_input_, true) ||
+            training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF)
+          throw std::invalid_argument("Paired DEVICE affine KFAC requires legacy ECP score curvature and line search OFF");
+        complex_device_affine = true;
+        const auto requirements = complex->deviceAffineStatisticsRequirements(makeLiveKFACRegistry(*selected_provider_));
+        complex_affine_device_bytes = requirements.device_bytes;
+        complex_affine_host_bytes = requirements.host_bytes;
+        complex_device_affine_bytes = checkedMemoryAdd(requirements.device_bytes, requirements.host_bytes);
+      }
       const bool inline_ecp = ecp && usesInlinePairedECPResponse(training_input_);
       const auto prepared_batch_bound = checkedMemoryMultiply(crowds_.size(),
           checkedMemoryMultiply(static_cast<std::size_t>(num_blocks), steps_per_block_));
@@ -3190,10 +3215,11 @@ void WFTrainBatched::run()
           // Isolation owns flat/leaves; caller snapshot and prepared native candidate add two P vectors.
           generation_host = checkedMemoryAdd(isolation.host_bytes, checkedMemoryMultiply(2, q.host_bytes));
         }
-        const auto device = checkedMemoryAdd(r.device_bytes, generation_device);
+        const auto device = checkedMemoryAdd(checkedMemoryAdd(r.device_bytes, generation_device),
+            complex_affine_device_bytes);
         const auto host = checkedMemoryAdd(checkedMemoryAdd(checkedMemoryAdd(
             checkedMemoryAdd(r.host_bytes, checkedMemoryAdd(additive_bytes, inline_capture_bytes)), replay_bytes),
-            generation_host), complex_fixed_grid_host_bytes);
+            generation_host), checkedMemoryAdd(complex_fixed_grid_host_bytes, complex_affine_host_bytes));
         if (device > limits.device_bytes || host > limits.host_bytes || r.matrix_work > limits.maximum_matrix_work)
           throw std::length_error(
               "WFTrainBatched: paired GPU derivative+successor device/HOST/work cap exceeded before sampling");
@@ -3212,14 +3238,19 @@ void WFTrainBatched::run()
       std::size_t complex_kfac_allowance = 0;
       if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
       {
-        complex_affine_score_bytes = complex->affineScoreStorage().required_bytes;
+        complex_affine_score_bytes = complex_device_affine ? 0 : complex->affineScoreStorage().required_bytes;
         const auto statistics_bytes = kfacStatisticsBytes(makeLiveKFACRegistry(*selected_provider_));
         // Include committed/pending factor states, inverse caches and solve scratch.
-        complex_kfac_allowance = checkedMemoryAdd(complex_affine_score_bytes,
-            checkedMemoryMultiply(8, statistics_bytes));
+        complex_kfac_allowance = checkedMemoryAdd(checkedMemoryAdd(complex_affine_score_bytes,
+            complex_device_affine_bytes), checkedMemoryMultiply(8, statistics_bytes));
         app_log() << "WFTrain complex KFAC before allocation: affine_score_bytes=" << complex_affine_score_bytes
                   << " transactional_factor_bytes=" << statistics_bytes
                   << " factor_inverse_allowance=" << complex_kfac_allowance << std::endl;
+        if (complex_device_affine)
+          app_log() << "WFTrain paired DEVICE affine numeric device=" << complex_affine_device_bytes
+                    << " HOST=" << complex_affine_host_bytes << " combined=" << complex_device_affine_bytes
+                    << "; exact per-domain admission, combined once in retained allowance; not aggregate HOST fit; "
+                       "actual DEVICE banks use aggregate HBM reservations; separate DEVICE score pass, HOST solve" << std::endl;
       }
       complex_expected_prepared_bytes = checkedMemoryAdd(derivative_bytes,
           training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE ? 0 :
@@ -4635,6 +4666,20 @@ void WFTrainBatched::run()
             auto registry = makeLiveKFACRegistry(*selected_provider_);
             device_affine = affine_provider && affine_provider->usesDeviceAffineStatistics() &&
                 !registry.affineBlocks().empty();
+#ifdef QMC_COMPLEX
+            device_affine = device_affine || complex_device_affine;
+            if (complex_device_affine)
+            {
+              device_affine_budget = complex_device_affine_bytes;
+              auto live = checkedMemoryAdd(retained_configuration_bytes, storage_diagnostics.retained_numeric_bytes);
+              live = checkedMemoryAdd(live, checkedMemoryAdd(device_affine_budget, kfacStatisticsBytes(registry)));
+              if (kfac_optimizer) live = checkedMemoryAdd(live, kfac_optimizer->retainedNumericBytes());
+              if (live > training_input_.getMaximumRetainedBytes())
+                throw std::length_error("Paired DEVICE affine statistics exceed maximum_retained_bytes");
+              logTrainingAllocation("paired_kfac_device_affine_combined_bound", 1,
+                  schema.parameterCount(), device_affine_budget);
+            }
+#endif
             if (const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_);
                 real && real->usesAcceleratorParameterProducts())
             {
@@ -4674,10 +4719,20 @@ void WFTrainBatched::run()
                 for (const auto& particles : retained.particles)
                   samples.push_back(particles.get());
               LiveDeviceAffineSink sink(*statistics);
-              affine_provider->accumulateDeviceAffineStatistics(samples, statistics->registry(),
+              if (affine_provider)
+                affine_provider->accumulateDeviceAffineStatistics(samples, statistics->registry(),
                   statistics->parameterVersion(),
                   statistics->curvatureConvention() == wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN,
                   sink, device_affine_budget);
+#ifdef QMC_COMPLEX
+              else if (complex_device_affine)
+                complex_training_component_->accumulateDeviceAffineStatistics(samples, statistics->registry(),
+                    statistics->parameterVersion(),
+                    statistics->curvatureConvention() == wftrain::KFACCurvatureConvention::REGISTERED_GAUSSIAN,
+                    sink, device_affine_budget);
+#endif
+              else
+                throw std::logic_error("DEVICE affine dispatch lacks its selected provider");
               // Precomputed descriptors acquire their HOST numeric bank only at import.
               if (psiformer::memory::enabled())
                 memory_statistics.snapshotAt(__FILE__, __LINE__, "KFAC::factor_observation_statistics",

@@ -130,6 +130,22 @@ public:
     ready_ = true;
   }
 
+  /// Observe the existing two reverse objectives on one admitted forward tape.
+  void evaluateAffine(const std::vector<double>& positions, PreparedDeviceAffineStatistics& factors)
+  {
+    if (orbital_only_)
+      throw std::logic_error("Raw-orbital owner cannot produce affine log-score statistics");
+    factors.requireModel(forward_->trunk_->model_.get());
+    prepareForward(positions);
+    for (std::size_t objective = 0; objective < 2; ++objective)
+    {
+      AffineChannel channel(factors, objective);
+      prepareObjective(objective, nullptr, &factors);
+      finishObjective(objective, true, &channel);
+    }
+    ready_ = true;
+  }
+
   /// Admit one retained raw head epoch, including configurations at wavefunction nodes.
   void evaluateOrbitals(const std::vector<double>& positions)
   {
@@ -296,8 +312,27 @@ private:
         t.positions_.data(), t.model_->nuclei(), ion_.data(), pair_.data(), same_.data(), t.model_->periodicCell()), "complex score geometry");
   }
 
+  /// Map existing real-trunk callbacks to one channel of the paired transaction.
+  class AffineChannel final : public DeviceAffineObservationSink
+  {
+  public:
+    AffineChannel(PreparedDeviceAffineStatistics& factors, std::size_t objective)
+        : factors_(factors), objective_(objective) {}
+
+    void observe(ParameterRole role, std::size_t layer, const double* activations,
+        const double* sensitivities, std::size_t rows, std::size_t input, std::size_t output) override
+    {
+      factors_.observeChannel(role, layer, HeadTensorComponent::REAL, objective_,
+          activations, sensitivities, rows, input, output);
+    }
+  private:
+    PreparedDeviceAffineStatistics& factors_;
+    std::size_t objective_;
+  };
+
   /// Seed canonical head/cusp intervals FIRST, accumulating both heads into realNF.
-  void prepareObjective(std::size_t objective, const cuDoubleComplex* raw_cotangents = nullptr)
+  void prepareObjective(std::size_t objective, const cuDoubleComplex* raw_cotangents = nullptr,
+      PreparedDeviceAffineStatistics* factors = nullptr)
   {
     auto& t = *forward_->trunk_;
     const auto n = t.ne_, d = t.shape_.determinants, a = t.shape_.nuclei, up = t.shape_.spin_up_electrons;
@@ -319,6 +354,14 @@ private:
             objective, component, spin, seed_.data(), forward_->status_.data()), "complex score affine cotangent");
         const auto& interval = t.plan_.parameter(spin ? ParameterRole::BACKFLOW_DOWN_WEIGHT : ParameterRole::BACKFLOW_UP_WEIGHT,
             NO_ATTENTION_BLOCK, component ? HeadTensorComponent::IMAG : HeadTensorComponent::REAL);
+        if (factors)
+        {
+          const auto begin = spin ? up : 0, rows = spin ? n - up : up;
+          factors->observeChannel(spin ? ParameterRole::BACKFLOW_DOWN_WEIGHT : ParameterRole::BACKFLOW_UP_WEIGHT,
+              NO_ATTENTION_BLOCK, component ? HeadTensorComponent::IMAG : HeadTensorComponent::REAL, objective,
+              t.valueFinalFeatures() + begin * t.shape_.feature_dimension, seed_.data() + begin * d * n,
+              rows, t.shape_.feature_dimension, d * n);
+        }
         accumulateDenseWeightAdjoint(t.blas_, dense, t.valueFinalFeatures(), seed_.data(), network_->response_.data() + interval.begin);
         accumulateDenseInputAdjoint(t.blas_, dense, seed_.data(), t.model_->parameters() + interval.begin, feature_.data());
       }
@@ -352,10 +395,10 @@ private:
   }
 
   /// Add the same taped trunk without clearing P, admit and pack this objective.
-  void finishObjective(std::size_t objective, bool pack = true)
+  void finishObjective(std::size_t objective, bool pack = true, DeviceAffineObservationSink* affine = nullptr)
   {
     auto& t = *forward_->trunk_;
-    network_->reverseImpl(t, {}, feature_.data(), false);
+    network_->reverseImpl(t, {}, feature_.data(), false, true, affine);
     if (pack)
       checkRuntime(launchComplexScorePack(t.queue_.getNative(), score_.capacity(), objective, network_->response_.data(),
         score_.data(), forward_->status_.data()), "complex score canonical objective pack");

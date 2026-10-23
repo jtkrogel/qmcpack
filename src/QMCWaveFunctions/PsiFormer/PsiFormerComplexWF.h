@@ -22,7 +22,7 @@
 namespace qmcplusplus
 {
 class TrialWaveFunction;
-namespace wftrain { class NonLocalECPNativeCapture; }
+namespace wftrain { class NonLocalECPNativeCapture; class KFACBlockRegistry; }
 namespace psiformer
 {
 struct InitializedPsiFormerParameters;
@@ -104,6 +104,20 @@ public:
   void observeHybridComplexAffineScores(const ParticleSet&, wftrain::AffineScoreObserver&,
                                         std::vector<double>& real_score,
                                         std::vector<double>& imaginary_score) const;
+
+  /// Explicit DEVICE affine sums with HOST fallback/reduction/optimizer boundaries.
+  bool usesDeviceAffineStatistics() const;
+
+  /// Exact additional domains, including simultaneous factor staging and fallback channels.
+  struct DeviceAffineStatisticsRequirements { std::size_t device_bytes, host_bytes; };
+
+  /// Inspect numeric requirements without allocating a factor bank or CPU affine tape.
+  DeviceAffineStatisticsRequirements deviceAffineStatisticsRequirements(const wftrain::KFACBlockRegistry&) const;
+
+  /// Collect raw factors through the existing driver-owned sample/import transactions.
+  void accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,
+      const wftrain::KFACBlockRegistry&, std::size_t expected_version, bool gaussian_curvature,
+      wftrain::DeviceAffineStatisticsSink&, std::size_t maximum_numeric_bytes) const;
 
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;

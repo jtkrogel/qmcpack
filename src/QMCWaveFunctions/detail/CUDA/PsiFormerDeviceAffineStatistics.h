@@ -43,6 +43,7 @@ struct DeviceAffineFactorDescriptor
   std::size_t input_width;
   std::size_t output_width;
   bool bias_augmented;
+  HeadTensorComponent head_component = HeadTensorComponent::REAL;
 };
 
 /** Borrow rows only for the callback; consumers enqueue work on the same stream. */
@@ -135,9 +136,16 @@ public:
       throw std::invalid_argument("Affine statistics require a model, blocks and finite positive budgets");
     model_->validateCurrentDevice();
     const auto& plan = model_->plan();
-    if (plan.environment().periodic_profile ||
-        plan.environment().amplitude_scalar_domain != ScalarDomain::REAL)
-      throw std::invalid_argument("Device affine statistics require real open geometry");
+    const auto& environment = plan.environment();
+    paired_ = environment.amplitude_scalar_domain == ScalarDomain::COMPLEX;
+    if (environment.periodic_profile || (paired_ &&
+        (environment.boundary != BoundaryCondition::PERIODIC || !environment.fixed_nuclei ||
+         environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
+         environment.parameter_scalar_domain != ScalarDomain::REAL ||
+         environment.compute_scalar_domain != ScalarDomain::REAL)) ||
+        (!paired_ && environment.amplitude_scalar_domain != ScalarDomain::REAL))
+      throw std::invalid_argument("Device affine statistics require real open or legacy paired torus metadata");
     if (requiredDeviceBytes(blocks_) > device_budget || requiredHostBytes(blocks_) > host_budget)
       throw std::length_error("Device affine statistics exceed prepared numeric budgets");
     const auto& shape = plan.modelShape();
@@ -155,12 +163,13 @@ public:
           block.role != ParameterRole::BACKFLOW_UP_WEIGHT &&
           block.role != ParameterRole::BACKFLOW_DOWN_WEIGHT)
         throw std::invalid_argument("Device affine role is not a supported real open layer");
-      const auto& tensor = plan.parameter(block.role, block.attention_block);
+      const auto& tensor = plan.parameter(block.role, block.attention_block, block.head_component);
       if (tensor.shape != std::vector<std::size_t>{block.input_width, block.output_width})
         throw std::invalid_argument("Device affine dimensions do not match the canonical tensor");
       for (std::size_t earlier = 0; earlier < index; ++earlier)
         if (blocks_[earlier].role == block.role &&
-            blocks_[earlier].attention_block == block.attention_block)
+            blocks_[earlier].attention_block == block.attention_block &&
+            blocks_[earlier].head_component == block.head_component)
           throw std::invalid_argument("Device affine registry contains a duplicate tensor");
       const bool biased = block.role == ParameterRole::UPDATE_HIDDEN_WEIGHT ||
                           block.role == ParameterRole::UPDATE_OUTPUT_WEIGHT;
@@ -184,6 +193,7 @@ public:
     host_status_.resize(finite_layout_.status_capacity);
     host_packed_.resize(elements_);
     observed_.resize(blocks_.size());
+    activation_addresses_.resize(blocks_.size());
     if (deviceWorkspaceBytes() > device_budget || hostWorkspaceBytes() > host_budget)
       throw std::length_error("Actual device affine numeric capacities exceed prepared budgets");
     zero(*accepted_);
@@ -201,7 +211,8 @@ public:
       throw std::overflow_error("Device affine sample count overflow");
     for (const auto& layout : layout_)
       (void)mul(samples_ + 1, layout.rows);
-    std::fill(observed_.begin(), observed_.end(), false);
+    std::fill(observed_.begin(), observed_.end(), 0);
+    std::fill(activation_addresses_.begin(), activation_addresses_.end(), nullptr);
     zero(*pending_);
     ++generation_;
     active_ = true;
@@ -212,37 +223,55 @@ public:
       const double* sensitivities, std::size_t rows, std::size_t input_width,
       std::size_t output_width) override
   {
+    observeChannel(role, layer, HeadTensorComponent::REAL, 0, activations, sensitivities,
+        rows, input_width, output_width);
+  }
+
+  /// Pair two objectives of the SAME real tensor without doubling activations/counts.
+  void observeChannel(ParameterRole role, std::size_t layer, HeadTensorComponent component,
+      std::size_t objective, const double* activations, const double* sensitivities,
+      std::size_t rows, std::size_t input_width, std::size_t output_width)
+  {
     if (!active_)
       throw std::logic_error("Device affine observation requires an active sample");
     std::size_t ordinal = 0;
     for (; ordinal < blocks_.size(); ++ordinal)
-      if (blocks_[ordinal].role == role && blocks_[ordinal].attention_block == layer)
+      if (blocks_[ordinal].role == role && blocks_[ordinal].attention_block == layer &&
+          blocks_[ordinal].head_component == component)
         break;
     if (ordinal == blocks_.size())
       return;
     const auto& block = blocks_[ordinal];
     const auto& layout = layout_[ordinal];
-    if (observed_[ordinal] || !activations || !sensitivities || rows != layout.rows ||
+    if (objective > (paired_ ? 1u : 0u) || observed_[ordinal] != (objective ? 1u : 0u) ||
+        !activations || !sensitivities || rows != layout.rows ||
+        (objective && activation_addresses_[ordinal] != activations) ||
         input_width != block.input_width || output_width != block.output_width)
       throw std::invalid_argument("Device affine observation extent or transaction mismatch");
     const DenseForwardLayout activation{rows, input_width, input_width,
         input_width, input_width, input_width};
     const DenseForwardLayout sensitivity{rows, output_width, output_width,
         output_width, output_width, output_width};
-    accumulateDenseWeightAdjoint(blas_, activation, activations, activations,
-        pending_->data() + layout.activation);
+    if (!objective)
+    {
+      activation_addresses_[ordinal] = activations;
+      accumulateDenseWeightAdjoint(blas_, activation, activations, activations,
+          pending_->data() + layout.activation);
+    }
     accumulateDenseWeightAdjoint(blas_, sensitivity, sensitivities, sensitivities,
         pending_->data() + layout.sensitivity);
-    if (block.bias_augmented)
+    if (block.bias_augmented && !objective)
       checkRuntime(launchDenseBiasAdjoint(queue_.getNative(), activation, activations,
           pending_->data() + layout.input_sum), "affine activation bias sums");
-    observed_[ordinal] = true;
+    observed_[ordinal] |= static_cast<unsigned char>(1u << objective);
   }
 
   /// Validate DEVICE pending sums before committing HOST fallback state.
   SampleCommit prepareSampleCommit()
   {
-    if (!active_ || !std::all_of(observed_.begin(), observed_.end(), [](bool value) { return value; }))
+    const unsigned char expected = paired_ ? 3 : 1;
+    if (!active_ || !std::all_of(observed_.begin(), observed_.end(),
+        [expected](unsigned char value) { return value == expected; }))
     {
       active_ = false;
       throw std::logic_error("Device affine sample lacks a registered observation");
@@ -277,7 +306,16 @@ public:
     prepared_ = false;
   }
   std::size_t sampleCount() const noexcept { return samples_; }
+
   std::size_t parameterVersion() const noexcept { return model_->version(); }
+
+  /// Borrow only the exact immutable image used to prepare these factor banks.
+  void requireModel(const PreparedDeviceModel* image) const
+  {
+    if (image != model_.get())
+      throw std::invalid_argument("Device affine statistics belong to a different image");
+    model_->validateCurrentDevice();
+  }
   const PreparedDeviceModel* modelIdentity() const noexcept { return model_.get(); }
 
   /// Count the two raw numeric banks and their finite-scan status owner.
@@ -366,7 +404,7 @@ private:
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::vector<DeviceAffineFactorDescriptor> blocks_;
   std::vector<BlockLayout> layout_;
-  bool gaussian_, active_ = false, prepared_ = false;
+  bool gaussian_, paired_ = false, active_ = false, prepared_ = false;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
   std::size_t elements_ = 0, samples_ = 0, generation_ = 0;
@@ -375,7 +413,8 @@ private:
   DerivativeFiniteScanLayout finite_layout_;
   std::vector<DerivativeFiniteStatus> host_status_;
   std::vector<double> host_packed_;
-  std::vector<bool> observed_;
+  std::vector<unsigned char> observed_;
+  std::vector<const double*> activation_addresses_;
 };
 
 } // namespace qmcplusplus::psiformer::device

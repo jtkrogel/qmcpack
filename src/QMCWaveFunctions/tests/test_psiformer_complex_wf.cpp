@@ -133,7 +133,7 @@ public:
       "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
       "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE",
       "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS",
-      "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY"};
+      "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "PSIFORMER_GPU_KFAC_AFFINE"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -2045,6 +2045,284 @@ TEST_CASE("Legacy standalone periodic import accepts only equivalent ordered ion
     }
   }
 }
+
+TEST_CASE("Shared DEVICE affine sink rejects an unimplemented imaginary fallback channel",
+          "[wavefunction][psiformer][complex_wf][complex_device_affine_sink]")
+{
+  struct RealSink final : wftrain::DeviceAffineStatisticsSink
+  {
+    void beginSample() override {}
+    void addFallbackScore(const std::vector<double>&) override { ++calls; }
+    void endSample() override {}
+    void abortSample() noexcept override {}
+    void import(std::vector<wftrain::KFACFactorStatistics>) override {}
+    int calls = 0;
+  } sink;
+  CHECK_THROWS(sink.addComplexFallbackScore({1}, {0}));
+  CHECK(sink.calls == 0);
+  CHECK_NOTHROW(sink.addComplexFallbackScore({1}, {}));
+  CHECK(sink.calls == 1);
+}
+
+#ifdef ENABLE_CUDA
+TEST_CASE("Paired DEVICE affine factors match independent CPU two-channel rows",
+          "[wavefunction][psiformer][complex_wf][complex_device_affine]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices) { WARN("NOT_RUN: HIP DEVICE affine"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) { WARN("NOT_RUN: CUDA DEVICE affine"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  const std::array<double, 3> twist = GENERATE(std::array<double,3>{0,0,0}, std::array<double,3>{.17,-.11,.07});
+  const auto convention = GENERATE(KFACCurvatureConvention::NATIVE_SCORE, KFACCurvatureConvention::REGISTERED_GAUSSIAN);
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell, 1, 3), p1 = electrons(simulation_cell, 1, 3), cpu_p = electrons(simulation_cell, 1, 3);
+  p1.R[2][0] += .037; p1.R[1][2] -= .029; p1.update();
+  auto source = ions(simulation_cell);
+  auto initialized = parameters();
+  initialized.model_shape.spin_up_electrons = 1;
+  initialized.model_shape.spin_down_electrons = 3;
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("device_affine", initialized, p, source,
+      clone_cap, twist, 64 * 1024 * 1024);
+  auto& gpu = *owner;
+  trial.addComponent(std::move(owner));
+  auto clone = trial.makeClone(p1);
+  RefVectorWithLeader<TrialWaveFunction> trials(trial); trials.push_back(trial); trials.push_back(*clone);
+  RefVectorWithLeader<ParticleSet> particles(p); particles.push_back(p); particles.push_back(p1);
+  PsiFormerComplexWF cpu("cpu_affine", initialized, cpu_p, source, clone_cap, twist);
+  const auto make_registry = [](const PsiFormerComplexWF& component) {
+    const auto metadata = component.gpuInferenceEnabled() ? component.hybridAffineParameterBlocks() : component.affineParameterBlocks();
+    std::vector<KFACAffineBlockDescriptor> blocks;
+    std::vector<bool> covered(component.parameterSchema().blocks().size());
+    for (const auto& block : metadata)
+    {
+      blocks.push_back({block.id, block.weight_block, block.bias_block, block.input_width, block.output_width});
+      covered.at(block.weight_block) = true;
+      if (block.bias_block != NO_KFAC_BIAS_BLOCK) covered.at(block.bias_block) = true;
+    }
+    std::vector<std::size_t> fallback;
+    for (std::size_t i = 0; i < covered.size(); ++i)
+      if (!covered[i] && component.parameterSchema().blocks()[i].trainable) fallback.push_back(i);
+    return KFACBlockRegistry(component.parameterSchema(), std::move(blocks), std::move(fallback), component.genericKFACParameterBlocks());
+  };
+  const auto cpu_registry = make_registry(cpu), registry = make_registry(gpu);
+  KFACFactorAccumulator expected(cpu_registry, 0, convention);
+  struct Rows final : AffineScoreObserver
+  {
+    KFACFactorAccumulator& accumulator;
+    explicit Rows(KFACFactorAccumulator& a) : accumulator(a) {}
+    void observe(const AffineScoreObservation& row) override
+    {
+      const auto& block = accumulator.registry().affineBlocks().at(row.affine_block);
+      accumulator.addObservation({row.affine_block, {row.activations, row.row_count * block.input_width},
+          {row.sensitivities, row.row_count * block.output_width}, row.row_count,
+          {row.imaginary_sensitivities, row.row_count * block.output_width}});
+    }
+  } rows(expected);
+  cpu.prepareAffineScores(cpu.affineScoreStorage().required_bytes);
+  std::vector<double> real, imaginary;
+  for (const auto* sample : {&p, &p1})
+  {
+    expected.beginSample(1);
+    cpu.observeComplexAffineScores(*sample, rows, real, imaginary);
+    expected.addFallbackScores({real.data(), real.size()}, {imaginary.data(), imaginary.size()});
+    expected.endSample();
+  }
+  reduceKFACFactorStatistics(expected);
+  CHECK_FALSE(gpu.usesDeviceAffineStatistics());
+  controls.set("PSIFORMER_GPU_KFAC_AFFINE", "bad");
+  CHECK_THROWS(gpu.usesDeviceAffineStatistics());
+  controls.set("PSIFORMER_GPU_KFAC_AFFINE", "1");
+  REQUIRE(gpu.usesDeviceAffineStatistics());
+  const auto requirement = gpu.deviceAffineStatisticsRequirements(registry);
+  const auto numeric = requirement.device_bytes + requirement.host_bytes;
+  REQUIRE(requirement.device_bytes > 0); REQUIRE(requirement.host_bytes > 0);
+  {
+    // Borrow only within gpu's lifetime; no second image or accepted-state mutation.
+    const auto* image_pointer = static_cast<const dev::PreparedDeviceModel*>(gpu.numericStorage().shared_image_identity);
+    std::shared_ptr<const dev::PreparedDeviceModel> image(image_pointer, [](const auto*) {});
+    const auto& tensor = image->plan().parameter(ps::ParameterRole::BACKFLOW_UP_WEIGHT);
+    const auto in = tensor.shape[0], out = tensor.shape[1];
+    std::vector<dev::DeviceAffineFactorDescriptor> blocks{{ps::ParameterRole::BACKFLOW_UP_WEIGHT,
+        ps::NO_ATTENTION_BLOCK, in, out, false}};
+    compute::Queue<PlatformKind::CUDA> queue;
+    dev::AcceleratorBlasHandle blas(queue);
+    using Owner = dev::PreparedDeviceAffineStatistics;
+    Owner factors(image, blocks, false, Owner::requiredDeviceBytes(blocks), Owner::requiredHostBytes(blocks), queue, blas);
+    std::vector<double> x(in), r(out), im(out);
+    for (std::size_t j = 0; j < in; ++j) x[j] = .01 * (j + 1);
+    for (std::size_t j = 0; j < out; ++j) { r[j] = .03 * (j + 1); im[j] = .04 * (2.0 - j); }
+    dev::DeviceBuffer<double> dx(in), dx_other(in), dr(out), di(out);
+    dx.upload(x.data(), in); dx_other.upload(x.data(), in); dr.upload(r.data(), out); di.upload(im.data(), out);
+    const auto observe = [&](std::size_t objective, const double* activation) {
+      factors.observeChannel(ps::ParameterRole::BACKFLOW_UP_WEIGHT, ps::NO_ATTENTION_BLOCK,
+          ps::HeadTensorComponent::REAL, objective, activation, objective ? di.data() : dr.data(), 1, in, out);
+    };
+    CHECK_THROWS(factors.beginSample(1)); CHECK_THROWS(factors.beginSample(0, .5));
+    factors.beginSample(0); CHECK_THROWS(observe(1, dx.data())); factors.abortSample();
+    factors.beginSample(0); observe(0, dx.data()); CHECK_THROWS(observe(0, dx.data()));
+    CHECK_THROWS(factors.prepareSampleCommit()); CHECK(factors.sampleCount() == 0); factors.abortSample();
+    factors.beginSample(0); observe(0, dx.data()); CHECK_THROWS(observe(1, dx_other.data())); factors.abortSample();
+    factors.beginSample(0); observe(0, dx.data()); observe(1, dx.data()); factors.finishSample();
+    std::vector<dev::DeviceAffineFactorSums> downloaded(1);
+    downloaded[0].activation_outer_sum.resize(in * in); downloaded[0].sensitivity_outer_sum.resize(out * out);
+    factors.download(downloaded);
+    CHECK(downloaded[0].sample_weight_sum == 1); CHECK(downloaded[0].row_count == 1);
+    for (std::size_t a = 0; a < in; ++a)
+      for (std::size_t b = 0; b < in; ++b) close(downloaded[0].activation_outer_sum[a*in+b], x[a]*x[b], 1e-14);
+    for (std::size_t a = 0; a < out; ++a)
+      for (std::size_t b = 0; b < out; ++b)
+        close(downloaded[0].sensitivity_outer_sum[a*out+b], r[a]*r[b]+im[a]*im[b], 1e-14);
+    const auto accepted_factors = downloaded;
+    x[0] = 1e308; dx.upload(x.data(), in);
+    factors.beginSample(0); observe(0, dx.data()); observe(1, dx.data());
+    CHECK_THROWS(factors.prepareSampleCommit()); factors.abortSample();
+    factors.download(downloaded);
+    CHECK(factors.sampleCount() == 1);
+    CHECK(downloaded[0].activation_outer_sum == accepted_factors[0].activation_outer_sum);
+    CHECK(downloaded[0].sensitivity_outer_sum == accepted_factors[0].sensitivity_outer_sum);
+  }
+  struct Sink final : DeviceAffineStatisticsSink
+  {
+    KFACFactorAccumulator& accumulator;
+    bool fail = false, imported = false;
+    std::function<void()> after_accept;
+    explicit Sink(KFACFactorAccumulator& a) : accumulator(a) {}
+    void beginSample() override { accumulator.beginSample(1); }
+    void addFallbackScore(const std::vector<double>& r) override { accumulator.addFallbackScores({r.data(),r.size()}); }
+    void addComplexFallbackScore(const std::vector<double>& r, const std::vector<double>& i) override
+    { accumulator.addFallbackScores({r.data(),r.size()}, {i.data(),i.size()}); }
+    void endSample() override
+    {
+      if (fail) throw std::runtime_error("injected HOST affine acceptance failure");
+      accumulator.endSample();
+      if (after_accept) after_accept();
+    }
+    void abortSample() noexcept override { accumulator.abortSample(); }
+    void import(std::vector<KFACFactorStatistics> factors) override
+    {
+      accumulator.importAffineStatistics(accumulator.registry().fingerprint(), accumulator.parameterVersion(), std::move(factors));
+      imported = true;
+    }
+  };
+  const std::vector<const ParticleSet*> samples{&p,&p1};
+  KFACFactorAccumulator unprepared(registry, 0, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+  Sink unprepared_sink(unprepared);
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 0, false, unprepared_sink, numeric));
+  constexpr auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+  const auto derivative = gpu.gpuDerivativeRequirements(2, 2, 1, 7, scope);
+  auto op = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 0, 0, 2, 1, 7,
+      derivative.device_bytes, derivative.host_bytes, 1, scope);
+  const auto fingerprint = op->storageDiagnostics().storage_fingerprint;
+  const auto accepted = evaluate(gpu, p);
+  const auto positions = p.R;
+  const auto gradients = p.G;
+  const auto laps = p.L;
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto before = metrics.snapshot();
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 0, false, unprepared_sink, numeric - 1));
+  CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+  KFACFactorAccumulator rejected(registry, 0, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+  Sink rejected_sink(rejected); rejected_sink.fail = true;
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 0, false, rejected_sink, numeric));
+  CHECK_FALSE(rejected_sink.imported); CHECK(rejected.sampleCount() == 0); CHECK_FALSE(rejected.sampleActive());
+  CHECK(metrics.snapshot().live_bytes == before.live_bytes);
+  KFACFactorAccumulator changed_source(registry, 0, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+  Sink changed_sink(changed_source);
+  const auto original_source = source.R[0][0];
+  changed_sink.after_accept = [&] { source.R[0][0] = original_source + .001; };
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 0, false, changed_sink, numeric));
+  CHECK_FALSE(changed_sink.imported);
+  CHECK_THROWS(changed_source.factors()); // Completed prefixes are not usable precomputed statistics.
+  source.R[0][0] = original_source;
+  struct ErrorMaximum
+  {
+    double absolute = 0, relative_nonzero = 0, zero_expected_absolute = 0;
+    double reference_at_max_absolute = 0;
+    void observe(double actual, double expected)
+    {
+      const double error = std::abs(actual - expected);
+      // Explicitly bound real factors; do not inherit Catch::Approx's relative default.
+      CHECK(error <= 3e-10 + 3e-12 * std::abs(expected));
+      if (error > absolute)
+      {
+        absolute = error;
+        reference_at_max_absolute = std::abs(expected);
+      }
+      if (expected != 0) relative_nonzero = std::max(relative_nonzero, error / std::abs(expected));
+      else zero_expected_absolute = std::max(zero_expected_absolute, error);
+    }
+  } a_error, g_error, fallback_error;
+  for (int repeat = 0; repeat < 2; ++repeat)
+  {
+    KFACFactorAccumulator actual(registry, 0, convention, KFACAffineStatisticsSource::PRECOMPUTED_SUMS);
+    Sink sink(actual);
+    gpu.accumulateDeviceAffineStatistics(samples, registry, 0,
+        convention == KFACCurvatureConvention::REGISTERED_GAUSSIAN, sink, numeric);
+    REQUIRE(sink.imported);
+    reduceKFACFactorStatistics(actual);
+    CHECK(actual.sampleCount() == 2);
+    CHECK(actual.fallbackWeightSum() == expected.fallbackWeightSum());
+    REQUIRE(actual.factors().size() == expected.factors().size());
+    for (std::size_t b = 0; b < actual.factors().size(); ++b)
+    {
+      const auto& a = actual.factors()[b]; const auto& e = expected.factors()[b];
+      CHECK(a.row_count == e.row_count); CHECK(a.row_weight_sum == e.row_weight_sum);
+      CHECK(a.sample_weight_sum == e.sample_weight_sum);
+      for (std::size_t i = 0; i < a.activation_outer_sum.size(); ++i)
+      {
+        a_error.observe(a.activation_outer_sum[i], e.activation_outer_sum[i]);
+      }
+      for (std::size_t i = 0; i < a.sensitivity_outer_sum.size(); ++i)
+      {
+        g_error.observe(a.sensitivity_outer_sum[i], e.sensitivity_outer_sum[i]);
+      }
+    }
+    const auto a = actual.fallbackDiagonalSum(), e = expected.fallbackDiagonalSum();
+    REQUIRE(a.size() == e.size());
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+      fallback_error.observe(a[i], e[i]);
+    }
+    CHECK(metrics.snapshot().live_bytes == before.live_bytes);
+    CHECK(op->storageDiagnostics().storage_fingerprint == fingerprint);
+    CHECK(gpu.get_log_value() == accepted);
+    for (std::size_t electron = 0; electron < p.R.size(); ++electron)
+    {
+      for (std::size_t d = 0; d < 3; ++d)
+      {
+        CHECK(p.R[electron][d] == positions[electron][d]);
+        CHECK(p.G[electron][d] == gradients[electron][d]);
+      }
+      CHECK(p.L[electron] == laps[electron]);
+    }
+    CHECK(gpu.affineScoreStorage().prepared_bytes == 0);
+  }
+  const auto original = source.R[0][0]; source.R[0][0] += .001;
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 0, false, unprepared_sink, numeric));
+  source.R[0][0] = original;
+  CHECK_THROWS(gpu.accumulateDeviceAffineStatistics(samples, registry, 1, false, unprepared_sink, numeric));
+  CHECK_FALSE(unprepared_sink.imported);
+  std::printf("COMPLEX_DEVICE_AFFINE_ERROR absolute_threshold=3e-10 relative_threshold=3e-12 gamma=%d gaussian=%d "
+      "A_abs=%.17g A_relative_nonzero=%.17g A_zero_expected_abs=%.17g A_reference_at_max_abs=%.17g "
+      "G_abs=%.17g G_relative_nonzero=%.17g G_zero_expected_abs=%.17g G_reference_at_max_abs=%.17g "
+      "fallback_abs=%.17g fallback_relative_nonzero=%.17g fallback_zero_expected_abs=%.17g fallback_reference_at_max_abs=%.17g\n",
+      twist == std::array<double,3>{0,0,0}, convention == KFACCurvatureConvention::REGISTERED_GAUSSIAN,
+      a_error.absolute, a_error.relative_nonzero, a_error.zero_expected_absolute, a_error.reference_at_max_absolute,
+      g_error.absolute, g_error.relative_nonzero, g_error.zero_expected_absolute, g_error.reference_at_max_absolute,
+      fallback_error.absolute, fallback_error.relative_nonzero, fallback_error.zero_expected_absolute,
+      fallback_error.reference_at_max_absolute);
+  std::printf("COMPLEX_DEVICE_AFFINE PASS Gamma_or_twist imbalanced1_3 all_A_G_fallback two_samples both_conventions HOSTrollback existing_owner\n");
+}
+#endif
 
 TEST_CASE("Complex provider affine rows preserve canonical phase scores and bounded factors",
           "[wavefunction][psiformer][complex_wf][complex_affine_provider]")

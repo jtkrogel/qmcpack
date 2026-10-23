@@ -27,6 +27,38 @@ class ParticleSet;
 namespace qmcplusplus::wftrain
 {
 
+struct KFACFactorStatistics;
+
+/// Driver-owned sample transactions around provider-owned DEVICE affine banks.
+class DeviceAffineStatisticsSink
+{
+public:
+  virtual ~DeviceAffineStatisticsSink() = default;
+
+  /// Begin the unit-weight HOST sample transaction.
+  virtual void beginSample() = 0;
+
+  /// Add real fallback-score entries to the active HOST sample.
+  virtual void addFallbackScore(const std::vector<double>& score) = 0;
+
+  /// Existing real sinks must explicitly admit any nonempty imaginary channel.
+  virtual void addComplexFallbackScore(const std::vector<double>& real, const std::vector<double>& imaginary)
+  {
+    if (!imaginary.empty())
+      throw std::invalid_argument("Device affine sink does not accept an imaginary fallback channel");
+    addFallbackScore(real);
+  }
+
+  /// Validate and admit the HOST sample before nonthrowing DEVICE publication.
+  virtual void endSample() = 0;
+
+  /// Discard an uncommitted HOST sample without changing accepted statistics.
+  virtual void abortSample() noexcept = 0;
+
+  /// Import the final raw factor bank after every sample has completed.
+  virtual void import(std::vector<KFACFactorStatistics> factors) = 0;
+};
+
 /// Identify the scalar representation owned by one parameter block.
 enum class ParameterScalarDomain
 {

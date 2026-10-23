@@ -425,26 +425,7 @@ public:
   bool usesDeviceAffineStatistics() const noexcept;
   std::size_t deviceAffineStatisticsStorageBytes(const wftrain::KFACBlockRegistry& registry) const;
   /// Driver-owned sample transactions; the wavefunction library never calls the optimizer implementation.
-  class DeviceAffineStatisticsSink
-  {
-  public:
-    virtual ~DeviceAffineStatisticsSink() = default;
-
-    /// Begin the unit-weight HOST sample transaction.
-    virtual void beginSample() = 0;
-
-    /// Add the real fallback-score entries to the active HOST sample.
-    virtual void addFallbackScore(const std::vector<double>& score) = 0;
-
-    /// Validate and admit the completed HOST sample.
-    virtual void endSample() = 0;
-
-    /// Discard an uncommitted HOST sample without changing accepted statistics.
-    virtual void abortSample() noexcept = 0;
-
-    /// Publish the final raw affine-factor bank after sample collection.
-    virtual void import(std::vector<wftrain::KFACFactorStatistics> factors) = 0;
-  };
+  using DeviceAffineStatisticsSink = wftrain::DeviceAffineStatisticsSink;
 
   /// Stream registered samples into device factors and the driver-owned HOST transaction sink.
   void accumulateDeviceAffineStatistics(const std::vector<const ParticleSet*>& samples,

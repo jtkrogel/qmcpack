@@ -787,6 +787,52 @@ public:
   /// Exact inventory excludes shared image/vendor/caller-owned borrowed batch inputs.
   const ComplexProductsCost& cost() const noexcept { return cost_; }
 
+  /// Reuse the existing image/queue/BLAS; only raw transactional factor banks are new.
+  std::unique_ptr<PreparedDeviceAffineStatistics> prepareAffineStatistics(
+      const std::vector<DeviceAffineFactorDescriptor>& blocks, bool gaussian,
+      std::size_t device_budget, std::size_t host_budget, std::size_t version)
+  {
+    requireNoStreamingNonlocal();
+    if (cost_.scope != ComplexProductsScope::SCORE_ECP_ONLY || version != image_->version())
+      throw std::invalid_argument("Complex affine factors require the current score-only owner");
+    return std::make_unique<PreparedDeviceAffineStatistics>(image_, blocks, gaussian,
+        device_budget, host_budget, queue_, blas_);
+  }
+
+  /// A separate DEVICE score pass replaces HOST affine replay, not producer scheduling.
+  void affineFallbackComplexScore(const std::vector<double>& positions,
+      PreparedDeviceAffineStatistics& factors, std::vector<double>& real, std::vector<double>& imaginary)
+  {
+    requireNoStreamingNonlocal();
+    if (cost_.scope != ComplexProductsScope::SCORE_ECP_ONLY || real.size() != cost_.parameters ||
+        imaginary.size() != cost_.parameters || generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Complex affine fallback requires prepared canonical HOST channels");
+    ready_ = jvp_ready_ = false;
+    ++generation_;
+    factors.requireModel(image_.get());
+    score_->evaluateAffine(positions, factors);
+    const auto view = score_->resultView();
+    if (view.image != image_.get() || view.count != cost_.parameters)
+      throw std::logic_error("Complex affine score image or canonical extent changed");
+    for (std::size_t offset = 0; offset < cost_.parameters; offset += cost_.chunk)
+    {
+      const auto count = std::min(cost_.chunk, cost_.parameters - offset);
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipMemcpyAsync(staging_.data(), view.data + offset, count * sizeof(cuDoubleComplex),
+          hipMemcpyDeviceToHost, queue_.getNative()), "complex affine fallback download");
+#else
+      checkRuntime(cudaMemcpyAsync(staging_.data(), view.data + offset, count * sizeof(cuDoubleComplex),
+          cudaMemcpyDeviceToHost, queue_.getNative()), "complex affine fallback download");
+#endif
+      queue_.sync();
+      for (std::size_t i = 0; i < count; ++i)
+      {
+        real[offset + i] = cuCreal(staging_[i]);
+        imaginary[offset + i] = cuCimag(staging_[i]);
+      }
+    }
+  }
+
   /// Track prepared owner/staging identities separately from request generations.
   std::size_t storageFingerprint() const noexcept
   {
@@ -919,7 +965,7 @@ private:
   /// Materialize only checked capacities, including finite partials in BOTH memory domains.
   PreparedDeviceComplexProducts(std::shared_ptr<const PreparedDeviceModel> image, std::size_t targets,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexProductsCost cost)
-      : image_(std::move(image)), queue_(queue), cost_(cost),
+      : image_(std::move(image)), queue_(queue), blas_(blas), cost_(cost),
         score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
         kinetic_(cost.scope == ComplexProductsScope::COMPLETE ? PreparedDeviceComplexKinetic::prepare(
             image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work) : nullptr),
@@ -947,6 +993,7 @@ private:
 
   const std::shared_ptr<const PreparedDeviceModel> image_;
   compute::Queue<PlatformKind::CUDA>& queue_;
+  AcceleratorBlasHandle& blas_;
   const ComplexProductsCost cost_;
   std::unique_ptr<PreparedDeviceComplexScore> score_;
   std::unique_ptr<PreparedDeviceComplexKinetic> kinetic_;
