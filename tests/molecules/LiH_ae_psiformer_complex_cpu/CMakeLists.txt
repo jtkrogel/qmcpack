@@ -5,6 +5,28 @@ add_test(NAME deterministic-psiformer-independent-twist-workflow-unit
 set_tests_properties(deterministic-psiformer-independent-twist-workflow-unit PROPERTIES
                      TIMEOUT 30 LABELS "deterministic;psiformer;cpu;workflow")
 if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION)
+  foreach(mode estimators dmc)
+    set(test_name deterministic-LiH-psiformer-cpu-modern-${mode}-restart)
+    add_test(NAME ${test_name}
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_modern_integration.py
+                     --binary $<TARGET_FILE:qmcpack>
+                     --fixture ${CMAKE_CURRENT_SOURCE_DIR}/complex_twist.xml
+                     --mode ${mode} --restart
+                     --output ${CMAKE_CURRENT_BINARY_DIR}/modern_${mode}_restart)
+    set_tests_properties(${test_name} PROPERTIES
+                         ENVIRONMENT "OMP_NUM_THREADS=2;OPENBLAS_NUM_THREADS=1"
+                         PROCESSORS 2 TIMEOUT 300
+                         LABELS "deterministic;psiformer;cpu;periodic;complex;modern;restart")
+  endforeach()
+  add_test(NAME deterministic-LiH-psiformer-cpu-modern-dmc-tmove-rejection
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_modern_integration.py
+                   --binary $<TARGET_FILE:qmcpack>
+                   --fixture ${CMAKE_CURRENT_SOURCE_DIR}/complex_twist.xml
+                   --mode dmc --expect-tmove-rejection
+                   --output ${CMAKE_CURRENT_BINARY_DIR}/modern_dmc_tmove_rejection)
+  set_tests_properties(deterministic-LiH-psiformer-cpu-modern-dmc-tmove-rejection PROPERTIES
+                       ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1"
+                       TIMEOUT 120 LABELS "deterministic;psiformer;cpu;periodic;complex;modern")
   if(ENABLE_CUDA AND NOT QMC_CUDA2HIP)
     foreach(variant complex_gamma complex_twist)
       set(test_name deterministic-LiH-paired-${variant}-gpu-target-xml)
