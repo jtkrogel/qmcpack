@@ -82,6 +82,56 @@ TEST_CASE("KFAC score estimator selection preserves explicit conventions across 
   CHECK_FALSE(wftrain::usesKFACScoreEstimator(adam, true));
 }
 
+TEST_CASE("Energy gradient estimators select score Adam independently and preserve legacy routing",
+          "[drivers][wf_train][score_policy]")
+{
+  using G = WFTrainDriverInput::GradientEstimator;
+  using E = wftrain::EnergyGradientEstimator;
+  const auto parse = [](const std::string& controls, const std::string& optimizer = "adam") {
+    return parseTrainingInput("<qmc><training optimizer='" + optimizer + "'>" + controls + "</training></qmc>");
+  };
+  const std::string score = "<parameter name='gradient_estimator'>score_covariance</parameter>";
+  const std::string full = "<parameter name='gradient_estimator'>full_local_energy_response</parameter>";
+  CHECK(parse("").getGradientEstimator() == G::LEGACY);
+  for (const std::string optimizer : {"adam", "sgd", "momentum_sgd", "rmsprop", "amsgrad", "kfac"})
+  {
+    const auto input = parse(score, optimizer);
+    CHECK(input.getGradientEstimator() == G::SCORE_COVARIANCE);
+    CHECK(wftrain::usesEnergyScoreEstimator(input, false));
+    CHECK(wftrain::usesEnergyScoreEstimator(input, true));
+    CHECK(wftrain::usesKFACScoreEstimator(input, false) == (optimizer == "kfac"));
+    CHECK(wftrain::usesKFACScoreEstimator(input, true) == (optimizer == "kfac"));
+    CHECK(wftrain::kfacScoreEstimator(input) == E::SCORE_COVARIANCE);
+  }
+  const auto response = parse(full);
+  CHECK(response.getGradientEstimator() == G::FULL_LOCAL_ENERGY_RESPONSE);
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(response, false));
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(response, true));
+  CHECK_FALSE(wftrain::usesEnergyScoreEstimator(response, false));
+  CHECK_FALSE(wftrain::usesEnergyScoreEstimator(response, true));
+  CHECK(wftrain::energyGradientEstimator(response, false) == E::SYMMETRIZED_HAMILTONIAN);
+  CHECK(wftrain::energyGradientEstimator(response, true) == E::PATHWISE_LOCAL_ENERGY);
+  CHECK(wftrain::energyGradientEstimator(parse(score), false) == E::SCORE_COVARIANCE);
+  CHECK(wftrain::energyGradientEstimator(parse(score), true) == E::SCORE_COVARIANCE);
+  CHECK(wftrain::energyGradientEstimator(parse(""), false) == E::SYMMETRIZED_HAMILTONIAN);
+  CHECK(wftrain::energyGradientEstimator(parse(""), true) == E::PATHWISE_LOCAL_ENERGY);
+  CHECK_NOTHROW(parse(score + "<parameter name='kfac_gradient_convention'>physical_covariance</parameter>", "kfac"));
+  CHECK_THROWS(parse("<parameter name='gradient_estimator'>unknown</parameter>"));
+  CHECK_THROWS(parse(score, "sr"));
+  CHECK_THROWS(parse(full, "kfac"));
+  CHECK_THROWS(parse(score + "<parameter name='kfac_gradient_convention'>half_covariance</parameter>", "kfac"));
+  CHECK_THROWS(parse(score + "<parameter name='kfac_objective'>clipped_covariance</parameter>", "kfac"));
+  CHECK_THROWS(parse(score + "<parameter name='line_search'>reference</parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training objective='orbital_mse'>" + score +
+      "<parameter name='teacher'>teacher</parameter><parameter name='target_provenance'>fixed</parameter></training></qmc>"));
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<qmc><training/></qmc>"));
+  auto reread = parse(score);
+  reread.readXML(document.getRoot());
+  CHECK(reread.getGradientEstimator() == G::LEGACY);
+  CHECK_FALSE(wftrain::usesKFACScoreEstimator(reread, false));
+}
+
 TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policies",
           "[drivers][wf_train][kfac][score_policy]")
 {

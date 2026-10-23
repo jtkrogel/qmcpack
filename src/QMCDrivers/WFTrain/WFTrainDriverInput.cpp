@@ -28,7 +28,8 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 94> allowed_controls{
+constexpr std::array<std::string_view, 95> allowed_controls{
+    "gradient_estimator",
     "defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
@@ -255,6 +256,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   checkpoint_interval_ = 1000;
   warmup_steps_ = 0;
   objective_                        = Objective::ENERGY;
+  gradient_estimator_ = GradientEstimator::LEGACY;
   orbital_target_                    = OrbitalTarget::SINGLE_REFERENCE;
   momentum_decay_ = 0.9;
   rms_decay_ = 0.9;
@@ -446,6 +448,16 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported objective=\"" + objective +
                                     "\"; supported objectives are energy, determinant_overlap and orbital_mse");
+  }
+  if (seen_controls.count("gradient_estimator"))
+  {
+    const auto& value = readControl("gradient_estimator");
+    if (value == "legacy") gradient_estimator_ = GradientEstimator::LEGACY;
+    else if (value == "score_covariance") gradient_estimator_ = GradientEstimator::SCORE_COVARIANCE;
+    else if (value == "full_local_energy_response")
+      gradient_estimator_ = GradientEstimator::FULL_LOCAL_ENERGY_RESPONSE;
+    else
+      throw UniformCommunicateError("WFTrainDriverInput: gradient_estimator must be legacy, score_covariance, or full_local_energy_response");
   }
   if (seen_controls.find("optimizer") != seen_controls.end())
   {
@@ -1010,6 +1022,20 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (seen_controls.count("kfac_curvature_period") &&
         parsePositiveSize(readControl("kfac_curvature_period"), "kfac_curvature_period") != 1)
       throw UniformCommunicateError("WFTrainDriverInput: persistent KFAC requires kfac_curvature_period=1");
+  }
+  if (gradient_estimator_ != GradientEstimator::LEGACY)
+  {
+    if (objective_ != Objective::ENERGY || (!first_order && optimizer_ != Optimizer::KFAC))
+      throw UniformCommunicateError("WFTrainDriverInput: explicit gradient_estimator requires energy and a first-order optimizer or KFAC");
+    if (gradient_estimator_ == GradientEstimator::FULL_LOCAL_ENERGY_RESPONSE && optimizer_ == Optimizer::KFAC)
+      throw UniformCommunicateError("WFTrainDriverInput: explicit full_local_energy_response requires a first-order optimizer");
+    if (gradient_estimator_ == GradientEstimator::SCORE_COVARIANCE && optimizer_ == Optimizer::KFAC &&
+        (kfac_defaults_ != KFACDefaults::LEGACY ||
+         (kfac_gradient_ != KFACGradient::LEGACY && kfac_gradient_ != KFACGradient::PHYSICAL_COVARIANCE) ||
+         kfac_objective_ != KFACObjective::RAW_COVARIANCE))
+      throw UniformCommunicateError("WFTrainDriverInput: score_covariance requires raw physical covariance without a KFAC preset");
+    if (line_search_ != LineSearch::OFF)
+      throw UniformCommunicateError("WFTrainDriverInput: explicit gradient_estimator currently requires line_search=off");
   }
 }
 

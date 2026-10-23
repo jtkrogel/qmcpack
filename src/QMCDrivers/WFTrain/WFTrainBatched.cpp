@@ -1810,6 +1810,12 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   const auto optimizer = static_cast<std::underlying_type_t<WFTrainDriverInput::Optimizer>>(
       training.getOptimizer());
   extendStageFingerprint(hash, objective);
+  // Preserve historical fingerprints when no independent estimator was selected.
+  if (training.getGradientEstimator() != WFTrainDriverInput::GradientEstimator::LEGACY)
+  {
+    extendStageFingerprint(hash, std::string("energy-gradient-estimator-v1"));
+    extendStageFingerprint(hash, static_cast<int>(training.getGradientEstimator()));
+  }
   if (training.samplesOrbitalStudent())
     extendStageFingerprint(hash, std::string("orbital-student-measure-energy-off-v1"));
   extendStageFingerprint(hash, optimizer);
@@ -2475,6 +2481,16 @@ void WFTrainBatched::process(xmlNodePtr node)
             "KFAC, MPI1/crowd1/step1 and PBYP/no drift; derivative products remain independent");
     }
     initPopulationAndCrowds(walker_counts);
+    // Independent score selection must retain the qualified scalar ECP topology.
+    if (!complex_training_component_ &&
+        training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE &&
+        selected_provider_->usesAcceleratorParameterProducts() &&
+        population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        (myComm->size() != 1 || crowds_.size() != 1 || qmcdriver_input_.get_max_blocks() != 1 ||
+         steps_per_block_ != 1 ||
+         population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN ||
+         vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift()))
+      throw UniformCommunicateError("GPU score-only ECP requires OPEN MPI1/crowd1/block1/step1 and PBYP/no drift");
     if (hybrid_score_kfac)
     {
       bool real_open_ae = false;
@@ -2524,6 +2540,9 @@ void WFTrainBatched::process(xmlNodePtr node)
       throw UniformCommunicateError("WFTrainBatched: paired ECP requires one block before sampling");
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
+    if (resident_adam_budget_ &&
+        training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE)
+      throw UniformCommunicateError("Resident ENERGY Adam does not implement the explicit score_covariance estimator");
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
     resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
     if (const auto* optin = std::getenv("PSIFORMER_GPU_RESIDENT_OPEN_OBSERVATION"))
@@ -3018,9 +3037,8 @@ void WFTrainBatched::run()
   wftrain::DistributedParameterReduction reduction(*myComm, reduction_policy);
   wftrain::TrainingCapabilities requirements{
       wftrain::TrainingCapability::VALUE_EVALUATION};
-  const bool complex_kfac_training = complex_training &&
-      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC;
-  const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_kfac_training);
+  const bool score_training = wftrain::usesEnergyScoreEstimator(training_input_, complex_training);
+  const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_training);
   // Admit only a scope that can still be the live chain; replay proves FULL again.
   const char* kfac_replay_optin = std::getenv("PSIFORMER_GPU_KFAC_SINGLE_REPLAY");
   const bool kfac_single_replay = kfac_replay_optin && std::string(kfac_replay_optin) == "1" &&
@@ -3032,10 +3050,16 @@ void WFTrainBatched::run()
     app_log() << "KFAC single-snapshot FULL replay: eligible=" << kfac_single_replay
               << "; exact current version/coordinate/spatial cache checks remain required" << std::endl;
   const auto kfac_estimator = wftrain::kfacScoreEstimator(training_input_);
+  const auto energy_estimator = wftrain::energyGradientEstimator(training_input_, complex_training);
+  if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY && myComm->rank() == 0)
+    app_log() << "WFTrain energy gradient estimator="
+              << (energy_estimator == wftrain::EnergyGradientEstimator::SCORE_COVARIANCE ? "score_covariance" :
+                  energy_estimator == wftrain::EnergyGradientEstimator::HALF_SCORE_COVARIANCE ? "half_score_covariance" :
+                  energy_estimator == wftrain::EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL ? "real_centered_score_residual" :
+                  energy_estimator == wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY ? "pathwise_local_energy" :
+                  "symmetrized_hamiltonian") << std::endl;
   wftrain::HighParameterTraining trainer(
-      requirements, score_kfac_training ? kfac_estimator :
-          complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
-                           : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+      requirements, energy_estimator,
       reduction);
   logTrainingAllocation("initial_parameter_snapshot", 0, selected_provider_->parameterSchema().parameterCount(),
       checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double)));
@@ -3887,7 +3911,7 @@ void WFTrainBatched::run()
             replayCrowdSamples(crowd, samples, resident_single_snapshot
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
             std::size_t scalar_ecp_budget = 0;
-            if (!complex_training && score_kfac_training && has_nonlocal_ecp &&
+            if (!complex_training && score_training && has_nonlocal_ecp &&
                 selected_provider_->usesAcceleratorParameterProducts())
             {
               const auto live = checkedMemoryAdd(retained_configuration_bytes,
@@ -3899,7 +3923,7 @@ void WFTrainBatched::run()
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
-                capture_ecp_jvp_replay, score_kfac_training, complex_training,
+                capture_ecp_jvp_replay, score_training, complex_training,
                 complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr,
 #ifdef QMC_COMPLEX
                 fixed_grid ? &*fixed_grid : nullptr,

@@ -36,18 +36,32 @@ inline bool supportsRealGpuOrbitalInference(const WFTrainDriverInput& input) noe
 inline bool hasExplicitKFACPolicy(const WFTrainDriverInput& input) noexcept
 {
   using I = WFTrainDriverInput;
-  return input.getKFACDefaults() != I::KFACDefaults::LEGACY ||
+  return (input.getOptimizer() == I::Optimizer::KFAC &&
+          input.getGradientEstimator() == I::GradientEstimator::SCORE_COVARIANCE) ||
+      input.getKFACDefaults() != I::KFACDefaults::LEGACY ||
       input.getKFACGradient() != I::KFACGradient::LEGACY ||
       input.getKFACUpdateOrder() != I::KFACUpdateOrder::POST_INVERSE_RATE ||
       input.getKFACScheduleArithmetic() != I::KFACScheduleArithmetic::DIVIDE_RATE;
 }
 
-/// Preserve legacy energy-response routing unless a score convention was selected.
+/// Preserve the optimizer-specific historical score convention.
 inline bool usesKFACScoreEstimator(const WFTrainDriverInput& input, bool paired_complex) noexcept
 {
+  if (input.getOptimizer() != WFTrainDriverInput::Optimizer::KFAC)
+    return false;
+  if (input.getGradientEstimator() != WFTrainDriverInput::GradientEstimator::LEGACY)
+    return input.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE;
   return input.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
       (paired_complex || input.getKFACDefaults() != WFTrainDriverInput::KFACDefaults::LEGACY ||
        input.getKFACGradient() != WFTrainDriverInput::KFACGradient::LEGACY);
+}
+
+/// Select score preparation independently of optimizer-specific execution options.
+inline bool usesEnergyScoreEstimator(const WFTrainDriverInput& input, bool paired_complex) noexcept
+{
+  if (input.getGradientEstimator() != WFTrainDriverInput::GradientEstimator::LEGACY)
+    return input.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE;
+  return usesKFACScoreEstimator(input, paired_complex);
 }
 
 /// Preserve C1 admission and bound additional crowds to one or two serialized real-open AE ranks.
@@ -70,7 +84,8 @@ inline bool supportsHybridKFACPolicy(const WFTrainDriverInput& input) noexcept
   return input.getOptimizer() == I::Optimizer::KFAC && input.getObjective() == I::Objective::ENERGY &&
       input.getLineSearch() == I::LineSearch::OFF && hasExplicitKFACPolicy(input) && clipping &&
       (objective == I::KFACObjective::RAW_COVARIANCE || objective == I::KFACObjective::CLIPPED_COVARIANCE) &&
-      (gradient == I::KFACGradient::HALF_COVARIANCE || gradient == I::KFACGradient::PHYSICAL_COVARIANCE) &&
+      (gradient == I::KFACGradient::HALF_COVARIANCE || gradient == I::KFACGradient::PHYSICAL_COVARIANCE ||
+       input.getGradientEstimator() == I::GradientEstimator::SCORE_COVARIANCE) &&
       input.getMaximumRetainedBytes() > 0 &&
       input.getMaximumRetainedBytes() != std::numeric_limits<std::size_t>::max();
 }
@@ -78,12 +93,23 @@ inline bool supportsHybridKFACPolicy(const WFTrainDriverInput& input) noexcept
 /// Choose the finite-sample score convention independently of numerical placement.
 inline EnergyGradientEstimator kfacScoreEstimator(const WFTrainDriverInput& input) noexcept
 {
+  if (input.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE)
+    return EnergyGradientEstimator::SCORE_COVARIANCE;
   using G = WFTrainDriverInput::KFACGradient;
   if (input.getKFACGradient() == G::HALF_COVARIANCE)
     return EnergyGradientEstimator::HALF_SCORE_COVARIANCE;
   if (input.getKFACGradient() == G::REAL_CENTERED_RESIDUAL)
     return EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL;
   return EnergyGradientEstimator::SCORE_COVARIANCE;
+}
+
+/// Resolve the established real/paired finite-sample response conventions.
+inline EnergyGradientEstimator energyGradientEstimator(const WFTrainDriverInput& input, bool paired_complex) noexcept
+{
+  if (usesEnergyScoreEstimator(input, paired_complex))
+    return kfacScoreEstimator(input);
+  return paired_complex ? EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
+                        : EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN;
 }
 
 /** Return the stable input spelling used in diagnostics and persisted metadata. */

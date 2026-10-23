@@ -108,6 +108,9 @@ public:
   /** Return discarded MC advances before every iteration's sample collection. */
   std::size_t getWarmupSteps() const noexcept { return warmup_steps_; }
 
+  /// LEGACY preserves the historical provider/optimizer finite-sample convention.
+  enum class GradientEstimator { LEGACY, SCORE_COVARIANCE, FULL_LOCAL_ENERGY_RESPONSE };
+  GradientEstimator getGradientEstimator() const noexcept { return gradient_estimator_; }
   Objective getObjective() const noexcept { return objective_; }
 
   OrbitalSampling getOrbitalSampling() const noexcept { return orbital_sampling_; }
@@ -246,6 +249,7 @@ private:
   std::size_t lm_inner_restart_length_{4};
   double lm_inner_relative_tolerance_{0.1};
   double kfac_fallback_damping_{1.0e-3};
+  GradientEstimator gradient_estimator_{GradientEstimator::LEGACY};
   KFACObjective kfac_objective_{KFACObjective::RAW_COVARIANCE};
   KFACDefaults kfac_defaults_{KFACDefaults::LEGACY};
   KFACGradient kfac_gradient_{KFACGradient::LEGACY};
