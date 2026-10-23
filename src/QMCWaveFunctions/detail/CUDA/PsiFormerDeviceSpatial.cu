@@ -333,6 +333,76 @@ __global__ void openFeatureJetsCooperativeKernel(OpenFeatureJetLayout layout,
   }
 }
 
+/// Canonical seven-column torus VALUE expressions; each pair owns disjoint outputs.
+__device__ bool writePeriodicFeatureValuePair(OpenFeatureJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, std::size_t configuration,
+    std::size_t electron, std::size_t nucleus, double* output)
+{
+  periodic_geometry::Pair pair;
+  if (!periodic_geometry::evaluatePair(cell,
+      positions + configuration * layout.position_configuration_stride + electron * layout.position_row_stride,
+      nuclei + nucleus * layout.nucleus_row_stride, pair, true))
+    return false;
+  const auto radial = device_math::softenedRadial(pair.radius);
+  const auto base = electron * layout.feature_width + 7 * nucleus;
+  output[layout.output.uncheckedValueOffset(configuration, base)] = radial.log1p_radius;
+  for (std::size_t vector = 0; vector < 2; ++vector)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double value = vector == 0 ? pair.displacement[dimension] : pair.complementary[dimension];
+      output[layout.output.uncheckedValueOffset(configuration, base + 1 + 3 * vector + dimension)] =
+          value * radial.log1p_over_radius;
+    }
+  return true;
+}
+
+/// One block/configuration; canonical GPU replay reconstructs all failed scratch.
+__global__ void periodicFeatureValuesCooperativeKernel(OpenFeatureJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::size_t logical_elements, std::size_t pairs,
+    double* output, OpenSpatialStatus* status)
+{
+  const std::size_t configuration = blockIdx.x;
+  const std::size_t active = active_electrons[configuration];
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = 0;
+  // Zero only logical elements; padded strides remain caller-owned and untouched.
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)] = 0.0;
+  __syncthreads();
+  if (active >= layout.output.electron_count)
+  {
+    if (threadIdx.x == 0)
+      status[configuration] = open_spatial::buildOpenFeatureJetsForConfiguration(
+          layout, positions, nuclei, configuration, active, output, &cell);
+    return; // Uniform branch after the cooperative clear.
+  }
+  for (std::size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x)
+    if (!writePeriodicFeatureValuePair(layout, cell, positions, nuclei, configuration,
+        pair / layout.nucleus_count, pair % layout.nucleus_count, output))
+      atomicOr(&failed, 1U);
+  // Exactly one thread writes each electron's spin value; derivative planes stay zero.
+  for (std::size_t electron = threadIdx.x; electron < layout.output.electron_count; electron += blockDim.x)
+    output[layout.output.uncheckedValueOffset(configuration,
+        electron * layout.feature_width + layout.feature_width - 1)] =
+        electron < layout.spin_up_count ? 1.0 : -1.0;
+  __syncthreads();
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    if (!device_math::isFiniteBinary64(output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)]))
+      atomicOr(&failed, 1U);
+  __syncthreads();
+  if (threadIdx.x == 0)
+  {
+    // Reconstruct even partial failed scratch in scalar order. In particular a
+    // later pair's geometric failure precedes the final computed-finite scan.
+    status[configuration] = failed ? open_spatial::buildOpenFeatureJetsForConfiguration(
+        layout, positions, nuclei, configuration, active, output, &cell) : OpenSpatialStatus::REGULAR;
+  }
+}
+
 __global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
                                    const double* input,
                                    const double* bias,
@@ -503,6 +573,114 @@ __global__ void openCuspValuesCooperativeKernel(OpenCuspJetLayout layout,
     else
       status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
           layout, positions, configuration, active, same_spin_alpha, opposite_spin_alpha, output);
+  }
+}
+
+/// Periodic pair math, with the same bounded tape and exact scalar subtraction order.
+__global__ void periodicCuspValuesCooperativeKernel(OpenCuspJetLayout layout,
+    const double* positions, const std::size_t* active_electrons, periodic_geometry::Cell cell,
+    double same_spin_alpha, double opposite_spin_alpha, std::size_t cells,
+    double* output, OpenSpatialStatus* status)
+{
+  constexpr std::size_t chunk_capacity = 512;
+  __shared__ double terms[chunk_capacity];
+  __shared__ unsigned int failed;
+  const std::size_t configuration = blockIdx.x;
+  const auto ne = layout.output.electron_count;
+  const auto active = active_electrons[configuration];
+  const double* coordinates = positions + configuration * layout.position_configuration_stride;
+  if (threadIdx.x == 0)
+  {
+    open_spatial::clearConfiguration(layout.output, configuration, output);
+    failed = active >= ne || !device_math::isFiniteBinary64(same_spin_alpha) ||
+        !device_math::isFiniteBinary64(opposite_spin_alpha);
+  }
+  __syncthreads();
+  if (failed)
+  {
+    if (threadIdx.x == 0)
+      status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
+          layout, positions, configuration, active, same_spin_alpha, opposite_spin_alpha, output, &cell);
+    return;
+  }
+  double value = 0.0;
+  for (std::size_t begin = 0; begin < cells;)
+  {
+    const auto span = cells - begin < chunk_capacity ? cells - begin : chunk_capacity;
+    for (std::size_t local = threadIdx.x; local < chunk_capacity; local += blockDim.x)
+    {
+      terms[local] = 0.0;
+      if (local >= span)
+        continue;
+      const auto linear = begin + local;
+      const auto first = linear / ne, second = linear % ne;
+      if (first >= second)
+        continue;
+      double radius_squared = 0.0;
+      bool finite_input = true;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double first_value = coordinates[first * layout.position_row_stride + dimension];
+        const double second_value = coordinates[second * layout.position_row_stride + dimension];
+        if (!device_math::isFiniteBinary64(first_value) || !device_math::isFiniteBinary64(second_value))
+          finite_input = false;
+        const double displacement = first_value - second_value;
+        radius_squared += displacement * displacement;
+      }
+      double radius = ::sqrt(radius_squared);
+      periodic_geometry::Pair pair;
+      if (!periodic_geometry::evaluatePair(cell,
+          coordinates + first * layout.position_row_stride,
+          coordinates + second * layout.position_row_stride, pair))
+        finite_input = false;
+      else
+        radius = pair.radius;
+      const bool same_spin = (first < layout.spin_up_count) == (second < layout.spin_up_count);
+      const double alpha = same_spin ? same_spin_alpha : opposite_spin_alpha;
+      const double factor = same_spin ? 0.25 : 0.5;
+      const double denominator = alpha + radius;
+      const double term = factor * alpha * alpha / denominator;
+      if (!finite_input || !device_math::isFiniteBinary64(term))
+        atomicOr(&failed, 1U);
+      else
+        terms[local] = term;
+    }
+    __syncthreads();
+    if (failed)
+    {
+      if (threadIdx.x == 0)
+        status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
+            layout, positions, configuration, active, same_spin_alpha, opposite_spin_alpha, output, &cell);
+      return;
+    }
+    if (threadIdx.x == 0)
+    {
+      auto first = begin / ne, second = begin % ne;
+      for (std::size_t local = 0; local < span; ++local)
+      {
+        if (first < second)
+          value -= terms[local];
+        if (++second == ne)
+        {
+          second = 0;
+          ++first;
+        }
+      }
+    }
+    __syncthreads();
+    // Advance by the valid span: even the largest representable extent cannot wrap.
+    begin += span;
+  }
+  if (threadIdx.x == 0)
+  {
+    if (device_math::isFiniteBinary64(value))
+    {
+      output[layout.output.uncheckedValueOffset(configuration, 0)] = value;
+      status[configuration] = OpenSpatialStatus::REGULAR;
+    }
+    else
+      status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
+          layout, positions, configuration, active, same_spin_alpha, opposite_spin_alpha, output, &cell);
   }
 }
 
@@ -963,6 +1141,30 @@ Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layou
   return peekSpatialLaunchError();
 }
 
+Error launchPeriodicFeatureValuesCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.nucleus_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenFeatureJetLayout(layout, true);
+  if (!positions || !nuclei || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer cooperative periodic feature storage is null");
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64)
+    return launchPeriodicFeatureJets(stream, layout, cell, positions, nuclei, active_electrons, output, status);
+  if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer cooperative periodic feature grid exceeds portable device x dimension");
+  const auto logical_elements = spatial_detail::checkedProduct(layout.output.plane_count,
+      layout.output.element_count, "PsiFormer cooperative periodic feature logical extent overflow");
+  const auto pairs = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.nucleus_count, "PsiFormer cooperative periodic feature pair extent overflow");
+  periodicFeatureValuesCooperativeKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      spatial_block_size, 0, stream>>>(layout, cell, positions, nuclei, active_electrons,
+          logical_elements, pairs, output, status);
+  return peekSpatialLaunchError();
+}
+
 Error launchBiasTanhJets(Stream stream, const SpatialElementwiseJetLayout& layout,
                          const double* input, const double* bias, double* output,
                          OpenSpatialStatus* status,
@@ -1083,6 +1285,29 @@ Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
   boundaryCuspJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
       output, status, cell);
+  return peekSpatialLaunchError();
+}
+
+Error launchPeriodicCuspValuesCooperative(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const std::size_t* active_electrons,
+    double same_spin_alpha, double opposite_spin_alpha, double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.output.electron_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenCuspJetLayout(layout);
+  if (!positions || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer cooperative periodic cusp device storage is null");
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64)
+    return launchPeriodicCuspJets(stream, layout, cell, positions, active_electrons,
+        same_spin_alpha, opposite_spin_alpha, output, status);
+  if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer cooperative periodic cusp grid exceeds portable device x dimension");
+  const auto cells = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.output.electron_count, "PsiFormer cooperative periodic cusp pair extent overflow");
+  periodicCuspValuesCooperativeKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      spatial_block_size, 0, stream>>>(layout, positions, active_electrons, cell,
+          same_spin_alpha, opposite_spin_alpha, cells, output, status);
   return peekSpatialLaunchError();
 }
 

@@ -106,6 +106,11 @@ Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layou
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
     const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
 
+/// Pair-disjoint periodic VALUE features with canonical GPU failure replay.
+Error launchPeriodicFeatureValuesCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
+
 Error launchBiasTanhJets(Stream stream,
                          const SpatialElementwiseJetLayout& layout,
                          const double* input,
@@ -137,6 +142,12 @@ Error launchOpenCuspValuesCooperative(Stream stream, const OpenCuspJetLayout& la
 
 /// Build periodic radial cusp jets, including the non-Euclidean radial trace rule.
 Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    double* output, OpenSpatialStatus* status);
+
+/// Bounded periodic VALUE pair chunks, retaining the scalar subtraction order.
+Error launchPeriodicCuspValuesCooperative(Stream stream, const OpenCuspJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* positions,
     const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
     double* output, OpenSpatialStatus* status);

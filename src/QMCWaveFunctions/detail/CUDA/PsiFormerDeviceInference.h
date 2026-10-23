@@ -412,6 +412,17 @@ inline bool configuredCooperativeOpenFeatures()
   throw std::invalid_argument("PSIFORMER_GPU_OPEN_FEATURE_COOPERATIVE must be 0 or 1");
 }
 
+/// Capture the default-OFF legacy periodic VALUE map before preparing its owner.
+inline bool configuredPeriodicValueGeometryCooperative()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_COOPERATIVE");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_COOPERATIVE must be 0 or 1");
+}
+
 /// Freeze retained OPEN feature admission independently of ordinary inference.
 inline bool configuredRetainedOpenFeatures()
 {
@@ -940,6 +951,7 @@ private:
         target_preparation_(target_preparation), retained_targets_(retained_targets),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
+        periodic_value_geometry_requested_(configuredPeriodicValueGeometryCooperative()),
         retained_open_features_requested_(configuredRetainedOpenFeatures()),
         cooperative_value_cusp_requested_(configuredCooperativeValueCusp()),
         retained_value_cusp_requested_(configuredRetainedValueCusp()),
@@ -1159,6 +1171,11 @@ private:
       std::clog << "PsiFormer VALUE LU preparation: selected="
                 << (usesCooperativeValueLu() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_control_bytes<=64; no inverse or extra global owner\n";
+    if (periodic_value_geometry_requested_)
+      std::clog << "PsiFormer periodic VALUE geometry preparation: selected="
+                << (usesCooperativePeriodicValueGeometry() ? "cooperative" : "scalar")
+                << " Ne=" << ne_
+                << " declared_feature_shared_bytes=4 declared_cusp_shared_bytes=4100 added_device_owner_bytes=0\n";
     if (cooperative_open_features_requested_)
       std::clog << "PsiFormer OPEN feature preparation: selected="
                 << (usesCooperativeOpenFeatures() ? "cooperative" : "scalar")
@@ -1406,8 +1423,15 @@ private:
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
     if (const auto* cell = model_->periodicCell())
-      checkRuntime(launchPeriodicFeatureJets(stream, features_, *cell, positions_.data(), model_->nuclei(),
-          active_.data(), raw_.data(), open_status_.data()), "model periodic feature VGL");
+    {
+      if (usesCooperativePeriodicValueGeometry())
+        checkRuntime(launchPeriodicFeatureValuesCooperative(stream, features_, *cell, positions_.data(),
+            model_->nuclei(), active_.data(), raw_.data(), open_status_.data()),
+            "model cooperative periodic VALUE features");
+      else
+        checkRuntime(launchPeriodicFeatureJets(stream, features_, *cell, positions_.data(), model_->nuclei(),
+            active_.data(), raw_.data(), open_status_.data()), "model periodic feature VGL");
+    }
     else if (usesCooperativeOpenFeatures())
       checkRuntime(launchOpenFeatureJetsCooperative(stream, features_, positions_.data(), model_->nuclei(),
           active_.data(), raw_.data(), open_status_.data()), "model cooperative open feature VGL");
@@ -1744,6 +1768,24 @@ public:
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
         environment.parameter_scalar_domain == ScalarDomain::REAL &&
         environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
+  /// Ordinary legacy-torus VALUE only: retained/reverse, target and mixed graphs stay unchanged.
+  bool usesCooperativePeriodicValueGeometry() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    const bool head = (environment.head_representation == HeadRepresentation::REAL &&
+                       environment.amplitude_scalar_domain == ScalarDomain::REAL) ||
+        (environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
+         environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
+    return periodic_value_geometry_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+        !mixed_open_features_excluded_ && !mixed_dense_ && environment.fixed_nuclei &&
+        environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
+        environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+        environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2] &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL && head;
   }
 
   /// Tile only ordinary real OPEN VALUE heads, never retained or mixed paths.
@@ -2098,9 +2140,16 @@ private:
       return;
     }
     if (const auto* cell = model_->periodicCell())
-      checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *cell, positions_.data(), active_.data(),
-          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
-          "model periodic cusp");
+    {
+      if (usesCooperativePeriodicValueGeometry())
+        checkRuntime(launchPeriodicCuspValuesCooperative(queue_.getNative(), cusp_, *cell, positions_.data(),
+            active_.data(), model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
+            "model cooperative periodic VALUE cusp");
+      else
+        checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *cell, positions_.data(), active_.data(),
+            model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
+            "model periodic cusp");
+    }
     else if (usesCooperativeValueCusp())
       checkRuntime(launchOpenCuspValuesCooperative(queue_.getNative(), cusp_, positions_.data(), active_.data(),
           model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
@@ -2291,6 +2340,7 @@ private:
   const bool cooperative_value_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
   const bool cooperative_open_features_requested_;
+  const bool periodic_value_geometry_requested_;
   const bool retained_open_features_requested_;
   bool mixed_open_features_excluded_ = false;
   const bool cooperative_value_cusp_requested_;
