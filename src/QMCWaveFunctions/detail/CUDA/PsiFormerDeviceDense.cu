@@ -19,6 +19,7 @@
 #include <cfloat>
 #include <cmath>
 #include <limits>
+#include <sstream>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -938,7 +939,25 @@ void PreparedDeviceMixedValueDense::finishEvaluation()
   if (execution.nonfinite_count || execution.invalid_softmax_count || execution.small_determinant_pivot_count ||
       execution.severe_cancellation_count || execution.extreme_ecp_ratio_count ||
       mixedConversionNeedsRetry(diagnostics_.conversion))
-    throw MixedPrecisionRetryRequired("Mixed affine evaluation requires a complete requested-graph FP64 retry");
+  {
+    // Report the already downloaded evidence without changing admission or retry arithmetic.
+    const auto& conversion = diagnostics_.conversion;
+    std::ostringstream reason;
+    reason.precision(17);
+    reason << "Mixed affine evaluation requires a complete requested-graph FP64 retry"
+           << "; execution_nonfinite=" << execution.nonfinite_count
+           << " invalid_softmax=" << execution.invalid_softmax_count
+           << " small_determinant_pivot=" << execution.small_determinant_pivot_count
+           << " severe_cancellation=" << execution.severe_cancellation_count
+           << " extreme_ecp_ratio=" << execution.extreme_ecp_ratio_count
+           << " conversion_nonfinite=" << conversion.nonfinite_input_count
+           << " conversion_overflow=" << conversion.overflow_count
+           << " conversion_subnormal=" << conversion.subnormal_output_count
+           << " conversion_underflow_to_zero=" << conversion.underflow_to_zero_count
+           << " conversion_max_absolute_error=" << conversion.maximum_absolute_error
+           << " conversion_max_relative_error=" << conversion.maximum_relative_error;
+    throw MixedPrecisionRetryRequired(reason.str().c_str());
+  }
 }
 
 void PreparedDeviceMixedValueDense::checkValueConditioning(

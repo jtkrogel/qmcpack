@@ -1588,10 +1588,18 @@ int main(int argc, char** argv)
       input_buffer.upload(huge_input.data(), huge_input.size());
       adapter->beginEvaluation(image);
       adapter->project(cast_layout, input_buffer.data(), image->parameters() + embedding_tensor.begin, output_buffer.data());
-      bool cast_rejected = false;
+      bool cast_rejected = false, cast_reason_detailed = false;
       try { adapter->finishEvaluation(); }
-      catch (const MixedPrecisionRetryRequired&) { cast_rejected = true; }
-      if (!cast_rejected || adapter->diagnostics().execution.nonfinite_count == 0)
+      catch (const MixedPrecisionRetryRequired& error)
+      {
+        cast_rejected = true;
+        const std::string reason = error.what();
+        cast_reason_detailed = reason.find("execution_nonfinite=" +
+            std::to_string(adapter->diagnostics().execution.nonfinite_count)) != std::string::npos &&
+            reason.find("conversion_subnormal=") != std::string::npos &&
+            reason.find("small_determinant_pivot=") != std::string::npos;
+      }
+      if (!cast_rejected || !cast_reason_detailed || adapter->diagnostics().execution.nonfinite_count == 0)
         throw std::runtime_error("Mixed affine casts hid a finite overflow hazard");
 
       // Rebinding selects a separately admitted immutable cache. Versions and
