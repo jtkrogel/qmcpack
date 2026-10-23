@@ -2477,9 +2477,21 @@ void WFTrainBatched::process(xmlNodePtr node)
             population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
             !provenance->scientific_definition.empty() &&
             supported_paired_move && !vmcdriver_input_.get_use_drift();
+        const bool hip_paired_reference_ecp = complex->gpuInferenceEnabled() &&
+            psiformer::compiledPsiFormerAcceleratorSupport().hip && myComm->size() == 1 &&
+            complex->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY && optimizer == O::ADAM &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE &&
+            !inference_input_.enabled && training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
+            training_input_.getMaximumUpdateNorm() == 0 && cap && cap != std::numeric_limits<std::size_t>::max() &&
+            supported_paired_move && !vmcdriver_input_.get_use_drift() &&
+            population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
+            !provenance->scientific_definition.empty();
         if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
-            psiformer::compiledPsiFormerAcceleratorSupport().hip && !legacy_paired_score_ecp && !legacy_paired_inline_ecp)
-          throw UniformCommunicateError("WFTrainBatched: paired HIP ECP requires legacy torus score covariance or inline full-response Adam/OFF");
+            psiformer::compiledPsiFormerAcceleratorSupport().hip && !legacy_paired_score_ecp &&
+            !legacy_paired_inline_ecp && !hip_paired_reference_ecp)
+          throw UniformCommunicateError("WFTrainBatched: paired HIP ECP requires legacy torus score covariance/OFF, "
+              "inline full-response Adam/OFF, or MPI1 ENERGY Adam/REFERENCE with default update controls");
         // Widen only the already qualified legacy AE score-covariance lane.
         // Its complex chunks and affine factors remain HOST-staged raw sums.
         legacy_paired_mpi2_kfac = complex->gpuInferenceEnabled() && myComm->size() == 2 &&
