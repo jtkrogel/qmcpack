@@ -400,6 +400,9 @@ void KFACFactorAccumulator::addFallbackScores(
   if (!imaginary_score.empty() &&
       (imaginary_score.size() != score.size() || !imaginary_score.data()))
     throw std::invalid_argument("KFAC imaginary fallback score extent does not match the real channel");
+  // Keep the load address valid even when an optimized empty-channel select is evaluated eagerly.
+  const DerivativeReal zero_imaginary = 0.0;
+  const DerivativeReal* imaginary_values = imaginary_score.empty() ? &zero_imaginary : imaginary_score.data();
   std::size_t packed = 0;
   for (std::size_t block_index : registry_.fallbackBlocks())
   {
@@ -410,7 +413,8 @@ void KFACFactorAccumulator::addFallbackScores(
     {
       if (!finite(score[parameter]))
         throw std::invalid_argument("KFAC fallback score contains a non-finite value");
-      const DerivativeReal imaginary = imaginary_score.empty() ? 0.0 : imaginary_score[parameter];
+      const std::size_t imaginary_index = imaginary_score.empty() ? 0 : parameter;
+      const DerivativeReal imaginary = imaginary_values[imaginary_index];
       if (!finite(imaginary))
         throw std::invalid_argument("KFAC imaginary fallback score contains a non-finite value");
       if (!generic_entries_.empty() && generic_entries_[packed])

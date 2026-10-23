@@ -783,6 +783,37 @@ TEST_CASE("Trace-balanced KFAC handles scalar and zero factors as damped represe
     }
 }
 
+TEST_CASE("KFAC empty imaginary fallback matches a zero channel at nonzero parameter offsets",
+          "[drivers][wftrain][kfac][empty_imaginary]")
+{
+  const StructuredParameterSchema schema{"offset/generic",
+      {{"frozen", {2}, 0, 2, ParameterScalarDomain::REAL64, false, "fixed"},
+       {"generic", {3}, 2, 3, ParameterScalarDomain::REAL64, true, "network"}}};
+  const std::array<DerivativeReal, 5> score{19.0, -23.0, 1.0, -2.0, 3.0};
+  const std::array<DerivativeReal, 5> imaginary{};
+  for (const auto convention : {KFACCurvatureConvention::NATIVE_SCORE,
+                                KFACCurvatureConvention::REGISTERED_GAUSSIAN})
+  {
+    KFACFactorAccumulator empty({schema, {}, {1}, {1}}, 0, convention);
+    KFACFactorAccumulator zero({schema, {}, {1}, {1}}, 0, convention);
+    for (int sample = 0; sample < 2; ++sample)
+    {
+      empty.beginSample(sample + 1);
+      zero.beginSample(sample + 1);
+      empty.addFallbackScores({score.data(), score.size()});
+      zero.addFallbackScores({score.data(), score.size()}, {imaginary.data(), imaginary.size()});
+      empty.endSample();
+      zero.endSample();
+    }
+    reduceKFACFactorStatistics(empty, nullptr, 2);
+    reduceKFACFactorStatistics(zero, nullptr, 2);
+    CHECK(empty.fallbackWeightSum() == zero.fallbackWeightSum());
+    REQUIRE(empty.fallbackDiagonalSum().size() == 3);
+    for (std::size_t index = 0; index < 3; ++index)
+      CHECK(empty.fallbackDiagonalSum()[index] == zero.fallbackDiagonalSum()[index]);
+  }
+}
+
 TEST_CASE("KFAC factor EMA normalizes each batch and retains its running weight",
           "[drivers][wftrain][kfac][kfac_state]")
 {
