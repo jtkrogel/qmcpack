@@ -7,6 +7,8 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 
 // Existing mapping covers complex storage, but not these arithmetic names.
 // Select direct vendor operations locally; do not extend the global CUDA shim.
@@ -210,6 +212,139 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
     fail(status, channel);
 }
 
+/// Inverse-null alternative: one block owns one in-place LU, with scalar phase/log.
+/// Every entry keeps the serial k-order and vendor operations; no sums are reordered.
+__global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
+    ComplexValueChannel* metadata, std::uint64_t* status)
+{
+  const auto channel = std::size_t(blockIdx.x), lane = std::size_t(threadIdx.x);
+  if (channel >= channels)
+    return;
+  __shared__ double magnitudes[256];
+  __shared__ std::size_t rows[256];
+  __shared__ double scale, log_abs, pivot_magnitude;
+  __shared__ cuDoubleComplex phase;
+  __shared__ std::size_t pivot;
+  __shared__ unsigned bad;
+  auto* a = matrices + channel * n * n;
+  if (!lane)
+  {
+    metadata[channel] = {make_cuDoubleComplex(0, 0), nodeLog(), 1};
+    bad = 0;
+  }
+  __syncthreads();
+  double local_scale = 0;
+  for (auto i = lane; i < n * n; i += 256)
+  {
+    if (!finite(a[i])) atomicOr(&bad, 1u);
+    local_scale = fmax(local_scale, fmax(fabs(cuCreal(a[i])), fabs(cuCimag(a[i]))));
+  }
+  magnitudes[lane] = local_scale;
+  __syncthreads();
+  for (unsigned stride = 128; stride; stride >>= 1)
+  {
+    if (lane < stride) magnitudes[lane] = fmax(magnitudes[lane], magnitudes[lane + stride]);
+    __syncthreads();
+  }
+  if (!lane)
+  {
+    scale = magnitudes[0];
+    if (bad) fail(status, channel);
+    phase = make_cuDoubleComplex(1, 0);
+    log_abs = double(n) * log(scale);
+  }
+  __syncthreads();
+  if (bad || scale == 0) return;
+  for (auto i = lane; i < n * n; i += 256)
+    a[i] = make_cuDoubleComplex(cuCreal(a[i]) / scale, cuCimag(a[i]) / scale);
+  __syncthreads();
+  for (std::size_t k = 0; k < n; ++k)
+  {
+    double best = -1;
+    std::size_t row = n;
+    for (auto i = k + lane; i < n; i += 256)
+    {
+      const auto magnitude = QMC_PF_COMPLEX_ABS(a[i * n + k]);
+      if (magnitude > best) { best = magnitude; row = i; }
+    }
+    magnitudes[lane] = best;
+    rows[lane] = row;
+    __syncthreads();
+    for (unsigned stride = 128; stride; stride >>= 1)
+    {
+      if (lane < stride && (magnitudes[lane + stride] > magnitudes[lane] ||
+          (magnitudes[lane + stride] == magnitudes[lane] && rows[lane + stride] < rows[lane])))
+      { magnitudes[lane] = magnitudes[lane + stride]; rows[lane] = rows[lane + stride]; }
+      __syncthreads();
+    }
+    if (!lane)
+    {
+      pivot = rows[0];
+      pivot_magnitude = magnitudes[0];
+      if (!device_math::isFiniteBinary64(pivot_magnitude)) { bad = 1; fail(status, channel); }
+    }
+    __syncthreads();
+    if (bad || pivot_magnitude == 0) return;
+    if (pivot != k)
+      for (auto j = lane; j < n; j += 256)
+      {
+        const auto temporary = a[k * n + j];
+        a[k * n + j] = a[pivot * n + j];
+        a[pivot * n + j] = temporary;
+      }
+    __syncthreads();
+    if (!lane)
+    {
+      if (pivot != k) phase = make_cuDoubleComplex(-cuCreal(phase), -cuCimag(phase));
+      phase = QMC_PF_COMPLEX_MUL(phase, make_cuDoubleComplex(cuCreal(a[k * n + k]) / pivot_magnitude,
+          cuCimag(a[k * n + k]) / pivot_magnitude));
+      log_abs += log(pivot_magnitude);
+      if (!finite(phase) || !device_math::isFiniteBinary64(log_abs)) { bad = 1; fail(status, channel); }
+    }
+    __syncthreads();
+    if (bad) return;
+    for (auto i = k + 1 + lane; i < n; i += 256)
+    {
+      a[i * n + k] = QMC_PF_COMPLEX_DIV(a[i * n + k], a[k * n + k]);
+      if (!finite(a[i * n + k])) atomicOr(&bad, 1u);
+    }
+    __syncthreads();
+    if (bad) { if (!lane) fail(status, channel); return; }
+    const auto trailing = n - k - 1;
+    for (auto index = lane; index < trailing * trailing; index += 256)
+    {
+      const auto i = k + 1 + index / trailing, j = k + 1 + index % trailing;
+      a[i * n + j] = QMC_PF_COMPLEX_SUB(a[i * n + j], QMC_PF_COMPLEX_MUL(a[i * n + k], a[k * n + j]));
+      if (!finite(a[i * n + j])) atomicOr(&bad, 1u);
+    }
+    __syncthreads();
+    if (bad) { if (!lane) fail(status, channel); return; }
+  }
+  for (auto i = lane; i < n * n; i += 256)
+    if (!finite(a[i])) atomicOr(&bad, 1u);
+  __syncthreads();
+  if (!lane)
+  {
+    const double magnitude = QMC_PF_COMPLEX_ABS(phase);
+    if (bad || !device_math::isFiniteBinary64(log_abs) || !finite(phase) || !(magnitude > 0))
+      fail(status, channel);
+    else
+      metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
+  }
+}
+
+/// Cold opt-in; changing a process environment after its first VALUE call is unsupported.
+bool cooperativeFactorEnabled()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_VALUE_COOPERATIVE_LU");
+    if (!value || std::strcmp(value, "0") == 0) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_VALUE_COOPERATIVE_LU must be 0 or 1");
+  }();
+  return enabled;
+}
+
 /// Mix channels at a common shift; node outputs never require logarithmic derivatives.
 __global__ void reduce(std::size_t batch, std::size_t determinants, const ComplexValueChannel* channels,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
@@ -322,7 +457,11 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
 {
   if (!n || !matrix || !metadata || !status || bool(inverse) != bool(permutation) || bool(inverse) != bool(solve))
     throw std::invalid_argument("Complex VALUE factor storage/size is invalid");
-  factor<<<blocks(channels), 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve);
+  const auto serial_blocks = blocks(channels);
+  if (!inverse && cooperativeFactorEnabled() && channels <= std::size_t(std::numeric_limits<int>::max()))
+    factorCooperative<<<static_cast<unsigned>(channels), 256, 0, stream>>>(channels, n, matrix, metadata, status);
+  else
+    factor<<<serial_blocks, 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve);
   return launched();
 }
 

@@ -40,6 +40,7 @@ Error launchComplexValuePack(Stream stream, std::size_t count, const double* env
     const double* projected_real, const double* projected_imag, cuDoubleComplex* matrix, std::uint64_t* status);
 
 /// Factor the private head in place, optionally preparing admitted inverse/solve scratch.
+/// Cold opt-in PSIFORMER_GPU_COMPLEX_VALUE_COOPERATIVE_LU=1 affects inverse-null calls only.
 Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
