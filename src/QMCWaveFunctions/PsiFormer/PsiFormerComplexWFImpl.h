@@ -22,6 +22,96 @@ struct PsiFormerComplexWF::Impl
   using C = psiformer::determinant::Complex;
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
+  /** Family-wide authority for retained CPU scratch, including dormant resources.
+   * This numerical budget excludes clone G/L, parameters and derivative owners.
+   */
+  struct CpuScratchBudget
+  {
+    explicit CpuScratchBudget(std::size_t cap) : limit(cap)
+    {
+      if (!cap || cap == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Complex shared CPU scratch requires a positive finite cap");
+    }
+
+    /// Reserve before allocation; the caller rolls back an unpublished candidate.
+    void reserve(std::size_t bytes)
+    {
+      std::lock_guard lock(mutex);
+      if (bytes > limit - retained)
+        throw std::length_error("Complex shared CPU scratch exceeds its family numeric cap before allocation");
+      retained += bytes;
+    }
+
+    /// Return only this owner's admitted bytes, including allocation rollback.
+    void release(std::size_t bytes) noexcept
+    {
+      std::lock_guard lock(mutex);
+      retained -= bytes;
+    }
+
+    const std::size_t limit;
+    std::mutex mutex;
+    std::size_t retained = 0, owners = 0, fingerprint = 0;
+  };
+
+  /** Exclusive lazy CPU VALUE/FULL/ACTIVE scratch with no accepted walker state.
+   * A CoreResult retains this owner and its execution lock until output copies finish.
+   */
+  struct CpuLane
+  {
+    explicit CpuLane(std::shared_ptr<CpuScratchBudget> authority) : budget(std::move(authority))
+    {
+      std::lock_guard lock(budget->mutex);
+      ++budget->owners;
+    }
+
+    ~CpuLane()
+    {
+      // Release allocations before returning their reservation to another lane.
+      value.reset();
+      full.reset();
+      active.reset();
+      std::lock_guard lock(budget->mutex);
+      budget->retained -= charged;
+      --budget->owners;
+      budget->fingerprint ^= fingerprint;
+    }
+
+    /// Publish only a complete, exactly sized workspace; failures preserve prior modes.
+    template<class Workspace, class Factory>
+    Workspace& prepare(std::unique_ptr<Workspace>& destination, std::size_t bytes, Factory factory)
+    {
+      if (!destination)
+      {
+        budget->reserve(bytes);
+        try
+        {
+          auto candidate = factory();
+          if (candidate->vectorStorageBytes() != bytes)
+            throw std::logic_error("Complex shared CPU workspace differs from its admitted requirement");
+          const auto next = (candidate->storageFingerprint() ^ bytes) * 1099511628211ULL;
+          std::lock_guard lock(budget->mutex);
+          destination = std::move(candidate);
+          charged += bytes;
+          fingerprint ^= next;
+          budget->fingerprint ^= next;
+        }
+        catch (...)
+        {
+          budget->release(bytes);
+          throw;
+        }
+      }
+      return *destination;
+    }
+
+    std::shared_ptr<CpuScratchBudget> budget;
+    std::mutex mutex;
+    std::unique_ptr<pf::DirectComplexValueWorkspace> value;
+    std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
+    std::size_t charged = 0, fingerprint = 0;
+  };
+
 #ifdef ENABLE_CUDA
   /** One exclusive numerical lane, owned by the model or an opt-in crowd resource.
    * Numeric owners share one immutable image. No borrowed GPU output escapes a call.
@@ -303,7 +393,7 @@ struct PsiFormerComplexWF::Impl
     /// Retain initializer provenance and construct only qualified complex inference owners.
     Model(const std::string& component_name, InitializedNativeModel initialized,
           const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit,
-          const std::string& kind = "all_electron"
+          const std::string& kind = "all_electron", std::size_t cpu_limit = 0
 #ifdef ENABLE_CUDA
           , std::shared_ptr<GpuLane> prepared = {}
 #endif
@@ -332,6 +422,21 @@ struct PsiFormerComplexWF::Impl
           , inference_concurrency(gpu_crowds)
 #endif
     {
+      if (cpu_limit)
+      {
+        if (gpu_limit)
+          throw std::invalid_argument("Complex shared CPU scratch cannot be combined with GPU inference");
+        cpu_budget = std::make_shared<CpuScratchBudget>(cpu_limit);
+        cpu = std::make_shared<CpuLane>(cpu_budget);
+        const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
+            plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size(),
+            bool(environment.periodic_profile), occupiedMomentumCount(plan),
+            environment.periodic_profile ? environment.periodic_profile->pair_feature_dimension : 8,
+            fourierModeCount(plan)};
+        cpu_requirements = {pf::DirectComplexValueWorkspace::storageRequirement(shape),
+            pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::FULL_VGL),
+            pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)};
+      }
       if (gpu_limit)
       {
 #ifdef ENABLE_CUDA
@@ -361,6 +466,9 @@ struct PsiFormerComplexWF::Impl
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     const std::size_t gpu_limit;
     const std::size_t gpu_capacity, gpu_crowds;
+    std::shared_ptr<CpuScratchBudget> cpu_budget;
+    std::shared_ptr<CpuLane> cpu;
+    std::array<std::size_t, 3> cpu_requirements{};
     std::atomic<std::size_t> acquired_teams{0};
 #ifdef ENABLE_CUDA
     psiformer::PsiFormerInferenceConcurrency inference_concurrency;
@@ -433,6 +541,20 @@ struct PsiFormerComplexWF::Impl
     /// Clone only the model anchor; each acquired crowd prepares independent HOST staging.
     std::unique_ptr<Resource> makeClone() const override
     { return std::make_unique<MultiWalkerResource>(state); }
+
+    /// CPU scalar dispatch needs membership only, not dense GPU transaction staging.
+    void prepareCpuTeam(const RefVectorWithLeader<WaveFunctionComponent>& list)
+    {
+      if (!cpu)
+        cpu = std::make_shared<CpuLane>(state->cpu_budget);
+      std::vector<PsiFormerComplexWF*> candidate;
+      candidate.reserve(list.size());
+      for (std::size_t i = 0; i < list.size(); ++i)
+        candidate.push_back(&static_cast<PsiFormerComplexWF&>(list[i]));
+      components.swap(candidate);
+    }
+
+    std::shared_ptr<CpuLane> cpu;
 
     /// Reject legacy real-adapter preparation metadata rather than silently ignoring it.
     void validateBatchResourcePreparation(const BatchResourcePreparationContext& context) const override
@@ -2084,10 +2206,11 @@ struct PsiFormerComplexWF::Impl
   /// Prepare only the selected CPU or GPU numerical profile.
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
        const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-       std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind)
+       std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
+       std::size_t cpu_limit)
       : Impl(std::make_shared<Model>(component_name,
                                    materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint, system_kind),
-                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind),
+                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind, cpu_limit),
              electrons, limit)
   {}
 
@@ -2107,7 +2230,7 @@ struct PsiFormerComplexWF::Impl
         bool(state->environment.periodic_profile), occupiedMomentumCount(state->plan),
         state->environment.periodic_profile ? state->environment.periodic_profile->pair_feature_dimension : 8,
         fourierModeCount(state->plan)};
-    if (!state->gpu_limit)
+    if (!state->gpu_limit && !state->cpu_budget)
     {
       numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
       for (auto mode : {pf::DirectSpatialMode::FULL_VGL, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT})
@@ -2120,7 +2243,7 @@ struct PsiFormerComplexWF::Impl
                     "complex clone bytes overflow");
     if (numeric_required > numeric_limit)
       throw std::length_error("Complex PsiFormer full clone numeric requirement exceeds its per-clone byte cap");
-    if (!state->gpu_limit)
+    if (!state->gpu_limit && !state->cpu_budget)
     {
       value = state->value.makeWorkspace();
       full = state->spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
@@ -2143,25 +2266,36 @@ struct PsiFormerComplexWF::Impl
     using pf::checkedStorageBytes;
     std::size_t bytes = 0;
     if (value)
-    {
-      bytes = value->vectorStorageBytes();
+      addStorageBytes(bytes, value->vectorStorageBytes(), "complex clone bytes overflow");
+    if (full)
       addStorageBytes(bytes, full->vectorStorageBytes(), "complex clone bytes overflow");
+    if (active)
       addStorageBytes(bytes, active->vectorStorageBytes(), "complex clone bytes overflow");
-    }
     addStorageBytes(bytes, checkedStorageBytes<GradType>(own_gradient.capacity(), "complex own gradient bytes overflow"),
                     "complex clone bytes overflow");
     addStorageBytes(bytes, checkedStorageBytes<ValueType>(own_laplacian.capacity(), "complex own Laplacian bytes overflow"),
                     "complex clone bytes overflow");
     std::size_t fingerprint = 0;
     if (value)
-    {
       fingerprint = value->storageFingerprint();
-      for (auto next : {full->storageFingerprint(), active->storageFingerprint()})
+    for (auto next : {full ? full->storageFingerprint() : 0, active ? active->storageFingerprint() : 0})
+      if (next)
         fingerprint = (fingerprint ^ next) * 1099511628211ULL;
-    }
     determinant::detail::mixStorage(fingerprint, own_gradient);
     determinant::detail::mixStorage(fingerprint, own_laplacian);
     NumericStorage result{numeric_required, bytes, numeric_limit, fingerprint};
+    if (state->cpu_budget)
+    {
+      std::lock_guard lock(state->cpu_budget->mutex);
+      result.shared_cpu_bytes = state->cpu_budget->retained;
+      result.shared_cpu_limit_bytes = state->cpu_budget->limit;
+      result.shared_cpu_owners = state->cpu_budget->owners;
+      result.shared_cpu_fingerprint = state->cpu_budget->fingerprint;
+      result.shared_cpu_identity = state->cpu_budget.get();
+      result.shared_cpu_value_bytes = state->cpu_requirements[0];
+      result.shared_cpu_full_bytes = state->cpu_requirements[1];
+      result.shared_cpu_active_bytes = state->cpu_requirements[2];
+    }
 #ifdef ENABLE_CUDA
     if (state->gpu)
     {
@@ -2385,7 +2519,19 @@ struct PsiFormerComplexWF::Impl
   bool denseEnabled() const noexcept { return state->gpu_capacity > 1; }
 
   /// B1/target inference also needs native resources when independent crowds are enabled.
-  bool crowdResourcesEnabled() const noexcept { return denseEnabled() || state->gpu_crowds > 1; }
+  bool crowdResourcesEnabled() const noexcept { return bool(state->cpu_budget) || denseEnabled() || state->gpu_crowds > 1; }
+
+  /// Select one crowd's exclusive scratch, retaining the family fallback for scalar callers.
+  std::shared_ptr<CpuLane> selectedCpuLane() const
+  {
+    if (acquired_leader)
+    {
+      const auto& leader = *acquired_leader->impl_;
+      if (leader.multiwalker && leader.multiwalker.getResource().cpu)
+        return leader.multiwalker.getResource().cpu;
+    }
+    return state->cpu;
+  }
 
 #ifdef ENABLE_CUDA
   /// Resolve the exact native crowd's lane; scalar non-resource callers keep the original owner.
@@ -2557,6 +2703,7 @@ struct PsiFormerComplexWF::Impl
   /// Common core view keeps a GPU operation locked until its scalar caller publishes copies.
   struct CoreResult : pf::DirectComplexSpatialResult
   {
+    std::shared_ptr<CpuLane> cpu_owner;
 #ifdef ENABLE_CUDA
     std::shared_ptr<GpuLane> owner;
     std::optional<psiformer::PsiFormerInferenceConcurrency::Lease> permit;
@@ -2615,18 +2762,30 @@ struct PsiFormerComplexWF::Impl
       return result;
     }
 #endif
+    if (state->cpu_budget)
+    {
+      result.cpu_owner = selectedCpuLane();
+      result.lease = std::unique_lock(result.cpu_owner->mutex);
+    }
     if (spatial)
     {
       NativeTimerScope numerical_timer(phase_timers.cpu_spatial);
-      auto& workspace = electron < 0 ? *full : *active;
+      const auto mode = electron < 0 ? pf::DirectSpatialMode::FULL_VGL : pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT;
+      auto& workspace = result.cpu_owner
+          ? result.cpu_owner->prepare(electron < 0 ? result.cpu_owner->full : result.cpu_owner->active,
+              state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); })
+          : (electron < 0 ? *full : *active);
       positions(workspace, p, replacement, absolute);
       static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
           ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
     }
     else
     {
-      positions(*value, p, replacement, absolute);
-      const auto evaluated = state->value.evaluate(*value);
+      auto& workspace = result.cpu_owner
+          ? result.cpu_owner->prepare(result.cpu_owner->value, state->cpu_requirements[0],
+              [&] { return state->value.makeWorkspace(); }) : *value;
+      positions(workspace, p, replacement, absolute);
+      const auto evaluated = state->value.evaluate(workspace);
       result.amplitude = evaluated.amplitude;
       result.parameter_version = evaluated.parameter_version;
     }
@@ -2806,10 +2965,11 @@ class PsiFormerComplexWF::FixedGridEnergyReference
 /// Construct the explicit paired CPU or strictly capped shared-GPU inference profile.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-    std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind)
+    std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
+    std::size_t cpu_limit)
     : WaveFunctionComponent(name),
       impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced,
-                                 gpu_limit, parameter_checkpoint, system_kind))
+                                 gpu_limit, parameter_checkpoint, system_kind, cpu_limit))
 {
   if (!parameter_checkpoint.empty())
     app_log() << "Complex PsiFormer imported model identity=" << impl_->state->identity << std::endl;
@@ -2887,8 +3047,14 @@ void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
     for (int d = 0; d < 3; ++d)
       if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
         throw std::invalid_argument("Complex orbital forward coordinates/spin order invalid");
-  impl_->positions(*impl_->value, particles);
-  const auto values = state->value.evaluateOrbitalValues(*impl_->value);
+  auto owner = state->cpu_budget ? impl_->selectedCpuLane() : nullptr;
+  std::unique_lock<std::mutex> execution;
+  if (owner)
+    execution = std::unique_lock(owner->mutex);
+  auto& workspace = owner ? owner->prepare(owner->value, state->cpu_requirements[0],
+      [&] { return state->value.makeWorkspace(); }) : *impl_->value;
+  impl_->positions(workspace, particles);
+  const auto values = state->value.evaluateOrbitalValues(workspace);
   orbitals.assign(values.values, values.values + values.size);
 }
 
@@ -3637,7 +3803,8 @@ void PsiFormerComplexWF::isolateParameterState()
                            model.dim, model.heads, model.blocks);
     auto state = std::make_shared<Impl::Model>(getName(),
         InitializedNativeModel{std::move(detached), original->profile, original->seed, original->environment},
-        *impl_->particles, *original->source, original->reduced_twist, 0, original->system_kind);
+        *impl_->particles, *original->source, original->reduced_twist, 0, original->system_kind,
+        original->cpu_budget ? original->cpu_budget->limit : 0);
     independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   }
   // Fresh executors/workspaces bind only detached leaves; accepted state and weak
@@ -3698,7 +3865,8 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
       InitializedNativeModel{std::move(model), original->profile, original->seed, original->environment},
-      *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind, std::move(lane));
+      *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind,
+      0, std::move(lane));
   state->private_origin = original;
   state->private_origin_image = image;
   state->private_origin_version = version;
@@ -3863,22 +4031,24 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
   NativeTimerScope timer(impl_->phase_timers.resource);
   std::shared_lock read(impl_->state->mutex);
   if (&components.getLeader() != this || components.empty() || &components[0] != this || impl_->multiwalker)
-    throw std::logic_error("Dense complex GPU acquisition requires its idle native leader");
+    throw std::logic_error("Complex resource acquisition requires its idle native leader");
   for (std::size_t i = 0; i < components.size(); ++i)
   {
     const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[i]);
     if (!component || component->impl_->state != impl_->state)
-      throw std::invalid_argument("Dense complex GPU acquisition requires same-model component clones");
+      throw std::invalid_argument("Complex resource acquisition requires same-model component clones");
+    if (impl_->state->cpu_budget)
+      component->impl_->requireIdle(*component->impl_->particles);
     for (std::size_t prior = 0; prior < i; ++prior)
       if (&components[i] == &components[prior])
-        throw std::invalid_argument("Dense complex GPU acquisition contains a duplicate clone");
+        throw std::invalid_argument("Complex resource acquisition contains a duplicate clone");
   }
   if (collection.getBatchResourcePreparationProvenance().state != BatchResourcePreparationState::UNPREPARED)
-    throw std::invalid_argument("Dense complex GPU acquisition does not support legacy batch_memory resources");
+    throw std::invalid_argument("Complex resource acquisition does not support legacy batch_memory resources");
   auto count = impl_->state->acquired_teams.load();
   do
   {
-    if (count >= impl_->state->gpu_crowds)
+    if (!impl_->state->cpu_budget && count >= impl_->state->gpu_crowds)
       throw std::logic_error("Complex GPU acquisition exceeds its frozen crowd limit");
   } while (!impl_->state->acquired_teams.compare_exchange_weak(count, count + 1));
   const auto cursor = collection.getCursor();
@@ -3887,14 +4057,17 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
   {
     for (std::size_t i = 0; i < components.size(); ++i)
       if (static_cast<PsiFormerComplexWF&>(components[i]).impl_->acquired_leader)
-        throw std::logic_error("Dense complex GPU clone already belongs to an acquired crowd");
+        throw std::logic_error("Complex clone already belongs to an acquired crowd");
     candidate = collection.lendResource<Impl::MultiWalkerResource>();
     if (candidate.getResource().state != impl_->state)
-      throw std::invalid_argument("Dense complex GPU resource belongs to another model family");
-    candidate.getResource().prepareTeam(components);
+      throw std::invalid_argument("Complex resource belongs to another model family");
+    if (impl_->state->cpu_budget)
+      candidate.getResource().prepareCpuTeam(components);
+    else
+      candidate.getResource().prepareTeam(components);
     auto& resource = candidate.getResource();
 #ifdef ENABLE_CUDA
-    if (impl_->state->gpu_crowds > 1 && !resource.gpu)
+    if (!impl_->state->cpu_budget && impl_->state->gpu_crowds > 1 && !resource.gpu)
     {
       const auto& primary = *impl_->state->gpu;
       resource.gpu = Impl::GpuLane::prepareFrozen(impl_->state->plan,
@@ -3947,14 +4120,14 @@ void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
   std::shared_lock read(impl_->state->mutex);
   if (&components.getLeader() != this || !impl_->multiwalker || impl_->resource_collection != &collection ||
       collection.getCursor() != impl_->resource_cursor)
-    throw std::logic_error("Dense complex GPU release requires its original resource loan and cursor");
+    throw std::logic_error("Complex resource release requires its original loan and cursor");
   auto& resource = impl_->multiwalker.getResource();
   if (components.size() != resource.components.size())
-    throw std::invalid_argument("Dense complex GPU release changed the acquired crowd extent");
+    throw std::invalid_argument("Complex resource release changed the acquired crowd extent");
   for (std::size_t i = 0; i < components.size(); ++i)
     if (&components[i] != resource.components[i] || resource.components[i]->impl_->acquired_leader != this ||
         resource.components[i]->impl_->acquired_lane != i)
-      throw std::invalid_argument("Dense complex GPU release changed its acquired lane order");
+      throw std::invalid_argument("Complex resource release changed its acquired lane order");
   // Valid-loan RAII cleanup revokes only component proposals, never ParticleSet coordinates.
   if (resource.collective_pending)
   {

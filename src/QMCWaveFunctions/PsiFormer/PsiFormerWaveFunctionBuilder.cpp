@@ -274,6 +274,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   [[maybe_unused]] std::size_t clone_numeric_limit = 0;
   [[maybe_unused]] std::size_t gpu_numeric_limit = 0;
+  [[maybe_unused]] std::size_t cpu_shared_numeric_limit = 0;
 #ifndef QMC_COMPLEX
   if (complex_profile)
     throw std::invalid_argument("psiformer_complex_periodic_v1 requires a complex QMCPACK build");
@@ -334,12 +335,20 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         optimize_scope != ((cpu_training || selected_gpu_training) ? "all" : "indices"))
       throw std::invalid_argument("Complex PsiFormer requires explicit qualified periodic native metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
+    if (xmlHasProp(cur, BAD_CAST "max_cpu_shared_numeric_bytes"))
+    {
+      if (explicit_gpu)
+        throw std::invalid_argument("max_cpu_shared_numeric_bytes requires the complex CPU profile");
+      cpu_shared_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_cpu_shared_numeric_bytes"),
+                                                       "max_cpu_shared_numeric_bytes");
+    }
     if (explicit_gpu)
       gpu_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_gpu_numeric_bytes"), "max_gpu_numeric_bytes");
     else if (xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
       throw std::invalid_argument("max_gpu_numeric_bytes requires the explicit complex GPU profile");
   }
-  else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes") || xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
+  else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes") || xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes") ||
+           xmlHasProp(cur, BAD_CAST "max_cpu_shared_numeric_bytes"))
     throw std::invalid_argument("Complex numeric caps belong only to psiformer_complex_periodic_v1");
   // Selected pair requests must validate their resolved metadata before consulting a device runtime.
   psiformer::PsiFormerAcceleratorResolution accelerator_resolution = selected_pair_gpu
@@ -573,7 +582,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     {
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
                                                          *source_particles, clone_numeric_limit, twist_array,
-                                                         gpu_numeric_limit, parameter_checkpoint, system);
+                                                         gpu_numeric_limit, parameter_checkpoint, system,
+                                                         cpu_shared_numeric_limit);
       const auto storage = complex->numericStorage();
       app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
                                      : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes
@@ -586,6 +596,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
                   << " shared_image_bytes=" << storage.shared_image_bytes
                   << "; one model-shared image/lane, per-operation mutex, base mw scalar loops; CPU tapes=0, "
                   << "sampling/Hamiltonian=CPU, no batching/TARGET/aggregate-fit claim" << std::endl;
+      if (cpu_shared_numeric_limit)
+        app_log() << "  Complex PsiFormer shared CPU scratch: cap=" << storage.shared_cpu_limit_bytes
+                  << " retained_bytes=" << storage.shared_cpu_bytes << " owners=" << storage.shared_cpu_owners
+                  << " per_lane_value_bytes=" << storage.shared_cpu_value_bytes
+                  << " per_lane_full_bytes=" << storage.shared_cpu_full_bytes
+                  << " per_lane_active_bytes=" << storage.shared_cpu_active_bytes
+                  << "; lazy=yes; one_lane_per_crowd_plus_scalar_fallback; dormant_owners_remain_charged=yes; "
+                  << "excludes clone G/L, model, derivatives and nonnumerical/native HOST owners" << std::endl;
       if (adopt_explicit_twist)
         targetPtcl.setTwist(reduced_twist);
       return complex;

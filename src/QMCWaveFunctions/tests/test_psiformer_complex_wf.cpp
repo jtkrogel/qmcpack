@@ -48,6 +48,7 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexProducts.h"
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <complex>
 #include <cstdio>
@@ -63,6 +64,7 @@
 #include <sstream>
 #include <system_error>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 namespace qmcplusplus
@@ -867,6 +869,227 @@ TEST_CASE("PsiFormer complex clone admits exact numeric bytes and independent sc
   CHECK(clone->numericStorage().fingerprint == clone_storage.fingerprint);
 }
 
+TEST_CASE("Complex CPU shared scratch is lazy, capped and independent of walker population",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_shared]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF shared("shared", parameters(), p, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  const auto cold = shared.numericStorage();
+  CHECK(cold.allocated_bytes == 4 * (sizeof(WaveFunctionComponent::GradType) + sizeof(WaveFunctionComponent::ValueType)));
+  CHECK(cold.allocated_bytes == cold.required_bytes);
+  CHECK(cold.shared_cpu_bytes == 0);
+  CHECK(cold.shared_cpu_owners == 1);
+  REQUIRE(cold.shared_cpu_identity != nullptr);
+  std::vector<std::unique_ptr<WaveFunctionComponent>> population;
+  for (int i = 1; i < 4096; ++i)
+    population.push_back(shared.makeClone(p));
+  const auto& last = dynamic_cast<PsiFormerComplexWF&>(*population.back());
+  CHECK(last.numericStorage().shared_cpu_identity == cold.shared_cpu_identity);
+  CHECK(last.numericStorage().allocated_bytes == cold.allocated_bytes);
+  CHECK(shared.numericStorage().shared_cpu_owners == 1);
+  CHECK(shared.numericStorage().shared_cpu_bytes == 0);
+
+  std::vector<C> orbitals;
+  shared.evaluateOrbitalValues(p, orbitals, shared.snapshotParameters().version);
+  CHECK(shared.numericStorage().shared_cpu_bytes == cold.shared_cpu_value_bytes);
+  PsiFormerComplexWF legacy("legacy", parameters(), p, source, clone_cap, twist);
+  const auto reference = evaluate(legacy, p);
+  const auto expected_g = p.G;
+  const auto expected_l = p.L;
+  close(evaluate(shared, p), reference, 2e-12);
+  CHECK(shared.numericStorage().shared_cpu_bytes == cold.shared_cpu_value_bytes + cold.shared_cpu_full_bytes);
+  for (int e = 0; e < 4; ++e)
+  {
+    for (int d = 0; d < 3; ++d)
+      close(p.G[e][d], expected_g[e][d], 2e-12);
+    close(p.L[e], expected_l[e], 2e-12);
+  }
+  p.makeMove(0, ParticleSet::PosType{.01, -.02, .03});
+  WaveFunctionComponent::GradType gradient{};
+  shared.ratioGrad(p, 0, gradient);
+  shared.restore(0);
+  p.rejectMove(0);
+  const auto warm = shared.numericStorage();
+  CHECK(warm.shared_cpu_bytes == cold.shared_cpu_value_bytes + cold.shared_cpu_full_bytes + cold.shared_cpu_active_bytes);
+  for (int repeat = 0; repeat < 3; ++repeat)
+    close(evaluate(shared, p), reference, 2e-12);
+  CHECK(shared.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  CHECK(shared.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+  CHECK(shared.numericStorage().fingerprint == cold.fingerprint);
+
+  // A later failed mode must not revoke the already prepared VALUE owner.
+  PsiFormerComplexWF short_cap("short", parameters(), p, source, clone_cap, twist, 0, {}, "all_electron",
+      cold.shared_cpu_value_bytes + cold.shared_cpu_full_bytes - 1);
+  short_cap.evaluateOrbitalValues(p, orbitals, short_cap.snapshotParameters().version);
+  CHECK_THROWS_AS(evaluate(short_cap, p), std::length_error);
+  CHECK(short_cap.numericStorage().shared_cpu_bytes == cold.shared_cpu_value_bytes);
+  CHECK_NOTHROW(short_cap.evaluateOrbitalValues(p, orbitals, short_cap.snapshotParameters().version));
+  PsiFormerComplexWF first_short("first_short", parameters(), p, source, clone_cap, twist, 0, {}, "all_electron",
+      cold.shared_cpu_full_bytes - 1);
+  CHECK_THROWS_AS(evaluate(first_short, p), std::length_error);
+  CHECK(first_short.numericStorage().shared_cpu_bytes == 0);
+  CHECK(first_short.numericStorage().shared_cpu_fingerprint == 0);
+  PsiFormerComplexWF exact("exact", parameters(), p, source, clone_cap, twist, 0, {}, "all_electron",
+      cold.shared_cpu_full_bytes);
+  close(evaluate(exact, p), reference, 2e-12);
+  CHECK(exact.numericStorage().shared_cpu_bytes == cold.shared_cpu_full_bytes);
+  CHECK_THROWS_AS(PsiFormerComplexWF("unlimited", parameters(), p, source, clone_cap, twist, 0, {}, "all_electron",
+      std::numeric_limits<std::size_t>::max()), std::invalid_argument);
+  CHECK_THROWS_AS(PsiFormerComplexWF("mixed", parameters(), p, source, clone_cap, twist, clone_cap, {}, "all_electron",
+      clone_cap), std::invalid_argument);
+  shared.isolateParameterState();
+  CHECK(shared.numericStorage().shared_cpu_identity != cold.shared_cpu_identity);
+  CHECK(shared.numericStorage().shared_cpu_limit_bytes == clone_cap);
+  CHECK(shared.numericStorage().shared_cpu_bytes == 0);
+  close(evaluate(shared, p), reference, 2e-12);
+}
+
+TEST_CASE("Complex CPU crowd leases and scalar fallback retain independent products",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_shared]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell), p2 = electrons(simulation_cell);
+  auto p3 = electrons(simulation_cell), p4 = electrons(simulation_cell);
+  p1.R[0][0] += .13;
+  p2.R[1][2] -= .09;
+  p3.R[2][1] += .12;
+  p4.R[3][0] -= .07;
+  p1.update();
+  p2.update();
+  p3.update();
+  p4.update();
+  auto source = ions(simulation_cell);
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF family("family", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  auto clone1 = family.makeClone(p1), clone2 = family.makeClone(p2);
+  auto clone3 = family.makeClone(p3), clone4 = family.makeClone(p4);
+  auto& crowd1 = dynamic_cast<PsiFormerComplexWF&>(*clone1);
+  auto& fallback = dynamic_cast<PsiFormerComplexWF&>(*clone2);
+  auto& fallback2 = dynamic_cast<PsiFormerComplexWF&>(*clone3);
+  auto& same_crowd = dynamic_cast<PsiFormerComplexWF&>(*clone4);
+  PsiFormerComplexWF ref0("ref", parameters(), p0, source, clone_cap, twist);
+  PsiFormerComplexWF ref1("ref", parameters(), p1, source, clone_cap, twist);
+  PsiFormerComplexWF ref2("ref", parameters(), p2, source, clone_cap, twist);
+  PsiFormerComplexWF ref3("ref", parameters(), p3, source, clone_cap, twist);
+  PsiFormerComplexWF ref4("ref", parameters(), p4, source, clone_cap, twist);
+  const auto expected0 = evaluate(ref0, p0), expected1 = evaluate(ref1, p1), expected2 = evaluate(ref2, p2);
+  const auto expected_g0 = p0.G, expected_g1 = p1.G, expected_g2 = p2.G;
+  const auto expected3 = evaluate(ref3, p3), expected4 = evaluate(ref4, p4);
+  const auto expected_g3 = p3.G, expected_g4 = p4.G;
+  RefVectorWithLeader<WaveFunctionComponent> team0(family, {family, same_crowd}), team1(crowd1, {crowd1});
+  ResourceCollection prototype("CPU shared");
+  family.createResource(prototype);
+  ResourceCollection resource0(prototype), resource1(prototype), missing("missing");
+  CHECK_THROWS(family.acquireResource(missing, team0));
+  RefVectorWithLeader<WaveFunctionComponent> duplicate(family, {family, family});
+  CHECK_THROWS(family.acquireResource(resource0, duplicate));
+  p0.makeMove(0, ParticleSet::PosType{.01, .02, -.01});
+  CHECK_THROWS(family.acquireResource(resource0, team0));
+  p0.rejectMove(0);
+  const auto cursor0 = resource0.getCursor(), cursor1 = resource1.getCursor();
+  family.acquireResource(resource0, team0);
+  crowd1.acquireResource(resource1, team1);
+  CHECK(family.numericStorage().shared_cpu_owners == 3);
+  CHECK(family.numericStorage().shared_cpu_bytes == 0);
+  CHECK_FALSE(family.supportsMultiParticleMoves());
+  auto exercise = [](PsiFormerComplexWF& component, ParticleSet& particles) {
+    std::vector<C> products;
+    for (int repeat = 0; repeat < 12; ++repeat)
+    {
+      products.push_back(evaluate(component, particles));
+      for (int e = 0; e < 4; ++e)
+      {
+        const auto gradient = component.evalGrad(particles, e);
+        for (int d = 0; d < 3; ++d)
+          products.push_back(gradient[d]);
+      }
+    }
+    return products;
+  };
+  std::promise<void> go;
+  const auto start = go.get_future().share();
+  std::atomic<int> ready{0};
+  auto work0 = std::async(std::launch::async, [&] {
+    ++ready; start.wait();
+    std::vector<C> result;
+    for (int repeat = 0; repeat < 4; ++repeat)
+    {
+      const auto first = exercise(family, p0), second = exercise(same_crowd, p4);
+      result.insert(result.end(), first.begin(), first.end());
+      result.insert(result.end(), second.begin(), second.end());
+    }
+    return result;
+  });
+  auto launch = [&](PsiFormerComplexWF& component, ParticleSet& particles) {
+    return std::async(std::launch::async, [&component, &particles, &ready, start, &exercise] {
+      ++ready; start.wait(); return exercise(component, particles);
+    });
+  };
+  auto work1 = launch(crowd1, p1), work2 = launch(fallback, p2), work3 = launch(fallback2, p3);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (ready.load() != 4 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  go.set_value();
+  REQUIRE(ready.load() == 4);
+  const auto check = [](const std::vector<C>& products, C log, const ParticleSet::ParticleGradient& gradients) {
+    for (std::size_t base = 0; base < products.size(); base += 13)
+    {
+      close(products[base], log, 2e-12);
+      for (int e = 0; e < 4; ++e)
+        for (int d = 0; d < 3; ++d)
+          close(products[base + 1 + 3 * e + d], gradients[e][d], 2e-12);
+    }
+  };
+  const auto team_products = work0.get();
+  for (std::size_t base = 0; base < team_products.size(); base += 2 * 12 * 13)
+  {
+    check(std::vector<C>(team_products.begin() + base, team_products.begin() + base + 12 * 13), expected0, expected_g0);
+    check(std::vector<C>(team_products.begin() + base + 12 * 13, team_products.begin() + base + 2 * 12 * 13),
+          expected4, expected_g4);
+  }
+  check(work1.get(), expected1, expected_g1);
+  check(work2.get(), expected2, expected_g2);
+  check(work3.get(), expected3, expected_g3);
+  const auto warm = family.numericStorage();
+  CHECK(warm.shared_cpu_bytes == 3 * (warm.shared_cpu_full_bytes + warm.shared_cpu_active_bytes));
+  CHECK_THROWS(family.releaseResource(resource0, team0)); // Caller must rewind the loan cursor.
+  resource0.rewind(cursor0);
+  resource1.rewind(cursor1);
+  RefVectorWithLeader<WaveFunctionComponent> wrong_order(family, {same_crowd, family});
+  CHECK_THROWS(family.releaseResource(resource0, wrong_order));
+  CHECK_THROWS(family.releaseResource(resource1, team0));
+  family.releaseResource(resource0, team0);
+  crowd1.releaseResource(resource1, team1);
+  CHECK(resource0.getCursor() == cursor0 + 1);
+  CHECK(resource1.getCursor() == cursor1 + 1);
+  CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  CHECK(family.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+  CHECK(family.numericStorage().shared_cpu_owners == 3); // Dormant lanes remain charged.
+  resource0.rewind(cursor0);
+  family.acquireResource(resource0, team0);
+  close(evaluate(family, p0), expected0, 2e-12);
+  CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  resource0.rewind(cursor0);
+  family.releaseResource(resource0, team0);
+  // Destruction, unlike release, returns dormant numerical reservations.
+  {
+    ResourceCollection temporary(prototype);
+    RefVectorWithLeader<WaveFunctionComponent> temporary_team(fallback2, {fallback2});
+    fallback2.acquireResource(temporary, temporary_team);
+    close(evaluate(fallback2, p3), expected3, 2e-12);
+    CHECK(family.numericStorage().shared_cpu_owners == 4);
+    CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes + warm.shared_cpu_full_bytes);
+    temporary.rewind();
+    fallback2.releaseResource(temporary, temporary_team);
+  }
+  CHECK(family.numericStorage().shared_cpu_owners == 3);
+  CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  CHECK(family.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+}
+
 TEST_CASE("PsiFormer complex walker record roundtrips only matching FULL own products",
           "[wavefunction][psiformer][complex_wf]")
 {
@@ -1062,15 +1285,17 @@ TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device 
                              "max_gpu_numeric_bytes='1024'", "optimize='yes'",
                              "precision='fp32_dense_fp64_islands'"})
     CHECK_THROWS(build(complexXml(request)));
-  CHECK_THROWS_WITH(build(complexXml("gpu='hip' max_gpu_numeric_bytes='67108864' "
-                                    "optimize='no' optimize_scope='indices'")),
-                    "Paired-complex HIP native profiles require separate runtime qualification");
   CHECK_THROWS(build(complexXml("", "")));
   CHECK_THROWS(build(complexXml("", "0")));
   CHECK_THROWS(build(complexXml("parameter_checkpoint=''")));
   CHECK_THROWS(build("<psiformer initialization='deepqmc_psiformer_v1' parameter_checkpoint='unused.root.h5'/>"));
   CHECK_THROWS(build(complexXml("twist='0.17 -0.11 0.07'", "1")));
   CHECK(readiness.calls == 0);
+  // AE HIP is an admitted profile, but this explicit rejecting readiness seam remains closed.
+  CHECK_THROWS_WITH(build(complexXml("gpu='hip' max_gpu_numeric_bytes='67108864' "
+                                    "optimize='no' optimize_scope='indices'")),
+                    Catch::Matchers::ContainsSubstring("PsiFormer accelerator backend 'hip' is not production-ready"));
+  CHECK(readiness.calls == 1);
   for (int d = 0; d < 3; ++d)
     CHECK(p.getTwist()[d] == 0);
   auto& source = *pool.at("ion0");
