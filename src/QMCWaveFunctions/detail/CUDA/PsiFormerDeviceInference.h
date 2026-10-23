@@ -349,6 +349,27 @@ inline bool configuredCooperativeValueLu()
   throw std::invalid_argument("PSIFORMER_GPU_VALUE_COOPERATIVE_LU must be 0 or 1");
 }
 
+/// Preserve OPEN eligibility; admit only the fixed legacy real-Gamma family additionally.
+inline bool supportsCooperativeRealValueLuEnvironment(const ExecutionEnvironment& environment) noexcept
+{
+  if (environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL)
+    return false;
+  if (environment.boundary == BoundaryCondition::OPEN)
+    return true;
+#ifndef QMC_COMPLEX
+  // Noncomplex PsiFormerWF rejects every outer twist. The image metadata alone
+  // cannot prove this for complex-build real heads, which retain scalar LU.
+  return environment.boundary == BoundaryCondition::PERIODIC && environment.fixed_nuclei &&
+      environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      !environment.periodic_profile && environment.head_representation == HeadRepresentation::REAL &&
+      environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+#else
+  return false;
+#endif
+}
+
 /// Freeze the opt-in OPEN VALUE orbital execution map before graph allocation.
 inline bool configuredTiledValueOrbitals()
 {
@@ -1684,10 +1705,7 @@ public:
     const auto& environment = plan_.environment();
     return cooperative_value_lu_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
         value_tape_.empty() && !mixed_value_lu_excluded_ && !mixed_dense_ && !kinetic_trunk_only_ &&
-        environment.boundary == BoundaryCondition::OPEN &&
-        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
-        environment.parameter_scalar_domain == ScalarDomain::REAL &&
-        environment.compute_scalar_domain == ScalarDomain::REAL;
+        supportsCooperativeRealValueLuEnvironment(environment);
   }
 
   /// Permanently preserve scalar VALUE LU for both sides of a mixed request/replay.

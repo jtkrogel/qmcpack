@@ -22,7 +22,10 @@
 #include "Message/Communicate.h"
 #include "OhmmsData/Libxml2Doc.h"
 #ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceInference.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
+#include "Particle/ParticleIO/XMLParticleIO.h"
+#include "QMCHamiltonians/ECPComponentBuilder.h"
 #endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -39,10 +42,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1941,7 +1946,212 @@ TEST_CASE("PsiFormer all-to-one and ragged virtual batches are state isolated",
   }
 }
 
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer real cooperative VALUE LU admits only its fixed metadata family",
+          "[wavefunction][psiformer][real_gamma_value_lu]")
+{
+  using namespace psiformer;
+  ExecutionEnvironment environment;
+  CHECK(device::supportsCooperativeRealValueLuEnvironment(environment));
+  environment.boundary = BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.periodic_axes = {true, true, true};
+#ifndef QMC_COMPLEX
+  CHECK(device::supportsCooperativeRealValueLuEnvironment(environment));
+#else
+  CHECK_FALSE(device::supportsCooperativeRealValueLuEnvironment(environment));
+#endif
+  for (int fault = 0; fault < 8; ++fault)
+  {
+    auto invalid = environment;
+    if (fault == 0) invalid.fixed_nuclei = false;
+    if (fault == 1) invalid.periodic_axes[1] = false;
+    if (fault == 2) invalid.periodic_profile = std::make_shared<PeriodicProfileMetadata>();
+    if (fault == 3) invalid.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TWO_CELL_V1;
+    if (fault == 4) invalid.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+    if (fault == 5) invalid.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+    if (fault == 6) invalid.parameter_scalar_domain = ScalarDomain::COMPLEX;
+    if (fault == 7) invalid.compute_scalar_domain = ScalarDomain::COMPLEX;
+    CHECK_FALSE(device::supportsCooperativeRealValueLuEnvironment(invalid));
+  }
+}
+#endif
+
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer Ne100 real Gamma cooperative VALUE LU captures one native ECP job",
+          "[wavefunction][psiformer][real_gamma_value_lu][gpu]")
+{
+  using Real = QMCTraits::RealType;
+  const char* input = std::getenv("PSIFORMER_TEST_REAL_GAMMA_LU_INPUT");
+  if (!input) { WARN("NOT_RUN: frozen N100 Gamma input required for native ECP capture"); return; }
+  ScopedEnvironmentVariable lazy("PSIFORMER_GPU_LAZY_VGL_PREPARATION", "1");
+  ScopedEnvironmentVariable tile("PSIFORMER_GPU_ECP_VALUE_TILE16", "1");
+  Libxml2Document document;
+  REQUIRE(document.parse(input));
+  const auto node = [&](const char* expression) -> xmlNodePtr {
+    auto* result = xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(expression), document.getXPathContext());
+    REQUIRE(result != nullptr);
+    REQUIRE(result->nodesetval != nullptr);
+    REQUIRE(result->nodesetval->nodeNr == 1);
+    auto* selected = result->nodesetval->nodeTab[0];
+    xmlXPathFreeObject(result);
+    return selected;
+  };
+  const auto content = [](xmlNodePtr selected) {
+    auto* text = xmlNodeGetContent(selected);
+    const std::string value(reinterpret_cast<const char*>(text));
+    xmlFree(text);
+    return value;
+  };
+  Lattice lattice;
+  std::istringstream cell(content(node("//simulationcell/parameter[@name='lattice']")));
+  for (int row = 0; row < 3; ++row)
+    for (int column = 0; column < 3; ++column)
+      REQUIRE(static_cast<bool>(cell >> lattice.R(row, column)));
+  REQUIRE(content(node("//simulationcell/parameter[@name='bconds']")).find("p p p") != std::string::npos);
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  auto ions = std::make_unique<ParticleSet>(simulation_cell);
+  XMLParticleParser source_parser(*ions);
+  REQUIRE(source_parser.readXML(node("//particleset[@name='ion0']")));
+  REQUIRE(ions->getTotalNum() == 100);
+  ions->update();
+  auto* physical_source = ions.get();
+  ParticleSet particles(simulation_cell);
+  particles.setName("e");
+  particles.create({50, 50});
+  for (int electron = 0; electron < 100; ++electron)
+    particles.R[electron] = ions->R[electron] + ParticleSet::PosType{
+        .17 + .03 * (electron / 50), .21 + .002 * electron, -.13 + .001 * electron};
+  particles.update();
+  particles.G = Value(0);
+  particles.L = Value(0);
+  const auto positions_before = particles.R;
+  const auto gradients_before = particles.G;
+  const auto laplacians_before = particles.L;
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::move(ions));
+  auto* head = node("//psiformer");
+  const auto make_component = [&](const char* backend, const char* selector) {
+    ScopedEnvironmentVariable selection("PSIFORMER_GPU_VALUE_COOPERATIVE_LU", selector);
+    xmlSetProp(head, reinterpret_cast<const xmlChar*>("gpu"), reinterpret_cast<const xmlChar*>(backend));
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+    return builder.buildComponent(head);
+  };
+#ifdef QMC_CUDA2HIP
+  const char* backend = "hip";
+#else
+  const char* backend = "cuda";
+#endif
+  auto cpu_storage = make_component("cpu", "0");
+  auto scalar_storage = make_component(backend, "0");
+  auto cooperative_storage = make_component(backend, "1");
+  auto& cpu = dynamic_cast<PsiFormerWF&>(*cpu_storage);
+  auto& scalar = dynamic_cast<PsiFormerWF&>(*scalar_storage);
+  auto& cooperative = dynamic_cast<PsiFormerWF&>(*cooperative_storage);
+  auto* href = xmlGetProp(node("//pairpot/pseudo[@elementType='Li']"), reinterpret_cast<const xmlChar*>("href"));
+  REQUIRE(href != nullptr);
+  const auto pp_path = std::filesystem::path(input).parent_path() / reinterpret_cast<const char*>(href);
+  xmlFree(href);
+  auto* nrule_text = xmlGetProp(node("//pairpot/pseudo[@elementType='Li']"),
+                               reinterpret_cast<const xmlChar*>("nrule"));
+  REQUIRE(nrule_text != nullptr);
+  const int nrule = std::stoi(reinterpret_cast<const char*>(nrule_text));
+  xmlFree(nrule_text);
+  ECPComponentBuilder ecp_builder("real_gamma_value_lu_capture", OHMMS::Controller, nrule, -1);
+  REQUIRE(ecp_builder.read_pp_file(pp_path.string()));
+  REQUIRE(ecp_builder.pp_nonloc != nullptr);
+  auto& pp = *ecp_builder.pp_nonloc;
+  ParticleSet::TensorType identity;
+  identity = 0;
+  for (int dimension = 0; dimension < 3; ++dimension) identity(dimension, dimension) = 1;
+  pp.rotateQuadratureGrid(identity);
+  const auto grid_before = pp.rotatedGrid();
+  const auto dr = particles.R[0] - physical_source->R[0];
+  const auto radius = std::sqrt(dot(dr, dr));
+  const auto knots = static_cast<std::size_t>(pp.getNknot());
+  REQUIRE(knots > 0);
+  std::vector<ParticleSet::PosType> deltas(knots), virtual_positions(knots);
+  std::vector<Real> weights(knots), radial(pp.getNchannel()), legendre(pp.getLmax() + 1);
+  pp.buildQuadraturePointRange(radius, dr, particles.R[0], 0, knots, 0, deltas,
+                              virtual_positions, weights, radial, legendre);
+  const std::vector<std::size_t> offsets{0, knots};
+  const std::vector<VirtualParticleBatch::Segment> segments{{0, 0, true, 0}};
+  const VirtualParticleBatch batch(1, offsets, segments, virtual_positions);
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  auto& metrics = psiformer::device::deviceMemoryMetrics(ordinal);
+  const auto evaluate = [&](PsiFormerWF& component, const char* selector) {
+    ScopedEnvironmentVariable selection("PSIFORMER_GPU_VALUE_COOPERATIVE_LU", selector);
+    ScopedEnvironmentVariable value_tile("PSIFORMER_GPU_ECP_VALUE_TILE16", &component == &cpu ? "0" : "1");
+    RefVectorWithLeader<WaveFunctionComponent> components(component, {component});
+    RefVectorWithLeader<ParticleSet> references(particles, {particles});
+    VirtualParticleSet scratch(particles);
+    RefVectorWithLeader<VirtualParticleSet> scratches(scratch, {scratch});
+    ResourceCollection resources("real Gamma Ne100 native ECP VALUE");
+    component.createResource(resources);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    std::vector<Value> ratios(knots, Value(-23));
+    const auto stamp = component.mw_evaluateVirtualRatios(components, references, scratches, batch, ratios);
+    const auto state = testing::TestPsiFormerVirtualBatch::cloneState(component);
+    const auto expected = ratios;
+    const auto warm = metrics.snapshot();
+    component.mw_evaluateVirtualRatios(components, references, scratches, batch, ratios);
+    CHECK(sameVectorBits(ratios, expected));
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(component, state));
+    std::vector<Value> sentinel(knots - 1, Value(-71));
+    CHECK_THROWS(component.mw_evaluateVirtualRatios(components, references, scratches, batch, sentinel));
+    CHECK(std::all_of(sentinel.begin(), sentinel.end(), [](Value value) { return value == Value(-71); }));
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(component, state));
+    return std::make_pair(ratios, stamp);
+  };
+  auto expected = evaluate(cpu, "0");
+  auto old = evaluate(scalar, "0");
+  auto actual = evaluate(cooperative, "1");
+  for (std::size_t knot = 0; knot < knots; ++knot)
+  {
+    checkValue(old.first[knot], expected.first[knot]);
+    checkValue(actual.first[knot], expected.first[knot]);
+    checkValue(actual.first[knot], old.first[knot]);
+  }
+  const auto contribution = [&](const std::vector<Value>& ratios) {
+    std::vector<Real> transformed(knots);
+    Real pair = 0;
+    NonLocalECPComponent::reduceQuadraturePointRange(0, 0, knots, deltas, weights, ratios,
+        nullptr, 0, transformed, 0, nullptr, pair);
+    return pair;
+  };
+  checkValue(contribution(actual.first), contribution(expected.first));
+  checkValue(contribution(old.first), contribution(expected.first));
+  for (auto* component : {&cpu, &scalar, &cooperative})
+  {
+    auto candidate = component->snapshotParameters();
+    candidate.values.at(127) += 1e-6;
+    CHECK(component->publishParameters(candidate, candidate.version) == candidate.version + 1);
+    CHECK_THROWS(component->publishParameters(candidate, candidate.version));
+  }
+  const auto updated_cpu = evaluate(cpu, "0");
+  const auto updated_old = evaluate(scalar, "0");
+  const auto updated = evaluate(cooperative, "1");
+  CHECK(updated.second != actual.second);
+  for (std::size_t knot = 0; knot < knots; ++knot)
+  {
+    checkValue(updated.first[knot], updated_cpu.first[knot]);
+    checkValue(updated.first[knot], updated_old.first[knot]);
+  }
+  checkValue(contribution(updated.first), contribution(updated_cpu.first));
+  CHECK(sameVectorBits(particles.R, positions_before));
+  CHECK(sameVectorBits(particles.G, gradients_before));
+  CHECK(sameVectorBits(particles.L, laplacians_before));
+  CHECK(sameVectorBits(pp.rotatedGrid(), grid_before));
+}
+
 TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
           "[wavefunction][psiformer][multiwalker][ecp][gpu]")
 {
