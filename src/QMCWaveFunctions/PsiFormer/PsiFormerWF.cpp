@@ -6383,16 +6383,21 @@ template<class Sink>
 pf::DirectValueResult streamCpuTargetVGL(const pf::DirectSpatialExecutor& executor,
     pf::DirectSpatialWorkspace& workspace, std::size_t max_targets, std::size_t version,
     const ParticleSet& particles, int replaced_particle, const ParticleSet::PosType* replacement,
-    Sink&& sink)
+    Sink&& sink, const MCMultiParticleMoves<CoordsType::POS>::Slice* moves = nullptr)
 {
   const std::size_t n = executor.layout()->electronCount();
   if (static_cast<std::size_t>(particles.getTotalNum()) != n || replaced_particle < -1 ||
       (replaced_particle >= 0 && static_cast<std::size_t>(replaced_particle) >= n))
     throw std::invalid_argument("PsiFormer CPU target VGL received incompatible physical positions");
+  std::size_t selected = 0;
   for (std::size_t e = 0; e < n; ++e)
   {
-    const auto& position = static_cast<int>(e) == replaced_particle
-        ? (replacement ? *replacement : particles.activeR(e)) : particles.R[e];
+    const bool selected_move = moves && selected < moves->size() &&
+        static_cast<std::size_t>(moves->particleIndex(selected)) == e;
+    const auto& position = selected_move ? moves->proposedPosition(selected) :
+        (static_cast<int>(e) == replaced_particle
+         ? (replacement ? *replacement : particles.activeR(e)) : particles.R[e]);
+    selected += selected_move;
     for (std::size_t d = 0; d < 3; ++d)
       workspace.setPosition(e, d, position[d]);
   }
@@ -12864,7 +12869,8 @@ void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transact
 
 // Reuse a leased numerical tape without moving per-clone accepted/staged products.
 void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles,
-                                      pf::DirectSpatialWorkspace& workspace)
+                                      pf::DirectSpatialWorkspace& workspace,
+                                      const MCMultiParticleMoves<CoordsType::POS>::Slice* moves)
 {
   NativeTimerScope timer(phase_timers_.vgl);
   NativeTimerScope numerical_timer(phase_timers_.cpu_spatial);
@@ -12881,11 +12887,11 @@ void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transact
                 makePhysicalGradient(transaction.state(), tile.gradient[3 * t + d], d);
           proposed_laplacian_[tile.target_begin + t] = static_cast<ValueType>(tile.lap_log[t]);
         }
-      });
+      }, moves);
   proposed_sign_ = value.sign;
   proposed_log_value_ = makePhysicalLogValue(transaction.state(), value.sign, value.logabs,
-                                           twistPhaseAngle(transaction.state(), particles));
-  proposed_configuration_identity_ = configurationIdentity(particles);
+      moves ? twistPhaseAngle(transaction.state(), particles, *moves) : twistPhaseAngle(transaction.state(), particles));
+  proposed_configuration_identity_ = moves ? configurationIdentity(particles, *moves) : configurationIdentity(particles);
   proposed_parameter_version_ = transaction.parameterVersion();
 }
 
@@ -14943,9 +14949,9 @@ void PsiFormerWF::mw_evaluateGL(
     bool) const
 { mw_evaluateLog(wfc_list, p_list, gradient_list, laplacian_list); }
 
-// Advertise PBYP-only CPU target inference before the driver draws selected moves.
+// Shared CPU target tapes retain complete selected products without a dense spatial tape.
 bool PsiFormerWF::supportsMultiParticleMoves() const noexcept
-{ return model_state_->cpu_target_vgl.targets == 0; }
+{ return !model_state_->cpu_target_vgl.targets || supportsSharedCpuTargetGeometry(*model_state_); }
 
 // Evaluate complete selected-electron proposals without modifying accepted ParticleSets.
 void PsiFormerWF::mw_evaluateMultiParticleMove(
@@ -14957,9 +14963,116 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
 {
   NativeTimerScope timer(phase_timers_.batch_vgl);
-  if (model_state_->cpu_target_vgl.targets)
-    throw std::logic_error("PsiFormer CPU target VGL supports PBYP inference, not selected-electron proposals");
   const std::size_t walker_count = wfc_list.size();
+  if (model_state_->cpu_target_vgl.targets)
+  {
+    if (!supportsMultiParticleMoves() || p_list.size() != walker_count || moves.walkerCount() != walker_count ||
+        log_ratios.size() != walker_count || proposed_gradient_list.size() != walker_count ||
+        proposed_laplacian_list.size() != walker_count)
+      throw std::invalid_argument("PsiFormer CPU target selected proposal has incompatible geometry or output shapes");
+    moves.validateFor(p_list);
+    if (!walker_count)
+      return;
+    auto& resource = requireMultiWalkerResource(wfc_list);
+    PsiFormerReadTransaction transaction(*model_state_);
+    const auto version = transaction.parameterVersion();
+    const auto electrons = transaction.state().execution_plan.modelShape().electrons();
+    const auto descriptor = moves.fingerprint();
+    std::vector<LogValue> staged_ratios(walker_count);
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      if (component.model_state_.get() != model_state_.get() || component.has_proposal_ ||
+          !component.acceptedStateMatches(p_list[walker], version, AcceptedStateRequirement::FULL_SPATIAL) ||
+          proposed_gradient_list[walker].get().size() != electrons ||
+          proposed_laplacian_list[walker].get().size() != electrons)
+        throw std::logic_error("PsiFormer CPU target selected proposal requires current complete accepted products");
+      component.resizeProposedSpatialStorage(electrons);
+      const auto g = checkedMemoryRange(proposed_gradient_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target gradient range overflow");
+      const auto l = checkedMemoryRange(proposed_laplacian_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target Laplacian range overflow");
+      for (std::size_t accepted = 0; accepted < walker_count; ++accepted)
+      {
+        const auto ag = checkedMemoryRange(p_list[accepted].G.data(), electrons,
+                                           "PsiFormer accepted gradient range overflow");
+        const auto al = checkedMemoryRange(p_list[accepted].L.data(), electrons,
+                                           "PsiFormer accepted Laplacian range overflow");
+        if (memoryRangesOverlap(g, ag) || memoryRangesOverlap(g, al) ||
+            memoryRangesOverlap(l, ag) || memoryRangesOverlap(l, al))
+          throw std::invalid_argument("PsiFormer selected target outputs alias accepted particle products");
+      }
+    }
+    // Reject aliases to any clone's retained or staging arrays before the first numerical write.
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      const auto g = checkedMemoryRange(proposed_gradient_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target gradient range overflow");
+      const auto l = checkedMemoryRange(proposed_laplacian_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target Laplacian range overflow");
+      for (std::size_t owned = 0; owned < walker_count; ++owned)
+      {
+        const auto& component = wfc_list.getCastedElement<PsiFormerWF>(owned);
+        for (const auto range : {
+             checkedMemoryRange(component.accepted_gradient_.data(), electrons, "PsiFormer selected accepted range overflow"),
+             checkedMemoryRange(component.accepted_laplacian_.data(), electrons, "PsiFormer selected accepted range overflow"),
+             checkedMemoryRange(component.proposed_gradient_.data(), electrons, "PsiFormer selected staged range overflow"),
+             checkedMemoryRange(component.proposed_laplacian_.data(), electrons, "PsiFormer selected staged range overflow")})
+          if (memoryRangesOverlap(g, range) || memoryRangesOverlap(l, range))
+            throw std::invalid_argument("PsiFormer selected target outputs alias clone-owned products");
+      }
+    }
+    if (!resource.target_spatial_workspace)
+    {
+      auto candidate = transaction.state().direct_spatial_executor.makeTargetWorkspace(
+          transaction.state().cpu_target_vgl.targets, transaction.state().cpu_target_vgl.owner_budget);
+      if (candidate->vectorStorageBytes() != transaction.state().cpu_target_vgl.owner_bytes)
+        throw std::logic_error("PsiFormer selected target owner differs from admitted numeric bytes");
+      resource.target_spatial_workspace = std::move(candidate);
+    }
+    // Stage every lane before validating or publishing any pending transaction or caller output.
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      const auto selected_moves = moves.slice(walker);
+      component.stageCpuTargetFullVGL(transaction, p_list[walker], *resource.target_spatial_workspace, &selected_moves);
+      component.validateCpuTargetFullVGLPublication(proposed_gradient_list[walker].get(),
+                                                  proposed_laplacian_list[walker].get());
+      staged_ratios[walker] = component.proposed_log_value_ - component.log_value_;
+      if (!isFiniteWavefunctionValue(staged_ratios[walker]))
+        throw std::runtime_error("PsiFormer CPU target selected proposal has a nonfinite log ratio");
+      const auto g = checkedMemoryRange(proposed_gradient_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target gradient range overflow");
+      const auto l = checkedMemoryRange(proposed_laplacian_list[walker].get().data(), electrons,
+                                        "PsiFormer selected target Laplacian range overflow");
+      for (std::size_t prior = 0; prior < walker; ++prior)
+      {
+        const auto pg = checkedMemoryRange(proposed_gradient_list[prior].get().data(), electrons,
+                                           "PsiFormer selected target gradient range overflow");
+        const auto pl = checkedMemoryRange(proposed_laplacian_list[prior].get().data(), electrons,
+                                           "PsiFormer selected target Laplacian range overflow");
+        if (memoryRangesOverlap(g, pg) || memoryRangesOverlap(g, pl) ||
+            memoryRangesOverlap(l, pg) || memoryRangesOverlap(l, pl))
+          throw std::invalid_argument("PsiFormer CPU target selected outputs overlap between walkers");
+      }
+    }
+    // All remaining writes are nonallocating and cannot expose a partially staged crowd.
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      component.proposed_descriptor_fingerprint_ = descriptor;
+      component.proposed_particle_ = -1;
+      component.proposal_origin_ = ProposalOrigin::MW_SELECTED_FULL_VGL;
+      component.has_proposal_ = true;
+      log_ratios[walker] = staged_ratios[walker];
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        proposed_gradient_list[walker].get()[electron] += component.proposed_gradient_[electron];
+        proposed_laplacian_list[walker].get()[electron] += component.proposed_laplacian_[electron];
+      }
+    }
+    return;
+  }
   if (!batch_execution_plan_)
   {
     if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
@@ -15777,8 +15890,8 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves,
     const std::vector<bool>& accepted) const
 {
-  if (model_state_->cpu_target_vgl.targets)
-    throw std::logic_error("PsiFormer CPU target VGL does not support selected-electron resolution");
+  if (model_state_->cpu_target_vgl.targets && !supportsMultiParticleMoves())
+    throw std::logic_error("PsiFormer CPU target selected resolution has unsupported geometry");
   const std::size_t walker_count = wfc_list.size();
   if (!batch_execution_plan_)
   {

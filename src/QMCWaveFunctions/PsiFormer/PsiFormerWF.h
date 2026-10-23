@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMERWF_H
 
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
@@ -1328,7 +1329,8 @@ private:
 
   /// Stage into clone-owned outputs using an already leased numerical tape.
   void stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles,
-                             pf::DirectSpatialWorkspace& workspace);
+                             pf::DirectSpatialWorkspace& workspace,
+                             const MCMultiParticleMoves<CoordsType::POS>::Slice* moves = nullptr);
 
   /// Prove all additive outputs are finite before a scalar or crowd publication.
   void validateCpuTargetFullVGLPublication(const ParticleSet::ParticleGradient& gradients,

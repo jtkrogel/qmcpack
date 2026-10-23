@@ -15,6 +15,7 @@
 #include "Message/Communicate.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
@@ -3342,7 +3343,11 @@ TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycl
 #endif
   PsiFormerWF target("pf_cpu_target", files.parameters.string(), files.configuration.string(),
       electrons, *ions, false, {}, false, {}, twist);
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
   CHECK_FALSE(target.supportsMultiParticleMoves());
+#else
+  CHECK(target.supportsMultiParticleMoves());
+#endif
   CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(target).ownedWorkspaceCount() == 0);
   electrons.G = ValueType(0);
   electrons.L = ValueType(0);
@@ -3363,7 +3368,11 @@ TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycl
   auto clone = target.makeClone(clone_electrons);
   auto& typed_clone = dynamic_cast<PsiFormerWF&>(*clone);
   CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(typed_clone).ownedWorkspaceCount() == 0);
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
   CHECK_FALSE(typed_clone.supportsMultiParticleMoves());
+#else
+  CHECK(typed_clone.supportsMultiParticleMoves());
+#endif
   clone_electrons.G = ValueType(0);
   clone_electrons.L = ValueType(0);
   CHECK(std::abs(clone->evaluateLog(clone_electrons, clone_electrons.G, clone_electrons.L) - expected_log) < 2e-11);
@@ -3635,6 +3644,117 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   CHECK(repeated.target_spatial_workspace_identity == first.target_spatial_workspace_identity);
   CHECK(repeated.target_spatial_bytes == first.target_spatial_bytes);
   compare_full();
+
+  // All-electron proposals retain complete private products on one shared target tape.
+  REQUIRE(leader.supportsMultiParticleMoves());
+  const auto original_positions = p0.R;
+  std::vector<ParticleSet::IndexType> selected;
+  std::vector<ParticleSet::PosType> proposed_positions;
+  std::vector<std::size_t> offsets{0};
+  for (auto* p : {&p0, &p1})
+  {
+    for (int electron = 0; electron < n; ++electron)
+    {
+      selected.push_back(electron);
+      proposed_positions.push_back(p->R[electron] + ParticleSet::PosType{.006, -.004, .003});
+    }
+    offsets.push_back(selected.size());
+  }
+  const MCMultiParticleMoves<CoordsType::POS> collective(offsets, selected, proposed_positions);
+  std::vector<PsiFormerWF::LogValue> ratios(2, PsiFormerWF::LogValue(91));
+  ParticleSet::ParticleGradient proposed_g0(n);
+  ParticleSet::ParticleGradient proposed_g1(n);
+  ParticleSet::ParticleLaplacian proposed_l0(n);
+  ParticleSet::ParticleLaplacian proposed_l1(n);
+  proposed_g0 = ValueType(0);
+  proposed_g1 = ValueType(0);
+  proposed_l0 = ValueType(0);
+  proposed_l1 = ValueType(0);
+  RefVector<ParticleSet::ParticleGradient> proposed_g{proposed_g0, proposed_g1};
+  RefVector<ParticleSet::ParticleLaplacian> proposed_l{proposed_l0, proposed_l1};
+  const auto accepted_before0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+  const auto accepted_before1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    RefVector<ParticleSet::ParticleGradient> alias{p0.G, proposed_g1};
+    CHECK_THROWS(leader.mw_evaluateMultiParticleMove(components, particles, collective, ratios, alias, proposed_l));
+    CHECK(ratios[0] == PsiFormerWF::LogValue(91));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted_before0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
+    leader.mw_evaluateMultiParticleMove(components, particles, collective, ratios, proposed_g, proposed_l);
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted_before0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
+    for (std::size_t walker = 0; walker < 2; ++walker)
+    {
+      auto expected = ParticleSet(walker ? p1 : p0);
+      for (int electron = 0; electron < n; ++electron)
+        expected.R[electron] = proposed_positions[walker * n + electron];
+      expected.G = ValueType(0);
+      expected.L = ValueType(0);
+      const auto expected_log = reference.evaluateLog(expected, expected.G, expected.L);
+      const auto previous = walker ? accepted_before1.log_value : accepted_before0.log_value;
+      CHECK(std::abs(ratios[walker] - (expected_log - previous)) < 2e-11);
+      for (int electron = 0; electron < n; ++electron)
+      {
+        for (int dimension = 0; dimension < 3; ++dimension)
+          CHECK(std::abs(proposed_g[walker].get()[electron][dimension] - expected.G[electron][dimension]) < 2e-10);
+        CHECK(std::abs(proposed_l[walker].get()[electron] - expected.L[electron]) < 2e-10);
+      }
+    }
+    auto altered_positions = proposed_positions;
+    altered_positions.back()[0] += .001;
+    const MCMultiParticleMoves<CoordsType::POS> changed(offsets, selected, altered_positions);
+    CHECK_THROWS(leader.mw_accept_rejectMultiParticleMove(components, particles, changed, {false, false}));
+    for (int electron = 0; electron < n; ++electron)
+      p0.R[electron] = proposed_positions[electron];
+    leader.mw_accept_rejectMultiParticleMove(components, particles, collective, {true, false});
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
+    CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).target_spatial_workspace_identity ==
+          first.target_spatial_workspace_identity);
+    CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).batch_bytes == 0);
+  }
+  p0.R = original_positions;
+  evaluate_crowd(resource);
+  compare_full();
+
+  // A late invalid destination cannot publish the already completed first lane.
+  proposed_g0 = ValueType(7);
+  proposed_g1 = ValueType(7);
+  proposed_l0 = ValueType(9);
+  proposed_l1 = ValueType(9);
+  proposed_l1[n - 1] = std::numeric_limits<double>::quiet_NaN();
+  ratios.assign(2, PsiFormerWF::LogValue(91));
+  const auto late_before0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+  const auto late_before1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    CHECK_THROWS(leader.mw_evaluateMultiParticleMove(components, particles, collective, ratios, proposed_g, proposed_l));
+    CHECK(ratios[0] == PsiFormerWF::LogValue(91));
+    CHECK(ratios[1] == PsiFormerWF::LogValue(91));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, late_before0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, late_before1));
+    for (int electron = 0; electron < n; ++electron)
+    {
+      for (int dimension = 0; dimension < 3; ++dimension)
+        CHECK(proposed_g0[electron][dimension] == ValueType(7));
+      CHECK(proposed_l0[electron] == ValueType(9));
+    }
+    proposed_g0 = ValueType(0);
+    proposed_g1 = ValueType(0);
+    proposed_l0 = ValueType(0);
+    proposed_l1 = ValueType(0);
+    auto unchanged_positions = proposed_positions;
+    for (std::size_t walker = 0; walker < 2; ++walker)
+      for (int electron = 0; electron < n; ++electron)
+        unchanged_positions[walker * n + electron] = particles[walker].R[electron];
+    const MCMultiParticleMoves<CoordsType::POS> unchanged(offsets, selected, unchanged_positions);
+    leader.mw_evaluateMultiParticleMove(components, particles, unchanged, ratios, proposed_g, proposed_l);
+    CHECK(std::abs(ratios[0]) < 2e-12);
+    CHECK(std::abs(ratios[1]) < 2e-12);
+    leader.mw_accept_rejectMultiParticleMove(components, particles, unchanged, {false, false});
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, late_before0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, late_before1));
+  }
 
   // Resource copies retain model provenance, never mutable numerical ownership.
   ResourceCollection independent(resource);

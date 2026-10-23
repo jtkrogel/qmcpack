@@ -460,6 +460,13 @@ bool isFirstOrder(WFTrainDriverInput::Optimizer optimizer)
       optimizer == O::MOMENTUM_SGD || optimizer == O::RMSPROP;
 }
 
+/// Preserve PBYP admission and require an actual component contract for all-electron sampling.
+bool supportsNativeEnergyMove(const VMCDriverInput& input, const WaveFunctionComponent& component)
+{
+  return input.get_move_kind() == VMCDriverInput::MoveKind::PBYP ||
+      (input.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON && component.supportsMultiParticleMoves());
+}
+
 /// Fixed first-order sample weights permit an inline ECP response without future replay.
 bool usesInlinePairedECPResponse(const WFTrainDriverInput& input)
 {
@@ -2428,6 +2435,15 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     VMCBatchedSampling::validateMoveConfiguration(vmcdriver_input_, population_.get_golden_electrons(),
                                                   population_.get_golden_twf(), serializing_crowd_walkers_);
+    const auto parsed_move = vmcdriver_input_.get_move_kind();
+    app_log() << "  WFTrain parsed electron move="
+              << (parsed_move == VMCDriverInput::MoveKind::ALL_ELECTRON ? "alle" :
+                  parsed_move == VMCDriverInput::MoveKind::PBYP ? "pbyp" : "n_electron")
+              << ", particles_per_joint_proposal="
+              << (parsed_move == VMCDriverInput::MoveKind::ALL_ELECTRON
+                  ? population_.get_golden_electrons().getTotalNum()
+                  : parsed_move == VMCDriverInput::MoveKind::PBYP ? 1 : vmcdriver_input_.get_electrons_per_move())
+              << "; parsed move kind is included in checkpoint stage identity" << std::endl;
 
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
@@ -2443,13 +2459,15 @@ void WFTrainBatched::process(xmlNodePtr node)
         const auto cap = training_input_.getMaximumRetainedBytes();
         const auto optimizer = training_input_.getOptimizer();
         const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance();
+        const bool supported_paired_move = supportsNativeEnergyMove(vmcdriver_input_, *complex) &&
+            (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP || !vmcdriver_input_.get_use_drift());
         legacy_paired_inline_ecp = optimizer == O::ADAM && usesInlinePairedECPResponse(training_input_) &&
             !inference_input_.enabled && training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
             training_input_.getMaximumUpdateNorm() == 0 &&
             complex->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
             population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
             !provenance->scientific_definition.empty() &&
-            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+            supported_paired_move && !vmcdriver_input_.get_use_drift();
         legacy_paired_score_ecp = complex->gpuInferenceEnabled() &&
             complex->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
             wftrain::usesEnergyScoreEstimator(training_input_, true) &&
@@ -2457,7 +2475,7 @@ void WFTrainBatched::process(xmlNodePtr node)
             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
             population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
             !provenance->scientific_definition.empty() &&
-            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+            supported_paired_move && !vmcdriver_input_.get_use_drift();
         if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
             psiformer::compiledPsiFormerAcceleratorSupport().hip && !legacy_paired_score_ecp && !legacy_paired_inline_ecp)
           throw UniformCommunicateError("WFTrainBatched: paired HIP ECP requires legacy torus score covariance or inline full-response Adam/OFF");
@@ -2468,7 +2486,7 @@ void WFTrainBatched::process(xmlNodePtr node)
             wftrain::supportsHybridKFACPolicy(training_input_) &&
             !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
             !population_.get_golden_hamiltonian().ecpModelProvenance() &&
-            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+            supported_paired_move && !vmcdriver_input_.get_use_drift();
         const bool cpu_orbital_mse = !complex->gpuInferenceEnabled() &&
             training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
             training_input_.getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE &&
@@ -2482,7 +2500,7 @@ void WFTrainBatched::process(xmlNodePtr node)
                 legacy_paired_score_ecp) && !vmcdriver_input_.get_use_drift()))) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
         const bool cpu_scalar_ecp = !complex->gpuInferenceEnabled() &&
-            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP &&
+            supported_paired_move &&
             complex->isPseudopotentialSystem() && population_.get_golden_hamiltonian().ecpModelProvenance() &&
             population_.get_golden_hamiltonian().ecpModelProvenance()->ordinary_locality_vp;
         const bool cpu_score_ecp = cpu_scalar_ecp && wftrain::usesEnergyScoreEstimator(training_input_, true) &&
@@ -2515,11 +2533,11 @@ void WFTrainBatched::process(xmlNodePtr node)
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() ||
              (myComm->size() != 1 && !legacy_paired_mpi2_kfac && !legacy_paired_score_ecp && !legacy_paired_inline_ecp) ||
-             vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
+             !supported_paired_move ||
              !supported_optimizer))
           throw UniformCommunicateError(
               "WFTrainBatched: paired GPU requires explicit caps, MPI1 (or legacy AE score KFAC MPI2 or legacy PP score/inline Adam), "
-              "PBYP ENERGY host first-order, "
+              "PBYP or supported all-electron/no-drift ENERGY host first-order, "
               "AE covariance KFAC/OFF without drift, or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
             (!cpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
@@ -2719,9 +2737,10 @@ void WFTrainBatched::process(xmlNodePtr node)
         real_provider && student_prototype_.getOrbitals().size() == 1 &&
         (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN ||
          (scalar_pp && real_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())) ||
-         (ae && myComm->size() == 1 && selected_pair_accelerator)) &&
+         (ae && myComm->size() == 1 && selected_pair_accelerator &&
+          vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP)) &&
         (ae || scalar_pp) &&
-        vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+        supportsNativeEnergyMove(vmcdriver_input_, *real_provider) && !vmcdriver_input_.get_use_drift();
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
     selected_pair_accelerator = complex_gpu_provider_ &&
         complex_training_component_->matchesPairedDevicePairTarget(population_.get_golden_electrons());
@@ -2730,7 +2749,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
         !population_.get_golden_hamiltonian().ecpModelProvenance())) &&
         (myComm->size() == 1 || legacy_paired_mpi2_kfac || legacy_paired_score_ecp) &&
-        vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+        supportsNativeEnergyMove(vmcdriver_input_, *complex_training_component_) && !vmcdriver_input_.get_use_drift();
 #endif
     int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
         (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
@@ -2742,7 +2761,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     myComm->allreduce(hybrid_ranks);
     if (policy_failure || (hybrid_ranks != 0 && hybrid_ranks != myComm->size()))
       throw UniformCommunicateError("Explicit KFAC score policies require a native CPU provider or a qualified sole AE/PP FP64 "
-          "GPU PBYP/no-drift covariance profile with finite retained cap on every rank; line_search=off is required");
+          "GPU PBYP or supported all-electron/no-drift covariance profile with finite retained cap on every rank; line_search=off is required");
     if (score_policy && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
         training_input_.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE &&
         (training_input_.getKFACClipMode() != WFTrainDriverInput::KFACClipMode::SOFT_MEDIAN ||
@@ -2792,11 +2811,11 @@ void WFTrainBatched::process(xmlNodePtr node)
                        [](auto count) { return count > 0; }) ||
           (extended && (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
                         !cap || cap == std::numeric_limits<std::size_t>::max())) ||
-          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift();
+          !supportsNativeEnergyMove(vmcdriver_input_, *target_provider) || vmcdriver_input_.get_use_drift();
       myComm->allreduce(invalid_target);
       if (invalid_target)
         throw UniformCommunicateError("CPU target VGL training requires sole REAL FP64 OPEN or legacy torus Gamma "
-            "AE/ordinary-VP PP energy Adam or explicit-policy KFAC, nonempty crowds/step1 and PBYP/no drift; "
+            "AE/ordinary-VP PP energy Adam or explicit-policy KFAC, nonempty crowds/step1 and PBYP or supported all-electron/no drift; "
             "extended rank/crowd/PP profiles require finite retained cap and line_search=off on every rank");
     }
     initPopulationAndCrowds(walker_counts);
@@ -2816,11 +2835,11 @@ void WFTrainBatched::process(xmlNodePtr node)
           steps_per_block_ != 1 ||
           (population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN &&
            !real->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())) ||
-          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift();
+          !supportsNativeEnergyMove(vmcdriver_input_, *real) || vmcdriver_input_.get_use_drift();
     }
     myComm->allreduce(invalid_score_ecp);
     if (invalid_score_ecp)
-      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN or legacy torus Gamma PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP/no drift on every rank");
+      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN or legacy torus Gamma PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP or supported all-electron/no drift on every rank");
     if (hybrid_score_kfac)
     {
       bool real_open_ae = false;
