@@ -2927,10 +2927,11 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     if (resident_device_authority_ &&
         ((!resident_adam_budget_ && !resident_sr_budget_.first) || !device_provider->deviceSamplingEnabled() ||
-         vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
+         (vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON &&
+          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::N_ELECTRON) ||
          vmcdriver_input_.get_use_drift() || serializing_crowd_walkers_ || inference_input_.enabled ||
          qmcdriver_input_.get_debug_checks() != DriverDebugChecks::ALL_OFF))
-      throw UniformCommunicateError("DEVICE authority requires explicit resident Adam or SR, DEVICE move=alle, no drift, batched refresh and no debug GL/inference");
+      throw UniformCommunicateError("DEVICE authority requires explicit resident Adam or SR, DEVICE joint alle/n_electron moves, no drift, batched refresh and no debug GL/inference");
     if (resident_sr_budget_.first)
     {
       if (resident_adam_budget_ || device_provider->deviceAdamBudget() ||

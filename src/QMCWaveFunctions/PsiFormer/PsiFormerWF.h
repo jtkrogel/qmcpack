@@ -706,7 +706,8 @@ public:
       const std::function<void(std::vector<double>&)>& gaussian_draw,
       const std::function<double()>& uniform_draw, bool use_drift,
       const std::function<void(double, const double*, double*)>& drift,
-      bool retain_device_coordinates = false) const;
+      bool retain_device_coordinates = false, std::size_t particles_per_move = 0,
+      const std::function<void(std::vector<std::size_t>&)>& select_indices = {}) const;
 
   /// Evaluate complete VGL data through one direct crowd batch boundary.
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

@@ -14402,7 +14402,8 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
     const std::function<void(std::vector<double>&)>& gaussian_draw,
     const std::function<double()>& uniform_draw, bool use_drift,
     const std::function<void(double, const double*, double*)>& drift,
-    bool retain_device_coordinates) const
+    bool retain_device_coordinates, std::size_t particles_per_move,
+    const std::function<void(std::vector<std::size_t>&)>& select_indices) const
 {
 #ifdef ENABLE_CUDA
   if (!deviceSamplingEnabled() || wfc_list.size() != p_list.size() || wfc_list.empty() ||
@@ -14441,7 +14442,7 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
       *transaction.state().numerical_tile_backend);
   const auto counts = backend.advanceMetropolis(batch.numericalSamplingWorkspace(), positions, masses, tau,
       substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted, {}, use_drift, drift,
-      retain_device_coordinates);
+      retain_device_coordinates, particles_per_move, select_indices);
   if (retain_device_coordinates)
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
       // Sampler DEVICE coordinates stay authoritative; native FULL is dirty until the cold fence.

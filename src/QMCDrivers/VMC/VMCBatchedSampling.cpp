@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <optional>
 
 namespace qmcplusplus
 {
@@ -112,10 +113,11 @@ void VMCBatchedSampling::validateMoveConfiguration(const VMCDriverInput& input,
                                                    bool serializing_crowd_walkers)
 {
   if (const auto* sampler = deviceSamplingComponent(wavefunction); sampler &&
-      (input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
+      ((input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON &&
+        input.get_move_kind() != VMCDriverInput::MoveKind::N_ELECTRON) ||
        input.get_use_drift() != sampler->deviceSamplingUsesDrift() ||
        electrons.isSpinor() || serializing_crowd_walkers))
-    throw UniformCommunicateError("Explicit device sampling requires move=alle, matching usedrift profile, POS and batched crowds.");
+    throw UniformCommunicateError("Explicit device sampling requires joint alle/n_electron moves, matching usedrift profile, POS and batched crowds.");
   if (input.get_move_kind() == VMCDriverInput::MoveKind::PBYP)
     return;
   if (serializing_crowd_walkers)
@@ -190,6 +192,24 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
         components.push_back(*wavefunction.getOrbitals()[0]);
       }
       const RefVectorWithLeader<WaveFunctionComponent> component_list(components[0], components);
+      const auto particles_per_move = move_kind == VMCDriverInput::MoveKind::N_ELECTRON
+          ? sft.vmcdrv_input.get_electrons_per_move() : 0;
+      std::optional<ElectronSubsetSelector> selector;
+      std::function<void(std::vector<std::size_t>&)> select_indices;
+      if (particles_per_move)
+      {
+        if (!subset_cursor)
+          throw std::logic_error("Selected device sampling requires a crowd cursor.");
+        selector.emplace(num_particles, particles_per_move, sft.vmcdrv_input.get_electron_selection());
+        selector->restoreCyclicCursor(*subset_cursor);
+        select_indices = [&](std::vector<std::size_t>& indices) {
+          for (int walker = 0; walker < num_walkers; ++walker)
+          {
+            const auto& selected = selector->selectForWalker(random_generator, walker);
+            std::copy(selected.begin(), selected.end(), indices.begin() + walker * particles_per_move);
+          }
+        };
+      }
       const auto counts = sampler->mw_advanceDeviceSampling(component_list, walker_elecs,
           sft.qmcdrv_input.get_tau(), sft.qmcdrv_input.get_sub_steps(),
           [&](std::vector<double>& gaussian) { makeGaussRandomWithEngine(gaussian, random_generator); },
@@ -202,7 +222,9 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
             sft.drift_modifier.getDrift(variance, native_gradient, drift);
             for (std::size_t d = 0; d < 3; ++d)
               result[d] = drift[d];
-          }, sft.resident_device_observation);
+          }, sft.resident_device_observation, particles_per_move, select_indices);
+      if (selector)
+        *subset_cursor = selector->cyclicCursor();
       for (std::size_t count = 0; count < counts.first; ++count)
         crowd.incAccept();
       for (std::size_t count = 0; count < counts.second; ++count)
