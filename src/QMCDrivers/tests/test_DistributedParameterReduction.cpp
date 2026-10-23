@@ -15,6 +15,7 @@
 
 #include "Message/Communicate.h"
 #include "QMCDrivers/WFTrain/HostStagedAcceleratorReduction.h"
+#include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
@@ -313,10 +314,11 @@ std::unique_ptr<EnergyGradientAccumulator> makeContribution(
     std::size_t version,
     int rank,
     std::size_t sample_count,
-    DerivativeAdjoint adjoint = DerivativeAdjoint::TRANSPOSE)
+    DerivativeAdjoint adjoint = DerivativeAdjoint::TRANSPOSE,
+    EnergyGradientEstimator estimator = EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN)
 {
   auto accumulator = std::make_unique<EnergyGradientAccumulator>(
-      schema, version, EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN, adjoint);
+      schema, version, estimator, adjoint);
   RankStreamingOperator derivative_operator(schema, version, rank, sample_count, adjoint);
   std::vector<DerivativeReal> weights;
   std::vector<DerivativeValue> energies;
@@ -329,7 +331,8 @@ std::unique_ptr<EnergyGradientAccumulator> makeContribution(
 }
 
 /// Form the independent global objective expected from all synthetic ranks.
-EnergyGradientResult makeReferenceResult(int size, int sample_rank_offset = 0)
+EnergyGradientResult makeReferenceResult(int size, int sample_rank_offset = 0,
+    EnergyGradientEstimator estimator = EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN)
 {
   DerivativeReal weight_sum = 0.0;
   DerivativeValue energy_sum = 0.0;
@@ -368,7 +371,7 @@ EnergyGradientResult makeReferenceResult(int size, int sample_rank_offset = 0)
   result.gradient.resize(5);
   for (std::size_t parameter = 0; parameter < 5; ++parameter)
     result.gradient[parameter] =
-        2.0 * std::real(response[parameter] + energy_score[parameter] -
+        2.0 * std::real((isScoreOnlyEstimator(estimator) ? DerivativeValue{} : response[parameter]) + energy_score[parameter] -
                         result.mean_energy * score[parameter]) /
         weight_sum;
   return result;
@@ -656,6 +659,71 @@ TEST_CASE("Distributed parameter reduction matches an independent global referen
     CHECK(result.energy_variance == Catch::Approx(reference.energy_variance).margin(1e-14));
     for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
       CHECK(result.gradient[parameter] == Catch::Approx(reference.gradient[parameter]));
+  }
+}
+
+TEST_CASE("Distributed physical score covariance normalizes unequal and empty ranks globally",
+          "[drivers][training][mpi][score_covariance]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const auto schema = makeSchema();
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 0, std::vector<double>(5, 0.5)};
+  constexpr auto estimator = EnergyGradientEstimator::SCORE_COVARIANCE;
+  const auto reference = makeReferenceResult(communicator.size(), 0, estimator);
+  for (const std::size_t chunk_size : {std::size_t{1}, std::size_t{2}})
+  {
+    DistributedParameterReduction reduction(communicator, {chunk_size});
+    reduction.preflight(schema, &parameters, estimator);
+    auto accumulator = makeContribution(schema, 0, communicator.rank(),
+        localSampleCount(communicator.rank(), communicator.size()), DerivativeAdjoint::TRANSPOSE, estimator);
+    reduction.reduce(*accumulator);
+    const auto result = accumulator->finalize();
+    CHECK(result.estimator == estimator);
+    CHECK(result.local_energy_term_mask == 0);
+    CHECK(result.sample_count == reference.sample_count);
+    CHECK(result.weight_sum == Catch::Approx(reference.weight_sum).epsilon(0).margin(2e-12));
+    CHECK(result.mean_energy.real() == Catch::Approx(reference.mean_energy.real()).epsilon(0).margin(2e-12));
+    for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
+      CHECK(result.gradient[parameter] == Catch::Approx(reference.gradient[parameter]).epsilon(0).margin(2e-12));
+    if (communicator.size() > 1)
+    {
+      const auto inconsistent_estimator = communicator.rank() == communicator.size() - 1
+          ? EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN : estimator;
+      auto inconsistent = makeContribution(schema, 0, communicator.rank(),
+          localSampleCount(communicator.rank(), communicator.size()), DerivativeAdjoint::TRANSPOSE,
+          inconsistent_estimator);
+      CHECK_THROWS_WITH(reduction.reduce(*inconsistent),
+          Catch::Matchers::ContainsSubstring("contribution metadata mismatch"));
+    }
+  }
+}
+
+TEST_CASE("Distributed score Adam commits the globally normalized analytic update twice",
+          "[drivers][training][mpi][score_covariance]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  RankProvider provider;
+  RankProducer producer(provider.parameterSchema(), communicator);
+  constexpr auto estimator = EnergyGradientEstimator::SCORE_COVARIANCE;
+  const auto reference = makeReferenceResult(communicator.size(), 0, estimator);
+  FirstOrderOptimizerOptions options;
+  options.learning_rates = {{"weights", 0.03}};
+  options.epsilon = 1e-7;
+  FirstOrderOptimizer optimizer(provider.parameterSchema(), options);
+  HighParameterTraining training({}, estimator, DistributedParameterReduction{communicator, {2}});
+  TrainingIterationState state;
+  for (std::size_t iteration = 1; iteration <= 2; ++iteration)
+  {
+    const auto result = training.runIteration(provider, producer, optimizer, state);
+    CHECK(result.parameter_version == iteration);
+    CHECK(optimizer.acceptedUpdateCount() == iteration);
+    const auto parameters = provider.snapshotParameters();
+    for (std::size_t parameter = 0; parameter < parameters.values.size(); ++parameter)
+    {
+      const double gradient = reference.gradient[parameter];
+      const double expected = 0.5 - iteration * 0.03 * gradient / (std::abs(gradient) + options.epsilon);
+      CHECK(parameters.values[parameter] == Catch::Approx(expected).epsilon(0).margin(2e-12));
+    }
   }
 }
 

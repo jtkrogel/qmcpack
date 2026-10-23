@@ -39,11 +39,12 @@ HighParameterTraining::HighParameterTraining(
     DistributedParameterReduction reduction)
     : requirements_(requirements), estimator_(estimator), reduction_(std::move(reduction))
 {
-  // Every energy-gradient iteration requires both elementary products regardless
-  // of additional model- or Hamiltonian-specific requirements supplied by the caller.
+  // Score objectives require no local-energy parameter response. Additional
+  // model- or Hamiltonian-specific caller requirements remain authoritative.
   requirements_.add(TrainingCapability::REAL_PARAMETERS);
   requirements_.add(TrainingCapability::SCORE_VJP);
-  requirements_.add(TrainingCapability::LOCAL_ENERGY_VJP);
+  if (!isScoreOnlyEstimator(estimator_))
+    requirements_.add(TrainingCapability::LOCAL_ENERGY_VJP);
 }
 
 TrainingIterationResult HighParameterTraining::runIteration(

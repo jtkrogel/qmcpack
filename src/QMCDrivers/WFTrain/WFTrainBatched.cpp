@@ -2412,7 +2412,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         !hamiltonian.hasPhysicalNLPP() && !provenance;
     const bool scalar_pp = real_provider && real_provider->isPseudopotentialSystem() &&
         hamiltonian.hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
-        !provenance->scientific_definition.empty() && myComm->size() == 1;
+        !provenance->scientific_definition.empty();
     selected_pair_accelerator = real_provider && selected_provider_->usesAcceleratorParameterProducts() &&
         real_provider->matchesRealDevicePairTarget(population_.get_golden_electrons());
     hybrid_score_kfac = wftrain::supportsHybridKFACPolicy(training_input_) && selected_provider_->usesAcceleratorParameterProducts() &&
@@ -2482,15 +2482,25 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     initPopulationAndCrowds(walker_counts);
     // Independent score selection must retain the qualified scalar ECP topology.
-    if (!complex_training_component_ &&
-        training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE &&
+    int invalid_score_ecp = 0;
+    if (!complex_training_component_ && wftrain::usesEnergyScoreEstimator(training_input_, false) &&
         selected_provider_->usesAcceleratorParameterProducts() &&
-        population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        (myComm->size() != 1 || crowds_.size() != 1 || qmcdriver_input_.get_max_blocks() != 1 ||
-         steps_per_block_ != 1 ||
-         population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN ||
-         vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift()))
-      throw UniformCommunicateError("GPU score-only ECP requires OPEN MPI1/crowd1/block1/step1 and PBYP/no drift");
+        population_.get_golden_hamiltonian().hasPhysicalNLPP())
+    {
+      const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+      const auto& metadata = population_.get_golden_hamiltonian().ecpModelProvenance();
+      const auto cap = training_input_.getMaximumRetainedBytes();
+      invalid_score_ecp = !real || !real->isPseudopotentialSystem() ||
+          student_prototype_.getOrbitals().size() != 1 || !metadata || !metadata->ordinary_locality_vp ||
+          metadata->scientific_definition.empty() || !cap || cap == std::numeric_limits<std::size_t>::max() ||
+          crowds_.size() != 1 || crowds_.front()->size() == 0 || qmcdriver_input_.get_max_blocks() != 1 ||
+          steps_per_block_ != 1 ||
+          population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN ||
+          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift();
+    }
+    myComm->allreduce(invalid_score_ecp);
+    if (invalid_score_ecp)
+      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP/no drift on every rank");
     if (hybrid_score_kfac)
     {
       bool real_open_ae = false;
@@ -2522,8 +2532,8 @@ void WFTrainBatched::process(xmlNodePtr node)
         throw UniformCommunicateError("Hybrid score KFAC requires nonempty crowds; C2/C4 require "
             "REAL OPEN AE FP64 MPI1/MPI2 and one prepared GPU inference lease per rank before sampling");
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-          (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
-        throw UniformCommunicateError("GPU score-only ECP requires MPI1/block1/step1 before sampling");
+          (qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
+        throw UniformCommunicateError("GPU score-only ECP requires block1/step1 before sampling");
       if (selected_pair_accelerator &&
           (myComm->size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
         throw UniformCommunicateError("Selected pair GPU KFAC requires MPI1/block1/step1 before sampling");
@@ -2957,17 +2967,26 @@ void WFTrainBatched::run()
   // score profiles bind their actual physical operators here. Public pair GPU
   // admission remains independently gated before run().
   std::exception_ptr physical_identity_failure;
+  std::vector<std::uint64_t> physical_identity_records;
+  std::uint64_t physical_identity_hash = 0;
   try
   {
+    physical_identity_records.resize(static_cast<std::size_t>(myComm->size()));
     if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
-        wftrain::supportsHybridKFACPolicy(training_input_))
+        wftrain::usesEnergyScoreEstimator(training_input_, false))
     {
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
         complex_physical_identity = realScoreECPIdentity(*device_provider, population_.get_golden_electrons(),
             population_.get_golden_hamiltonian());
-      else if (device_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()))
+      else if (wftrain::supportsHybridKFACPolicy(training_input_) &&
+               device_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()))
         complex_physical_identity = wftrain::realPairCoulombIdentity(*device_provider, population_.get_golden_electrons(),
             population_.get_golden_hamiltonian());
+    }
+    if (!complex_physical_identity.empty())
+    {
+      physical_identity_hash = UINT64_C(14695981039346656037);
+      extendStageFingerprint(physical_identity_hash, complex_physical_identity);
     }
   }
   catch (...) { physical_identity_failure = std::current_exception(); }
@@ -2979,6 +2998,10 @@ void WFTrainBatched::run()
       std::rethrow_exception(physical_identity_failure);
     throw UniformCommunicateError("WFTrainBatched: another rank failed GPU physical identity preflight");
   }
+  myComm->allgather(&physical_identity_hash, physical_identity_records.data(), 1);
+  if (!std::all_of(physical_identity_records.begin(), physical_identity_records.end(),
+                   [&](std::uint64_t identity) { return identity == physical_identity_hash; }))
+    throw UniformCommunicateError("WFTrainBatched: GPU physical operator or ordered-ion identity differs across ranks before sampling");
 #endif
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
@@ -3914,8 +3937,9 @@ void WFTrainBatched::run()
             if (!complex_training && score_training && has_nonlocal_ecp &&
                 selected_provider_->usesAcceleratorParameterProducts())
             {
-              const auto live = checkedMemoryAdd(retained_configuration_bytes,
+              auto live = checkedMemoryAdd(retained_configuration_bytes,
                   kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0);
+              live = checkedMemoryAdd(live, first_order_optimizer ? first_order_optimizer->retainedBytes() : 0);
               if (retained_samples.size() != 1 || live >= training_input_.getMaximumRetainedBytes())
                 throw std::length_error("GPU score-only ECP requires one retained batch with remaining numeric budget");
               scalar_ecp_budget = training_input_.getMaximumRetainedBytes() - live;

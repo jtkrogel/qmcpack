@@ -1203,6 +1203,36 @@ TEST_CASE("Missing streaming capability fails before producer work",
   CHECK(producer.calls == 0);
 }
 
+TEST_CASE("Score training requires no local-energy product unless explicitly requested",
+          "[drivers][training][score_covariance]")
+{
+  ToyProvider provider;
+  ReferenceProducer producer(nullptr, false);
+  producer.bindSchema(provider.parameterSchema());
+  ScaleAndSubtract updater(0.1);
+  TrainingIterationState state;
+  CHECK_FALSE(producer.capabilities().contains(TrainingCapability::LOCAL_ENERGY_VJP));
+  for (const auto estimator : {EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+                               EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY})
+  {
+    HighParameterTraining response({}, estimator);
+    CHECK_THROWS_WITH(response.runIteration(provider, producer, updater, state),
+        Catch::Matchers::ContainsSubstring("local_energy_vjp"));
+  }
+  HighParameterTraining explicit_requirement({TrainingCapability::LOCAL_ENERGY_VJP},
+                                            EnergyGradientEstimator::SCORE_COVARIANCE);
+  CHECK_THROWS_WITH(explicit_requirement.runIteration(provider, producer, updater, state),
+      Catch::Matchers::ContainsSubstring("local_energy_vjp"));
+  CHECK(producer.calls == 0);
+  CHECK(provider.snapshotParameters().version == 0);
+  HighParameterTraining score({}, EnergyGradientEstimator::SCORE_COVARIANCE);
+  const auto result = score.runIteration(provider, producer, updater, state);
+  CHECK(result.parameter_version == 1);
+  CHECK(result.objective.estimator == EnergyGradientEstimator::SCORE_COVARIANCE);
+  CHECK(result.objective.local_energy_term_mask == 0);
+  CHECK(producer.calls == 1);
+}
+
 TEST_CASE("Accepted nonlocal tiles reduce complete complex energies without derivatives",
           "[drivers][training][nonlocal_energy]")
 {
