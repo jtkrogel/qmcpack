@@ -2462,6 +2462,21 @@ void WFTrainBatched::process(xmlNodePtr node)
         const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance();
         const bool supported_paired_move = supportsNativeEnergyMove(vmcdriver_input_, *complex) &&
             (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP || !vmcdriver_input_.get_use_drift());
+        // Supervised raw-orbital VJPs use the explicit GPU publication wrapper, not ENERGY adjoints.
+        const bool gpu_orbital_mse = complex->gpuInferenceEnabled() && myComm->size() == 1 &&
+            training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
+            training_input_.getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE &&
+            optimizer == O::ADAM && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
+            !inference_input_.enabled && qmcdriver_input_.get_max_blocks() == 1 &&
+            training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
+            training_input_.getMaximumUpdateNorm() == 0 && training_input_.getMaximumMetricNorm() == 0 &&
+            supported_paired_move && !vmcdriver_input_.get_use_drift() &&
+            ((complex->matchesLegacyTorusAllElectronTarget(population_.get_golden_electrons()) &&
+              !population_.get_golden_hamiltonian().hasPhysicalNLPP() && !provenance) ||
+             (training_input_.samplesOrbitalStudent() &&
+              complex->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+              population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
+              !provenance->scientific_definition.empty()));
         legacy_paired_inline_ecp = optimizer == O::ADAM && usesInlinePairedECPResponse(training_input_) &&
             !inference_input_.enabled && training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
             training_input_.getMaximumUpdateNorm() == 0 &&
@@ -2489,7 +2504,7 @@ void WFTrainBatched::process(xmlNodePtr node)
             !provenance->scientific_definition.empty();
         if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
             psiformer::compiledPsiFormerAcceleratorSupport().hip && !legacy_paired_score_ecp &&
-            !legacy_paired_inline_ecp && !hip_paired_reference_ecp)
+            !legacy_paired_inline_ecp && !hip_paired_reference_ecp && !gpu_orbital_mse)
           throw UniformCommunicateError("WFTrainBatched: paired HIP ECP requires legacy torus score covariance/OFF, "
               "inline full-response Adam/OFF, or MPI1 ENERGY Adam/REFERENCE with default update controls");
         // Widen only the already qualified legacy AE score-covariance lane.
@@ -2523,7 +2538,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         const bool cpu_mse_ecp = cpu_scalar_ecp && cpu_orbital_mse && optimizer == O::ADAM &&
             training_input_.samplesOrbitalStudent() &&
             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF;
-        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp && !cpu_mse_ecp &&
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp && !cpu_mse_ecp && !gpu_orbital_mse &&
             !legacy_paired_score_ecp && !legacy_paired_inline_ecp &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
              training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
@@ -2553,7 +2568,7 @@ void WFTrainBatched::process(xmlNodePtr node)
               "PBYP or supported all-electron/no-drift ENERGY host first-order, "
               "AE covariance KFAC/OFF without drift, or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
-            (!cpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
+            (!cpu_orbital_mse && !gpu_orbital_mse && training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY) ||
             !supported_optimizer ||
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
@@ -3130,7 +3145,16 @@ void WFTrainBatched::run()
           checkedMemoryMultiply(largest_batch, sizeof(wftrain::DerivativeValue))) : 0;
       // R(S) counts the weak-shared family lane ONCE and all disjoint immutable coordinates/masses.
       std::size_t derivative_bytes = 0, successor_bytes = 0;
-      if (complex_gpu_provider_)
+      if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+      {
+        derivative_bytes = complex->orbitalMSEStorage().prepared_bytes;
+        if (complex_gpu_provider_)
+        {
+          const auto q = complex->gpuParameterPublicationRequirements();
+          successor_bytes = checkedMemoryAdd(q.device_bytes, q.host_bytes);
+        }
+      }
+      else if (complex_gpu_provider_)
       {
         const auto& limits = training_input_.getComplexGpuTraining();
         const bool scalar_ecp = ecp && wftrain::usesEnergyScoreEstimator(training_input_, true);
@@ -3182,8 +3206,6 @@ void WFTrainBatched::run()
                      "OFF includes one successor/native candidate; excludes source inference generation, "
                      "native/image model HOST and vendor storage" << std::endl;
       }
-      else if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
-        derivative_bytes = complex->orbitalMSEStorage().prepared_bytes;
       else
         derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
       derivative_bytes = checkedMemoryAdd(derivative_bytes, additive_bytes);
@@ -3245,7 +3267,8 @@ void WFTrainBatched::run()
                   << " temporary_capture_bytes=" << inline_capture_bytes
                   << " virtual_capacity=0; primary response=complete kinetic; native VP order preserved" << std::endl;
       }
-      else if ((!complex_gpu_provider_ || wftrain::usesEnergyScoreEstimator(training_input_, true)) &&
+      else if ((!complex_gpu_provider_ || training_input_.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE) &&
+          (!complex_gpu_provider_ || wftrain::usesEnergyScoreEstimator(training_input_, true)) &&
           population_.get_golden_hamiltonian().hasPhysicalNLPP())
       {
         // One temporary B-energy vector and one B-coefficient vector coexist only during accepted-grid capture.
@@ -5636,7 +5659,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a distinct frozen teacher");
   bool paired = false;
 #ifdef QMC_COMPLEX
-  auto* complex = dynamic_cast<PsiFormerComplexWF*>(selected_provider_);
+  auto* complex = complex_training_component_;
   paired = complex != nullptr;
 #endif
   if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_))
@@ -5645,21 +5668,21 @@ void WFTrainBatched::initializeOrbitalPretraining()
   {
     bool supported = false;
 #ifdef QMC_COMPLEX
-    supported = complex && !complex->gpuInferenceEnabled();
+    supported = complex != nullptr;
 #endif
     if (!supported)
-      throw UniformCommunicateError("Full-matrix orbital normalization requires the CPU paired provider");
+      throw UniformCommunicateError("Full-matrix orbital normalization requires the paired provider");
     app_log() << "WFTrain orbital_mse normalization=full_matrix_mean" << std::endl;
   }
   if (training_input_.samplesOrbitalStudent())
   {
     const auto* real_student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-    bool cpu_student = real_student && !real_student->usesAcceleratorParameterProducts();
+    bool supported_student = real_student && !real_student->usesAcceleratorParameterProducts();
 #ifdef QMC_COMPLEX
-    cpu_student = cpu_student || (complex && !complex->gpuInferenceEnabled());
+    supported_student = supported_student || complex != nullptr;
 #endif
-    if (!cpu_student)
-      throw UniformCommunicateError("Student-measure orbital_mse requires a CPU provider");
+    if (!supported_student)
+      throw UniformCommunicateError("Student-measure orbital_mse requires a supported real CPU or paired provider");
     app_log() << "WFTrain orbital_mse sampling=student target=frozen energy_evaluation=off" << std::endl;
   }
 
@@ -5706,8 +5729,8 @@ void WFTrainBatched::initializeOrbitalPretraining()
 #ifdef QMC_COMPLEX
   if (complex)
   {
-    // Only the fixed-gauge single-reference CPU target is qualified, never a GPU fallback.
-    if (top || !single || complex->gpuInferenceEnabled())
+    // The fixed-gauge single-reference teacher remains CPU, independently of the student backend.
+    if (top || !single)
       throw UniformCommunicateError("Paired orbital_mse requires a CPU single-reference periodic orbital teacher");
     complex_orbital_target_ = std::make_unique<psiformer::ComplexOrbitalTargetEvaluator>(
         psiformer::ComplexOrbitalTargetEvaluator::fromSingleReference(*single, electrons, complex->reducedTwist(),
@@ -5715,13 +5738,27 @@ void WFTrainBatched::initializeOrbitalPretraining()
     orbital_target_fingerprint_ = complex_orbital_target_->descriptor().fingerprint();
     orbital_target_bytes_ = complex_orbital_target_->retainedScalarBytes();
     const auto caller_bytes = checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double));
-    const auto required = checkedMemoryAdd(complex->orbitalMSEStorage().required_bytes,
+    const auto owner_bytes = complex->orbitalMSEStorage().required_bytes;
+    auto required = checkedMemoryAdd(owner_bytes,
         checkedMemoryAdd(orbital_target_bytes_, caller_bytes));
+    if (complex->gpuInferenceEnabled())
+    {
+      const auto q = complex->gpuParameterPublicationRequirements();
+      const auto& limits = training_input_.getComplexGpuTraining();
+      if (checkedMemoryAdd(owner_bytes, q.device_bytes) > limits.device_bytes ||
+          checkedMemoryAdd(owner_bytes, q.host_bytes) > limits.host_bytes)
+        throw std::length_error("Paired GPU orbital-MSE combined owner/successor cap exceeded before preparation");
+      required = checkedMemoryAdd(required, checkedMemoryAdd(q.device_bytes, q.host_bytes));
+      app_log() << "WFTrain paired GPU orbital-MSE combined DEVICE+HOST owner bound=" << owner_bytes
+                << "; conservatively checked under each independent GPU device/HOST cap; "
+                   "successor device=" << q.device_bytes << " HOST=" << q.host_bytes << std::endl;
+    }
     if (required > training_input_.getMaximumRetainedBytes())
       throw std::length_error("Paired orbital-MSE score/target/caller-gradient cap exceeded before preparation");
     complex->prepareOrbitalMSE(training_input_.getMaximumRetainedBytes() - orbital_target_bytes_ - caller_bytes);
     complex_orbital_score_bytes_ = complex->orbitalMSEStorage().prepared_bytes;
-    app_log() << "WFTrain paired CPU orbital-MSE score owner=" << complex_orbital_score_bytes_
+    app_log() << "WFTrain paired " << (complex->gpuInferenceEnabled() ? "GPU" : "CPU")
+              << " orbital-MSE score owner=" << complex_orbital_score_bytes_
               << " target/scratch=" << orbital_target_bytes_ << " caller gradient=" << caller_bytes
               << "; excludes inference/model/SPO metadata and allocator/RSS" << std::endl;
     return;
