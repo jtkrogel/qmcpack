@@ -7,6 +7,7 @@
  * @brief Scalar component and XML/device admission regression tests.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "Particle/ParticleSet.h"
@@ -947,6 +948,274 @@ TEST_CASE("Complex CPU shared scratch is lazy, capped and independent of walker 
   close(evaluate(shared, p), reference, 2e-12);
 }
 
+TEST_CASE("Complex shared CPU collective proposals retain atomic complete products",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_collective]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+  p1.R[1][2] += .09;
+  p1.update();
+  auto source = ions(simulation_cell);
+  const auto twist = GENERATE(std::array<double, 3>{}, (std::array<double, 3>{.17, -.11, .07}));
+  PsiFormerComplexWF family("collective", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  auto other = family.makeClone(p1);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
+  PsiFormerComplexWF private_cpu("private", parameters(), p0, source, clone_cap, twist);
+  CHECK_FALSE(private_cpu.supportsMultiParticleMoves());
+  REQUIRE(family.supportsMultiParticleMoves());
+  const std::array<C, 2> old_logs{evaluate(family, p0), evaluate(clone, p1)};
+  const std::array<decltype(p0.R), 2> old_positions{p0.R, p1.R};
+  const std::array<ParticleSet::ParticleGradient, 2> old_g{p0.G, p1.G};
+  const std::array<ParticleSet::ParticleLaplacian, 2> old_l{p0.L, p1.L};
+  RefVectorWithLeader<WaveFunctionComponent> team(family, {family, clone});
+  RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+  std::vector<ParticleSet::IndexType> indices{0, 1, 2, 3, 0, 1, 2, 3};
+  std::vector<ParticleSet::PosType> positions;
+  for (std::size_t i = 0; i < indices.size(); ++i)
+    positions.push_back(old_positions[i / 4][i % 4] + ParticleSet::PosType{.003 * (i + 1), -.002, .004});
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  const Moves moves({0, 4, 8}, indices, positions);
+  std::array<ParticleSet::ParticleGradient, 2> proposed_g{ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> proposed_l{ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  RefVector<ParticleSet::ParticleGradient> gradients{proposed_g[0], proposed_g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{proposed_l[0], proposed_l[1]};
+  std::array<C, 2> oracle_logs;
+  auto oracle_g = proposed_g;
+  auto oracle_l = proposed_l;
+  for (std::size_t walker = 0; walker < 2; ++walker)
+  {
+    auto proposed = electrons(simulation_cell);
+    for (std::size_t e = 0; e < 4; ++e)
+      proposed.R[e] = positions[walker * 4 + e];
+    proposed.update();
+    auto oracle = private_cpu.makeClone(proposed);
+    oracle_logs[walker] = evaluate(*oracle, proposed);
+    oracle_g[walker] = proposed.G;
+    oracle_l[walker] = proposed.L;
+  }
+  ResourceCollection prototype("CPU collective" );
+  family.createResource(prototype);
+  const auto before = family.numericStorage();
+  {
+    ResourceCollection resource(prototype);
+    const auto cursor = resource.getCursor();
+    family.acquireResource(resource, team);
+    std::vector<C> ratios(2, C{9, 7});
+    auto reset = [&] {
+      ratios.assign(2, C{9, 7});
+      for (std::size_t i = 0; i < 2; ++i)
+      {
+        proposed_g[i] = C{};
+        proposed_l[i] = C{};
+      }
+    };
+    reset();
+    auto alias = gradients;
+    alias[1] = std::ref(p0.G);
+    CHECK_THROWS(family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, alias, laplacians));
+    family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians);
+    const auto warm = family.numericStorage();
+    CHECK(warm.shared_cpu_bytes > before.shared_cpu_bytes + before.shared_cpu_full_bytes);
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+      close(ratios[i], oracle_logs[i] - old_logs[i], 2e-12);
+      CHECK((i ? clone : family).get_log_value() == old_logs[i]);
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        close(proposed_l[i][e], oracle_l[i][e], 2e-12);
+        CHECK(targets[i].L[e] == old_l[i][e]);
+        for (int d = 0; d < 3; ++d)
+        {
+          close(proposed_g[i][e][d], oracle_g[i][e][d], 2e-12);
+          CHECK(targets[i].G[e][d] == old_g[i][e][d]);
+        }
+      }
+    }
+    CHECK_THROWS(family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false}));
+    family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false, false});
+    reset();
+    proposed_l[1][3] = C{std::numeric_limits<double>::infinity(), 0};
+    CHECK_THROWS(family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians));
+    CHECK(ratios[0] == (C{9, 7}));
+    CHECK(ratios[1] == (C{9, 7}));
+    reset();
+    family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians);
+    CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+    CHECK(family.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+    for (std::size_t e = 0; e < 4; ++e)
+      p0.R[e] = positions[e];
+    p0.update();
+    family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false});
+    close(family.get_log_value(), oracle_logs[0], 2e-12);
+    CHECK(clone.get_log_value() == old_logs[1]);
+    CHECK_NOTHROW(family.observeCoulombEnergy(p0, 0));
+    CHECK_NOTHROW(clone.observeCoulombEnergy(p1, 0));
+    resource.rewind(cursor);
+    family.releaseResource(resource, team);
+    CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  }
+  CHECK(family.numericStorage().shared_cpu_bytes == before.shared_cpu_bytes);
+  CHECK(family.numericStorage().shared_cpu_fingerprint == before.shared_cpu_fingerprint);
+}
+
+TEST_CASE("Complex CPU collective products obey exact family admission and growth rollback",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_collective]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+  p1.R[2][0] += .04;
+  p1.update();
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF descriptor("descriptor", parameters(), p0, source, clone_cap, {}, 0, {}, "all_electron", clone_cap);
+  const auto full = descriptor.numericStorage().shared_cpu_full_bytes;
+  using Grad = WaveFunctionComponent::GradType;
+  using Value = WaveFunctionComponent::ValueType;
+  const auto staging = 3 * sizeof(double) + sizeof(C) + sizeof(std::uint64_t) + 4 * (sizeof(Grad) + sizeof(Value));
+  const bool first_fails = GENERATE(true, false);
+  const auto cap = first_fails ? full + staging - 1 : 2 * full + staging;
+  PsiFormerComplexWF family("cap", parameters(), p0, source, clone_cap, {}, 0, {}, "all_electron", cap);
+  auto other = family.makeClone(p1);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
+  evaluate(family, p0);
+  evaluate(clone, p1);
+  const auto before = family.numericStorage();
+  RefVectorWithLeader<WaveFunctionComponent> one(family, {family});
+  RefVectorWithLeader<ParticleSet> target(p0, {p0});
+  const MCMultiParticleMoves<CoordsType::POS> move({0, 4}, {0, 1, 2, 3},
+      {p0.R[0], p0.R[1], p0.R[2], p0.R[3]});
+  ParticleSet::ParticleGradient g(4);
+  ParticleSet::ParticleLaplacian l(4);
+  RefVector<ParticleSet::ParticleGradient> gradients{g};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{l};
+  std::vector<C> ratios(1, C{9, 7});
+  ResourceCollection prototype("CPU collective exact cap");
+  family.createResource(prototype);
+  {
+    ResourceCollection resource(prototype);
+    const auto cursor = resource.getCursor();
+    family.acquireResource(resource, one);
+    if (first_fails)
+    {
+      CHECK_THROWS_AS(family.mw_evaluateMultiParticleMove(one, target, move, ratios, gradients, laplacians), std::length_error);
+      CHECK(family.numericStorage().shared_cpu_bytes == before.shared_cpu_bytes);
+      CHECK(family.numericStorage().shared_cpu_fingerprint == before.shared_cpu_fingerprint);
+      CHECK(ratios[0] == (C{9, 7}));
+    }
+    else
+    {
+      family.mw_evaluateMultiParticleMove(one, target, move, ratios, gradients, laplacians);
+      CHECK(family.numericStorage().shared_cpu_bytes == cap);
+      family.mw_accept_rejectMultiParticleMove(one, target, move, std::vector<bool>{false});
+    }
+    resource.rewind(cursor);
+    family.releaseResource(resource, one);
+    if (!first_fails)
+    {
+      const auto warm = family.numericStorage();
+      resource.rewind(cursor);
+      RefVectorWithLeader<WaveFunctionComponent> two(family, {family, clone});
+      RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+      family.acquireResource(resource, two);
+      const MCMultiParticleMoves<CoordsType::POS> both({0, 4, 8}, {0, 1, 2, 3, 0, 1, 2, 3},
+          {p0.R[0], p0.R[1], p0.R[2], p0.R[3], p1.R[0], p1.R[1], p1.R[2], p1.R[3]});
+      ParticleSet::ParticleGradient g1(4);
+      ParticleSet::ParticleLaplacian l1(4);
+      RefVector<ParticleSet::ParticleGradient> gs{g, g1};
+      RefVector<ParticleSet::ParticleLaplacian> ls{l, l1};
+      ratios.assign(2, C{9, 7});
+      CHECK_THROWS_AS(family.mw_evaluateMultiParticleMove(two, targets, both, ratios, gs, ls), std::length_error);
+      CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+      CHECK(family.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+      CHECK(ratios[0] == (C{9, 7}));
+      resource.rewind(cursor);
+      family.releaseResource(resource, two);
+    }
+  }
+  CHECK(family.numericStorage().shared_cpu_bytes == before.shared_cpu_bytes);
+  CHECK(family.numericStorage().shared_cpu_fingerprint == before.shared_cpu_fingerprint);
+}
+
+TEST_CASE("Complex CPU collective crowds evaluate concurrently without shared proposed products",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_collective]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+  auto p2 = electrons(simulation_cell), p3 = electrons(simulation_cell);
+  std::array<ParticleSet*, 4> particles{&p0, &p1, &p2, &p3};
+  for (std::size_t i = 0; i < particles.size(); ++i)
+  {
+    particles[i]->R[1][0] += .03 * i;
+    particles[i]->update();
+  }
+  auto source = ions(simulation_cell);
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF family("parallel", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  auto c1 = family.makeClone(p1), c2 = family.makeClone(p2), c3 = family.makeClone(p3);
+  auto& leader = dynamic_cast<PsiFormerComplexWF&>(*c2);
+  std::array<WaveFunctionComponent*, 4> components{&family, c1.get(), c2.get(), c3.get()};
+  std::array<C, 4> initial_logs, expected;
+  for (std::size_t i = 0; i < 4; ++i)
+  {
+    initial_logs[i] = evaluate(*components[i], *particles[i]);
+    auto proposed = electrons(simulation_cell);
+    proposed.R = particles[i]->R;
+    for (std::size_t e = 0; e < 4; ++e)
+      proposed.R[e] += ParticleSet::PosType{.001 * (i + 1), -.002, .003};
+    proposed.update();
+    PsiFormerComplexWF oracle("oracle", parameters(), proposed, source, clone_cap, twist);
+    expected[i] = evaluate(oracle, proposed) - initial_logs[i];
+  }
+  RefVectorWithLeader<WaveFunctionComponent> team0(family, {family, *c1}), team1(leader, {leader, *c3});
+  RefVectorWithLeader<ParticleSet> targets0(p0, {p0, p1}), targets1(p2, {p2, p3});
+  ResourceCollection prototype("concurrent CPU collective");
+  family.createResource(prototype);
+  ResourceCollection r0(prototype), r1(prototype);
+  const auto cursor0 = r0.getCursor(), cursor1 = r1.getCursor();
+  family.acquireResource(r0, team0);
+  leader.acquireResource(r1, team1);
+  std::promise<void> go;
+  const auto start = go.get_future().share();
+  std::atomic<int> ready{0};
+  auto run = [&](PsiFormerComplexWF& owner, auto& team, auto& targets, std::size_t offset) {
+    std::vector<ParticleSet::PosType> positions;
+    for (std::size_t i = 0; i < 2; ++i)
+      for (std::size_t e = 0; e < 4; ++e)
+        positions.push_back(targets[i].R[e] + ParticleSet::PosType{.001 * (offset + i + 1), -.002, .003});
+    const MCMultiParticleMoves<CoordsType::POS> moves({0, 4, 8}, {0, 1, 2, 3, 0, 1, 2, 3}, positions);
+    ParticleSet::ParticleGradient g0(4), g1(4);
+    ParticleSet::ParticleLaplacian l0(4), l1(4);
+    RefVector<ParticleSet::ParticleGradient> gs{g0, g1};
+    RefVector<ParticleSet::ParticleLaplacian> ls{l0, l1};
+    std::vector<C> ratios(2), result;
+    ++ready;
+    start.wait();
+    for (int repeat = 0; repeat < 5; ++repeat)
+    {
+      g0 = g1 = C{};
+      l0 = l1 = C{};
+      owner.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gs, ls);
+      result.insert(result.end(), ratios.begin(), ratios.end());
+      owner.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false, false});
+    }
+    return result;
+  };
+  auto work0 = std::async(std::launch::async, [&] { return run(family, team0, targets0, 0); });
+  auto work1 = std::async(std::launch::async, [&] { return run(leader, team1, targets1, 2); });
+  while (ready.load() != 2)
+    std::this_thread::yield();
+  go.set_value();
+  const std::array<std::vector<C>, 2> results{work0.get(), work1.get()};
+  for (std::size_t crowd = 0; crowd < 2; ++crowd)
+    for (std::size_t i = 0; i < results[crowd].size(); ++i)
+      close(results[crowd][i], expected[2 * crowd + i % 2], 2e-12);
+  for (std::size_t i = 0; i < 4; ++i)
+    CHECK(components[i]->get_log_value() == initial_logs[i]);
+  r0.rewind(cursor0);
+  r1.rewind(cursor1);
+  family.releaseResource(r0, team0);
+  leader.releaseResource(r1, team1);
+}
+
 TEST_CASE("Complex CPU crowd leases and scalar fallback retain independent products",
           "[wavefunction][psiformer][complex_wf][complex_cpu_shared]")
 {
@@ -994,7 +1263,7 @@ TEST_CASE("Complex CPU crowd leases and scalar fallback retain independent produ
   crowd1.acquireResource(resource1, team1);
   CHECK(family.numericStorage().shared_cpu_owners == 3);
   CHECK(family.numericStorage().shared_cpu_bytes == 0);
-  CHECK_FALSE(family.supportsMultiParticleMoves());
+  CHECK(family.supportsMultiParticleMoves());
   auto exercise = [](PsiFormerComplexWF& component, ParticleSet& particles) {
     std::vector<C> products;
     for (int repeat = 0; repeat < 12; ++repeat)
@@ -4243,6 +4512,67 @@ TEST_CASE("PsiFormer explicit GPU parameter publication reuses inference storage
 #endif
 
 #ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across walker tiles",
+          "[wavefunction][psiformer][complex_gpu_collective_b1]")
+{
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "1");
+  controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "1");
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+  {
+    const SimulationCell simulation_cell(cell());
+    auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+    p1.R[0][1] += .03;
+    p1.update();
+    auto source = ions(simulation_cell);
+    PsiFormerComplexWF gpu("b1", parameters(), p0, source, clone_cap, twist, 64 * 1024 * 1024);
+    auto other = gpu.makeClone(p1);
+    auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
+    REQUIRE(gpu.supportsMultiParticleMoves());
+    const std::array<C, 2> initial{evaluate(gpu, p0), evaluate(clone, p1)};
+    RefVectorWithLeader<WaveFunctionComponent> team(gpu, {gpu, clone});
+    RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+    std::vector<ParticleSet::PosType> positions;
+    for (std::size_t i = 0; i < 2; ++i)
+      for (std::size_t e = 0; e < 4; ++e)
+        positions.push_back(targets[i].R[e] + ParticleSet::PosType{.002 * (i + 1), -.003, .001});
+    const MCMultiParticleMoves<CoordsType::POS> moves({0, 4, 8}, {0, 1, 2, 3, 0, 1, 2, 3}, positions);
+    ParticleSet::ParticleGradient g0(4), g1(4);
+    ParticleSet::ParticleLaplacian l0(4), l1(4);
+    RefVector<ParticleSet::ParticleGradient> gs{g0, g1};
+    RefVector<ParticleSet::ParticleLaplacian> ls{l0, l1};
+    std::vector<C> ratios(2);
+    ResourceCollection resources("B1 collective");
+    gpu.createResource(resources);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lease(resources, team);
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+      g0 = g1 = C{};
+      l0 = l1 = C{};
+      gpu.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gs, ls);
+      for (std::size_t i = 0; i < 2; ++i)
+      {
+        auto proposed = electrons(simulation_cell);
+        for (std::size_t e = 0; e < 4; ++e)
+          proposed.R[e] = positions[4 * i + e];
+        proposed.update();
+        PsiFormerComplexWF oracle("oracle", parameters(), proposed, source, clone_cap, twist);
+        close(std::exp(ratios[i]), std::exp(evaluate(oracle, proposed) - initial[i]), 2e-9);
+        for (std::size_t e = 0; e < 4; ++e)
+        {
+          close(ls[i].get()[e], proposed.L[e], 2e-8);
+          for (int d = 0; d < 3; ++d)
+            close(gs[i].get()[e][d], proposed.G[e][d], 2e-8);
+        }
+      }
+      CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false}));
+      gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false, false});
+      CHECK(gpu.get_log_value() == initial[0]);
+      CHECK(clone.get_log_value() == initial[1]);
+    }
+  }
+}
+
 TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cache transactions",
           "[wavefunction][psiformer][complex_gpu_dense]")
 {

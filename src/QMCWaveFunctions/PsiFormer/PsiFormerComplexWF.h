@@ -244,7 +244,7 @@ public:
 
   void releaseResource(ResourceCollection&, const RefVectorWithLeader<WaveFunctionComponent>&) const override;
 
-  /// Only opt-in dense GPU families admit native selected/all-electron transactions.
+  /// Shared CPU and native GPU families admit bounded selected/all-electron transactions.
   bool supportsMultiParticleMoves() const noexcept override;
 
   /// Add complete proposed physical G/L; retain pure FULL products until whole-mask resolution.

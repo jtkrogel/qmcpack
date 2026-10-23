@@ -22,7 +22,7 @@ struct PsiFormerComplexWF::Impl
   using C = psiformer::determinant::Complex;
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
-  /** Family-wide authority for retained CPU scratch, including dormant resources.
+  /** Family-wide authority for CPU scratch and collective products, including dormant resources.
    * This numerical budget excludes clone G/L, parameters and derivative owners.
    */
   struct CpuScratchBudget
@@ -549,6 +549,70 @@ struct PsiFormerComplexWF::Impl
     explicit MultiWalkerResource(std::shared_ptr<Model> state)
         : Resource("PsiFormerComplexMultiWalkerResource"), state(std::move(state)) {}
 
+    /// Retire proposed CPU products before returning their family reservation.
+    ~MultiWalkerResource() override
+    {
+      if (cpu_collective_bytes)
+      {
+        std::vector<Amplitude>().swap(amplitude);
+        std::vector<LogValue>().swap(logs);
+        std::vector<std::uint64_t>().swap(keys);
+        std::vector<GradType>().swap(gradient);
+        std::vector<ValueType>().swap(laplacian);
+        std::lock_guard lock(state->cpu_budget->mutex);
+        state->cpu_budget->retained -= cpu_collective_bytes;
+        state->cpu_budget->fingerprint ^= cpu_collective_fingerprint;
+      }
+    }
+
+    /// Prepare a whole candidate while old proposed products remain live and charged.
+    void prepareCpuCollective(std::size_t walkers)
+    {
+      const char* message = "Complex CPU collective staging overflow";
+      const auto elements = pf::checkedStorageProduct(walkers, state->model.ne, message);
+      if (walkers <= amplitude.size() && elements <= gradient.size())
+        return;
+      auto bytes = pf::checkedStorageProduct(walkers,
+          sizeof(Amplitude) + sizeof(LogValue) + sizeof(std::uint64_t), message);
+      pf::addStorageBytes(bytes, pf::checkedStorageProduct(elements,
+          sizeof(GradType) + sizeof(ValueType), message), message);
+      state->cpu_budget->reserve(bytes);
+      try
+      {
+        std::vector<Amplitude> next_amplitude(walkers);
+        std::vector<LogValue> next_logs(walkers);
+        std::vector<std::uint64_t> next_keys(walkers);
+        std::vector<GradType> next_gradient(elements);
+        std::vector<ValueType> next_laplacian(elements);
+        const auto actual = next_amplitude.capacity() * sizeof(Amplitude) + next_logs.capacity() * sizeof(LogValue) +
+            next_keys.capacity() * sizeof(std::uint64_t) + next_gradient.capacity() * sizeof(GradType) +
+            next_laplacian.capacity() * sizeof(ValueType);
+        if (actual != bytes)
+          throw std::logic_error("Complex CPU collective capacity differs from its reservation");
+        amplitude.swap(next_amplitude);
+        logs.swap(next_logs);
+        keys.swap(next_keys);
+        gradient.swap(next_gradient);
+        laplacian.swap(next_laplacian);
+      }
+      catch (...)
+      {
+        state->cpu_budget->release(bytes);
+        throw;
+      }
+      // Local candidates (now holding old allocations) have been destroyed above.
+      {
+        std::lock_guard lock(state->cpu_budget->mutex);
+        state->cpu_budget->retained -= cpu_collective_bytes;
+        cpu_collective_bytes = bytes;
+        state->cpu_budget->fingerprint ^= cpu_collective_fingerprint;
+        cpu_collective_fingerprint = (reinterpret_cast<std::uintptr_t>(gradient.data()) ^ bytes) * 1099511628211ULL;
+        state->cpu_budget->fingerprint ^= cpu_collective_fingerprint;
+      }
+      trace_cpu_collective.snapshotAt(__FILE__, __LINE__, "ComplexWF::shared_cpu_COLLECTIVE_PRODUCTS",
+          bytes, reinterpret_cast<std::uintptr_t>(this));
+    }
+
     /// Clone only the model anchor; each acquired crowd prepares independent HOST staging.
     std::unique_ptr<Resource> makeClone() const override
     { return std::make_unique<MultiWalkerResource>(state); }
@@ -635,6 +699,8 @@ struct PsiFormerComplexWF::Impl
     std::vector<GradType> gradient;
     std::vector<ValueType> laplacian;
     std::size_t reported_host_bytes = 0;
+    std::size_t cpu_collective_bytes = 0, cpu_collective_fingerprint = 0;
+    psiformer::memory::HostCapacity trace_cpu_collective;
     bool collective_pending = false;
     std::size_t collective_version = 0;
     std::uint64_t collective_descriptor = 0;
@@ -2517,20 +2583,26 @@ struct PsiFormerComplexWF::Impl
   /// Copy positions through checked setters, optionally replacing one row by an absolute virtual position.
   template<class Workspace>
   void positions(Workspace& workspace, const ParticleSet& p, int replacement = -1,
-      const ParticleSet::PosType* absolute = nullptr) const
+      const ParticleSet::PosType* absolute = nullptr,
+      const MCMultiParticleMoves<CoordsType::POS>::Slice* collective = nullptr) const
   {
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
       for (int dimension = 0; dimension < 3; ++dimension)
         workspace.setPosition(electron, dimension,
             replacement == electron ? (absolute ? (*absolute)[dimension] : p.activeR(electron)[dimension])
                                     : p.R[electron][dimension]);
+    if (collective)
+      for (std::size_t selected = 0; selected < collective->size(); ++selected)
+        for (int dimension = 0; dimension < 3; ++dimension)
+          workspace.setPosition(collective->particleIndex(selected), dimension,
+              collective->proposedPosition(selected)[dimension]);
   }
 
   /// Capacity is immutable even when publication replaces the generation pointer.
   bool denseEnabled() const noexcept { return state->gpu_capacity > 1; }
 
-  /// B1/target inference also needs native resources when independent crowds are enabled.
-  bool crowdResourcesEnabled() const noexcept { return bool(state->cpu_budget) || denseEnabled() || state->gpu_crowds > 1; }
+  /// Collective B1 and shared CPU inference also need an exact native resource loan.
+  bool crowdResourcesEnabled() const noexcept { return bool(state->cpu_budget) || state->gpu_limit != 0; }
 
   /// Select one crowd's exclusive scratch, retaining the family fallback for scalar callers.
   std::shared_ptr<CpuLane> selectedCpuLane() const
@@ -2600,18 +2672,18 @@ struct PsiFormerComplexWF::Impl
     const auto* leader = dynamic_cast<const PsiFormerComplexWF*>(&components.getLeader());
     if (!leader || leader->impl_.get() != this || !multiwalker || components.empty() ||
         components.size() != targets.size() || &components[0] != leader)
-      throw std::logic_error("Dense complex GPU call requires its acquired native leader/team");
+      throw std::logic_error("Complex native call requires its acquired leader/team");
     auto& resource = multiwalker.getResource();
     if (resource.state != state || resource.components.size() != components.size())
-      throw std::invalid_argument("Dense complex GPU crowd has foreign resource ownership or extent");
+      throw std::invalid_argument("Complex native crowd has foreign resource ownership or extent");
     if (resource.collective_pending && !collective_resolution)
-      throw std::logic_error("Dense complex GPU staging is frozen until collective resolution");
+      throw std::logic_error("Complex native staging is frozen until collective resolution");
     for (std::size_t i = 0; i < components.size(); ++i)
     {
       auto* component = dynamic_cast<PsiFormerComplexWF*>(&components[i]);
       if (!component || component != resource.components[i] || component->impl_->state != state ||
           component->impl_->acquired_leader != leader || component->impl_->acquired_lane != i)
-        throw std::invalid_argument("Dense complex GPU call changed its acquired model or lane order");
+        throw std::invalid_argument("Complex native call changed its acquired model or lane order");
       component->impl_->validate(targets[i], electron, electron >= 0);
     }
     return resource;
@@ -2724,7 +2796,8 @@ struct PsiFormerComplexWF::Impl
 
   /// Route VALUE/FULL/ACTIVE without duplicating physical twist, ratio or cache algebra.
   CoreResult core(const ParticleSet& p, bool spatial, int replacement = -1, int electron = -1,
-      const ParticleSet::PosType* absolute = nullptr)
+      const ParticleSet::PosType* absolute = nullptr,
+      const MCMultiParticleMoves<CoordsType::POS>::Slice* collective = nullptr)
   {
     NativeTimerScope timer(spatial ? (electron < 0 ? phase_timers.vgl : phase_timers.gradient) : phase_timers.value);
     CoreResult result;
@@ -2787,7 +2860,7 @@ struct PsiFormerComplexWF::Impl
               state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); },
               electron < 0 ? CpuLane::Mode::FULL_VGL : CpuLane::Mode::ACTIVE_ELECTRON_GRADIENT)
           : (electron < 0 ? *full : *active);
-      positions(workspace, p, replacement, absolute);
+      positions(workspace, p, replacement, absolute, collective);
       static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
           ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
     }
@@ -2802,6 +2875,33 @@ struct PsiFormerComplexWF::Impl
       result.parameter_version = evaluated.parameter_version;
     }
     return result;
+  }
+
+  /// Reuse one crowd FULL tape, copying each borrowed result before releasing its lease.
+  void stageCpuCollective(MultiWalkerResource& resource, const RefVectorWithLeader<ParticleSet>& targets,
+      const MCMultiParticleMoves<CoordsType::POS>& moves)
+  {
+    resource.prepareCpuCollective(targets.size());
+    const auto n = state->model.ne;
+    for (std::size_t walker = 0; walker < targets.size(); ++walker)
+    {
+      auto& clone = *resource.components[walker]->impl_;
+      const auto slice = moves.slice(walker);
+      const auto result = clone.core(targets[walker], true, -1, -1, nullptr, &slice);
+      resource.amplitude[walker] = result.amplitude;
+      resource.logs[walker] = clone.physicalLog(result.amplitude, targets[walker], slice);
+      resource.keys[walker] = configurationIdentity(targets[walker], slice);
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          resource.gradient[walker * n + e][d] = clone.physicalGradient(result.gradient[3 * e + d], d);
+        const auto value = result.laplacian_log[e];
+        const auto converted = makePsiFormerScalar<ValueType>(value.real(), value.imag());
+        if (!isFiniteWavefunctionValue(converted))
+          throw std::overflow_error("Complex CPU collective Laplacian conversion overflow");
+        resource.laplacian[walker * n + e] = converted;
+      }
+    }
   }
 
   /// Apply the sole common outer phase at the adapter boundary, never inside an orbital head.
@@ -4160,10 +4260,10 @@ void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
   impl_->state->acquired_teams.fetch_sub(1);
 }
 
-/// Collective support is explicit dense GPU inference only; CPU/defaultB1 stay closed.
+/// Shared CPU and native GPU families retain bounded complete-configuration products.
 bool PsiFormerComplexWF::supportsMultiParticleMoves() const noexcept
 {
-  return impl_->denseEnabled();
+  return bool(impl_->state->cpu_budget) || impl_->state->gpu_limit != 0;
 }
 
 /// Retain pure FULL products until a matching collective resolution, with all-output atomicity.
@@ -4174,7 +4274,7 @@ void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
     const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
 {
   if (!supportsMultiParticleMoves())
-    throw std::logic_error("Complex collective proposals require opt-in dense GPU inference");
+    throw std::logic_error("Complex collective proposals require shared CPU or native GPU inference");
   NativeTimerScope timer(impl_->phase_timers.batch_vgl);
   std::shared_lock read(impl_->state->mutex);
   auto& resource = impl_->requireDenseTeam(components, targets);
@@ -4214,7 +4314,10 @@ void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
         throw std::invalid_argument("Complex collective proposal walker outputs overlap");
     }
   }
-  impl_->stageDense(resource, targets, true, -1, false, &moves);
+  if (impl_->state->cpu_budget)
+    impl_->stageCpuCollective(resource, targets, moves);
+  else
+    impl_->stageDense(resource, targets, true, -1, false, &moves);
   for (std::size_t i = 0; i < walkers; ++i)
   {
     if (!isFiniteWavefunctionValue(resource.logs[i] - resource.components[i]->log_value_))
@@ -4258,7 +4361,7 @@ void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves, const std::vector<bool>& accepted) const
 {
   if (!supportsMultiParticleMoves())
-    throw std::logic_error("Complex collective resolution requires opt-in dense GPU inference");
+    throw std::logic_error("Complex collective resolution requires shared CPU or native GPU inference");
   std::shared_lock read(impl_->state->mutex);
   auto& resource = impl_->requireDenseTeam(components, targets, -1, /*collective_resolution=*/true);
   moves.validateFor(targets);
