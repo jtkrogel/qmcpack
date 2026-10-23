@@ -421,9 +421,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
         throw UniformCommunicateError("Complex GPU inference requires parsed PBYP VMC_BATCH moves");
       if (const auto* complex = selectedComplexProfile(primaryPsi); complex &&
           complex->isPseudopotentialSystem() && !is_pbyp_move &&
-          (vmcdriver_input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
-           !complex->supportsMultiParticleMoves()))
-        throw UniformCommunicateError("Scalar PP inference requires PBYP or supported all-electron VMC_BATCH moves");
+          !complex->supportsMultiParticleMoves())
+        throw UniformCommunicateError("Scalar PP inference requires PBYP or supported collective VMC_BATCH moves");
 #endif
 
       // I don't like that QMCDriverFactory is unpacking the driver input here, ideally only the driver should need to
