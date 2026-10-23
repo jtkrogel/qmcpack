@@ -102,7 +102,7 @@ private:
  * Production APIs see only bounded parameter chunks. The explicit sample-by-parameter
  * rows here make the expected VJP algebra independent and easy to inspect.
  */
-class ToyStreamingOperator final : public StreamingDerivativeOperator
+class ToyStreamingOperator : public StreamingDerivativeOperator
 {
 public:
   ToyStreamingOperator(const StructuredParameterSchema& schema,
@@ -1231,6 +1231,53 @@ TEST_CASE("Score training requires no local-energy product unless explicitly req
   CHECK(result.objective.estimator == EnergyGradientEstimator::SCORE_COVARIANCE);
   CHECK(result.objective.local_energy_term_mask == 0);
   CHECK(producer.calls == 1);
+}
+
+TEST_CASE("Prepared score-only ownership does not imply a local-energy response",
+          "[drivers][training][prepared][score_covariance]")
+{
+  ToyProvider provider;
+  const auto parameters = provider.snapshotParameters();
+  class ScoreOnlyOperator final : public ToyStreamingOperator
+  {
+  public:
+    using ToyStreamingOperator::ToyStreamingOperator;
+    StreamingDerivativeCapabilities capabilities() const noexcept override
+    {
+      auto result = ToyStreamingOperator::capabilities();
+      result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP);
+      result.local_energy_term_mask = 0;
+      return result;
+    }
+  };
+  const auto make_batches = [&] {
+    std::vector<PreparedEnergyGradientBatch> batches;
+    PreparedEnergyGradientBatch batch;
+    batch.derivative_operator = std::make_unique<ScoreOnlyOperator>(
+        provider.parameterSchema(), parameters.version, makeScores(), ComplexRows{});
+    batch.weights = {1, 2, 1};
+    batch.local_energies = {-1, .5, 2};
+    batches.push_back(std::move(batch));
+    return batches;
+  };
+  CHECK_THROWS(PreparedEnergyGradientProducer(make_batches()));
+  auto additive = make_batches();
+  additive.front().additive_local_energy_vjp.emplace();
+  CHECK_THROWS(PreparedEnergyGradientProducer(std::move(additive), std::nullopt, true));
+  PreparedEnergyGradientProducer producer(make_batches(), std::nullopt, true);
+  CHECK(producer.capabilities().contains(TrainingCapability::SCORE_VJP));
+  CHECK_FALSE(producer.capabilities().contains(TrainingCapability::LOCAL_ENERGY_VJP));
+  EnergyGradientAccumulator full(provider.parameterSchema(), parameters.version);
+  CHECK_THROWS(producer.accumulate(parameters, full));
+  CHECK(full.state() == DerivativeSinkState::IDLE);
+  EnergyGradientAccumulator score(provider.parameterSchema(), parameters.version,
+                                  EnergyGradientEstimator::SCORE_COVARIANCE);
+  CHECK_NOTHROW(producer.accumulate(parameters, score));
+  score.completeSingleParticipantReduction();
+  const auto result = score.finalize();
+  CHECK(result.sample_count == 3);
+  CHECK(result.local_energy_term_mask == 0);
+  CHECK(result.weight_sum == 4);
 }
 
 TEST_CASE("Accepted nonlocal tiles reduce complete complex energies without derivatives",

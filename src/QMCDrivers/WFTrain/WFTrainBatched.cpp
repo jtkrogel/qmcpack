@@ -672,7 +672,7 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     };
     auto& leader = componentAt(0);
     RefVectorWithLeader<WaveFunctionComponent> component_batch(leader);
-    if (gpu_training && has_nonlocal_ecp)
+    if (gpu_training && has_nonlocal_ecp && !score_only)
     {
       const auto samples = walkers.size();
       if (fixed_grid)
@@ -735,14 +735,28 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
                 << " samples=" << samples << " max_abs_ImVnl=" << maximum_imaginary_nonlocal << std::endl;
       return batch;
     }
-    if (!gpu_training && has_nonlocal_ecp)
+    if (has_nonlocal_ecp)
     {
       // The score owner supplies immutable identity only; no local-energy parameter products are requested.
       for (std::size_t sample = 0; sample < walkers.size(); ++sample)
         component_batch.push_back(componentAt(sample));
-      const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
-      batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
-          component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+      if (gpu_training)
+      {
+        batch.local_energy_term_mask = 0;
+        const auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+        const auto chunk = std::min(maximum_parameter_chunk_size, leader.parameterSchema().parameterCount());
+        const auto required = leader.gpuDerivativeRequirements(
+            walkers.size(), walkers.size(), gpu_training->kinetic_targets, chunk, scope);
+        batch.derivative_operator = leader.makeBudgetedGpuDerivativeOperator(twf_batch, electron_batch,
+            batch_ordinal, sample_offset, walkers.size(), gpu_training->kinetic_targets, chunk,
+            required.device_bytes, required.host_bytes, gpu_training->maximum_matrix_work, scope);
+      }
+      else
+      {
+        const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+        batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
+            component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+      }
       const auto& schema = batch.derivative_operator->parameterSchema();
       const auto version = batch.derivative_operator->parameterVersion();
       const auto energy_bytes = wftrain::NonLocalEnergyAccumulator::requiredBytes(walkers.size());
@@ -757,7 +771,7 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, energy, {&channel, 1}, sink);
       if (energy.gridFingerprint() != result.grid_fingerprint)
-        throw std::logic_error("CPU nonlocal energy accepted-grid identity changed");
+        throw std::logic_error("Scalar nonlocal energy accepted-grid identity changed");
       double maximum_imaginary_nonlocal = 0;
       batch.local_energies.reserve(walkers.size());
       for (std::size_t sample = 0; sample < walkers.size(); ++sample)
@@ -772,18 +786,19 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
             (1 + std::abs(reported_nonlocal) + std::abs(captured.real()));
         if (!wftrain::isFiniteTrainingReal(reported_nonlocal) ||
             std::abs(reported_nonlocal - captured.real()) > tolerance)
-          throw std::logic_error("CPU complex nonlocal energy differs from the native accepted real potential");
+          throw std::logic_error("Scalar complex nonlocal energy differs from the native accepted real potential");
         // Native V already contains Re(Vnl). Restore only Im(Vnl), together with the actual complex kinetic value.
         const auto observed = componentAt(sample).observeCoulombEnergy(
             electrons[sample], hamiltonian.getLocalPotential());
         const auto complete = observed.local_energy + wftrain::DerivativeValue{0, captured.imag()};
         if (!wftrain::isFiniteTrainingReal(complete.real()) || !wftrain::isFiniteTrainingReal(complete.imag()))
-          throw std::overflow_error("CPU complete complex nonlocal energy is nonfinite");
+          throw std::overflow_error("Scalar complete complex nonlocal energy is nonfinite");
         batch.local_energies.push_back(complete);
         maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(captured.imag()));
       }
       // The physical energy includes ECP, but the derivative owner does not advertise an ECP dEL response.
-      app_log() << std::setprecision(17) << "WFTrain CPU accepted-grid ECP: grid=" << result.grid_fingerprint
+      app_log() << std::setprecision(17) << "WFTrain " << (gpu_training ? "GPU score-only" : "CPU")
+                << " accepted-grid ECP: grid=" << result.grid_fingerprint
                 << " version=" << version << " samples=" << walkers.size()
                 << " max_abs_ImVnl=" << maximum_imaginary_nonlocal
                 << " capture_numeric_bytes=" << energy_bytes << " ECP_derivative_response_mask=0" << std::endl;
@@ -1956,6 +1971,102 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   return text.str();
 }
 
+/// Validate the native periodic PP operator partition, without touching quadrature RNGs.
+std::string periodicScoreECPIdentity(ParticleSet& electrons, const ParticleSet& ions,
+    QMCHamiltonian& hamiltonian, const std::string& model_identity)
+{
+  const auto& provenance = hamiltonian.ecpModelProvenance();
+  if (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())
+    throw std::invalid_argument("Periodic score ECP requires physical ordinary-locality provenance");
+  const CoulombPBCAA *ee = nullptr, *ii = nullptr;
+  std::size_t kinetic = 0, local = 0, nonlocal = 0;
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  for (int term = 0; term < hamiltonian.size(); ++term)
+  {
+    const auto* current = hamiltonian.getComponent(term);
+    if (const auto* k = dynamic_cast<const BareKineticEnergy*>(current))
+    {
+      if (&k->getTargetPSet() != &electrons)
+        throw std::invalid_argument("Periodic score ECP kinetic target differs");
+      ++kinetic;
+    }
+    else if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(current))
+    {
+      auto*& selected = aa->is_active ? ee : ii;
+      if (selected || aa->usesOffload() || aa->ewaldModelDefinition().empty())
+        throw std::invalid_argument("Periodic score ECP requires unique native 3D Ewald ee/ii");
+      selected = aa;
+      extendStageFingerprint(hash, aa->ewaldModelDefinition());
+    }
+    else if (const auto* l = dynamic_cast<const CoulombPBCAB*>(current))
+    {
+      if (&l->getSourcePSet() != &ions || &l->Peln != &electrons || l->ewaldModelDefinition().empty())
+        throw std::invalid_argument("Periodic score local ECP sources differ");
+      bool occupied_pp = false;
+      for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+      {
+        if (static_cast<std::size_t>(ions.GroupID[ion]) >= l->Vspec.size())
+          throw std::invalid_argument("Periodic score local ECP species channel is missing");
+        // A mixed PP/AE source retains the native bare Coulomb spline for AE species.
+        const bool pp_channel = static_cast<bool>(l->Vspec[ions.GroupID[ion]]);
+        occupied_pp = occupied_pp || pp_channel;
+        extendStageFingerprint(hash, pp_channel);
+      }
+      if (!occupied_pp)
+        throw std::invalid_argument("Periodic score local ECP has no occupied PP channel");
+      extendStageFingerprint(hash, l->ewaldModelDefinition());
+      ++local;
+    }
+    else if (const auto* nl = dynamic_cast<const NonLocalECPotential*>(current))
+    {
+      if (&nl->sourceParticles() != &ions || nl->virtualTargetParticles() != &electrons ||
+          nl->usesDLA() || !nl->usesVirtualParticles())
+        throw std::invalid_argument("Periodic score nonlocal ECP requires the same ordinary VP sources");
+      ++nonlocal;
+    }
+    else
+      throw std::invalid_argument("Periodic score ECP requires kinetic, native Ewald ee/ii and local/nonlocal PP only");
+  }
+  if (kinetic != 1 || local != 1 || nonlocal != 1 || !ee || !ii ||
+      &ee->Ps != &electrons || &ii->Ps != &ions)
+    throw std::invalid_argument("Periodic score ECP operator partition or physical sources differ");
+  const auto& es = electrons.getSpeciesSet();
+  const int charge = es.findAttribute("charge");
+  const auto& masses = electrons.get_mass_by_group();
+  if (charge < 0 || masses.size() < static_cast<std::size_t>(electrons.groups()))
+    throw std::invalid_argument("Periodic score ECP electron charges/masses are missing");
+  for (int group = 0; group < electrons.groups(); ++group)
+  {
+    if (es(charge, group) != -1 || !wftrain::isFiniteTrainingReal(masses[group]) ||
+        std::abs(masses[group] - 1) > 64 * std::numeric_limits<double>::epsilon())
+      throw std::invalid_argument("Periodic score ECP requires unit-mass charge-minus-one electrons");
+  }
+  extendStageFingerprint(hash, model_identity);
+  extendStageFingerprint(hash, provenance->scientific_definition);
+  const auto& species = ions.getSpeciesSet();
+  const int ion_charge = species.findAttribute("charge");
+  if (ion_charge < 0)
+    throw std::invalid_argument("Periodic score ECP ionic charges are missing");
+  extendStageFingerprint(hash, ions.getTotalNum());
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+  {
+    extendStageFingerprint(hash, species.speciesName.at(ions.GroupID[ion]));
+    const auto z = species(ion_charge, ions.GroupID[ion]);
+    if (!wftrain::isFiniteTrainingReal(z))
+      throw std::invalid_argument("Periodic score ECP ionic charge is nonfinite");
+    extendStageFingerprint(hash, z);
+    for (int d = 0; d < 3; ++d)
+    {
+      if (!wftrain::isFiniteTrainingReal(ions.R[ion][d]))
+        throw std::invalid_argument("Periodic score ECP ionic position is nonfinite");
+      extendStageFingerprint(hash, ions.R[ion][d]);
+    }
+  }
+  std::ostringstream identity;
+  identity << "legacy-torus-score-ecp-v1/" << std::hex << hash;
+  return identity.str();
+}
+
 /// Bind only the new GPU score-only PP stage to actual operator content and ion ordering.
 std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
 {
@@ -1975,6 +2086,12 @@ std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons,
     throw std::invalid_argument("GPU score-only ECP has no actual nonlocal operator");
   const auto& ions = nonlocal->sourceParticles();
   component.validateSystem(electrons, ions, "pseudopotential");
+  if (electrons.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+  {
+    if (!component.matchesLegacyTorusPseudopotentialTarget(electrons))
+      throw std::invalid_argument("Periodic real score ECP requires legacy torus Gamma metadata");
+    return periodicScoreECPIdentity(electrons, ions, hamiltonian, component.trainingConfigurationFingerprint());
+  }
   const auto& species = ions.getSpeciesSet();
   const int charge = species.findAttribute("charge");
   if (charge < 0)
@@ -2153,17 +2270,26 @@ void WFTrainBatched::process(xmlNodePtr node)
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
 #ifdef QMC_COMPLEX
     bool legacy_paired_mpi2_kfac = false;
+    bool legacy_paired_score_ecp = false;
     for (const auto& orbital : student_prototype_.getOrbitals())
       if (auto* complex = dynamic_cast<PsiFormerComplexWF*>(orbital.get()))
       {
         complex_training_component_ = complex;
-        if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
-            psiformer::compiledPsiFormerAcceleratorSupport().hip)
-          throw UniformCommunicateError("WFTrainBatched: paired HIP pseudopotential profiles are inference-only");
-
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
         const auto optimizer = training_input_.getOptimizer();
+        const auto& provenance = population_.get_golden_hamiltonian().ecpModelProvenance();
+        legacy_paired_score_ecp = complex->gpuInferenceEnabled() &&
+            complex->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+            wftrain::usesEnergyScoreEstimator(training_input_, true) &&
+            (optimizer == O::ADAM || (optimizer == O::KFAC && wftrain::supportsHybridKFACPolicy(training_input_))) &&
+            training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
+            population_.get_golden_hamiltonian().hasPhysicalNLPP() && provenance && provenance->ordinary_locality_vp &&
+            !provenance->scientific_definition.empty() &&
+            vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
+        if (complex->gpuInferenceEnabled() && complex->isPseudopotentialSystem() &&
+            psiformer::compiledPsiFormerAcceleratorSupport().hip && !legacy_paired_score_ecp)
+          throw UniformCommunicateError("WFTrainBatched: paired HIP ECP optimization requires qualified legacy torus score covariance");
         // Widen only the already qualified legacy AE score-covariance lane.
         // Its complex chunks and affine factors remain HOST-staged raw sums.
         legacy_paired_mpi2_kfac = complex->gpuInferenceEnabled() && myComm->size() == 2 &&
@@ -2180,21 +2306,22 @@ void WFTrainBatched::process(xmlNodePtr node)
             optimizer == O::STOCHASTIC_RECONFIGURATION ||
             (optimizer == O::KFAC && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
              (!complex->gpuInferenceEnabled() ||
-              (wftrain::supportsHybridKFACPolicy(training_input_) && !complex->isPseudopotentialSystem() &&
-               !population_.get_golden_hamiltonian().ecpModelProvenance() && !vmcdriver_input_.get_use_drift()))) ||
+              (wftrain::supportsHybridKFACPolicy(training_input_) &&
+               ((!complex->isPseudopotentialSystem() && !population_.get_golden_hamiltonian().ecpModelProvenance()) ||
+                legacy_paired_score_ecp) && !vmcdriver_input_.get_use_drift()))) ||
             (complex->gpuInferenceEnabled() && isFirstOrder(optimizer));
         const bool cpu_scalar_ecp = !complex->gpuInferenceEnabled() &&
             vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP &&
             complex->isPseudopotentialSystem() && population_.get_golden_hamiltonian().ecpModelProvenance() &&
             population_.get_golden_hamiltonian().ecpModelProvenance()->ordinary_locality_vp;
-        const bool cpu_score_ecp = cpu_scalar_ecp && optimizer == O::KFAC &&
+        const bool cpu_score_ecp = cpu_scalar_ecp && wftrain::usesEnergyScoreEstimator(training_input_, true) &&
             training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF;
         // Supervised PP fitting needs raw orbitals only; it does not admit energy Adam or PP dEL.
         const bool cpu_mse_ecp = cpu_scalar_ecp && cpu_orbital_mse && optimizer == O::ADAM &&
             training_input_.samplesOrbitalStudent() &&
             training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF;
-        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp && !cpu_mse_ecp &&
+        if (population_.get_golden_hamiltonian().hasPhysicalNLPP() && !cpu_score_ecp && !cpu_mse_ecp && !legacy_paired_score_ecp &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
              training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
              (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF &&
@@ -2202,7 +2329,7 @@ void WFTrainBatched::process(xmlNodePtr node)
              inference_input_.enabled ||
              training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
              training_input_.getMaximumUpdateNorm() != 0))
-          throw UniformCommunicateError("Paired ECP training requires CPU score-only ENERGY KFAC/OFF or student single-reference "
+          throw UniformCommunicateError("Paired ECP training requires CPU score-only ENERGY/OFF, qualified GPU score covariance/OFF, or student single-reference "
               "orbital_mse Adam/OFF with ordinary scalar VP "
               "or GPU ENERGY Adam/OFF or REFERENCE with default update controls");
         // GPU reference candidates require the separate budgeted private lane/image route.
@@ -2214,11 +2341,12 @@ void WFTrainBatched::process(xmlNodePtr node)
               training_input_.getUpdateScale() == 1 && training_input_.getWeightDecay() == 0 &&
               training_input_.getMaximumUpdateNorm() == 0));
         if (complex->gpuInferenceEnabled() &&
-            (!training_input_.getComplexGpuTraining().enabled() || (myComm->size() != 1 && !legacy_paired_mpi2_kfac) ||
+            (!training_input_.getComplexGpuTraining().enabled() ||
+             (myComm->size() != 1 && !legacy_paired_mpi2_kfac && !legacy_paired_score_ecp) ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
              !supported_optimizer))
           throw UniformCommunicateError(
-              "WFTrainBatched: paired GPU requires explicit caps, MPI1 (or legacy AE score KFAC MPI2), "
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1 (or legacy AE score KFAC MPI2 or legacy PP score), "
               "PBYP ENERGY host first-order, "
               "AE covariance KFAC/OFF without drift, or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
@@ -2418,6 +2546,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     hybrid_score_kfac = wftrain::supportsHybridKFACPolicy(training_input_) && selected_provider_->usesAcceleratorParameterProducts() &&
         real_provider && student_prototype_.getOrbitals().size() == 1 &&
         (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN ||
+         (scalar_pp && real_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())) ||
          (ae && myComm->size() == 1 && selected_pair_accelerator)) &&
         (ae || scalar_pp) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
@@ -2425,10 +2554,10 @@ void WFTrainBatched::process(xmlNodePtr node)
     selected_pair_accelerator = complex_gpu_provider_ &&
         complex_training_component_->matchesPairedDevicePairTarget(population_.get_golden_electrons());
     hybrid_score_kfac = complex_gpu_provider_ && wftrain::supportsHybridKFACPolicy(training_input_) &&
-        !complex_training_component_->isPseudopotentialSystem() &&
+        (legacy_paired_score_ecp || (!complex_training_component_->isPseudopotentialSystem() &&
         !population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        !population_.get_golden_hamiltonian().ecpModelProvenance() &&
-        (myComm->size() == 1 || legacy_paired_mpi2_kfac) &&
+        !population_.get_golden_hamiltonian().ecpModelProvenance())) &&
+        (myComm->size() == 1 || legacy_paired_mpi2_kfac || legacy_paired_score_ecp) &&
         vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP && !vmcdriver_input_.get_use_drift();
 #endif
     int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
@@ -2495,12 +2624,13 @@ void WFTrainBatched::process(xmlNodePtr node)
           metadata->scientific_definition.empty() || !cap || cap == std::numeric_limits<std::size_t>::max() ||
           crowds_.size() != 1 || crowds_.front()->size() == 0 || qmcdriver_input_.get_max_blocks() != 1 ||
           steps_per_block_ != 1 ||
-          population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN ||
+          (population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN &&
+           !real->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())) ||
           vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift();
     }
     myComm->allreduce(invalid_score_ecp);
     if (invalid_score_ecp)
-      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP/no drift on every rank");
+      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN or legacy torus Gamma PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP/no drift on every rank");
     if (hybrid_score_kfac)
     {
       bool real_open_ae = false;
@@ -2773,10 +2903,15 @@ void WFTrainBatched::run()
       {
         const auto& limits = training_input_.getComplexGpuTraining();
         const bool ecp = population_.get_golden_hamiltonian().hasPhysicalNLPP();
-        const auto points = ecp ? pairedECPPointCapacity(population_.get_golden_hamiltonian(), target, largest_batch) : 0;
+        const bool scalar_ecp = ecp && wftrain::usesEnergyScoreEstimator(training_input_, true);
+        const auto scope = scalar_ecp ? PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY :
+            PsiFormerComplexWF::GpuDerivativeScope::COMPLETE;
+        const auto points = ecp && !scalar_ecp ?
+            pairedECPPointCapacity(population_.get_golden_hamiltonian(), target, largest_batch) : 0;
         const auto r = complex->gpuDerivativeRequirements(samples, checkedMemoryAdd(largest_batch, points), limits.kinetic_targets,
-            std::min(p, training_input_.getParameterChunkSize()));
-        const auto replay_bytes = ecp ? complex->gpuNonLocalReplayRequirements(largest_batch, points).bound_host_extra_bytes : 0;
+            std::min(p, training_input_.getParameterChunkSize()), scope);
+        const auto replay_bytes = ecp && !scalar_ecp ?
+            complex->gpuNonLocalReplayRequirements(largest_batch, points).bound_host_extra_bytes : 0;
         if (ecp && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
         {
           if (largest_batch < 2)
@@ -2871,13 +3006,14 @@ void WFTrainBatched::run()
       prospective = checkedMemoryAdd(prospective, successor_bytes);
       prospective = checkedMemoryAdd(prospective, complex_fixed_grid_host_bytes);
       prospective = checkedMemoryAdd(prospective, complex_kfac_allowance);
-      if (!complex_gpu_provider_ && population_.get_golden_hamiltonian().hasPhysicalNLPP())
+      if ((!complex_gpu_provider_ || wftrain::usesEnergyScoreEstimator(training_input_, true)) &&
+          population_.get_golden_hamiltonian().hasPhysicalNLPP())
       {
         // One temporary B-energy vector and one B-coefficient vector coexist only during accepted-grid capture.
         const auto nonlocal_capture_bytes = checkedMemoryMultiply(2,
             wftrain::NonLocalEnergyAccumulator::requiredBytes(largest_batch));
         prospective = checkedMemoryAdd(prospective, nonlocal_capture_bytes);
-        app_log() << "WFTrain CPU nonlocal energy before allocation: temporary_numeric_bytes="
+        app_log() << "WFTrain scalar nonlocal energy before allocation: temporary_numeric_bytes="
                   << nonlocal_capture_bytes << "; no ECP parameter derivatives or retained quadrature replay" << std::endl;
       }
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
@@ -2918,6 +3054,15 @@ void WFTrainBatched::run()
           else if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(term))
             complex_physical_identity += ab->ewaldModelDefinition();
         }
+      }
+      if (complex_gpu_provider_ && wftrain::usesEnergyScoreEstimator(training_input_, true) &&
+          population_.get_golden_hamiltonian().hasPhysicalNLPP())
+      {
+        if (!complex->matchesLegacyTorusPseudopotentialTarget(target))
+          throw std::invalid_argument("Paired GPU score ECP requires matching legacy torus PP metadata");
+        complex_physical_identity = periodicScoreECPIdentity(population_.get_golden_electrons(),
+            complex->sourceParticles(), population_.get_golden_hamiltonian(),
+            complex->trainingConfigurationFingerprint());
       }
     }
     catch (...) { budget_failure = std::current_exception(); }
@@ -2962,16 +3107,16 @@ void WFTrainBatched::run()
   }
 #endif
 
-#ifndef QMC_COMPLEX
-  // Older real CPU/legacy fingerprints remain unchanged. Only new explicit GPU
-  // score profiles bind their actual physical operators here. Public pair GPU
-  // admission remains independently gated before run().
+  // Older real CPU/legacy fingerprints remain unchanged. New GPU score profiles
+  // bind their actual operators; paired identity was resolved above. Agree all
+  // physical identities before sampling, independently of device ordinal masks.
   std::exception_ptr physical_identity_failure;
   std::vector<std::uint64_t> physical_identity_records;
   std::uint64_t physical_identity_hash = 0;
   try
   {
     physical_identity_records.resize(static_cast<std::size_t>(myComm->size()));
+#ifndef QMC_COMPLEX
     if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
         wftrain::usesEnergyScoreEstimator(training_input_, false))
     {
@@ -2983,6 +3128,7 @@ void WFTrainBatched::run()
         complex_physical_identity = wftrain::realPairCoulombIdentity(*device_provider, population_.get_golden_electrons(),
             population_.get_golden_hamiltonian());
     }
+#endif
     if (!complex_physical_identity.empty())
     {
       physical_identity_hash = UINT64_C(14695981039346656037);
@@ -3002,7 +3148,6 @@ void WFTrainBatched::run()
   if (!std::all_of(physical_identity_records.begin(), physical_identity_records.end(),
                    [&](std::uint64_t identity) { return identity == physical_identity_hash; }))
     throw UniformCommunicateError("WFTrainBatched: GPU physical operator or ordered-ion identity differs across ranks before sampling");
-#endif
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
   for (auto& crowd : crowds_)
@@ -4283,7 +4428,8 @@ void WFTrainBatched::run()
                 checkedMemoryAdd(retained_configuration_bytes, checkedMemoryAdd(
                     storage_diagnostics.retained_numeric_bytes, statistics->retainedNumericBytes())));
           preparation_failure = {};
-          try { producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(std::move(batches), std::move(clipping)); }
+          try { producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
+              std::move(batches), std::move(clipping), score_training); }
           catch (...) { preparation_failure = std::current_exception(); }
           reduction.preflight(schema, &*parameters, kfac_estimator, preparation_failure);
           storage_diagnostics = producer->storageDiagnostics();
@@ -4352,7 +4498,7 @@ void WFTrainBatched::run()
           try
           {
             producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
-                std::move(batches));
+                std::move(batches), std::nullopt, score_training);
           }
           catch (...)
           {

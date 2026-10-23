@@ -64,6 +64,8 @@ public:
 
   /// Match legacy AE metadata and an actual BULK target, excluding selected/PP families.
   bool matchesLegacyTorusAllElectronTarget(const ParticleSet& electrons) const;
+  /// Match legacy torus PP metadata and its actual target/source, cell and outer twist.
+  bool matchesLegacyTorusPseudopotentialTarget(const ParticleSet& electrons) const;
 
   /// Match immutable model physics metadata to the native Hamiltonian route.
   bool isPseudopotentialSystem() const;

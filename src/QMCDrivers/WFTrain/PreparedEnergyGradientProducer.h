@@ -116,9 +116,11 @@ struct PreparedEnergyGradientStorageDiagnostics
 class PreparedEnergyGradientProducer final : public GradientProducer
 {
 public:
+  /// Explicit score mode needs no dEL owner and cannot be consumed as a complete-response producer.
   PreparedEnergyGradientProducer(
       std::vector<PreparedEnergyGradientBatch> batches,
-      std::optional<EnergyClippingTransform> clipping = std::nullopt);
+      std::optional<EnergyClippingTransform> clipping = std::nullopt,
+      bool score_only = false);
 
   TrainingCapabilities capabilities() const noexcept override;
 
@@ -142,6 +144,7 @@ private:
   std::size_t parameter_version_ = 0;
   std::uint32_t local_energy_term_mask_ = 0;
   bool consumed_ = false;
+  bool score_only_ = false;
 };
 
 } // namespace qmcplusplus::wftrain

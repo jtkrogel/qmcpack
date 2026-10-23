@@ -7984,6 +7984,34 @@ bool PsiFormerWF::matchesRealDevicePairTarget(const ParticleSet& particles) cons
   return true;
 }
 
+/// Match the existing full-cell torus PP family, without admitting versioned pair features.
+bool PsiFormerWF::matchesLegacyTorusPseudopotentialTarget(const ParticleSet& particles) const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  const auto& state = transaction.state();
+  const auto& environment = state.execution_plan.environment();
+  if (system_kind_ != "pseudopotential" || environment.periodic_profile || state.twist_phase.active() ||
+      environment.boundary != psiformer::BoundaryCondition::PERIODIC ||
+      environment.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+      particles.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+    return false;
+  constexpr double tolerance = 128 * std::numeric_limits<double>::epsilon();
+  for (std::size_t axis = 0; axis < 3; ++axis)
+  {
+    if (!std::isfinite(particles.getTwist()[axis]) || particles.getTwist()[axis] != 0)
+      return false;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double actual = particles.getLattice().R(axis, dimension);
+      const double expected = environment.lattice_vectors[axis][dimension];
+      if (!std::isfinite(actual) || !std::isfinite(expected) ||
+          std::abs(actual - expected) > tolerance * (1 + std::abs(expected)))
+        return false;
+    }
+  }
+  return true;
+}
+
 /// Reuse persistent physical identity without downloading a device-authoritative parameter image.
 std::string PsiFormerWF::trainingConfigurationFingerprint() const
 {

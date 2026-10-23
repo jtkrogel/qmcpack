@@ -2635,6 +2635,25 @@ bool PsiFormerComplexWF::matchesLegacyTorusAllElectronTarget(const ParticleSet& 
       state.environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
 }
 
+/// Match the fixed legacy torus target, including its outer twist and source bindings.
+bool PsiFormerComplexWF::matchesLegacyTorusPseudopotentialTarget(const ParticleSet& electrons) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto& state = *impl_->state;
+  if (&electrons != impl_->particles || electrons.getLattice().SuperCellEnum != SUPERCELL_BULK ||
+      state.system_kind != "pseudopotential" || state.environment.periodic_profile ||
+      state.environment.boundary != psiformer::BoundaryCondition::PERIODIC ||
+      state.environment.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1)
+    return false;
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    if (!psiformer::determinant::isFiniteReal(electrons.getTwist()[axis]) ||
+        electrons.getTwist()[axis] != state.reduced_twist[axis])
+      return false;
+  validateRuntimeLattice(electrons, state.environment, "Paired legacy PP target");
+  Impl::validateDerivativeSource(state);
+  return true;
+}
+
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {

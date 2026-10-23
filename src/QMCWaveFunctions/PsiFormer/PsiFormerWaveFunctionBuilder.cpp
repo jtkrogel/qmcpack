@@ -259,12 +259,11 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
       (imported_model && imported_model->paired_complex) ||
       (pair_profile && profile_head == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX);
-  // Only legacy PP inference may proceed to the existing Gamma/FP64/source checks.
-  // The WFTrain entry rejects HIP PP independently of this component optimize flag.
-  const bool legacy_hip_pp_inference = !pair_profile && system == "pseudopotential" &&
-      !parseOptimizationFlag(optimize);
+  // Legacy PP products reuse the native torus component. WFTrain separately
+  // admits only qualified score-only HIP optimization, never a PP dEL response.
+  const bool legacy_hip_pp = !pair_profile && system == "pseudopotential";
   if (complex_profile && normalizedAcceleratorRequest(gpu) == "hip" &&
-      system != "all_electron" && !legacy_hip_pp_inference)
+      system != "all_electron" && !legacy_hip_pp)
     throw std::invalid_argument("Paired-complex HIP native profiles require separate runtime qualification");
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
@@ -318,7 +317,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&
         optimization_enabled && optimize_scope == "all" && optimize_indices.empty() &&
         (system == "all_electron" || cpu_ecp);
-    const bool selected_gpu_training = selected_pair_gpu && optimization_enabled &&
+    const bool selected_gpu_training = (selected_pair_gpu || (!pair_profile && gpu_ecp)) && optimization_enabled &&
         optimize_scope == "all" && optimize_indices.empty();
     if ((!explicit_gpu && request != "no" && request != "cpu") ||
         (optimization_enabled && !cpu_training && !selected_gpu_training) ||
@@ -402,7 +401,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::invalid_argument("Real versioned periodic profiles currently require Gamma twist");
   if (pair_profile && complex_profile && selected_pair_gpu && (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Selected paired GPU periodic profiles require Gamma twist");
-  if (complex_profile && system == "pseudopotential" &&
+  if (pair_profile && complex_profile && system == "pseudopotential" &&
       accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
       (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Native paired pseudopotential initialization requires Gamma twist");

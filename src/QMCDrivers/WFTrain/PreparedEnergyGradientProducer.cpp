@@ -131,8 +131,8 @@ std::size_t PreparedLocalEnergyVJPCapture::storageFingerprint() const noexcept
 
 PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
     std::vector<PreparedEnergyGradientBatch> batches,
-    std::optional<EnergyClippingTransform> clipping)
-    : batches_(std::move(batches)), clipping_(std::move(clipping))
+    std::optional<EnergyClippingTransform> clipping, bool score_only)
+    : batches_(std::move(batches)), clipping_(std::move(clipping)), score_only_(score_only)
 {
   if (batches_.empty())
     throw std::invalid_argument(
@@ -150,14 +150,14 @@ PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
     const StreamingDerivativeOperator& derivative = *batch.derivative_operator;
     const StreamingDerivativeCapabilities offered = derivative.capabilities();
     if (!offered.supports(DerivativeProduct::SCORE_VJP) ||
-        !offered.supports(DerivativeProduct::LOCAL_ENERGY_VJP))
+        (!score_only_ && !offered.supports(DerivativeProduct::LOCAL_ENERGY_VJP)))
       throw std::invalid_argument(
           "Prepared energy-gradient batch lacks a required VJP product");
     if (offered.parameter_scalar_domain != ParameterScalarDomain::REAL64)
       throw std::invalid_argument(
           "Prepared energy-gradient production currently requires real parameters");
     if (!offered.coversLocalEnergyTerms(batch.local_energy_term_mask) ||
-        batch.local_energy_term_mask == 0)
+        (!score_only_ && batch.local_energy_term_mask == 0))
       throw std::invalid_argument(
           "Prepared energy-gradient batch has incomplete local-energy coverage");
     if (batch.weights.size() != derivative.sampleCount() ||
@@ -168,6 +168,8 @@ PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
     std::uint32_t complete_term_mask = batch.local_energy_term_mask;
     if (batch.additive_local_energy_vjp)
     {
+      if (score_only_)
+        throw std::invalid_argument("Score-only prepared production does not consume additive local-energy responses");
       const PreparedAdditiveLocalEnergyVJP& additive =
           *batch.additive_local_energy_vjp;
       if ((batch.local_energy_term_mask & additive.local_energy_term_mask) != 0)
@@ -229,7 +231,8 @@ PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
   capabilities_.add(TrainingCapability::REAL_PARAMETERS);
   capabilities_.add(TrainingCapability::VALUE_EVALUATION);
   capabilities_.add(TrainingCapability::SCORE_VJP);
-  capabilities_.add(TrainingCapability::LOCAL_ENERGY_VJP);
+  if (!score_only_)
+    capabilities_.add(TrainingCapability::LOCAL_ENERGY_VJP);
   if (supports_score_jvp)
     capabilities_.add(TrainingCapability::SCORE_JVP);
   if ((local_energy_term_mask_ &
@@ -249,6 +252,8 @@ void PreparedEnergyGradientProducer::accumulate(
   if (consumed_)
     throw std::logic_error(
         "Prepared energy-gradient producer can be consumed only once");
+  if (score_only_ && !isScoreOnlyEstimator(accumulator.estimator()))
+    throw std::invalid_argument("Score-only prepared production requires a score-only accumulator");
   if (parameters.schema_fingerprint != schema_fingerprint_ ||
       parameters.version != parameter_version_)
     throw std::invalid_argument(

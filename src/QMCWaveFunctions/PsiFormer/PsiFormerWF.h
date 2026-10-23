@@ -458,6 +458,8 @@ public:
 
   /// Match selected real pair metadata and the target's full cell/Gamma twist, not GPU readiness.
   bool matchesRealDevicePairTarget(const ParticleSet& particles) const;
+  /// Match only full-cell legacy torus PP metadata, Gamma twist and the actual target cell.
+  bool matchesLegacyTorusPseudopotentialTarget(const ParticleSet& particles) const;
 
   /// Fingerprint immutable physical model semantics, excluding learned parameters and Hamiltonian settings.
   std::string trainingConfigurationFingerprint() const;

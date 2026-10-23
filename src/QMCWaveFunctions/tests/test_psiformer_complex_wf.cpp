@@ -570,6 +570,7 @@ TEST_CASE("PsiFormer paired system metadata survives private ownership",
   PsiFormerComplexWF explicit_ae("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "all_electron");
   CHECK(explicit_ae.trainingConfigurationFingerprint() == implicit_ae.trainingConfigurationFingerprint());
   CHECK_FALSE(explicit_ae.isPseudopotentialSystem());
+  CHECK_FALSE(explicit_ae.matchesLegacyTorusPseudopotentialTarget(particles));
   CHECK(implicit_ae.matchesLegacyTorusAllElectronTarget(particles));
   CHECK(explicit_ae.matchesLegacyTorusAllElectronTarget(particles));
   const SimulationCell open_cell;
@@ -581,12 +582,19 @@ TEST_CASE("PsiFormer paired system metadata survives private ownership",
   PsiFormerComplexWF pp("psiformer", parameters(), particles, source, clone_cap, {}, 0, {}, "pseudopotential");
   CHECK(pp.isPseudopotentialSystem());
   CHECK_FALSE(pp.matchesLegacyTorusAllElectronTarget(particles));
+  CHECK(pp.matchesLegacyTorusPseudopotentialTarget(particles));
+  CHECK_FALSE(pp.matchesLegacyTorusPseudopotentialTarget(open_particles));
+  CHECK_FALSE(pp.matchesLegacyTorusPseudopotentialTarget(clone_particles));
+  particles.setTwist(ParticleSet::PosType{.125, 0, 0});
+  CHECK_FALSE(pp.matchesLegacyTorusPseudopotentialTarget(particles));
+  particles.setTwist(ParticleSet::PosType{});
   const auto fingerprint = pp.trainingConfigurationFingerprint();
   CHECK(fingerprint != explicit_ae.trainingConfigurationFingerprint());
   auto clone = pp.makeClone(clone_particles);
   auto* private_pp = dynamic_cast<PsiFormerComplexWF*>(clone.get());
   REQUIRE(private_pp != nullptr);
   private_pp->isolateParameterState();
+  CHECK(private_pp->matchesLegacyTorusPseudopotentialTarget(clone_particles));
   CHECK(private_pp->trainingConfigurationFingerprint() == fingerprint);
   const auto path = "psiformer_paired_kind." + std::to_string(OHMMS::Controller->rank()) + ".h5";
   private_pp->exportModel(path);
@@ -5031,7 +5039,37 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   const auto current = gpu.snapshotParameters();
   const auto current_stamp = gpu.mw_evaluateVirtualRatios(components, particles, scratch, batch, ratios);
   constexpr auto selective_scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+  // Score covariance needs accepted B only, not capacity for any virtual grid.
+  const auto accepted_requirement = gpu.gpuDerivativeRequirements(2, 2, 3, 7, selective_scope);
+  {
+    auto accepted_only = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+        accepted_requirement.device_bytes, accepted_requirement.host_bytes, 1, selective_scope);
+    CHECK(accepted_requirement.matrix_work == 0);
+    CHECK_FALSE(accepted_only->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+    CHECK(accepted_only->capabilities().local_energy_term_mask == 0);
+    auto accepted_channel = channel;
+    accepted_channel.product = DerivativeProduct::SCORE_VJP;
+    accepted_channel.local_energy_term_mask = 0;
+    accepted_channel.coefficients.parameter_version = current.version;
+    auto cpu_channel = accepted_channel;
+    cpu_channel.coefficients.parameter_version = 0;
+    ComplexStreamingSink accepted_result, cpu_result;
+    for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+    {
+      cpu_result.reset(); accepted_result.reset();
+      base_oracle->applyVJPs({&cpu_channel, 1}, adjoint, cpu_result);
+      accepted_only->applyVJPs({&accepted_channel, 1}, adjoint, accepted_result);
+      for (std::size_t i = 0; i < direction.size(); ++i)
+        close(accepted_result.values[0][i], cpu_result.values[0][i], 2e-12);
+    }
+    accepted_channel.product = DerivativeProduct::LOCAL_ENERGY_VJP;
+    ComplexStreamingSink refused;
+    CHECK_THROWS(accepted_only->applyVJPs({&accepted_channel, 1}, DerivativeAdjoint::TRANSPOSE, refused));
+  }
   const auto selective_requirement = gpu.gpuDerivativeRequirements(2, 13, 3, 7, selective_scope);
+  // Reverse products remain device B1; only HOST capacity grows with maxB.
+  CHECK(accepted_requirement.device_bytes == selective_requirement.device_bytes);
+  CHECK(accepted_requirement.host_bytes < selective_requirement.host_bytes);
   CHECK(selective_requirement.matrix_work == 0);
   CHECK(selective_requirement.device_bytes < requirement.device_bytes);
   CHECK(selective_requirement.host_bytes < requirement.host_bytes);
@@ -5480,10 +5518,28 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
         "optimize='no' max_clone_numeric_bytes='8388608' " + controls + "/>"));
     return importer.buildComponent(xml.getRoot());
   };
-  CHECK_THROWS_AS(load("gpu='no' twist='0 0 0'"), std::invalid_argument);
-  CHECK_THROWS_AS(load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='.1 0 0'"), std::invalid_argument);
-  CHECK_THROWS_AS(load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='0 0 0'", "all_electron"), std::invalid_argument);
-  auto loaded_base = load("gpu='cuda' max_gpu_numeric_bytes='67108864' twist='0 0 0'");
+  auto cpu_loaded_base = load("gpu='no' twist='0 0 0'");
+  auto* cpu_loaded = dynamic_cast<PsiFormerComplexWF*>(cpu_loaded_base.get());
+  REQUIRE(cpu_loaded != nullptr);
+  CHECK_FALSE(cpu_loaded->gpuInferenceEnabled());
+  CHECK(cpu_loaded->isPseudopotentialSystem());
+  CHECK(cpu_loaded->snapshotParameters().version == 0);
+  CHECK(cpu_loaded->snapshotParameters().values == export_state.values);
+  close(evaluate(*cpu_loaded, loaded_p), export_log, 3e-9);
+  for (int e = 0; e < loaded_p.getTotalNum(); ++e)
+  {
+    close(loaded_p.L[e], export_l[e], 3e-9);
+    for (int d = 0; d < 3; ++d) close(loaded_p.G[e][d], export_g[e][d], 3e-9);
+  }
+  CHECK_THROWS_AS(load("gpu='no' twist='.1 0 0'"), std::invalid_argument);
+#ifdef QMC_CUDA2HIP
+  const std::string import_gpu = "gpu='hip' ";
+#else
+  const std::string import_gpu = "gpu='cuda' ";
+#endif
+  CHECK_THROWS_AS(load(import_gpu + "max_gpu_numeric_bytes='67108864' twist='.1 0 0'"), std::invalid_argument);
+  CHECK_THROWS_AS(load(import_gpu + "max_gpu_numeric_bytes='67108864' twist='0 0 0'", "all_electron"), std::invalid_argument);
+  auto loaded_base = load(import_gpu + "max_gpu_numeric_bytes='67108864' twist='0 0 0'");
   auto* loaded = dynamic_cast<PsiFormerComplexWF*>(loaded_base.get());
   REQUIRE(loaded != nullptr); REQUIRE(loaded->gpuInferenceEnabled());
   CHECK(loaded->isPseudopotentialSystem());
