@@ -16,6 +16,7 @@
 
 #include <functional>
 #include <string_view>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -56,6 +57,8 @@ public:
     // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
     bool resident_device_observation = false;
     std::function<void(Crowd&, bool)> resident_device_observe;
+    /// One independent cyclic stream per crowd, shared by warmup and production.
+    mutable std::vector<IndexType> subset_cursors;
 
     State(const QMCDriverInput& qmc_input,
           const VMCDriverInput& vmc_input,
@@ -116,7 +119,8 @@ private:
                              Timers& timers,
                              RandomBase<FullPrecRealType>& random_generator,
                              bool recompute,
-                             bool accumulate_this_step);
+                             bool accumulate_this_step,
+                             IndexType* subset_cursor);
 };
 
 } // namespace qmcplusplus

@@ -30,6 +30,23 @@ ElectronSubsetSelector::ElectronSubsetSelector(IndexType electron_count,
   selected_indices_.resize(electrons_per_move_);
 }
 
+/// Validate a persisted cyclic stream before publication.
+void ElectronSubsetSelector::restoreCyclicCursor(IndexType cursor)
+{
+  if (cursor < 0 || cursor >= electron_count_ || (selection_ == Selection::RANDOM && cursor != 0))
+    throw std::invalid_argument("ElectronSubsetSelector has an invalid cyclic cursor.");
+  cyclic_cursor_ = cursor;
+}
+
+/// Share cyclic coverage across walkers while retaining independent random subsets.
+const std::vector<ElectronSubsetSelector::IndexType>& ElectronSubsetSelector::selectForWalker(
+    RandomBase<FullPrecisionRealType>& random_gen, std::size_t walker_index)
+{
+  if (selection_ == Selection::RANDOM || walker_index == 0)
+    return select(random_gen);
+  return selected_indices_;
+}
+
 const std::vector<ElectronSubsetSelector::IndexType>& ElectronSubsetSelector::select(
     RandomBase<FullPrecisionRealType>& random_gen)
 {

@@ -126,6 +126,8 @@ void VMCBatched::run()
 
   StateForThread vmc_state(qmcdriver_input_, vmcdriver_input_, *drift_modifier_, population_, steps_per_block_,
                            serializing_crowd_walkers_);
+  if (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON)
+    vmc_state.subset_cursors.resize(crowds_.size(), 0);
   VMCBatchedSampling::Timers sampling_timers{
       timers_.resource_timer,     timers_.movepbyp_timer,    timers_.buffer_timer,
       timers_.hamiltonian_timer,  timers_.collectables_timer, timers_.estimators_timer,

@@ -51,7 +51,8 @@ public:
                            int& global_step,
                            std::size_t participant_count,
                            std::size_t rank,
-                           std::size_t crowd_count);
+                           std::size_t crowd_count,
+                           std::vector<QMCTraits::IndexType>* subset_cursors = nullptr);
 
   const SamplerShardTopology& topology() const noexcept { return topology_; }
 
@@ -70,6 +71,7 @@ private:
   MCPopulation& population_;
   const RefVector<RNG>& random_generators_;
   int& global_step_;
+  std::vector<QMCTraits::IndexType>* subset_cursors_;
   SamplerShardTopology topology_;
 };
 

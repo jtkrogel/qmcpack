@@ -9,6 +9,7 @@
  * @brief Selected-parameter QMCPACK integration tests for PsiFormerWF.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
@@ -3565,6 +3566,7 @@ TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before
 TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted products",
           "[wavefunction][psiformer][cpu_target_crowd]")
 {
+  const int subset_kind = GENERATE(0, 1, 2, 3);
   ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
   ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
   bool periodic = false, pseudopotential = false;
@@ -3645,15 +3647,19 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   CHECK(repeated.target_spatial_bytes == first.target_spatial_bytes);
   compare_full();
 
-  // All-electron proposals retain complete private products on one shared target tape.
+  // Selected proposals retain complete private products on one shared target tape.
   REQUIRE(leader.supportsMultiParticleMoves());
+  const int electron_count = static_cast<int>(n);
+  const int moved_electrons = subset_kind == 0 ? electron_count : subset_kind == 1 ? 1 :
+      subset_kind == 2 ? std::max(1, electron_count / 2) : electron_count - 1;
+  INFO("electrons=" << n << " moved=" << moved_electrons << " periodic=" << periodic << " PP=" << pseudopotential);
   const auto original_positions = p0.R;
   std::vector<ParticleSet::IndexType> selected;
   std::vector<ParticleSet::PosType> proposed_positions;
   std::vector<std::size_t> offsets{0};
   for (auto* p : {&p0, &p1})
   {
-    for (int electron = 0; electron < n; ++electron)
+    for (int electron = n - moved_electrons; electron < n; ++electron)
     {
       selected.push_back(electron);
       proposed_positions.push_back(p->R[electron] + ParticleSet::PosType{.006, -.004, .003});
@@ -3687,8 +3693,9 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
     for (std::size_t walker = 0; walker < 2; ++walker)
     {
       auto expected = ParticleSet(walker ? p1 : p0);
-      for (int electron = 0; electron < n; ++electron)
-        expected.R[electron] = proposed_positions[walker * n + electron];
+      const auto slice = collective.slice(walker);
+      for (std::size_t local = 0; local < slice.size(); ++local)
+        expected.R[slice.particleIndex(local)] = slice.proposedPosition(local);
       expected.G = ValueType(0);
       expected.L = ValueType(0);
       const auto expected_log = reference.evaluateLog(expected, expected.G, expected.L);
@@ -3705,9 +3712,12 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
     altered_positions.back()[0] += .001;
     const MCMultiParticleMoves<CoordsType::POS> changed(offsets, selected, altered_positions);
     CHECK_THROWS(leader.mw_accept_rejectMultiParticleMove(components, particles, changed, {false, false}));
-    for (int electron = 0; electron < n; ++electron)
-      p0.R[electron] = proposed_positions[electron];
+    for (std::size_t local = 0; local < collective.slice(0).size(); ++local)
+      p0.R[collective.slice(0).particleIndex(local)] = collective.slice(0).proposedPosition(local);
     leader.mw_accept_rejectMultiParticleMove(components, particles, collective, {true, false});
+    for (int electron = 0; electron < n - moved_electrons; ++electron)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        CHECK(p0.R[electron][dimension] == original_positions[electron][dimension]);
     CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
     CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).target_spatial_workspace_identity ==
           first.target_spatial_workspace_identity);
@@ -3745,8 +3755,8 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
     proposed_l1 = ValueType(0);
     auto unchanged_positions = proposed_positions;
     for (std::size_t walker = 0; walker < 2; ++walker)
-      for (int electron = 0; electron < n; ++electron)
-        unchanged_positions[walker * n + electron] = particles[walker].R[electron];
+      for (std::size_t local = 0; local < collective.slice(walker).size(); ++local)
+        unchanged_positions[offsets[walker] + local] = particles[walker].R[collective.slice(walker).particleIndex(local)];
     const MCMultiParticleMoves<CoordsType::POS> unchanged(offsets, selected, unchanged_positions);
     leader.mw_evaluateMultiParticleMove(components, particles, unchanged, ratios, proposed_g, proposed_l);
     CHECK(std::abs(ratios[0]) < 2e-12);

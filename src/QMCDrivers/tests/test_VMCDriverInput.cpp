@@ -142,6 +142,46 @@ TEST_CASE("ElectronSubsetSelector", "[drivers]")
     CHECK((selector.select(random_gen) == std::vector<IndexType>{0, 1}));
   }
 
+  SECTION("cyclic state continues across sampling steps and rejects invalid restore")
+  {
+    for (IndexType count : {1, 2, 4})
+    {
+      ElectronSubsetSelector uninterrupted(5, count, Selection::CYCLIC);
+      uninterrupted.select(random_gen);
+      uninterrupted.select(random_gen);
+      ElectronSubsetSelector resumed(5, count, Selection::CYCLIC);
+      resumed.restoreCyclicCursor(uninterrupted.cyclicCursor());
+      CHECK(resumed.select(random_gen) == uninterrupted.select(random_gen));
+      const auto before = resumed.cyclicCursor();
+      CHECK_THROWS_AS(resumed.restoreCyclicCursor(-1), std::invalid_argument);
+      CHECK_THROWS_AS(resumed.restoreCyclicCursor(5), std::invalid_argument);
+      CHECK(resumed.cyclicCursor() == before);
+    }
+    ElectronSubsetSelector random(5, 2, Selection::RANDOM);
+    CHECK_THROWS_AS(random.restoreCyclicCursor(1), std::invalid_argument);
+  }
+
+  SECTION("cyclic crowd scheduling visits every coordinate of every walker")
+  {
+    std::vector<std::vector<bool>> visited(4, std::vector<bool>(4, false));
+    IndexType cursor = 0;
+    for (int step = 0; step < 4; ++step)
+    {
+      ElectronSubsetSelector selector(4, 1, Selection::CYCLIC);
+      selector.restoreCyclicCursor(cursor);
+      for (std::size_t walker = 0; walker < visited.size(); ++walker)
+      {
+        const auto& subset = selector.selectForWalker(random_gen, walker);
+        REQUIRE(subset.size() == 1);
+        CHECK(subset[0] == step);
+        visited[walker][subset[0]] = true;
+      }
+      cursor = selector.cyclicCursor();
+    }
+    for (const auto& walker : visited)
+      CHECK(std::all_of(walker.begin(), walker.end(), [](bool value) { return value; }));
+  }
+
   SECTION("random selection is sorted and without replacement")
   {
     random_gen.set_value(0.5);

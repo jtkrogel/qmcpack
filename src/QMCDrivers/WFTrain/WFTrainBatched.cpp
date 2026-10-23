@@ -460,11 +460,12 @@ bool isFirstOrder(WFTrainDriverInput::Optimizer optimizer)
       optimizer == O::MOMENTUM_SGD || optimizer == O::RMSPROP;
 }
 
-/// Preserve PBYP admission and require an actual component contract for all-electron sampling.
+/// Collective sampling requires the component's complete selected-proposal contract.
 bool supportsNativeEnergyMove(const VMCDriverInput& input, const WaveFunctionComponent& component)
 {
   return input.get_move_kind() == VMCDriverInput::MoveKind::PBYP ||
-      (input.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON && component.supportsMultiParticleMoves());
+      ((input.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON ||
+        input.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON) && component.supportsMultiParticleMoves());
 }
 
 /// Fixed first-order sample weights permit an inline ECP response without future replay.
@@ -3398,6 +3399,8 @@ void WFTrainBatched::run()
   VMCBatchedSampling::State sampling_state(qmcdriver_input_, vmcdriver_input_, *drift_modifier_, population_,
                                             steps_per_block_, serializing_crowd_walkers_);
   sampling_state.evaluate_energy = !training_input_.samplesOrbitalStudent();
+  if (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON)
+    sampling_state.subset_cursors.resize(crowds_.size(), 0);
   std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> resident_observations;
   bool resident_host_dirty = false;
   if (resident_open_observation_)
@@ -3586,7 +3589,10 @@ void WFTrainBatched::run()
   int global_step = 0;
   wftrain::WFTrainSamplerCheckpoint sampler_checkpoint(
       population_, rngs_, global_step, static_cast<std::size_t>(myComm->size()),
-      static_cast<std::size_t>(myComm->rank()), crowds_.size());
+      static_cast<std::size_t>(myComm->rank()), crowds_.size(),
+      vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON &&
+              vmcdriver_input_.get_electron_selection() == VMCDriverInput::ElectronSelection::CYCLIC
+          ? &sampling_state.subset_cursors : nullptr);
   const bool resumed = !training_input_.getRestartPath().empty();
   if (!training_input_.getCheckpointPath().empty() && myComm->rank() == 0)
     app_warning() << "WFTrain checkpoint_path is deprecated; native checkpoints use "

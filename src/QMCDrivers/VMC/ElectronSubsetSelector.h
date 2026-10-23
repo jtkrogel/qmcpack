@@ -19,7 +19,8 @@ namespace qmcplusplus
 /** Select a canonical subset of electron indices for an n-electron VMC move.
  *
  * Random selection is uniform without replacement. Cyclic selection consumes a
- * contiguous stream of indices, advancing by electrons_per_move on each call.
+ * contiguous stream of indices, advancing by electrons_per_move on each call to
+ * select. Crowd sampling shares one cyclic subset across all walkers per substep.
  * Wrapped cyclic subsets are sorted before being returned, so every result is
  * strictly increasing and contains no duplicates.
  */
@@ -39,8 +40,18 @@ public:
    */
   const std::vector<IndexType>& select(RandomBase<FullPrecisionRealType>& random_gen);
 
+  /// Call in walker order: cyclic subsets advance once per crowd substep.
+  const std::vector<IndexType>& selectForWalker(RandomBase<FullPrecisionRealType>& random_gen,
+                                               std::size_t walker_index);
+
   /// Restart cyclic selection at electron zero. Random selection has no cursor.
   void reset() noexcept { cyclic_cursor_ = 0; }
+
+  /// Next cyclic electron, independent of random-generator state.
+  IndexType cyclicCursor() const noexcept { return cyclic_cursor_; }
+
+  /// Restore the next cyclic index; reject invalid state without changing it.
+  void restoreCyclicCursor(IndexType cursor);
 
   IndexType getElectronCount() const noexcept { return electron_count_; }
   IndexType getElectronsPerMove() const noexcept { return electrons_per_move_; }

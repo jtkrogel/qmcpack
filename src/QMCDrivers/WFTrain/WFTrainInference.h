@@ -82,6 +82,8 @@ public:
     VMCBatchedSampling::State state(qmcdriver_input_, input_.vmc, *drift_modifier_, population_,
                                     steps_per_block_, serializing_crowd_walkers_);
     state.evaluate_energy = input_.evaluate_energy;
+    if (input_.vmc.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON)
+      state.subset_cursors.resize(crowds_.size(), 0);
     state.accumulate_estimators = !orbital_observer_;
     VMCBatchedSampling::Timers timers{timers_.resource_timer, timers_.movepbyp_timer, timers_.buffer_timer,
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,

@@ -137,7 +137,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
                                          Timers& timers,
                                          RandomBase<FullPrecRealType>& random_generator,
                                          bool recompute,
-                                         bool accumulate_this_step)
+                                         bool accumulate_this_step,
+                                         IndexType* subset_cursor)
 {
   if (crowd.size() == 0)
     return;
@@ -229,6 +230,12 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
         ElectronSubsetSelector selector(num_particles, particles_per_move,
                                         sft.vmcdrv_input.get_electron_selection());
+        if (move_kind == VMCDriverInput::MoveKind::N_ELECTRON)
+        {
+          if (!subset_cursor)
+            throw std::logic_error("Selected electron sampling requires a crowd cursor.");
+          selector.restoreCyclicCursor(*subset_cursor);
+        }
         std::vector<ParticleSet::PosType> gaussian_displacements(num_walkers * particles_per_move);
         std::vector<ParticleSet::PosType> physical_displacements(num_walkers * particles_per_move);
         std::vector<ParticleSet::PosType> proposed_positions(num_walkers * particles_per_move);
@@ -254,7 +261,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
             if (move_kind == VMCDriverInput::MoveKind::ALL_ELECTRON)
               selection = &all_electrons;
             else
-              selection = &selector.select(random_generator);
+              selection = &selector.selectForWalker(random_generator, iw);
 
             const ParticleSet& particles = walker_elecs[iw];
             for (int local_index = 0; local_index < particles_per_move; ++local_index)
@@ -340,6 +347,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
           TrialWaveFunction::mw_accept_rejectMultiParticleMove(walker_twfs, walker_elecs, moves, accepted);
           ParticleSet::mw_accept_rejectMoveSelectedParticles(walker_elecs, accepted);
+          if (subset_cursor && move_kind == VMCDriverInput::MoveKind::N_ELECTRON)
+            *subset_cursor = selector.cyclicCursor();
         }
       }
     }
@@ -522,14 +531,16 @@ template void VMCBatchedSampling::advanceWalkers<CoordsType::POS>(const State& s
                                                                   Timers& timers,
                                                                   RandomBase<FullPrecRealType>& random_generator,
                                                                   bool recompute,
-                                                                  bool accumulate_this_step);
+                                                                  bool accumulate_this_step,
+                                                                  IndexType* subset_cursor);
 
 template void VMCBatchedSampling::advanceWalkers<CoordsType::POS_SPIN>(const State& state,
                                                                        Crowd& crowd,
                                                                        Timers& timers,
                                                                        RandomBase<FullPrecRealType>& random_generator,
                                                                        bool recompute,
-                                                                       bool accumulate_this_step);
+                                                                       bool accumulate_this_step,
+                                                                       IndexType* subset_cursor);
 
 void VMCBatchedSampling::runVMCStep(int crowd_id,
                                     const State& state,
@@ -545,10 +556,11 @@ void VMCBatchedSampling::runVMCStep(int crowd_id,
   crowd.setRNGForHamiltonian(random_generator);
   const bool recompute  = state.is_recomputing_block && state.step + 1 == state.steps_per_block;
   const bool accumulate = state.step % state.qmcdrv_input.get_estimator_measurement_period() == 0;
+  IndexType* cursor = state.subset_cursors.empty() ? nullptr : &state.subset_cursors.at(crowd_id);
   if (state.population.get_golden_electrons().isSpinor())
-    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, recompute, accumulate);
+    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, recompute, accumulate, cursor);
   else
-    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, recompute, accumulate);
+    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, recompute, accumulate, cursor);
 }
 
 void VMCBatchedSampling::runWarmupStep(int crowd_id,
@@ -562,10 +574,11 @@ void VMCBatchedSampling::runWarmupStep(int crowd_id,
   validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
+  IndexType* cursor = state.subset_cursors.empty() ? nullptr : &state.subset_cursors.at(crowd_id);
   if (state.population.get_golden_electrons().isSpinor())
-    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, false, false);
+    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, false, false, cursor);
   else
-    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, false, false);
+    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, false, false, cursor);
 }
 
 } // namespace qmcplusplus

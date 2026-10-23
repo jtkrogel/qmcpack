@@ -243,10 +243,11 @@ TEST_CASE("WFTrain sampler checkpoint restores live walkers and RNG",
   walker.Age      = 3;
   const long walker_id = walker.getWalkerID();
   auto expected_rng = rng.makeClone();
+  std::vector<QMCTraits::IndexType> subset_cursors{3};
 
   wftrain::WFTrainSamplerCheckpoint checkpoint(
       population, rngs, global_step, static_cast<std::size_t>(comm->size()),
-      static_cast<std::size_t>(comm->rank()), 1);
+      static_cast<std::size_t>(comm->rank()), 1, &subset_cursors);
   const std::filesystem::path file = "wftrain_live_sampler_test.h5";
   std::error_code cleanup_error;
   std::filesystem::remove(file, cleanup_error);
@@ -259,9 +260,11 @@ TEST_CASE("WFTrain sampler checkpoint restores live walkers and RNG",
   walker.setWalkerID(-99);
   static_cast<void>(rng());
   global_step = 99;
+  subset_cursors[0] = 1;
   auto prepared = wftrain::TrainingCheckpoint::prepareSamplerShardRestore(file, checkpoint);
   CHECK(walker.R[0][0] == 9.0);
   CHECK(global_step == 99);
+  CHECK(subset_cursors[0] == 1);
   prepared->commit();
 
   CHECK(walker.R[0][0] == 1.25);
@@ -270,7 +273,18 @@ TEST_CASE("WFTrain sampler checkpoint restores live walkers and RNG",
   CHECK(walker.Age == 3);
   CHECK(walker.getWalkerID() == walker_id);
   CHECK(global_step == 19);
+  CHECK(subset_cursors[0] == 3);
   CHECK(rng() == (*expected_rng)());
+  subset_cursors[0] = population.get_golden_electrons().getTotalNum();
+  CHECK_THROWS_AS(checkpoint.checkpointMetadata(), std::logic_error);
+  subset_cursors[0] = 3;
+  wftrain::WFTrainSamplerCheckpoint historical(
+      population, rngs, global_step, static_cast<std::size_t>(comm->size()),
+      static_cast<std::size_t>(comm->rank()), 1);
+  wftrain::TrainingCheckpoint::saveSamplerShardAtomic(file, historical);
+  CHECK_NOTHROW(wftrain::TrainingCheckpoint::prepareSamplerShardRestore(file, historical));
+  CHECK_THROWS(wftrain::TrainingCheckpoint::prepareSamplerShardRestore(file, checkpoint));
+  CHECK(subset_cursors[0] == 3);
   std::filesystem::remove(file, cleanup_error);
 }
 
