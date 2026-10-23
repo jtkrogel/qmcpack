@@ -367,6 +367,18 @@ public:
       const RefVectorWithLeader<TrialWaveFunction>&, const RefVectorWithLeader<ParticleSet>&,
       const wftrain::StreamingDerivativeOperator&, std::size_t maximum_host_bytes) const;
 
+  /// Additional HOST capture storage; accepted derivative scratch is already admitted.
+  std::size_t nonLocalVJPCaptureRequiredBytes(std::size_t samples) const;
+
+  /// Capture a fixed-coefficient ECP VJP inline; input samples/operator outlive the transaction.
+  std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> makeBudgetedNonLocalVJPConsumer(
+      const RefVectorWithLeader<TrialWaveFunction>&, const RefVectorWithLeader<ParticleSet>&,
+      const wftrain::StreamingDerivativeOperator&, std::size_t maximum_host_bytes) const;
+
+  /// Borrow the completed complex scalar energy from that exact response transaction.
+  wftrain::DerivativeArrayView<const wftrain::DerivativeValue> capturedNonLocalEnergies(
+      const wftrain::NonLocalECPDerivativeConsumer&) const;
+
   /// Identify the fixed ion source for final-system Coulomb admission, not a movable source API.
   const ParticleSet& sourceParticles() const;
 

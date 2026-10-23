@@ -1713,6 +1713,334 @@ struct PsiFormerComplexWF::Impl
     psiformer::memory::HostCapacity trace_capacity;
   };
 
+  /// One native accepted-grid VJP; borrow the immutable accepted stream, never retain Q records.
+  struct NonLocalVJPCapture final : wftrain::NonLocalECPDerivativeConsumer
+  {
+    enum class State { IDLE, ACTIVE, COMPLETE, POISONED };
+
+    /// Admit only new fixed capture buffers; accepted coordinates and derivative scratch are borrowed.
+    static std::size_t required(std::size_t samples, std::size_t electrons, bool gpu)
+    {
+      const char* message = "Complex inline ECP capture extent overflow";
+      if (!samples || !electrons)
+        throw std::invalid_argument("Complex inline ECP capture requires a nonempty accepted batch");
+      auto bytes = pf::checkedStorageProduct(samples, 2 * sizeof(C) + sizeof(const ParticleSet*), message);
+      if (!gpu)
+        pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(3, electrons, message), message), message);
+      return bytes;
+    }
+
+    /// Reuse the accepted CPU stream's leased score tape and canonical contraction vector.
+    NonLocalVJPCapture(const DerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
+        std::unique_lock<std::mutex>&& lease)
+        : NonLocalVJPCapture(s.state, s, s.positions, targets, std::move(lease), false)
+    {
+      cpu_lane = s.lane;
+    }
+
+#ifdef ENABLE_CUDA
+    /// Reuse the accepted GPU stream's immutable image and device accumulator without a Q owner.
+    NonLocalVJPCapture(const GpuDerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
+        std::unique_lock<std::mutex>&& lease)
+        : NonLocalVJPCapture(s.lane->state, s, s.positions, targets, std::move(lease), true)
+    {
+      gpu_lane = s.lane;
+    }
+#endif
+
+    /// Allocate admitted B scalars/pointers and CPU coordinate scratch before any native grid draw.
+    NonLocalVJPCapture(std::shared_ptr<Model> model, const wftrain::StreamingDerivativeOperator& source,
+        const std::vector<double>& accepted_positions, const RefVectorWithLeader<ParticleSet>& targets,
+        std::unique_lock<std::mutex>&& lease, bool gpu)
+        : model(std::move(model)), source(source), positions(accepted_positions), execution(std::move(lease)),
+          coefficients(source.sampleCount()), energies(source.sampleCount()),
+          moved_positions(gpu ? 0 : 3 * this->model->model.ne)
+    {
+      particles.reserve(targets.size());
+      for (auto& target : targets) particles.push_back(&target.get());
+    }
+
+    /// An abandoned live traversal cannot leave a publishable partial response.
+    ~NonLocalVJPCapture() override
+    {
+      if (state == State::ACTIVE)
+        abort();
+    }
+
+    /// Fence the exact accepted family, generation, coordinates and idle reference particles.
+    void requireCurrent() const
+    {
+      std::shared_lock read(model->mutex);
+      if (model->model.p.version() != source.parameterVersion() ||
+          model->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex inline ECP source is stale or pending");
+#ifdef ENABLE_CUDA
+      if (gpu_lane && model->gpu != gpu_lane->generation)
+        throw std::logic_error("Complex inline ECP device generation changed");
+#endif
+      validateDerivativeSource(*model);
+      const auto n = model->model.ne;
+      for (std::size_t b = 0; b < particles.size(); ++b)
+      {
+        const auto& p = *particles[b];
+        if (p.getActivePtcl() >= 0 || p.R.size() != n)
+          throw std::logic_error("Complex inline ECP reference is pending or invalid");
+        for (std::size_t e = 0; e < n; ++e)
+          for (int d = 0; d < 3; ++d)
+            if (p.R[e][d] != positions[3 * (b * n + e) + d])
+              throw std::logic_error("Complex inline ECP accepted reference changed");
+      }
+    }
+
+    /// Reject foreign metadata or coefficients before the native Hamiltonian advances its RNG.
+    void preflight(const wftrain::NonLocalECPDerivativeContext& c,
+        wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+        const wftrain::ParameterReductionSink& sink) const override
+    {
+      using namespace wftrain;
+      const auto& schema = source.parameterSchema();
+      if (state != State::IDLE || channels.size() != 1 || sink.state() != DerivativeSinkState::IDLE ||
+          c.provider_id != schema.providerId() || c.schema_fingerprint != schema.fingerprint() ||
+          c.parameter_version != source.parameterVersion() || c.batch_ordinal != source.batchOrdinal() ||
+          c.sample_offset != source.sampleOffset() || c.sample_count != source.sampleCount() ||
+          c.localization != NonLocalECPLocalization::ORDINARY_LOCALITY || !c.uses_virtual_particles ||
+          !c.scalar_relativistic || c.used_dense_derivative_fallback)
+        throw std::invalid_argument("Complex inline ECP requires matching scalar ordinary-locality metadata");
+      const auto& channel = channels[0];
+      const auto& v = channel.coefficients;
+      if (channel.id.empty() || channel.product != DerivativeProduct::LOCAL_ENERGY_VJP ||
+          channel.local_energy_term_mask != localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP) ||
+          v.provider_id != c.provider_id || v.schema_fingerprint != c.schema_fingerprint ||
+          v.parameter_version != c.parameter_version || v.batch_ordinal != c.batch_ordinal ||
+          v.sample_offset != c.sample_offset || v.values.size() != c.sample_count || !v.values.data())
+        throw std::invalid_argument("Complex inline ECP coefficient identity differs");
+      for (auto value : v.values)
+        if (!isFiniteWavefunctionValue(value))
+          throw std::invalid_argument("Complex inline ECP coefficient is nonfinite");
+      requireCurrent();
+    }
+
+    /// Bind the actual accepted point count and activate one isolated transpose response channel.
+    void begin(const wftrain::NonLocalECPDerivativeContext& c,
+        wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+        wftrain::ParameterReductionSink& output) override
+    {
+      using namespace wftrain;
+      preflight(c, channels, output);
+      if (!c.grid_fingerprint)
+        throw std::invalid_argument("Complex inline ECP requires accepted grid identity");
+      expected = c.expected_point_count;
+      grid = c.grid_fingerprint;
+      std::copy(channels[0].coefficients.values.begin(), channels[0].coefficients.values.end(), coefficients.begin());
+      descriptor = {c.provider_id, c.schema_fingerprint, c.parameter_version,
+          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP), DerivativeAdjoint::TRANSPOSE,
+          ParameterScalarDomain::REAL64, ParameterScalarDomain::COMPLEX128, c.batch_ordinal, c.sample_offset,
+          c.sample_count, ReductionDomain::CROWD_LOCAL, DerivativeExecutionDomain::HOST, 1,
+          source.parameterChunkPlan().maximumChunkSize(), 1, localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+      sink = &output;
+      try
+      {
+        sink->begin(descriptor, source.parameterChunkPlan(), channels);
+#ifdef ENABLE_CUDA
+        if (gpu_lane)
+        {
+          std::shared_lock read(model->mutex);
+          std::unique_lock gpu(gpu_lane->generation->mutex);
+          gpu_lane->products->beginStreamingNonlocalVJP(pf::checkedStorageSum(expected, source.sampleCount(),
+              "Complex inline ECP score count overflow"));
+        }
+        else
+#endif
+          std::fill(cpu_lane->channels[0].begin(), cpu_lane->channels[0].end(), C{});
+        state = State::ACTIVE;
+      }
+      catch (...) { abort(); throw; }
+    }
+
+    /// Callback inputs remain live only during this call; scores are contracted before returning.
+    void consume(const wftrain::NonLocalECPDerivativeTile& tile) override
+    {
+      try
+      {
+        requireCurrent();
+        const auto& batch = tile.virtual_particles;
+        if (state != State::ACTIVE || tile.grid_fingerprint != grid || tile.tile_ordinal != tiles ||
+            batch.empty() || !batch.fingerprint() || batch.walkerCount() != source.sampleCount() ||
+            points > expected || batch.size() > expected - points ||
+            tile.bare_weights.size() != batch.size() || tile.complete_ratios.size() != batch.size() ||
+            !tile.bare_weights.data() || !tile.complete_ratios.data() || tile.evaluation_stamps.size() != 1 ||
+            !tile.evaluation_stamps.data() || !tile.evaluation_stamps[0].matches(model.get(), source.parameterVersion()))
+          throw std::invalid_argument("Complex inline ECP tile lacks exact grid, source or coverage");
+        for (std::size_t segment = 0; segment < batch.segmentCount(); ++segment)
+        {
+          const auto slice = batch.slice(segment);
+          if (slice.empty() || slice.walkerId() < 0 || slice.electronId() < 0 ||
+              std::size_t(slice.walkerId()) >= source.sampleCount() || std::size_t(slice.electronId()) >= model->model.ne)
+            throw std::invalid_argument("Complex inline ECP segment reference is invalid");
+          const auto sample = std::size_t(slice.walkerId());
+          for (std::size_t local = 0; local < slice.size(); ++local)
+          {
+            const auto q = slice.flatOffset() + local;
+            const C bare = tile.bare_weights[q], ratio = tile.complete_ratios[q];
+            const auto weight = bare * ratio;
+            if (bare.imag() != 0 || !isFiniteWavefunctionValue(bare) || !isFiniteWavefunctionValue(ratio) ||
+                !isFiniteWavefunctionValue(weight) || !isFiniteWavefunctionValue(energies[sample] + weight))
+              throw std::invalid_argument("Complex inline ECP complete weight is invalid");
+            const auto& position = slice.absolutePosition(local);
+            const std::array<double, 3> replacement{position[0], position[1], position[2]};
+            fold(sample, std::size_t(slice.electronId()), &replacement, weight);
+            energies[sample] += weight;
+          }
+        }
+        points += batch.size();
+        ++tiles;
+      }
+      catch (...) { abort(); throw; }
+    }
+
+    /// Add c*weight*O at one configuration, including zero-weight node validation.
+    void fold(std::size_t sample, std::size_t electron, const std::array<double, 3>* replacement, C weight)
+    {
+      std::shared_lock read(model->mutex);
+      if (model->model.p.version() != source.parameterVersion() || model->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex inline ECP source changed during score contraction");
+#ifdef ENABLE_CUDA
+      if (gpu_lane)
+      {
+        if (model->gpu != gpu_lane->generation)
+          throw std::logic_error("Complex inline ECP image changed");
+        std::unique_lock gpu(gpu_lane->generation->mutex);
+        const psiformer::device::ComplexVirtualReplacement move{electron, replacement ? *replacement : std::array<double, 3>{}};
+        gpu_lane->products->accumulateStreamingNonlocalScore(positions, sample, replacement ? &move : nullptr,
+            coefficients[sample], weight);
+        return;
+      }
+#endif
+      const auto n = model->model.ne;
+      std::copy_n(positions.data() + 3 * sample * n, 3 * n, moved_positions.data());
+      if (replacement)
+        std::copy(replacement->begin(), replacement->end(), moved_positions.begin() + 3 * electron);
+      cpu_lane->score_work->setPositions(pf::GeometryPositionView::interleaved(moved_positions.data(), n));
+      const auto score = cpu_lane->score.evaluate(*cpu_lane->score_work);
+      const auto weighted = coefficients[sample] * weight;
+      if (!isFiniteWavefunctionValue(weighted))
+        throw std::overflow_error("Complex inline ECP weighted coefficient overflow");
+      for (std::size_t parameter = 0; parameter < score.parameter_count; ++parameter)
+        cpu_lane->channels[0][parameter] += weighted * score.parameter_score[parameter];
+    }
+
+    /// Subtract accepted scores and emit complete finite chunks outside model/device locks.
+    void end() override
+    {
+      try
+      {
+        requireCurrent();
+        if (state != State::ACTIVE || points != expected)
+          throw std::logic_error("Complex inline ECP traversal is incomplete");
+        for (std::size_t sample = 0; sample < source.sampleCount(); ++sample)
+          fold(sample, 0, nullptr, -energies[sample]);
+#ifdef ENABLE_CUDA
+        if (gpu_lane)
+        {
+          psiformer::device::PreparedDeviceComplexProducts::CompletedResult receipt;
+          {
+            std::shared_lock read(model->mutex);
+            if (model->model.p.version() != source.parameterVersion() || model->gpu != gpu_lane->generation ||
+                model->pending_proposals.load(std::memory_order_relaxed))
+              throw std::logic_error("Complex inline ECP source changed before publication");
+            std::unique_lock gpu(gpu_lane->generation->mutex);
+            gpu_lane->products->finishStreamingNonlocalVJP();
+            receipt = gpu_lane->products->completedResult();
+          }
+          for (const auto& chunk : source.parameterChunkPlan().chunks())
+          {
+            const C* output;
+            {
+              std::unique_lock gpu(gpu_lane->generation->mutex);
+              output = gpu_lane->products->downloadCompletedChunk(receipt, 0, chunk.parameter_offset, chunk.count);
+            }
+            sink->add(0, {chunk, {output, chunk.count}});
+          }
+        }
+        else
+#endif
+        {
+          for (auto value : cpu_lane->channels[0])
+            if (!isFiniteWavefunctionValue(value))
+              throw std::overflow_error("Complex inline ECP contraction is nonfinite");
+          for (const auto& chunk : source.parameterChunkPlan().chunks())
+            sink->add(0, {chunk, {cpu_lane->channels[0].data() + chunk.parameter_offset, chunk.count}});
+        }
+        sink->end();
+        state = State::COMPLETE;
+        execution.unlock();
+      }
+      catch (...) { abort(); throw; }
+    }
+
+    /// Poison the sink and release execution authority without exposing partial scalar/vector data.
+    void abort() noexcept override
+    {
+#ifdef ENABLE_CUDA
+      if (gpu_lane && execution.owns_lock())
+        gpu_lane->products->abortStreamingNonlocalVJP();
+#endif
+      if (sink)
+        sink->abort();
+      state = State::POISONED;
+      if (execution.owns_lock())
+        execution.unlock();
+    }
+
+    /// Fixed-weight inline capture deliberately cannot serve future arbitrary-weight or JVP requests.
+    std::unique_ptr<wftrain::NonLocalECPJVPReplay> releaseJVPReplay() override
+    {
+      throw std::logic_error("Complex inline ECP capture has no arbitrary-weight replay");
+    }
+
+    /// Preserve the full complex Vnl for complete native energy assembly after successful capture.
+    wftrain::DerivativeArrayView<const C> nonlocalEnergies() const
+    {
+      if (state != State::COMPLETE)
+        throw std::logic_error("Complex inline ECP energies are incomplete");
+      return {energies.data(), energies.size()};
+    }
+
+    /// Report concrete fixed capacities separately from the already-admitted shared stream.
+    wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
+    {
+      wftrain::StreamingDerivativeStorageDiagnostics d;
+      d.sample_count = source.sampleCount();
+      d.sample_auxiliary_bytes = (coefficients.capacity() + energies.capacity()) * sizeof(C) +
+          particles.capacity() * sizeof(const ParticleSet*) + moved_positions.capacity() * sizeof(double);
+      d.retained_numeric_bytes = d.sample_auxiliary_bytes;
+      d.allocation_generation = 1;
+      d.storage_fingerprint = 1469598103934665603ULL;
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, coefficients);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, energies);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, moved_positions);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, particles);
+      return d;
+    }
+
+    const std::shared_ptr<Model> model;
+    const wftrain::StreamingDerivativeOperator& source;
+    const std::vector<double>& positions;
+    std::unique_lock<std::mutex> execution;
+    std::shared_ptr<DerivativeLane> cpu_lane;
+#ifdef ENABLE_CUDA
+    std::shared_ptr<GpuDerivativeLane> gpu_lane;
+#endif
+    std::vector<C> coefficients, energies;
+    std::vector<double> moved_positions;
+    std::vector<const ParticleSet*> particles;
+    wftrain::ParameterReductionSink* sink = nullptr;
+    wftrain::DerivativeStreamDescriptor descriptor;
+    State state = State::IDLE;
+    std::uint64_t grid = 0;
+    std::size_t expected = 0, points = 0, tiles = 0;
+  };
+
   /// Override initializer values before parameter-dependent identity or device image construction.
   static InitializedNativeModel materialize(psiformer::InitializedPsiFormerParameters initialized,
       const ParticleSet& electrons, const ParticleSet& ions, const std::string& component_name,
@@ -2777,6 +3105,88 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     throw std::logic_error("Complex PsiFormer derivative numeric capacity differs from exact admission");
   state->derivative_lane = lane;
   return result;
+}
+
+/// Bound only transient scalar/coordinate capture; shared derivative scratch is already admitted.
+std::size_t PsiFormerComplexWF::nonLocalVJPCaptureRequiredBytes(std::size_t samples) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return Impl::NonLocalVJPCapture::required(samples, impl_->state->model.ne, gpuInferenceEnabled());
+}
+
+/// Pin a fresh accepted derivative stream through one native, fixed-coefficient ECP traversal.
+std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::makeBudgetedNonLocalVJPConsumer(
+    const RefVectorWithLeader<TrialWaveFunction>& wavefunctions, const RefVectorWithLeader<ParticleSet>& particles,
+    const wftrain::StreamingDerivativeOperator& op, std::size_t host_cap) const
+{
+  const auto* cpu = dynamic_cast<const Impl::DerivativeStream*>(&op);
+#ifdef ENABLE_CUDA
+  const auto* gpu = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
+  const bool device = gpu != nullptr;
+  if ((cpu && cpu->state != impl_->state) || (gpu && gpu->lane->state != impl_->state) || (!cpu && !gpu))
+    throw std::invalid_argument("Complex inline ECP requires its own accepted derivative stream");
+  std::unique_lock execution(device ? gpu->lane->execution_mutex : cpu->lane->execution_mutex);
+#else
+  const bool device = false;
+  if (!cpu || cpu->state != impl_->state)
+    throw std::invalid_argument("Complex inline ECP requires its own CPU derivative stream");
+  std::unique_lock execution(cpu->lane->execution_mutex);
+#endif
+  std::shared_lock read(impl_->state->mutex);
+  const auto& positions = cpu ? cpu->positions
+#ifdef ENABLE_CUDA
+      : gpu->positions
+#else
+      : cpu->positions
+#endif
+      ;
+  if (!host_cap || host_cap == std::numeric_limits<std::size_t>::max() ||
+      Impl::NonLocalVJPCapture::required(op.sampleCount(), impl_->state->model.ne, device) > host_cap)
+    throw std::length_error("Complex inline ECP capture exceeds finite HOST admission");
+  if (op.parameterVersion() != impl_->state->model.p.version() ||
+      impl_->state->pending_proposals.load(std::memory_order_relaxed) || particles.size() != op.sampleCount() ||
+      wavefunctions.size() != op.sampleCount() || &particles.getLeader() != impl_->particles ||
+      &particles[0] != &particles.getLeader() || &wavefunctions[0] != &wavefunctions.getLeader())
+    throw std::invalid_argument("Complex inline ECP accepted stream or leader identity differs");
+  Impl::validateDerivativeSource(*impl_->state);
+#ifdef ENABLE_CUDA
+  if (gpu && (gpu->lane->generation != impl_->state->gpu || gpu->replay))
+    throw std::invalid_argument("Complex inline ECP requires an unbound current GPU generation");
+#endif
+  for (std::size_t b = 0; b < particles.size(); ++b)
+  {
+    const auto& orbitals = wavefunctions[b].getOrbitals();
+    const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+    if (!component || component->impl_->state != impl_->state || particles[b].isSpinor())
+      throw std::invalid_argument("Complex inline ECP requires sole same-family nonspinor clones");
+    component->impl_->requireIdle(particles[b]);
+    for (std::size_t previous = 0; previous < b; ++previous)
+      if (&particles[previous] == &particles[b] || &wavefunctions[previous] == &wavefunctions[b])
+        throw std::invalid_argument("Complex inline ECP native clone scratch aliases");
+    for (std::size_t e = 0; e < particles[b].R.size(); ++e)
+      for (int d = 0; d < 3; ++d)
+        if (particles[b].R[e][d] != positions[3 * (b * particles[b].R.size() + e) + d])
+          throw std::invalid_argument("Complex inline ECP accepted coordinates changed before preparation");
+  }
+  std::unique_ptr<Impl::NonLocalVJPCapture> capture;
+#ifdef ENABLE_CUDA
+  if (gpu) capture = std::make_unique<Impl::NonLocalVJPCapture>(*gpu, particles, std::move(execution));
+  else
+#endif
+    capture = std::make_unique<Impl::NonLocalVJPCapture>(*cpu, particles, std::move(execution));
+  if (capture->storageDiagnostics().retained_numeric_bytes > host_cap)
+    throw std::length_error("Complex inline ECP actual capture capacities exceed HOST admission");
+  return capture;
+}
+
+/// Borrow completed complex nonlocal energy from the same native response transaction.
+wftrain::DerivativeArrayView<const wftrain::DerivativeValue> PsiFormerComplexWF::capturedNonLocalEnergies(
+    const wftrain::NonLocalECPDerivativeConsumer& consumer) const
+{
+  const auto* capture = dynamic_cast<const Impl::NonLocalVJPCapture*>(&consumer);
+  if (!capture || capture->model != impl_->state)
+    throw std::invalid_argument("Complex inline ECP energy receipt belongs to another provider");
+  return capture->nonlocalEnergies();
 }
 
 /// Metadata-only pre-MC ledger query; no dummy operator, allocation or GPU call.

@@ -5367,6 +5367,27 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   const std::vector<NonLocalECPReplayPoint> grid(replay->points().begin(), replay->points().end());
   REQUIRE(grid.size() > 5); REQUIRE(grid.size() + 4 <= 128);
   CHECK(replay->tiles().size() > 1);
+  // The same native grid can be contracted immediately without retaining its points.
+  const auto inline_bytes = gpu.nonLocalVJPCaptureRequiredBytes(2);
+  CHECK_THROWS(gpu.nonLocalVJPCaptureRequiredBytes(0));
+  CHECK_THROWS(gpu.makeBudgetedNonLocalVJPConsumer(trials, particles, *op, inline_bytes - 1));
+  auto inline_consumer = gpu.makeBudgetedNonLocalVJPConsumer(trials, particles, *op, inline_bytes);
+  CHECK(inline_consumer->storageDiagnostics().retained_numeric_bytes <= inline_bytes);
+  PreparedLocalEnergyVJPCapture inline_sink(schema, 0, channel.local_energy_term_mask);
+  auto mismatched_channel = channel;
+  mismatched_channel.coefficients.parameter_version = 1;
+  CHECK_THROWS(QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hamiltonians, trials, particles, *inline_consumer, {&mismatched_channel, 1}, inline_sink));
+  CHECK(inline_sink.state() == DerivativeSinkState::IDLE);
+  const auto inline_native = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hamiltonians, trials, particles, *inline_consumer, {&channel, 1}, inline_sink);
+  CHECK(inline_native.grid_fingerprint == actual.grid_fingerprint);
+  CHECK(inline_sink.state() == DerivativeSinkState::COMPLETE);
+  CHECK_THROWS(inline_consumer->releaseJVPReplay());
+  const auto inline_energies = gpu.capturedNonLocalEnergies(*inline_consumer);
+  REQUIRE(inline_energies.size() == 2);
+  const auto inline_response = inline_sink.release();
+  CHECK(inline_response.local_energy_term_mask == channel.local_energy_term_mask);
   const auto reference_cap = reference_requirement.new_reference_host_bytes +
       reference_requirement.shared_replay_descriptor_bytes + replay->storageDiagnostics().retained_numeric_bytes +
       actual.native_capture->hostBytes(); // Shared owners ONCE, plus one new per-sample reference.
@@ -5409,6 +5430,7 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     const auto observed = (b ? gpu1 : gpu).observeCapturedLocalEnergy(particles[b], *op, b, hamiltonians[b].getLocalPotential());
     const auto cpu_kinetic = dynamic_cast<PsiFormerComplexWF&>(components[b]).observeCoulombEnergy(*cp[b], 0).kinetic;
     close(observed.nonlocal, nonlocal_energy[b], 3e-9);
+    close(inline_energies[b], nonlocal_energy[b], 3e-9);
     close(observed.local_energy, cpu_kinetic + local_baseline(particles[b]) + nonlocal_energy[b], 3e-9);
     close(observed.local_energy.real(), actual.local_energies[b], 3e-9);
     CHECK(observed.reported_real_potential == hamiltonians[b].getLocalPotential());
@@ -5430,6 +5452,9 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
     ComplexStreamingSink expected, output;
     oracle->applyVJPs({&score, 1}, adjoint, expected); op->applyVJPs({&channel, 1}, adjoint, output);
     for (std::size_t i = 0; i < direction.size(); ++i) close(output.values[0][i], expected.values[0][i], 3e-9);
+    if (adjoint == DerivativeAdjoint::TRANSPOSE)
+      for (std::size_t i = 0; i < direction.size(); ++i)
+        close(inline_response.weighted_vjp[i], expected.values[0][i], 3e-9);
     ComplexSampleSink jvp;
     op->applyLocalEnergyJVP({schema, 0, {direction.data(), direction.size()}}, channel.local_energy_term_mask, jvp);
     C lhs{}, rhs{};
