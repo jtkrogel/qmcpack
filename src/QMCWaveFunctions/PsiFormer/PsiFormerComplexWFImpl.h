@@ -129,6 +129,15 @@ struct PsiFormerComplexWF::Impl
    */
   struct GpuLane
   {
+    /// A separate VALUE-only width never multiplies the accepted FULL owner.
+    static std::size_t configuredVirtualCapacity()
+    {
+      const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY");
+      if (!value || std::string(value) == "0")
+        return 0;
+      return configuredCapacity("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY");
+    }
+
     /// Freeze the opt-in numerical tile width once when creating a model family.
     static std::size_t configuredCapacity(const char* name = "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY")
     {
@@ -197,14 +206,16 @@ struct PsiFormerComplexWF::Impl
         std::size_t limit, std::size_t capacity)
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
-      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity);
+      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
+                           configuredVirtualCapacity());
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
     static std::unique_ptr<GpuLane> prepareFrozen(const psiformer::PsiFormerExecutionPlan& plan,
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
         std::size_t limit, psiformer::device::TargetVglPreparation preparation, std::size_t capacity = 1,
-        std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {})
+        std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {},
+        std::size_t virtual_capacity = 0)
     {
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
@@ -229,12 +240,12 @@ struct PsiFormerComplexWF::Impl
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
                                      work > preparation.scalar_work_budget))
         throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
-      const auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
+      auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
                                                              "Complex GPU lane bytes overflow");
       if (bytes > limit)
         throw std::length_error("Complex GPU VALUE+spatial lane exceeds its explicit device byte cap");
       constexpr auto staging_per_electron = 3 * sizeof(double) + 5 * sizeof(cuDoubleComplex) + 4 * sizeof(C);
-      const auto host = psiformer::spatial_detail::checkedAdd(
+      auto host = psiformer::spatial_detail::checkedAdd(
           psiformer::spatial_detail::checkedAdd(value.host_bytes, spatial.host_bytes, "Complex GPU host bytes overflow"),
           psiformer::spatial_detail::checkedAdd(
               psiformer::spatial_detail::checkedProduct(sizeof(ComplexValueResult), capacity, "Complex GPU amplitude staging overflow"),
@@ -242,6 +253,28 @@ struct PsiFormerComplexWF::Impl
                   psiformer::spatial_detail::checkedProduct(capacity, plan.modelShape().electrons(), "Complex GPU staging overflow"),
                   "Complex GPU staging overflow"),
               "Complex GPU staging overflow"), "Complex GPU host bytes overflow");
+      if (virtual_capacity)
+      {
+        if (plan.environment().periodic_profile || !configuredDeviceMemoryAdmission().limit_bytes)
+          throw std::invalid_argument("Complex virtual tiles require legacy periodic FP64 and aggregate device admission");
+        const auto extra = estimateComplexValueCost(plan, virtual_capacity);
+        const auto add = [](std::size_t a, std::size_t b) {
+          return psiformer::spatial_detail::checkedAdd(a, b, "Complex virtual tile bytes overflow");
+        };
+        const auto mul = [](std::size_t a, std::size_t b) {
+          return psiformer::spatial_detail::checkedProduct(a, b, "Complex virtual tile bytes overflow");
+        };
+        bytes = add(bytes, extra.device_bytes);
+        host = add(host, add(extra.host_bytes, mul(virtual_capacity,
+            add(mul(3 * sizeof(double), plan.modelShape().electrons()),
+                sizeof(ComplexValueResult) + sizeof(std::array<std::size_t, 3>)))));
+        if (add(bytes, host) > limit)
+          throw std::length_error("Complex virtual tile exceeds conservative combined DEVICE/HOST numeric bound");
+        app_log() << "  Complex virtual tile preflight: capacity=" << virtual_capacity
+                  << ", extra_value_device_bytes=" << extra.device_bytes
+                  << ", combined_numeric_bytes=" << add(bytes, host)
+                  << "; existing_numeric_limit=yes; aggregate_HOST_fit=no; before_allocation=yes" << std::endl;
+      }
       if (capacity > 1 || shared_image)
         app_log() << "  Complex PsiFormer dense GPU preflight: tile_capacity=" << capacity
                   << ", value_device_bytes=" << value.device_bytes << ", full_vgl_device_bytes=" << spatial.device_bytes
@@ -249,7 +282,8 @@ struct PsiFormerComplexWF::Impl
                   << ", independent_resource_lane=" << bool(shared_image)
                   << "; image_and_vendor_bytes_excluded=yes" << std::endl;
       return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
-                                                preparation, work, bytes, host, capacity, std::move(shared_image)));
+                                                preparation, work, bytes, host, capacity, std::move(shared_image),
+                                                virtual_capacity));
     }
 
     /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
@@ -257,8 +291,9 @@ struct PsiFormerComplexWF::Impl
         const std::vector<double>& nuclei, std::size_t version,
         psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
         psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host,
-        std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image)
-        : capacity(capacity), electrons(plan.modelShape().electrons()), blas(queue),
+        std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image,
+        std::size_t virtual_capacity)
+        : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
                   ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
@@ -269,15 +304,37 @@ struct PsiFormerComplexWF::Impl
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas, spatial_cost.device_bytes)),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
           laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),
+          virtual_positions(3 * electrons * virtual_capacity), virtual_amplitude(virtual_capacity),
+          virtual_indices(virtual_capacity),
           device_bytes(bytes), host_bytes(host), preparation(preparation)
     {
+      if (virtual_capacity)
+      {
+        const auto extra = psiformer::device::estimateComplexValueCost(plan, virtual_capacity);
+        int ordinal;
+#ifdef QMC_CUDA2HIP
+        psiformer::device::checkRuntime(hipGetDevice(&ordinal), "complex virtual tile device");
+#else
+        psiformer::device::checkRuntime(cudaGetDevice(&ordinal), "complex virtual tile device");
+#endif
+        // Probe the complete addition, then release it before per-buffer reservations.
+        // Concurrent model allocations can still cause clean RAII rollback.
+        { auto probe = psiformer::device::deviceMemoryMetrics(ordinal).reserveAllocation(extra.device_bytes); }
+        virtual_value = psiformer::device::PreparedDeviceComplexValue::prepare(
+            image, virtual_capacity, queue, blas, extra.device_bytes);
+      }
       const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
               sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
               sizeof(cuDoubleComplex) * (gradient.capacity() + laplacian.capacity() + ratio.capacity()) +
-              sizeof(C) * converted.capacity();
+              sizeof(C) * converted.capacity() +
+              (virtual_value ? virtual_value->cost().host_bytes : 0) +
+              sizeof(double) * virtual_positions.capacity() +
+              sizeof(psiformer::device::ComplexValueResult) * virtual_amplitude.capacity() +
+              sizeof(std::array<std::size_t, 3>) * virtual_indices.capacity();
       if (actual_host != host_bytes)
         throw std::logic_error("Complex GPU host capacities differ from checked preparation");
-      if (value->cost().device_bytes + full->cost().device_bytes != device_bytes)
+      if (value->cost().device_bytes + full->cost().device_bytes +
+          (virtual_value ? virtual_value->cost().device_bytes : 0) != device_bytes)
         throw std::logic_error("Complex GPU owner capacities differ from checked preparation");
       app_log() << "  Complex PsiFormer GPU inference prepared: mode="
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
@@ -295,10 +352,14 @@ struct PsiFormerComplexWF::Impl
         return;
       value->validateModelRebind(current);
       full->validateModelRebind(current);
+      if (virtual_value)
+        virtual_value->validateModelRebind(current);
       queue.sync();
       auto retired = image; // Prevent graph adoption from retiring the last old image.
       value->adoptPreparedModel(current);
       full->adoptPreparedModel(current);
+      if (virtual_value)
+        virtual_value->adoptPreparedModel(current);
       image = current;
     }
 
@@ -315,16 +376,20 @@ struct PsiFormerComplexWF::Impl
       converted.resize(4 * electrons * count);
     }
 
-    const std::size_t capacity, electrons;
+    const std::size_t capacity, electrons, virtual_capacity;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
     std::unique_ptr<psiformer::device::PreparedDeviceComplexValue> value;
+    std::unique_ptr<psiformer::device::PreparedDeviceComplexValue> virtual_value;
     std::unique_ptr<psiformer::device::PreparedDeviceComplexSpatial> full;
     std::vector<double> positions;
     std::vector<psiformer::device::ComplexValueResult> amplitude;
     std::vector<cuDoubleComplex> gradient, laplacian, ratio;
     std::vector<C> converted;
+    std::vector<double> virtual_positions;
+    std::vector<psiformer::device::ComplexValueResult> virtual_amplitude;
+    std::vector<std::array<std::size_t, 3>> virtual_indices;
     const std::size_t device_bytes, host_bytes;
     const psiformer::device::TargetVglPreparation preparation;
     std::size_t dense_value_calls = 0, dense_vgl_calls = 0, dense_ratio_grad_calls = 0, dense_eval_grad_calls = 0,
@@ -521,6 +586,8 @@ struct PsiFormerComplexWF::Impl
       const auto version = native_candidate.commit();
       generation->value->adoptPreparedModel(successor);
       generation->full->adoptPreparedModel(successor);
+      if (generation->virtual_value)
+        generation->virtual_value->adoptPreparedModel(successor);
       generation->image = successor;
       retired_derivative.swap(state->gpu_derivative_lane);
       committed = true;
@@ -4175,7 +4242,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
   parameters.parameter_version = version;
   auto lane = std::shared_ptr<Impl::GpuLane>(Impl::GpuLane::prepareFrozen(original->plan,
       parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
-      source_lane->preparation, source_lane->capacity, image));
+      source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
@@ -4321,6 +4388,8 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     captured->queue.sync();
     captured->value->validateModelRebind(successor);
     captured->full->validateModelRebind(successor);
+    if (captured->virtual_value)
+      captured->virtual_value->validateModelRebind(successor);
     auto native = state->model.p.prepare_flat_values(candidate.values, expected_version);
     // All clones, including this publisher, reject old accepted caches by version.
     return std::make_unique<Impl::PreparedGpuPublication>(state, captured, std::move(successor),
@@ -4388,7 +4457,7 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
       resource.gpu = Impl::GpuLane::prepareFrozen(impl_->state->plan,
           impl_->state->model.p.flat_values(), impl_->state->model.cfg.nuclei.x,
           impl_->state->model.p.version(), impl_->state->gpu_limit,
-          primary.preparation, primary.capacity, primary.image);
+          primary.preparation, primary.capacity, primary.image, primary.virtual_capacity);
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes
@@ -5361,6 +5430,120 @@ WaveFunctionComponent::EvaluationStamp PsiFormerComplexWF::mw_evaluateVirtualRat
 {
   const auto state = impl_->state;
   std::size_t version;
+#ifdef ENABLE_CUDA
+  if (state->gpu && state->gpu->virtual_capacity)
+  {
+    std::shared_lock read(state->mutex);
+    impl_->requireNoCollective();
+    if (&components.getLeader() != this || components.size() != batch.walkerCount() ||
+        particles.size() != components.size() || scratch.size() != components.size())
+      throw std::invalid_argument("Complex virtual tile leader/list extent mismatch");
+    batch.validateOutputExtent(ratios.size());
+    batch.validateFor(particles, state->source->getTotalNum());
+    for (const auto& position : batch.absolutePositions())
+      for (int dimension = 0; dimension < 3; ++dimension)
+        if (!psiformer::determinant::isFiniteReal(position[dimension]))
+          throw std::invalid_argument("Complex virtual tile positions must be finite");
+    for (std::size_t walker = 0; walker < components.size(); ++walker)
+    {
+      const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[walker]);
+      if (!component || component->impl_->state != state || component->impl_->particles != &particles[walker])
+        throw std::invalid_argument("Complex virtual tile requires exact same-family reference clones");
+      for (std::size_t other = 0; other < walker; ++other)
+        if (&components[walker] == &components[other] || &scratch[walker] == &scratch[other])
+          throw std::invalid_argument("Complex virtual tile requires distinct clones and scratch objects");
+      for (std::size_t reference = 0; reference < components.size(); ++reference)
+        if (static_cast<const ParticleSet*>(&scratch[walker]) == &particles[reference])
+          throw std::invalid_argument("Complex virtual tile scratch aliases a reference walker");
+      if (scratch[walker].isSpinor() != particles[walker].isSpinor())
+        throw std::invalid_argument("Complex virtual tile scratch/reference spinor mismatch");
+      component->impl_->requireIdle(particles[walker]);
+      component->impl_->validate(particles[walker], 0);
+      component->impl_->formRatio(component->impl_->accepted, particles[walker], 0, &particles[walker].R[0]);
+    }
+    const auto bytes = pf::checkedStorageBytes<ValueType>(
+        pf::checkedStorageProduct(4, batch.size(), "Complex virtual tile staging overflow"),
+        "Complex virtual tile staging overflow");
+    if (bytes > impl_->numeric_limit - impl_->numeric_required)
+      throw std::length_error("Complex virtual tile output exceeds clone numeric staging cap");
+    version = state->model.p.version();
+    auto permit = state->inference_concurrency.acquire();
+    const auto owner = impl_->selectedGpuLane();
+    auto& lane = *owner;
+    std::unique_lock lease(lane.mutex);
+    impl_->bindGpuLane(lane);
+    if (!lane.virtual_value || lane.virtual_capacity != state->gpu->virtual_capacity)
+      throw std::logic_error("Complex virtual tile owner differs from its frozen family");
+    std::vector<ValueType> staged(ratios.size());
+    std::size_t count = 0;
+    const auto flush = [&] {
+      if (!count)
+        return;
+      lane.virtual_positions.resize(3 * lane.electrons * count);
+      lane.virtual_amplitude.resize(count);
+      {
+        NativeTimerScope numerical(impl_->phase_timers.gpu_evaluate);
+        lane.virtual_value->evaluate(lane.virtual_positions);
+      }
+      {
+        NativeTimerScope download(impl_->phase_timers.gpu_download);
+        lane.virtual_value->download(lane.virtual_value->resultView(), lane.virtual_amplitude);
+      }
+      for (std::size_t local = 0; local < count; ++local)
+      {
+        const auto& index = lane.virtual_indices[local];
+        const auto& result = lane.virtual_amplitude[local];
+        const Impl::Amplitude amplitude{{result.phase.x, result.phase.y}, result.log_abs};
+        const auto& component = static_cast<const PsiFormerComplexWF&>(components[index[1]]);
+        const auto& position = batch.absolutePositions()[index[0]];
+        staged[index[0]] = component.impl_->formRatio(amplitude, particles[index[1]], index[2], &position);
+      }
+      count = 0;
+    };
+    try
+    {
+      NativeTimerScope value_timer(impl_->phase_timers.value);
+      for (std::size_t segment = 0; segment < batch.segmentCount(); ++segment)
+      {
+        const auto slice = batch.slice(segment);
+        for (std::size_t point = 0; point < slice.size(); ++point)
+        {
+          // Every packed configuration starts from its own immutable walker base.
+          lane.virtual_positions.resize(3 * lane.electrons * lane.virtual_capacity);
+          const auto offset = 3 * lane.electrons * count;
+          const auto& reference = particles[slice.walkerId()];
+          for (std::size_t electron = 0; electron < lane.electrons; ++electron)
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              lane.virtual_positions[offset + 3 * electron + dimension] = reference.R[electron][dimension];
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            lane.virtual_positions[offset + 3 * slice.electronId() + dimension] = slice.absolutePosition(point)[dimension];
+          lane.virtual_indices[count++] = {slice.flatOffset() + point,
+              static_cast<std::size_t>(slice.walkerId()), static_cast<std::size_t>(slice.electronId())};
+          if (count == lane.virtual_capacity)
+            flush();
+        }
+      }
+      flush();
+      Impl::validateDerivativeSource(*state);
+      for (std::size_t walker = 0; walker < components.size(); ++walker)
+      {
+        const auto& component = static_cast<const PsiFormerComplexWF&>(components[walker]);
+        component.impl_->requireIdle(particles[walker]);
+        component.impl_->validate(particles[walker], 0);
+        component.impl_->formRatio(component.impl_->accepted, particles[walker], 0, &particles[walker].R[0]);
+      }
+      if (state->model.p.version() != version || state->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex virtual tile source/version changed before publication");
+      ratios.swap(staged);
+      return EvaluationStamp::versioned(state.get(), static_cast<std::uint64_t>(version));
+    }
+    catch (...)
+    {
+      lane.virtual_value->discardResults();
+      throw;
+    }
+  }
+#endif
   {
     std::shared_lock read(state->mutex);
     impl_->requireNoCollective();

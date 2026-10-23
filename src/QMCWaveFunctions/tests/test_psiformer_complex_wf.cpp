@@ -132,7 +132,8 @@ public:
       "PSIFORMER_GPU_LIFTED_CHANNELS", "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
       "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
       "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE",
-      "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS"};
+      "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS",
+      "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -5731,6 +5732,146 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
 #endif
 }
 #ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer paired virtual tiles pack independent ragged walker replacements",
+          "[wavefunction][psiformer][complex_virtual_tile]")
+{
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices) { WARN("NOT_RUN: virtual tile requires GPU"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) { WARN("NOT_RUN: virtual tile requires GPU"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  if (!ps::device::configuredDeviceMemoryAdmission().limit_bytes)
+  { WARN("NOT_RUN: virtual tile requires explicit aggregate device admission"); return; }
+  ScopedComplexGpuControls controls;
+  auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  const SimulationCell simulation_cell(cell());
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+    for (std::size_t capacity : {std::size_t(1), std::size_t(2), std::size_t(4)})
+    {
+      CAPTURE(capacity, twist);
+      controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", std::to_string(capacity));
+      auto p = electrons(simulation_cell), p1 = electrons(simulation_cell);
+      p1.R[1][2] += .037; p1.update();
+      PsiFormerComplexWF gpu("tile", initialized, p, source, clone_cap, twist, 64 * 1024 * 1024);
+      auto clone = gpu.makeClone(p1);
+      auto& gpu1 = dynamic_cast<PsiFormerComplexWF&>(*clone);
+      const auto log0 = evaluate(gpu, p), log1 = evaluate(gpu1, p1);
+      const auto accepted_g = p.G, accepted_g1 = p1.G;
+      const auto accepted_l = p.L, accepted_l1 = p1.L;
+      const auto storage = gpu.numericStorage();
+      RefVectorWithLeader<WaveFunctionComponent> components(gpu, {gpu, gpu1});
+      RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
+      VirtualParticleSet v0(p), v1(p1);
+      v0.makeMovesAbsolute(p, 0, {&p.R[0], 1});
+      v1.makeMovesAbsolute(p1, 2, {&p1.R[2], 1});
+      const auto scratch0 = v0.R, scratch1 = v1.R;
+      RefVectorWithLeader<VirtualParticleSet> scratch(v0, {v0, v1});
+      const std::vector<std::size_t> offsets{0, 2, 5, 9};
+      const std::vector<VirtualParticleBatch::Segment> segments{{1, 2}, {0, 0, true, 0}, {1, 3}};
+      std::vector<ParticleSet::PosType> points;
+      std::vector<C> expected;
+      for (std::size_t segment = 0; segment < segments.size(); ++segment)
+        for (std::size_t q = offsets[segment]; q < offsets[segment + 1]; ++q)
+        {
+          const auto walker = segments[segment].walkerId(), electron = segments[segment].electronId();
+          auto absolute = particles[walker].R[electron];
+          absolute[0] += .009 * (q + 1); absolute[2] -= .003 * q;
+          if (q == 8)
+            for (int d = 0; d < 3; ++d) absolute[d] += cell().R(0, d);
+          points.push_back(absolute);
+          auto fresh_p = electrons(simulation_cell);
+          for (int e = 0; e < 4; ++e) fresh_p.R[e] = particles[walker].R[e];
+          fresh_p.R[electron] = absolute; fresh_p.update();
+          PsiFormerComplexWF fresh("independent", initialized, fresh_p, source, clone_cap, twist);
+          expected.push_back(std::exp(evaluate(fresh, fresh_p) - (walker ? log1 : log0)));
+        }
+      const VirtualParticleBatch batch(2, offsets, segments, points);
+      std::vector<C> output(points.size(), C{71, -9});
+      const auto call = [&] { return gpu.mw_evaluateVirtualRatios(components, particles, scratch, batch, output); };
+      const auto warm = metrics.snapshot();
+      const auto stamp = call();
+      REQUIRE(stamp.isVersioned());
+      for (std::size_t q = 0; q < output.size(); ++q) close(output[q], expected[q]);
+      CHECK(call() == stamp);
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+      const std::vector<std::size_t> empty_offsets{0};
+      const std::vector<VirtualParticleBatch::Segment> empty_segments;
+      const std::vector<ParticleSet::PosType> empty_points;
+      const VirtualParticleBatch empty(2, empty_offsets, empty_segments, empty_points);
+      std::vector<C> empty_output;
+      CHECK(gpu.mw_evaluateVirtualRatios(components, particles, scratch, empty, empty_output) == stamp);
+      CHECK(empty_output.empty());
+      const std::vector<std::size_t> bad_offsets{0, 2, 2, 5, 9};
+      const std::vector<VirtualParticleBatch::Segment> bad_segments{{1, 2}, {0, 1}, {0, 0}, {1, 3}};
+      CHECK_THROWS(VirtualParticleBatch(2, bad_offsets, bad_segments, points));
+      REQUIRE(v0.R.size() == scratch0.size()); REQUIRE(v1.R.size() == scratch1.size());
+      for (std::size_t q = 0; q < scratch0.size(); ++q)
+        for (int d = 0; d < 3; ++d) CHECK(v0.R[q][d] == scratch0[q][d]);
+      for (std::size_t q = 0; q < scratch1.size(); ++q)
+        for (int d = 0; d < 3; ++d) CHECK(v1.R[q][d] == scratch1[q][d]);
+      CHECK(gpu.get_log_value() == log0); CHECK(gpu1.get_log_value() == log1);
+      CHECK(p.G == accepted_g); CHECK(p1.G == accepted_g1);
+      CHECK(p.L == accepted_l); CHECK(p1.L == accepted_l1);
+      CHECK(gpu.numericStorage().fingerprint == storage.fingerprint);
+      const auto saved = output;
+      const auto last = points.back(); points.back()[0] = std::numeric_limits<double>::quiet_NaN();
+      CHECK_THROWS(call()); CHECK(output == saved); points.back() = last;
+      RefVectorWithLeader<VirtualParticleSet> aliases(v0, {v0, v0});
+      CHECK_THROWS(gpu.mw_evaluateVirtualRatios(components, particles, aliases, batch, output));
+      CHECK(output == saved);
+      p.makeMove(0, ParticleSet::PosType{.01, 0, 0}); gpu.ratio(p, 0);
+      CHECK_THROWS(call()); CHECK(output == saved);
+      gpu.restore(0); p.rejectMove(0);
+      CHECK(call() == stamp);
+      auto changed = gpu.snapshotParameters(); changed.values[0] += .002;
+      const auto budget = gpu.gpuParameterPublicationRequirements();
+      REQUIRE(gpu.publishBudgetedGpuParameters(changed, changed.version, budget.device_bytes, budget.host_bytes) == 1);
+      CHECK_THROWS(call()); CHECK(output == saved);
+      evaluate(gpu, p); evaluate(gpu1, p1);
+      const auto after_publication = metrics.snapshot();
+      CHECK(call() != stamp);
+      CHECK(metrics.snapshot().allocation_calls == after_publication.allocation_calls);
+      // The stronger ON-only numeric bound rejects before image or optional allocation.
+      const auto before_cap = metrics.snapshot();
+      const auto combined = storage.shared_gpu_bytes + storage.shared_gpu_host_bytes;
+      CHECK_THROWS(PsiFormerComplexWF("capped", initialized, p, source, clone_cap, twist, combined - 1));
+      CHECK(metrics.snapshot().allocation_calls == before_cap.allocation_calls);
+      std::printf("COMPLEX_VIRTUAL_TILE PASS T=%zu Q=9 W=2 independent_CPU=1 scratch_unchanged=1 warm_allocations=0\n", capacity);
+    }
+  // A competing native reservation can win after local numeric preflight.  Admit
+  // the candidate's old image/base owners, but leave no optional-tile headroom;
+  // destruction must undo every partial candidate owner without harming a peer.
+  {
+    controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "0");
+    auto p = electrons(simulation_cell);
+    PsiFormerComplexWF peer("peer", initialized, p, source, clone_cap, {}, 64 * 1024 * 1024);
+    const auto peer_log = evaluate(peer, p);
+    const auto inventory = peer.numericStorage();
+    const auto baseline = metrics.snapshot();
+    const auto policy = ps::device::configuredDeviceMemoryAdmission();
+    const auto available = *policy.limit_bytes - policy.external_reserve_bytes - baseline.live_bytes;
+    const auto old_owners = inventory.shared_gpu_bytes + inventory.shared_image_bytes;
+    REQUIRE(available > old_owners);
+    {
+      auto competing = metrics.reserveAllocation(available - old_owners);
+      controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "4");
+      CHECK_THROWS(PsiFormerComplexWF("partial", initialized, p, source, clone_cap, {}, 64 * 1024 * 1024));
+      CHECK(metrics.snapshot().live_bytes == baseline.live_bytes);
+      CHECK(metrics.snapshot().allocation_calls > baseline.allocation_calls);
+    }
+    CHECK(peer.get_log_value() == peer_log);
+    CHECK_NOTHROW(evaluate(peer, p));
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+  CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
+}
+
 TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership",
           "[wavefunction][psiformer][complex_captured_ecp]")
 {
@@ -6147,6 +6288,11 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   REQUIRE(cudaGetDevice(&device) == cudaSuccess);
 #endif
   ScopedComplexGpuControls controls;
+  const auto virtual_capacity = GENERATE(0, 4);
+  CAPTURE(virtual_capacity);
+  if (virtual_capacity && !ps::device::configuredDeviceMemoryAdmission().limit_bytes)
+  { WARN("NOT_RUN: native ECP virtual tile requires aggregate device admission"); return; }
+  controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", std::to_string(virtual_capacity));
   const SimulationCell simulation_cell(cell());
   auto source = ions(simulation_cell), p = electrons(simulation_cell, 3, 1);
   // VP's zero-table limit means "all" when cloned; prepare the same ion table in both owners first.
@@ -6201,6 +6347,13 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial, *trial1});
   RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
   RefVectorWithLeader<QMCHamiltonian> hamiltonians(ham, {ham, *ham1});
+  // Candidate isolation is a cold, unacquired-family operation.  Establish its
+  // private owners before borrowing the source crowd's inference resources.
+  ParticleSet private_p(p), private_cpu_p(p);
+  auto private_owner = gpu.makeClone(private_p);
+  auto& private_gpu = dynamic_cast<PsiFormerComplexWF&>(*private_owner);
+  const auto isolation = private_gpu.gpuCandidateIsolationRequirements();
+  private_gpu.isolateBudgetedGpuParameterState(isolation.device_bytes, isolation.host_bytes);
   ResourceCollection pr("paired actual ECP particles"), wr("paired actual ECP wavefunctions"), hr("paired actual ECP H");
   p.createResource(pr); trial.createResource(wr); ham.createResource(hr);
   ResourceCollectionTeamLock<ParticleSet> pl(pr, particles);
@@ -6256,8 +6409,12 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   CHECK_THROWS(QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
       hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, native_requirement.total_host_bytes - 1));
   CHECK(replay_sink.state() == DerivativeSinkState::IDLE);
+  const auto native_begin = std::chrono::steady_clock::now();
   const auto actual = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
       hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, native_requirement.total_host_bytes);
+  const auto native_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - native_begin).count();
+  std::printf("COMPLEX_ACTUAL_ECP_OPERATION virtual_T=%d W=2 seconds=%.9g timing=steady_clock_complete_native_capture derivative_mode=unchanged\n",
+      virtual_capacity, native_seconds);
   REQUIRE(actual.native_capture);
   CHECK(actual.native_capture->hostBytes() == native_requirement.total_host_bytes);
   CHECK(actual.native_capture->scientificDefinition() == provenance->scientific_definition);
@@ -6375,11 +6532,6 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   CHECK_THROWS(gpu.makeBudgetedFixedGridEnergyReference(p, *op, 2, actual.native_capture, reference_cap));
   auto fixed_grid = gpu.makeBudgetedFixedGridEnergyReference(p, *op, 0, actual.native_capture, reference_cap);
   CHECK_THROWS(gpu1.makeBudgetedFixedGridEnergyReference(p1, *op, 0, actual.native_capture, reference_cap));
-  ParticleSet private_p(p), private_cpu_p(p);
-  auto private_owner = gpu.makeClone(private_p);
-  auto& private_gpu = dynamic_cast<PsiFormerComplexWF&>(*private_owner);
-  const auto isolation = private_gpu.gpuCandidateIsolationRequirements();
-  private_gpu.isolateBudgetedGpuParameterState(isolation.device_bytes, isolation.host_bytes);
   PsiFormerComplexWF private_cpu("actual_ecp", initialized, private_cpu_p, source, clone_cap, twist);
   const auto private_publication = private_gpu.gpuParameterPublicationRequirements();
   const auto real_leaf = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),

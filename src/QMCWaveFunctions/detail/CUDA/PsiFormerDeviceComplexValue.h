@@ -254,6 +254,9 @@ public:
   /// Report checked standalone storage, excluding shared image/queue/vendor reserves.
   const ComplexValueCost& cost() const noexcept { return cost_; }
 
+  /// A consumer failed after numerical publication; no borrowed result may survive.
+  void discardResults() noexcept { valid_ = false; }
+
 private:
   friend class PreparedDeviceComplexScore;
 
