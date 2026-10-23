@@ -6572,6 +6572,93 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   std::printf("COMPLEX_ACTUAL_ECP PASS actual_traversal=1 complex_energy=1 real_reporting=1 CPU_allP=1 duality=1 cap_abort_stale=1\n");
 }
 #endif
+TEST_CASE("PsiFormer paired GPU raw orbital-MSE matches independent CPU objective and preserves accepted state",
+          "[wavefunction][psiformer][complex_gpu_orbital_mse]")
+{
+#ifdef ENABLE_CUDA
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  const bool available = hipGetDeviceCount(&devices) == hipSuccess && devices;
+#else
+  const bool available = cudaGetDeviceCount(&devices) == cudaSuccess && devices;
+#endif
+  if (!available) { WARN("NOT_RUN: orbital-MSE needs a native GPU"); return; }
+  ScopedComplexGpuControls controls;
+  const SimulationCell simulation_cell(cell());
+  auto source = ions(simulation_cell);
+  for (const std::array<double, 3> twist : {std::array<double, 3>{0, 0, 0}, {.17, -.11, .07}})
+  {
+    auto p = electrons(simulation_cell), cpu_p = electrons(simulation_cell);
+    PsiFormerComplexWF cpu("mse", parameters(), cpu_p, source, clone_cap, twist);
+    PsiFormerComplexWF gpu("mse", parameters(), p, source, clone_cap, twist, 64 * 1024 * 1024);
+    const auto accepted = evaluate(gpu, p);
+    const auto accepted_energy = gpu.observeCoulombEnergy(p, 0).kinetic;
+    const auto state = gpu.snapshotParameters();
+    std::vector<C> target;
+    cpu.evaluateOrbitalValues(cpu_p, target, state.version);
+    for (std::size_t i = 0; i < target.size(); ++i) target[i] += C{.013 * std::sin(double(i)), -.021};
+    cpu.prepareOrbitalMSE(cpu.orbitalMSEStorage().required_bytes);
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+    REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+    auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+    const auto requirement = gpu.orbitalMSEStorage();
+    const auto before = metrics.snapshot();
+    CHECK_THROWS(gpu.prepareOrbitalMSE(requirement.required_bytes - 1));
+    CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+    CHECK(gpu.orbitalMSEStorage().prepared_bytes == 0);
+    gpu.prepareOrbitalMSE(requirement.required_bytes);
+    const auto prepared = gpu.orbitalMSEStorage();
+    CHECK(prepared.prepared_bytes == requirement.required_bytes);
+    std::vector<C> raw, expected_raw;
+    gpu.evaluateOrbitalValues(p, raw, state.version);
+    cpu.evaluateOrbitalValues(cpu_p, expected_raw, state.version);
+    for (std::size_t i = 0; i < raw.size(); ++i) close(raw[i], expected_raw[i], 2e-12);
+    std::vector<double> gradient(state.values.size(), 71), expected(gradient.size());
+    for (auto normalization : {wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM,
+        wftrain::OrbitalLossNormalization::FULL_MATRIX_MEAN})
+    {
+      const auto warm = metrics.snapshot();
+      const auto loss = gpu.evaluateOrbitalMSE(p, target, gradient, state.version, normalization);
+      const auto expected_loss = cpu.evaluateOrbitalMSE(cpu_p, target, expected, state.version, normalization);
+      CHECK(loss == Catch::Approx(expected_loss).margin(2e-12));
+      for (std::size_t i = 0; i < gradient.size(); ++i)
+        CHECK(gradient[i] == Catch::Approx(expected[i]).margin(2e-12));
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    }
+    const auto good_gradient = gradient;
+    auto bad = target; bad.back() = {std::numeric_limits<double>::quiet_NaN(), 0};
+    CHECK_THROWS(gpu.evaluateOrbitalMSE(p, bad, gradient, state.version)); CHECK(gradient == good_gradient);
+    CHECK_THROWS(gpu.evaluateOrbitalMSE(p, target, gradient, state.version + 1)); CHECK(gradient == good_gradient);
+    const auto source_x = source.R[0][0]; source.R[0][0] += .01;
+    CHECK_THROWS(gpu.evaluateOrbitalMSE(p, target, gradient, state.version)); CHECK(gradient == good_gradient);
+    source.R[0][0] = source_x;
+    CHECK(gpu.get_log_value() == accepted);
+    close(gpu.observeCoulombEnergy(p, 0).kinetic, accepted_energy, 2e-12);
+    CHECK(gpu.snapshotParameters().values == state.values);
+    CHECK(gpu.orbitalMSEStorage().storage_fingerprint == prepared.storage_fingerprint);
+    // Raw orbitals remain defined at a complete wavefunction node.
+    const auto saved = p.R[1]; p.R[1] = p.R[0]; cpu_p.R[1] = cpu_p.R[0];
+    gpu.evaluateOrbitalValues(p, raw, state.version); cpu.evaluateOrbitalValues(cpu_p, expected_raw, state.version);
+    for (std::size_t i = 0; i < raw.size(); ++i) close(raw[i], expected_raw[i], 2e-12);
+    p.R[1] = saved; cpu_p.R[1] = saved;
+    auto candidate = state; candidate.values[1] += .001;
+    const auto budget = gpu.gpuParameterPublicationRequirements();
+    CHECK(gpu.publishBudgetedGpuParameters(candidate, state.version, budget.device_bytes, budget.host_bytes) == 1);
+    CHECK(cpu.publishParameters(candidate, state.version) == 1);
+    const auto new_loss = gpu.evaluateOrbitalMSE(p, target, gradient, 1);
+    CHECK(new_loss == Catch::Approx(cpu.evaluateOrbitalMSE(cpu_p, target, expected, 1)).margin(2e-12));
+    for (std::size_t i = 0; i < gradient.size(); ++i)
+      CHECK(gradient[i] == Catch::Approx(expected[i]).margin(2e-12));
+    CHECK(gpu.orbitalMSEStorage().storage_fingerprint == prepared.storage_fingerprint);
+  }
+#else
+  WARN("NOT_RUN: orbital-MSE GPU provider requires a GPU build");
+#endif
+}
 } // namespace qmcplusplus
 
 namespace qmcplusplus

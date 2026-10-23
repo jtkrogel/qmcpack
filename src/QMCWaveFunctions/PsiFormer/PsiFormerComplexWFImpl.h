@@ -1567,6 +1567,64 @@ struct PsiFormerComplexWF::Impl
     std::mutex execution_mutex;
   };
 
+#ifdef ENABLE_CUDA
+  /// Separately capped raw-orbital observation/VJP scratch, never an accepted inference cache.
+  struct GpuOrbitalMSELane
+  {
+    static std::size_t required(const Model& s)
+    {
+      const auto cost = psiformer::device::estimateComplexOrbitalVJPCost(s.plan);
+      auto bytes = cost.device_bytes;
+      pf::addStorageBytes(bytes, cost.host_bytes, "GPU orbital owner overflow");
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(3, s.model.ne,
+          "orbital coordinates overflow"), "orbital coordinates overflow"),
+          "GPU orbital owner overflow");
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<cuDoubleComplex>(cost.forward.matrices,
+          "orbital matrices overflow"), "GPU orbital owner overflow");
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(s.plan.parameterCount(),
+          "orbital response overflow"), "GPU orbital owner overflow");
+      return bytes;
+    }
+    explicit GpuOrbitalMSELane(const Model& s)
+        : blas(queue), image(s.gpu->image),
+          owner(psiformer::device::PreparedDeviceComplexScore::prepareOrbitalVJP(image, queue, blas,
+              psiformer::device::estimateComplexOrbitalVJPCost(s.plan).device_bytes)),
+          positions(3 * s.model.ne), raw(owner->cost().forward.matrices), response(s.plan.parameterCount()),
+          bytes(required(s)) {}
+    void forward(const Model& s, const ParticleSet& p)
+    {
+      if (image != s.gpu->image)
+      {
+        owner->rebindModel(s.gpu->image);
+        image = s.gpu->image;
+      }
+      if (image->version() != s.model.p.version())
+        throw std::logic_error("Complex orbital image/native version mismatch");
+      for (std::size_t row = 0; row < s.model.ne; ++row)
+        for (int d = 0; d < 3; ++d) positions[3 * row + d] = p.R[row][d];
+      owner->evaluateOrbitals(positions);
+      owner->downloadOrbitals(owner->orbitalView(), raw);
+    }
+    std::size_t fingerprint() const noexcept
+    {
+      auto value = reinterpret_cast<std::uintptr_t>(owner.get()) ^ bytes;
+      psiformer::determinant::detail::mixStorage(value, positions);
+      psiformer::determinant::detail::mixStorage(value, raw);
+      psiformer::determinant::detail::mixStorage(value, response);
+      return value;
+    }
+    compute::Queue<PlatformKind::CUDA> queue;
+    psiformer::device::AcceleratorBlasHandle blas;
+    std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+    std::unique_ptr<psiformer::device::PreparedDeviceComplexScore> owner;
+    std::vector<double> positions;
+    std::vector<cuDoubleComplex> raw;
+    std::vector<double> response;
+    const std::size_t bytes;
+    std::mutex execution_mutex;
+  };
+#endif
+
   /// Resolve each actual real affine tensor, including the two independent head leaves.
   static std::vector<wftrain::AffineParameterBlock> affineBlocks(const Model& s)
   {
@@ -3058,6 +3116,9 @@ struct PsiFormerComplexWF::Impl
   psiformer::PsiFormerTimers phase_timers;
   std::shared_ptr<Model> state;
   std::shared_ptr<OrbitalMSELane> orbital_mse;
+#ifdef ENABLE_CUDA
+  std::shared_ptr<GpuOrbitalMSELane> gpu_orbital_mse;
+#endif
   std::shared_ptr<AffineLane> affine_lane;
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
@@ -3178,9 +3239,15 @@ PsiFormerComplexWF::OrbitalMSEStorage PsiFormerComplexWF::orbitalMSEStorage() co
 {
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex orbital-MSE is CPU-only");
   std::lock_guard factory(state->derivative_factory_mutex);
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    const auto& lane = impl_->gpu_orbital_mse;
+    return {Impl::GpuOrbitalMSELane::required(*state), lane ? lane->bytes : 0,
+        lane ? lane->fingerprint() : 0};
+  }
+#endif
   const auto& lane = impl_->orbital_mse;
   return {Impl::OrbitalMSELane::required(*state), lane ? lane->bytes() : 0,
       lane ? lane->work->storageFingerprint() ^ lane->score.numericMetadataStorageFingerprint() : 0};
@@ -3191,28 +3258,37 @@ void PsiFormerComplexWF::prepareOrbitalMSE(std::size_t maximum_bytes)
 {
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex orbital-MSE is CPU-only");
   impl_->requireIdle(*impl_->particles);
   Impl::validateDerivativeSource(*state);
-  const auto required = Impl::OrbitalMSELane::required(*state);
+  const auto required =
+#ifdef ENABLE_CUDA
+      gpuInferenceEnabled() ? Impl::GpuOrbitalMSELane::required(*state) :
+#endif
+      Impl::OrbitalMSELane::required(*state);
   if (!maximum_bytes || maximum_bytes == std::numeric_limits<std::size_t>::max() || required > maximum_bytes)
     throw std::length_error("Complex orbital-MSE numeric cap exceeded before preparation");
   if (state->pending_proposals.load(std::memory_order_relaxed))
     throw std::logic_error("Complex orbital-MSE requires an idle model family");
   std::lock_guard factory(state->derivative_factory_mutex);
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    std::lock_guard execution(state->gpu->mutex);
+    if (!impl_->gpu_orbital_mse)
+      impl_->gpu_orbital_mse = std::make_shared<Impl::GpuOrbitalMSELane>(*state);
+    return;
+  }
+#endif
   if (!impl_->orbital_mse)
     impl_->orbital_mse = std::make_shared<Impl::OrbitalMSELane>(*state);
 }
 
-/// Reuse clone-local VALUE scratch under the sequential observation contract, without a P-sized owner.
+/// CPU borrows VALUE scratch; GPU borrows its explicitly prepared raw-VJP owner.
 void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
     std::vector<std::complex<double>>& orbitals, std::size_t expected_version) const
 {
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex orbital forward is CPU-only");
   if (state->model.p.version() != expected_version)
     throw std::runtime_error("Complex orbital forward parameter version is stale");
   impl_->requireIdle(*impl_->particles);
@@ -3227,6 +3303,20 @@ void PsiFormerComplexWF::evaluateOrbitalValues(const ParticleSet& particles,
     for (int d = 0; d < 3; ++d)
       if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
         throw std::invalid_argument("Complex orbital forward coordinates/spin order invalid");
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    std::shared_ptr<Impl::GpuOrbitalMSELane> lane;
+    { std::lock_guard factory(state->derivative_factory_mutex); lane = impl_->gpu_orbital_mse; }
+    if (!lane) throw std::logic_error("Complex GPU orbital forward requires explicit orbital-MSE preparation");
+    std::scoped_lock execution(lane->execution_mutex, state->gpu->mutex);
+    lane->forward(*state, particles);
+    orbitals.resize(lane->raw.size());
+    for (std::size_t i = 0; i < orbitals.size(); ++i)
+      orbitals[i] = {cuCreal(lane->raw[i]), cuCimag(lane->raw[i])};
+    return;
+  }
+#endif
   auto owner = state->cpu_budget ? impl_->selectedCpuLane() : nullptr;
   std::unique_lock<std::mutex> execution;
   if (owner)
@@ -3245,8 +3335,6 @@ double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
 {
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
-  if (gpuInferenceEnabled())
-    throw std::logic_error("Complex orbital-MSE is CPU-only");
   if (state->model.p.version() != expected_version)
     throw std::runtime_error("Complex orbital-MSE parameter version is stale");
   impl_->requireIdle(*impl_->particles);
@@ -3261,6 +3349,53 @@ double PsiFormerComplexWF::evaluateOrbitalMSE(const ParticleSet& particles,
     for (int d = 0; d < 3; ++d)
       if (particles.GroupID[row] != (row < up ? 0 : 1) || !psiformer::determinant::isFiniteReal(particles.R[row][d]))
         throw std::invalid_argument("Complex orbital-MSE coordinates/spin order invalid");
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    using Normalization = wftrain::OrbitalLossNormalization;
+    if (normalization != Normalization::SPIN_SECTOR_SUM && normalization != Normalization::FULL_MATRIX_MEAN)
+      throw std::invalid_argument("Invalid complex orbital-MSE normalization");
+    std::shared_ptr<Impl::GpuOrbitalMSELane> lane;
+    { std::lock_guard factory(state->derivative_factory_mutex); lane = impl_->gpu_orbital_mse; }
+    if (!lane) throw std::logic_error("Complex GPU orbital-MSE must be explicitly prepared");
+    if (target.size() != lane->raw.size() || gradient.size() != lane->response.size())
+      throw std::invalid_argument("Complex GPU orbital-MSE target/gradient extent mismatch");
+    const auto output = reinterpret_cast<std::uintptr_t>(gradient.data());
+    const auto overlaps = [&](const void* data, std::size_t bytes) {
+      const auto input = reinterpret_cast<std::uintptr_t>(data);
+      const auto output_bytes = pf::checkedStorageBytes<double>(gradient.size(), "orbital output bytes overflow");
+      if (bytes > std::numeric_limits<std::uintptr_t>::max() - input ||
+          output_bytes > std::numeric_limits<std::uintptr_t>::max() - output)
+        throw std::invalid_argument("Complex GPU orbital-MSE address overflow");
+      return bytes && output_bytes && output < input + bytes && input < output + output_bytes;
+    };
+    if (overlaps(target.data(), pf::checkedStorageBytes<Impl::C>(target.size(), "orbital target bytes overflow")) ||
+        overlaps(state->model.p.flat_values().data(), pf::checkedStorageBytes<double>(gradient.size(), "orbital parameter bytes overflow")))
+      throw std::invalid_argument("Complex GPU orbital-MSE output aliases target/parameters");
+    for (const auto value : target)
+      if (!isFiniteWavefunctionValue(value)) throw std::invalid_argument("Complex GPU orbital-MSE target is nonfinite");
+    std::scoped_lock execution(lane->execution_mutex, state->gpu->mutex);
+    lane->forward(*state, particles);
+    double loss = 0;
+    for (std::size_t i = 0; i < target.size(); ++i)
+    {
+      const auto row = (i / n) % n;
+      const auto denominator = normalization == Normalization::FULL_MATRIX_MEAN ? n : (row < up ? up : n - up);
+      const double scale = 1.0 / static_cast<double>(state->model.ndet * denominator * n);
+      const Impl::C residual = Impl::C{cuCreal(lane->raw[i]), cuCimag(lane->raw[i])} - target[i];
+      loss += scale * std::norm(residual);
+      const auto seed = 2.0 * scale * std::conj(residual);
+      lane->raw[i] = make_cuDoubleComplex(seed.real(), seed.imag());
+    }
+    if (!psiformer::determinant::isFiniteReal(loss)) throw std::overflow_error("Complex GPU orbital-MSE loss overflow");
+    lane->owner->reverseOrbitals(lane->owner->orbitalView(), lane->raw);
+    lane->owner->downloadOrbitalVJP(lane->owner->orbitalVJPView(), lane->response);
+    for (double value : lane->response)
+      if (!psiformer::determinant::isFiniteReal(value)) throw std::overflow_error("Complex GPU orbital-MSE response overflow");
+    std::copy(lane->response.begin(), lane->response.end(), gradient.begin());
+    return loss;
+  }
+#endif
   std::shared_ptr<Impl::OrbitalMSELane> lane;
   {
     std::lock_guard factory(state->derivative_factory_mutex);

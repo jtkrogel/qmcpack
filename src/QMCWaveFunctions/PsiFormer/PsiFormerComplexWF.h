@@ -108,7 +108,7 @@ public:
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
-  /// Explicit score-only CPU owner; excludes caller gradient/target, SPO and inference owners.
+  /// Explicit CPU score or GPU raw-VJP owner; excludes caller gradient/target, SPO and inference owners.
   struct OrbitalMSEStorage { std::size_t required_bytes, prepared_bytes, storage_fingerprint; };
   /// Report this score-only owner's required/prepared bytes and warmed allocation identity.
   OrbitalMSEStorage orbitalMSEStorage() const;
@@ -119,11 +119,11 @@ public:
   /// Return the immutable raw-orbital channel count without preparing determinant products.
   std::size_t orbitalMSEChannelCount() const noexcept;
 
-  /// Copy version-coherent CPU raw orbital values without determinant or parameter derivatives.
+  /// Copy version-coherent raw orbitals; GPU requires explicit orbital-MSE preparation.
   void evaluateOrbitalValues(const ParticleSet& particles, std::vector<std::complex<double>>& orbitals,
       std::size_t expected_version) const;
 
-  /// Evaluate a prepared CPU raw-orbital loss without changing accepted state or caller output on failure.
+  /// Evaluate a prepared raw-orbital loss without changing accepted state or caller output on failure.
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
       std::vector<double>& gradient, std::size_t expected_version,
       wftrain::OrbitalLossNormalization normalization = wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM) const;
