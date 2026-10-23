@@ -47,6 +47,23 @@ inline bool configuredLazyVglPreparation()
  */
 class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
 {
+  /// Shared cold receipt survives either backend/context destruction order.
+  struct MixedFinalStatistics
+  {
+    ~MixedFinalStatistics() noexcept
+    {
+      try
+      {
+        std::clog << "PsiFormer explicit mixed inference summary: scope=all_destroyed_contexts"
+                  << ", contexts=" << contexts.load(std::memory_order_relaxed)
+                  << ", mixed_batches=" << successes.load(std::memory_order_relaxed)
+                  << ", whole_fp64_retries=" << retries.load(std::memory_order_relaxed) << std::endl;
+      }
+      catch (...) {} // Diagnostics must not throw during resource destruction.
+    }
+    std::atomic<std::size_t> contexts{0}, successes{0}, retries{0};
+  };
+
 public:
   /// Bind one immutable parameter version and its canonical layout fingerprint.
   explicit PreparedDeviceBatchBackend(std::shared_ptr<const PreparedDeviceModel> image,
@@ -72,6 +89,7 @@ public:
     {
       preparation_queue_ = std::make_unique<compute::Queue<PlatformKind::CUDA>>();
       mixed_parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(image_, *preparation_queue_, true);
+      mixed_statistics_ = std::make_shared<MixedFinalStatistics>();
     }
     else if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
@@ -600,7 +618,7 @@ private:
             std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters,
             const PsiFormerAcceleratorSharedModel& model,
             std::size_t capacity, std::uint64_t identity, TargetVglPreparation target_preparation, bool lazy_spatial)
-        : owner(backend), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
+        : owner(backend), capacity(capacity), mixed_statistics(backend->mixed_statistics_), executor(PreparedDeviceCrowdHooks::backend(),
             PreparedDeviceCrowdHooks::coverage()), crowd(identity),
           hooks(image, model, identity, std::move(mixed_parameters), target_preparation, lazy_spatial)
     {
@@ -610,8 +628,20 @@ private:
       executor.prepare(crowd, model.activeProvenance().layout_fingerprint, capacity, hooks);
     }
 
+    /// Collect existing counters only; do not create graphs or synchronize a queue.
+    ~Context() override
+    {
+      if (mixed_statistics)
+      {
+        mixed_statistics->successes.fetch_add(hooks.mixedBatches(), std::memory_order_relaxed);
+        mixed_statistics->retries.fetch_add(hooks.mixedRetries(), std::memory_order_relaxed);
+        mixed_statistics->contexts.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
     const PreparedDeviceBatchBackend* const owner;
     const std::size_t capacity;
+    const std::shared_ptr<MixedFinalStatistics> mixed_statistics;
     std::mutex evaluation_mutex;
     PsiFormerAcceleratorExecutor executor;
     PsiFormerAcceleratorCrowdState crowd;
@@ -702,6 +732,7 @@ private:
   const std::function<void()> first_dispatch_reporter_;
   mutable std::atomic<std::size_t> numerical_tiles_{0};
   mutable std::atomic<bool> mixed_reported_{false};
+  std::shared_ptr<MixedFinalStatistics> mixed_statistics_;
 };
 
 } // namespace qmcplusplus::psiformer::device
