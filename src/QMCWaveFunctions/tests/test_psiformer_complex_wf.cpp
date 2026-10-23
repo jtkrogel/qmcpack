@@ -957,6 +957,8 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   p1.update();
   auto source = ions(simulation_cell);
   const auto twist = GENERATE(std::array<double, 3>{}, (std::array<double, 3>{.17, -.11, .07}));
+  const auto selected = GENERATE(1, 2, 3, 4);
+  CAPTURE(selected);
   PsiFormerComplexWF family("collective", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
   auto other = family.makeClone(p1);
   auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
@@ -969,12 +971,17 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   const std::array<ParticleSet::ParticleLaplacian, 2> old_l{p0.L, p1.L};
   RefVectorWithLeader<WaveFunctionComponent> team(family, {family, clone});
   RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
-  std::vector<ParticleSet::IndexType> indices{0, 1, 2, 3, 0, 1, 2, 3};
+  std::vector<ParticleSet::IndexType> indices;
   std::vector<ParticleSet::PosType> positions;
-  for (std::size_t i = 0; i < indices.size(); ++i)
-    positions.push_back(old_positions[i / 4][i % 4] + ParticleSet::PosType{.003 * (i + 1), -.002, .004});
+  for (int walker = 0; walker < 2; ++walker)
+    for (int row = 0; row < selected; ++row)
+    {
+      const int electron = selected == 4 ? row : row + 1;
+      indices.push_back(electron);
+      positions.push_back(old_positions[walker][electron] + ParticleSet::PosType{.003 * (positions.size() + 1), -.002, .004});
+    }
   using Moves = MCMultiParticleMoves<CoordsType::POS>;
-  const Moves moves({0, 4, 8}, indices, positions);
+  const Moves moves({0, std::size_t(selected), std::size_t(2 * selected)}, indices, positions);
   std::array<ParticleSet::ParticleGradient, 2> proposed_g{ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
   std::array<ParticleSet::ParticleLaplacian, 2> proposed_l{ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
   RefVector<ParticleSet::ParticleGradient> gradients{proposed_g[0], proposed_g[1]};
@@ -985,8 +992,9 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   for (std::size_t walker = 0; walker < 2; ++walker)
   {
     auto proposed = electrons(simulation_cell);
-    for (std::size_t e = 0; e < 4; ++e)
-      proposed.R[e] = positions[walker * 4 + e];
+    proposed.R = old_positions[walker];
+    for (int row = 0; row < selected; ++row)
+      proposed.R[indices[walker * selected + row]] = positions[walker * selected + row];
     proposed.update();
     auto oracle = private_cpu.makeClone(proposed);
     oracle_logs[walker] = evaluate(*oracle, proposed);
@@ -1042,12 +1050,17 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
     family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians);
     CHECK(family.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
     CHECK(family.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
-    for (std::size_t e = 0; e < 4; ++e)
-      p0.R[e] = positions[e];
+    for (int row = 0; row < selected; ++row)
+      p0.R[indices[row]] = positions[row];
     p0.update();
     family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false});
     close(family.get_log_value(), oracle_logs[0], 2e-12);
     CHECK(clone.get_log_value() == old_logs[1]);
+    for (int electron = 0; electron < 4; ++electron)
+      for (int d = 0; d < 3; ++d)
+        CHECK(p1.R[electron][d] == old_positions[1][electron][d]);
+    for (int row = selected; row < 4; ++row)
+      CHECK(p0.R[(row + 1) % 4] == old_positions[0][(row + 1) % 4]);
     CHECK_NOTHROW(family.observeCoulombEnergy(p0, 0));
     CHECK_NOTHROW(clone.observeCoulombEnergy(p1, 0));
     resource.rewind(cursor);
@@ -4515,6 +4528,8 @@ TEST_CASE("PsiFormer explicit GPU parameter publication reuses inference storage
 TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across walker tiles",
           "[wavefunction][psiformer][complex_gpu_collective_b1]")
 {
+  const auto selected = GENERATE(1, 2, 3, 4);
+  CAPTURE(selected);
   ScopedComplexGpuControls controls;
   controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "1");
   controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "1");
@@ -4532,11 +4547,18 @@ TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across w
     const std::array<C, 2> initial{evaluate(gpu, p0), evaluate(clone, p1)};
     RefVectorWithLeader<WaveFunctionComponent> team(gpu, {gpu, clone});
     RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+    const std::array<decltype(p0.R), 2> old_positions{p0.R, p1.R};
+    std::vector<ParticleSet::IndexType> indices;
     std::vector<ParticleSet::PosType> positions;
     for (std::size_t i = 0; i < 2; ++i)
-      for (std::size_t e = 0; e < 4; ++e)
-        positions.push_back(targets[i].R[e] + ParticleSet::PosType{.002 * (i + 1), -.003, .001});
-    const MCMultiParticleMoves<CoordsType::POS> moves({0, 4, 8}, {0, 1, 2, 3, 0, 1, 2, 3}, positions);
+      for (int row = 0; row < selected; ++row)
+      {
+        const int electron = selected == 4 ? row : row + 1;
+        indices.push_back(electron);
+        positions.push_back(targets[i].R[electron] + ParticleSet::PosType{.002 * (i + 1), -.003, .001});
+      }
+    const MCMultiParticleMoves<CoordsType::POS> moves(
+        {0, std::size_t(selected), std::size_t(2 * selected)}, indices, positions);
     ParticleSet::ParticleGradient g0(4), g1(4);
     ParticleSet::ParticleLaplacian l0(4), l1(4);
     RefVector<ParticleSet::ParticleGradient> gs{g0, g1};
@@ -4553,8 +4575,9 @@ TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across w
       for (std::size_t i = 0; i < 2; ++i)
       {
         auto proposed = electrons(simulation_cell);
-        for (std::size_t e = 0; e < 4; ++e)
-          proposed.R[e] = positions[4 * i + e];
+        proposed.R = old_positions[i];
+        for (int row = 0; row < selected; ++row)
+          proposed.R[indices[selected * i + row]] = positions[selected * i + row];
         proposed.update();
         PsiFormerComplexWF oracle("oracle", parameters(), proposed, source, clone_cap, twist);
         close(std::exp(ratios[i]), std::exp(evaluate(oracle, proposed) - initial[i]), 2e-9);
@@ -4570,6 +4593,21 @@ TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across w
       CHECK(gpu.get_log_value() == initial[0]);
       CHECK(clone.get_log_value() == initial[1]);
     }
+    g0 = g1 = C{}; l0 = l1 = C{};
+    gpu.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gs, ls);
+    const auto accepted_log = initial[0] + ratios[0];
+    for (int row = 0; row < selected; ++row)
+      p0.R[indices[row]] = positions[row];
+    p0.update();
+    gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false});
+    close(gpu.get_log_value(), accepted_log, 2e-12);
+    CHECK(clone.get_log_value() == initial[1]);
+    for (int electron = 0; electron < 4; ++electron)
+      for (int d = 0; d < 3; ++d)
+        CHECK(p1.R[electron][d] == old_positions[1][electron][d]);
+    for (int row = selected; row < 4; ++row)
+      CHECK(p0.R[(row + 1) % 4] == old_positions[0][(row + 1) % 4]);
+    CHECK_NOTHROW(gpu.observeCoulombEnergy(p0, 0));
   }
 }
 
@@ -5186,6 +5224,112 @@ TEST_CASE("PsiFormer paired inference crowds own independent leased lanes",
   CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
 }
 #endif
+TEST_CASE("PsiFormer paired all-to-one VALUE observes complete replacements without state publication",
+          "[wavefunction][psiformer][complex_all_to_one]")
+{
+  const auto lattice = cell();
+  const SimulationCell simulation_cell(lattice);
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  std::vector<std::size_t> device_caps{0};
+#ifdef ENABLE_CUDA
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  const bool available = hipGetDeviceCount(&devices) == hipSuccess && devices;
+#else
+  const bool available = cudaGetDeviceCount(&devices) == cudaSuccess && devices;
+#endif
+  if (available) device_caps.push_back(64 * 1024 * 1024);
+  else WARN("NOT_RUN: paired all-to-one GPU parity requires an available device");
+  ScopedComplexGpuControls controls;
+#endif
+  for (const auto device_cap : device_caps)
+    for (const std::array<double, 3> twist : {std::array<double, 3>{0, 0, 0}, {.17, -.11, .07}})
+    {
+      CAPTURE(device_cap, twist);
+      auto p = electrons(simulation_cell);
+      auto foreign = electrons(simulation_cell);
+      PsiFormerComplexWF component("all_to_one", initialized, p, source, clone_cap, twist, device_cap);
+      CHECK(component.gpuInferenceEnabled() == (device_cap != 0));
+      const auto accepted_log = evaluate(component, p);
+      const auto accepted_positions = p.R;
+      const auto accepted_g = p.G;
+      const auto accepted_l = p.L;
+      const auto snapshot = component.snapshotParameters();
+      const auto storage = component.numericStorage();
+      const auto accepted_energy = component.observeCoulombEnergy(p, 0);
+      auto point = p.R[0]; point[0] += .037; point[2] -= .019;
+      std::vector<C> ratios(p.getTotalNum(), C{71, -9});
+      p.makeVirtualMoves(point);
+      component.evaluateRatiosAlltoOne(p, ratios);
+      for (int electron = 0; electron < p.getTotalNum(); ++electron)
+      {
+        auto explicit_p = electrons(simulation_cell);
+        explicit_p.R[electron] = point;
+        explicit_p.update();
+        // Independent complete FULL evaluation at replaced coordinates, with a fresh CPU owner.
+        PsiFormerComplexWF oracle("explicit", initialized, explicit_p, source, clone_cap, twist);
+        close(ratios[electron], std::exp(evaluate(oracle, explicit_p) - accepted_log), 2e-12);
+      }
+      const auto expected = ratios;
+      component.evaluateRatiosAlltoOne(p, ratios);
+      CHECK(ratios == expected);
+      close(component.observeCoulombEnergy(p, 0).kinetic, accepted_energy.kinetic, 2e-12);
+      auto translated = p.R[0];
+      for (int d = 0; d < 3; ++d) translated[d] += lattice.R(0, d);
+      p.makeVirtualMoves(translated);
+      component.evaluateRatiosAlltoOne(p, ratios);
+      close(ratios[0], std::exp(C{0, 2 * std::acos(-1.) * twist[0]}), 2e-12);
+      close(ratios[1], C{}, 2e-12); // translated coincident same-spin rows
+      const auto saved = ratios;
+      auto bad = point; bad[1] = std::numeric_limits<double>::quiet_NaN();
+      p.makeVirtualMoves(bad);
+      CHECK_THROWS(component.evaluateRatiosAlltoOne(p, ratios)); CHECK(ratios == saved);
+      p.makeVirtualMoves(point);
+      std::vector<C> short_output(1, C{71, -9});
+      CHECK_THROWS(component.evaluateRatiosAlltoOne(p, short_output));
+      CHECK(short_output == std::vector<C>(1, C{71, -9}));
+      CHECK_THROWS(component.evaluateRatiosAlltoOne(foreign, ratios)); CHECK(ratios == saved);
+      // Failed observation preserves the pending proposal so its original acceptance still succeeds.
+      p.makeMove(2, ParticleSet::PosType{.01, 0, 0});
+      const auto proposal_ratio = component.ratio(p, 2);
+      CHECK_THROWS(component.evaluateRatiosAlltoOne(p, ratios)); CHECK(ratios == saved);
+      CHECK(component.get_log_value() == accepted_log);
+      for (int electron = 0; electron < p.getTotalNum(); ++electron)
+        for (int d = 0; d < 3; ++d)
+          CHECK(p.R[electron][d] == accepted_positions[electron][d]);
+      CHECK(p.G == accepted_g); CHECK(p.L == accepted_l);
+      CHECK(component.snapshotParameters().values == snapshot.values);
+      CHECK(component.numericStorage().fingerprint == storage.fingerprint);
+      CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+      component.acceptMove(p, 2); p.acceptMove(2); p.donePbyP();
+      close(std::exp(component.get_log_value() - accepted_log), proposal_ratio, 2e-12);
+      evaluate(component, p);
+      p.makeVirtualMoves(point);
+      component.evaluateRatiosAlltoOne(p, ratios);
+      if (!device_cap)
+      {
+        const auto current = component.snapshotParameters();
+        component.publishParameters(current, current.version);
+        const auto before_stale = ratios;
+        CHECK_THROWS(component.evaluateRatiosAlltoOne(p, ratios)); CHECK(ratios == before_stale);
+        evaluate(component, p);
+        component.evaluateRatiosAlltoOne(p, ratios);
+      }
+    }
+  auto p = electrons(simulation_cell);
+  auto zero = initialized;
+  for (const auto& leaf : zero.layouts)
+    if (leaf.module.find("Backflow") != std::string::npos)
+      std::fill(zero.values.begin() + leaf.begin, zero.values.begin() + leaf.end, 0.);
+  PsiFormerComplexWF nodal("zero_all_to_one", zero, p, source, clone_cap);
+  CHECK_THROWS(evaluate(nodal, p));
+  p.makeVirtualMoves(p.R[0]);
+  std::vector<C> sentinel(4, C{71, -9});
+  CHECK_THROWS(nodal.evaluateRatiosAlltoOne(p, sentinel));
+  CHECK(sentinel == std::vector<C>(4, C{71, -9}));
+}
+
 TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole Bloch phase",
           "[wavefunction][psiformer][complex_virtual_value]")
 {

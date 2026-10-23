@@ -5020,10 +5020,29 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGradWithSpin(ParticleSet&,
   rejectUnsupported("spin proposal gradients");
 }
 
-/// All-to-one geometry cannot reuse one selected ParticleSet proposal.
-void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet&, std::vector<ValueType>&)
+/// Observe complete single-replacement ratios at one absolute position without publishing proposals.
+void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<ValueType>& ratios)
 {
-  rejectUnsupported("all-to-one ratios");
+  std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
+  impl_->requireIdle(particles);
+  if (particles.isSpinor() || ratios.size() != static_cast<std::size_t>(particles.getTotalNum()))
+    throw std::invalid_argument("Complex PsiFormer all-to-one VALUE shape/spin mismatch");
+  const auto position = particles.getActivePos();
+  for (int d = 0; d < 3; ++d)
+    if (!psiformer::determinant::isFiniteReal(position[d]))
+      throw std::invalid_argument("Complex PsiFormer all-to-one VALUE position is nonfinite");
+  // Validate the denominator before using the shared numerical owner or publishing output.
+  impl_->formRatio(impl_->accepted, particles, 0, &particles.R[0]);
+  if (ratios.size() > (impl_->numeric_limit - impl_->numeric_required) / sizeof(ValueType))
+    throw std::length_error("Complex PsiFormer all-to-one VALUE staging exceeds clone numeric cap");
+  std::vector<ValueType> staged(ratios.size());
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    const auto evaluated = impl_->core(particles, false, electron, -1, &position);
+    staged[electron] = impl_->formRatio(evaluated.amplitude, particles, electron, &position);
+  }
+  std::copy(staged.begin(), staged.end(), ratios.begin());
 }
 
 /// Evaluate pure wavefunction VALUE ratios without moving or publishing the accepted walker.
