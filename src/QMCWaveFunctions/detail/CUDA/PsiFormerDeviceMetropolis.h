@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerDeviceMetropolis.h
- * @brief Injected-draw real/open joint Metropolis, with opt-in native host drift.
+ * @brief Injected-draw real open/Gamma joint Metropolis, with opt-in native host drift.
  * The borrowed VALUE graph and queue MUST outlive this noncopyable owner. Callers
  * hold their existing model/crowd execution lease, exclude competing graph work
  * and publication during a request, and keep the owning device current. This is
@@ -23,6 +23,18 @@ namespace qmcplusplus::psiformer::device
 {
 /// Borrow the native configured host drift policy; arguments are variance, G, drift.
 using NativeDriftCallback = std::function<void(double, const double*, double*)>;
+
+/// Admit only fixed-ion real OPEN or legacy full-torus Gamma geometry, before allocation.
+inline void validateMetropolisEnvironment(const ExecutionEnvironment& environment)
+{
+  if (environment.periodic_profile || !environment.fixed_nuclei ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL || environment.compute_scalar_domain != ScalarDomain::REAL ||
+      (environment.boundary == BoundaryCondition::PERIODIC &&
+       (environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool axis) { return axis; }))))
+    throw std::invalid_argument("Device Metropolis requires fixed-ion real OPEN or legacy full-torus Gamma geometry");
+}
 
 /// Drift additions charge retained VALUE, no-P reverse and device Green correction.
 inline CoordinateGradientCost estimateMetropolisDriftCost(const PsiFormerExecutionPlan& plan,
@@ -116,11 +128,12 @@ public:
   {
     graph.model_->validateCurrentDevice();
     const auto ne = graph.plan_.modelShape().electrons();
+    validateMetropolisEnvironment(graph.plan_.environment());
     if (graph.mode_ != SpatialJetMode::VALUE_ONLY || graph.mixed_dense_ || graph.retained_targets_ ||
         graph.target_preparation_.max_targets ||
-        graph.plan_.environment().boundary != BoundaryCondition::OPEN || &graph.queue_ != &queue ||
+        &graph.queue_ != &queue ||
         positions.empty() || positions.size() % (3 * ne) != 0 || inverse_mass.size() != ne)
-      throw std::invalid_argument("Device Metropolis needs one borrowed FP64/open VALUE graph and packed physical inputs");
+      throw std::invalid_argument("Device Metropolis needs one borrowed real FP64 VALUE graph and packed physical inputs");
     const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne, selected);
     if (cost.device_bytes > workspace_budget_bytes)
       throw std::length_error("Device Metropolis exceeds its standalone owner budget");

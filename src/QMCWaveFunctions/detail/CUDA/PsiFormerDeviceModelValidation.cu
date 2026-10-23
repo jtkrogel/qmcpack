@@ -558,6 +558,43 @@ int main(int argc, char** argv)
       // No broad CPU/GPU reference matrix or production sampler is constructed here.
       const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
       validateDeviceMetropolis(model, image, queue, handle);
+      // Repack each tensor independently for the established skew-periodic embedding.
+      auto environment = plan.environment();
+      environment.boundary = BoundaryCondition::PERIODIC;
+      environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+      environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
+      environment.periodic_axes = {true, true, true};
+      auto forbidden = environment;
+      forbidden.periodic_profile = std::make_shared<PeriodicProfileMetadata>();
+      bool profile_rejected = false;
+      try { validateMetropolisEnvironment(forbidden); }
+      catch (const std::invalid_argument&) { profile_rejected = true; }
+      if (!profile_rejected)
+        throw std::runtime_error("Versioned periodic profile bypassed legacy sampler admission");
+      std::cout << "PASS periodic profile rejection with legacy torus enum before graph preparation\n";
+      const auto original = model.p.flat_values();
+      std::vector<double> parameters;
+      std::vector<pf::Layout> layouts;
+      for (const auto& tensor : plan.parameterTensors())
+      {
+        auto tensor_shape = tensor.shape;
+        if (tensor.role == ParameterRole::ELECTRON_EMBEDDING_WEIGHT)
+          tensor_shape[0] = 7 * shape.nuclei + 1;
+        std::size_t count = 1;
+        for (const auto extent : tensor_shape)
+          count = spatial_detail::checkedProduct(count, extent, "Periodic sampler tensor extent overflow");
+        const auto begin = parameters.size();
+        for (std::size_t index = 0; index < count; ++index)
+          parameters.push_back(original[tensor.begin + index % (tensor.end - tensor.begin)]);
+        layouts.push_back({tensor.module, tensor.name, tensor_shape, begin, parameters.size()});
+      }
+      pf::PsiFormer periodic(pf::Parameters(std::move(parameters), std::move(layouts)),
+                             model.cfg, model.ndet, model.dim, model.heads, model.blocks);
+      const auto periodic_plan = PsiFormerExecutionPlan::fromParameters(periodic.p, shape, environment);
+      const auto periodic_image = std::make_shared<PreparedDeviceModel>(periodic_plan,
+          periodic.p.flat_values(), periodic.cfg.nuclei.x, 0);
+      validateDeviceMetropolis(periodic, periodic_image, queue, handle);
+      std::cout << "PASS skew-periodic Metropolis: unwrapped coordinates, CPU joint law, selected subsets\n";
       std::ofstream output(argv[3]);
       output << "PASS injected numerical Metropolis; costs/transfers in stdout; XML/RNG/Hamiltonian not integrated\n";
       if (!output)

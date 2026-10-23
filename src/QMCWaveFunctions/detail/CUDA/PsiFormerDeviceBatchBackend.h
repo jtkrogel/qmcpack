@@ -300,7 +300,7 @@ public:
         positions.empty() || positions.size() % (3 * ne) || inverse_mass.size() != ne ||
         !substeps || !gaussian_draw || !uniform_draw || version != image_->version() ||
         !device_math::isFiniteBinary64(tau) || tau <= 0)
-      throw std::invalid_argument("Device sampling requires its explicit real/open FP64 crowd profile and current image");
+      throw std::invalid_argument("Device sampling requires its explicit real FP64 crowd profile and current image");
     if (selected != bool(select_indices) || particles_per_move >= ne)
       throw std::invalid_argument("Device sampling selected moves require a proper subset and index callback");
     if (use_drift != bool(metropolisDriftBudget()) || (use_drift && !drift))
@@ -698,10 +698,12 @@ private:
       throw std::invalid_argument("Explicit device drift requires sampler preparation and a finite additions cap");
     if (preparation.adam_workspace_budget_bytes && precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Explicit device Adam requires FP64 reference precision");
+    if (preparation.metropolis_workspace_budget_bytes)
+      validateMetropolisEnvironment(plan.environment());
     if (preparation.metropolis_workspace_budget_bytes &&
         (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
-         plan.environment().boundary != BoundaryCondition::OPEN))
-      throw std::invalid_argument("Explicit device sampling requires real/open FP64 preparation");
+         (preparation.metropolis_drift_budget_bytes && plan.environment().boundary != BoundaryCondition::OPEN)))
+      throw std::invalid_argument("Explicit device sampling requires real FP64; periodic sampling excludes drift");
     if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
         (preparation.vgl.max_targets || preparation.kinetic.max_targets ||
          preparation.select_vgl_targets || preparation.select_kinetic_targets))

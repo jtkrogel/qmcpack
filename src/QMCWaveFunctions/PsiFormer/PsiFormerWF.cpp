@@ -1143,8 +1143,10 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   preparation.adam_workspace_budget_bytes = adam;
   preparation.select_vgl_targets = select_vgl;
   preparation.select_kinetic_targets = select_kinetic;
-  if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
-    throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open sampling");
+  if (metropolis)
+    psiformer::device::validateMetropolisEnvironment(plan.environment());
+  if (metropolis && metropolis_drift && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
+    throw std::invalid_argument("Periodic device sampling requires no drift until separately qualified");
   if (vgl || select_vgl)
     preparation.vgl = {vgl, bytes, work, parallel_trace_bytes};
   if (kinetic || select_kinetic)

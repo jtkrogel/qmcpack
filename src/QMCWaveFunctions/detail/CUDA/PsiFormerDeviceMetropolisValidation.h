@@ -29,6 +29,20 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
   checkRuntime(cudaGetDevice(&ordinal), "Native sampler validation device");
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
+  if (use_drift && image->plan().environment().boundary == BoundaryCondition::PERIODIC)
+  {
+    DeviceExecutionPreparation preparation;
+    preparation.metropolis_workspace_budget_bytes = 4096;
+    preparation.metropolis_drift_budget_bytes = 4096;
+    const auto before = metrics.snapshot();
+    bool rejected = false;
+    try { PreparedDeviceBatchBackend unsupported(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+      throw std::runtime_error("Periodic production drift was not rejected before device allocation");
+    std::cout << "PASS periodic production drift rejection before allocation/native draws\n";
+    return;
+  }
   DriftModifierUNR policy(.37); // Exercise the actual nondefault native limiter, not a copied formula.
   const NativeDriftCallback drift = [&](double variance, const double* gradient, double* result) {
     DriftModifierUNR::GradType g;
@@ -281,6 +295,12 @@ void validateSelectedMetropolis(Model& model, const std::shared_ptr<const Prepar
       {
         std::copy_n(model.cfg.electrons.x.data() + walker % model.cfg.nconfig * stride, stride,
                     seed.data() + walker * stride);
+        if (walker == 2 && image->plan().environment().boundary == BoundaryCondition::PERIODIC)
+          for (std::size_t electron = 0; electron < ne; ++electron)
+            for (int xyz = 0; xyz < 3; ++xyz)
+              seed[walker * stride + electron * 3 + xyz] +=
+                  image->plan().environment().lattice_vectors[0][xyz] -
+                  2 * image->plan().environment().lattice_vectors[2][xyz];
         for (std::size_t local = 0; local < count; ++local)
         {
           selected[walker * count + local] = (walker ? ne - count : 0) + local;
@@ -515,8 +535,9 @@ void validateDeviceMetropolis(Model& model, const std::shared_ptr<const Prepared
     if (!rejected)
       throw std::runtime_error("Metropolis resolved the same proposal twice");
 
-    // A late feature overflow follows earlier valid microtiles, but publishes no prefix.
-    if (population == 5)
+    // Open features overflow here; periodic features reduce the same finite input.
+    // Both geometries retain the failed-resolution/version rollback checks below.
+    if (population == 5 && image->plan().environment().boundary == BoundaryCondition::OPEN)
     {
       auto bad_gaussian = gaussian;
       bad_gaussian[4 * stride] = std::numeric_limits<double>::max() / 4;
@@ -629,8 +650,10 @@ void validateDeviceMetropolis(Model& model, const std::shared_ptr<const Prepared
   if (!overflow_rejected)
     throw std::runtime_error("Metropolis unchecked extent overflow");
   std::cout << "PASS injected device Metropolis: B1/5 VALUE microtile2/tails, nonunit mass/tau, u0, "
-               "CPU law/cache parity, view epochs, stale/double/failed resolution, late numerical rollback, "
-               "model refresh, mixed node/regular isolation, unused uniform/signflip, exact bytes, "
+               "CPU law/cache parity, view epochs, stale/double/failed resolution, "
+            << (image->plan().environment().boundary == BoundaryCondition::OPEN
+                    ? "late numerical rollback, " : "periodic finite-feature reduction, ")
+            << "model refresh, mixed node/regular isolation, unused uniform/signflip, exact bytes, "
                "zero warmed device allocations/fixed host-mask capacity; "
             << "max_abs_error=" << maximum_error
             << " measured_D2D_calls=" << total_copies << " measured_draw_H2D_bytes=" << total_upload_bytes
