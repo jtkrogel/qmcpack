@@ -37,6 +37,17 @@ class PsiFormerWF;
 
 namespace wftrain
 {
+/// Separate physical rank agreement from the legacy persisted-stage identity.
+struct RealECPPhysicalIdentity
+{
+  std::string fingerprint;
+  bool mixed_open_sources = false;
+};
+
+/// Validate the actual real PP operator/source partition independently of the energy estimator.
+RealECPPhysicalIdentity realECPPhysicalIdentity(PsiFormerWF& component, ParticleSet& electrons,
+                                             QMCHamiltonian& hamiltonian);
+
 /// Validate and fingerprint only the selected real pair native AE Ewald physics row.
 std::string realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian);
 #ifdef QMC_COMPLEX

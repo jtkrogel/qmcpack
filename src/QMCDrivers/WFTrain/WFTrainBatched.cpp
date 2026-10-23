@@ -42,6 +42,7 @@
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
 #include "QMCDrivers/WFTrain/ComplexOrbitalInferenceMoments.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
+#include "QMCHamiltonians/LocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/CoulombPotential.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
@@ -2097,7 +2098,7 @@ std::string periodicScoreECPIdentity(ParticleSet& electrons, const ParticleSet& 
   return identity.str();
 }
 
-/// Bind only the new GPU score-only PP stage to actual operator content and ion ordering.
+/// Preserve the historical real score identity while validating its PP metadata.
 std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
 {
   const auto& provenance = hamiltonian.ecpModelProvenance();
@@ -2212,6 +2213,138 @@ std::string pairCoulombIdentity(ParticleSet& electrons, QMCHamiltonian& hamilton
   return identity.str();
 }
 } // namespace
+
+/// Validate real PP/bare sources without evaluating energies or rotating grids.
+wftrain::RealECPPhysicalIdentity wftrain::realECPPhysicalIdentity(
+    PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
+{
+  const auto previous_identity = realScoreECPIdentity(component, electrons, hamiltonian);
+  if (electrons.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+    return {previous_identity, false};
+
+  const LocalECPotential* local = nullptr;
+  const NonLocalECPotential* nonlocal = nullptr;
+  const CoulombPotential* ee = nullptr;
+  const CoulombPotential* ii = nullptr;
+  const CoulombPotential* bare = nullptr;
+  std::size_t kinetic = 0;
+  for (int term = 0; term < hamiltonian.size(); ++term)
+  {
+    const auto* current = hamiltonian.getComponent(term);
+    if (const auto* k = dynamic_cast<const BareKineticEnergy*>(current))
+    {
+      if (&k->getTargetPSet() != &electrons)
+        throw std::invalid_argument("OPEN ECP kinetic target differs");
+      ++kinetic;
+    }
+    else if (const auto* l = dynamic_cast<const LocalECPotential*>(current))
+    {
+      if (local)
+        throw std::invalid_argument("OPEN ECP has duplicate local PP operators");
+      local = l;
+    }
+    else if (const auto* nl = dynamic_cast<const NonLocalECPotential*>(current))
+    {
+      if (nonlocal)
+        throw std::invalid_argument("OPEN ECP has duplicate nonlocal PP operators");
+      nonlocal = nl;
+    }
+    else if (const auto* c = dynamic_cast<const CoulombPotential*>(current))
+    {
+      const bool electron_pair = c->isSameParticleSet() && &c->getSourcePSet() == &electrons;
+      auto*& selected = c->isSameParticleSet() ? (electron_pair ? ee : ii) : bare;
+      if (selected || c->computesForces())
+        throw std::invalid_argument("OPEN ECP Coulomb partition is duplicated or unsupported");
+      selected = c;
+    }
+    else
+      throw std::invalid_argument("OPEN ECP requires kinetic, native ee/ii, local/nonlocal PP and optional bare-ion Coulomb only");
+  }
+  if (kinetic != 1 || !local || !nonlocal || !ee || !ii)
+    throw std::invalid_argument("OPEN ECP operator partition is incomplete");
+  const auto& ions = nonlocal->sourceParticles();
+  if (&local->IonConfig != &ions || &local->Pion != &ions || &local->Peln != &electrons ||
+      nonlocal->virtualTargetParticles() != &electrons ||
+      &ee->getTargetPSet() != &electrons || !ee->evaluatesCurrentTarget() ||
+      &ii->getSourcePSet() != &ions || &ii->getTargetPSet() != &ions || ii->evaluatesCurrentTarget() ||
+      local->PP.size() != static_cast<std::size_t>(ions.getTotalNum()) || local->Zeff.size() != local->PP.size())
+    throw std::invalid_argument("OPEN ECP actual operator sources or local species channels differ");
+  const auto& species = ions.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  const auto& electron_species = electrons.getSpeciesSet();
+  const int electron_charge = electron_species.findAttribute("charge");
+  const auto& masses = electrons.get_mass_by_group();
+  if (charge < 0 || electron_charge < 0 || masses.size() < static_cast<std::size_t>(electrons.groups()))
+    throw std::invalid_argument("OPEN ECP charges or electron masses are missing");
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  for (int group = 0; group < electrons.groups(); ++group)
+  {
+    if (electron_species(electron_charge, group) != -1 || !wftrain::isFiniteTrainingReal(masses[group]) ||
+        std::abs(masses[group] - 1) > 64 * std::numeric_limits<double>::epsilon())
+      throw std::invalid_argument("OPEN ECP requires unit-mass charge-minus-one electrons");
+    extendStageFingerprint(hash, electrons.groupsize(group));
+    extendStageFingerprint(hash, electron_species(electron_charge, group));
+    extendStageFingerprint(hash, masses[group]);
+  }
+  extendStageFingerprint(hash, previous_identity);
+  extendStageFingerprint(hash, component.trainingConfigurationFingerprint());
+  std::vector<std::size_t> missing;
+  for (std::size_t ion = 0; ion < local->PP.size(); ++ion)
+  {
+    const bool pp = local->PP[ion] != nullptr;
+    extendStageFingerprint(hash, pp);
+    if (pp)
+    {
+      if (!wftrain::isFiniteTrainingReal(local->Zeff[ion]) || local->Zeff[ion] != species(charge, ions.GroupID[ion]))
+        throw std::invalid_argument("OPEN ECP local effective charge differs from its physical ion");
+      extendStageFingerprint(hash, local->Zeff[ion]);
+    }
+    else
+      missing.push_back(ion);
+  }
+  if (missing.size() == local->PP.size() || (missing.empty() != (bare == nullptr)))
+    throw std::invalid_argument("OPEN ECP bare-ion Coulomb coverage is missing or double counted");
+  if (bare)
+  {
+    const auto& auxiliary = bare->getSourcePSet();
+    const auto& auxiliary_species = auxiliary.getSpeciesSet();
+    const int auxiliary_charge = auxiliary_species.findAttribute("charge");
+    if (&bare->getTargetPSet() != &electrons || !bare->evaluatesCurrentTarget() ||
+        auxiliary.getLattice().SuperCellEnum != SUPERCELL_OPEN || auxiliary_charge < 0 ||
+        auxiliary.getTotalNum() != static_cast<int>(missing.size()))
+      throw std::invalid_argument("OPEN ECP bare-ion source/target or occupied extent differs");
+    std::vector<bool> matched(missing.size(), false);
+    for (int site = 0; site < auxiliary.getTotalNum(); ++site)
+    {
+      if (!wftrain::isFiniteTrainingReal(auxiliary_species(auxiliary_charge, auxiliary.GroupID[site])))
+        throw std::invalid_argument("OPEN ECP bare source charge must be finite");
+      for (int dimension = 0; dimension < 3; ++dimension)
+        if (!wftrain::isFiniteTrainingReal(auxiliary.R[site][dimension]))
+          throw std::invalid_argument("OPEN ECP bare source coordinates must be finite");
+      std::size_t match = missing.size();
+      for (std::size_t candidate = 0; candidate < missing.size(); ++candidate)
+      {
+        const auto ion = missing[candidate];
+        if (!matched[candidate] && auxiliary_species(auxiliary_charge, auxiliary.GroupID[site]) ==
+            species(charge, ions.GroupID[ion]) && auxiliary.R[site] == ions.R[ion])
+        {
+          match = candidate;
+          break;
+        }
+      }
+      if (match == missing.size())
+        throw std::invalid_argument("OPEN ECP bare source must cover each missing physical ion exactly once");
+      matched[match] = true;
+      extendStageFingerprint(hash, missing[match]);
+      extendStageFingerprint(hash, auxiliary_species(auxiliary_charge, auxiliary.GroupID[site]));
+      for (int dimension = 0; dimension < 3; ++dimension)
+        extendStageFingerprint(hash, auxiliary.R[site][dimension]);
+    }
+  }
+  std::ostringstream identity;
+  identity << "real-open-physical-ecp-v1/" << std::hex << hash;
+  return {identity.str(), !missing.empty()};
+}
 
 /// Preserve the existing real profile's physical checks and restart identity exactly.
 std::string wftrain::realPairCoulombIdentity(PsiFormerWF& component, ParticleSet& electrons, QMCHamiltonian& hamiltonian)
@@ -3189,23 +3322,39 @@ void WFTrainBatched::run()
   try
   {
     physical_identity_records.resize(static_cast<std::size_t>(myComm->size()));
+    std::string physical_agreement_identity;
 #ifndef QMC_COMPLEX
+    std::optional<wftrain::RealECPPhysicalIdentity> real_ecp_identity;
+    if (device_provider && device_provider->isPseudopotentialSystem() &&
+        training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
+        student_prototype_.getOrbitals().size() == 1)
+    {
+      real_ecp_identity = wftrain::realECPPhysicalIdentity(*device_provider,
+          population_.get_golden_electrons(), population_.get_golden_hamiltonian());
+      physical_agreement_identity = real_ecp_identity->fingerprint;
+      // Only the newly complete mixed-source row changes its persisted identity.
+      if (real_ecp_identity->mixed_open_sources)
+        complex_physical_identity = physical_agreement_identity;
+    }
     if (device_provider && device_provider->usesAcceleratorParameterProducts() &&
         wftrain::usesEnergyScoreEstimator(training_input_, false))
     {
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
-        complex_physical_identity = realScoreECPIdentity(*device_provider, population_.get_golden_electrons(),
-            population_.get_golden_hamiltonian());
+        complex_physical_identity = real_ecp_identity && real_ecp_identity->mixed_open_sources
+            ? real_ecp_identity->fingerprint
+            : realScoreECPIdentity(*device_provider, population_.get_golden_electrons(), population_.get_golden_hamiltonian());
       else if (wftrain::supportsHybridKFACPolicy(training_input_) &&
                device_provider->matchesRealDevicePairTarget(population_.get_golden_electrons()))
         complex_physical_identity = wftrain::realPairCoulombIdentity(*device_provider, population_.get_golden_electrons(),
             population_.get_golden_hamiltonian());
     }
 #endif
-    if (!complex_physical_identity.empty())
+    if (physical_agreement_identity.empty())
+      physical_agreement_identity = complex_physical_identity;
+    if (!physical_agreement_identity.empty())
     {
       physical_identity_hash = UINT64_C(14695981039346656037);
-      extendStageFingerprint(physical_identity_hash, complex_physical_identity);
+      extendStageFingerprint(physical_identity_hash, physical_agreement_identity);
     }
   }
   catch (...) { physical_identity_failure = std::current_exception(); }

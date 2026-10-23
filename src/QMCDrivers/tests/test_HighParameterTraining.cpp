@@ -26,12 +26,17 @@
 #include "QMCHamiltonians/CoulombPBCAA.h"
 #include "QMCHamiltonians/CoulombPBCAB.h"
 #include "QMCHamiltonians/HarmonicExternalPotential.h"
+#include "QMCHamiltonians/CoulombPotential.h"
+#include "QMCHamiltonians/ECPotentialBuilder.h"
+#include "OhmmsData/Libxml2Doc.h"
+#include "Utilities/FakeRandom.h"
 #include "LongRange/LRCoulombSingleton.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -400,6 +405,149 @@ private:
 };
 
 } // namespace
+
+TEST_CASE("Real OPEN PP identity requires complete native bare-ion source coverage",
+          "[drivers][wftrain][open_ecp_physics]")
+{
+  namespace ps = psiformer;
+  namespace fixture = testing::psiformer;
+  const SimulationCell cell;
+  ParticleSet electrons(cell);
+  ParticleSet ions(cell);
+  ParticleSet auxiliary(cell);
+  electrons.setName("e");
+  electrons.create({1, 1});
+  auto& es = electrons.getSpeciesSet();
+  es.addSpecies("u");
+  es.addSpecies("d");
+  const int mass = es.addAttribute("mass");
+  const int charge = es.addAttribute("charge");
+  es(mass, 0) = es(mass, 1) = 1;
+  es(charge, 0) = es(charge, 1) = -1;
+  electrons.R[0] = {.3, .4, .5};
+  electrons.R[1] = {.7, .8, 2.1};
+  electrons.resetGroups();
+  ions.setName("ion0");
+  ions.create({1, 1});
+  auto& is = ions.getSpeciesSet();
+  is.addSpecies("Li");
+  is.addSpecies("H");
+  const int ion_charge = is.addAttribute("charge");
+  is(ion_charge, 0) = is(ion_charge, 1) = 1;
+  const int atomic_number = is.addAttribute("atomicnumber");
+  is(atomic_number, 0) = 3;
+  is(atomic_number, 1) = 1;
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {0, 0, 3.01392421};
+  ions.resetGroups();
+  ions.update();
+  auxiliary.setName("bare_h");
+  auxiliary.create({1});
+  auto& as = auxiliary.getSpeciesSet();
+  as.addSpecies("H");
+  const int auxiliary_charge = as.addAttribute("charge");
+  as(auxiliary_charge, 0) = 1;
+  auxiliary.R[0] = ions.R[1];
+  auxiliary.resetGroups();
+  auxiliary.update();
+  electrons.addTable(ions);
+  electrons.update();
+  ps::InitializedPsiFormerParameters parameters;
+  parameters.model_shape = {1, 1, 2, 1, 4, 1, 1};
+  parameters.profile = "unit_open_physics";
+  parameters.seed = 37;
+  auto leaves = fixture::makeLayout(2, 2, false, 1, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256)
+        extent = 4;
+      else if (extent == 32)
+        extent = 2;
+  parameters.values = fixture::makeParameters("h2", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto end = cursor + fixture::product(leaf.shape);
+    parameters.layouts.push_back({leaf.module, leaf.name, leaf.shape, cursor, end});
+    cursor = end;
+  }
+  PsiFormerWF component("open_physics", parameters, electrons, ions, false);
+  component.validateSystem(electrons, ions, "pseudopotential");
+  ParticleSet other(electrons);
+  other.setName("other_e");
+  other.update();
+  // Count any accidental quadrature draws during metadata-only admission.
+  struct CountingRandom : FakeRandom<QMCTraits::FullPrecRealType>
+  {
+    std::size_t draws = 0;
+    QMCTraits::FullPrecRealType operator()() override
+    {
+      ++draws;
+      return .371;
+    }
+  } random;
+  const auto pp_directory = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/molecules/LiH_pp";
+  // Construct the actual native PP and Coulomb partition, never a mock energy term.
+  const auto makeHamiltonian = [&](bool all_pp, bool include_bare, ParticleSet* pp_target = nullptr) {
+    auto result = std::make_unique<QMCHamiltonian>();
+    result->addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+    result->addOperator(std::make_unique<CoulombPotential>(electrons, true, false), "ee");
+    result->addOperator(std::make_unique<CoulombPotential>(ions, false, false), "ii");
+    Libxml2Document document;
+    const std::string pseudo = "<pairpot type='pseudo' format='xml' algorithm='batched' DLA='no'>"
+        "<pseudo elementType='Li' href='" + (pp_directory / "Li.BFD.xml").string() + "'/>" +
+        (all_pp ? "<pseudo elementType='H' href='" + (pp_directory / "H.BFD.xml").string() + "'/>" : "") + "</pairpot>";
+    REQUIRE(document.parseFromString(pseudo));
+    ECPotentialBuilder builder(*result, ions, pp_target ? *pp_target : electrons, OHMMS::Controller);
+    REQUIRE(builder.put(document.getRoot()));
+    for (int term = 0; term < result->size(); ++term)
+      if (auto* nonlocal = dynamic_cast<NonLocalECPotential*>(result->getComponent(term)))
+        nonlocal->setRandomGenerator(&random);
+    if (include_bare)
+      result->addOperator(std::make_unique<CoulombPotential>(auxiliary, electrons, true), "bare");
+    return result;
+  };
+  auto mixed = makeHamiltonian(false, true);
+  const auto identity = realECPPhysicalIdentity(component, electrons, *mixed);
+  CHECK(identity.mixed_open_sources);
+  CHECK_FALSE(identity.fingerprint.empty());
+  CHECK(realECPPhysicalIdentity(component, electrons, *mixed).fingerprint == identity.fingerprint);
+  es(mass, 0) = 1 + std::numeric_limits<double>::epsilon();
+  electrons.resetGroups();
+  CHECK(realECPPhysicalIdentity(component, electrons, *mixed).fingerprint != identity.fingerprint);
+  es(mass, 0) = 1;
+  electrons.resetGroups();
+  auto all_pp = makeHamiltonian(true, false);
+  CHECK_FALSE(realECPPhysicalIdentity(component, electrons, *all_pp).mixed_open_sources);
+  CHECK(realECPPhysicalIdentity(component, electrons, *all_pp).fingerprint != identity.fingerprint);
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *makeHamiltonian(false, false)));
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *makeHamiltonian(true, true)));
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *makeHamiltonian(false, true, &other)));
+  auto foreign_bare = makeHamiltonian(false, false);
+  foreign_bare->addOperator(std::make_unique<CoulombPotential>(auxiliary, other, true), "foreign_bare");
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *foreign_bare));
+  auxiliary.R[0][0] += .01;
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  auxiliary.R[0] = ions.R[1];
+  auxiliary.R[0][0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  auxiliary.R[0] = ions.R[1];
+  as(auxiliary_charge, 0) = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  as(auxiliary_charge, 0) = 2;
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  as(auxiliary_charge, 0) = 1;
+  auxiliary.R[0] = ions.R[0];
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  auxiliary.R[0] = ions.R[1];
+  CHECK(realECPPhysicalIdentity(component, electrons, *mixed).fingerprint == identity.fingerprint);
+  mixed->addOperator(std::make_unique<CoulombPotential>(auxiliary, electrons, true), "duplicate_bare");
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *mixed));
+  all_pp->addOperator(std::make_unique<CoulombPotential>(ions, false, false), "duplicate_ii");
+  CHECK_THROWS(realECPPhysicalIdentity(component, electrons, *all_pp));
+  CHECK(random.draws == 0);
+}
 
 TEST_CASE("Selected real pair physics identity binds actual native Ewald sources and targets",
           "[drivers][wftrain][pair_physics]")
