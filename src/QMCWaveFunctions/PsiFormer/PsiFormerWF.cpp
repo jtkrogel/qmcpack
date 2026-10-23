@@ -6437,6 +6437,24 @@ void requireUnitElectronMasses(const ParticleSet& particles)
   }
 }
 
+/// Keep optimized target admission and per-crowd tape ownership on the same real geometry.
+bool supportsSharedCpuTargetGeometry(const PsiFormerSharedState& state)
+{
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
+  return false;
+#else
+  const auto& environment = state.execution_plan.environment();
+  if (state.precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+      environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+    return false;
+  return environment.boundary == psiformer::BoundaryCondition::OPEN ||
+      (environment.boundary == psiformer::BoundaryCondition::PERIODIC &&
+       environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+       !environment.periodic_profile && !state.twist_phase.active() &&
+       std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool axis) { return axis; }));
+#endif
+}
+
 } // namespace
 
 // Load an exported model before entering the common optimizer-registration path.
@@ -6519,10 +6537,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
 #if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
     throw std::invalid_argument("PsiFormer CPU target VGL training requires a REAL FP64 build");
 #else
-    if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
-        model_state_->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
-        model_state_->execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
-      throw std::invalid_argument("PsiFormer CPU target VGL training requires REAL FP64 OPEN metadata");
+    if (!supportsSharedCpuTargetGeometry(*model_state_))
+      throw std::invalid_argument("PsiFormer CPU target VGL training requires REAL FP64 OPEN or legacy torus Gamma metadata");
 #endif
   }
   if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && enable_optimization)
@@ -12361,8 +12377,6 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
     throw std::invalid_argument("PsiFormer system must be all_electron or pseudopotential");
   if (electrons.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electrons or spin-orbit pseudopotentials");
-  if (usesCpuTargetVGL() && isOptimizable() && system_kind != "all_electron")
-    throw std::invalid_argument("PsiFormer CPU target VGL training requires an all-electron system");
   validateMatchingLattices(electrons, ions);
 
   PsiFormerReadTransaction state_lock(*model_state_);
@@ -14479,14 +14493,8 @@ void PsiFormerWF::mw_evaluateLog(
 
     if (transaction.state().cpu_target_vgl.targets)
     {
-      // Only the REAL FP64 OPEN no-plan route changes ownership. Preserve other
-      // admitted inference profiles and every scalar fallback tape unchanged.
-      bool shared_target = false;
-#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
-      shared_target = transaction.state().precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
-          transaction.state().execution_plan.environment().boundary == psiformer::BoundaryCondition::OPEN &&
-          transaction.state().execution_plan.environment().amplitude_scalar_domain == psiformer::ScalarDomain::REAL;
-#endif
+      // One independently leased crowd tape; accepted/staged products stay clone-private.
+      const bool shared_target = supportsSharedCpuTargetGeometry(transaction.state());
       if (shared_target && !resource.target_spatial_workspace)
       {
         auto candidate = transaction.state().direct_spatial_executor.makeTargetWorkspace(

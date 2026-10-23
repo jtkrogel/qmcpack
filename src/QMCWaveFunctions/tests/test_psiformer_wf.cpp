@@ -3330,8 +3330,16 @@ TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycl
   ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "3");
   ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
   if (periodic)
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
     CHECK_THROWS_AS(PsiFormerWF("pf_cpu_target_periodic_training", files.parameters.string(),
         files.configuration.string(), electrons, *ions, true, {0}, false, {}, twist), std::invalid_argument);
+#else
+  {
+    PsiFormerWF optimized("pf_cpu_target_periodic_training", files.parameters.string(),
+        files.configuration.string(), electrons, *ions, true, {0}, false, {}, twist);
+    CHECK(optimized.usesCpuTargetVGL());
+  }
+#endif
   PsiFormerWF target("pf_cpu_target", files.parameters.string(), files.configuration.string(),
       electrons, *ions, false, {}, false, {}, twist);
   CHECK_FALSE(target.supportsMultiParticleMoves());
@@ -3532,6 +3540,9 @@ TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before
                        true, {0});
   CHECK(optimized.usesCpuTargetVGL());
   auto ions = makeLiHIons(simulation_cell);
+  CHECK_NOTHROW(optimized.validateSystem(particles, *ions, "pseudopotential"));
+  CHECK(optimized.isPseudopotentialSystem());
+  ions->R[0][0] += .1;
   CHECK_THROWS_AS(optimized.validateSystem(particles, *ions, "pseudopotential"), std::invalid_argument);
 #endif
   BatchExecutionRequirements requirements;
@@ -3547,17 +3558,33 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
 {
   ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
   ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
-  auto files = generateFiles("lih", 4, 4);
-  const SimulationCell simulation_cell;
-  auto p0 = makeLiHElectrons(simulation_cell);
-  auto p1 = makeLiHElectrons(simulation_cell);
+  bool periodic = false, pseudopotential = false;
+  SECTION("OPEN AE") {}
+  SECTION("OPEN PP") { pseudopotential = true; }
+  SECTION("legacy torus Gamma AE") { periodic = true; }
+  SECTION("legacy torus Gamma PP") { periodic = pseudopotential = true; }
+  Lattice lattice;
+  if (periodic)
+  {
+    lattice.R = {8.0, 0.0, 0.0, .6, 7.4, 0.0, -.3, .5, 8.5};
+    lattice.BoxBConds = {true, true, true};
+    lattice.reset();
+  }
+  const auto system = pseudopotential ? "lih_pp" : "lih";
+  const auto kind = pseudopotential ? "pseudopotential" : "all_electron";
+  auto files = generateFiles(system, 4, periodic ? 7 : 4);
+  const SimulationCell simulation_cell(lattice);
+  auto p0 = makeLiHElectrons(simulation_cell, system);
+  auto p1 = makeLiHElectrons(simulation_cell, system);
+  const auto n = p0.getTotalNum();
   p1.R[0][0] += 0.013;
-  auto ions = makeLiHIons(simulation_cell);
-  PsiFormerWF reference("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
+  auto ions = makeLiHIons(simulation_cell, system);
+  PsiFormerWF reference("pf", files.parameters.string(), files.configuration.string(), p0, *ions, true, {}, true);
+  reference.validateSystem(p0, *ions, kind);
   ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "1");
   ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
-  PsiFormerWF leader("pf", files.parameters.string(), files.configuration.string(), true, {}, true);
-  leader.validateSystem(p0, *ions, "all_electron");
+  PsiFormerWF leader("pf", files.parameters.string(), files.configuration.string(), p0, *ions, true, {}, true);
+  leader.validateSystem(p0, *ions, kind);
   auto clone = leader.makeClone(p1);
   auto& follower = dynamic_cast<PsiFormerWF&>(*clone);
   RefVectorWithLeader<WaveFunctionComponent> components(leader, {leader, follower});
@@ -3579,15 +3606,15 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   const auto compare_full = [&]() {
     for (auto* p : {&p0, &p1})
     {
-      ParticleSet::ParticleGradient expected_g(4);
-      ParticleSet::ParticleLaplacian expected_l(4);
+      ParticleSet::ParticleGradient expected_g(n);
+      ParticleSet::ParticleLaplacian expected_l(n);
       expected_g = ValueType(0);
       expected_l = ValueType(0);
       const auto expected_log = reference.evaluateLog(*p, expected_g, expected_l);
       const auto actual = testing::TestPsiFormerWF::scalarStateSnapshot(p == &p0 ? leader : follower);
       CHECK(std::abs(actual.log_value - expected_log) < 2e-11);
       CHECK(actual.current_sign == testing::TestPsiFormerWF::scalarStateSnapshot(reference).current_sign);
-      for (int e = 0; e < 4; ++e)
+      for (int e = 0; e < n; ++e)
       {
         for (int d = 0; d < 3; ++d)
           CHECK(std::abs(p->G[e][d] - expected_g[e][d]) < 2e-10);
@@ -3622,6 +3649,40 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   CHECK(separate.target_spatial_workspace_identity != first.target_spatial_workspace_identity);
   CHECK(separate.target_spatial_bytes == first.target_spatial_bytes);
 
+  // Real concurrent crowds use distinct clone teams and independently leased resources.
+  auto p2 = ParticleSet(p0), p3 = ParticleSet(p1);
+  auto other0 = leader.makeClone(p2), other1 = leader.makeClone(p3);
+  auto& other_leader = dynamic_cast<PsiFormerWF&>(*other0);
+  RefVectorWithLeader<WaveFunctionComponent> other_components(other_leader, {other_leader, *other1});
+  RefVectorWithLeader<ParticleSet> other_particles(p2, {p2, p3});
+  RefVector<ParticleSet::ParticleGradient> other_gradients{p2.G, p3.G};
+  RefVector<ParticleSet::ParticleLaplacian> other_laplacians{p2.L, p3.L};
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  auto original_crowd = std::async(std::launch::async, [&] { start.wait(); return evaluate_crowd(resource); });
+  auto other_crowd = std::async(std::launch::async, [&] {
+    start.wait();
+    p2.G = ValueType(0); p2.L = ValueType(0); p3.G = ValueType(0); p3.L = ValueType(0);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(independent, other_components);
+    other_leader.mw_evaluateLog(other_components, other_particles, other_gradients, other_laplacians);
+    return testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(other_leader, other_components);
+  });
+  start_promise.set_value();
+  const auto concurrent0 = original_crowd.get(), concurrent1 = other_crowd.get();
+  CHECK(concurrent0.target_spatial_workspace_identity == first.target_spatial_workspace_identity);
+  CHECK(concurrent1.target_spatial_workspace_identity == separate.target_spatial_workspace_identity);
+  CHECK(concurrent0.target_spatial_workspace_identity != concurrent1.target_spatial_workspace_identity);
+  for (int e = 0; e < n; ++e)
+  {
+    for (int d = 0; d < 3; ++d)
+    {
+      CHECK(sameScalarBits(p0.G[e][d], p2.G[e][d]));
+      CHECK(sameScalarBits(p1.G[e][d], p3.G[e][d]));
+    }
+    CHECK(sameScalarBits(p0.L[e], p2.L[e]));
+    CHECK(sameScalarBits(p1.L[e], p3.L[e]));
+  }
+
   auto candidate = leader.snapshotParameters();
   const auto old_version = candidate.version;
   candidate.values[0] += 0.01;
@@ -3638,13 +3699,13 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   const auto caller_l0 = p0.L;
   const auto caller_l1 = p1.L;
   CHECK_THROWS(leader.publishParameters(candidate, old_version));
-  const auto saved_position = p1.R[3][0];
-  p1.R[3][0] = std::numeric_limits<double>::quiet_NaN();
+  const auto saved_position = p1.R[n - 1][0];
+  p1.R[n - 1][0] = std::numeric_limits<double>::quiet_NaN();
   {
     ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
     CHECK_THROWS(leader.mw_evaluateLog(components, particles, gradients, laplacians));
   }
-  p1.R[3][0] = saved_position;
+  p1.R[n - 1][0] = saved_position;
   CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted0));
   CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted1));
   const auto after0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
@@ -3657,7 +3718,7 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   CHECK(after1.accepted_configuration_identity == accepted1.accepted_configuration_identity);
   CHECK(after0.accepted_parameter_version == accepted0.accepted_parameter_version);
   CHECK(after1.accepted_parameter_version == accepted1.accepted_parameter_version);
-  for (int e = 0; e < 4; ++e)
+  for (int e = 0; e < n; ++e)
   {
     for (int d = 0; d < 3; ++d)
     {
@@ -3670,8 +3731,8 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   compare_full(); // Caller G/L were not partly published by the successful first lane.
 
   // A later scalar call owns a separate tape. Crowd reuse must not erase it.
-  ParticleSet::ParticleGradient scalar_g(4);
-  ParticleSet::ParticleLaplacian scalar_l(4);
+  ParticleSet::ParticleGradient scalar_g(n);
+  ParticleSet::ParticleLaplacian scalar_l(n);
   scalar_g = ValueType(0);
   scalar_l = ValueType(0);
   leader.evaluateLog(p0, scalar_g, scalar_l);

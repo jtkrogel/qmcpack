@@ -2633,20 +2633,38 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_max_blocks());
     // Target spatial tapes do not replace score/complete local-energy products.
     // Bound native energy training independently of the spatial owner budget.
-    if (const auto* target_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
-        target_provider && target_provider->usesCpuTargetVGL())
+    const auto* target_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+    const bool target_training = target_provider && target_provider->usesCpuTargetVGL();
+    int target_ranks = target_training ? 1 : 0;
+    myComm->allreduce(target_ranks);
+    if (target_ranks != 0 && target_ranks != myComm->size())
+      throw UniformCommunicateError("CPU target VGL training must select the same owner profile on every rank");
+    if (target_training)
     {
       const bool admitted_optimizer = training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM ||
           (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC &&
            wftrain::supportsHybridKFACPolicy(training_input_));
-      if (!admitted_optimizer || training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-          student_prototype_.getOrbitals().size() != 1 || myComm->size() != 1 ||
-          walker_counts.walkers_per_crowd.size() != 1 || steps_per_block_ != 1 ||
-          target_provider->isPseudopotentialSystem() || population_.get_golden_hamiltonian().hasPhysicalNLPP() ||
-          population_.get_golden_hamiltonian().ecpModelProvenance() ||
-          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift())
-        throw UniformCommunicateError("CPU target VGL training requires sole REAL OPEN AE energy Adam or explicit-policy "
-            "KFAC, MPI1/crowd1/step1 and PBYP/no drift; derivative products remain independent");
+      const auto& hamiltonian = population_.get_golden_hamiltonian();
+      const auto& provenance = hamiltonian.ecpModelProvenance();
+      const bool ae = !target_provider->isPseudopotentialSystem() && !hamiltonian.hasPhysicalNLPP() && !provenance;
+      const bool pp = target_provider->isPseudopotentialSystem() && hamiltonian.hasPhysicalNLPP() &&
+          provenance && provenance->ordinary_locality_vp && !provenance->scientific_definition.empty();
+      const bool extended = myComm->size() != 1 || walker_counts.walkers_per_crowd.size() != 1 || !ae ||
+          population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN;
+      const auto cap = training_input_.getMaximumRetainedBytes();
+      int invalid_target = !admitted_optimizer ||
+          training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+          student_prototype_.getOrbitals().size() != 1 || steps_per_block_ != 1 || (!ae && !pp) ||
+          !std::all_of(walker_counts.walkers_per_crowd.begin(), walker_counts.walkers_per_crowd.end(),
+                       [](auto count) { return count > 0; }) ||
+          (extended && (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+                        !cap || cap == std::numeric_limits<std::size_t>::max())) ||
+          vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP || vmcdriver_input_.get_use_drift();
+      myComm->allreduce(invalid_target);
+      if (invalid_target)
+        throw UniformCommunicateError("CPU target VGL training requires sole REAL FP64 OPEN or legacy torus Gamma "
+            "AE/ordinary-VP PP energy Adam or explicit-policy KFAC, nonempty crowds/step1 and PBYP/no drift; "
+            "extended rank/crowd/PP profiles require finite retained cap and line_search=off on every rank");
     }
     initPopulationAndCrowds(walker_counts);
     // Independent score selection must retain the qualified scalar ECP topology.
