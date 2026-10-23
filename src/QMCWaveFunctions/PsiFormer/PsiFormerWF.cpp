@@ -14946,8 +14946,100 @@ void PsiFormerWF::mw_evaluateGL(
     const RefVectorWithLeader<ParticleSet>& p_list,
     const RefVector<ParticleSet::ParticleGradient>& gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list,
-    bool) const
-{ mw_evaluateLog(wfc_list, p_list, gradient_list, laplacian_list); }
+    bool fromscratch) const
+{
+#ifndef QMC_COMPLEX
+  if (!fromscratch && !batch_execution_plan_ && !wfc_list.empty())
+  {
+    if (wfc_list.size() != p_list.size() || wfc_list.size() != gradient_list.size() ||
+        wfc_list.size() != laplacian_list.size())
+      throw std::invalid_argument("PsiFormer accepted FULL list sizes do not match");
+    requireMultiWalkerResource(wfc_list);
+    PsiFormerReadTransaction transaction(*model_state_, model_state_->resident_device_authority_enabled);
+    const auto version = transaction.parameterVersion();
+    const auto electrons = transaction.state().execution_plan.modelShape().electrons();
+    bool reusable = transaction.state().direct_spatial_mode == DirectBackendMode::DIRECT &&
+        !model_state_->resident_device_authority_enabled &&
+        model_state_->planned_single_transaction_count.load(std::memory_order_acquire) == 0 &&
+        model_state_->planned_selected_transaction_count.load(std::memory_order_acquire) == 0;
+    for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    {
+      const auto& component = wfc_list.getCastedElement<PsiFormerWF>(lane);
+      component.requireNoSelectedParticleProposal("mw_evaluateGL");
+      if (gradient_list[lane].get().size() != electrons || laplacian_list[lane].get().size() != electrons)
+        throw std::invalid_argument("PsiFormer accepted FULL output extent mismatch");
+      validateRuntimeLattice(p_list[lane], transaction.state().execution_plan.environment(),
+                             "PsiFormer accepted FULL particles");
+      reusable = reusable && component.bound_particle_set_ == &p_list[lane] &&
+          p_list[lane].getActivePtcl() == -1 && !p_list[lane].isSpinor() &&
+          !component.has_proposal_ && component.proposal_origin_ == ProposalOrigin::NONE &&
+          !component.restore_validation_pending_ && component.observed_parameter_version_ == version &&
+          component.accepted_gradient_.size() == electrons && component.accepted_laplacian_.size() == electrons &&
+          component.acceptedStateMatches(p_list[lane], version, AcceptedStateRequirement::FULL_SPATIAL) &&
+          isCoherentPhysicalValue(transaction.state(), component.current_sign_, component.log_value_, p_list[lane]);
+    }
+    if (reusable)
+    {
+      // Validate every output and sum before publishing any component contribution.
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+      {
+        const auto g = checkedMemoryRange(gradient_list[lane].get().data(), electrons,
+                                          "PsiFormer accepted FULL output range overflow");
+        const auto l = checkedMemoryRange(laplacian_list[lane].get().data(), electrons,
+                                          "PsiFormer accepted FULL output range overflow");
+        if (memoryRangesOverlap(g, l))
+          throw std::invalid_argument("PsiFormer accepted FULL outputs overlap");
+        for (std::size_t other = 0; other < wfc_list.size(); ++other)
+        {
+          const auto& component = wfc_list.getCastedElement<PsiFormerWF>(other);
+          for (const auto owned : {
+               checkedMemoryRange(component.accepted_gradient_.data(), electrons, "PsiFormer accepted FULL range overflow"),
+               checkedMemoryRange(component.accepted_laplacian_.data(), electrons, "PsiFormer accepted FULL range overflow"),
+               checkedMemoryRange(component.proposed_gradient_.data(), component.proposed_gradient_.size(), "PsiFormer proposed FULL range overflow"),
+               checkedMemoryRange(component.proposed_laplacian_.data(), component.proposed_laplacian_.size(), "PsiFormer proposed FULL range overflow"),
+               checkedMemoryRange(p_list[other].R.data(), p_list[other].R.size(), "PsiFormer position range overflow")})
+            if (memoryRangesOverlap(g, owned) || memoryRangesOverlap(l, owned))
+              throw std::invalid_argument("PsiFormer accepted FULL output aliases private or position storage");
+          const auto pg = checkedMemoryRange(p_list[other].G.data(), p_list[other].G.size(),
+                                             "PsiFormer particle gradient range overflow");
+          const auto pl = checkedMemoryRange(p_list[other].L.data(), p_list[other].L.size(),
+                                             "PsiFormer particle Laplacian range overflow");
+          if ((memoryRangesOverlap(g, pg) && !(other == lane && sameMemoryRange(g, pg))) ||
+              memoryRangesOverlap(g, pl) || memoryRangesOverlap(l, pg) ||
+              (memoryRangesOverlap(l, pl) && !(other == lane && sameMemoryRange(l, pl))))
+            throw std::invalid_argument("PsiFormer accepted FULL output aliases another particle product");
+          if (other < lane)
+          {
+            const auto og = checkedMemoryRange(gradient_list[other].get().data(), electrons,
+                                               "PsiFormer accepted FULL output range overflow");
+            const auto ol = checkedMemoryRange(laplacian_list[other].get().data(), electrons,
+                                               "PsiFormer accepted FULL output range overflow");
+            if (memoryRangesOverlap(g, og) || memoryRangesOverlap(g, ol) ||
+                memoryRangesOverlap(l, og) || memoryRangesOverlap(l, ol))
+              throw std::invalid_argument("PsiFormer accepted FULL output lanes overlap");
+          }
+        }
+        const auto& component = wfc_list.getCastedElement<PsiFormerWF>(lane);
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          for (std::size_t d = 0; d < 3; ++d)
+            if (!isFiniteWavefunctionValue(component.accepted_gradient_[electron][d]) ||
+                !isFiniteWavefunctionValue(gradient_list[lane].get()[electron][d] + component.accepted_gradient_[electron][d]))
+              throw std::overflow_error("PsiFormer accepted FULL gradient sum is nonfinite");
+          if (!isFiniteWavefunctionValue(component.accepted_laplacian_[electron]) ||
+              !isFiniteWavefunctionValue(laplacian_list[lane].get()[electron] + component.accepted_laplacian_[electron]))
+            throw std::overflow_error("PsiFormer accepted FULL Laplacian sum is nonfinite");
+        }
+      }
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+        wfc_list.getCastedElement<PsiFormerWF>(lane).accumulateAcceptedSpatial(
+            gradient_list[lane].get(), laplacian_list[lane].get());
+      return;
+    }
+  }
+#endif
+  mw_evaluateLog(wfc_list, p_list, gradient_list, laplacian_list);
+}
 
 // Shared CPU target tapes retain complete selected products without a dense spatial tape.
 bool PsiFormerWF::supportsMultiParticleMoves() const noexcept

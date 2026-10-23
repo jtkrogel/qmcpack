@@ -29,6 +29,7 @@
 #include "QMCWaveFunctions/tests/psiformer_test_utils.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceRuntime.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/CoulombPotential.h"
 #include "ResourceCollection.h"
@@ -222,13 +223,57 @@ TEST_CASE("Device sampling reuses FULL state only after proved rejection",
   component.publishParameters(candidate, candidate.version);
   CHECK_FALSE(VMCBatchedSampling::canReuseRejectedDeviceFullState(trial, electrons, 0, false));
   const auto before_version_refresh = metrics.snapshot();
-  TrialWaveFunction::mw_evaluateLog(trials, particles);
+  TrialWaveFunction::mw_evaluateGL(trials, particles, false);
   CHECK(metrics.snapshot().download_calls > before_version_refresh.download_calls);
   CHECK(VMCBatchedSampling::canReuseRejectedDeviceFullState(trial, electrons, 0, false));
   TrialWaveFunction missing(options);
   missing.addComponent(std::make_unique<PsiFormerWF>("missing_full", initialized, electrons, ions,
       false, std::vector<std::size_t>{}, false, "", std::array<double, 3>{}, resolution));
   CHECK_FALSE(VMCBatchedSampling::canReuseRejectedDeviceFullState(missing, electrons, 0, false));
+
+  // A selected joint proposal already retains complete own G/L, including when
+  // its coordinates are rejected. Cached publication must perform no device work.
+  ResourceCollection particle_prototype("cached_full_particles");
+  electrons.createResource(particle_prototype);
+  ResourceCollection particle_resources(particle_prototype);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  for (const bool take : {false, true})
+  {
+    const MCMultiParticleMoves<CoordsType::POS> move({0, 1}, {0},
+        {electrons.R[0] + ParticleSet::PosType{.013, -.007, .004}});
+    std::vector<TrialWaveFunction::LogValue> ratios(1);
+    TrialWaveFunction::mw_evaluateMultiParticleMove(trials, particles, move, ratios);
+    std::vector<bool> valid;
+    ParticleSet::mw_makeMoveSelectedParticles(particles, move, valid);
+    REQUIRE(valid.size() == 1);
+    REQUIRE(valid[0]);
+    TrialWaveFunction::mw_accept_rejectMultiParticleMove(trials, particles, move, {take});
+    ParticleSet::mw_accept_rejectMoveSelectedParticles(particles, {take});
+    const auto cached_before = metrics.snapshot();
+    TrialWaveFunction::mw_evaluateGL(trials, particles, false);
+    const auto cached_after = metrics.snapshot();
+    CHECK(cached_after.upload_calls == cached_before.upload_calls);
+    CHECK(cached_after.download_calls == cached_before.download_calls);
+    CHECK(cached_after.allocation_calls == cached_before.allocation_calls);
+    const auto cached_g = electrons.G;
+    const auto cached_l = electrons.L;
+    const auto cached_log = trial.getLogPsi();
+    const auto cached_phase = trial.getPhase();
+    electrons.update();
+    const auto cached_energy = energy();
+    const auto fresh_before = metrics.snapshot();
+    TrialWaveFunction::mw_evaluateGL(trials, particles, true);
+    CHECK(metrics.snapshot().download_calls > fresh_before.download_calls);
+    CHECK(trial.getLogPsi() == Catch::Approx(cached_log).margin(2e-12));
+    CHECK(trial.getPhase() == cached_phase);
+    CHECK(energy() == Catch::Approx(cached_energy).epsilon(2e-12).margin(2e-12));
+    for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    {
+      for (int d = 0; d < 3; ++d)
+        CHECK(std::abs(electrons.G[electron][d] - cached_g[electron][d]) < 2e-12);
+      CHECK(std::abs(electrons.L[electron] - cached_l[electron]) < 2e-12);
+    }
+  }
 }
 #endif
 

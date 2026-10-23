@@ -3605,13 +3605,16 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   ResourceCollection resource_template("target_shared");
   leader.createResource(resource_template);
   ResourceCollection resource(resource_template);
-  const auto evaluate_crowd = [&](ResourceCollection& selected) {
+  const auto evaluate_crowd = [&](ResourceCollection& selected, bool evaluate_gl = false) {
     p0.G = ValueType(0);
     p0.L = ValueType(0);
     p1.G = ValueType(0);
     p1.L = ValueType(0);
     ResourceCollectionTeamLock<WaveFunctionComponent> lock(selected, components);
-    leader.mw_evaluateLog(components, particles, gradients, laplacians);
+    if (evaluate_gl)
+      leader.mw_evaluateGL(components, particles, gradients, laplacians, false);
+    else
+      leader.mw_evaluateLog(components, particles, gradients, laplacians);
     return testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components);
   };
   const auto compare_full = [&]() {
@@ -3688,6 +3691,7 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
     CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted_before0));
     CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
     leader.mw_evaluateMultiParticleMove(components, particles, collective, ratios, proposed_g, proposed_l);
+    CHECK_THROWS_AS(leader.mw_evaluateGL(components, particles, proposed_g, proposed_l, false), std::logic_error);
     CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, accepted_before0));
     CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, accepted_before1));
     for (std::size_t walker = 0; walker < 2; ++walker)
@@ -3722,10 +3726,55 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
     CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).target_spatial_workspace_identity ==
           first.target_spatial_workspace_identity);
     CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).batch_bytes == 0);
+
+    // The rejected lane retains a different staged configuration: exact state
+    // preservation proves cached GL did not stage another target FULL evaluation.
+    const auto after_accept0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+    const auto after_accept1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+    proposed_g0 = ValueType(1);
+    proposed_g1 = ValueType(1);
+    proposed_l0 = ValueType(2);
+    proposed_l1 = ValueType(2);
+    leader.mw_evaluateGL(components, particles, proposed_g, proposed_l, false);
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(leader, after_accept0));
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(follower, after_accept1));
+    for (std::size_t walker = 0; walker < 2; ++walker)
+    {
+      const auto& state = walker ? after_accept1 : after_accept0;
+      for (std::size_t electron = 0; electron < n; ++electron)
+      {
+        for (int d = 0; d < 3; ++d)
+          CHECK(proposed_g[walker].get()[electron][d] == ValueType(1) + state.accepted_gradient[electron][d]);
+        CHECK(proposed_l[walker].get()[electron] == ValueType(2) + state.accepted_laplacian[electron]);
+      }
+    }
+    RefVector<ParticleSet::ParticleGradient> overlapping{proposed_g0, proposed_g0};
+    CHECK_THROWS_AS(leader.mw_evaluateGL(components, particles, overlapping, proposed_l, false), std::invalid_argument);
+    proposed_g0 = ValueType(7);
+    proposed_l1[n - 1] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(leader.mw_evaluateGL(components, particles, proposed_g, proposed_l, false), std::overflow_error);
+    for (std::size_t electron = 0; electron < n; ++electron)
+      for (int d = 0; d < 3; ++d)
+        CHECK(proposed_g0[electron][d] == ValueType(7));
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(leader, after_accept0));
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(follower, after_accept1));
+    proposed_g0 = ValueType(0);
+    proposed_g1 = ValueType(0);
+    proposed_l0 = ValueType(0);
+    proposed_l1 = ValueType(0);
+    leader.mw_evaluateGL(components, particles, proposed_g, proposed_l, true);
+    CHECK_FALSE(testing::TestPsiFormerWF::scalarStateMatches(follower, after_accept1));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, after_accept0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, after_accept1));
   }
   p0.R = original_positions;
   evaluate_crowd(resource);
   compare_full();
+  p0.R[0][0] += .003;
+  evaluate_crowd(resource, true);
+  compare_full();
+  p0.R = original_positions;
+  evaluate_crowd(resource);
 
   // A late invalid destination cannot publish the already completed first lane.
   proposed_g0 = ValueType(7);
@@ -3818,7 +3867,7 @@ TEST_CASE("PsiFormer CPU target crowd leases one tape without sharing accepted p
   candidate.values[0] += 0.01;
   leader.publishParameters(candidate, old_version);
   reference.publishParameters(candidate, old_version);
-  const auto refreshed = evaluate_crowd(resource);
+  const auto refreshed = evaluate_crowd(resource, true);
   CHECK(refreshed.target_spatial_workspace_identity == first.target_spatial_workspace_identity);
   CHECK(refreshed.target_spatial_parameter_version == old_version + 1);
   compare_full();
