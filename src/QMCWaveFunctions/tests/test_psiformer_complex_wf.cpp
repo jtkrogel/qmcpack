@@ -1104,6 +1104,62 @@ TEST_CASE("Paired CPU XML admits complete structured optimization and preserves 
   CHECK(readiness.calls == 0);
 }
 
+TEST_CASE("Legacy paired CPU pseudopotential inference initializes without optimization",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_pp_inference]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  p.create({1, 1});
+  p.R[0] = {.2, .1, .3}; p.R[1] = {1.1, .5, 1.4};
+  p.resetGroups(); p.update();
+  auto training_p = ParticleSet(p);
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  auto source = std::make_unique<ParticleSet>(ions(simulation_cell));
+  auto& species = source->getSpeciesSet();
+  species(species.findAttribute("charge"), 0) = 1;
+  species(species.findAttribute("valence"), 0) = 1;
+  source->resetGroups(); source->update();
+  pool.emplace("ion0", std::move(source));
+  AdmissionReadiness readiness;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, pool, &readiness);
+  PsiFormerWaveFunctionBuilder training_builder(OHMMS::Controller, training_p, pool, &readiness);
+  const auto xml = [](const std::string& controls) {
+    return std::string("<psiformer source='ion0' system='pseudopotential' ") +
+        "initialization='psiformer_complex_periodic_v1' initialization_seed='17' " +
+        "feature_policy='periodic_torus_v1' gpu='cpu' max_clone_numeric_bytes='67108864' " + controls + "/>";
+  };
+  const auto build = [](PsiFormerWaveFunctionBuilder& selected, const std::string& text) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(text));
+    return selected.buildComponent(document.getRoot());
+  };
+  for (const std::string twist : {"0 0 0", ".125 -.0625 .03125"})
+  {
+    p.setTwist({}); training_p.setTwist({});
+    const auto fixed_twist = "twist='" + twist + "' ";
+    auto cold_base = build(builder, xml(fixed_twist + "optimize='no'"));
+    auto training_base = build(training_builder, xml(fixed_twist + "optimize='yes' optimize_scope='all'"));
+    auto* cold = dynamic_cast<PsiFormerComplexWF*>(cold_base.get());
+    auto* training = dynamic_cast<PsiFormerComplexWF*>(training_base.get());
+    REQUIRE(cold != nullptr); REQUIRE(training != nullptr);
+    CHECK_FALSE(cold->gpuInferenceEnabled());
+    CHECK(cold->isPseudopotentialSystem());
+    CHECK(cold->snapshotParameters().version == 0);
+    CHECK(cold->snapshotParameters().values == training->snapshotParameters().values);
+    close(evaluate(*cold, p), evaluate(*training, training_p), 2e-12);
+    for (int e = 0; e < p.getTotalNum(); ++e)
+    {
+      close(p.L[e], training_p.L[e], 2e-12);
+      for (int d = 0; d < 3; ++d) close(p.G[e][d], training_p.G[e][d], 2e-12);
+    }
+    close(cold->observeCoulombEnergy(p, .25).local_energy,
+          training->observeCoulombEnergy(training_p, .25).local_energy, 2e-12);
+  }
+  CHECK_THROWS(build(builder, xml("optimize='no' optimize_scope='all'")));
+  CHECK_THROWS(build(builder, xml("optimize='no' precision='fp32_dense_fp64_islands'")));
+  CHECK(readiness.calls == 0);
+}
+
 TEST_CASE("PsiFormer paired XML observes the same production Coulomb Hamiltonian sample",
           "[wavefunction][psiformer][complex_wf][complex_admission]")
 {
