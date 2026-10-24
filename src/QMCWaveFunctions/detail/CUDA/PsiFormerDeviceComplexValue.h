@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_VALUE_H
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceComplexValueKernels.h"
+#include "PsiFormerDeviceOrbitalProjection.h"
 #include <array>
 #include <cstring>
 
@@ -17,6 +18,7 @@ struct ComplexValueCost
   std::size_t trunk_bytes, device_bytes, host_bytes, matrices;
   std::size_t pair_event_bytes = 0;
   std::size_t envelope_anchor_bytes = 0, envelope_host_bytes = 0;
+  std::size_t projection_pointer_bytes = 0;
 };
 
 namespace complex_detail
@@ -70,11 +72,26 @@ inline bool configuredComplexValuePairCheck()
 
 /// Count an ordinary VALUE owner, including its admitted optional pair records.
 inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
-                                               bool allow_pair_check = true, bool virtual_envelope_reuse = false)
+                                               bool allow_pair_check = true, bool virtual_envelope_reuse = false,
+                                               bool batched_projection = false)
 {
   auto cost = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto& e = plan.environment();
   const auto n = plan.modelShape().electrons();
+  if (batched_projection)
+  {
+    if (!allow_pair_check || n < 64 || e.periodic_profile || !e.fixed_nuclei ||
+        e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Batched paired heads require ordinary fixed legacy-torus FP64 Ne>=64");
+    const auto spins = (plan.modelShape().spin_up_electrons != 0) +
+        (plan.modelShape().spin_up_electrons != n);
+    cost.projection_pointer_bytes = spatial_detail::checkedProduct(std::size_t(2),
+        orbitalProjectionPointerBytes(batch, 1, plan.modelShape().determinants, spins),
+        "Paired projection pointer bytes overflow");
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, cost.projection_pointer_bytes,
+        "Paired projection owner bytes overflow");
+  }
   if (allow_pair_check && configuredComplexValuePairCheck() && n >= 64 && !e.periodic_profile &&
       e.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
       std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
@@ -140,14 +157,19 @@ public:
   /// Exact combined preflight precedes constructor/trunk/device allocation.
   static std::unique_ptr<PreparedDeviceComplexValue> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
-      std::size_t budget, bool virtual_envelope_reuse = false)
+      std::size_t budget, bool virtual_envelope_reuse = false, bool batched_projection = false)
   {
     if (!image)
       throw std::invalid_argument("Complex VALUE requires a named paired image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse);
+    const auto cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse, batched_projection);
     if (cost.device_bytes > budget)
       throw std::length_error("Numerical complex VALUE exceeds its standalone owner budget");
+    if (cost.projection_pointer_bytes)
+      std::clog << "  Paired head projection preparation: mode=VALUE selected=determinant_batched D="
+                << image->plan().modelShape().determinants << " capacity=" << capacity
+                << " pointer_device_bytes=" << cost.projection_pointer_bytes
+                << " pointer_host_bytes=0; before_allocation=yes\n";
     if (cost.pair_event_bytes)
       std::clog << "  Complex VALUE pair-check preparation: selected=cooperative Ne="
                 << image->plan().modelShape().electrons() << " capacity=" << capacity
@@ -385,10 +407,17 @@ private:
 
     // Project both head components from this SAME admitted real trunk generation.
     const auto m = t.product(t.batch_, t.matrices_per_configuration_);
-    projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), parameter(ParameterRole::BACKFLOW_UP_WEIGHT),
-        parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT), projections_.data());
-    projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), parameter(ParameterRole::BACKFLOW_UP_WEIGHT, HeadTensorComponent::IMAG),
-        parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT, HeadTensorComponent::IMAG), projections_.data() + cost_.matrices);
+    for (std::size_t component = 0; component < 2; ++component)
+    {
+      const auto part = component ? HeadTensorComponent::IMAG : HeadTensorComponent::REAL;
+      const auto* up = parameter(ParameterRole::BACKFLOW_UP_WEIGHT, part);
+      const auto* down = parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT, part);
+      auto* output = projections_.data() + component * cost_.matrices;
+      if (projection_banks_[component])
+        projection_banks_[component]->project(t.blas_, t.queue_.getNative(), t.orbitals_, t.a_.data(), up, down, output);
+      else
+        projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), up, down, output);
+    }
     resetStatus();
     if (virtual_envelope)
       checkRuntime(launchComplexValueVirtualEnvelopes(t.queue_.getNative(), t.orbitals_, *t.model_->periodicCell(),
@@ -550,12 +579,16 @@ private:
         envelope_rows_(cost.envelope_anchor_bytes ? capacity : 0, "ComplexValue::request_rows_", __FILE__, __LINE__),
         envelope_anchor_status_(cost.envelope_anchor_bytes ? 1 : 0, "ComplexValue::request_status_", __FILE__, __LINE__)
   {
+    if (cost.projection_pointer_bytes)
+      for (auto& bank : projection_banks_)
+        bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +
         channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8 +
         (inverse_.capacity() + solve_.capacity()) * sizeof(cuDoubleComplex) + permutation_.capacity() * sizeof(std::size_t) +
         pair_events_.capacity() * sizeof(std::uint64_t) + envelope_anchor_.capacity() * sizeof(double) +
-        envelope_rows_.capacity() * sizeof(std::size_t) + envelope_anchor_status_.capacity() * sizeof(std::uint64_t);
+        envelope_rows_.capacity() * sizeof(std::size_t) + envelope_anchor_status_.capacity() * sizeof(std::uint64_t) +
+        (projection_banks_[0] ? projection_banks_[0]->deviceBytes() + projection_banks_[1]->deviceBytes() : 0);
     if ((cost.pair_event_bytes && (retain_score || pair_events_.capacity() != capacity)) ||
         pair_events_.capacity() * sizeof(std::uint64_t) != cost.pair_event_bytes)
       throw std::logic_error("Complex VALUE pair records differ from admitted ordinary owner");
@@ -603,6 +636,7 @@ private:
 
   const ComplexValueCost cost_;
   std::unique_ptr<PreparedDeviceInference> trunk_;
+  std::array<std::unique_ptr<PreparedDeviceOrbitalProjection>, 2> projection_banks_;
   DeviceBuffer<double> envelope_, projections_;
   DeviceBuffer<cuDoubleComplex> matrix_;
   DeviceBuffer<ComplexValueChannel> channels_;

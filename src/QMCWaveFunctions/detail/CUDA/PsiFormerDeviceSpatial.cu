@@ -10,6 +10,8 @@
  */
 
 #include "PsiFormerDeviceSpatial.h"
+#include "PsiFormerDeviceOrbitalProjection.h"
+#include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalProjection.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicPairAttention.h"
@@ -1550,6 +1552,72 @@ Error launchFinalSpatialCombination(
       layout, determinant_metadata, determinant_status, determinant_gradient,
       determinant_laplacian_log, cusp, phase, output, laplacian_ratio, status);
   return peekSpatialLaunchError();
+}
+
+/// Materialize only pointer metadata; all numerical inputs/outputs keep their old layout.
+__global__ void orbitalProjectionPointersKernel(OpenOrbitalJetLayout layout, std::size_t count,
+    const double* features, const double* up, const double* down, double* output,
+    const double** weights, const double** source, double** destinations)
+{
+  auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count)
+    return;
+  const auto destination = index;
+  const auto determinant = index % layout.determinant_count;
+  index /= layout.determinant_count;
+  const auto plane = index % layout.features.plane_count;
+  index /= layout.features.plane_count;
+  const auto configuration = index % layout.features.configuration_count;
+  const auto spin = index / layout.features.configuration_count;
+  const bool is_up = layout.spin_up_count != 0 && spin == 0;
+  const auto first = is_up ? 0 : layout.spin_up_count;
+  weights[destination] = (is_up ? up : down) + determinant * layout.backflow_determinant_stride;
+  source[destination] = features + layout.features.uncheckedPlaneOffset(configuration, plane,
+      first * layout.feature_row_stride);
+  destinations[destination] = output + layout.orbitals.uncheckedPlaneOffset(configuration, plane,
+      open_orbital::outputElement(layout, determinant, first, 0));
+}
+
+/// Refresh one complete stage before its stream-ordered grouped GEMMs.
+Error launchOrbitalProjectionPointers(Stream stream, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* up, const double* down, double* output,
+    const double** weights, const double** source, double** destinations)
+{
+  validateOpenOrbitalJetLayout(layout);
+  const auto bytes = orbitalProjectionPointerBytes(layout.features.configuration_count,
+      layout.features.plane_count, layout.determinant_count,
+      (layout.spin_up_count != 0) + (layout.spin_up_count != layout.features.electron_count));
+  const auto count = bytes / (sizeof(const double*) * 2 + sizeof(double*));
+  const auto blocks = checkedSpatialBlockCount(count, "Orbital projection pointer grid exceeds device x dimension");
+  if (!features || !output || !weights || !source || !destinations ||
+      (layout.spin_up_count && !up) || (layout.spin_up_count != layout.features.electron_count && !down))
+    throw std::invalid_argument("Orbital projection pointer refresh has null admitted storage");
+  orbitalProjectionPointersKernel<<<blocks, spatial_block_size, 0, stream>>>(layout, count,
+      features, up, down, output, weights, source, destinations);
+  return peekSpatialLaunchError();
+}
+
+/// Validate ordering without touching stream state or introducing a fence.
+void validateOrbitalProjectionStream(const AcceleratorBlasHandle& handle, Stream stream)
+{
+  if (handle.h_stream != stream)
+    throw std::invalid_argument("Orbital projection pointers and BLAS require one ordered stream");
+}
+
+/// Preserve the same FP64 logical matrix per determinant using documented pointer batching.
+void projectOrbitalDeterminantsBatched(AcceleratorBlasHandle& handle, const DenseForwardLayout& layout,
+    std::size_t determinants, const double* const* weights, const double* const* source,
+    double* const* output)
+{
+  validateDenseForwardLayout(layout);
+  const auto checked = [](std::size_t n) {
+    if (!n || n > std::size_t(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Orbital projection batched BLAS extent exceeds int");
+    return static_cast<int>(n);
+  };
+  compute::BLAS::gemm_batched(handle, 'N', 'N', checked(layout.output_width), checked(layout.rows),
+      checked(layout.input_width), 1.0, weights, checked(layout.weight_row_stride),
+      source, checked(layout.source_row_stride), 0.0, output, checked(layout.target_row_stride), checked(determinants));
 }
 
 // Reuse the retained factor allocation: each GEMM writes its logical tile only.

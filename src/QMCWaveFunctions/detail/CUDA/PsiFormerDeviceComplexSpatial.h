@@ -14,6 +14,7 @@ namespace qmcplusplus::psiformer::device
 struct ComplexSpatialCost
 {
   std::size_t trunk_bytes, device_bytes, host_bytes, matrices, head_elements;
+  std::size_t projection_pointer_bytes = 0;
 };
 
 /// Replace only the legacy product scratch with an explicitly admitted immutable slab.
@@ -38,7 +39,8 @@ inline ComplexSpatialCost withConcurrentSpatialTraceCost(ComplexSpatialCost cost
 
 /// Admit the complete real trunk/head/inverse/traces inventory before allocation.
 inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
-                                                     std::size_t concurrent_targets = 0)
+                                                     std::size_t concurrent_targets = 0,
+                                                     bool batched_projection = false)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::FULL_VGL);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex FULL extent overflow"); };
@@ -50,9 +52,19 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
     throw std::overflow_error("Complex FULL head index exceeds launch/status admission");
   const auto extra = add(add(mul(16, base.matrices), mul(16 + sizeof(std::size_t), vectors)),
       add(mul(16, mul(bn, n)), mul(80, bn)));
-  return withConcurrentSpatialTraceCost(
+  auto cost = withConcurrentSpatialTraceCost(
       {base.trunk_bytes, add(base.device_bytes, extra), base.host_bytes, base.matrices, head},
       plan, batch, n, concurrent_targets);
+  if (batched_projection)
+  {
+    cost.projection_pointer_bytes = mul(planes,
+        estimateComplexValueCost(plan, batch, true, false, true).projection_pointer_bytes);
+    // Validate the full pointer launch grid as well as its checked numeric bytes.
+    (void)orbitalProjectionPointerBytes(batch, planes, plan.modelShape().determinants,
+        (plan.modelShape().spin_up_electrons != 0) + (plan.modelShape().spin_up_electrons != n));
+    cost.device_bytes = add(cost.device_bytes, cost.projection_pointer_bytes);
+  }
+  return cost;
 }
 
 /// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
@@ -99,14 +111,19 @@ public:
   /// Reject malformed profiles/extents and byte limits BEFORE preparing numeric buffers.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget,
-      std::size_t concurrent_targets = 0)
+      std::size_t concurrent_targets = 0, bool batched_projection = false)
   {
     if (!image)
       throw std::invalid_argument("Complex FULL requires a paired numerical image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexSpatialCost(image->plan(), capacity, concurrent_targets);
+    const auto cost = estimateComplexSpatialCost(image->plan(), capacity, concurrent_targets, batched_projection);
     if (cost.device_bytes > budget)
       throw std::length_error("Complex FULL exceeds its standalone owner workspace budget");
+    if (cost.projection_pointer_bytes)
+      std::clog << "  Paired head projection preparation: mode=FULL selected=determinant_batched D="
+                << image->plan().modelShape().determinants << " capacity=" << capacity
+                << " pointer_device_bytes=" << cost.projection_pointer_bytes
+                << " pointer_host_bytes=0; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
         std::move(image), capacity, queue, blas, cost, {}, concurrent_targets));
   }
@@ -299,10 +316,17 @@ private:
   {
     auto& t = *trunk_;
     // Two projections consume the SAME real FULL trunk; E supplies only radial jets.
-    projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), parameter(ParameterRole::BACKFLOW_UP_WEIGHT),
-        parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT), projections_.data());
-    projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), parameter(ParameterRole::BACKFLOW_UP_WEIGHT, HeadTensorComponent::IMAG),
-        parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT, HeadTensorComponent::IMAG), projections_.data() + cost_.head_elements);
+    for (std::size_t component = 0; component < 2; ++component)
+    {
+      const auto part = component ? HeadTensorComponent::IMAG : HeadTensorComponent::REAL;
+      const auto* up = parameter(ParameterRole::BACKFLOW_UP_WEIGHT, part);
+      const auto* down = parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT, part);
+      auto* output = projections_.data() + component * cost_.head_elements;
+      if (projection_banks_[component])
+        projection_banks_[component]->project(t.blas_, t.queue_.getNative(), t.orbitals_, t.a_.data(), up, down, output);
+      else
+        projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), up, down, output);
+    }
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipMemsetAsync(status_.data(), 0xff, 8, t.queue_.getNative()), "complex FULL status reset");
 #else
@@ -351,7 +375,11 @@ private:
         canonical_(preparation.max_targets ? new ComplexValueResult[capacity] : nullptr),
         target_current_(preparation.max_targets && capacity > 1 ? capacity : 0)
   {
-    auto actual = trunk_->deviceWorkspaceBytes() + (envelope_.capacity() + projections_.capacity()) * sizeof(double);
+    if (cost.projection_pointer_bytes)
+      for (auto& bank : projection_banks_)
+        bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
+    auto actual = trunk_->deviceWorkspaceBytes() + (envelope_.capacity() + projections_.capacity()) * sizeof(double) +
+        (projection_banks_[0] ? projection_banks_[0]->deviceBytes() + projection_banks_[1]->deviceBytes() : 0);
     for (const auto* buffer : {&head_, &inverse_, &solve_, &product_, &channel_terms_, &outputs_})
       actual += buffer->capacity() * sizeof(cuDoubleComplex);
     actual += permutation_.capacity() * sizeof(std::size_t) + channels_.capacity() * sizeof(ComplexValueChannel) +
@@ -387,6 +415,7 @@ private:
 
   ComplexSpatialCost cost_;
   std::unique_ptr<PreparedDeviceInference> trunk_;
+  std::array<std::unique_ptr<PreparedDeviceOrbitalProjection>, 2> projection_banks_;
   std::size_t capacity_electrons_;
   const std::size_t concurrent_targets_;
   const ComplexSpatialTraceWorkspacePlan trace_workspace_;
