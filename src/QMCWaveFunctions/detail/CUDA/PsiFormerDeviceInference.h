@@ -449,6 +449,17 @@ inline bool configuredPeriodicValueGeometryTiled()
   throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_TILED must be 0 or 1");
 }
 
+/// Freeze optional ordinary REAL pair geometry at backend preparation.
+inline bool configuredPeriodicValuePairGeometry()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_PERIODIC_VALUE_PAIR_GEOMETRY");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_PAIR_GEOMETRY must be 0 or 1");
+}
+
 /// Freeze optional ordinary REAL request-local envelope reuse at backend preparation.
 inline bool configuredRealVirtualEnvelopeReuse()
 {
@@ -1583,7 +1594,17 @@ private:
       deviceMemoryMetrics(sparse_envelope_->descriptors.deviceOrdinal()).uploaded(bytes);
     }
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
-    if (const auto* cell = model_->periodicCell())
+    if (periodic_value_pairs_)
+      checkRuntime(launchPeriodicOrbitalValuesPairGeometry(stream, orbitals_, *model_->periodicCell(),
+          a_.data(), positions_.data(), model_->nuclei(),
+          parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
+          parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
+          parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
+          active_.data(), orbital_jets_.data(), open_status_.data(), periodic_value_pairs_->radii.data(),
+          periodic_value_pairs_->valid.data(), periodic_value_pairs_->radii.capacity(),
+          sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}),
+          "model periodic VALUE pair geometry");
+    else if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicOrbitalJets(stream, orbitals_, *cell, a_.data(), positions_.data(), model_->nuclei(),
           parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
           parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
@@ -2006,6 +2027,31 @@ public:
         environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
   }
 
+  /// Charge capacity, although each producer/consumer touches only its live prefix.
+  std::size_t periodicValuePairDeviceBytes() const
+  {
+    return admitsSparseEnvelopeAnchor() && plan_.modelShape().nuclei != 0
+        ? estimatePeriodicValuePairCost(batch_capacity_, ne_, plan_.modelShape().nuclei).device_bytes : 0;
+  }
+
+  /// Publish optional storage only after the caller admits every simultaneous graph.
+  void preparePeriodicValuePairs()
+  {
+    if (periodic_value_pairs_ || !admitsSparseEnvelopeAnchor() || plan_.modelShape().nuclei == 0)
+      return;
+    const auto cost = estimatePeriodicValuePairCost(batch_capacity_, ne_, plan_.modelShape().nuclei);
+    auto candidate = std::make_unique<PeriodicValuePairScratch>();
+    candidate->radii.reserveNamed(cost.pair_elements, "Inference::periodic_pair_radius", __FILE__, __LINE__);
+    candidate->valid.reserveNamed(cost.pair_elements, "Inference::periodic_pair_valid", __FILE__, __LINE__);
+    periodic_value_pairs_ = std::move(candidate);
+  }
+
+  /// Roll back only this optional bank; completed anchor/baseline owners survive.
+  void discardPeriodicValuePairs() noexcept { periodic_value_pairs_.reset(); }
+
+  /// Detect an unsupported replacement instead of inheriting uncharged policy.
+  bool hasPeriodicValuePairs() const noexcept { return bool(periodic_value_pairs_); }
+
   /// Numeric added owner bytes, independent of reference/walker count.
   std::size_t sparseEnvelopeDeviceBytes() const
   {
@@ -2282,6 +2328,11 @@ public:
     {
       add(checkedDeviceBytes<double>(periodic_value_tiling_->terms.capacity()));
       add(checkedDeviceBytes<std::uint32_t>(periodic_value_tiling_->flags.capacity()));
+    }
+    if (periodic_value_pairs_)
+    {
+      add(checkedDeviceBytes<double>(periodic_value_pairs_->radii.capacity()));
+      add(checkedDeviceBytes<std::uint8_t>(periodic_value_pairs_->valid.capacity()));
     }
     for (const auto& tape : value_tape_)
       add(tape->storageBytes());
@@ -2704,6 +2755,13 @@ private:
     DeviceBuffer<std::uint32_t> flags;
   };
   std::unique_ptr<PeriodicValueTilingScratch> periodic_value_tiling_;
+  /// Fixed-capacity storage; request launches initialize only the live batch prefix.
+  struct PeriodicValuePairScratch
+  {
+    DeviceBuffer<double> radii;
+    DeviceBuffer<std::uint8_t> valid;
+  };
+  std::unique_ptr<PeriodicValuePairScratch> periodic_value_pairs_;
   DeviceBuffer<double> full_phase_, full_output_, full_lap_ratio_;
   std::vector<double> tile_phase_, tile_log_, canonical_phase_, canonical_log_;
   std::vector<device_determinant::CombinationMetadata> host_combinations_;

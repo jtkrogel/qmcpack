@@ -5046,7 +5046,7 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
       return;
     const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
         model_state->numerical_tile_backend.get());
-    if (!backend || !backend->sparseValueHintsRequested())
+    if (!backend || (!backend->sparseValueHintsRequested() && !backend->periodicValuePairsRequested()))
       return;
     sparse_envelope_prepared = true;
     if (!declared_single_crowd)
@@ -5076,6 +5076,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
         ecp_value_workspace = std::move(candidate);
       }
       backend->prepareSparseValueReuse(batch_workspace->numericalSamplingWorkspace(),
+          dedicated_value16 ? &ecp_value_workspace->numericalSamplingWorkspace() : nullptr);
+      backend->preparePeriodicValuePairs(batch_workspace->numericalSamplingWorkspace(),
           dedicated_value16 ? &ecp_value_workspace->numericalSamplingWorkspace() : nullptr);
     }
     catch (const std::length_error&)

@@ -10,6 +10,7 @@
  */
 
 #include "PsiFormerDeviceSpatial.h"
+#include "PsiFormerDevicePeriodicValuePairs.h"
 #include "PsiFormerDeviceOrbitalProjection.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalProjection.h"
@@ -1915,6 +1916,51 @@ Error launchOpenOrbitalValuesTiled(Stream stream, const OpenOrbitalJetLayout& la
   openOrbitalValuesTiledKernel<<<static_cast<unsigned int>(count), dim3(8, 8), 0, stream>>>(layout,
       features, positions, nuclei, backflow_up, backflow_down, pi_up, pi_down, zeta_up, zeta_down,
       active_electrons, output, status, tiles);
+  return peekSpatialLaunchError();
+}
+
+Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* features,
+    const double* positions, const double* nuclei, const double* backflow_up,
+    const double* backflow_down, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status, double* pair_radii,
+    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor)
+{
+  periodic_geometry::validateCell(cell);
+  validateOpenOrbitalJetLayout(layout);
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || layout.features.gradient_lanes ||
+      layout.features.laplacian_lanes)
+    throw std::invalid_argument("Periodic pair bank requires ordinary VALUE");
+  const auto cost = estimatePeriodicValuePairCost(layout.features.configuration_count,
+      layout.features.electron_count, layout.nucleus_count);
+  if (cost.pair_elements > pair_capacity || !pair_radii || !pair_valid)
+    throw std::invalid_argument("Periodic VALUE pair bank exceeds prepared capacity");
+  const bool need_up = layout.spin_up_count != 0;
+  const bool need_down = layout.spin_up_count != layout.features.electron_count;
+  if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
+      (need_up && (!backflow_up || !pi_up || !zeta_up)) ||
+      (need_down && (!backflow_down || !pi_down || !zeta_down)))
+    throw std::invalid_argument("Periodic VALUE pair device storage is null");
+  if (!anchor.references || !anchor.changed_electrons || !anchor.positions || !anchor.envelope ||
+      anchor.envelope == output || anchor.positions == positions ||
+      anchor.envelope == positions || anchor.positions == output)
+    anchor = {};
+  const auto pair_blocks = checkedSpatialBlockCount(cost.pair_elements,
+      "Periodic VALUE pair producer grid exceeds device x dimension");
+  const auto count = openOrbitalElementCount(layout);
+  const auto orbital_blocks = checkedSpatialBlockCount(count,
+      "Periodic VALUE pair consumer grid exceeds device x dimension");
+  periodic_value_pairs::Inputs input{features, positions, nuclei, backflow_up, backflow_down,
+      pi_up, pi_down, zeta_up, zeta_down, active_electrons};
+  // The layout is the live prefix, not the capacity used for owner admission.
+  periodic_value_pairs::preparePairs<<<pair_blocks, spatial_block_size, 0, stream>>>(
+      layout, cell, input, pair_radii, pair_valid, cost.pair_elements);
+  const auto producer_error = peekSpatialLaunchError();
+  if (producer_error != success)
+    return producer_error;
+  periodic_value_pairs::consumePairs<true><<<orbital_blocks, spatial_block_size, 0, stream>>>(
+      layout, cell, input, pair_radii, pair_valid, output, status, anchor, count);
   return peekSpatialLaunchError();
 }
 

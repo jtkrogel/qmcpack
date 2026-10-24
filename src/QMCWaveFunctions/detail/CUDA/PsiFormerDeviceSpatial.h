@@ -21,6 +21,27 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Capacity-sized request-local radius and complete-Pair validity ownership.
+struct PeriodicValuePairCost
+{
+  std::size_t pair_elements = 0, device_bytes = 0;
+};
+
+/// Check the independently allocated binary64 and byte banks before admission.
+inline PeriodicValuePairCost estimatePeriodicValuePairCost(
+    std::size_t capacity, std::size_t electrons, std::size_t nuclei)
+{
+  if (!capacity || !electrons || !nuclei)
+    throw std::invalid_argument("Periodic VALUE pair geometry requires positive extents");
+  PeriodicValuePairCost cost;
+  cost.pair_elements = spatial_detail::checkedProduct(capacity,
+      spatial_detail::checkedProduct(electrons, nuclei, "Periodic VALUE pair extent overflow"),
+      "Periodic VALUE pair capacity overflow");
+  cost.device_bytes = spatial_detail::checkedProduct(cost.pair_elements,
+      sizeof(double) + sizeof(std::uint8_t), "Periodic VALUE pair bytes overflow");
+  return cost;
+}
+
 /// Capacity-owned VALUE geometry tape; feature/cusp stages reuse one flag bank.
 struct PeriodicValueTilingCost
 {
@@ -268,6 +289,15 @@ struct SparseEnvelopeAnchorView
   bool capture = false;
   bool ready = false;
 };
+
+/// Fill only the live prefix, then consume its canonical Pair bank in nucleus order.
+Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* features,
+    const double* positions, const double* nuclei, const double* backflow_up,
+    const double* backflow_down, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status, double* pair_radii,
+    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor = {});
 
 /// Build real Gamma-periodic orbital jets and optional retained product factors.
 Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,

@@ -133,6 +133,14 @@ public:
             image_->plan().modelShape().nuclei <= 300 && image_->plan().modelShape().determinants <= 16 &&
             image_->plan().modelShape().feature_dimension <= 256 &&
             image_->plan().modelShape().attention_heads <= 4 && image_->plan().modelShape().attention_blocks <= 4),
+        pair_geometry_requested_(configuredPeriodicValuePairGeometry()),
+        pair_geometry_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
+            image_->plan().modelShape().nuclei != 0 &&
+            !preparation_.select_vgl_targets && !preparation_.select_kinetic_targets &&
+            !preparation_.metropolis_workspace_budget_bytes && !preparation_.metropolis_drift_budget_bytes &&
+            preparation_.active_inference_crowds == 1 && image_->plan().modelShape().electrons() >= 64 &&
+            image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
+            supportsLazyRealInferenceEnvironment(image_->plan().environment())),
         sparse_envelope_requested_(configuredRealVirtualEnvelopeReuse()),
         sparse_envelope_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
             !preparation_.select_vgl_targets &&
@@ -160,6 +168,8 @@ public:
       throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
     if (sparse_envelope_requested_ && !sparse_envelope_eligible_)
       std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=profile_or_automatic_target_selection\n";
+    if (pair_geometry_requested_ && !pair_geometry_eligible_)
+      std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=ineligible_backend_profile\n";
   }
 
   // Contexts retain references to the owner/mutex, so this backend is address-stable.
@@ -309,6 +319,12 @@ public:
     return sparse_envelope_requested_ && sparse_envelope_eligible_;
   }
 
+  /// Request only the narrow cold pair policy, independently of anchor reuse.
+  bool periodicValuePairsRequested() const noexcept
+  {
+    return pair_geometry_requested_ && pair_geometry_eligible_;
+  }
+
   /// Preserve the original numerical tile method when no scoped hints are present.
   pf::DirectBatchTileResultView evaluateSparseValueTile(pf::DirectBatchTileBackendWorkspace& workspace,
       const double* coordinates, std::size_t size, std::size_t parameter_version,
@@ -331,6 +347,10 @@ private:
     std::unique_lock context_lock(context->evaluation_mutex, std::try_to_lock);
     if (!context_lock.owns_lock())
       throw std::logic_error("Device inference cannot re-enter the same native crowd resource");
+    // Recovery/capacity replacement must not silently drop a frozen admitted bank.
+    if (context->pair_preparation_effective &&
+        (!context->hooks.values_ || !context->hooks.values_->hasPeriodicValuePairs()))
+      throw std::logic_error("VALUE pair context replacement requires fresh cold admission");
     // Native DeviceManager binds OpenMP workers. Validate foreign callers too,
     // before any stream use; never silently select a different process device.
     image_->validateCurrentDevice();
@@ -542,6 +562,103 @@ public:
     if (value16)
       value16->sparse_preparation_checked = value16->sparse_preparation_effective = true;
     std::clog << "PsiFormer REAL virtual envelope preparation: effective=1 participants=" << (value16 ? 2 : 1)
+              << " requested_device_bytes=" << extra << " future_FULL_numeric_bound=" << future_full
+              << " HOST_scope=numeric_not_aggregate_fit\n";
+    return true;
+  }
+
+  /// Admit all simultaneous VALUE banks while preserving existing anchor state.
+  bool preparePeriodicValuePairs(pf::DirectBatchTileBackendWorkspace& ordinary_workspace,
+      pf::DirectBatchTileBackendWorkspace* value16_workspace = nullptr) const
+  {
+    if (!periodicValuePairsRequested())
+      return false;
+    std::lock_guard lock(control_mutex_);
+    auto* ordinary = dynamic_cast<Context*>(&ordinary_workspace);
+    auto* value16 = dynamic_cast<Context*>(value16_workspace);
+    if (!ordinary || ordinary->owner != this ||
+        (value16_workspace && (!value16 || value16->owner != this || value16 == ordinary)))
+      throw std::invalid_argument("VALUE pair preparation requires distinct bound contexts");
+    std::unique_lock first_lock(ordinary->evaluation_mutex, std::try_to_lock);
+    std::unique_lock<std::mutex> second_lock;
+    if (value16)
+      second_lock = std::unique_lock(value16->evaluation_mutex, std::try_to_lock);
+    if (!first_lock.owns_lock() || (value16 && !second_lock.owns_lock()))
+      throw std::logic_error("VALUE pair preparation requires released contexts");
+    auto* first = ordinary->hooks.values_.get();
+    auto* second = value16 ? value16->hooks.values_.get() : nullptr;
+    if (ordinary->pair_preparation_checked)
+    {
+      if (ordinary->pair_preparation_effective &&
+          (!first || !first->hasPeriodicValuePairs() ||
+           (value16 && (!second || !second->hasPeriodicValuePairs()))))
+        throw std::logic_error("VALUE pair context replacement requires fresh cold admission");
+      return ordinary->pair_preparation_effective;
+    }
+    ordinary->pair_preparation_checked = true;
+    if (!first || !first->admitsSparseEnvelopeAnchor() ||
+        (value16 && (!second || !second->admitsSparseEnvelopeAnchor())) ||
+        !configuredDeviceMemoryAdmission().limit_bytes)
+    {
+      std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=unbounded_or_ineligible_baseline\n";
+      return false;
+    }
+    const auto& plan = image_->plan();
+    const auto future_full = ordinary->hooks.spatial_ ? 0 :
+        (ordinary->hooks.target_preparation_.max_targets
+          ? estimatePreparedTargetVglCost(plan, ordinary->capacity, ordinary->hooks.target_preparation_).device_workspace_bytes
+          : estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes);
+    const auto extra = spatial_detail::checkedAdd(first->periodicValuePairDeviceBytes(),
+        second ? second->periodicValuePairDeviceBytes() : 0, "VALUE pair combined bytes overflow");
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&ordinal), "VALUE pair preparation current device");
+#else
+    checkRuntime(cudaGetDevice(&ordinal), "VALUE pair preparation current device");
+#endif
+    const auto rollback = [&] {
+      first->discardPeriodicValuePairs();
+      if (second)
+        second->discardPeriodicValuePairs();
+    };
+    try
+    {
+      auto future_reservation = deviceMemoryMetrics(ordinal).reserveAllocation(future_full);
+      { auto optional_preflight = deviceMemoryMetrics(ordinal).reserveAllocation(extra); }
+      first->preparePeriodicValuePairs();
+      if (second)
+        second->preparePeriodicValuePairs();
+    }
+    catch (const std::length_error&)
+    {
+      rollback();
+      std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=aggregate_fit requested_device_bytes="
+                << extra << " future_FULL_numeric_bound=" << future_full << '\n';
+      return false;
+    }
+    catch (const std::bad_alloc&)
+    {
+      rollback();
+      std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=optional_HOST_allocation\n";
+      return false;
+    }
+    catch (const std::runtime_error& error)
+    {
+      rollback();
+      if (!recoverOptionalEnvelopeAllocation(error))
+        throw;
+      std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=optional_DEVICE_allocation\n";
+      return false;
+    }
+    catch (...)
+    {
+      rollback();
+      throw;
+    }
+    ordinary->pair_preparation_effective = true;
+    if (value16)
+      value16->pair_preparation_checked = value16->pair_preparation_effective = true;
+    std::clog << "PsiFormer REAL VALUE pair geometry: effective=1 participants=" << (value16 ? 2 : 1)
               << " requested_device_bytes=" << extra << " future_FULL_numeric_bound=" << future_full
               << " HOST_scope=numeric_not_aggregate_fit\n";
     return true;
@@ -968,6 +1085,7 @@ private:
     std::size_t sampler_version = 0;
     bool resident_coordinates = false;
     bool sparse_preparation_checked = false, sparse_preparation_effective = false;
+    bool pair_preparation_checked = false, pair_preparation_effective = false;
     std::vector<double> positions;
     std::size_t coordinate_generation = 0;
     bool parallel_batch_reported = false;
@@ -1044,6 +1162,8 @@ private:
   const bool large_score_eligible_;
   mutable bool large_score_single_crowd_ = false;
   mutable std::atomic<std::size_t> live_eager_contexts_{0};
+  const bool pair_geometry_requested_;
+  const bool pair_geometry_eligible_;
   const bool sparse_envelope_requested_;
   const bool sparse_envelope_eligible_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;
