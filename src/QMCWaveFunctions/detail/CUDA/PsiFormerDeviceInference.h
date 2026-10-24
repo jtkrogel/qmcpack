@@ -970,6 +970,7 @@ private:
   friend class PreparedDeviceComplexSpatial;
   friend struct ComplexSpatialTargetValidationAccess;
   friend class PreparedDeviceComplexScore;
+  friend struct ComplexScoreGeometryValidationAccess;
   friend class PreparedDeviceKineticTrunk;
   friend struct KineticTrunkValidationAccess;
   friend struct RetainedOpenFeatureValidationAccess;
@@ -986,7 +987,7 @@ private:
                           SpatialJetMode mode, bool retain_score_tape, bool retain_spatial_tape,
                           InferenceStatusPolicy status_policy,
                           TargetVglPreparation target_preparation, bool retained_targets, bool real_trunk_only = false,
-                          bool kinetic_trunk_only = false)
+                          bool kinetic_trunk_only = false, bool retained_score_periodic_geometry = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets),
@@ -997,7 +998,8 @@ private:
         retained_open_features_requested_(configuredRetainedOpenFeatures()),
         cooperative_value_cusp_requested_(configuredCooperativeValueCusp()),
         retained_value_cusp_requested_(configuredRetainedValueCusp()),
-        tiled_value_orbitals_requested_(configuredTiledValueOrbitals()), kinetic_trunk_only_(kinetic_trunk_only)
+        tiled_value_orbitals_requested_(configuredTiledValueOrbitals()),
+        retained_score_periodic_geometry_(retained_score_periodic_geometry), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -1013,6 +1015,20 @@ private:
       throw std::invalid_argument("Parallel traces reject trunks, score tapes and implicit targets");
     const auto& environment = plan_.environment();
     const bool head_free_targets = real_trunk_only && target_preparation_.max_targets;
+    // This private option is only a primal VALUE substitution for complete paired parameter scores.
+    if (retained_score_periodic_geometry_ &&
+        (!retain_score_tape || retain_spatial_tape || mode_ != SpatialJetMode::VALUE_ONLY || !real_trunk_only ||
+         batch_size != 1 || retained_targets || target_preparation_.max_targets || kinetic_trunk_only ||
+         environment.boundary != BoundaryCondition::PERIODIC || !environment.fixed_nuclei ||
+         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
+         environment.parameter_scalar_domain != ScalarDomain::REAL ||
+         environment.compute_scalar_domain != ScalarDomain::REAL ||
+         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX ||
+         environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+         environment.periodic_profile || !environment.periodic_axes[0] || !environment.periodic_axes[1] ||
+         !environment.periodic_axes[2] || shape_.electrons() < 64 || shape_.electrons() > 300 ||
+         shape_.determinants < 1 || shape_.determinants > 16))
+      throw std::invalid_argument("Retained periodic geometry requires complete fixed paired FP64 VALUE score ownership");
     if (kinetic_trunk_only && (!real_trunk_only || batch_size != 1 || !retain_spatial_tape ||
         retain_score_tape || retained_targets || !target_preparation.max_targets ||
         target_preparation.max_targets > shape_.electrons()))
@@ -1879,8 +1895,8 @@ public:
                        environment.amplitude_scalar_domain == ScalarDomain::REAL) ||
         (environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
-    return periodic_value_geometry_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
-        value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
+    return ((periodic_value_geometry_requested_ && value_tape_.empty()) || retained_score_periodic_geometry_) &&
+        ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY && !retained_targets_ && !kinetic_trunk_only_ &&
         environment.fixed_nuclei &&
         environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
         environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
@@ -2630,6 +2646,7 @@ private:
   const bool cooperative_value_cusp_requested_;
   const bool retained_value_cusp_requested_;
   const bool tiled_value_orbitals_requested_;
+  const bool retained_score_periodic_geometry_;
   bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;

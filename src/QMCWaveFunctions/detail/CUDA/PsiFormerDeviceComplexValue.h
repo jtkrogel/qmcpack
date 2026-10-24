@@ -565,6 +565,7 @@ public:
 
 private:
   friend class PreparedDeviceComplexScore;
+  friend struct ComplexScoreGeometryValidationAccess;
 
   /// Accessors may reenter the owner; recheck authority before borrowing request storage.
   void validateEnvelopeRequest(const EnvelopeRequest& request) const
@@ -642,10 +643,12 @@ private:
   /// Prepare no real head/determinant/reverse buffers; assert the exact allocation inventory.
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost,
-      bool retain_score = false, bool retain_inverse = true, bool score_inverse_columns = false)
+      bool retain_score = false, bool retain_inverse = true, bool score_inverse_columns = false,
+      bool score_periodic_geometry = false)
       : cost_(cost), score_inverse_columns_(score_inverse_columns),
         trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
-          SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true)),
+          SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true,
+          false, score_periodic_geometry)),
         envelope_(cost.matrices, "ComplexValue::envelope_", __FILE__, __LINE__),
         projections_(2 * cost.matrices, "ComplexValue::projections_", __FILE__, __LINE__),
         matrix_(cost.matrices, "ComplexValue::matrix_", __FILE__, __LINE__),
