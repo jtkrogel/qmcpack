@@ -34,6 +34,9 @@
 #include "Utilities/RuntimeOptions.h"
 #include "io/hdf/hdf_archive.h"
 #include "psiformer_test_utils.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
+#endif
 
 #include <array>
 #include <atomic>
@@ -50,6 +53,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -224,6 +228,21 @@ public:
   {
     return component.directWorkspaceDiagnosticsForTesting();
   }
+
+  /// Exercise ownership independently of the strict accelerator-only selector.
+  static const void* scalarEcpCrowdWorkspace(const PsiFormerWF& component, const ParticleSet& reference)
+  { return component.scalarEcpCrowdWorkspaceForTesting(reference); }
+
+  static void withScalarEcpCrowdBorrow(const PsiFormerWF& component, const ParticleSet& reference,
+                                      const std::function<void()>& callback)
+  { component.withScalarEcpCrowdBorrowForTesting(reference, callback); }
+
+  static bool scalarEcpRuntimeUsesCrowdWorkspace(PsiFormerWF& component, const ParticleSet& reference)
+  { return component.scalarEcpRuntimeUsesCrowdWorkspaceForTesting(reference); }
+
+  /// Measure the backend's actual owning eager contexts at a quiescent test boundary.
+  static std::size_t scalarEcpEagerContextCount(const PsiFormerWF& component)
+  { return component.scalarEcpEagerContextCountForTesting(); }
 
   /// Inspect the existing acquired crowd owner without exposing its implementation.
   static PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnostics(
@@ -1699,7 +1718,8 @@ std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder
                                                    const std::string& system = "all_electron",
                                                    const std::string& selected_indices = "0 514",
                                                    const std::string& feature_policy = "",
-                                                   const std::string& twist = "")
+                                                   const std::string& twist = "",
+                                                   const std::string& gpu = "")
 {
   std::ostringstream xml;
   xml << "<psiformer name=\"" << name
@@ -1711,6 +1731,8 @@ std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder
     xml << " feature_policy=\"" << feature_policy << "\"";
   if (!twist.empty())
     xml << " twist=\"" << twist << "\"";
+  if (!gpu.empty())
+    xml << " gpu=\"" << gpu << "\"";
   xml << "/>";
 
   Libxml2Document document;
@@ -8301,5 +8323,266 @@ TEST_CASE("PsiFormer native timer levels and owner handles", "[wavefunction][psi
     CHECK(manager.current_timer() == parent);
   }
 }
+
+TEST_CASE("PsiFormer scalar ECP scratch loan is exact and full-span",
+          "[wavefunction][psiformer][scalar_ecp_crowd_loan]")
+{
+  auto files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  PsiFormerWF prototype("pf_scalar_loan", files.parameters.string(), files.configuration.string());
+  for (const std::size_t count : {1u, 2u, 8u})
+  {
+    std::vector<std::unique_ptr<ParticleSet>> particles;
+    std::vector<std::unique_ptr<WaveFunctionComponent>> clones;
+    RefVector<WaveFunctionComponent> refs;
+    for (std::size_t lane = 0; lane < count; ++lane)
+    {
+      particles.emplace_back(new ParticleSet(makeLiHElectrons(simulation_cell)));
+      clones.push_back(prototype.makeClone(*particles.back()));
+      refs.push_back(*clones.back());
+    }
+    auto& leader = dynamic_cast<PsiFormerWF&>(*clones[0]);
+    RefVectorWithLeader<WaveFunctionComponent> components(leader, refs);
+    ResourceCollection resource_template("scalar_ecp_loan");
+    resource_template.setDriverCrowdCount(1);
+    leader.createResource(resource_template);
+    ResourceCollection resources(resource_template);
+    CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(leader, *particles[0]) == nullptr);
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+      const void* identity = testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(leader, *particles[0]);
+      REQUIRE(identity != nullptr);
+      for (std::size_t lane = 0; lane < count; ++lane)
+      {
+        auto& component = dynamic_cast<PsiFormerWF&>(*clones[lane]);
+        CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(component, *particles[lane]) == identity);
+        CHECK_FALSE(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component).owns_batch_workspace);
+        testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(component, *particles[lane], [&] {
+          CHECK_THROWS_AS(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(
+              component, *particles[lane], [] {}), std::logic_error);
+          CHECK_THROWS_AS(leader.releaseResource(resources, components), std::logic_error);
+          CHECK_THROWS_AS(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components),
+                          std::logic_error);
+        });
+        CHECK_THROWS_AS(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(
+            component, *particles[lane], [] { throw std::runtime_error("loan failure"); }),
+                        std::runtime_error);
+        CHECK_NOTHROW(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(
+            component, *particles[lane], [] {}));
+        std::atomic<bool> wrong_thread_rejected{false};
+        std::thread other([&] {
+          try { testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(component, *particles[lane]); }
+          catch (const std::logic_error&) { wrong_thread_rejected = true; }
+        });
+        other.join();
+        CHECK(wrong_thread_rejected.load());
+      }
+      auto foreign = makeLiHElectrons(simulation_cell);
+      CHECK_THROWS_AS(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(leader, foreign), std::logic_error);
+      // Metadata proof is CPU-safe, but the real selector must retain private CPU scratch.
+      CHECK_FALSE(testing::TestPsiFormerWF::scalarEcpRuntimeUsesCrowdWorkspace(leader, *particles[0]));
+      CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader).owns_batch_workspace);
+    }
+    CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(leader, *particles[0]) == nullptr);
+  }
+}
+
+TEST_CASE("PsiFormer scalar ECP scratch excludes unknown and multiple crowds",
+          "[wavefunction][psiformer][scalar_ecp_crowd_loan]")
+{
+  auto files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  auto particles = makeLiHElectrons(simulation_cell);
+  PsiFormerWF prototype("pf_scalar_loan_excluded", files.parameters.string(), files.configuration.string());
+  auto clone = prototype.makeClone(particles);
+  auto& component = dynamic_cast<PsiFormerWF&>(*clone);
+  RefVectorWithLeader<WaveFunctionComponent> components(component, {component});
+  for (const std::size_t crowds : {0u, 2u})
+  {
+    ResourceCollection resources("scalar_ecp_loan_excluded");
+    resources.setDriverCrowdCount(crowds);
+    component.createResource(resources);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(component, particles) == nullptr);
+    CHECK_THROWS_AS(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(component, particles, [] {}),
+                    std::logic_error);
+  }
+}
+
+TEST_CASE("PsiFormer scalar ECP acquisition authority is renewed after takeback and copy",
+          "[wavefunction][psiformer][scalar_ecp_crowd_loan]")
+{
+  auto files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  auto particles = makeLiHElectrons(simulation_cell);
+  PsiFormerWF prototype("pf_scalar_reacquire", files.parameters.string(), files.configuration.string());
+  auto clone = prototype.makeClone(particles);
+  auto& component = dynamic_cast<PsiFormerWF&>(*clone);
+  RefVectorWithLeader<WaveFunctionComponent> components(component, {component});
+  ResourceCollection original("scalar_ecp_reacquire");
+  original.setDriverCrowdCount(1);
+  component.createResource(original);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(original, components);
+    CHECK_NOTHROW(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(component, particles, [] {}));
+  }
+  CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(component, particles) == nullptr);
+  ResourceCollection copied(original);
+  std::atomic<bool> acquired_on_new_thread{false};
+  std::thread other([&] {
+    try
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(copied, components);
+      testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(component, particles, [] {});
+      acquired_on_new_thread = true;
+    }
+    catch (...) {}
+  });
+  other.join();
+  CHECK(acquired_on_new_thread.load());
+  CHECK(testing::TestPsiFormerWF::scalarEcpCrowdWorkspace(component, particles) == nullptr);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(copied, components);
+    CHECK_NOTHROW(testing::TestPsiFormerWF::withScalarEcpCrowdBorrow(component, particles, [] {}));
+  }
+}
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("PsiFormer GPU scalar ECP reuses one acquired crowd owner",
+          "[wavefunction][psiformer][scalar_ecp_crowd_gpu]")
+{
+  ScopedEnvironmentVariable large_score("PSIFORMER_GPU_LARGE_SCORE_TILE4", "1");
+  ScopedEnvironmentVariable eager("PSIFORMER_GPU_LAZY_VGL_PREPARATION", "0");
+  ScopedEnvironmentVariable envelope("PSIFORMER_GPU_REAL_VIRTUAL_ENVELOPE_REUSE", "0");
+  constexpr std::size_t ne = 64;
+  Lattice lattice;
+  lattice.R = {80., 0., 0., .3, 80., 0., .1, .2, 80.};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet base(cell);
+  base.setName("e");
+  base.create({32, 32});
+  auto& electron_species = base.getSpeciesSet();
+  electron_species.addSpecies("u");
+  electron_species.addSpecies("d");
+  const int mass = electron_species.addAttribute("mass");
+  electron_species(mass, 0) = electron_species(mass, 1) = 1.;
+  auto ions = std::make_unique<ParticleSet>(cell);
+  ions->setName("ion0");
+  ions->create({64});
+  auto& ion_species = ions->getSpeciesSet();
+  ion_species.addSpecies("H");
+  ion_species(ion_species.addAttribute("charge"), 0) = 1.;
+  for (std::size_t e = 0; e < ne; ++e)
+  {
+    const ParticleSet::PosType nucleus{1. + 6. * (e % 4), 1. + 6. * ((e / 4) % 4), 1. + 6. * (e / 16)};
+    ions->R[e] = nucleus;
+    base.R[e] = nucleus + ParticleSet::PosType{.06, .08, .10};
+  }
+  base.resetGroups();
+  ions->resetGroups();
+  base.update();
+  ions->update();
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::move(ions));
+  const std::vector<ParticleSet::SingleParticlePos> moves{{.023, -.017, .012}, {-.031, .014, .027}};
+  const auto make_component = [&](ParticleSet& particles, const std::string& name) {
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+#ifdef QMC_CUDA2HIP
+    const std::string vendor = "hip";
+#else
+    const std::string vendor = "cuda";
+#endif
+    return buildInternalPsiFormer(builder, name, 17, "all_electron", "0 514",
+                                  "periodic_torus_v1", "", vendor);
+  };
+  ParticleSet oracle_particles(base);
+  auto oracle = make_component(oracle_particles, "pf_scalar_oracle");
+  VirtualParticleSet oracle_virtual(oracle_particles);
+  oracle_virtual.makeMoves(oracle_particles, 0, moves);
+  std::vector<ValueType> expected(moves.size());
+  oracle->evaluateRatios(oracle_virtual, expected);
+  for (const std::size_t count : {1u, 2u, 8u})
+  {
+    auto prototype = make_component(base, "pf_scalar_gpu_loan");
+    std::vector<std::unique_ptr<ParticleSet>> particles;
+    std::vector<std::unique_ptr<WaveFunctionComponent>> clones;
+    std::vector<std::unique_ptr<VirtualParticleSet>> virtuals;
+    RefVector<WaveFunctionComponent> components;
+    RefVector<ParticleSet> particle_refs;
+    RefVector<ParticleSet::ParticleGradient> gradients;
+    RefVector<ParticleSet::ParticleLaplacian> laplacians;
+    for (std::size_t lane = 0; lane < count; ++lane)
+    {
+      particles.push_back(std::make_unique<ParticleSet>(base));
+      clones.push_back(prototype->makeClone(*particles.back()));
+      virtuals.push_back(std::make_unique<VirtualParticleSet>(*particles.back()));
+      virtuals.back()->makeMoves(*particles.back(), 0, moves);
+      components.push_back(*clones.back());
+      particle_refs.push_back(*particles.back());
+      gradients.push_back(particles.back()->G);
+      laplacians.push_back(particles.back()->L);
+    }
+    auto& leader = dynamic_cast<PsiFormerWF&>(*clones[0]);
+    RefVectorWithLeader<WaveFunctionComponent> crowd(leader, components);
+    RefVectorWithLeader<ParticleSet> particle_crowd(*particles[0], particle_refs);
+    ResourceCollection resources("scalar_ecp_gpu");
+    resources.setDriverCrowdCount(1);
+    leader.createResource(resources);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, crowd);
+    const auto full = [&] {
+      for (auto& p : particles) { p->G = ValueType(0); p->L = ValueType(0); }
+      leader.mw_evaluateLog(crowd, particle_crowd, gradients, laplacians);
+    };
+    full();
+    REQUIRE(testing::TestPsiFormerWF::scalarEcpEagerContextCount(leader) == 1);
+    const auto values = [&] {
+      for (std::size_t lane = 0; lane < count; ++lane)
+      {
+        auto& component = dynamic_cast<PsiFormerWF&>(*clones[lane]);
+        REQUIRE(testing::TestPsiFormerWF::scalarEcpRuntimeUsesCrowdWorkspace(component, *particles[lane]));
+        const auto before = testing::TestPsiFormerWF::scalarStateSnapshot(component);
+        const auto old_g = particles[lane]->G;
+        const auto old_l = particles[lane]->L;
+        std::vector<ValueType> actual(moves.size());
+        component.evaluateRatios(*virtuals[lane], actual);
+        for (std::size_t move = 0; move < moves.size(); ++move)
+          CHECK(actual[move] == Catch::Approx(expected[move]).epsilon(2e-9).margin(2e-9));
+        CHECK(testing::TestPsiFormerWF::scalarStateMatches(component, before));
+        CHECK_FALSE(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component).owns_batch_workspace);
+        for (std::size_t e = 0; e < ne; ++e)
+        {
+          CHECK(particles[lane]->L[e] == old_l[e]);
+          for (std::size_t d = 0; d < 3; ++d) CHECK(particles[lane]->G[e][d] == old_g[e][d]);
+        }
+        CHECK(testing::TestPsiFormerWF::scalarEcpEagerContextCount(leader) == 1);
+      }
+    };
+    values();
+    full();
+    std::vector<ParticleSet::ParticleGradient> saved_g;
+    std::vector<ParticleSet::ParticleLaplacian> saved_l;
+    for (const auto& p : particles) { saved_g.push_back(p->G); saved_l.push_back(p->L); }
+    auto& metrics = psiformer::device::deviceMemoryMetrics(0);
+    metrics.resetInterval();
+    values();
+    full();
+    const auto warm = metrics.snapshot();
+    CHECK(warm.allocation_calls == 0);
+    CHECK(warm.free_calls == 0);
+    for (std::size_t lane = 0; lane < count; ++lane)
+      for (std::size_t e = 0; e < ne; ++e)
+      {
+        CHECK(particles[lane]->L[e] == saved_l[lane][e]);
+        for (std::size_t d = 0; d < 3; ++d) CHECK(particles[lane]->G[e][d] == saved_g[lane][e][d]);
+      }
+    std::cout << "Scalar ECP crowd lifecycle: W=" << count << " eager_contexts="
+              << testing::TestPsiFormerWF::scalarEcpEagerContextCount(leader)
+              << " live_DEVICE=" << warm.live_bytes << " peak_DEVICE=" << warm.peak_bytes
+              << " warm_allocations=" << warm.allocation_calls << "\n";
+  }
+}
+#endif
 
 } // namespace qmcplusplus

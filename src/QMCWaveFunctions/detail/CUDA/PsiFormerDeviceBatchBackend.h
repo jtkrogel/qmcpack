@@ -40,6 +40,17 @@ inline bool configuredLazyVglPreparation()
   throw std::invalid_argument("PSIFORMER_GPU_LAZY_VGL_PREPARATION requires 0 or 1");
 }
 
+/// Capture the experimental large-score policy once at backend construction.
+inline bool configuredLargeScoreTile4()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_LARGE_SCORE_TILE4");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_LARGE_SCORE_TILE4 requires 0 or 1");
+}
+
 /// Keep lazy VALUE ownership on the original OPEN or fixed legacy real torus lane.
 inline bool supportsLazyRealInferenceEnvironment(const ExecutionEnvironment& environment)
 {
@@ -110,6 +121,18 @@ public:
                                       bool outer_twist = false)
       : image_(checkedImage(std::move(image))),
         preparation_(validatedPreparation(image_->plan(), precision, preparation)), lazy_spatial_(lazy_spatial),
+        large_score_requested_(configuredLargeScoreTile4()),
+        large_score_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
+            !lazy_spatial && !preparation_.select_vgl_targets && !preparation_.select_kinetic_targets &&
+            !preparation_.metropolis_workspace_budget_bytes && !preparation_.metropolis_drift_budget_bytes &&
+            !preparation_.retained_coordinate_workspace_budget_bytes && !preparation_.adam_workspace_budget_bytes &&
+            preparation_.active_inference_crowds == 1 &&
+            image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
+            supportsLazyRealInferenceEnvironment(image_->plan().environment()) &&
+            image_->plan().modelShape().electrons() >= 64 && image_->plan().modelShape().electrons() <= 300 &&
+            image_->plan().modelShape().nuclei <= 300 && image_->plan().modelShape().determinants <= 16 &&
+            image_->plan().modelShape().feature_dimension <= 256 &&
+            image_->plan().modelShape().attention_heads <= 4 && image_->plan().modelShape().attention_blocks <= 4),
         sparse_envelope_requested_(configuredRealVirtualEnvelopeReuse()),
         sparse_envelope_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
             !preparation_.select_vgl_targets &&
@@ -166,6 +189,28 @@ public:
   bool lazySpatialPreparation() const noexcept
   { return lazy_spatial_; }
 
+  /// Cold driver topology proof, not a maximum-concurrent-lease assumption.
+  void noteLargeScorePreparationContext(bool unplanned_single_crowd) const
+  {
+    if (!large_score_requested_)
+      return;
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    large_score_single_crowd_ = unplanned_single_crowd;
+  }
+
+  /// Reuse existing crowd scratch only under the same cold score/C1 proof.
+  /// This does not admit score capacity4 or relax its exact live-owner guard.
+  bool permitsScalarEcpCrowdScratchBorrow() const
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    return large_score_requested_ && large_score_eligible_ && large_score_single_crowd_ &&
+        preparation_.active_inference_crowds == 1 && !sparse_envelope_requested_;
+  }
+
+  /// Observe actual eager context ownership without authorizing or allocating a lane.
+  std::size_t liveEagerContextsForTesting() const noexcept
+  { return live_eager_contexts_.load(std::memory_order_acquire); }
+
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
   std::unique_ptr<PreparedDeviceProductSession> prepareProductSession(
       ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
@@ -176,6 +221,76 @@ public:
       throw std::invalid_argument("Concurrent GPU inference does not admit parameter-product or training sessions");
     if (mixed_parameters_)
       throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
+    // The eager ordinary context is already live. Reserve the unchanged B1
+    // kinetic root, future C3 sums and successor image before optional B growth.
+    // The target-cost full-Ne bound may conservatively exceed the old FULL
+    // owner's exact storage; it is never multiplied by score capacity.
+    if (large_score_requested_ && large_score_eligible_ && large_score_single_crowd_ &&
+        live_eager_contexts_.load(std::memory_order_acquire) == 1 &&
+        score_capacity > 1 && configuredDeviceMemoryAdmission().limit_bytes)
+    {
+      if (score_capacity > 4)
+        throw std::invalid_argument("Large REAL score capacity must remain within1..4");
+      const auto& plan = image_->plan();
+      const auto selected = estimateScoreTileStorage(plan, score_capacity);
+      const auto baseline = estimateScoreTileStorage(plan, 1);
+      const auto kinetic = profile == ProductSessionProfile::SCORE_AND_KINETIC
+          ? estimateTargetKineticCost(plan,
+              preparation_.kinetic.max_targets ? preparation_.kinetic.max_targets : plan.modelShape().electrons(),
+              preparation_.kinetic.lifted_channel_slots,
+              preparation_.kinetic.parallel_trace_workspace_budget_bytes).device_workspace_bytes : 0;
+      auto reserve = spatial_detail::checkedAdd(kinetic,
+          PreparedDeviceScoreContraction::requiredBytes(plan.parameterCount(), 3), "Score baseline reserve overflow");
+      reserve = spatial_detail::checkedAdd(reserve, image_->deviceStorageBytes(), "Score successor reserve overflow");
+      reserve = spatial_detail::checkedAdd(reserve, selected.device_bytes, "Score candidate reserve overflow");
+      int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&ordinal), "Large score current device");
+#else
+      checkRuntime(cudaGetDevice(&ordinal), "Large score current device");
+#endif
+      try
+      {
+        { auto preflight = deviceMemoryMetrics(ordinal).reserveAllocation(reserve); }
+        std::clog << "PsiFormer large REAL score before allocation: requested=" << score_capacity
+                  << " DEVICE_score_graph_delta=" << selected.device_bytes - baseline.device_bytes
+                  << " HOST_score_graph_numeric_delta=" << selected.host_numeric_bytes - baseline.host_numeric_bytes
+                  << " HOST_scope=requested_numeric_not_aggregate_RSS\n";
+        auto candidate = std::make_unique<PreparedDeviceProductSession>(
+            image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_, true);
+        std::clog << "PsiFormer large REAL score preparation: selected=" << score_capacity
+                  << " DEVICE_score_graph_bytes=" << selected.device_bytes
+                  << " DEVICE_score_graph_delta=" << selected.device_bytes - baseline.device_bytes
+                  << " unchanged_baseline_overlap_bound=" << reserve - selected.device_bytes
+                  << " HOST_score_graph_numeric_delta=" << selected.host_numeric_bytes - baseline.host_numeric_bytes
+                  << " HOST_actual_session_numeric_bytes=" << candidate->hostWorkspaceBytes()
+                  << " HOST_session_stage_numeric_delta=" << checkedDeviceBytes<double>(
+                      spatial_detail::checkedProduct(score_capacity - 1,
+                          3 * plan.modelShape().electrons() + 2, "Score HOST staging overflow"))
+                  << " HOST_ECP_stage_if_used_bytes=" << checkedDeviceBytes<double>(
+                      spatial_detail::checkedProduct(score_capacity,
+                          3 * plan.modelShape().electrons() + 1, "Score HOST ECP staging overflow"))
+                  << " HOST_scope=numeric_not_aggregate_fit kinetic_owners="
+                  << (profile == ProductSessionProfile::SCORE_AND_KINETIC ? 1 : 0) << '\n';
+        return candidate;
+      }
+      catch (const std::length_error&)
+      {
+        std::clog << "PsiFormer large REAL score preparation: selected=1 reason=aggregate_fit\n";
+      }
+      catch (const std::bad_alloc&)
+      {
+        std::clog << "PsiFormer large REAL score preparation: selected=1 reason=optional_HOST_allocation\n";
+      }
+      catch (const std::runtime_error& error)
+      {
+        if (!recoverOptionalEnvelopeAllocation(error))
+          throw;
+        std::clog << "PsiFormer large REAL score preparation: selected=1 reason=optional_DEVICE_allocation\n";
+      }
+    }
+    else if (large_score_requested_ && score_capacity > 1)
+      std::clog << "PsiFormer large REAL score preparation: selected=1 reason=profile_topology_or_unbounded_admission\n";
     return std::make_unique<PreparedDeviceProductSession>(
         image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_);
   }
@@ -819,11 +934,15 @@ private:
           spatial_detail::checkedProduct(3, image->plan().modelShape().electrons(), "Device tile coordinates overflow"),
           "Device tile staging overflow"));
       executor.prepare(crowd, model.activeProvenance().layout_fingerprint, capacity, hooks);
+      if (owner->large_score_requested_ && !lazy_spatial)
+        owner->live_eager_contexts_.fetch_add(1, std::memory_order_release);
     }
 
     /// Collect existing counters only; do not create graphs or synchronize a queue.
     ~Context() override
     {
+      if (owner->large_score_requested_ && !owner->lazy_spatial_)
+        owner->live_eager_contexts_.fetch_sub(1, std::memory_order_release);
       // The existing destruction boundary, not the virtual-request hot path.
       try { if (hooks.values_) hooks.values_->reportSparseEnvelopeAnchor(); }
       catch (...) {} // Optional diagnostics cannot interfere with retirement.
@@ -921,6 +1040,10 @@ private:
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
   const DeviceExecutionPreparation preparation_;
   const bool lazy_spatial_;
+  const bool large_score_requested_;
+  const bool large_score_eligible_;
+  mutable bool large_score_single_crowd_ = false;
+  mutable std::atomic<std::size_t> live_eager_contexts_{0};
   const bool sparse_envelope_requested_;
   const bool sparse_envelope_eligible_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;

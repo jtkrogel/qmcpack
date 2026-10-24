@@ -250,7 +250,7 @@ foreach(CATEGORY common trialwf sposet jastrow determinant)
 
 endforeach()
 
-target_link_libraries(test_wavefunction_trialwf IO::HDF5)
+target_link_libraries(test_wavefunction_trialwf IO::HDF5 qmcham)
 
 function(CONFIGURE_PSIFORMER_THREADING_TARGET TARGET_NAME)
   target_link_libraries(

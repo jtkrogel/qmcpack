@@ -71,6 +71,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -5017,6 +5018,22 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::unique_ptr<pf::DirectBatchWorkspace> ecp_value_workspace;
   bool ecp_value_reported = false;
   bool sparse_envelope_prepared = false;
+  /// Team-lock provenance and a full-call guard for serialized scalar ECP use.
+  std::thread::id scalar_value_acquisition_thread;
+  mutable std::atomic<bool> scalar_value_borrow_active{false};
+
+  /// Pass actual driver topology, not the backend's concurrency limit.
+  void noteLargeScorePreparation(bool declared_single_crowd) const
+  {
+#ifdef ENABLE_CUDA
+    if (const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+            model_state->numerical_tile_backend.get()))
+      backend->noteLargeScorePreparationContext(declared_single_crowd &&
+          !expected_plan && !prepared_plan && !acquired_from_prepared_collection &&
+          !model_state->resident_device_authority_requested &&
+          !model_state->resident_device_authority_enabled && !model_state->twist_phase.active());
+#endif
+  }
 
   /// Acquire only the existing ordinary/VALUE16 participants before ECP RNG.
   /// Failure to fit optional reuse leaves the canonical GPU tile path available.
@@ -6270,6 +6287,43 @@ private:
     mix_vector(walker_indices);
     return hash;
   }
+};
+
+/// Keep borrowed HOST packing and numerical result consumption inside one loan.
+struct PsiFormerWF::ScalarEcpValueWorkspaceLease
+{
+  explicit ScalarEcpValueWorkspaceLease(pf::DirectBatchWorkspace& workspace,
+                                       std::atomic<bool>* active = nullptr)
+      : workspace(&workspace), active(active)
+  {
+    if (active)
+    {
+      bool expected = false;
+      if (!active->compare_exchange_strong(expected, true, std::memory_order_acquire))
+        throw std::logic_error("PsiFormer scalar ECP crowd scratch cannot re-enter");
+    }
+  }
+
+  ScalarEcpValueWorkspaceLease(const ScalarEcpValueWorkspaceLease&) = delete;
+  ScalarEcpValueWorkspaceLease& operator=(const ScalarEcpValueWorkspaceLease&) = delete;
+
+  // Transfer the sole release obligation without changing workspace ownership.
+  ScalarEcpValueWorkspaceLease(ScalarEcpValueWorkspaceLease&& other) noexcept
+      : workspace(other.workspace), active(std::exchange(other.active, nullptr)) {}
+
+  // Return only the exclusion token; the crowd continues to own its storage.
+  ~ScalarEcpValueWorkspaceLease()
+  {
+    if (active)
+      active->store(false, std::memory_order_release);
+  }
+
+  // The caller must consume every borrowed view before this lease ends.
+  pf::DirectBatchWorkspace& get() const noexcept { return *workspace; }
+
+private:
+  pf::DirectBatchWorkspace* workspace;
+  std::atomic<bool>* active;
 };
 
 namespace
@@ -8451,6 +8505,7 @@ void PsiFormerWF::acquireResource(
             ? std::optional<std::size_t>(collection_provenance.crowd_index)
             : std::nullopt,
         wfc_list.size());
+    candidate_handle.getResource().noteLargeScorePreparation(collection.hasSingleDriverCrowd());
     candidate_handle.getResource().prepareVirtualEnvelopeReuse(wfc_list.size(), collection.hasSingleDriverCrowd());
   }
   catch (...)
@@ -8465,6 +8520,7 @@ void PsiFormerWF::acquireResource(
   }
   leader.mw_resource_handle_ = std::move(candidate_handle);
   auto& acquired_resource = leader.mw_resource_handle_.getResource();
+  acquired_resource.scalar_value_acquisition_thread = std::this_thread::get_id();
   if (leader.batch_execution_plan_)
   {
     acquired_resource.acquired_plan_identity            = collection_provenance.plan.get();
@@ -8532,6 +8588,8 @@ void PsiFormerWF::releaseResource(
           "PsiFormer multiwalker resource release order differs from acquisition");
   }
   auto& resource = leader.mw_resource_handle_.getResource();
+  if (resource.scalar_value_borrow_active.load(std::memory_order_acquire))
+    throw std::logic_error("Cannot return PsiFormer crowd scratch during scalar ECP borrowing");
   if (resource.prepared_plan)
   {
     for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
@@ -8581,6 +8639,7 @@ void PsiFormerWF::releaseResource(
   resource.acquired_plan_identity            = nullptr;
   resource.acquired_crowd_index              = 0;
   resource.acquired_from_prepared_collection = false;
+  resource.scalar_value_acquisition_thread = {};
   for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
   {
     auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
@@ -8604,6 +8663,8 @@ PsiFormerWF::PsiFormerMultiWalkerResource& PsiFormerWF::requireMultiWalkerResour
     throw std::logic_error("PsiFormer multiwalker method requires an acquired ResourceCollection");
 
   auto& resource = leader.mw_resource_handle_.getResource();
+  if (resource.scalar_value_borrow_active.load(std::memory_order_acquire))
+    throw std::logic_error("PsiFormer crowd dispatch cannot re-enter scalar ECP scratch");
   resource.validateAcquiredBinding(leader.model_state_.get(),
                                    leader.batch_execution_plan_, std::nullopt,
                                    wfc_list.size());
@@ -13068,6 +13129,94 @@ pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
   if (!direct_batch_workspace_)
     direct_batch_workspace_ = model_state_->direct_batch_executor.makeWorkspace();
   return *direct_batch_workspace_;
+}
+
+// Deterministic restart ECP is serialized inside the existing acquired team.
+// Accepted FULL authority uses clone-owned G/L, not this ephemeral result view.
+PsiFormerWF::ScalarEcpValueWorkspaceLease
+PsiFormerWF::acquireScalarEcpValueWorkspace(const ParticleSet& reference)
+{
+#ifdef ENABLE_CUDA
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  if (backend && backend->permitsScalarEcpCrowdScratchBorrow() &&
+      !batch_execution_plan_ && !has_proposal_)
+  {
+    if (const auto* resource = findScalarEcpValueCrowdResource(reference))
+      return ScalarEcpValueWorkspaceLease(*resource->batch_workspace,
+                                          &resource->scalar_value_borrow_active);
+  }
+#endif
+  return ScalarEcpValueWorkspaceLease(requireDirectBatchWorkspace());
+}
+
+// This ownership probe is CPU-safe; it does not authorize GPU execution.
+const PsiFormerWF::PsiFormerMultiWalkerResource*
+PsiFormerWF::findScalarEcpValueCrowdResource(const ParticleSet& reference) const
+{
+  if (!acquired_crowd_leader_ || batch_execution_plan_ || has_proposal_ || direct_batch_workspace_)
+    return nullptr;
+  const auto& leader = *acquired_crowd_leader_;
+  if (leader.acquired_resource_collection_ && !leader.acquired_resource_collection_->hasSingleDriverCrowd())
+    return nullptr;
+  if (!leader.mw_resource_handle_ || !leader.acquired_resource_collection_ ||
+        leader.acquired_crowd_leader_ != &leader || acquired_crowd_size_ == 0 ||
+        acquired_crowd_size_ != leader.acquired_crowd_size_ ||
+        acquired_lane_index_ >= acquired_crowd_size_ ||
+        model_state_.get() != leader.model_state_.get() || bound_particle_set_ != &reference ||
+        leader.acquired_resource_collection_->getOutstandingLoanCount() <
+            leader.acquired_resource_outstanding_loans_)
+    throw std::logic_error("PsiFormer scalar ECP scratch requires its exact acquired model/member loan");
+  const auto& resource = leader.mw_resource_handle_.getResource();
+  resource.validateAcquiredBinding(model_state_.get(), batch_execution_plan_, std::nullopt,
+                                   acquired_crowd_size_);
+  if (resource.scalar_value_acquisition_thread != std::this_thread::get_id())
+    throw std::logic_error("PsiFormer scalar ECP scratch requires the acquiring team thread");
+  if (leader.acquired_resource_collection_->hasSingleDriverCrowd() &&
+      !resource.expected_plan && !resource.prepared_plan &&
+      !resource.acquired_from_prepared_collection && resource.batch_workspace &&
+      resource.batch_workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY) ==
+          pf::DirectBatchWorkspace::default_tile_capacity)
+    return &resource;
+  return nullptr;
+}
+
+// Expose identity only to focused lifetime tests, never an escaped result view.
+const void* PsiFormerWF::scalarEcpCrowdWorkspaceForTesting(const ParticleSet& reference) const
+{
+  const auto* resource = findScalarEcpValueCrowdResource(reference);
+  return resource ? resource->batch_workspace.get() : nullptr;
+}
+
+// A CPU loan proof must never masquerade as accelerator execution admission.
+bool PsiFormerWF::scalarEcpRuntimeUsesCrowdWorkspaceForTesting(const ParticleSet& reference)
+{
+  const auto* expected = scalarEcpCrowdWorkspaceForTesting(reference);
+  auto lease = acquireScalarEcpValueWorkspace(reference);
+  return expected && expected == &lease.get();
+}
+
+// Read actual ownership rather than inferring eager contexts from process RSS.
+std::size_t PsiFormerWF::scalarEcpEagerContextCountForTesting() const
+{
+#ifdef ENABLE_CUDA
+  if (const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+          model_state_->numerical_tile_backend.get()))
+    return backend->liveEagerContextsForTesting();
+#endif
+  return 0;
+}
+
+// Exercise the same full-span non-reentrant guard without enabling a CPU route.
+void PsiFormerWF::withScalarEcpCrowdBorrowForTesting(
+    const ParticleSet& reference, const std::function<void()>& callback) const
+{
+  const auto* resource = findScalarEcpValueCrowdResource(reference);
+  if (!resource)
+    throw std::logic_error("PsiFormer scalar ECP test requires an exact crowd loan");
+  ScalarEcpValueWorkspaceLease lease(*resource->batch_workspace,
+                                    &resource->scalar_value_borrow_active);
+  callback();
 }
 
 // Stage physical G/L in existing proposal products while keeping accepted state untouched.
@@ -19418,7 +19567,8 @@ void PsiFormerWF::evaluateRatiosUnderRead(
   }
 
   const std::size_t parameter_version = transaction.parameterVersion();
-  auto& batch = requireDirectBatchWorkspace();
+  auto scratch_lease = acquireScalarEcpValueWorkspace(reference);
+  auto& batch = scratch_lease.get();
   batch.resize(pf::DirectBatchMode::VALUE_ONLY, configurations);
   packBatchConfiguration(batch, 0, reference);
   for (std::size_t move = 0; move < ratios.size(); ++move)

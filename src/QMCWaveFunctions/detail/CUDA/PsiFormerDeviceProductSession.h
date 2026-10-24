@@ -43,6 +43,82 @@ enum class ProductSessionProfile
   SCORE_AND_KINETIC
 };
 
+/** Owned numeric storage of the three score graphs, not the kinetic root.
+ * Shared model images, vendor-private storage and caller staging are excluded.
+ * HOST counts requested numeric elements; actual vector capacities are reported
+ * separately by the prepared owners and are not an aggregate RSS admission.
+ */
+struct ScoreTileStorage
+{
+  std::size_t device_bytes = 0;
+  std::size_t host_numeric_bytes = 0;
+};
+
+/** Exact constructor inventory for ordinary retained VALUE, reverse and JVP.
+ * Fixed P responses/finite words and pair-spin metadata are counted once, while
+ * only the existing score graphs grow with B. No lifted kinetic storage occurs
+ * in this descriptor. Keep the prepared byte-difference oracle in the tests.
+ */
+inline ScoreTileStorage estimateScoreTileStorage(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  if (batch == 0 || batch > 4 || plan.environment().periodic_profile ||
+      plan.environment().amplitude_scalar_domain != ScalarDomain::REAL)
+    throw std::invalid_argument("Score tile storage requires an ordinary REAL capacity1..4");
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Score tile storage overflow");
+  };
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Score tile storage overflow");
+  };
+  const auto& s = plan.modelShape();
+  const auto ne = s.electrons(), nf = mul(mul(batch, ne), s.feature_dimension);
+  const auto attention = mul(mul(mul(batch, s.attention_heads), ne), ne);
+  const auto matrices = mul(mul(mul(batch, s.determinants), ne), ne);
+  const auto factors = mul(batch, s.determinants), parameters = plan.parameterCount();
+  const auto finite = add(parameters / 4096, parameters % 4096 != 0);
+  const auto features = plan.environment().boundary == BoundaryCondition::PERIODIC
+      ? makePeriodicFeatureJetLayout(batch, ne, s.nuclei, s.spin_up_electrons, SpatialJetMode::VALUE_ONLY)
+      : makeOpenFeatureJetLayout(batch, ne, s.nuclei, s.spin_up_electrons, SpatialJetMode::VALUE_ONLY);
+  const auto final = makeFinalSpatialJetLayout(batch, ne, SpatialJetMode::VALUE_ONLY).output;
+  const auto cusp = makeOpenCuspJetLayout(batch, ne, s.spin_up_electrons, SpatialJetMode::VALUE_ONLY).output;
+  // VALUE: raw/working planes, determinant factor/solve data and retained tapes.
+  std::size_t doubles = 0;
+  for (auto count : {mul(3, mul(batch, ne)), spatialJetSpanElements(features.output),
+       mul(8, nf), attention, mul(6, matrices), mul(factors, ne), mul(4, factors),
+       spatialJetSpanElements(cusp), batch, spatialJetSpanElements(final),
+       mul(batch, final.laplacian_lanes), mul(s.attention_blocks, add(mul(8, nf), attention))})
+    doubles = add(doubles, count);
+  // Reverse includes its neural adjoints, pair distances and two P outputs.
+  for (auto count : {mul(4, matrices), nf, mul(mul(batch, ne), s.nuclei),
+       mul(batch, mul(ne, ne - 1) / 2), batch, factors, mul(10, nf), attention,
+       mul(3, parameters)})
+    doubles = add(doubles, count);
+  // JVP owns a separate direction and feature/orbital tangent graph.
+  for (auto count : {mul(10, nf), attention, mul(2, matrices), parameters, batch})
+    doubles = add(doubles, count);
+  ScoreTileStorage cost{checkedDeviceBytes<double>(doubles), 0};
+  const auto status_count = std::max(nf, matrices);
+  const auto jet_status_count = mul(mul(batch, s.attention_heads), ne);
+  for (auto bytes : {checkedDeviceBytes<std::size_t>(add(batch, mul(factors, ne))),
+       checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors),
+       checkedDeviceBytes<device_determinant::CombinationMetadata>(batch),
+       checkedDeviceBytes<OpenSpatialStatus>(status_count),
+       checkedDeviceBytes<device_math::JetMathStatus>(jet_status_count),
+       checkedDeviceBytes<InferenceStatusWord>(1),
+       checkedDeviceBytes<std::uint8_t>(mul(ne, ne - 1) / 2),
+       checkedDeviceBytes<device_determinant::DerivativeStatus>(mul(2, batch)),
+       checkedDeviceBytes<DerivativeFiniteStatus>(add(mul(2, finite), 1))})
+    cost.device_bytes = add(cost.device_bytes, bytes);
+  for (auto bytes : {checkedDeviceBytes<OpenSpatialStatus>(status_count),
+       checkedDeviceBytes<device_math::JetMathStatus>(jet_status_count),
+       checkedDeviceBytes<double>(mul(2, batch)),
+       checkedDeviceBytes<device_determinant::FactorizationMetadata>(mul(2, factors)),
+       checkedDeviceBytes<device_determinant::DerivativeStatus>(mul(2, batch)),
+       checkedDeviceBytes<DerivativeFiniteStatus>(add(mul(2, finite), 1))})
+    cost.host_numeric_bytes = add(cost.host_numeric_bytes, bytes);
+  return cost;
+}
+
 /** Lease one prepared numerical derivative lane, sharing its backend's image.
  * The backend must outlive the session; the model owner and mutex are borrowed.
  * An outer provider scratch lease rejects callback re-entry and serializes use.
@@ -209,10 +285,12 @@ public:
                                std::mutex& control_mutex, std::uint64_t identity,
                                ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
                                std::size_t score_capacity = 1,
-                               DeviceExecutionPreparation preparation = {})
+                               DeviceExecutionPreparation preparation = {},
+                               bool admit_large_score = false)
       : active_image_(active_image), image_(active_image), owner_(owner), mutex_(control_mutex),
         profile_(validatedProfile(profile)),
-        score_capacity_(admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
+        score_capacity_(admit_large_score ? validatedScoreCapacity(score_capacity)
+                                         : admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
         preparation_(validatedPreparation(image_->plan(), preparation)),
         blas_(queue_), values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
         score_(image_, score_capacity_, queue_, blas_), jvp_(image_, score_capacity_, queue_, blas_),
@@ -236,6 +314,15 @@ public:
         "Device score tile position extent overflow"));
     tile_weights_.reserve(score_capacity_);
     products_.reserve(score_capacity_);
+    if (admit_large_score)
+    {
+      const auto expected = estimateScoreTileStorage(image_->plan(), score_capacity_);
+      const auto actual = spatial_detail::checkedAdd(values_.deviceWorkspaceBytes(),
+          spatial_detail::checkedAdd(score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes(),
+              "Score graph storage overflow"), "Score graph storage overflow");
+      if (actual != expected.device_bytes)
+        throw std::logic_error("Large REAL score graph differs from its cold storage descriptor");
+    }
     executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
   }
 

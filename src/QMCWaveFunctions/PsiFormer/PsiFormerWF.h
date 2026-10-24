@@ -1014,6 +1014,7 @@ private:
       bool score_only) const;
 
   struct PsiFormerMultiWalkerResource;
+  struct ScalarEcpValueWorkspaceLease;
 
   /// Identify the exact planned entry point whose common runtime contract is checked.
   enum class PlannedOperation
@@ -1462,6 +1463,19 @@ private:
 
   /// Lazily create legacy batch scratch only when no explicit plan is bound.
   pf::DirectBatchWorkspace& requireDirectBatchWorkspace();
+
+  /// Borrow only an exact acquired crowd's scalar ECP VALUE scratch.
+  ScalarEcpValueWorkspaceLease acquireScalarEcpValueWorkspace(const ParticleSet& reference);
+
+  /// CPU-safe loan proof; execution eligibility remains in the GPU caller.
+  const PsiFormerMultiWalkerResource* findScalarEcpValueCrowdResource(const ParticleSet& reference) const;
+
+  /// Friend-only ownership/guard probes, never an alternate numerical route.
+  const void* scalarEcpCrowdWorkspaceForTesting(const ParticleSet& reference) const;
+  void withScalarEcpCrowdBorrowForTesting(const ParticleSet& reference,
+                                        const std::function<void()>& callback) const;
+  bool scalarEcpRuntimeUsesCrowdWorkspaceForTesting(const ParticleSet& reference);
+  std::size_t scalarEcpEagerContextCountForTesting() const;
 
   /// Fingerprint one exact ordered scalar VALUE input without allocating.
   std::uint64_t scalarValueInputFingerprint(
