@@ -12,6 +12,22 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Only explicitly staged approximate head failures may request a whole-graph replay.
+enum class ComplexValueFailureStage { AFFINE_TRUNK, PHYSICAL_ENVELOPE, PACKED_HEAD, FACTORIZATION, COMBINATION };
+class MixedComplexValueFailure : public std::runtime_error
+{
+public:
+  MixedComplexValueFailure(ComplexValueFailureStage stage, std::uint64_t status)
+      : std::runtime_error("Complex VALUE numerical failure, status=" + std::to_string(status)), stage_(stage)
+  {}
+  MixedComplexValueFailure(ComplexValueFailureStage stage, const char* reason)
+      : std::runtime_error(reason), stage_(stage)
+  {}
+  ComplexValueFailureStage stage() const noexcept { return stage_; }
+private:
+  ComplexValueFailureStage stage_;
+};
+
 /// Explicit mixed-domain owner bytes; shared image/vendor storage is excluded.
 struct ComplexValueCost
 {
@@ -202,6 +218,12 @@ public:
 
   /// Complete every live configuration before publishing the sole result prefix.
   void evaluate(const std::vector<double>& positions)
+  { evaluateCoordinates(positions, nullptr); }
+
+private:
+  friend class PreparedDeviceMixedComplexValue;
+  /// The private mixed composition supplies a separately admitted pivot bank.
+  void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots)
   {
     invalidate();
     auto& t = *trunk_;
@@ -211,9 +233,10 @@ public:
       throw std::invalid_argument("Complex VALUE packed physical input exceeds capacity");
     t.setBatchCount(positions.size() / stride);
     t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
-    evaluateOwnedCoordinates();
+    evaluateOwnedCoordinates(false, minimum_scaled_pivots);
   }
 
+public:
   /// Prepare one private base without publishing or advancing an ordinary VALUE epoch.
   EnvelopeRequest beginVirtualEnvelopeBase(const double* positions, std::size_t count)
   {
@@ -400,7 +423,19 @@ private:
   {
     auto& t = *trunk_;
     t.resetStatusAdmission();
-    t.evaluatePreparedTrunk();
+    try
+    {
+      t.evaluatePreparedTrunk();
+    }
+    catch (const InferenceStatusError& error)
+    {
+      // The first feature stage is physical. Only later, typed neural failures may replay.
+      if (!t.mixed_dense_ || error.stage() == 0)
+        throw;
+      throw MixedComplexValueFailure(ComplexValueFailureStage::AFFINE_TRUNK, error.what());
+    }
+    if (t.mixed_dense_)
+      t.mixed_dense_->admitAffinePrefix();
     if (include_cusp)
       t.evaluateCusp();
     t.checkOpen(t.batch_);
@@ -430,28 +465,45 @@ private:
           t.positions_.data(), t.model_->nuclei(), parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN), envelope_.data(), status_.data()),
           "paired VALUE envelopes");
+    if (t.mixed_dense_)
+    {
+      // Physical envelope failures remain hard errors, independent of approximate head arithmetic.
+      admitStatus(ComplexValueFailureStage::PHYSICAL_ENVELOPE);
+      resetStatus();
+    }
     checkRuntime(launchComplexValuePack(t.queue_.getNative(), m, envelope_.data(), projections_.data(),
         projections_.data() + cost_.matrices, matrix_.data(), status_.data()), "paired VALUE head");
-    admitStatus();
+    admitStatus(ComplexValueFailureStage::PACKED_HEAD);
   }
 
   /// All coordinate loading paths share exactly the same trunk, head and determinant algebra.
-  void evaluateOwnedCoordinates(bool virtual_envelope = false)
+  void evaluateOwnedCoordinates(bool virtual_envelope = false, double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
+    if (t.mixed_dense_ && (!minimum_scaled_pivots || inverse_.capacity() || virtual_envelope))
+      throw std::logic_error("Mixed paired VALUE requires private inverse-null conditioning storage");
+    PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
     evaluateHeadOwnedCoordinates(true, virtual_envelope);
 
     // The private head epoch ends here: matrix storage now becomes LU IN PLACE.
-    checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
-        matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex VALUE factorization");
-    admitStatus();
+    if (minimum_scaled_pivots)
+      checkRuntime(launchComplexValueFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, matrix_.data(), channels_.data(), status_.data(), minimum_scaled_pivots), "complex VALUE diagnostic factorization");
+    else
+      checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
+          matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex VALUE factorization");
+    admitStatus(ComplexValueFailureStage::FACTORIZATION);
     if (pair_events_.capacity())
       checkRuntime(launchComplexValuePairCheck(t.queue_.getNative(), t.batch_, t.ne_, t.shape_.spin_up_electrons,
           *t.model_->periodicCell(), t.positions_.data(), pair_events_.data()), "complex VALUE pair check");
     checkRuntime(launchComplexValueReduce(t.queue_.getNative(), t.batch_, t.shape_.determinants,
         t.ne_, t.shape_.spin_up_electrons, *t.model_->periodicCell(), t.positions_.data(),
         channels_.data(), t.cusp_jets_.data(), results_.data(), status_.data(), 1, pair_events_.data()), "complex VALUE mixture");
-    admitStatus();
+    admitStatus(ComplexValueFailureStage::COMBINATION);
+    if (t.mixed_dense_)
+      t.mixed_dense_->checkComplexValueConditioning(minimum_scaled_pivots, channels_.data(), results_.data(),
+                                                  t.batch_, t.shape_.determinants);
+    mixed_attempt.finish();
     t.value_tape_valid_ = !t.value_tape_.empty();
     valid_ = true;
   }
@@ -625,13 +677,17 @@ private:
   }
 
   /// Synchronize/status-admit before transitioning from head to LU or final publication.
-  void admitStatus()
+  void admitStatus(ComplexValueFailureStage stage = ComplexValueFailureStage::FACTORIZATION)
   {
     trunk_->queue_.sync();
     std::uint64_t status;
     status_.downloadOnStream(&status, 1, trunk_->queue_.getNative());
     if (status != std::numeric_limits<std::uint64_t>::max())
+    {
+      if (trunk_->mixed_dense_)
+        throw MixedComplexValueFailure(stage, status);
       throw std::runtime_error("Complex VALUE numerical failure, status=" + std::to_string(status));
+    }
   }
 
   const ComplexValueCost cost_;

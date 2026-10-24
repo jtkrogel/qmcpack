@@ -29,6 +29,8 @@ namespace qmcplusplus::psiformer::device
 {
 
 class PreparedDeviceModel;
+struct ComplexValueChannel;
+struct ComplexValueResult;
 
 /** A bounded mixed request failed numerical admission and needs a whole-graph FP64 retry. */
 class MixedPrecisionRetryRequired final : public std::runtime_error
@@ -45,6 +47,14 @@ public:
   PreparedDeviceMixedDenseParameters(std::shared_ptr<const PreparedDeviceModel> model,
                                      compute::Queue<PlatformKind::CUDA>& queue,
                                      bool allow_fp64_retry = false);
+
+  /// A paired numerical owner explicitly authorizes only its shared real affine trunk.
+  PreparedDeviceMixedDenseParameters(std::shared_ptr<const PreparedDeviceModel> model,
+                                     compute::Queue<PlatformKind::CUDA>& queue,
+                                     MixedTrunkHeadPolicy policy, bool allow_fp64_retry = false);
+
+  /// Derive immutable family authority from the admitted image, not a mutable flag.
+  MixedTrunkHeadPolicy trunkHeadPolicy() const noexcept;
 
   /// An inadmissible conversion remains versioned but may only execute through FP64 replay.
   bool usable() const noexcept { return usable_; }
@@ -107,6 +117,14 @@ public:
                               const device_determinant::CombinationMetadata* combinations,
                               std::size_t configurations, std::size_t determinants);
 
+  /// Screen typed paired metadata without reinterpreting REAL determinant records.
+  void checkComplexValueConditioning(const double* minimum_scaled_pivots,
+                                    const ComplexValueChannel* channels, const ComplexValueResult* results,
+                                    std::size_t configurations, std::size_t determinants);
+
+  /// Admit cast/activation diagnostics before a paired FP64 head; keep the attempt open.
+  void admitAffinePrefix();
+
   /// Admit all casts/GEMMs before any approximate value result becomes visible.
   void finishEvaluation();
 
@@ -129,6 +147,9 @@ public:
   std::size_t deviceWorkspaceBytes() const;
 
 private:
+  /// Download and validate diagnostics without choosing publication or transaction state.
+  void admitDiagnostics();
+
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters_;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;

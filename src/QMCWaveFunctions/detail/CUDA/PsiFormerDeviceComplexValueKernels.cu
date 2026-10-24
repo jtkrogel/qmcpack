@@ -163,9 +163,10 @@ __device__ bool inverseFromLu(const cuDoubleComplex* a, std::size_t n, double sc
 }
 
 /// Serial-per-channel scaled partial-pivot LU; zero pivots are singular, not errors.
+template<bool CollectPivots>
 __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
     ComplexValueChannel* metadata, std::uint64_t* status,
-    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve)
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve, double* minimum_scaled_pivots)
 {
   const auto channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= channels)
@@ -176,6 +177,9 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
     for (std::size_t i = 0; i < n; ++i)
       perm[i] = i;
   metadata[channel] = {make_cuDoubleComplex(0, 0), nodeLog(), 1};
+  if constexpr (CollectPivots)
+    minimum_scaled_pivots[channel] = 0;
+  double minimum_pivot = INFINITY;
   double scale = 0;
   for (std::size_t i = 0; i < n * n; ++i)
   {
@@ -208,6 +212,8 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
     }
     if (magnitude == 0)
       return;
+    if constexpr (CollectPivots)
+      minimum_pivot = fmin(minimum_pivot, magnitude);
     if (pivot != k)
     {
       for (std::size_t j = 0; j < n; ++j)
@@ -266,12 +272,15 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
   metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
   if (inverse && !inverseFromLu(a, n, scale, perm, inverse + channel * n * n, solve + channel * n))
     fail(status, channel);
+  if constexpr (CollectPivots)
+    minimum_scaled_pivots[channel] = minimum_pivot;
 }
 
 /// Inverse-null alternative: one block owns one in-place LU, with scalar phase/log.
 /// Every entry keeps the serial k-order and vendor operations; no sums are reordered.
+template<bool CollectPivots>
 __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
-    ComplexValueChannel* metadata, std::uint64_t* status)
+    ComplexValueChannel* metadata, std::uint64_t* status, double* minimum_scaled_pivots)
 {
   const auto channel = std::size_t(blockIdx.x), lane = std::size_t(threadIdx.x);
   if (channel >= channels)
@@ -279,6 +288,7 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   __shared__ double magnitudes[256];
   __shared__ std::size_t rows[256];
   __shared__ double scale, log_abs, pivot_magnitude;
+  __shared__ double minimum_pivot;
   __shared__ cuDoubleComplex phase;
   __shared__ std::size_t pivot;
   __shared__ unsigned bad;
@@ -286,6 +296,11 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   if (!lane)
   {
     metadata[channel] = {make_cuDoubleComplex(0, 0), nodeLog(), 1};
+    if constexpr (CollectPivots)
+    {
+      minimum_scaled_pivots[channel] = 0;
+      minimum_pivot = INFINITY;
+    }
     bad = 0;
   }
   __syncthreads();
@@ -338,6 +353,8 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
       pivot = rows[0];
       pivot_magnitude = magnitudes[0];
       if (!device_math::isFiniteBinary64(pivot_magnitude)) { bad = 1; fail(status, channel); }
+      if constexpr (CollectPivots)
+        minimum_pivot = fmin(minimum_pivot, pivot_magnitude);
     }
     __syncthreads();
     if (bad || pivot_magnitude == 0) return;
@@ -385,7 +402,11 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
     if (bad || !device_math::isFiniteBinary64(log_abs) || !finite(phase) || !(magnitude > 0))
       fail(status, channel);
     else
+    {
       metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
+      if constexpr (CollectPivots)
+        minimum_scaled_pivots[channel] = minimum_pivot;
+    }
   }
 }
 
@@ -601,9 +622,25 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     throw std::invalid_argument("Complex VALUE factor storage/size is invalid");
   const auto serial_blocks = blocks(channels);
   if (!inverse && cooperativeFactorEnabled() && channels <= std::size_t(std::numeric_limits<int>::max()))
-    factorCooperative<<<static_cast<unsigned>(channels), 256, 0, stream>>>(channels, n, matrix, metadata, status);
+    factorCooperative<false><<<static_cast<unsigned>(channels), 256, 0, stream>>>(channels, n, matrix, metadata, status, nullptr);
   else
-    factor<<<serial_blocks, 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve);
+    factor<false><<<serial_blocks, 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve, nullptr);
+  return launched();
+}
+
+/// Collect component-max-scaled pivots without altering factor arithmetic or publication.
+Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    double* minimum_scaled_pivots)
+{
+  if (!channels || !n || !matrix || !metadata || !status || !minimum_scaled_pivots)
+    throw std::invalid_argument("Complex VALUE diagnostic factor storage/size is invalid");
+  if (cooperativeFactorEnabled() && channels <= std::size_t(std::numeric_limits<int>::max()))
+    factorCooperative<true><<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+        channels, n, matrix, metadata, status, minimum_scaled_pivots);
+  else
+    factor<true><<<blocks(channels), 128, 0, stream>>>(
+        channels, n, matrix, metadata, status, nullptr, nullptr, nullptr, minimum_scaled_pivots);
   return launched();
 }
 

@@ -954,6 +954,7 @@ private:
   friend class PreparedDeviceMetropolis;
   friend class PreparedDeviceKineticReverse;
   friend class PreparedDeviceComplexValue;
+  friend class PreparedDeviceMixedComplexValue;
   friend class PreparedDeviceComplexSpatial;
   friend struct ComplexSpatialTargetValidationAccess;
   friend class PreparedDeviceComplexScore;
@@ -2229,6 +2230,20 @@ public:
   }
 
 private:
+  /// Numerical paired composition only; ordinary REAL attachment remains independently restricted.
+  void setMixedDenseForPairedTrunk(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
+  {
+    if (adapter && (mode_ != SpatialJetMode::VALUE_ONLY || target_preparation_.max_targets ||
+        !value_tape_.empty() || retained_targets_ || kinetic_trunk_only_ ||
+        !supportsMixedPairedTrunkEnvironment(plan_.environment())))
+      throw std::invalid_argument("Mixed paired trunk requires ordinary legacy-torus VALUE without retained state");
+    if (adapter && (adapter->modelImage().get() != model_.get() ||
+        adapter->maximumRows() < product(batch_capacity_, ne_)))
+      throw std::invalid_argument("Mixed paired trunk adapter has a foreign image or insufficient row capacity");
+    mixed_dense_ = std::move(adapter);
+    value_tape_valid_ = result_valid_ = false;
+  }
+
   /** Cancel adapter state on every graph exit, including an early physical failure. */
   struct MixedValueAttempt
   {

@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceDense.h"
 #include "PsiFormerDeviceBlasMathMode.h"
 #include "PsiFormerDeviceMixedValueDense.h"
+#include "PsiFormerDeviceComplexValueKernels.h"
 #include "PsiFormerDevicePrecision.h"
 #include "PsiFormerDeviceInference.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
@@ -772,19 +773,59 @@ __global__ void mixedValueConditioningKernel(const device_determinant::Factoriza
     atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.severe_cancellation_count), 1ULL);
 }
 
+/// Read typed paired-head records; complex component-max scaling is not the REAL metric.
+__global__ void mixedComplexValueConditioningKernel(const double* minimum_scaled_pivots,
+    const ComplexValueChannel* channels, const ComplexValueResult* results,
+    std::size_t configurations, std::size_t determinants, PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= configurations)
+    return;
+  unsigned long long bad_pivots = 0;
+  for (std::size_t determinant = 0; determinant < determinants; ++determinant)
+  {
+    const auto index = configuration * determinants + determinant;
+    const auto& channel = channels[index];
+    const auto pivot = minimum_scaled_pivots[index];
+    if (channel.status != 0 || !device_math::isFiniteBinary64(channel.log_abs) ||
+        !device_math::isFiniteBinary64(cuCreal(channel.phase)) ||
+        !device_math::isFiniteBinary64(cuCimag(channel.phase)) ||
+        !device_math::isFiniteBinary64(pivot) || pivot < 1.0e-3)
+      ++bad_pivots;
+  }
+  if (bad_pivots)
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.small_determinant_pivot_count), bad_pivots);
+  const auto& result = results[configuration];
+  if (result.status != 0 || !device_math::isFiniteBinary64(result.log_abs) ||
+      !device_math::isFiniteBinary64(cuCreal(result.phase)) ||
+      !device_math::isFiniteBinary64(cuCimag(result.phase)) ||
+      !device_math::isFiniteBinary64(result.cancellation_ratio) || result.cancellation_ratio < 1.0e-3)
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.severe_cancellation_count), 1ULL);
+}
+
 } // namespace
 
 PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
     std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue,
     bool allow_fp64_retry)
+    : PreparedDeviceMixedDenseParameters(std::move(model), queue,
+                                        MixedTrunkHeadPolicy::REAL_AMPLITUDE, allow_fp64_retry)
+{}
+
+PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
+    std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue,
+    MixedTrunkHeadPolicy policy, bool allow_fp64_retry)
     : model_(std::move(model))
 {
   if (!model_)
     throw std::invalid_argument("Mixed dense parameters require an immutable canonical model");
   model_->validateCurrentDevice();
   const auto& environment = model_->plan().environment();
-  if (!supportsMixedRealInferenceEnvironment(environment))
+  if (policy == MixedTrunkHeadPolicy::REAL_AMPLITUDE && !supportsMixedRealInferenceEnvironment(environment))
     throw std::invalid_argument("Mixed affine projections require a fixed-ion real open or legacy Gamma model");
+  if ((policy == MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD && !supportsMixedPairedTrunkEnvironment(environment)) ||
+      (policy != MixedTrunkHeadPolicy::REAL_AMPLITUDE && policy != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD))
+    throw std::invalid_argument("Mixed affine projections require an explicitly admitted immutable head family");
   const auto count = model_->plan().parameterCount();
   weights_.reserveNamed(count, "MixedDenseParameters::fp32_weights", __FILE__, __LINE__);
   clearMixedDeviceStorage(queue.getNative(), weights_.data(), checkedDeviceBytes<float>(count));
@@ -817,6 +858,12 @@ PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
 std::size_t PreparedDeviceMixedDenseParameters::deviceStorageBytes() const
 {
   return checkedDeviceBytes<float>(weights_.capacity());
+}
+
+MixedTrunkHeadPolicy PreparedDeviceMixedDenseParameters::trunkHeadPolicy() const noexcept
+{
+  return model_->plan().environment().head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX
+      ? MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD : MixedTrunkHeadPolicy::REAL_AMPLITUDE;
 }
 
 std::size_t MixedValueDenseStatistics::roundTripBytes() const
@@ -923,11 +970,23 @@ void PreparedDeviceMixedValueDense::projectSpatial(const SpatialDenseJetLayout& 
   project(makeFoldedSpatialDenseLayout(layout), source, weight, target);
 }
 
+void PreparedDeviceMixedValueDense::admitAffinePrefix()
+{
+  if (!active_)
+    throw std::logic_error("Mixed affine prefix admission has no open evaluation");
+  admitDiagnostics();
+}
+
 void PreparedDeviceMixedValueDense::finishEvaluation()
 {
   if (!active_)
     throw std::logic_error("Mixed dense admission has no open evaluation");
   active_ = false;
+  admitDiagnostics();
+}
+
+void PreparedDeviceMixedValueDense::admitDiagnostics()
+{
   queue_.sync();
   device_diagnostics_.download(&diagnostics_, 1);
   // Keep the device-leaf library independent of the host precision-policy object
@@ -974,6 +1033,23 @@ void PreparedDeviceMixedValueDense::checkValueConditioning(
 #endif
 }
 
+void PreparedDeviceMixedValueDense::checkComplexValueConditioning(const double* minimum_scaled_pivots,
+    const ComplexValueChannel* channels, const ComplexValueResult* results,
+    std::size_t configurations, std::size_t determinants)
+{
+  if (!active_ || parameters_->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD ||
+      !minimum_scaled_pivots || !channels || !results || !configurations || configurations > maximum_rows_ ||
+      determinants != modelImage()->plan().modelShape().determinants)
+    throw std::invalid_argument("Mixed paired conditioning requires a live matching determinant batch");
+  mixedComplexValueConditioningKernel<<<valueBlockCount(configurations), value_block_size, 0, queue_.getNative()>>>(
+      minimum_scaled_pivots, channels, results, configurations, determinants, device_diagnostics_.data());
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipPeekAtLastError(), "mixed paired conditioning admission");
+#else
+  checkRuntime(cudaPeekAtLastError(), "mixed paired conditioning admission");
+#endif
+}
+
 void PreparedDeviceMixedValueDense::rebindParameters(
     std::shared_ptr<const PreparedDeviceMixedDenseParameters> successor)
 {
@@ -981,6 +1057,8 @@ void PreparedDeviceMixedValueDense::rebindParameters(
     throw std::logic_error("Cannot rebind mixed parameters during an open evaluation");
   if (!successor)
     throw std::invalid_argument("Mixed dense successor cache is null");
+  if (successor->trunkHeadPolicy() != parameters_->trunkHeadPolicy())
+    throw std::invalid_argument("Mixed dense successor changes its admitted head family");
   modelImage()->validateSuccessor(successor->modelImage());
   parameters_ = std::move(successor);
   diagnostics_ = {};

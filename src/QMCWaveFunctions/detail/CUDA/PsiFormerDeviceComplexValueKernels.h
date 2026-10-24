@@ -58,6 +58,11 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
+/// Mixed-only conditioning evidence in a separate bank; channel ABI and FP64 entry point are unchanged.
+Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    double* minimum_scaled_pivots);
+
 /// Record the earliest canonical same-spin zero/invalid pair without changing status/results.
 Error launchComplexValuePairCheck(Stream stream, std::size_t batch, std::size_t electrons,
     std::size_t spin_up, periodic_geometry::Cell cell, const double* positions, std::uint64_t* events);

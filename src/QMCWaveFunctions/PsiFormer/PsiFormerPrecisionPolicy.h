@@ -35,6 +35,26 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
   FP32_DENSE_FP64_ISLANDS
 };
 
+/// Explicit numerical-owner authority; the existing REAL attachment stays the default.
+enum class MixedTrunkHeadPolicy : std::uint8_t
+{
+  REAL_AMPLITUDE,
+  PAIRED_COMPLEX_FP64_HEAD
+};
+
+/// The paired numerical adapter changes real affine projections, never the FP64 head.
+inline bool supportsMixedPairedTrunkEnvironment(const ExecutionEnvironment& environment)
+{
+  return environment.fixed_nuclei &&
+      environment.parameter_scalar_domain == ScalarDomain::REAL &&
+      environment.compute_scalar_domain == ScalarDomain::REAL &&
+      environment.amplitude_scalar_domain == ScalarDomain::COMPLEX &&
+      environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
+      environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
+      environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+}
+
 /// Admit the existing real affine adapter only on its qualified geometry families.
 inline bool supportsMixedRealInferenceEnvironment(const ExecutionEnvironment& environment)
 {
