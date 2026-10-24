@@ -85,15 +85,44 @@ inline bool configuredComplexScoreCooperativeLu()
   return enabled;
 }
 
+/// Capture the SCORE-only pair scan independently of unrelated ordinary VALUE options.
+inline bool configuredComplexScorePairCheck()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_SCORE_COOPERATIVE_PAIR_CHECK");
+    if (!value || std::string_view(value) == "0")
+      return false;
+    if (std::string_view(value) == "1")
+      return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_SCORE_COOPERATIVE_PAIR_CHECK must be 0 or 1");
+  }();
+  return enabled;
+}
+
+/// Keep retained pair records inside the already qualified fixed paired FP64 envelope.
+inline bool complexScorePairCheckEligible(const PsiFormerExecutionPlan& plan)
+{
+  return complexScoreInverseColumnsEligible(plan);
+}
+
 /// Standalone B1 score inventory; canonical bytes are exactly realP+complexP=24P.
 struct ComplexScoreCost { ComplexValueCost forward; std::size_t device_bytes, host_bytes, canonical_bytes; };
 
 /// Count the head-free retained VALUE profile, one network lane and one complexP.
-inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& plan)
+inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& plan,
+    bool pair_check = configuredComplexScorePairCheck())
 {
   auto forward = estimateComplexValueCost(plan, 1, false);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex score extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex score bytes overflow"); };
+  if (pair_check && complexScorePairCheckEligible(plan))
+  {
+    const auto pairs = mul(plan.modelShape().electrons(), plan.modelShape().electrons());
+    if (pairs > std::numeric_limits<std::uint64_t>::max() / 2)
+      throw std::overflow_error("Retained score pair event encoding exceeds uint64 admission");
+    forward.pair_event_bytes = sizeof(std::uint64_t);
+    forward.device_bytes = add(forward.device_bytes, forward.pair_event_bytes);
+  }
   const auto& s = plan.modelShape();
   const auto n = s.electrons(), nf = mul(n, s.feature_dimension), probability = mul(s.attention_heads, mul(n, n));
   const auto p = plan.parameterCount(), q = mul(n, n - 1) / 2;
@@ -117,7 +146,7 @@ inline ComplexScoreCost estimateComplexOrbitalVJPCost(const PsiFormerExecutionPl
   if (plan.environment().periodic_profile ||
       plan.environment().geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
     throw std::invalid_argument("Paired raw-orbital VJP requires the qualified periodic_torus_v1 profile");
-  auto cost = estimateComplexScoreCost(plan);
+  auto cost = estimateComplexScoreCost(plan, false);
   const auto multiply = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex orbital VJP bytes overflow"); };
   const auto& shape = plan.modelShape();
   const auto inverse_bytes = spatial_detail::checkedAdd(multiply(16, cost.forward.matrices),
@@ -204,6 +233,9 @@ public:
 
   /// Report the frozen LU policy without changing the existing inverse-column and publication contracts.
   bool usesCooperativeLu() const noexcept { return cooperative_lu_; }
+
+  /// Report the effective frozen pair-event owner, not the ambient ordinary VALUE flag.
+  bool usesCooperativePairCheck() const noexcept { return cooperative_pair_check_; }
 
   /// Reuse one tape and oneP scratch for both real objectives before publishing.
   void evaluate(const std::vector<double>& positions)
@@ -356,11 +388,13 @@ private:
         periodic_geometry_(!orbital_only && periodic_geometry && complexScorePeriodicGeometryEligible(image->plan())),
         cooperative_lu_(!orbital_only && cooperative_lu && inverse_columns_ &&
             complexScoreInverseColumnsEligible(image->plan())),
+        cooperative_pair_check_(!orbital_only && cost.forward.pair_event_bytes &&
+            complexScorePairCheckEligible(image->plan())),
         cooperative_weighted_inverses_(!orbital_only && configuredComplexScoreWeightedInversesCooperative() &&
             image->plan().modelShape().electrons() >= 64 && image->plan().modelShape().electrons() <= 300 &&
             image->plan().modelShape().determinants >= 1 && image->plan().modelShape().determinants <= 16),
         forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true, !orbital_only,
-            inverse_columns_, periodic_geometry_, cooperative_lu_)),
+            inverse_columns_, periodic_geometry_, cooperative_lu_, cooperative_pair_check_)),
         network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
         feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension, "ComplexScore::feature_", __FILE__, __LINE__),
         ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei, "ComplexScore::ion_", __FILE__, __LINE__),
@@ -514,6 +548,7 @@ private:
   const bool inverse_columns_;
   const bool periodic_geometry_;
   const bool cooperative_lu_;
+  const bool cooperative_pair_check_;
   const bool cooperative_weighted_inverses_;
   std::unique_ptr<PreparedDeviceComplexValue> forward_;
   std::unique_ptr<PreparedDeviceNetworkReverse> network_;

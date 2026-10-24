@@ -649,8 +649,9 @@ private:
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost,
       bool retain_score = false, bool retain_inverse = true, bool score_inverse_columns = false,
-      bool score_periodic_geometry = false, bool score_cooperative_lu = false)
+      bool score_periodic_geometry = false, bool score_cooperative_lu = false, bool score_pair_check = false)
       : cost_(cost), score_inverse_columns_(score_inverse_columns), score_cooperative_lu_(score_cooperative_lu),
+        score_pair_check_(score_pair_check),
         trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true,
           false, score_periodic_geometry)),
@@ -674,6 +675,9 @@ private:
       throw std::invalid_argument("Cooperative score LU requires retained inverse-column ownership");
     if (score_inverse_columns_ && (!retain_score || !retain_inverse || !inverse_.capacity()))
       throw std::logic_error("Inverse columns require the retained SCORE inverse owner");
+    if (score_pair_check_ && (!retain_score || !retain_inverse || capacity != 1 ||
+        cost.pair_event_bytes != sizeof(std::uint64_t)))
+      throw std::invalid_argument("Retained score pair check requires one complete SCORE event owner");
     if (cost.projection_pointer_bytes)
       for (auto& bank : projection_banks_)
         bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
@@ -686,9 +690,9 @@ private:
         pair_events_.capacity() * sizeof(std::uint64_t) + envelope_anchor_.capacity() * sizeof(double) +
         envelope_rows_.capacity() * sizeof(std::size_t) + envelope_anchor_status_.capacity() * sizeof(std::uint64_t) +
         (projection_banks_[0] ? projection_banks_[0]->deviceBytes() + projection_banks_[1]->deviceBytes() : 0);
-    if ((cost.pair_event_bytes && (retain_score || pair_events_.capacity() != capacity)) ||
+    if ((cost.pair_event_bytes && ((retain_score && !score_pair_check_) || pair_events_.capacity() != capacity)) ||
         pair_events_.capacity() * sizeof(std::uint64_t) != cost.pair_event_bytes)
-      throw std::logic_error("Complex VALUE pair records differ from admitted ordinary owner");
+      throw std::logic_error("Complex VALUE pair records differ from admitted ordinary or SCORE owner");
     const auto request_host = envelope_base_.capacity() * sizeof(double) +
         envelope_rows_host_.capacity() * sizeof(std::size_t);
     if (actual != cost.device_bytes || trunk_->deviceWorkspaceBytes() != cost.trunk_bytes ||
@@ -739,6 +743,7 @@ private:
   // Immutable selectors only; inverse/permutation/solve remain the existing retained banks.
   const bool score_inverse_columns_;
   const bool score_cooperative_lu_;
+  const bool score_pair_check_;
   std::unique_ptr<PreparedDeviceInference> trunk_;
   std::array<std::unique_ptr<PreparedDeviceOrbitalProjection>, 2> projection_banks_;
   DeviceBuffer<double> envelope_, projections_;

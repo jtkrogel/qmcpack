@@ -640,6 +640,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--complex-score-weighted-inverses-only" &&
         std::string_view(argv[1]) != "--complex-score-periodic-geometry-only" &&
         std::string_view(argv[1]) != "--complex-score-cooperative-lu-only" &&
+        std::string_view(argv[1]) != "--complex-score-pair-events-only" &&
         std::string_view(argv[1]) != "--complex-score-inverse-columns-only" &&
         std::string_view(argv[1]) != "--large-real-score-tile-only" &&
         std::string_view(argv[1]) != "--complex-inverse-columns-only" &&
@@ -660,7 +661,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only" &&
         std::string_view(argv[1]) != "--paired-two-cell-only" && std::string_view(argv[1]) != "--complex-orbital-vjp-only" && std::string_view(argv[1]) != "--complex-lu-only" && std::string_view(argv[1]) != "--complex-lu-growth-only" &&
         std::string_view(argv[1]) != "--complex-roots-only" && std::string_view(argv[1]) != "--complex-roots-large-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-score-cooperative-lu-only|--complex-score-periodic-geometry-only|--complex-score-inverse-columns-only|--complex-score-weighted-inverses-only|--large-real-score-tile-only|--complex-kinetic-head-owner-k3-diagnostic-only|--complex-kinetic-head-owner-k1-only|--complex-kinetic-head-parallel-only|--complex-target-factor-reuse-only|--complex-inverse-columns-only|--complex-mixed-value-only|--complex-mixed-full-only|--head-determinant-batch-only|--real-virtual-envelope-only|--mixed-periodic-geometry-only|--periodic-feature-jets-only|--complex-roots-only|--complex-roots-large-only|"
+      throw std::invalid_argument("Usage: periodic_validation [--complex-score-pair-events-only|--complex-score-cooperative-lu-only|--complex-score-periodic-geometry-only|--complex-score-inverse-columns-only|--complex-score-weighted-inverses-only|--large-real-score-tile-only|--complex-kinetic-head-owner-k3-diagnostic-only|--complex-kinetic-head-owner-k1-only|--complex-kinetic-head-parallel-only|--complex-target-factor-reuse-only|--complex-inverse-columns-only|--complex-mixed-value-only|--complex-mixed-full-only|--head-determinant-batch-only|--real-virtual-envelope-only|--mixed-periodic-geometry-only|--periodic-feature-jets-only|--complex-roots-only|--complex-roots-large-only|"
           "--periodic-value-tiling-only|--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-concurrent-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
@@ -673,7 +674,13 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--complex-score-cooperative-lu-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--complex-score-pair-events-only")
+    {
+      (void)configuredComplexScorePairCheck(); // Invalid cold policy exits before numerical fixtures.
+      validateComplexValuePairEvents(true);
+      validateComplexScorePeriodicGeometry(false, true);
+    }
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-score-cooperative-lu-only")
     {
       validateComplexInverseColumns(true);
       validateComplexScorePeriodicGeometry(true);

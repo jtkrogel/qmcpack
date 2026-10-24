@@ -67,18 +67,22 @@ void validateComplexValuePairOwner()
   catch (const std::invalid_argument&) { revoked = true; }
   if (!revoked) throw std::runtime_error("Eligible pair owner retained an old-image result");
   owner->evaluate(positions);
-  // The retained score constructor checks its actual full inventory; no pair buffer is charged or owned.
+  // Ordinary VALUE flags never admit SCORE events; only its separate explicit policy can own them.
   const auto score_cost = estimateComplexScoreCost(plan);
   const auto score_before = metrics.snapshot();
   auto score = PreparedDeviceComplexScore::prepare(successor, queue, blas, score_cost.device_bytes);
-  if (score_cost.forward.pair_event_bytes || metrics.snapshot().live_bytes - score_before.live_bytes != score_cost.device_bytes)
+  const auto score_pair_bytes = configuredComplexScorePairCheck() && complexScorePairCheckEligible(plan) ?
+      sizeof(std::uint64_t) : 0;
+  if (score_cost.forward.pair_event_bytes != score_pair_bytes ||
+      metrics.snapshot().live_bytes - score_before.live_bytes != score_cost.device_bytes)
     throw std::runtime_error("Eligible retained score inherited ordinary pair ownership");
   std::cout << "PASS eligible complex VALUE pair owner: Ne=64 capacity=2 event_device_owner_bytes="
-            << cost.pair_event_bytes << " exact_cost=1 cost_minus_one_denied=1 warm_allocations=0 rebind=1 retained_score_excluded=1\n";
+            << cost.pair_event_bytes << " exact_cost=1 cost_minus_one_denied=1 warm_allocations=0 rebind=1 retained_score_excluded="
+            << (score_pair_bytes == 0) << '\n';
 }
 
 /// Compare complete old/new reduction bits and independently enumerate event priority.
-void validateComplexValuePairEvents()
+void validateComplexValuePairEvents(bool incoming_status_case = false)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -153,14 +157,15 @@ void validateComplexValuePairEvents()
             (variant == 3 && expected[0] != UINT64_MAX) || (variant == 5 && expected[0] != 3))
           throw std::runtime_error("Pair-event fixture lost exact periodic node or event-order distinction");
         const std::uint64_t clear = UINT64_MAX;
-        old_status.upload(&clear, 1); new_status.upload(&clear, 1); events.upload(actual.data(), actual.size());
+        const std::uint64_t incoming = incoming_status_case && n == 64 && live == 1 && variant == 5 ? 7 : clear;
+        old_status.upload(&incoming, 1); new_status.upload(&incoming, 1); events.upload(actual.data(), actual.size());
         checkRuntime(launchComplexValuePairCheck(queue.getNative(), live, n, spin, cell, positions.data(), events.data()),
                      "pair-event validation precheck");
         queue.sync();
         events.download(actual.data(), capacity);
         std::uint64_t old_failure, new_failure;
         new_status.download(&new_failure, 1);
-        if (new_failure != clear) throw std::runtime_error("Pair precheck changed numerical status early");
+        if (new_failure != incoming) throw std::runtime_error("Pair precheck changed numerical status early");
         for (std::size_t b = 0; b < capacity; ++b)
           if (actual[b] != (b < live ? expected[b] : clear))
             throw std::runtime_error("Pair precheck ordinal/type or live tail differs from independent scalar scan");

@@ -5,6 +5,7 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_GEOMETRY_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_GEOMETRY_VALIDATION_H
 #include "PsiFormerDeviceComplexScoreValidation.h"
+#include "PsiFormerDeviceComplexProducts.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include <cstring>
@@ -17,13 +18,15 @@ struct ComplexScoreGeometryValidationAccess
   /// Keep explicit primal-policy oracles independent of the process-cached selectors.
   static std::unique_ptr<PreparedDeviceComplexScore> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, bool geometry,
-      bool cooperative_lu = false)
+      bool cooperative_lu = false, bool pair_check = false)
   {
-    const auto cost = estimateComplexScoreCost(image->plan());
+    const auto cost = estimateComplexScoreCost(image->plan(), pair_check);
     auto owner = std::unique_ptr<PreparedDeviceComplexScore>(
         new PreparedDeviceComplexScore(std::move(image), queue, blas, cost, false, true, geometry, cooperative_lu));
     if (owner->forward_->trunk_->usesCooperativePeriodicValueGeometry() != geometry ||
-        owner->forward_->score_cooperative_lu_ != cooperative_lu)
+        owner->forward_->score_cooperative_lu_ != cooperative_lu ||
+        owner->usesCooperativePairCheck() != pair_check ||
+        owner->forward_->pair_events_.capacity() != std::size_t(pair_check))
       throw std::runtime_error("Retained score owner did not dispatch its explicit primal policies");
     return owner;
   }
@@ -58,9 +61,11 @@ struct ComplexScoreGeometryValidationAccess
   }
 };
 
-/// Compare retained objectives, publication and rebind under geometry or cooperative-LU policies.
-inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = false)
+/// Compare retained objectives, publication and rebind under one selected primal policy.
+inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = false, bool qualify_pair_check = false)
 {
+  if (qualify_cooperative_lu && qualify_pair_check)
+    throw std::invalid_argument("Retained primal qualification changes only one policy at a time");
   const auto descriptor = makeTargetCostPlan(64, true, true);
   const auto initialized = initializePsiFormerParameters(descriptor.modelShape(), 1729,
       PSIFORMER_COMPLEX_PERIODIC_V1, descriptor.environment());
@@ -76,6 +81,25 @@ inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = f
   AcceleratorBlasHandle blas(queue);
   auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
   const auto cost = estimateComplexScoreCost(plan);
+  if (qualify_pair_check)
+  {
+    const auto without = estimateComplexScoreCost(plan, false), with = estimateComplexScoreCost(plan, true);
+    if (without.forward.pair_event_bytes || with.forward.pair_event_bytes != sizeof(std::uint64_t) ||
+        with.device_bytes != without.device_bytes + sizeof(std::uint64_t) ||
+        with.forward.device_bytes != without.forward.device_bytes + sizeof(std::uint64_t) ||
+        with.host_bytes != without.host_bytes || with.canonical_bytes != without.canonical_bytes ||
+        with.forward.projection_pointer_bytes || with.forward.envelope_anchor_bytes ||
+        with.forward.periodic_geometry.device_bytes || estimateComplexOrbitalVJPCost(plan).forward.pair_event_bytes)
+      throw std::runtime_error("Retained pair cost widened another role/option or differs from exactly eight bytes");
+    for (auto scope : {ComplexProductsScope::COMPLETE, ComplexProductsScope::SCORE_ECP_ONLY})
+    {
+      const auto aggregate = estimateComplexProductsCost(plan, 1, 1, 1, plan.parameterCount(),
+          ComplexProductsHostOutput::CHUNKED, scope);
+      if (aggregate.score.device_bytes != cost.device_bytes ||
+          aggregate.score.forward.pair_event_bytes != cost.forward.pair_event_bytes)
+        throw std::runtime_error("Enclosing complex product preflight lost its selected SCORE event owner");
+    }
+  }
   auto& metrics = deviceMemoryMetrics(0);
   const auto before = metrics.snapshot();
   bool denied = false;
@@ -87,12 +111,17 @@ inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = f
   if (selected->usesPeriodicGeometry() != configuredComplexScorePeriodicGeometry() ||
       (qualify_cooperative_lu && (selected->usesCooperativeLu() != configuredComplexScoreCooperativeLu() ||
           !selected->usesPeriodicGeometry() || !selected->usesInverseColumns())) ||
+      (qualify_pair_check && (selected->usesCooperativePairCheck() != configuredComplexScorePairCheck() ||
+          !selected->usesPeriodicGeometry() || !selected->usesCooperativeLu() || !selected->usesInverseColumns())) ||
       metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
     throw std::runtime_error("Retained geometry selector or exact unchanged cost differs");
   selected.reset();
-  auto scalar = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, qualify_cooperative_lu);
-  auto cooperative_owner = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, true, qualify_cooperative_lu);
-  if ((qualify_cooperative_lu ? scalar->usesCooperativeLu() || !cooperative_owner->usesCooperativeLu() :
+  auto scalar = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas,
+      qualify_cooperative_lu || qualify_pair_check, qualify_pair_check);
+  auto cooperative_owner = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, true,
+      qualify_cooperative_lu || qualify_pair_check, qualify_pair_check);
+  if (qualify_pair_check ? scalar->usesCooperativePairCheck() || !cooperative_owner->usesCooperativePairCheck() :
+      (qualify_cooperative_lu ? scalar->usesCooperativeLu() || !cooperative_owner->usesCooperativeLu() :
           scalar->usesPeriodicGeometry() || !cooperative_owner->usesPeriodicGeometry()))
     throw std::runtime_error("Explicit retained score primal oracles not distinct");
   std::vector<cuDoubleComplex> reference(plan.parameterCount()), actual(plan.parameterCount());
@@ -171,13 +200,18 @@ inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = f
   compare();
   const auto raw_cost = estimateComplexOrbitalVJPCost(plan);
   auto raw = PreparedDeviceComplexScore::prepareOrbitalVJP(successor, queue, blas, raw_cost.device_bytes);
-  if (raw->usesPeriodicGeometry() || raw->usesCooperativeLu())
+  if (raw->usesPeriodicGeometry() || raw->usesCooperativeLu() || raw->usesCooperativePairCheck())
     throw std::runtime_error("Raw-orbital VJP admitted geometry-only selection");
   for (const auto n : {63, 64, 300, 301})
-    if (complexScorePeriodicGeometryEligible(makeTargetCostPlan(n, true, true)) != (n >= 64 && n <= 300))
+    if (complexScorePeriodicGeometryEligible(makeTargetCostPlan(n, true, true)) != (n >= 64 && n <= 300) ||
+        complexScorePairCheckEligible(makeTargetCostPlan(n, true, true)) != (n >= 64 && n <= 300) ||
+        estimateComplexScoreCost(makeTargetCostPlan(n, true, true), true).forward.pair_event_bytes !=
+            ((n >= 64 && n <= 300) ? sizeof(std::uint64_t) : 0))
       throw std::runtime_error("Retained geometry electron range differs from qualification");
   if (complexScorePeriodicGeometryEligible(makeTargetCostPlan(64, false)) ||
-      complexScorePeriodicGeometryEligible(makeTargetCostPlan(64, true)))
+      complexScorePeriodicGeometryEligible(makeTargetCostPlan(64, true)) ||
+      complexScorePairCheckEligible(makeTargetCostPlan(64, false)) ||
+      complexScorePairCheckEligible(makeTargetCostPlan(64, true)))
     throw std::runtime_error("Open/real retained geometry selection widened");
   const auto layouts = [&](bool extra_determinant) {
     std::vector<ParameterLayoutInput> result;
@@ -203,7 +237,9 @@ inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = f
   };
   auto d17 = plan.modelShape();
   d17.determinants = 17;
-  if (complexScorePeriodicGeometryEligible(PsiFormerExecutionPlan(d17, layouts(true), plan.environment())))
+  const PsiFormerExecutionPlan excluded_d17(d17, layouts(true), plan.environment());
+  if (complexScorePeriodicGeometryEligible(excluded_d17) || complexScorePairCheckEligible(excluded_d17) ||
+      estimateComplexScoreCost(excluded_d17, true).forward.pair_event_bytes)
     throw std::runtime_error("Retained geometry D17 selection widened");
   for (bool partial_axes : {false, true})
   {
@@ -216,16 +252,18 @@ inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = f
     try
     {
       const PsiFormerExecutionPlan excluded(plan.modelShape(), layouts(false), environment);
-      if (complexScorePeriodicGeometryEligible(excluded))
+      if (complexScorePeriodicGeometryEligible(excluded) || complexScorePairCheckEligible(excluded))
         throw std::runtime_error("Retained geometry partial-axes/moving-nuclei selection widened");
     }
     catch (const std::invalid_argument&) {}
   }
-  std::cout << (qualify_cooperative_lu ? "PASS retained_score_cooperative_lu " : "PASS retained_score_periodic_geometry ")
+  std::cout << (qualify_pair_check ? "PASS retained_score_pair_events " :
+      (qualify_cooperative_lu ? "PASS retained_score_cooperative_lu " : "PASS retained_score_periodic_geometry "))
             << "raw_tape_allP_amplitude_bits=exact objectives=2 changed_alpha_embedding_image=1"
             << " stale_rejected=1 second_failure_hidden=1 warm_allocations=0 minus_one=1 raw_excluded=1"
-            << " extra_device_bytes=0 selected="
-            << (qualify_cooperative_lu ? configuredComplexScoreCooperativeLu() : configuredComplexScorePeriodicGeometry()) << '\n';
+            << " extra_device_bytes=" << (qualify_pair_check ? sizeof(std::uint64_t) : 0) << " selected="
+            << (qualify_pair_check ? configuredComplexScorePairCheck() :
+                (qualify_cooperative_lu ? configuredComplexScoreCooperativeLu() : configuredComplexScorePeriodicGeometry())) << '\n';
 }
 } // namespace qmcplusplus::psiformer::device
 #endif
