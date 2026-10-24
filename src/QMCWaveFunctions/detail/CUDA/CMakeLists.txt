@@ -139,6 +139,9 @@ endif()
 # Self-contained generated periodic fixture: no trained checkpoint data required.
 add_executable(psiformer_device_periodic_validation EXCLUDE_FROM_ALL
                PsiFormerDevicePeriodicValidation.cu
+               # The standalone native batch adapter needs its control-plane implementations.
+               ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
+               ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
                ../../PsiFormer/PsiFormerInitialization.cpp
                ../../PsiFormer/PsiFormerExecutionPlan.cpp
                ../../PsiFormer/PsiFormerGeometry.cpp)
