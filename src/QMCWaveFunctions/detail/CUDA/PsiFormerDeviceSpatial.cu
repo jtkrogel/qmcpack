@@ -510,6 +510,147 @@ __global__ void periodicFeatureValuesCooperativeKernel(OpenFeatureJetLayout layo
   }
 }
 
+
+/// Independent VALUE pair tiles write only their own seven feature columns.
+__global__ void periodicFeatureValueTilesKernel(OpenFeatureJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::size_t pairs, std::size_t tiles,
+    std::uint32_t* flags, double* output)
+{
+  const auto configuration = std::size_t(blockIdx.x) / tiles;
+  const auto tile = std::size_t(blockIdx.x) % tiles;
+  const auto pair = tile * blockDim.x + threadIdx.x;
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = active_electrons[configuration] >= layout.output.electron_count;
+  __syncthreads();
+  if (pair < pairs && active_electrons[configuration] < layout.output.electron_count &&
+      !writePeriodicFeatureValuePair(layout, cell, positions, nuclei, configuration,
+          pair / layout.nucleus_count, pair % layout.nucleus_count, output))
+    atomicOr(&failed, 1U);
+  __syncthreads();
+  if (threadIdx.x == 0)
+    flags[blockIdx.x] = failed;
+}
+
+/// Publish spin/finiteness only after every pair tile, or reconstruct scalar failure scratch.
+__global__ void periodicFeatureValueTilesFinishKernel(OpenFeatureJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::size_t tiles, const std::uint32_t* flags,
+    double* output, OpenSpatialStatus* status)
+{
+  const auto configuration = std::size_t(blockIdx.x);
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = 0;
+  __syncthreads();
+  for (std::size_t tile = threadIdx.x; tile < tiles; tile += blockDim.x)
+    if (flags[configuration * tiles + tile])
+      atomicOr(&failed, 1U);
+  __syncthreads();
+  if (!failed)
+  {
+    for (std::size_t electron = threadIdx.x; electron < layout.output.electron_count; electron += blockDim.x)
+      output[layout.output.uncheckedValueOffset(configuration,
+          electron * layout.feature_width + layout.feature_width - 1)] =
+          electron < layout.spin_up_count ? 1.0 : -1.0;
+    __syncthreads();
+    for (std::size_t logical = threadIdx.x; logical < layout.output.element_count; logical += blockDim.x)
+      if (!device_math::isFiniteBinary64(output[layout.output.uncheckedValueOffset(configuration, logical)]))
+        atomicOr(&failed, 1U);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    status[configuration] = failed ? open_spatial::buildOpenFeatureJetsForConfiguration(
+        layout, positions, nuclei, configuration, active_electrons[configuration], output, &cell) :
+        OpenSpatialStatus::REGULAR;
+}
+
+/// Materialize unchanged periodic pair expressions; no partial sums or early public errors.
+__global__ void periodicCuspValueTilesKernel(OpenCuspJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const std::size_t* active_electrons, double same_spin_alpha,
+    double opposite_spin_alpha, std::size_t cells, std::size_t tiles,
+    double* terms, std::uint32_t* flags)
+{
+  const auto configuration = std::size_t(blockIdx.x) / tiles;
+  const auto tile = std::size_t(blockIdx.x) % tiles;
+  const auto linear = tile * blockDim.x + threadIdx.x;
+  const auto ne = layout.output.electron_count;
+  const double* coordinates = positions + configuration * layout.position_configuration_stride;
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = active_electrons[configuration] >= ne ||
+        !device_math::isFiniteBinary64(same_spin_alpha) ||
+        !device_math::isFiniteBinary64(opposite_spin_alpha);
+  __syncthreads();
+  if (linear < cells)
+  {
+    terms[configuration * cells + linear] = 0.0;
+    const auto first = linear / ne, second = linear % ne;
+    if (first < second)
+    {
+      double radius_squared = 0.0;
+      bool finite_input = true;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double first_value = coordinates[first * layout.position_row_stride + dimension];
+        const double second_value = coordinates[second * layout.position_row_stride + dimension];
+        if (!device_math::isFiniteBinary64(first_value) || !device_math::isFiniteBinary64(second_value))
+          finite_input = false;
+        const double displacement = first_value - second_value;
+        radius_squared += displacement * displacement;
+      }
+      double radius = ::sqrt(radius_squared);
+      periodic_geometry::Pair pair;
+      if (!periodic_geometry::evaluatePair(cell,
+          coordinates + first * layout.position_row_stride,
+          coordinates + second * layout.position_row_stride, pair))
+        finite_input = false;
+      else
+        radius = pair.radius;
+      const bool same_spin = (first < layout.spin_up_count) == (second < layout.spin_up_count);
+      const double alpha = same_spin ? same_spin_alpha : opposite_spin_alpha;
+      const double factor = same_spin ? 0.25 : 0.5;
+      const double denominator = alpha + radius;
+      const double term = factor * alpha * alpha / denominator;
+      if (!finite_input || !device_math::isFiniteBinary64(term))
+        atomicOr(&failed, 1U);
+      else
+        terms[configuration * cells + linear] = term;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    flags[blockIdx.x] = failed;
+}
+
+/// A single ordered subtraction per configuration preserves every canonical rounding step.
+__global__ void periodicCuspValueTilesFinishKernel(OpenCuspJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const std::size_t* active_electrons, double same_spin_alpha,
+    double opposite_spin_alpha, std::size_t cells, std::size_t tiles,
+    const double* terms, const std::uint32_t* flags, double* output, OpenSpatialStatus* status)
+{
+  const auto configuration = std::size_t(blockIdx.x);
+  bool failed = false;
+  for (std::size_t tile = 0; tile < tiles; ++tile)
+    failed = failed || flags[configuration * tiles + tile];
+  open_spatial::clearConfiguration(layout.output, configuration, output);
+  double value = 0.0;
+  if (!failed)
+    for (std::size_t first = 0; first < layout.output.electron_count; ++first)
+      for (std::size_t second = first + 1; second < layout.output.electron_count; ++second)
+        value -= terms[configuration * cells + first * layout.output.electron_count + second];
+  if (failed || !device_math::isFiniteBinary64(value))
+    status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
+        layout, positions, configuration, active_electrons[configuration],
+        same_spin_alpha, opposite_spin_alpha, output, &cell);
+  else
+  {
+    output[layout.output.uncheckedValueOffset(configuration, 0)] = value;
+    status[configuration] = OpenSpatialStatus::REGULAR;
+  }
+}
+
 __global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
                                    const double* input,
                                    const double* bias,
@@ -1331,6 +1472,77 @@ Error launchPeriodicFeatureValuesCooperative(Stream stream, const OpenFeatureJet
   periodicFeatureValuesCooperativeKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
       spatial_block_size, 0, stream>>>(layout, cell, positions, nuclei, active_electrons,
           logical_elements, pairs, output, status);
+  return peekSpatialLaunchError();
+}
+
+
+/// Launch independent VALUE feature tiles and publish only after all tiles finish.
+Error launchPeriodicFeatureValuesTiled(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::uint32_t* flags, std::size_t flag_capacity,
+    double* output, OpenSpatialStatus* status)
+{
+  periodic_geometry::validateCell(cell);
+  validateOpenFeatureJetLayout(layout, true);
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64 ||
+      !layout.output.configuration_count || !positions || !nuclei || !active_electrons ||
+      !flags || !output || !status)
+    throw std::invalid_argument("Tiled periodic features require ordinary VALUE storage");
+  const auto pairs = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.nucleus_count, "Tiled periodic feature pair extent overflow");
+  const auto tiles = pairs / spatial_block_size + (pairs % spatial_block_size != 0);
+  const auto blocks = spatial_detail::checkedProduct(layout.output.configuration_count, tiles,
+      "Tiled periodic feature grid overflow");
+  if (flag_capacity < blocks)
+    throw std::length_error("Tiled periodic feature flags exceed admitted capacity");
+  if (blocks > std::size_t(std::numeric_limits<int>::max()) ||
+      layout.output.configuration_count > std::size_t(std::numeric_limits<int>::max()))
+    throw std::length_error("Tiled periodic feature grid exceeds portable dimension");
+  periodicFeatureValueTilesKernel<<<static_cast<unsigned int>(blocks), spatial_block_size, 0, stream>>>(
+      layout, cell, positions, nuclei, active_electrons, pairs, tiles, flags, output);
+  auto error = peekSpatialLaunchError();
+  if (error != success)
+    return error;
+  periodicFeatureValueTilesFinishKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      spatial_block_size, 0, stream>>>(layout, cell, positions, nuclei, active_electrons,
+          tiles, flags, output, status);
+  return peekSpatialLaunchError();
+}
+
+/// Build a global term tape, then retain the canonical per-configuration subtraction order.
+Error launchPeriodicCuspValuesTiled(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    double* terms, std::size_t term_capacity, std::uint32_t* flags, std::size_t flag_capacity,
+    double* output, OpenSpatialStatus* status)
+{
+  periodic_geometry::validateCell(cell);
+  validateOpenCuspJetLayout(layout);
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64 ||
+      !layout.output.configuration_count || !positions || !active_electrons || !terms ||
+      !flags || !output || !status)
+    throw std::invalid_argument("Tiled periodic cusp requires ordinary VALUE storage");
+  const auto cells = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.output.electron_count, "Tiled periodic cusp pair extent overflow");
+  const auto tiles = cells / spatial_block_size + (cells % spatial_block_size != 0);
+  const auto blocks = spatial_detail::checkedProduct(layout.output.configuration_count, tiles,
+      "Tiled periodic cusp grid overflow");
+  const auto count = spatial_detail::checkedProduct(layout.output.configuration_count, cells,
+      "Tiled periodic cusp tape extent overflow");
+  if (term_capacity < count || flag_capacity < blocks)
+    throw std::length_error("Tiled periodic cusp exceeds admitted tape capacity");
+  if (blocks > std::size_t(std::numeric_limits<int>::max()) ||
+      layout.output.configuration_count > std::size_t(std::numeric_limits<int>::max()))
+    throw std::length_error("Tiled periodic cusp grid exceeds portable dimension");
+  periodicCuspValueTilesKernel<<<static_cast<unsigned int>(blocks), spatial_block_size, 0, stream>>>(
+      layout, cell, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+      cells, tiles, terms, flags);
+  auto error = peekSpatialLaunchError();
+  if (error != success)
+    return error;
+  periodicCuspValueTilesFinishKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      1, 0, stream>>>(layout, cell, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+          cells, tiles, terms, flags, output, status);
   return peekSpatialLaunchError();
 }
 

@@ -35,6 +35,7 @@ struct ComplexValueCost
   std::size_t pair_event_bytes = 0;
   std::size_t envelope_anchor_bytes = 0, envelope_host_bytes = 0;
   std::size_t projection_pointer_bytes = 0;
+  PeriodicValueTilingCost periodic_geometry;
 };
 
 namespace complex_detail
@@ -89,7 +90,7 @@ inline bool configuredComplexValuePairCheck()
 /// Count an ordinary VALUE owner, including its admitted optional pair records.
 inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
                                                bool allow_pair_check = true, bool virtual_envelope_reuse = false,
-                                               bool batched_projection = false)
+                                               bool batched_projection = false, bool tiled_geometry = false)
 {
   auto cost = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto& e = plan.environment();
@@ -136,6 +137,18 @@ inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& p
     cost.device_bytes = add(cost.device_bytes, add(cost.envelope_anchor_bytes, add(rows, sizeof(std::uint64_t))));
     cost.host_bytes = add(cost.host_bytes, cost.envelope_host_bytes);
   }
+  if (tiled_geometry)
+  {
+    if (!allow_pair_check || n < 64 || e.periodic_profile || !e.fixed_nuclei ||
+        e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Tiled paired geometry requires ordinary legacy periodic FP64 VALUE");
+    cost.periodic_geometry = estimatePeriodicValueTilingCost(batch, n, plan.modelShape().nuclei);
+    cost.trunk_bytes = spatial_detail::checkedAdd(cost.trunk_bytes, cost.periodic_geometry.device_bytes,
+        "Tiled paired geometry trunk bytes overflow");
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, cost.periodic_geometry.device_bytes,
+        "Tiled paired geometry owner bytes overflow");
+  }
   return cost;
 }
 
@@ -173,14 +186,26 @@ public:
   /// Exact combined preflight precedes constructor/trunk/device allocation.
   static std::unique_ptr<PreparedDeviceComplexValue> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
-      std::size_t budget, bool virtual_envelope_reuse = false, bool batched_projection = false)
+      std::size_t budget, bool virtual_envelope_reuse = false, bool batched_projection = false,
+      bool tiled_geometry = false)
   {
     if (!image)
       throw std::invalid_argument("Complex VALUE requires a named paired image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse, batched_projection);
+    auto cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse,
+        batched_projection, tiled_geometry);
+    if (tiled_geometry && cost.device_bytes > budget)
+    {
+      cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse, batched_projection);
+      std::clog << "PsiFormer periodic VALUE geometry tiling: effective=0 reason=standalone_budget\n";
+    }
     if (cost.device_bytes > budget)
       throw std::length_error("Numerical complex VALUE exceeds its standalone owner budget");
+    if (cost.periodic_geometry.device_bytes)
+      std::clog << "PsiFormer periodic VALUE geometry tiling: effective=1 Ne="
+                << image->plan().modelShape().electrons() << " capacity=" << capacity
+                << " added_DEVICE_bytes=" << cost.periodic_geometry.device_bytes
+                << " added_HOST_numeric_bytes=0; before_allocation=yes; metadata_excluded=yes\n";
     if (cost.projection_pointer_bytes)
       std::clog << "  Paired head projection preparation: mode=VALUE selected=determinant_batched D="
                 << image->plan().modelShape().determinants << " capacity=" << capacity
@@ -222,6 +247,7 @@ public:
 
 private:
   friend class PreparedDeviceMixedComplexValue;
+  friend struct PeriodicValueTilingValidationAccess;
   /// The private mixed composition supplies a separately admitted pivot bank.
   void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots)
   {
@@ -634,6 +660,8 @@ private:
     if (cost.projection_pointer_bytes)
       for (auto& bank : projection_banks_)
         bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
+    if (cost.periodic_geometry.device_bytes)
+      trunk_->prepareTiledPeriodicValueGeometry(cost.periodic_geometry);
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +
         channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8 +

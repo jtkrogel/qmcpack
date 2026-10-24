@@ -16,9 +16,50 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
+#include <cstdint>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Capacity-owned VALUE geometry tape; feature/cusp stages reuse one flag bank.
+struct PeriodicValueTilingCost
+{
+  std::size_t term_elements = 0, flag_elements = 0, device_bytes = 0;
+};
+
+/// Check every optional scratch product before allocating or launching a tiled stage.
+inline PeriodicValueTilingCost estimatePeriodicValueTilingCost(
+    std::size_t batch, std::size_t electrons, std::size_t nuclei)
+{
+  if (!batch || !electrons || !nuclei)
+    throw std::invalid_argument("Periodic VALUE tiling requires positive extents");
+  const auto multiply = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Periodic VALUE tiling extent overflow");
+  };
+  const auto cells = multiply(electrons, electrons);
+  const auto pairs = multiply(electrons, nuclei);
+  const auto tiles = [](std::size_t count) { return count / 128 + (count % 128 != 0); };
+  const auto feature_tiles = tiles(pairs), cusp_tiles = tiles(cells);
+  PeriodicValueTilingCost cost;
+  cost.term_elements = multiply(batch, cells);
+  cost.flag_elements = multiply(batch, feature_tiles > cusp_tiles ? feature_tiles : cusp_tiles);
+  cost.device_bytes = spatial_detail::checkedAdd(multiply(cost.term_elements, sizeof(double)),
+      multiply(cost.flag_elements, sizeof(std::uint32_t)), "Periodic VALUE tiling bytes overflow");
+  return cost;
+}
+
+/// Pair-parallel VALUE writers followed by canonical finite/failure publication.
+Error launchPeriodicFeatureValuesTiled(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::uint32_t* flags, std::size_t flag_capacity,
+    double* output, OpenSpatialStatus* status);
+
+/// Global pair tape followed by the original ordered scalar subtraction, never a tree sum.
+Error launchPeriodicCuspValuesTiled(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    double* terms, std::size_t term_capacity, std::uint32_t* flags, std::size_t flag_capacity,
+    double* output, OpenSpatialStatus* status);
 
 /** Scatter one admitted local target root into separate complete VGL outputs.
  * Does not mark a request complete; the owner must admit all tiles first.

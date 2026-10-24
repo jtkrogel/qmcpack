@@ -31,6 +31,7 @@
 #include "PsiFormerDeviceTargetKineticValidation.h"
 #include "PsiFormerDeviceLazyVglValidation.h"
 #include "PsiFormerDevicePeriodicFeatureJetsValidation.h"
+#include "PsiFormerDevicePeriodicValueTilingValidation.h"
 #include "PsiFormerDeviceMixedPeriodicGeometryValidation.h"
 #include "PsiFormerDeviceRealEnvelopeValidation.h"
 #include "PsiFormerDeviceOrbitalProjectionValidation.h"
@@ -638,6 +639,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--real-virtual-envelope-only" &&
         std::string_view(argv[1]) != "--mixed-periodic-geometry-only" &&
         std::string_view(argv[1]) != "--periodic-feature-jets-only" &&
+        std::string_view(argv[1]) != "--periodic-value-tiling-only" &&
         std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
         std::string_view(argv[1]) != "--complex-spatial-target-only" &&
@@ -646,7 +648,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--paired-two-cell-only" && std::string_view(argv[1]) != "--complex-orbital-vjp-only" && std::string_view(argv[1]) != "--complex-lu-only" && std::string_view(argv[1]) != "--complex-lu-growth-only" &&
         std::string_view(argv[1]) != "--complex-roots-only" && std::string_view(argv[1]) != "--complex-roots-large-only"))
       throw std::invalid_argument("Usage: periodic_validation [--complex-target-factor-reuse-only|--complex-inverse-columns-only|--complex-mixed-value-only|--complex-mixed-full-only|--head-determinant-batch-only|--real-virtual-envelope-only|--mixed-periodic-geometry-only|--periodic-feature-jets-only|--complex-roots-only|--complex-roots-large-only|"
-          "--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-concurrent-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
+          "--periodic-value-tiling-only|--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-concurrent-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -675,6 +677,12 @@ int main(int argc, char** argv)
     {
       qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
       qmcplusplus::psiformer::device::MixedPeriodicGeometryValidationAccess::run(queue);
+    }
+    else if (argc == 2 && std::string_view(argv[1]) == "--periodic-value-tiling-only")
+    {
+      qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+      qmcplusplus::psiformer::device::validatePeriodicValueTiling(queue);
+      qmcplusplus::psiformer::device::PeriodicValueTilingValidationAccess::run(queue);
     }
     else if (argc == 2 && std::string_view(argv[1]) == "--periodic-feature-jets-only")
     {

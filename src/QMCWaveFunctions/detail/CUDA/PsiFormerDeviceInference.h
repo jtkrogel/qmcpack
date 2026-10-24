@@ -438,6 +438,17 @@ inline bool configuredPeriodicValueGeometryCooperative()
   throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_COOPERATIVE must be 0 or 1");
 }
 
+/// Parse the independent default-OFF ordinary VALUE tiling policy at cold preparation.
+inline bool configuredPeriodicValueGeometryTiled()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_TILED");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_TILED must be 0 or 1");
+}
+
 /// Freeze optional ordinary REAL request-local envelope reuse at backend preparation.
 inline bool configuredRealVirtualEnvelopeReuse()
 {
@@ -1459,7 +1470,12 @@ private:
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
     if (const auto* cell = model_->periodicCell())
     {
-      if (usesCooperativePeriodicValueGeometry())
+      if (usesTiledPeriodicValueGeometry())
+        checkRuntime(launchPeriodicFeatureValuesTiled(stream, features_, *cell, positions_.data(),
+            model_->nuclei(), active_.data(), periodic_value_tiling_->flags.data(),
+            periodic_value_tiling_->flags.capacity(), raw_.data(), open_status_.data()),
+            "model tiled periodic VALUE features");
+      else if (usesCooperativePeriodicValueGeometry())
         checkRuntime(launchPeriodicFeatureValuesCooperative(stream, features_, *cell, positions_.data(),
             model_->nuclei(), active_.data(), raw_.data(), open_status_.data()),
             "model cooperative periodic VALUE features");
@@ -1826,6 +1842,33 @@ public:
         environment.amplitude_scalar_domain == ScalarDomain::REAL &&
         environment.parameter_scalar_domain == ScalarDomain::REAL &&
         environment.compute_scalar_domain == ScalarDomain::REAL;
+  }
+
+  /// A costed ordinary owner may use its tape only outside every sticky mixed path.
+  bool usesTiledPeriodicValueGeometry() const noexcept
+  {
+    return periodic_value_tiling_ && !mixed_dense_ && !mixed_open_features_excluded_;
+  }
+
+  /// Allocate only an explicitly costed ordinary VALUE tape after baseline preparation.
+  void prepareTiledPeriodicValueGeometry(const PeriodicValueTilingCost& admitted)
+  {
+    const auto& e = plan_.environment();
+    if (mode_ != SpatialJetMode::VALUE_ONLY || ne_ < 64 || !value_tape_.empty() ||
+        retained_targets_ || target_preparation_.max_targets || kinetic_trunk_only_ ||
+        mixed_dense_ || mixed_open_features_excluded_ || !model_->periodicCell() ||
+        !e.fixed_nuclei || e.periodic_profile ||
+        e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !e.periodic_axes[0] || !e.periodic_axes[1] || !e.periodic_axes[2])
+      throw std::invalid_argument("Tiled periodic geometry rejects nonordinary VALUE ownership");
+    const auto expected = estimatePeriodicValueTilingCost(batch_capacity_, ne_, shape_.nuclei);
+    if (admitted.term_elements != expected.term_elements || admitted.flag_elements != expected.flag_elements ||
+        admitted.device_bytes != expected.device_bytes || periodic_value_tiling_)
+      throw std::invalid_argument("Tiled periodic geometry differs from its admitted capacity");
+    auto candidate = std::make_unique<PeriodicValueTilingScratch>();
+    candidate->terms.reserveNamed(admitted.term_elements, "Inference::periodic_value_terms_", __FILE__, __LINE__);
+    candidate->flags.reserveNamed(admitted.flag_elements, "Inference::periodic_value_flags_", __FILE__, __LINE__);
+    periodic_value_tiling_ = std::move(candidate);
   }
 
   /// Legacy-torus FP64 geometry precedes affine precision and is identical on mixed/replay graphs.
@@ -2219,6 +2262,11 @@ public:
     add(checkedDeviceBytes<InferenceStatusWord>(sticky_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
     if (parallel_traces_) add(parallel_traces_->deviceWorkspaceBytes());
+    if (periodic_value_tiling_)
+    {
+      add(checkedDeviceBytes<double>(periodic_value_tiling_->terms.capacity()));
+      add(checkedDeviceBytes<std::uint32_t>(periodic_value_tiling_->flags.capacity()));
+    }
     for (const auto& tape : value_tape_)
       add(tape->storageBytes());
     if (sparse_envelope_)
@@ -2370,7 +2418,13 @@ private:
     }
     if (const auto* cell = model_->periodicCell())
     {
-      if (usesCooperativePeriodicValueGeometry())
+      if (usesTiledPeriodicValueGeometry())
+        checkRuntime(launchPeriodicCuspValuesTiled(queue_.getNative(), cusp_, *cell, positions_.data(),
+            active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
+            periodic_value_tiling_->terms.data(), periodic_value_tiling_->terms.capacity(),
+            periodic_value_tiling_->flags.data(), periodic_value_tiling_->flags.capacity(),
+            cusp_jets_.data(), open_status_.data()), "model tiled periodic VALUE cusp");
+      else if (usesCooperativePeriodicValueGeometry())
         checkRuntime(launchPeriodicCuspValuesCooperative(queue_.getNative(), cusp_, *cell, positions_.data(),
             active_.data(), model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
             "model cooperative periodic VALUE cusp");
@@ -2626,6 +2680,13 @@ private:
     bool ready = false;
   };
   std::unique_ptr<SparseEnvelopeAnchor> sparse_envelope_;
+  /// Optional cold-owned tape; all stages overwrite their live prefix before consumption.
+  struct PeriodicValueTilingScratch
+  {
+    DeviceBuffer<double> terms;
+    DeviceBuffer<std::uint32_t> flags;
+  };
+  std::unique_ptr<PeriodicValueTilingScratch> periodic_value_tiling_;
   DeviceBuffer<double> full_phase_, full_output_, full_lap_ratio_;
   std::vector<double> tile_phase_, tile_log_, canonical_phase_, canonical_log_;
   std::vector<device_determinant::CombinationMetadata> host_combinations_;
