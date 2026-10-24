@@ -8,21 +8,52 @@
 #include "PsiFormerDeviceComplexValue.h"
 #include "PsiFormerDeviceComplexSpatialKernels.h"
 #include "PsiFormerDeviceComplexKineticKernels.h"
+#include <cstdlib>
+#include <string_view>
 
 namespace qmcplusplus::psiformer::device
 {
+/// Capture one strict cold factor policy; the original scalar route remains the default.
+inline bool configuredComplexKineticCooperativeLu()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_KINETIC_COOPERATIVE_LU");
+    if (!value || std::string_view(value) == "0")
+      return false;
+    if (std::string_view(value) == "1")
+      return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_KINETIC_COOPERATIVE_LU must be 0 or 1");
+  }();
+  return enabled;
+}
+
+/// Bound existing qualified factor composition to fixed legacy-torus paired FP64 owners.
+inline bool complexKineticCooperativeLuEligible(const PsiFormerExecutionPlan& plan)
+{
+  const auto& environment = plan.environment();
+  const auto& shape = plan.modelShape();
+  return environment.boundary == BoundaryCondition::PERIODIC && environment.fixed_nuclei &&
+      environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
+      environment.parameter_scalar_domain == ScalarDomain::REAL && environment.compute_scalar_domain == ScalarDomain::REAL &&
+      environment.amplitude_scalar_domain == ScalarDomain::COMPLEX &&
+      environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 && !environment.periodic_profile &&
+      environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2] &&
+      shape.electrons() >= 64 && shape.electrons() <= 300 && shape.determinants >= 1 && shape.determinants <= 16;
+}
+
 /// Standalone max-K numeric inventory; image/vendor/object metadata are excluded.
 struct ComplexKineticCost
 {
   KineticTrunkCost trunk;
   std::size_t device_bytes, host_bytes, canonical_bytes, matrix_work, matrices, head_elements;
   std::size_t private_features, private_parameters;
-  bool parallel_head;
+  bool parallel_head, cooperative_factor;
 };
 
 /// Exact combined preflight: one real trunk/P, max-K mixed jets and complexP.
 inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
-    bool parallel_requested = complexKineticHeadParallelRequested())
+    bool parallel_requested = complexKineticHeadParallelRequested(),
+    bool cooperative_requested = configuredComplexKineticCooperativeLu())
 {
   complex_detail::baseCost(plan, 1, SpatialJetMode::VALUE_ONLY);
   const auto t = estimateKineticTrunkCost(plan, targets);
@@ -50,7 +81,8 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   // Matrix-contraction sites only, not neural/head FLOPs or a throughput estimate.
   const auto work = add(mul(14, mul(d, mul(nn, nn))), mul(4, mul(d, mul(tiles, mul(nn, n)))));
   return {t, bytes, add(t.host_bytes, sizeof(ComplexValueResult)), mul(24, p), work, m, h,
-      private_features, private_parameters, parallel_head};
+      private_features, private_parameters, parallel_head,
+      cooperative_requested && complexKineticCooperativeLuEligible(plan)};
 }
 
 /** B1 numerical dK/d(real parameters), with learned paired-head complex phase.
@@ -74,16 +106,20 @@ public:
   static std::unique_ptr<PreparedDeviceComplexKinetic> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
       std::size_t budget, std::size_t matrix_work_budget,
-      bool parallel_requested = complexKineticHeadParallelRequested())
+      bool parallel_requested = complexKineticHeadParallelRequested(),
+      bool cooperative_requested = configuredComplexKineticCooperativeLu())
   {
     if (!image)
       throw std::invalid_argument("Complex kinetic requires a paired numerical image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested);
+    const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested, cooperative_requested);
     if (cost.device_bytes > budget || cost.matrix_work > matrix_work_budget)
       throw std::length_error("Complex kinetic exceeds its per-owner byte or matrix-work cap");
     return std::unique_ptr<PreparedDeviceComplexKinetic>(new PreparedDeviceComplexKinetic(image, targets, queue, blas, cost));
   }
+
+  /// Expose the admitted immutable factor policy without borrowing numeric results.
+  bool usesCooperativeFactorization() const { return cost_.cooperative_factor; }
 
   /// Reuse each immediate K tape for BOTH objectives before releasing its ticket.
   void evaluate(const std::vector<double>& positions, const std::vector<double>& inverse_masses,
@@ -177,6 +213,15 @@ private:
   {
     layout_.features = withSpatialTargetRange(layout_.features, 0, targets);
     layout_.orbitals = withSpatialTargetRange(layout_.orbitals, 0, targets);
+    // Plane zero is exactly the existing D*N*N VALUE provider bank. The rest of
+    // each max-K jet allocation remains untouched by factor restoration/replay.
+    const auto n = image_->plan().modelShape().electrons();
+    if (cost.cooperative_factor && (layout_.orbitals.element_count != cost.matrices ||
+        layout_.orbitals.plane_stride != cost.matrices || layout_.orbital_row_stride != n ||
+        layout_.orbital_determinant_stride != n * n ||
+        layout_.orbitals.configuration_stride != cost.head_elements ||
+        layout_.orbitals.plane_count * cost.matrices != cost.head_elements))
+      throw std::logic_error("Cooperative kinetic factor requires exact packed VALUE prefixes");
     // Prepared trunk feature planes are packed; generic padded leaves charge their own full span.
     if (cost.parallel_head && (layout_.feature_row_stride != image->plan().modelShape().feature_dimension ||
         layout_.features.element_count != image->plan().modelShape().electrons() * image->plan().modelShape().feature_dimension ||
@@ -269,8 +314,13 @@ private:
     checkRuntime(launchComplexSpatialHead(stream, layout_, envelope_.data(), projections_.data(),
         projections_.data() + cost_.head_elements, head_.data(), status_.data()), "complex kinetic paired head");
     admit();
-    checkRuntime(launchComplexValueFactor(stream, d, n, head_.data(), channels_.data(), status_.data(), inverse_.data(),
-        permutation_.data(), solve_.data()), "complex kinetic inverse");
+    if (cost_.cooperative_factor)
+      checkRuntime(launchComplexScoreCooperativeInverseColumns(stream, d, n, envelope_.data(), projections_.data(),
+          projections_.data() + cost_.head_elements, head_.data(), channels_.data(), status_.data(), inverse_.data(),
+          permutation_.data(), solve_.data()), "complex kinetic cooperative inverse");
+    else
+      checkRuntime(launchComplexValueFactor(stream, d, n, head_.data(), channels_.data(), status_.data(), inverse_.data(),
+          permutation_.data(), solve_.data()), "complex kinetic inverse");
     admit();
     checkRuntime(launchComplexValueReduce(stream, 1, d, n, shape.spin_up_electrons, *image_->periodicCell(), ticket.positions,
         channels_.data(), ticket.cusp_jets, amplitude_.data(), status_.data(), ticket.cusp.configuration_stride), "complex kinetic amplitude");

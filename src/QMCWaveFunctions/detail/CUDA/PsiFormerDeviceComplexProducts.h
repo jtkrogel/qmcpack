@@ -969,7 +969,7 @@ private:
         score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
         kinetic_(cost.scope == ComplexProductsScope::COMPLETE ? PreparedDeviceComplexKinetic::prepare(
             image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work,
-            cost.kinetic.parallel_head) : nullptr),
+            cost.kinetic.parallel_head, cost.kinetic.cooperative_factor) : nullptr),
         accumulated_(cost.channels * cost.parameters, "ComplexProducts::accumulated_", __FILE__, __LINE__),
         status_(cost.statuses, "ComplexProducts::status_", __FILE__, __LINE__),
         host_status_(cost.statuses),

@@ -128,7 +128,7 @@ inline void validateComplexKineticHeadParallel()
 }
 
 /// Exercise complete dK/dP ownership, exact preallocation rejection, warm reuse and same-family rebind.
-inline void validateComplexKineticHeadOwner(std::size_t targets = 3)
+inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualify_factor = false)
 {
   const auto metadata = makeTargetCostPlan(64, true, true);
   // The versioned initializer remains fixed at its production architecture.
@@ -182,13 +182,70 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3)
   checkRuntime(cudaGetDevice(&device), "parallel kinetic owner device");
 #endif
   auto& metrics = deviceMemoryMetrics(device);
-  const auto off = estimateComplexKineticCost(plan, targets, false), on = estimateComplexKineticCost(plan, targets, true);
+  const auto off = estimateComplexKineticCost(plan, targets, qualify_factor, false);
+  const auto on = estimateComplexKineticCost(plan, targets, true, qualify_factor);
+  if (qualify_factor)
+  {
+    if (off.device_bytes != on.device_bytes || off.host_bytes != on.host_bytes ||
+        off.canonical_bytes != on.canonical_bytes || off.matrix_work != on.matrix_work ||
+        off.cooperative_factor || !on.cooperative_factor)
+      throw std::runtime_error("Kinetic factor composition changed its exact zero-storage cost");
+    const auto selected = estimateComplexKineticCost(plan, targets, true);
+    auto selected_owner = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
+        selected.device_bytes, selected.matrix_work, true);
+    if (selected_owner->usesCooperativeFactorization() != configuredComplexKineticCooperativeLu())
+      throw std::runtime_error("Kinetic factor cold selection did not reach the actual owner");
+    for (const auto n : {63, 64, 300, 301})
+      if (complexKineticCooperativeLuEligible(makeTargetCostPlan(n, true, true)) != (n >= 64 && n <= 300))
+        throw std::runtime_error("Kinetic factor electron range differs from qualification");
+    if (complexKineticCooperativeLuEligible(makeTargetCostPlan(64, false)) ||
+        complexKineticCooperativeLuEligible(makeTargetCostPlan(64, true)))
+      throw std::runtime_error("Kinetic factor admitted open/real metadata");
+    const auto layouts_for = [&](std::size_t determinants) {
+      std::vector<ParameterLayoutInput> result;
+      std::size_t begin = 0;
+      for (const auto& tensor : plan.parameterTensors())
+      {
+        auto dimensions = tensor.shape;
+        if (tensor.role == ParameterRole::ENVELOPE_PI_UP || tensor.role == ParameterRole::ENVELOPE_PI_DOWN ||
+            tensor.role == ParameterRole::ENVELOPE_ZETA_UP || tensor.role == ParameterRole::ENVELOPE_ZETA_DOWN)
+          dimensions[0] = determinants * 64;
+        if (tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT || tensor.role == ParameterRole::BACKFLOW_DOWN_WEIGHT)
+          dimensions[1] = determinants * 64;
+        std::size_t count = 1;
+        for (auto dimension : dimensions)
+          count = spatial_detail::checkedProduct(count, dimension, "Kinetic factor metadata test overflow");
+        result.push_back({tensor.module, tensor.name, dimensions, begin, begin + count});
+        begin += count;
+      }
+      return result;
+    };
+    auto d17 = plan.modelShape();
+    d17.determinants = 17;
+    if (complexKineticCooperativeLuEligible(PsiFormerExecutionPlan(d17, layouts_for(17), plan.environment())))
+      throw std::runtime_error("Kinetic factor admitted D17 metadata");
+    for (bool partial_axes : {false, true})
+    {
+      auto environment = plan.environment();
+      if (partial_axes)
+        environment.periodic_axes[2] = false;
+      else
+        environment.fixed_nuclei = false;
+      try
+      {
+        const PsiFormerExecutionPlan excluded(plan.modelShape(), layouts_for(shape.determinants), environment);
+        if (complexKineticCooperativeLuEligible(excluded))
+          throw std::runtime_error("Kinetic factor admitted moving nuclei/partial periodic axes");
+      }
+      catch (const std::invalid_argument&) {}
+    }
+  }
   for (const auto cost : {off, on})
   {
     const auto before = metrics.snapshot();
     bool rejected = false;
     try { (void)PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas, cost.device_bytes - 1,
-        cost.matrix_work, cost.parallel_head); }
+        cost.matrix_work, cost.parallel_head, cost.cooperative_factor); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
       throw std::runtime_error("Parallel kinetic owner byte-minus-one allocated");
@@ -204,11 +261,16 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3)
     throw std::runtime_error("Parallel kinetic enclosing admission allocated below exact cost");
   const auto selective = estimateComplexProductsCost(plan, targets, 1, 1, plan.parameterCount(),
       ComplexProductsHostOutput::RETAINED, ComplexProductsScope::SCORE_ECP_ONLY);
-  if (selective.kinetic.device_bytes || selective.kinetic.private_features || selective.kinetic.private_parameters)
+  if (selective.kinetic.device_bytes || selective.kinetic.private_features || selective.kinetic.private_parameters ||
+      selective.kinetic.cooperative_factor)
     throw std::runtime_error("Selective score owner charged kinetic scratch");
   const auto before = metrics.snapshot();
-  auto scalar = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas, off.device_bytes, off.matrix_work, false);
-  auto parallel = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas, on.device_bytes, on.matrix_work, true);
+  auto scalar = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
+      off.device_bytes, off.matrix_work, off.parallel_head, false);
+  auto parallel = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
+      on.device_bytes, on.matrix_work, on.parallel_head, on.cooperative_factor);
+  if (scalar->usesCooperativeFactorization() || parallel->usesCooperativeFactorization() != qualify_factor)
+    throw std::runtime_error("Kinetic owner did not retain its explicit factor policies");
   if (metrics.snapshot().live_bytes - before.live_bytes != off.device_bytes + on.device_bytes)
     throw std::runtime_error("Parallel kinetic actual owner bytes differ");
   const auto compare = [&] {
@@ -246,6 +308,57 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3)
   catch (const std::invalid_argument&) { stale_rejected = true; }
   if (!stale_rejected) throw std::runtime_error("Parallel kinetic rebind preserved stale authority");
   compare();
+  if (qualify_factor)
+  {
+    auto invalid = positions;
+    invalid.back() = std::numeric_limits<double>::quiet_NaN();
+    bool rejected = false;
+    try { parallel->evaluate(invalid, masses, kappa); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected)
+      throw std::runtime_error("Kinetic factor accepted a nonfinite request");
+    rejected = false;
+    try { (void)parallel->resultView(); }
+    catch (const std::logic_error&) { rejected = true; }
+    if (!rejected)
+      throw std::runtime_error("Kinetic factor failed request retained publication authority");
+    // Zero BOTH components of every up-spin projection: each determinant has
+    // exact zero rows, forcing canonical singular-factor rejection before roots.
+    for (auto component : {HeadTensorComponent::REAL, HeadTensorComponent::IMAG})
+    {
+      const auto& interval = plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK, component);
+      std::fill(values.begin() + interval.begin, values.begin() + interval.end, 0.0);
+    }
+    auto singular = successor->makeUpdatedImage(values, 2);
+    scalar->rebindModel(singular);
+    parallel->rebindModel(singular);
+    std::string canonical_failure;
+    for (auto* owner : {scalar.get(), parallel.get()})
+    {
+      bool failed = false;
+      try { owner->evaluate(positions, masses, kappa); }
+      catch (const std::runtime_error& error)
+      {
+        if (canonical_failure.empty())
+          canonical_failure = error.what();
+        else if (canonical_failure != error.what())
+          throw std::runtime_error("Kinetic factor changed canonical singular failure status");
+        failed = true;
+      }
+      if (!failed || canonical_failure.find("finite/inverse admission failed") == std::string::npos)
+        throw std::runtime_error("Kinetic factor did not reject a singular inverse canonically");
+      failed = false;
+      try { (void)owner->resultView(); }
+      catch (const std::logic_error&) { failed = true; }
+      if (!failed)
+        throw std::runtime_error("Kinetic singular factor published a partial derivative");
+    }
+    std::cout << "PASS kinetic_factor_owner Ne=64 D=2 F=32 K=" << targets
+              << " complete_dK_dP_energy_amplitude_bits=exact changed_weight_rebind=exact stale_rejected=1"
+                 " singular_status=canonical nonfinite_publication=rejected warm_allocations=0 minus_one=1"
+                 " extra_device_bytes=0 selected=" << configuredComplexKineticCooperativeLu() << '\n';
+    return;
+  }
   std::cout << "PASS parallel kinetic owner Ne=64 D=2 F=32 K=" << targets << " complete_dK_dP_energy_amplitude_bits=exact"
                " same_family_changed_weight_rebind=exact stale_view=rejected warm_allocations=0 byte_minus_one=preallocation\n";
 }
