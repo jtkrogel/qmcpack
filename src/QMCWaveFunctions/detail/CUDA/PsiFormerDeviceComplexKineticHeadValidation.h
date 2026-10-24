@@ -128,7 +128,8 @@ inline void validateComplexKineticHeadParallel()
 }
 
 /// Exercise complete dK/dP ownership, exact preallocation rejection, warm reuse and same-family rebind.
-inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualify_factor = false)
+inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualify_factor = false,
+    bool qualify_roots = false)
 {
   const auto metadata = makeTargetCostPlan(64, true, true);
   // The versioned initializer remains fixed at its production architecture.
@@ -182,13 +183,32 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
   checkRuntime(cudaGetDevice(&device), "parallel kinetic owner device");
 #endif
   auto& metrics = deviceMemoryMetrics(device);
-  const auto off = estimateComplexKineticCost(plan, targets, qualify_factor, false);
-  const auto on = estimateComplexKineticCost(plan, targets, true, qualify_factor);
-  if (qualify_factor)
+  const auto off = estimateComplexKineticCost(plan, targets, qualify_factor || qualify_roots, qualify_roots, false);
+  const auto on = estimateComplexKineticCost(plan, targets, true, qualify_factor || qualify_roots, qualify_roots);
+  if (qualify_roots)
   {
-    if (off.device_bytes != on.device_bytes || off.host_bytes != on.host_bytes ||
+    const auto expected = 48 * (shape.determinants - 1) * shape.electrons() * shape.electrons() + 8;
+    if (on.device_bytes - off.device_bytes != expected || on.host_bytes != off.host_bytes ||
+        on.matrix_work != off.matrix_work || off.channel_roots || !on.channel_roots ||
+        off.root_scratch != 3 * 64 * 64 || on.root_scratch != 3 * 2 * 64 * 64)
+      throw std::runtime_error("Channel kinetic exact scratch/private-flag cost differs");
+    const auto selected = estimateComplexKineticCost(plan, targets, true, true);
+    auto selected_owner = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
+        selected.device_bytes, selected.matrix_work, true, true);
+    if (selected_owner->usesChannelRoots() != configuredComplexKineticChannelRoots())
+      throw std::runtime_error("Channel kinetic cold selection did not reach the actual owner");
+    for (const auto n : {63, 64, 300, 301})
+    {
+      const auto excluded = makeTargetCostPlan(n, true, true);
+      if (estimateComplexKineticCost(excluded, 1, true, true, true).channel_roots != (n >= 64 && n <= 300))
+        throw std::runtime_error("Channel kinetic electron eligibility differs");
+    }
+  }
+  if (qualify_factor || qualify_roots)
+  {
+    if (qualify_factor && (off.device_bytes != on.device_bytes || off.host_bytes != on.host_bytes ||
         off.canonical_bytes != on.canonical_bytes || off.matrix_work != on.matrix_work ||
-        off.cooperative_factor || !on.cooperative_factor)
+        off.cooperative_factor || !on.cooperative_factor))
       throw std::runtime_error("Kinetic factor composition changed its exact zero-storage cost");
     const auto selected = estimateComplexKineticCost(plan, targets, true);
     auto selected_owner = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
@@ -224,6 +244,15 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
     d17.determinants = 17;
     if (complexKineticCooperativeLuEligible(PsiFormerExecutionPlan(d17, layouts_for(17), plan.environment())))
       throw std::runtime_error("Kinetic factor admitted D17 metadata");
+    if (qualify_roots)
+      for (const auto determinants : {std::size_t(1), std::size_t(17)})
+      {
+        auto shape = plan.modelShape();
+        shape.determinants = determinants;
+        const PsiFormerExecutionPlan excluded(shape, layouts_for(determinants), plan.environment());
+        if (estimateComplexKineticCost(excluded, 1, true, true, true).channel_roots)
+          throw std::runtime_error("Channel kinetic admitted D1/D17 metadata");
+      }
     for (bool partial_axes : {false, true})
     {
       auto environment = plan.environment();
@@ -245,7 +274,7 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
     const auto before = metrics.snapshot();
     bool rejected = false;
     try { (void)PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas, cost.device_bytes - 1,
-        cost.matrix_work, cost.parallel_head, cost.cooperative_factor); }
+        cost.matrix_work, cost.parallel_head, cost.cooperative_factor, cost.channel_roots); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
       throw std::runtime_error("Parallel kinetic owner byte-minus-one allocated");
@@ -262,14 +291,16 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
   const auto selective = estimateComplexProductsCost(plan, targets, 1, 1, plan.parameterCount(),
       ComplexProductsHostOutput::RETAINED, ComplexProductsScope::SCORE_ECP_ONLY);
   if (selective.kinetic.device_bytes || selective.kinetic.private_features || selective.kinetic.private_parameters ||
-      selective.kinetic.cooperative_factor)
+      selective.kinetic.cooperative_factor || selective.kinetic.channel_roots || selective.kinetic.root_scratch)
     throw std::runtime_error("Selective score owner charged kinetic scratch");
   const auto before = metrics.snapshot();
   auto scalar = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
-      off.device_bytes, off.matrix_work, off.parallel_head, false);
+      off.device_bytes, off.matrix_work, off.parallel_head, off.cooperative_factor, off.channel_roots);
   auto parallel = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
-      on.device_bytes, on.matrix_work, on.parallel_head, on.cooperative_factor);
-  if (scalar->usesCooperativeFactorization() || parallel->usesCooperativeFactorization() != qualify_factor)
+      on.device_bytes, on.matrix_work, on.parallel_head, on.cooperative_factor, on.channel_roots);
+  if (scalar->usesCooperativeFactorization() != off.cooperative_factor ||
+      parallel->usesCooperativeFactorization() != on.cooperative_factor ||
+      scalar->usesChannelRoots() || parallel->usesChannelRoots() != qualify_roots)
     throw std::runtime_error("Kinetic owner did not retain its explicit factor policies");
   if (metrics.snapshot().live_bytes - before.live_bytes != off.device_bytes + on.device_bytes)
     throw std::runtime_error("Parallel kinetic actual owner bytes differ");
@@ -308,7 +339,7 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
   catch (const std::invalid_argument&) { stale_rejected = true; }
   if (!stale_rejected) throw std::runtime_error("Parallel kinetic rebind preserved stale authority");
   compare();
-  if (qualify_factor)
+  if (qualify_factor || qualify_roots)
   {
     auto invalid = positions;
     invalid.back() = std::numeric_limits<double>::quiet_NaN();
@@ -353,10 +384,12 @@ inline void validateComplexKineticHeadOwner(std::size_t targets = 3, bool qualif
       if (!failed)
         throw std::runtime_error("Kinetic singular factor published a partial derivative");
     }
-    std::cout << "PASS kinetic_factor_owner Ne=64 D=2 F=32 K=" << targets
+    std::cout << (qualify_roots ? "PASS kinetic_channel_roots_owner Ne=64 D=2 F=32 K=" :
+                                "PASS kinetic_factor_owner Ne=64 D=2 F=32 K=") << targets
               << " complete_dK_dP_energy_amplitude_bits=exact changed_weight_rebind=exact stale_rejected=1"
                  " singular_status=canonical nonfinite_publication=rejected warm_allocations=0 minus_one=1"
-                 " extra_device_bytes=0 selected=" << configuredComplexKineticCooperativeLu() << '\n';
+                 " extra_device_bytes=" << on.device_bytes - off.device_bytes << " selected="
+              << (qualify_roots ? configuredComplexKineticChannelRoots() : configuredComplexKineticCooperativeLu()) << '\n';
     return;
   }
   std::cout << "PASS parallel kinetic owner Ne=64 D=2 F=32 K=" << targets << " complete_dK_dP_energy_amplitude_bits=exact"

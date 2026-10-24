@@ -7,6 +7,149 @@
 #include "PsiFormerDeviceComplexKineticKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexOrbital.h"
+#include <array>
+#include <cstdlib>
+#include <string_view>
+#include <type_traits>
+
+/// Compare channel ownership with the existing cooperative leaf, including canonical failure prefixes.
+inline void validateComplexKineticChannelRoots()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  const char* cooperative = std::getenv("PSIFORMER_GPU_COOPERATIVE_COMPLEX_KINETIC_ROOTS");
+  if (!cooperative || std::string_view(cooperative) != "1")
+    throw std::invalid_argument("Channel root oracle requires explicit cooperative matrix roots=1");
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  const auto clear = std::numeric_limits<std::uint64_t>::max();
+  std::size_t comparisons = 0;
+  // Cheap matrix-only cases, not a large-N neural architecture cross-product.
+  for (const auto descriptor : {std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
+  {
+    const auto n = descriptor[0], d = descriptor[1], k = descriptor[2], nn = n * n, m = d * nn;
+    auto layout = makeOpenOrbitalJetLayout(1, d, n, 1, 3, n / 2, SpatialJetMode::FULL_VGL);
+    layout.features = withSpatialTargetRange(layout.features, n - k, k);
+    layout.orbitals = withSpatialTargetRange(layout.orbitals, n - k, k);
+    const auto elements = layout.orbitals.plane_count * m;
+    std::vector<cuDoubleComplex> inverse(m), head(elements), gradient(3 * k), laplacian(k), qg(3 * k), ql(k);
+    std::vector<cuDoubleComplex> initial(elements), a(elements), b(elements);
+    std::vector<ComplexValueChannel> records(d);
+    DeviceBuffer<cuDoubleComplex> di(m), dh(elements), dg(3 * k), dl(k), dqg(3 * k), dql(k);
+    DeviceBuffer<cuDoubleComplex> old_out(elements), new_out(elements), old_work(3 * nn), new_work(3 * m);
+    DeviceBuffer<ComplexValueChannel> dc(d);
+    DeviceBuffer<ComplexValueResult> amplitude(1);
+    DeviceBuffer<std::uint64_t> old_status(1), new_status(1), private_failure(1);
+    for (std::size_t variant = 0; variant < 13; ++variant)
+    {
+      std::fill(inverse.begin(), inverse.end(), make_cuDoubleComplex(0, 0));
+      std::fill(head.begin(), head.end(), make_cuDoubleComplex(0, 0));
+      std::fill(gradient.begin(), gradient.end(), make_cuDoubleComplex(0, 0));
+      std::fill(laplacian.begin(), laplacian.end(), make_cuDoubleComplex(0, 0));
+      for (std::size_t channel = 0; channel < d; ++channel)
+      {
+        records[channel] = {make_cuDoubleComplex(1, 0), 0, 0};
+        for (std::size_t i = 0; i < n; ++i)
+        {
+          inverse[channel * nn + i * n + i] = make_cuDoubleComplex(1, 0);
+          for (std::size_t plane = 1; plane < layout.orbitals.plane_count; ++plane)
+            head[plane * m + channel * nn + i * n + i] =
+                make_cuDoubleComplex(0.001 * (i + 1), variant == 1 ? -0.0003 * (plane + 1) : 0);
+        }
+      }
+      std::fill(qg.begin(), qg.end(), make_cuDoubleComplex(0.25, -0.125));
+      std::fill(ql.begin(), ql.end(), make_cuDoubleComplex(-0.5, 0.125));
+      ComplexValueResult result{make_cuDoubleComplex(1, 0), std::log(double(d)), 1, 0, 0};
+      if (variant == 2)
+        records.back().log_abs = -740;
+      if (variant == 3)
+        result.phase = make_cuDoubleComplex(0, 0);
+      if (variant == 4)
+        for (std::size_t channel = 0; channel < d; ++channel)
+          records[channel].phase = make_cuDoubleComplex(channel % 2 ? -1 : 1, 0);
+      if (variant == 5)
+        inverse.back() = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0);
+      if (variant == 6 || variant == 8 || variant == 11)
+      {
+        const auto plane = variant == 8 ? 2 : variant == 11 ? 3 : 1;
+        head[plane * m + (d - 1) * nn] = make_cuDoubleComplex(1e200, 0);
+      }
+      if (variant == 12)
+        records.back().status = 1;
+      const std::uint64_t incoming = variant == 10 || variant == 11 ? 0 : variant == 7 || variant == 8 ? 7 : clear;
+      for (std::size_t i = 0; i < elements; ++i)
+        initial[i] = make_cuDoubleComplex(i % 2 ? -0.0 : 0.125, -0.25);
+      di.upload(inverse.data(), m); dh.upload(head.data(), elements);
+      dg.upload(gradient.data(), gradient.size()); dl.upload(laplacian.data(), k);
+      dqg.upload(qg.data(), qg.size()); dql.upload(ql.data(), k);
+      dc.upload(records.data(), d); amplitude.upload(&result, 1);
+      old_out.upload(initial.data(), elements); new_out.upload(initial.data(), elements);
+      old_status.upload(&incoming, 1); new_status.upload(&incoming, 1);
+      checkRuntime(launchComplexKineticMatrixRoots(queue.getNative(), layout, dc.data(), amplitude.data(), di.data(),
+          dh.data(), dg.data(), dl.data(), dqg.data(), dql.data(), old_out.data(), old_work.data(), old_status.data()),
+          "canonical cooperative root oracle");
+      checkRuntime(launchComplexKineticChannelRoots(queue.getNative(), layout, dc.data(), amplitude.data(), di.data(),
+          dh.data(), dg.data(), dl.data(), dqg.data(), dql.data(), new_out.data(), new_work.data(), new_work.capacity(),
+          new_status.data(), private_failure.data()), "channel root candidate");
+      queue.sync();
+      std::uint64_t sa, sb;
+      old_status.download(&sa, 1); new_status.download(&sb, 1);
+      old_out.download(a.data(), elements); new_out.download(b.data(), elements);
+      if (sa != sb || std::memcmp(a.data(), b.data(), elements * sizeof(a[0])))
+        throw std::runtime_error("Channel roots changed output/status/failure-prefix bits variant=" + std::to_string(variant));
+      if ((variant == 0 || variant == 1 || variant == 7 || variant == 9 || variant == 10) && sa != incoming)
+        throw std::runtime_error("Channel roots valid fixture rejected");
+      if (((variant >= 3 && variant <= 6) || variant == 8 || variant == 11 || variant == 12) &&
+          sa != std::min(incoming, std::uint64_t(1)))
+        throw std::runtime_error("Channel roots failure fixture did not reject canonically");
+      const auto unchanged = [&](auto& buffer, const auto& expected) {
+        using T = typename std::decay_t<decltype(expected)>::value_type;
+        std::vector<T> actual(expected.size());
+        buffer.download(actual.data(), actual.size());
+        if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(T)))
+          throw std::runtime_error("Channel roots mutated an immutable input");
+      };
+      unchanged(di, inverse); unchanged(dh, head); unchanged(dg, gradient); unchanged(dl, laplacian);
+      unchanged(dqg, qg); unchanged(dql, ql); unchanged(dc, records);
+      ComplexValueResult result_after;
+      amplitude.download(&result_after, 1);
+      if (std::memcmp(&result_after, &result, sizeof(result)))
+        throw std::runtime_error("Channel roots mutated amplitude metadata");
+      ++comparisons;
+    }
+    // All invalid calls stop before memset/launch, including partial byte-span aliases.
+    const auto invoke = [&](OpenOrbitalJetLayout selected, cuDoubleComplex* work, std::size_t capacity,
+                            std::uint64_t* failure) {
+      return launchComplexKineticChannelRoots(queue.getNative(), selected, dc.data(), amplitude.data(), di.data(),
+          dh.data(), dg.data(), dl.data(), dqg.data(), dql.data(), new_out.data(), work, capacity,
+          new_status.data(), failure);
+    };
+    for (std::size_t guard = 0; guard < 4; ++guard)
+    {
+      bool rejected = false;
+      try
+      {
+        (void)invoke(layout, guard == 1 ? nullptr : guard == 2 ? di.data() + 1 : new_work.data(),
+            guard == 0 ? new_work.capacity() - 1 : new_work.capacity(),
+            guard == 3 ? new_status.data() : private_failure.data());
+      }
+      catch (const std::logic_error&) { rejected = true; }
+      if (!rejected)
+        throw std::runtime_error("Channel roots invalid scratch/alias admission launched");
+    }
+    for (const auto unsupported_shape : {std::array<std::size_t, 2>{63, d}, {301, d}, {n, 1}, {n, 17}})
+    {
+      const auto unsupported = makeOpenOrbitalJetLayout(1, unsupported_shape[1], unsupported_shape[0], 1, 3,
+          unsupported_shape[0] / 2, SpatialJetMode::FULL_VGL);
+      bool rejected = false;
+      try { (void)invoke(unsupported, new_work.data(), new_work.capacity(), private_failure.data()); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      if (!rejected)
+        throw std::runtime_error("Channel root primitive admitted unsupported Ne/D");
+    }
+  }
+  std::cout << "PASS kinetic_channel_roots comparisons=" << comparisons
+            << " complete_output_status_bits=exact failure_prefix=exact inputs_unchanged=1 private_reset=per_call guards=8\n";
+}
 
 /// Independent CPU Wide root oracle and paired-head FD, never a numerical GPU fallback.
 void validateComplexKineticLeaves()

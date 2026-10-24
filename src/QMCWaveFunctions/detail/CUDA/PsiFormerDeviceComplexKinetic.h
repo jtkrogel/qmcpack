@@ -27,6 +27,20 @@ inline bool configuredComplexKineticCooperativeLu()
   return enabled;
 }
 
+/// Capture the channel-workspace policy before enclosing allocation admission.
+inline bool configuredComplexKineticChannelRoots()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_KINETIC_CHANNEL_ROOTS");
+    if (!value || std::string_view(value) == "0")
+      return false;
+    if (std::string_view(value) == "1")
+      return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_KINETIC_CHANNEL_ROOTS must be 0 or 1");
+  }();
+  return enabled;
+}
+
 /// Bound existing qualified factor composition to fixed legacy-torus paired FP64 owners.
 inline bool complexKineticCooperativeLuEligible(const PsiFormerExecutionPlan& plan)
 {
@@ -46,14 +60,15 @@ struct ComplexKineticCost
 {
   KineticTrunkCost trunk;
   std::size_t device_bytes, host_bytes, canonical_bytes, matrix_work, matrices, head_elements;
-  std::size_t private_features, private_parameters;
-  bool parallel_head, cooperative_factor;
+  std::size_t private_features, private_parameters, root_scratch;
+  bool parallel_head, cooperative_factor, channel_roots;
 };
 
 /// Exact combined preflight: one real trunk/P, max-K mixed jets and complexP.
 inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
     bool parallel_requested = complexKineticHeadParallelRequested(),
-    bool cooperative_requested = configuredComplexKineticCooperativeLu())
+    bool cooperative_requested = configuredComplexKineticCooperativeLu(),
+    bool channel_roots_requested = configuredComplexKineticChannelRoots())
 {
   complex_detail::baseCost(plan, 1, SpatialJetMode::VALUE_ONLY);
   const auto t = estimateKineticTrunkCost(plan, targets);
@@ -62,12 +77,16 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   const auto& s = plan.modelShape();
   const auto n = s.electrons(), d = s.determinants, p = plan.parameterCount(), nn = mul(n, n);
   const auto m = mul(d, nn), h = mul(add(1, mul(4, targets)), m), tiles = n / targets + (n % targets != 0);
+  const bool channel_roots = channel_roots_requested && d >= 2 && complexKineticCooperativeLuEligible(plan);
+  const auto root_scratch = mul(3, channel_roots ? m : nn);
   const auto largest = std::max(h, p);
   if (largest - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8) ||
       (largest - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
     throw std::overflow_error("Complex kinetic launch/status extent exceeds admission");
   auto bytes = add(t.device_bytes, add(mul(56, h), mul(16, m)));
-  bytes = add(bytes, add(mul(16 + sizeof(std::size_t), mul(d, n)), mul(48, nn)));
+  bytes = add(bytes, add(mul(16 + sizeof(std::size_t), mul(d, n)), mul(sizeof(cuDoubleComplex), root_scratch)));
+  if (channel_roots)
+    bytes = add(bytes, sizeof(std::uint64_t));
   bytes = add(bytes, add(mul(144, targets), add(mul(16, p), add(mul(8, n), add(mul(32, d), 96)))));
   // Only ordinary fixed legacy-torus FP64 owners enter this independent-output route.
   const auto& environment = plan.environment();
@@ -81,8 +100,8 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   // Matrix-contraction sites only, not neural/head FLOPs or a throughput estimate.
   const auto work = add(mul(14, mul(d, mul(nn, nn))), mul(4, mul(d, mul(tiles, mul(nn, n)))));
   return {t, bytes, add(t.host_bytes, sizeof(ComplexValueResult)), mul(24, p), work, m, h,
-      private_features, private_parameters, parallel_head,
-      cooperative_requested && complexKineticCooperativeLuEligible(plan)};
+      private_features, private_parameters, root_scratch, parallel_head,
+      cooperative_requested && complexKineticCooperativeLuEligible(plan), channel_roots};
 }
 
 /** B1 numerical dK/d(real parameters), with learned paired-head complex phase.
@@ -107,12 +126,14 @@ public:
       std::size_t targets, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
       std::size_t budget, std::size_t matrix_work_budget,
       bool parallel_requested = complexKineticHeadParallelRequested(),
-      bool cooperative_requested = configuredComplexKineticCooperativeLu())
+      bool cooperative_requested = configuredComplexKineticCooperativeLu(),
+      bool channel_roots_requested = configuredComplexKineticChannelRoots())
   {
     if (!image)
       throw std::invalid_argument("Complex kinetic requires a paired numerical image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested, cooperative_requested);
+    const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested, cooperative_requested,
+        channel_roots_requested);
     if (cost.device_bytes > budget || cost.matrix_work > matrix_work_budget)
       throw std::length_error("Complex kinetic exceeds its per-owner byte or matrix-work cap");
     return std::unique_ptr<PreparedDeviceComplexKinetic>(new PreparedDeviceComplexKinetic(image, targets, queue, blas, cost));
@@ -120,6 +141,9 @@ public:
 
   /// Expose the admitted immutable factor policy without borrowing numeric results.
   bool usesCooperativeFactorization() const { return cost_.cooperative_factor; }
+
+  /// Expose the frozen channel policy without lending its private workspace.
+  bool usesChannelRoots() const { return cost_.channel_roots; }
 
   /// Reuse each immediate K tape for BOTH objectives before releasing its ticket.
   void evaluate(const std::vector<double>& positions, const std::vector<double>& inverse_masses,
@@ -196,7 +220,7 @@ private:
         roots_(cost.head_elements, "ComplexKinetic::roots_", __FILE__, __LINE__),
         inverse_(cost.matrices, "ComplexKinetic::inverse_", __FILE__, __LINE__),
         solve_(image->plan().modelShape().determinants * image->plan().modelShape().electrons(), "ComplexKinetic::solve_", __FILE__, __LINE__),
-        scratch_(3 * image->plan().modelShape().electrons() * image->plan().modelShape().electrons(), "ComplexKinetic::scratch_", __FILE__, __LINE__),
+        scratch_(cost.root_scratch, "ComplexKinetic::scratch_", __FILE__, __LINE__),
         outputs_(5 * targets, "ComplexKinetic::outputs_", __FILE__, __LINE__),
         coefficients_(4 * targets, "ComplexKinetic::coefficients_", __FILE__, __LINE__),
         response_(image->plan().parameterCount(), "ComplexKinetic::response_", __FILE__, __LINE__),
@@ -209,7 +233,8 @@ private:
         status_(1, "ComplexKinetic::status_", __FILE__, __LINE__),
         private_features_(cost.private_features, "ComplexKinetic::private_features_", __FILE__, __LINE__),
         private_response_(cost.private_parameters, "ComplexKinetic::private_response_", __FILE__, __LINE__),
-        private_status_(cost.parallel_head ? 1 : 0, "ComplexKinetic::private_status_", __FILE__, __LINE__)
+        private_status_(cost.parallel_head ? 1 : 0, "ComplexKinetic::private_status_", __FILE__, __LINE__),
+        root_failure_(cost.channel_roots ? 1 : 0, "ComplexKinetic::root_failure_", __FILE__, __LINE__)
   {
     layout_.features = withSpatialTargetRange(layout_.features, 0, targets);
     layout_.orbitals = withSpatialTargetRange(layout_.orbitals, 0, targets);
@@ -232,7 +257,8 @@ private:
     for (const auto* b : {&head_, &roots_, &inverse_, &solve_, &scratch_, &outputs_, &coefficients_, &response_, &energy_})
       actual += sizeof(cuDoubleComplex) * b->capacity();
     actual += sizeof(std::size_t) * permutation_.capacity() + 32 * channels_.capacity() + 48 + 8;
-    actual += 8 * (private_features_.capacity() + private_response_.capacity() + private_status_.capacity());
+    actual += 8 * (private_features_.capacity() + private_response_.capacity() + private_status_.capacity() +
+        root_failure_.capacity());
     if (actual != cost.device_bytes || cost.canonical_bytes != 24 * response_.capacity())
       throw std::logic_error("Complex kinetic exact inventory/24P mismatch");
   }
@@ -339,9 +365,15 @@ private:
         ticket.cusp_jets, masses_.data(), kappa_.data(), coefficients_.data(), coefficients_.data() + 3 * k,
         energy_.data(), status_.data()), "complex kinetic physical roots");
     admit();
-    checkRuntime(launchComplexKineticMatrixRoots(stream, layout_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
-        outputs_.data(), outputs_.data() + 3 * k, coefficients_.data(), coefficients_.data() + 3 * k,
-        roots_.data(), scratch_.data(), status_.data()), "complex kinetic matrix roots");
+    if (cost_.channel_roots)
+      checkRuntime(launchComplexKineticChannelRoots(stream, layout_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
+          outputs_.data(), outputs_.data() + 3 * k, coefficients_.data(), coefficients_.data() + 3 * k,
+          roots_.data(), scratch_.data(), scratch_.capacity(), status_.data(), root_failure_.data()),
+          "complex kinetic channel roots");
+    else
+      checkRuntime(launchComplexKineticMatrixRoots(stream, layout_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
+          outputs_.data(), outputs_.data() + 3 * k, coefficients_.data(), coefficients_.data() + 3 * k,
+          roots_.data(), scratch_.data(), status_.data()), "complex kinetic matrix roots");
     admit();
   }
 
@@ -397,7 +429,7 @@ private:
   DeviceBuffer<ComplexValueResult> amplitude_;
   DeviceBuffer<std::uint64_t> status_;
   DeviceBuffer<double> private_features_, private_response_;
-  DeviceBuffer<std::uint64_t> private_status_;
+  DeviceBuffer<std::uint64_t> private_status_, root_failure_;
   ComplexValueResult first_amplitude_;
   std::size_t generation_ = 0;
   bool ready_ = false;

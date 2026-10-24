@@ -266,13 +266,20 @@ __device__ bool multiplyCooperative(const C* left, const C* right, C* output,
   return !rootStageRejected(rejected);
 }
 
-/// One block reuses the SAME three N*N matrices; scalar reductions never change order.
+/// Each selected channel owns three N*N matrices; canonical replay preserves failed prefixes.
+template<bool ChannelParallel = false, bool FailedOnly = false>
 __global__ void matrixRootsCooperative(OpenOrbitalJetLayout layout, const ComplexValueChannel* records,
     const ComplexValueResult* amplitude, const C* inverse, const C* head, const C* gradient,
-    const C* laplacian, const C* qg, const C* ql, C* output, C* scratch, std::uint64_t* status)
+    const C* laplacian, const C* qg, const C* ql, C* output, C* scratch, std::uint64_t* status,
+    const std::uint64_t* replay_failure)
 {
+  if constexpr (FailedOnly)
+    if (*replay_failure == ~std::uint64_t(0))
+      return;
   const auto n = layout.features.electron_count, nn = n * n, d = layout.determinant_count;
   const auto m = layout.orbitals.element_count, k = layout.orbitals.laplacian_lanes;
+  const auto first = ChannelParallel ? std::size_t(blockIdx.x) : 0;
+  const auto last = ChannelParallel ? first + 1 : d;
   __shared__ unsigned rejected;
   __shared__ double shift, log_total, log_weight;
   __shared__ C phase, ratio, alpha, delta;
@@ -284,13 +291,19 @@ __global__ void matrixRootsCooperative(OpenOrbitalJetLayout layout, const Comple
     if (threadIdx.x == 0) fail(status);
     return;
   }
-  for (auto i = std::size_t(threadIdx.x); i < layout.orbitals.plane_count * m; i += blockDim.x)
-    output[i] = make_cuDoubleComplex(0, 0);
+  if constexpr (ChannelParallel)
+  {
+    for (auto i = std::size_t(threadIdx.x); i < layout.orbitals.plane_count * nn; i += blockDim.x)
+      output[(i / nn) * m + first * nn + i % nn] = make_cuDoubleComplex(0, 0);
+  }
+  else
+    for (auto i = std::size_t(threadIdx.x); i < layout.orbitals.plane_count * m; i += blockDim.x)
+      output[i] = make_cuDoubleComplex(0, 0);
   __syncthreads();
-  C* a = scratch;
+  C* a = scratch + (ChannelParallel ? 3 * first * nn : 0);
   C* b = a + nn;
   C* c = b + nn;
-  for (std::size_t channel = 0; channel < d; ++channel)
+  for (std::size_t channel = first; channel < last; ++channel)
   {
     const auto begin = channel * nn;
     const auto* inv = inverse + begin;
@@ -755,9 +768,79 @@ Error launchComplexKineticMatrixRoots(Stream stream, OpenOrbitalJetLayout layout
   const void* outputs[]{roots, scratch, status};
   open_kinetic_reverse_detail::rejectAliasedStorage(reads, outputs, "Complex kinetic root storage aliases");
   if (cooperativeMatrixRootsRequested())
-    matrixRootsCooperative<<<1, 256, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status);
+    matrixRootsCooperative<><<<1, 256, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status, nullptr);
   else
     matrixRoots<<<1, 1, 0, stream>>>(layout, channels, amplitude, inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status);
+  return launched();
+}
+
+/// Check all live byte spans before resetting private state or launching any work.
+Error launchComplexKineticChannelRoots(Stream stream, OpenOrbitalJetLayout layout,
+    const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const C* inverse,
+    const C* orbitals, const C* gradient, const C* laplacian, const C* qg, const C* ql,
+    C* roots, C* scratch, std::size_t scratch_capacity, std::uint64_t* status, std::uint64_t* private_failure)
+{
+  validate(layout);
+  const auto n = layout.features.electron_count, d = layout.determinant_count;
+  if (n < 64 || n > 300 || d < 2 || d > 16)
+    throw std::invalid_argument("Channel kinetic roots require Ne64..300 and D2..16");
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Channel kinetic root extent overflow");
+  };
+  const auto m = layout.orbitals.element_count, k = layout.orbitals.laplacian_lanes;
+  const auto required = mul(3, mul(d, mul(n, n)));
+  if (scratch_capacity < required)
+    throw std::length_error("Channel kinetic root scratch is too small");
+  struct Span
+  {
+    const void* pointer;
+    std::size_t bytes;
+  };
+  const Span reads[]{{channels, mul(d, sizeof(ComplexValueChannel))}, {amplitude, sizeof(ComplexValueResult)},
+      {inverse, mul(m, sizeof(C))}, {orbitals, mul(mul(layout.orbitals.plane_count, m), sizeof(C))},
+      {gradient, mul(mul(3, k), sizeof(C))}, {laplacian, mul(k, sizeof(C))},
+      {qg, mul(mul(3, k), sizeof(C))}, {ql, mul(k, sizeof(C))}};
+  const Span outputs[]{{roots, mul(mul(layout.orbitals.plane_count, m), sizeof(C))},
+      {scratch, mul(required, sizeof(C))}, {status, sizeof(std::uint64_t)},
+      {private_failure, sizeof(std::uint64_t)}};
+  const auto address = [](Span span) {
+    const auto first = reinterpret_cast<std::uintptr_t>(span.pointer);
+    if (!span.pointer)
+      throw std::invalid_argument("Channel kinetic root storage is null");
+    if (span.bytes > std::numeric_limits<std::uintptr_t>::max() - first)
+      throw std::overflow_error("Channel kinetic root address extent overflow");
+    return first;
+  };
+  const auto overlap = [&](Span a, Span b) {
+    const auto first = address(a), second = address(b);
+    return first < second + b.bytes && second < first + a.bytes;
+  };
+  for (const auto& read : reads)
+    (void)address(read);
+  for (std::size_t i = 0; i < 4; ++i)
+  {
+    (void)address(outputs[i]);
+    for (const auto& read : reads)
+      if (overlap(outputs[i], read))
+        throw std::invalid_argument("Channel kinetic root input/output spans overlap");
+    for (std::size_t j = 0; j < i; ++j)
+      if (overlap(outputs[i], outputs[j]))
+        throw std::invalid_argument("Channel kinetic root writable spans overlap");
+  }
+#ifdef QMC_CUDA2HIP
+  auto result = hipMemsetAsync(private_failure, 0xff, sizeof(std::uint64_t), stream);
+#else
+  auto result = cudaMemsetAsync(private_failure, 0xff, sizeof(std::uint64_t), stream);
+#endif
+  if (result != success)
+    return result;
+  matrixRootsCooperative<true><<<static_cast<unsigned>(d), 256, 0, stream>>>(layout, channels, amplitude,
+      inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, private_failure, nullptr);
+  result = launched();
+  if (result != success)
+    return result;
+  matrixRootsCooperative<false, true><<<1, 256, 0, stream>>>(layout, channels, amplitude,
+      inverse, orbitals, gradient, laplacian, qg, ql, roots, scratch, status, private_failure);
   return launched();
 }
 

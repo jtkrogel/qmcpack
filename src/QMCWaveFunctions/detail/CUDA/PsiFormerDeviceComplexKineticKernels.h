@@ -37,6 +37,15 @@ Error launchComplexKineticMatrixRoots(Stream stream, OpenOrbitalJetLayout layout
     const cuDoubleComplex* gradient_root, const cuDoubleComplex* laplacian_root,
     cuDoubleComplex* roots, cuDoubleComplex* scratch, std::uint64_t* status);
 
+/// Explicit D-channel workspace; speculative failures replay the canonical cooperative prefix.
+/// Scratch capacity is in complex elements; the private flag never aliases public status.
+Error launchComplexKineticChannelRoots(Stream stream, OpenOrbitalJetLayout layout,
+    const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
+    const cuDoubleComplex* orbitals, const cuDoubleComplex* core_gradient, const cuDoubleComplex* core_laplacian,
+    const cuDoubleComplex* gradient_root, const cuDoubleComplex* laplacian_root,
+    cuDoubleComplex* roots, cuDoubleComplex* scratch, std::size_t scratch_capacity,
+    std::uint64_t* status, std::uint64_t* private_failure);
+
 /// Add one real objective's paired-head/envelope P and feature seeds, never cusp or trunk.
 Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout layout,
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const double* parameters,
