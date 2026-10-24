@@ -5140,6 +5140,9 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
     return;
   }
   ScopedComplexGpuControls controls;
+  std::size_t target = 0;
+  SECTION("FULL") {}
+  SECTION("explicit K3") { target = 3; }
   controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
   auto& metrics = dev::deviceMemoryMetrics(ordinal);
   const auto outside = metrics.snapshot();
@@ -5167,14 +5170,23 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
       for (int j = 0; j < 3; ++j)
         environment.lattice_vectors[i][j] = simulation_cell.getLattice().R(i, j);
     const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, environment);
-    const auto owner_bytes = dev::estimateComplexValueCost(plan, 2).device_bytes + dev::estimateComplexSpatialCost(plan, 2).device_bytes;
+    const auto spatial = target ? dev::estimateComplexSpatialTargetCost(plan, target, 2)
+                                : dev::estimateComplexSpatialCost(plan, 2);
+    const auto owner_bytes = dev::estimateComplexValueCost(plan, 2).device_bytes + spatial.device_bytes;
+    if (target)
+      controls.target(target, spatial.device_bytes,
+          dev::estimateHeadFreeTargetPrefixCost(plan, target, 2).charged_scalar_work_units);
     const auto before_rejection = metrics.snapshot();
     CHECK_THROWS_AS(PsiFormerComplexWF("pf", initialized, p0, source, clone_cap, twist, owner_bytes - 1), std::length_error);
     CHECK(metrics.snapshot().allocation_calls == before_rejection.allocation_calls);
-    controls.target(1, owner_bytes, 1000000000);
-    CHECK_THROWS_AS(PsiFormerComplexWF("pf", initialized, p0, source, clone_cap, twist, owner_bytes), std::invalid_argument);
+    controls.target(1, owner_bytes, 1);
+    CHECK_THROWS_AS(PsiFormerComplexWF("pf", initialized, p0, source, clone_cap, twist, owner_bytes), std::length_error);
     for (const auto* name : {"PSIFORMER_GPU_VGL_TARGETS", "PSIFORMER_GPU_TARGET_WORKSPACE_BYTES", "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET"})
       ::unsetenv(name);
+
+    if (target)
+      controls.target(target, spatial.device_bytes,
+          dev::estimateHeadFreeTargetPrefixCost(plan, target, 2).charged_scalar_work_units);
 
     PsiFormerComplexWF gpu("pf", initialized, p0, source, clone_cap, twist, owner_bytes);
     PsiFormerComplexWF cpu("pf", initialized, p0, source, clone_cap, twist);

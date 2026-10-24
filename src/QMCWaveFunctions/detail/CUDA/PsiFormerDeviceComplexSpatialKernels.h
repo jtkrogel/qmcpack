@@ -18,10 +18,11 @@ Error launchComplexSpatialTraces(Stream stream, std::size_t batch, std::size_t d
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
     cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status);
 
-/// Immediate B1 compact-target overload; physical N matrices, only 3K/K/K output lanes.
+/// Compact-target input; output configuration strides default to K, or explicit physical N.
 Error launchComplexSpatialTraces(Stream stream, OpenOrbitalJetLayout layout,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
-    cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status);
+    cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status,
+    std::size_t output_electrons = 0);
 } // namespace qmcplusplus::psiformer::device
 #endif

@@ -228,15 +228,13 @@ struct PsiFormerComplexWF::Impl
         if (shared_image->version() != version || shared_image->plan().parameterCount() != plan.parameterCount())
           throw std::invalid_argument("Complex crowd shared image/version differs from its admitted family");
       }
-      if (capacity > 1 && preparation.max_targets)
-        throw std::invalid_argument("Dense complex GPU tiles do not support the B1 target-K profile");
       if (capacity > 1 && !configuredDeviceMemoryAdmission().limit_bytes)
         throw std::invalid_argument("Dense complex GPU tiles require native aggregate device admission");
       const auto value = estimateComplexValueCost(plan, capacity);
       const auto spatial = preparation.max_targets
-          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets) : estimateComplexSpatialCost(plan, capacity);
+          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity) : estimateComplexSpatialCost(plan, capacity);
       const auto work = preparation.max_targets
-          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets).charged_scalar_work_units : 0;
+          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity).charged_scalar_work_units : 0;
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
                                      work > preparation.scalar_work_budget))
         throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
@@ -300,7 +298,7 @@ struct PsiFormerComplexWF::Impl
                   : psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version))),
           value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas, value_cost.device_bytes)),
           full(preparation.max_targets
-              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation)
+              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity)
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas, spatial_cost.device_bytes)),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
           laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),

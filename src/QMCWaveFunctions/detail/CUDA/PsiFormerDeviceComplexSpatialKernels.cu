@@ -115,6 +115,7 @@ __device__ cuDoubleComplex squareTrace(const cuDoubleComplex* inverse, const cuD
 
 /// Strict full-population inverse admission, determinant traces, then real cusp composition.
 __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::size_t n, std::size_t targets,
+    std::size_t output_electrons,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
     cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status)
@@ -177,7 +178,7 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
       }
       sum.add(weighted);
     }
-    gradient[3 * b * targets + lane] = sum.value();
+    gradient[3 * b * output_electrons + lane] = sum.value();
   }
   for (std::size_t e = 0; e < targets; ++e)
   {
@@ -207,7 +208,7 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
     ComplexSum core_square, physical_square;
     for (std::size_t mu = 0; mu < 3; ++mu)
     {
-      auto& g = gradient[3 * (b * targets + e) + mu];
+      auto& g = gradient[3 * (b * output_electrons + e) + mu];
       core_square.add(QMC_PF_MUL(g, g));
       g = make_cuDoubleComplex(cuCreal(g) + cusp[b * planes + 1 + 3 * e + mu], cuCimag(g));
       physical_square.add(QMC_PF_MUL(g, g));
@@ -217,9 +218,9 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
     auto l = QMC_PF_SUB(ratio.value(), core_square.value());
     l = make_cuDoubleComplex(cuCreal(l) + cusp[b * planes + 1 + 3 * targets + e], cuCimag(l));
     const auto r = physical_square.value();
-    lap_log[b * targets + e] = l;
-    lap_ratio[b * targets + e] = make_cuDoubleComplex(cuCreal(l) + cuCreal(r), cuCimag(l) + cuCimag(r));
-    if (!finite(l) || !finite(lap_ratio[b * targets + e]))
+    lap_log[b * output_electrons + e] = l;
+    lap_ratio[b * output_electrons + e] = make_cuDoubleComplex(cuCreal(l) + cuCreal(r), cuCimag(l) + cuCimag(r));
+    if (!finite(l) || !finite(lap_ratio[b * output_electrons + e]))
       fail(status, b);
   }
 }
@@ -258,7 +259,7 @@ __device__ bool cooperativeSpatialCombination(std::size_t determinants,
 
 /// Parallel independent complex product entries; ordinary signed traces keep scalar order.
 __global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determinants,
-    std::size_t n, std::size_t targets, const ComplexValueChannel* channels,
+    std::size_t n, std::size_t targets, std::size_t output_electrons, const ComplexValueChannel* channels,
     const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
     cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio,
@@ -301,7 +302,7 @@ __global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determina
       }
       if (rejected)
         break;
-      gradient[3 * b * targets + lane] = sum.value();
+      gradient[3 * b * output_electrons + lane] = sum.value();
     }
   __syncthreads();
   if (rejected)
@@ -358,7 +359,7 @@ __global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determina
       ComplexSum core_square, physical_square;
       for (std::size_t mu = 0; mu < 3; ++mu)
       {
-        auto& g = gradient[3 * (b * targets + e) + mu];
+        auto& g = gradient[3 * (b * output_electrons + e) + mu];
         core_square.add(QMC_PF_MUL(g, g));
         g = make_cuDoubleComplex(cuCreal(g) + cusp[b * planes + 1 + 3 * e + mu], cuCimag(g));
         physical_square.add(QMC_PF_MUL(g, g));
@@ -368,9 +369,9 @@ __global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determina
       auto l = QMC_PF_SUB(ratio.value(), core_square.value());
       l = make_cuDoubleComplex(cuCreal(l) + cusp[b * planes + 1 + 3 * targets + e], cuCimag(l));
       const auto r = physical_square.value();
-      lap_log[b * targets + e] = l;
-      lap_ratio[b * targets + e] = make_cuDoubleComplex(cuCreal(l) + cuCreal(r), cuCimag(l) + cuCimag(r));
-      if (!finite(l) || !finite(lap_ratio[b * targets + e]))
+      lap_log[b * output_electrons + e] = l;
+      lap_ratio[b * output_electrons + e] = make_cuDoubleComplex(cuCreal(l) + cuCreal(r), cuCimag(l) + cuCimag(r));
+      if (!finite(l) || !finite(lap_ratio[b * output_electrons + e]))
         fail(status, b);
     }
     __syncthreads();
@@ -430,36 +431,45 @@ Error launchComplexSpatialTraces(Stream stream, std::size_t batch, std::size_t d
   const auto block_count = blocks(batch);
   if (cooperativeSpatialTracesRequested() && batch <= std::numeric_limits<int>::max())
     tracesCooperativeKernel<<<static_cast<unsigned int>(batch), 128, 0, stream>>>(
-        batch, determinants, n, n, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+        batch, determinants, n, n, n, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
   else
-    tracesKernel<<<block_count, 128, 0, stream>>>(batch, determinants, n, n, channels, amplitude,
+    tracesKernel<<<block_count, 128, 0, stream>>>(batch, determinants, n, n, n, channels, amplitude,
         inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
   return launched();
 }
 
-/// Reuse the SAME contraction for one compact physical-target tape; FULL API stays unchanged.
+/// Reuse the SAME contraction for packed live configurations and compact target planes.
 Error launchComplexSpatialTraces(Stream stream, OpenOrbitalJetLayout layout,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
-    cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status)
+    cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio, std::uint64_t* status,
+    std::size_t output_electrons)
 {
   validateOpenOrbitalJetLayout(layout);
   const auto n = layout.features.electron_count;
   const auto nn = spatial_detail::checkedProduct(n, n, "Complex target trace extent overflow");
   const auto m = spatial_detail::checkedProduct(layout.determinant_count, nn, "Complex target trace extent overflow");
-  if (layout.features.configuration_count != 1 || layout.features.mode != SpatialJetMode::FULL_VGL ||
+  const auto batch = layout.features.configuration_count;
+  if (!output_electrons) output_electrons = layout.orbitals.laplacian_lanes;
+  if (layout.features.mode != SpatialJetMode::FULL_VGL ||
+      output_electrons < layout.orbitals.laplacian_lanes || output_electrons > n ||
       layout.orbitals.element_count != m || layout.orbital_row_stride != n || layout.orbital_determinant_stride != nn ||
       layout.orbitals.plane_stride != m || layout.orbitals.configuration_stride !=
           spatial_detail::checkedProduct(layout.orbitals.plane_count, m, "Complex target trace extent overflow") ||
       !channels || !amplitude || !inverse ||
       !head || !cusp || !product || !gradient || !lap_log || !lap_ratio || !status)
-    throw std::invalid_argument("Complex target traces require packed B1 current jets");
-  if (cooperativeSpatialTracesRequested())
-    tracesCooperativeKernel<<<1, 128, 0, stream>>>(1, layout.determinant_count, layout.features.electron_count,
-        layout.orbitals.laplacian_lanes, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+    throw std::invalid_argument("Complex target traces require packed current jets and valid output strides");
+  const auto block_count = blocks(batch);
+  (void)spatial_detail::checkedProduct(3, spatial_detail::checkedProduct(batch, output_electrons,
+      "Complex target output extent overflow"), "Complex target output extent overflow");
+  if (cooperativeSpatialTracesRequested() && batch <= std::numeric_limits<int>::max())
+    tracesCooperativeKernel<<<static_cast<unsigned int>(batch), 128, 0, stream>>>(batch, layout.determinant_count, n,
+        layout.orbitals.laplacian_lanes, output_electrons, channels, amplitude, inverse, head, cusp, product,
+        gradient, lap_log, lap_ratio, status);
   else
-    tracesKernel<<<1, 128, 0, stream>>>(1, layout.determinant_count, layout.features.electron_count,
-        layout.orbitals.laplacian_lanes, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
+    tracesKernel<<<block_count, 128, 0, stream>>>(batch, layout.determinant_count, n,
+        layout.orbitals.laplacian_lanes, output_electrons, channels, amplitude, inverse, head, cusp, product,
+        gradient, lap_log, lap_ratio, status);
   return launched();
 }
 } // namespace qmcplusplus::psiformer::device

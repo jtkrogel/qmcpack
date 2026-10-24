@@ -20,6 +20,7 @@ struct ComplexSpatialTargetValidationAccess
       throw std::runtime_error("Forward paired target graph allocated tapes or real-head/full fallback");
     owner.invalidate();
     t.beginCoordinateEvaluation();
+    t.setBatchCount(positions.size() / (3 * t.ne_));
     t.positions_.upload(positions.data(), positions.size());
     std::size_t completed = 0;
     bool injected = false, rejected = false;
@@ -32,7 +33,16 @@ struct ComplexSpatialTargetValidationAccess
         if (begin + count == t.ne_)
         {
           const auto invalid = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0);
-          owner.inverse_.upload(&invalid, 1);
+          auto* last_inverse = owner.inverse_.data() +
+              (t.batch_ - 1) * t.shape_.determinants * t.ne_ * t.ne_;
+#ifdef QMC_CUDA2HIP
+          checkRuntime(hipMemcpyAsync(last_inverse, &invalid, sizeof(invalid), hipMemcpyHostToDevice,
+              t.queue_.getNative()), "late batched target fault injection");
+#else
+          checkRuntime(cudaMemcpyAsync(last_inverse, &invalid, sizeof(invalid), cudaMemcpyHostToDevice,
+              t.queue_.getNative()), "late batched target fault injection");
+#endif
+          t.queue_.sync();
           injected = true;
         }
         owner.finishTarget(begin);
@@ -244,5 +254,93 @@ void validateComplexSpatialTargets()
   }
   std::cout << "PASS complex target spatial checks=" << checks << " max_G=" << max_g << " max_L=" << max_l
             << " max_kinetic=" << max_kinetic << " max_legacy_FULL=" << max_full << " late_tail_rollback=1\n";
+
+  // Distinct configurations and independent B/K tails must never share final root strides.
+  constexpr std::size_t capacity = 3, k = 3;
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity);
+  const auto work = estimateHeadFreeTargetPrefixCost(plan, k, capacity).charged_scalar_work_units;
+  const auto before = metrics.snapshot();
+  for (bool bytes : {false, true})
+  {
+    bool rejected = false;
+    try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+        {k, cost.device_bytes - bytes, work - !bytes}, capacity); }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+      throw std::runtime_error("Batched target byte/work rejection allocated");
+  }
+  auto batched = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, cost.device_bytes, work}, capacity);
+  if (metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
+    throw std::runtime_error("Batched target actual bytes differ from preflight");
+  auto full_batch = PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
+      estimateComplexSpatialCost(plan, capacity).device_bytes);
+  const std::vector<double> packed(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 36);
+  double max_batched = 0;
+  const auto compare_batch = [&](std::size_t live) {
+    const std::vector<double> positions(packed.begin(), packed.begin() + 12 * live);
+    amplitude.resize(live); full_amplitude.resize(live);
+    g.resize(12 * live); fg.resize(12 * live);
+    l.resize(4 * live); r.resize(4 * live); fl.resize(4 * live); fr.resize(4 * live);
+    batched->evaluate(positions);
+    batched->download(batched->resultView(), amplitude, g, l, r);
+    full_batch->evaluate(positions);
+    full_batch->download(full_batch->resultView(), full_amplitude, fg, fl, fr);
+    for (std::size_t b = 0; b < live; ++b)
+    {
+      workspace->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 12 * b, 4));
+      const auto expected = oracle.evaluateFull(*workspace);
+      near(amplitude[b].log_abs, expected.amplitude.log_abs, "batched target log", 2e-11);
+      near(std::abs(host(amplitude[b].phase) - expected.amplitude.phase), 0, "batched target phase", 2e-11);
+      near(amplitude[b].log_abs, full_amplitude[b].log_abs, "batched target FULL log", 2e-11);
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        for (std::size_t mu = 0; mu < 3; ++mu)
+        {
+          const auto index = 12 * b + 3 * e + mu;
+          const auto error = std::abs(host(g[index]) - expected.gradient[3 * e + mu]);
+          max_batched = std::max(max_batched, error);
+          near(error, 0, "batched target CPU G", 2e-11);
+          near(std::abs(host(g[index]) - host(fg[index])), 0, "batched target FULL G", 2e-11);
+        }
+        const auto index = 4 * b + e;
+        for (const auto error : {std::abs(host(l[index]) - expected.laplacian_log[e]),
+                                std::abs(host(r[index]) - expected.laplacian_ratio[e]),
+                                std::abs(host(l[index]) - host(fl[index])),
+                                std::abs(host(r[index]) - host(fr[index]))})
+        {
+          max_batched = std::max(max_batched, error);
+          near(error, 0, "batched target CPU/FULL L", 2e-11);
+        }
+      }
+    }
+  };
+  compare_batch(3);
+  bool extent_rejected = false;
+  try { batched->evaluate(std::vector<double>(48, 0)); }
+  catch (const std::invalid_argument&) { extent_rejected = true; }
+  if (!extent_rejected) throw std::runtime_error("Batched target admitted oversized live batch");
+  compare_batch(3);
+  const auto old_view = batched->resultView();
+  const auto warm_batch = metrics.snapshot();
+  for (const auto live : {std::size_t(1), std::size_t(2), std::size_t(3)}) compare_batch(live);
+  if (metrics.snapshot().allocation_calls != warm_batch.allocation_calls ||
+      metrics.snapshot().free_calls != warm_batch.free_calls)
+    throw std::runtime_error("Batched target warm allocation/free");
+  bool stale_rejected = false;
+  try { batched->download(old_view, amplitude, g, l, r); }
+  catch (const std::invalid_argument&) { stale_rejected = true; }
+  if (!stale_rejected) throw std::runtime_error("Batched target admitted stale view");
+  ComplexSpatialTargetValidationAccess::failLate(*batched, packed);
+  bool failure_rejected = false;
+  try { (void)batched->resultView(); }
+  catch (const std::logic_error&) { failure_rejected = true; }
+  if (!failure_rejected) throw std::runtime_error("Batched target published late nonzero-walker failure");
+  compare_batch(3);
+  auto successor = image->makeUpdatedImage(parameters, ++version);
+  batched->rebindModel(successor); full_batch->rebindModel(successor);
+  compare_batch(2);
+  std::cout << "PASS complex batched target B3 live3/1/2/3 K3-tail CPU/FULL max_error=" << max_batched
+            << " warm_allocations=0 late_nonzero_walker_failure=1 recovery=1 rebind=1\n";
 }
 #endif

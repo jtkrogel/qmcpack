@@ -31,22 +31,26 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
   return {base.trunk_bytes, add(base.device_bytes, extra), base.host_bytes, base.matrices, head};
 }
 
-/// Count the forward-only B1 paired target profile, never a kinetic/reverse owner.
-inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets)
+/// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
+inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
+                                                         std::size_t batch = 1)
 {
-  const auto base = complex_detail::baseCost(plan, 1, SpatialJetMode::VALUE_ONLY);
-  const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets);
+  const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
+  const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex target extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex target bytes overflow"); };
   const auto& s = plan.modelShape();
-  const auto n = s.electrons(), h = mul(add(1, mul(4, targets)), base.matrices);
+  const auto n = s.electrons(), bn = mul(batch, n), h = mul(add(1, mul(4, targets)), base.matrices);
   if (h - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8) ||
       (h - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
     throw std::overflow_error("Complex target head exceeds launch/status admission");
   const auto bytes = add(prefix.device_workspace_bytes, add(mul(40, h), add(mul(16, base.matrices),
-      add(mul(16 + sizeof(std::size_t), mul(s.determinants, n)), add(mul(16, mul(n, n)),
-          add(mul(80, n), add(mul(sizeof(ComplexValueChannel), s.determinants), sizeof(ComplexValueResult) + 8)))))));
-  return {prefix.device_workspace_bytes, bytes, add(prefix.host_workspace_bytes, sizeof(ComplexValueResult)), base.matrices, h};
+      add(mul(16 + sizeof(std::size_t), mul(s.determinants, bn)), add(mul(16, mul(bn, n)),
+          add(mul(80, bn), add(mul(sizeof(ComplexValueChannel), mul(batch, s.determinants)),
+              add(mul(batch, sizeof(ComplexValueResult)), 8))))))));
+  // B1 keeps its original stack current-amplitude staging; batches retain both arrays.
+  const auto amplitude_host = mul(mul(batch, batch > 1 ? 2 : 1), sizeof(ComplexValueResult));
+  return {prefix.device_workspace_bytes, bytes, add(prefix.host_workspace_bytes, amplitude_host), base.matrices, h};
 }
 
 /** Numerical CORE FULL_VGL over one real trunk, paired head and canonical image.
@@ -79,18 +83,19 @@ public:
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(std::move(image), capacity, queue, blas, cost));
   }
 
-  /// Explicit B1 target admission precedes every prefix/head/output allocation.
+  /// Explicit batch target admission precedes every prefix/head/output allocation.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
-      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation)
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation,
+      std::size_t capacity = 1)
   {
     if (!image || !preparation.max_targets || !preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget)
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets);
-    const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets);
+    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity);
+    const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Complex target VGL exceeds its per-owner byte/work caps");
-    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(std::move(image), 1, queue, blas, cost, preparation));
+    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(std::move(image), capacity, queue, blas, cost, preparation));
   }
 
   /// Revoke all products before a same-family successor can replace the current image.
@@ -184,7 +189,7 @@ private:
     t.resetStatusAdmission();
     t.evaluatePreparedTrunk();
     t.evaluateCusp();
-    t.checkOpen(1);
+    t.checkOpen(t.batch_);
     finishHead();
   }
 
@@ -194,7 +199,8 @@ private:
     auto& t = *trunk_;
     checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.orbitals_, channels_.data(), amplitude_.data(),
         inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data() + 3 * begin,
-        outputs_.data() + 3 * t.ne_ + begin, outputs_.data() + 4 * t.ne_ + begin, status_.data()), "complex target traces");
+        outputs_.data() + 3 * capacity_electrons_ + begin,
+        outputs_.data() + 4 * capacity_electrons_ + begin, status_.data(), t.ne_), "complex target traces");
     admitStatus();
   }
 
@@ -203,24 +209,29 @@ private:
   {
     auto& t = *trunk_;
     t.beginCoordinateEvaluation();
-    if (positions.size() != 3 * t.ne_)
-      throw std::invalid_argument("Complex target VGL requires one complete physical configuration");
+    const auto stride = 3 * t.ne_;
+    if (positions.empty() || positions.size() % stride || positions.size() > t.positions_.capacity())
+      throw std::invalid_argument("Complex target VGL requires complete configurations within capacity");
+    t.setBatchCount(positions.size() / stride);
     t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
     for (std::size_t begin = 0; begin < t.ne_;)
     {
       const auto count = std::min(t.target_preparation_.max_targets, t.ne_ - begin);
       prepareTarget(begin, count);
-      ComplexValueResult current;
-      amplitude_.downloadOnStream(&current, 1, t.queue_.getNative());
-      if (!begin)
-        *canonical_ = current;
-      else if (std::abs(current.log_abs - canonical_->log_abs) > 2e-11 ||
-          std::hypot(cuCreal(current.phase) - cuCreal(canonical_->phase), cuCimag(current.phase) - cuCimag(canonical_->phase)) > 2e-11)
-        throw std::runtime_error("Complex target VGL base changed within one request");
+      ComplexValueResult single;
+      auto* current = target_current_.empty() ? &single : target_current_.data();
+      amplitude_.downloadOnStream(current, t.batch_, t.queue_.getNative());
+      for (std::size_t b = 0; b < t.batch_; ++b)
+        if (!begin)
+          canonical_[b] = current[b];
+        else if (std::abs(current[b].log_abs - canonical_[b].log_abs) > 2e-11 ||
+            std::hypot(cuCreal(current[b].phase) - cuCreal(canonical_[b].phase),
+                       cuCimag(current[b].phase) - cuCimag(canonical_[b].phase)) > 2e-11)
+          throw std::runtime_error("Complex target VGL base changed within one request");
       finishTarget(begin);
       begin += count;
     }
-    amplitude_.uploadOnStream(canonical_.get(), 1, t.queue_.getNative());
+    amplitude_.uploadOnStream(canonical_.get(), t.batch_, t.queue_.getNative());
     t.queue_.sync();
     valid_ = true;
   }
@@ -274,7 +285,8 @@ private:
         channels_(capacity * trunk_->shape_.determinants, "ComplexSpatial::channels_", __FILE__, __LINE__),
         amplitude_(capacity, "ComplexSpatial::amplitude_", __FILE__, __LINE__),
         status_(1, "ComplexSpatial::status_", __FILE__, __LINE__),
-        canonical_(preparation.max_targets ? new ComplexValueResult : nullptr)
+        canonical_(preparation.max_targets ? new ComplexValueResult[capacity] : nullptr),
+        target_current_(preparation.max_targets && capacity > 1 ? capacity : 0)
   {
     auto actual = trunk_->deviceWorkspaceBytes() + (envelope_.capacity() + projections_.capacity()) * sizeof(double);
     for (const auto* buffer : {&head_, &inverse_, &solve_, &product_, &outputs_})
@@ -282,7 +294,8 @@ private:
     actual += permutation_.capacity() * sizeof(std::size_t) + channels_.capacity() * sizeof(ComplexValueChannel) +
         amplitude_.capacity() * sizeof(ComplexValueResult) + 8;
     if (actual != cost.device_bytes || trunk_->deviceWorkspaceBytes() != cost.trunk_bytes ||
-        trunk_->hostWorkspaceBytes() + (canonical_ ? sizeof(ComplexValueResult) : 0) != cost.host_bytes)
+        trunk_->hostWorkspaceBytes() + (canonical_ ? capacity * sizeof(ComplexValueResult) : 0) +
+            target_current_.capacity() * sizeof(ComplexValueResult) != cost.host_bytes)
       throw std::logic_error("Complex FULL owned bytes differ from exact preflight");
   }
 
@@ -318,7 +331,8 @@ private:
   DeviceBuffer<ComplexValueChannel> channels_;
   DeviceBuffer<ComplexValueResult> amplitude_;
   DeviceBuffer<std::uint64_t> status_;
-  std::unique_ptr<ComplexValueResult> canonical_;
+  std::unique_ptr<ComplexValueResult[]> canonical_;
+  std::vector<ComplexValueResult> target_current_;
   std::size_t generation_ = 0;
   bool valid_ = false;
 };
