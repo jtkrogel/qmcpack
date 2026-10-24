@@ -92,7 +92,7 @@ void validateComplexSpatialTargetCosts()
 }
 
 /// Target forward-only oracle/legacy parity, physical outputs, generations and budgets.
-void validateComplexSpatialTargets()
+void validateComplexSpatialTargets(std::size_t concurrent_targets = 0)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -144,18 +144,23 @@ void validateComplexSpatialTargets()
   std::size_t checks = 0, version = 0;
   for (std::size_t k : {std::size_t(1), std::size_t(3), std::size_t(4)})
   {
-    const auto cost = estimateComplexSpatialTargetCost(plan, k);
+    const auto cost = estimateComplexSpatialTargetCost(plan, k, 1, concurrent_targets);
     const auto work = estimateHeadFreeTargetPrefixCost(plan, k).charged_scalar_work_units;
     const auto before = metrics.snapshot();
     for (bool bytes : {false, true})
     {
       bool rejected = false;
-      try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas, {k, cost.device_bytes - bytes, work - !bytes}); }
+      try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+          {k, cost.device_bytes - bytes, work - !bytes}, 1, concurrent_targets); }
       catch (const std::length_error&) { rejected = true; }
       if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
         throw std::runtime_error("Target spatial byte/work rejection allocated");
     }
-    auto gpu = PreparedDeviceComplexSpatial::prepare(image, queue, blas, {k, cost.device_bytes, work});
+    auto gpu = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+        {k, cost.device_bytes, work}, 1, concurrent_targets);
+    const auto trace_fingerprint = gpu->traceStorageFingerprint();
+    if (gpu->concurrentTraceTargets() != concurrent_targets)
+      throw std::runtime_error("Target spatial lost its frozen trace profile");
     if (metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
       throw std::runtime_error("Target spatial actual bytes differ from exact preflight");
     const auto compare = [&](const std::vector<double>& positions) {
@@ -198,7 +203,8 @@ void validateComplexSpatialTargets()
     const auto warm = metrics.snapshot();
     for (std::size_t sample = 0; sample < 3; ++sample)
       compare(std::vector<double>(model.cfg.electrons.x.begin() + 12 * sample, model.cfg.electrons.x.begin() + 12 * (sample + 1)));
-    if (metrics.snapshot().allocation_calls != warm.allocation_calls || metrics.snapshot().free_calls != warm.free_calls)
+    if (metrics.snapshot().allocation_calls != warm.allocation_calls || metrics.snapshot().free_calls != warm.free_calls ||
+        gpu->traceStorageFingerprint() != trace_fingerprint)
       throw std::runtime_error("Target spatial warmed DEVICE allocation/free");
     bool rejected = false;
     try { gpu->download(stale, amplitude, g, l, r); }
@@ -219,7 +225,9 @@ void validateComplexSpatialTargets()
       const auto allocations = metrics.snapshot().allocation_calls;
       gpu->rebindModel(image);
       full->rebindModel(image);
-      if (metrics.snapshot().allocation_calls != allocations) throw std::runtime_error("Target spatial rebind allocated");
+      if (metrics.snapshot().allocation_calls != allocations || gpu->traceStorageFingerprint() != trace_fingerprint ||
+          gpu->concurrentTraceTargets() != concurrent_targets)
+        throw std::runtime_error("Target spatial rebind allocated or changed its immutable trace profile");
     };
     auto zero = parameters;
     for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
@@ -248,7 +256,8 @@ void validateComplexSpatialTargets()
     if (!rejected) throw std::runtime_error("Target spatial published singular-request output");
     replace(parameters);
     compare(base);
-    std::cout << "complex_spatial_target K=" << k << " predicted_device_bytes=" << cost.device_bytes
+    std::cout << "complex_spatial_target K=" << k << " trace_targets=" << concurrent_targets
+              << " predicted_device_bytes=" << cost.device_bytes
               << " actual_device_bytes=" << cost.device_bytes << " host_numeric_bytes=" << cost.host_bytes
               << " retained_tape_bytes=0 response_P_bytes=0 warm_device_allocations=0 scope=device_wide\n";
   }
@@ -257,24 +266,25 @@ void validateComplexSpatialTargets()
 
   // Distinct configurations and independent B/K tails must never share final root strides.
   constexpr std::size_t capacity = 3, k = 3;
-  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity);
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, concurrent_targets);
   const auto work = estimateHeadFreeTargetPrefixCost(plan, k, capacity).charged_scalar_work_units;
   const auto before = metrics.snapshot();
   for (bool bytes : {false, true})
   {
     bool rejected = false;
     try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-        {k, cost.device_bytes - bytes, work - !bytes}, capacity); }
+        {k, cost.device_bytes - bytes, work - !bytes}, capacity, concurrent_targets); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
       throw std::runtime_error("Batched target byte/work rejection allocated");
   }
   auto batched = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-      {k, cost.device_bytes, work}, capacity);
+      {k, cost.device_bytes, work}, capacity, concurrent_targets);
+  const auto batch_trace_fingerprint = batched->traceStorageFingerprint();
   if (metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
     throw std::runtime_error("Batched target actual bytes differ from preflight");
   auto full_batch = PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
-      estimateComplexSpatialCost(plan, capacity).device_bytes);
+      estimateComplexSpatialCost(plan, capacity, concurrent_targets).device_bytes, concurrent_targets);
   const std::vector<double> packed(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 36);
   double max_batched = 0;
   const auto compare_batch = [&](std::size_t live) {
@@ -325,7 +335,8 @@ void validateComplexSpatialTargets()
   const auto warm_batch = metrics.snapshot();
   for (const auto live : {std::size_t(1), std::size_t(2), std::size_t(3)}) compare_batch(live);
   if (metrics.snapshot().allocation_calls != warm_batch.allocation_calls ||
-      metrics.snapshot().free_calls != warm_batch.free_calls)
+      metrics.snapshot().free_calls != warm_batch.free_calls ||
+      batched->traceStorageFingerprint() != batch_trace_fingerprint)
     throw std::runtime_error("Batched target warm allocation/free");
   bool stale_rejected = false;
   try { batched->download(old_view, amplitude, g, l, r); }
@@ -339,8 +350,12 @@ void validateComplexSpatialTargets()
   compare_batch(3);
   auto successor = image->makeUpdatedImage(parameters, ++version);
   batched->rebindModel(successor); full_batch->rebindModel(successor);
+  if (batched->traceStorageFingerprint() != batch_trace_fingerprint ||
+      batched->concurrentTraceTargets() != concurrent_targets)
+    throw std::runtime_error("Batched target successor changed its frozen trace profile");
   compare_batch(2);
   std::cout << "PASS complex batched target B3 live3/1/2/3 K3-tail CPU/FULL max_error=" << max_batched
+            << " trace_targets=" << concurrent_targets
             << " warm_allocations=0 late_nonzero_walker_failure=1 recovery=1 rebind=1\n";
 }
 #endif

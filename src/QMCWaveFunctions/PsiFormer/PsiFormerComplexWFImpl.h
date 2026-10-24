@@ -129,6 +129,19 @@ struct PsiFormerComplexWF::Impl
    */
   struct GpuLane
   {
+    /// Capture trace concurrency once; successor and crowd owners reuse this profile.
+    static std::size_t configuredTraceTargets()
+    {
+      const char* option = std::getenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_TARGETS");
+      if (!option || std::string(option) == "0")
+        return 0;
+      const auto targets = configuredCapacity("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_TARGETS");
+      const char* cooperative = std::getenv("PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES");
+      if (targets > 8 || !cooperative || std::string(cooperative) != "1")
+        throw std::invalid_argument("Complex spatial trace targets require capacity1..8 and cooperative spatial traces=1");
+      return targets;
+    }
+
     /// A separate VALUE-only width never multiplies the accepted FULL owner.
     static std::size_t configuredVirtualCapacity()
     {
@@ -207,7 +220,7 @@ struct PsiFormerComplexWF::Impl
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
       return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
-                           configuredVirtualCapacity());
+                           configuredVirtualCapacity(), configuredTraceTargets());
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
@@ -215,7 +228,7 @@ struct PsiFormerComplexWF::Impl
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
         std::size_t limit, psiformer::device::TargetVglPreparation preparation, std::size_t capacity = 1,
         std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {},
-        std::size_t virtual_capacity = 0)
+        std::size_t virtual_capacity = 0, std::size_t trace_targets = 0)
     {
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
@@ -232,7 +245,8 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Dense complex GPU tiles require native aggregate device admission");
       const auto value = estimateComplexValueCost(plan, capacity);
       const auto spatial = preparation.max_targets
-          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity) : estimateComplexSpatialCost(plan, capacity);
+          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets)
+          : estimateComplexSpatialCost(plan, capacity, trace_targets);
       const auto work = preparation.max_targets
           ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity).charged_scalar_work_units : 0;
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
@@ -281,7 +295,7 @@ struct PsiFormerComplexWF::Impl
                   << "; image_and_vendor_bytes_excluded=yes" << std::endl;
       return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
                                                 preparation, work, bytes, host, capacity, std::move(shared_image),
-                                                virtual_capacity));
+                                                virtual_capacity, trace_targets));
     }
 
     /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
@@ -290,16 +304,18 @@ struct PsiFormerComplexWF::Impl
         psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
         psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host,
         std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image,
-        std::size_t virtual_capacity)
-        : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity), blas(queue),
+        std::size_t virtual_capacity, std::size_t trace_targets)
+        : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity),
+          trace_targets(trace_targets), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
                   ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
                   : psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version))),
           value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas, value_cost.device_bytes)),
           full(preparation.max_targets
-              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity)
-              : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas, spatial_cost.device_bytes)),
+              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity, trace_targets)
+              : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
+                    spatial_cost.device_bytes, trace_targets)),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
           laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),
           virtual_positions(3 * electrons * virtual_capacity), virtual_amplitude(virtual_capacity),
@@ -337,6 +353,8 @@ struct PsiFormerComplexWF::Impl
       app_log() << "  Complex PsiFormer GPU inference prepared: mode="
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
                 << ", tile_capacity=" << capacity
+                << ", concurrent_trace_targets=" << trace_targets
+                << ", trace_storage_fingerprint=" << full->traceStorageFingerprint()
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
                 << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
@@ -374,7 +392,7 @@ struct PsiFormerComplexWF::Impl
       converted.resize(4 * electrons * count);
     }
 
-    const std::size_t capacity, electrons, virtual_capacity;
+    const std::size_t capacity, electrons, virtual_capacity, trace_targets;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
@@ -4454,7 +4472,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
   parameters.parameter_version = version;
   auto lane = std::shared_ptr<Impl::GpuLane>(Impl::GpuLane::prepareFrozen(original->plan,
       parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
-      source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity));
+      source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
@@ -4669,7 +4687,7 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
       resource.gpu = Impl::GpuLane::prepareFrozen(impl_->state->plan,
           impl_->state->model.p.flat_values(), impl_->state->model.cfg.nuclei.x,
           impl_->state->model.p.version(), impl_->state->gpu_limit,
-          primary.preparation, primary.capacity, primary.image, primary.virtual_capacity);
+          primary.preparation, primary.capacity, primary.image, primary.virtual_capacity, primary.trace_targets);
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes

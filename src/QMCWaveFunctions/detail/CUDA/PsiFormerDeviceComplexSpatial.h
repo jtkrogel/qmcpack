@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_H
 #include "PsiFormerDeviceComplexValue.h"
 #include "PsiFormerDeviceComplexSpatialKernels.h"
+#include "PsiFormerDeviceComplexSpatialConcurrent.h"
 
 namespace qmcplusplus::psiformer::device
 {
@@ -15,8 +16,29 @@ struct ComplexSpatialCost
   std::size_t trunk_bytes, device_bytes, host_bytes, matrices, head_elements;
 };
 
+/// Replace only the legacy product scratch with an explicitly admitted immutable slab.
+inline ComplexSpatialCost withConcurrentSpatialTraceCost(ComplexSpatialCost cost,
+    const PsiFormerExecutionPlan& plan, std::size_t batch, std::size_t targets, std::size_t concurrent_targets)
+{
+  if (!concurrent_targets)
+    return cost;
+  if (plan.environment().periodic_profile)
+    throw std::invalid_argument("Concurrent complex spatial traces do not admit versioned periodic profiles");
+  const auto n = plan.modelShape().electrons();
+  const auto trace = planComplexSpatialTraceWorkspace(batch, plan.modelShape().determinants, n, targets,
+      concurrent_targets);
+  const auto old_product = spatial_detail::checkedProduct(std::size_t(16),
+      spatial_detail::checkedProduct(batch, spatial_detail::checkedProduct(n, n,
+          "Complex trace product extent overflow"), "Complex trace product extent overflow"),
+      "Complex trace product bytes overflow");
+  cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, trace.device_bytes - old_product,
+      "Complex concurrent spatial owner bytes overflow");
+  return cost;
+}
+
 /// Admit the complete real trunk/head/inverse/traces inventory before allocation.
-inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
+                                                     std::size_t concurrent_targets = 0)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::FULL_VGL);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex FULL extent overflow"); };
@@ -28,12 +50,14 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
     throw std::overflow_error("Complex FULL head index exceeds launch/status admission");
   const auto extra = add(add(mul(16, base.matrices), mul(16 + sizeof(std::size_t), vectors)),
       add(mul(16, mul(bn, n)), mul(80, bn)));
-  return {base.trunk_bytes, add(base.device_bytes, extra), base.host_bytes, base.matrices, head};
+  return withConcurrentSpatialTraceCost(
+      {base.trunk_bytes, add(base.device_bytes, extra), base.host_bytes, base.matrices, head},
+      plan, batch, n, concurrent_targets);
 }
 
 /// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
 inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
-                                                         std::size_t batch = 1)
+                                                         std::size_t batch = 1, std::size_t concurrent_targets = 0)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch);
@@ -50,7 +74,9 @@ inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecut
               add(mul(batch, sizeof(ComplexValueResult)), 8))))))));
   // B1 keeps its original stack current-amplitude staging; batches retain both arrays.
   const auto amplitude_host = mul(mul(batch, batch > 1 ? 2 : 1), sizeof(ComplexValueResult));
-  return {prefix.device_workspace_bytes, bytes, add(prefix.host_workspace_bytes, amplitude_host), base.matrices, h};
+  return withConcurrentSpatialTraceCost(
+      {prefix.device_workspace_bytes, bytes, add(prefix.host_workspace_bytes, amplitude_host), base.matrices, h},
+      plan, batch, targets, concurrent_targets);
 }
 
 /** Numerical CORE FULL_VGL over one real trunk, paired head and canonical image.
@@ -72,30 +98,33 @@ public:
 
   /// Reject malformed profiles/extents and byte limits BEFORE preparing numeric buffers.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
-      std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget)
+      std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget,
+      std::size_t concurrent_targets = 0)
   {
     if (!image)
       throw std::invalid_argument("Complex FULL requires a paired numerical image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexSpatialCost(image->plan(), capacity);
+    const auto cost = estimateComplexSpatialCost(image->plan(), capacity, concurrent_targets);
     if (cost.device_bytes > budget)
       throw std::length_error("Complex FULL exceeds its standalone owner workspace budget");
-    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(std::move(image), capacity, queue, blas, cost));
+    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
+        std::move(image), capacity, queue, blas, cost, {}, concurrent_targets));
   }
 
   /// Explicit batch target admission precedes every prefix/head/output allocation.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation,
-      std::size_t capacity = 1)
+      std::size_t capacity = 1, std::size_t concurrent_targets = 0)
   {
     if (!image || !preparation.max_targets || !preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget)
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity);
+    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity, concurrent_targets);
     const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Complex target VGL exceeds its per-owner byte/work caps");
-    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(std::move(image), capacity, queue, blas, cost, preparation));
+    return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
+        std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets));
   }
 
   /// Revoke all products before a same-family successor can replace the current image.
@@ -142,9 +171,16 @@ public:
     t.checkOpen(t.batch_);
 
     finishHead();
-    checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.batch_, t.shape_.determinants, t.ne_, channels_.data(),
-        amplitude_.data(), inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data(),
-        outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()), "complex FULL traces");
+    if (concurrent_targets_)
+      checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
+          t.ne_, t.ne_, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
+          t.cusp_jets_.data(), product_.data(), channel_terms_.data(), outputs_.data(),
+          outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()),
+          "concurrent complex FULL traces");
+    else
+      checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.batch_, t.shape_.determinants, t.ne_, channels_.data(),
+          amplitude_.data(), inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data(),
+          outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()), "complex FULL traces");
     admitStatus();
     valid_ = true;
   }
@@ -178,6 +214,21 @@ public:
   /// Count standalone owned storage, excluding shared model/vendor reserves.
   const ComplexSpatialCost& cost() const noexcept { return cost_; }
 
+  /// Expose immutable admission rather than mutable process controls.
+  std::size_t concurrentTraceTargets() const noexcept { return concurrent_targets_; }
+
+  /// Track scratch identity/capacity across warm evaluation and same-shape successors.
+  std::size_t traceStorageFingerprint() const noexcept
+  {
+    std::size_t result = concurrent_targets_;
+    for (const auto* buffer : {&product_, &channel_terms_})
+    {
+      result = (result ^ buffer->capacity()) * 1099511628211ULL;
+      result = (result ^ reinterpret_cast<std::uintptr_t>(buffer->data())) * 1099511628211ULL;
+    }
+    return result;
+  }
+
 private:
   friend struct ComplexSpatialTargetValidationAccess;
 
@@ -197,10 +248,17 @@ private:
   void finishTarget(std::size_t begin)
   {
     auto& t = *trunk_;
-    checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.orbitals_, channels_.data(), amplitude_.data(),
-        inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data() + 3 * begin,
-        outputs_.data() + 3 * capacity_electrons_ + begin,
-        outputs_.data() + 4 * capacity_electrons_ + begin, status_.data(), t.ne_), "complex target traces");
+    if (concurrent_targets_)
+      checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
+          t.ne_, t.orbitals_.orbitals.laplacian_lanes, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(),
+          inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), channel_terms_.data(),
+          outputs_.data() + 3 * begin, outputs_.data() + 3 * capacity_electrons_ + begin,
+          outputs_.data() + 4 * capacity_electrons_ + begin, status_.data()), "concurrent complex target traces");
+    else
+      checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.orbitals_, channels_.data(), amplitude_.data(),
+          inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data() + 3 * begin,
+          outputs_.data() + 3 * capacity_electrons_ + begin,
+          outputs_.data() + 4 * capacity_electrons_ + begin, status_.data(), t.ne_), "complex target traces");
     admitStatus();
   }
 
@@ -271,15 +329,20 @@ private:
   /// Allocate only the checked FULL trunk/head/inverse/traces inventory.
   PreparedDeviceComplexSpatial(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexSpatialCost cost,
-      TargetVglPreparation preparation = {})
+      TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), preparation, false, true)),
-        capacity_electrons_(capacity * trunk_->ne_), envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
+        capacity_electrons_(capacity * trunk_->ne_), concurrent_targets_(concurrent_targets),
+        trace_workspace_(planComplexSpatialTraceWorkspace(capacity, trunk_->shape_.determinants, trunk_->ne_,
+            preparation.max_targets ? preparation.max_targets : trunk_->ne_, concurrent_targets)),
+        envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
         projections_(2 * cost.head_elements, "ComplexSpatial::projections_", __FILE__, __LINE__),
         head_(cost.head_elements, "ComplexSpatial::head_", __FILE__, __LINE__),
         inverse_(cost.matrices, "ComplexSpatial::inverse_", __FILE__, __LINE__),
         solve_(capacity_electrons_ * trunk_->shape_.determinants, "ComplexSpatial::solve_", __FILE__, __LINE__),
-        product_(capacity_electrons_ * trunk_->ne_, "ComplexSpatial::product_", __FILE__, __LINE__),
+        product_(concurrent_targets ? trace_workspace_.product_elements : capacity_electrons_ * trunk_->ne_,
+            "ComplexSpatial::product_", __FILE__, __LINE__),
+        channel_terms_(trace_workspace_.channel_elements, "ComplexSpatial::channel_terms_", __FILE__, __LINE__),
         outputs_(5 * capacity_electrons_, "ComplexSpatial::outputs_", __FILE__, __LINE__),
         permutation_(solve_.capacity(), "ComplexSpatial::permutation_", __FILE__, __LINE__),
         channels_(capacity * trunk_->shape_.determinants, "ComplexSpatial::channels_", __FILE__, __LINE__),
@@ -289,7 +352,7 @@ private:
         target_current_(preparation.max_targets && capacity > 1 ? capacity : 0)
   {
     auto actual = trunk_->deviceWorkspaceBytes() + (envelope_.capacity() + projections_.capacity()) * sizeof(double);
-    for (const auto* buffer : {&head_, &inverse_, &solve_, &product_, &outputs_})
+    for (const auto* buffer : {&head_, &inverse_, &solve_, &product_, &channel_terms_, &outputs_})
       actual += buffer->capacity() * sizeof(cuDoubleComplex);
     actual += permutation_.capacity() * sizeof(std::size_t) + channels_.capacity() * sizeof(ComplexValueChannel) +
         amplitude_.capacity() * sizeof(ComplexValueResult) + 8;
@@ -325,8 +388,10 @@ private:
   ComplexSpatialCost cost_;
   std::unique_ptr<PreparedDeviceInference> trunk_;
   std::size_t capacity_electrons_;
+  const std::size_t concurrent_targets_;
+  const ComplexSpatialTraceWorkspacePlan trace_workspace_;
   DeviceBuffer<double> envelope_, projections_;
-  DeviceBuffer<cuDoubleComplex> head_, inverse_, solve_, product_, outputs_;
+  DeviceBuffer<cuDoubleComplex> head_, inverse_, solve_, product_, channel_terms_, outputs_;
   DeviceBuffer<std::size_t> permutation_;
   DeviceBuffer<ComplexValueChannel> channels_;
   DeviceBuffer<ComplexValueResult> amplitude_;

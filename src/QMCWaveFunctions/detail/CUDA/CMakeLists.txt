@@ -20,6 +20,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceAdamKernels.cu
     PsiFormerDeviceComplexValueKernels.cu
     PsiFormerDeviceComplexSpatialKernels.cu
+    PsiFormerDeviceComplexSpatialConcurrent.cu
     PsiFormerDeviceComplexScoreKernels.cu
     PsiFormerDeviceComplexKineticKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
@@ -48,6 +49,7 @@ set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceDeterminantKe
     PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceMetropolisKernels.cu PsiFormerDeviceAdamKernels.cu
     PsiFormerDeviceComplexValueKernels.cu PsiFormerDeviceComplexSpatialKernels.cu
+    PsiFormerDeviceComplexSpatialConcurrent.cu
     PsiFormerDeviceComplexScoreKernels.cu PsiFormerDeviceComplexKineticKernels.cu APPEND PROPERTY COMPILE_OPTIONS
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>

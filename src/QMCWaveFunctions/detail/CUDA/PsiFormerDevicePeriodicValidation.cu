@@ -624,12 +624,13 @@ int main(int argc, char** argv)
     }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only" &&
+        std::string_view(argv[1]) != "--complex-spatial-target-only" &&
+        std::string_view(argv[1]) != "--complex-spatial-concurrent-only" && std::string_view(argv[1]) != "--complex-products-only" &&
         std::string_view(argv[1]) != "--periodic-pair-only" && std::string_view(argv[1]) != "--two-cell-model-only" &&
         std::string_view(argv[1]) != "--paired-two-cell-only" && std::string_view(argv[1]) != "--complex-orbital-vjp-only" && std::string_view(argv[1]) != "--complex-lu-only" && std::string_view(argv[1]) != "--complex-lu-growth-only" &&
         std::string_view(argv[1]) != "--complex-roots-only" && std::string_view(argv[1]) != "--complex-roots-large-only"))
       throw std::invalid_argument("Usage: periodic_validation [--complex-roots-only|--complex-roots-large-only|"
-          "--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
+          "--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-concurrent-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -666,6 +667,9 @@ int main(int argc, char** argv)
       validatePeriodicPairAttention();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-target-only")
       validateComplexSpatialTargets();
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-concurrent-only")
+      for (const auto targets : {std::size_t(1), std::size_t(3), std::size_t(8)})
+        validateComplexSpatialTargets(targets);
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-products-only")
       validateComplexProducts();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-kinetic-only")

@@ -15,6 +15,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerFoldedDense.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialTracePlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
@@ -34,6 +35,32 @@ namespace spatial_jet = qmcplusplus::psiformer::spatial_jet;
 namespace open_spatial = qmcplusplus::psiformer::open_spatial;
 namespace determinant = qmcplusplus::psiformer::device_determinant;
 namespace open_orbital = qmcplusplus::psiformer::open_orbital;
+
+/// Concurrency storage is immutable, independently bounded and absent by default.
+TEST_CASE("PsiFormer concurrent complex spatial trace workspace is checked",
+          "[psiformer][device][spatial][concurrent-trace-cost]")
+{
+  using qmcplusplus::psiformer::device::planComplexSpatialTraceWorkspace;
+  CHECK(planComplexSpatialTraceWorkspace(1, 16, 100, 100, 0).device_bytes == 0);
+  const auto n100 = planComplexSpatialTraceWorkspace(1, 16, 100, 100, 8);
+  CHECK(n100.target_capacity == 8);
+  CHECK(n100.product_elements == 1280000);
+  CHECK(n100.channel_elements == 512);
+  CHECK(n100.device_bytes == 20488192);
+  CHECK(planComplexSpatialTraceWorkspace(4, 16, 100, 8, 8).device_bytes == 4 * n100.device_bytes);
+  CHECK(planComplexSpatialTraceWorkspace(1, 16, 200, 200, 8).device_bytes == 81928192);
+  CHECK(planComplexSpatialTraceWorkspace(3, 2, 7, 1, 8).target_capacity == 1);
+  CHECK(planComplexSpatialTraceWorkspace(3, 2, 7, 3, 8).target_capacity == 3);
+  CHECK_THROWS_AS(planComplexSpatialTraceWorkspace(1, 2, 7, 7, 9), std::invalid_argument);
+  CHECK_THROWS_AS(planComplexSpatialTraceWorkspace(0, 2, 7, 7, 1), std::invalid_argument);
+  CHECK_THROWS_AS(planComplexSpatialTraceWorkspace(1, 0, 7, 7, 1), std::invalid_argument);
+  CHECK_THROWS_AS(planComplexSpatialTraceWorkspace(1, 2, 7, 8, 1), std::invalid_argument);
+  CHECK_THROWS_AS(planComplexSpatialTraceWorkspace(1, 2, 7, 0, 1), std::invalid_argument);
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  CHECK_THROWS(planComplexSpatialTraceWorkspace(maximum, 2, 7, 7, 8));
+  CHECK_THROWS(planComplexSpatialTraceWorkspace(1, 2, maximum, 1, 1));
+  CHECK_THROWS(planComplexSpatialTraceWorkspace(std::size_t(std::numeric_limits<int>::max()), 2, 7, 1, 1));
+}
 
 /// Constrain one-plane features/cusp and defined nodal values without derivatives.
 TEST_CASE("PsiFormer value-only spatial storage preserves values and guard lanes",
