@@ -12,6 +12,112 @@
 #include <string_view>
 #include <type_traits>
 
+/// Compare private concurrent publication with canonical cooperative outputs and failed prefixes.
+inline void validateComplexKineticConcurrentTraces()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  if (!complexSpatialCooperativeTracesRequested())
+    throw std::invalid_argument("Concurrent kinetic trace oracle requires cooperative spatial traces=1");
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  std::size_t comparisons = 0;
+  for (const auto descriptor : {std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
+  {
+    const auto n = descriptor[0], d = descriptor[1], k = descriptor[2], m = d * n * n;
+    auto layout = makeOpenOrbitalJetLayout(1, d, n, 1, 3, n / 2, SpatialJetMode::FULL_VGL);
+    layout.features = withSpatialTargetRange(layout.features, n - k, k);
+    layout.orbitals = withSpatialTargetRange(layout.orbitals, n - k, k);
+    const auto planes = layout.orbitals.plane_count;
+    const auto sentinel = make_cuDoubleComplex(-7.25, 0.125);
+    std::vector<cuDoubleComplex> inverse(m), head(planes * m), initial(5 * k, sentinel), a(5 * k), b(5 * k);
+    std::vector<double> cusp(planes);
+    std::vector<ComplexValueChannel> records(d);
+    DeviceBuffer<cuDoubleComplex> di(m), dh(head.size()), work(m), terms(4 * d), trial(5 * k), oa(5 * k), ob(5 * k);
+    DeviceBuffer<double> dcusp(planes);
+    DeviceBuffer<ComplexValueChannel> dc(d);
+    DeviceBuffer<ComplexValueResult> da(1);
+    DeviceBuffer<std::uint64_t> sa(1), sb(1), failure(1);
+    for (std::size_t variant = 0; variant < 12; ++variant)
+    {
+      std::fill(inverse.begin(), inverse.end(), make_cuDoubleComplex(0, 0));
+      std::fill(head.begin(), head.end(), make_cuDoubleComplex(0, 0));
+      std::fill(cusp.begin(), cusp.end(), 0);
+      for (std::size_t channel = 0; channel < d; ++channel)
+      {
+        records[channel] = {make_cuDoubleComplex(1, 0), 0, 0};
+        for (std::size_t i = 0; i < n; ++i)
+        {
+          inverse[channel * n * n + i * n + i] = make_cuDoubleComplex(1, 0);
+          for (std::size_t plane = 1; plane < planes; ++plane)
+            head[plane * m + channel * n * n + i * n + i] =
+                make_cuDoubleComplex(0.001 * (i + 1), variant == 1 ? -0.0003 * (plane + 1) : -0.0);
+        }
+      }
+      ComplexValueResult amplitude{make_cuDoubleComplex(1, 0), std::log(double(d)), 1, 0, 0};
+      if (variant == 2) records.back().log_abs = -740;
+      if (variant == 3) amplitude.phase = make_cuDoubleComplex(0, 0);
+      if (variant == 4)
+        for (std::size_t channel = 0; channel < d; ++channel)
+          records[channel].phase = make_cuDoubleComplex(channel % 2 ? -1 : 1, 0);
+      if (variant == 5) inverse.back() = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0);
+      if (variant == 6) head[3 * k * m + m - 1] = make_cuDoubleComplex(std::numeric_limits<double>::infinity(), 0);
+      if (variant == 7) head[(planes - 1) * m + m - 1] = make_cuDoubleComplex(1e200, 0);
+      if (variant == 8) cusp.back() = std::numeric_limits<double>::infinity();
+      if (variant == 9) cusp[3 * k] = std::numeric_limits<double>::quiet_NaN();
+      if (variant == 10) records.back().status = 1;
+      if (variant == 11) records.back().log_abs = -std::numeric_limits<double>::infinity();
+      di.upload(inverse.data(), inverse.size()); dh.upload(head.data(), head.size());
+      dc.upload(records.data(), records.size()); da.upload(&amplitude, 1); dcusp.upload(cusp.data(), cusp.size());
+      if (!variant)
+        for (std::size_t invalid = 0; invalid < 5; ++invalid)
+        {
+          bool rejected = false;
+          try
+          {
+            (void)launchComplexSpatialTracesTransactional(queue.getNative(), layout, dc.data(), da.data(), di.data(),
+                dh.data(), dcusp.data(), invalid == 3 ? di.data() : work.data(), work.capacity() - (invalid == 0),
+                terms.data(), terms.capacity() - (invalid == 1), invalid == 4 ? nullptr : trial.data(),
+                trial.capacity() - (invalid == 2), ob.data(), sb.data(), failure.data());
+          }
+          catch (const std::invalid_argument&) { rejected = true; }
+          catch (const std::length_error&) { rejected = true; }
+          if (!rejected)
+            throw std::runtime_error("Concurrent kinetic traces admitted null/alias/short workspace");
+        }
+      oa.upload(initial.data(), initial.size()); ob.upload(initial.data(), initial.size());
+      const std::uint64_t incoming = variant == 1 ? 7 : variant == 7 ? 0 : UINT64_MAX;
+      sa.upload(&incoming, 1); sb.upload(&incoming, 1);
+      checkRuntime(launchComplexSpatialTraces(queue.getNative(), layout, dc.data(), da.data(), di.data(), dh.data(),
+          dcusp.data(), work.data(), oa.data(), oa.data() + 3 * k, oa.data() + 4 * k, sa.data()), "canonical kinetic trace fixture");
+      checkRuntime(launchComplexSpatialTracesTransactional(queue.getNative(), layout, dc.data(), da.data(), di.data(),
+          dh.data(), dcusp.data(), work.data(), work.capacity(), terms.data(), terms.capacity(), trial.data(), trial.capacity(),
+          ob.data(), sb.data(), failure.data()), "transactional kinetic trace fixture");
+      queue.sync();
+      std::uint64_t x, y;
+      sa.download(&x, 1); sb.download(&y, 1); oa.download(a.data(), a.size()); ob.download(b.data(), b.size());
+      if (x != y || std::memcmp(a.data(), b.data(), a.size() * sizeof(cuDoubleComplex)))
+        throw std::runtime_error("Concurrent kinetic traces changed complete outputs/status/failed prefix bits");
+      std::vector<cuDoubleComplex> input_check(head.size());
+      dh.download(input_check.data(), input_check.size());
+      if (std::memcmp(input_check.data(), head.data(), head.size() * sizeof(cuDoubleComplex)))
+        throw std::runtime_error("Concurrent kinetic traces changed input head bytes");
+      input_check.resize(inverse.size()); di.download(input_check.data(), input_check.size());
+      if (std::memcmp(input_check.data(), inverse.data(), inverse.size() * sizeof(cuDoubleComplex)))
+        throw std::runtime_error("Concurrent kinetic traces changed inverse bytes");
+      std::vector<double> cusp_check(cusp.size()); dcusp.download(cusp_check.data(), cusp_check.size());
+      std::vector<ComplexValueChannel> record_check(d); dc.download(record_check.data(), d);
+      ComplexValueResult amplitude_check; da.download(&amplitude_check, 1);
+      if (std::memcmp(cusp_check.data(), cusp.data(), cusp.size() * sizeof(double)) ||
+          std::memcmp(record_check.data(), records.data(), records.size() * sizeof(ComplexValueChannel)) ||
+          std::memcmp(&amplitude_check, &amplitude, sizeof(amplitude)))
+        throw std::runtime_error("Concurrent kinetic traces changed metadata or cusp bytes");
+      ++comparisons;
+    }
+  }
+  std::cout << "PASS kinetic_concurrent_traces comparisons=" << comparisons
+            << " complete_output_status_bits=exact failed_prefix=exact incoming_status=preserved recovery=1\n";
+}
+
 /// Compare channel ownership with the existing cooperative leaf, including canonical failure prefixes.
 inline void validateComplexKineticChannelRoots()
 {

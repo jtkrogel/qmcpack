@@ -13,6 +13,20 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Freeze the optional transactional trace workspace before allocation admission.
+inline bool configuredComplexKineticConcurrentTraces()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_KINETIC_CONCURRENT_TRACES");
+    if (!value || std::string_view(value) == "0")
+      return false;
+    if (std::string_view(value) == "1")
+      return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_KINETIC_CONCURRENT_TRACES must be 0 or 1");
+  }();
+  return enabled;
+}
+
 /// Capture one strict cold factor policy; the original scalar route remains the default.
 inline bool configuredComplexKineticCooperativeLu()
 {
@@ -61,14 +75,16 @@ struct ComplexKineticCost
   KineticTrunkCost trunk;
   std::size_t device_bytes, host_bytes, canonical_bytes, matrix_work, matrices, head_elements;
   std::size_t private_features, private_parameters, root_scratch;
-  bool parallel_head, cooperative_factor, channel_roots;
+  std::size_t trace_terms, trace_outputs;
+  bool parallel_head, cooperative_factor, channel_roots, concurrent_traces;
 };
 
 /// Exact combined preflight: one real trunk/P, max-K mixed jets and complexP.
 inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
     bool parallel_requested = complexKineticHeadParallelRequested(),
     bool cooperative_requested = configuredComplexKineticCooperativeLu(),
-    bool channel_roots_requested = configuredComplexKineticChannelRoots())
+    bool channel_roots_requested = configuredComplexKineticChannelRoots(),
+    bool concurrent_traces_requested = configuredComplexKineticConcurrentTraces())
 {
   complex_detail::baseCost(plan, 1, SpatialJetMode::VALUE_ONLY);
   const auto t = estimateKineticTrunkCost(plan, targets);
@@ -78,7 +94,11 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   const auto n = s.electrons(), d = s.determinants, p = plan.parameterCount(), nn = mul(n, n);
   const auto m = mul(d, nn), h = mul(add(1, mul(4, targets)), m), tiles = n / targets + (n % targets != 0);
   const bool channel_roots = channel_roots_requested && d >= 2 && complexKineticCooperativeLuEligible(plan);
-  const auto root_scratch = mul(3, channel_roots ? m : nn);
+  const bool concurrent_traces = concurrent_traces_requested && d >= 2 &&
+      complexKineticCooperativeLuEligible(plan) && complexSpatialCooperativeTracesRequested();
+  const auto root_scratch = std::max(mul(3, channel_roots ? m : nn), concurrent_traces ? m : std::size_t(0));
+  const auto trace_terms = concurrent_traces ? mul(4, d) : 0;
+  const auto trace_outputs = concurrent_traces ? mul(5, targets) : 0;
   const auto largest = std::max(h, p);
   if (largest - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8) ||
       (largest - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
@@ -87,6 +107,8 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   bytes = add(bytes, add(mul(16 + sizeof(std::size_t), mul(d, n)), mul(sizeof(cuDoubleComplex), root_scratch)));
   if (channel_roots)
     bytes = add(bytes, sizeof(std::uint64_t));
+  if (concurrent_traces)
+    bytes = add(bytes, add(mul(16, add(trace_terms, trace_outputs)), sizeof(std::uint64_t)));
   bytes = add(bytes, add(mul(144, targets), add(mul(16, p), add(mul(8, n), add(mul(32, d), 96)))));
   // Only ordinary fixed legacy-torus FP64 owners enter this independent-output route.
   const auto& environment = plan.environment();
@@ -100,8 +122,8 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   // Matrix-contraction sites only, not neural/head FLOPs or a throughput estimate.
   const auto work = add(mul(14, mul(d, mul(nn, nn))), mul(4, mul(d, mul(tiles, mul(nn, n)))));
   return {t, bytes, add(t.host_bytes, sizeof(ComplexValueResult)), mul(24, p), work, m, h,
-      private_features, private_parameters, root_scratch, parallel_head,
-      cooperative_requested && complexKineticCooperativeLuEligible(plan), channel_roots};
+      private_features, private_parameters, root_scratch, trace_terms, trace_outputs, parallel_head,
+      cooperative_requested && complexKineticCooperativeLuEligible(plan), channel_roots, concurrent_traces};
 }
 
 /** B1 numerical dK/d(real parameters), with learned paired-head complex phase.
@@ -127,13 +149,14 @@ public:
       std::size_t budget, std::size_t matrix_work_budget,
       bool parallel_requested = complexKineticHeadParallelRequested(),
       bool cooperative_requested = configuredComplexKineticCooperativeLu(),
-      bool channel_roots_requested = configuredComplexKineticChannelRoots())
+      bool channel_roots_requested = configuredComplexKineticChannelRoots(),
+      bool concurrent_traces_requested = configuredComplexKineticConcurrentTraces())
   {
     if (!image)
       throw std::invalid_argument("Complex kinetic requires a paired numerical image");
     image->validateCurrentDevice();
     const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested, cooperative_requested,
-        channel_roots_requested);
+        channel_roots_requested, concurrent_traces_requested);
     if (cost.device_bytes > budget || cost.matrix_work > matrix_work_budget)
       throw std::length_error("Complex kinetic exceeds its per-owner byte or matrix-work cap");
     return std::unique_ptr<PreparedDeviceComplexKinetic>(new PreparedDeviceComplexKinetic(image, targets, queue, blas, cost));
@@ -144,6 +167,9 @@ public:
 
   /// Expose the frozen channel policy without lending its private workspace.
   bool usesChannelRoots() const { return cost_.channel_roots; }
+
+  /// Inspect only the immutable trace policy, not its speculative output storage.
+  bool usesConcurrentTraces() const { return cost_.concurrent_traces; }
 
   /// Reuse each immediate K tape for BOTH objectives before releasing its ticket.
   void evaluate(const std::vector<double>& positions, const std::vector<double>& inverse_masses,
@@ -234,7 +260,10 @@ private:
         private_features_(cost.private_features, "ComplexKinetic::private_features_", __FILE__, __LINE__),
         private_response_(cost.private_parameters, "ComplexKinetic::private_response_", __FILE__, __LINE__),
         private_status_(cost.parallel_head ? 1 : 0, "ComplexKinetic::private_status_", __FILE__, __LINE__),
-        root_failure_(cost.channel_roots ? 1 : 0, "ComplexKinetic::root_failure_", __FILE__, __LINE__)
+        root_failure_(cost.channel_roots ? 1 : 0, "ComplexKinetic::root_failure_", __FILE__, __LINE__),
+        trace_terms_(cost.trace_terms, "ComplexKinetic::trace_terms_", __FILE__, __LINE__),
+        trace_outputs_(cost.trace_outputs, "ComplexKinetic::trace_outputs_", __FILE__, __LINE__),
+        trace_failure_(cost.concurrent_traces ? 1 : 0, "ComplexKinetic::trace_failure_", __FILE__, __LINE__)
   {
     layout_.features = withSpatialTargetRange(layout_.features, 0, targets);
     layout_.orbitals = withSpatialTargetRange(layout_.orbitals, 0, targets);
@@ -254,11 +283,12 @@ private:
       throw std::logic_error("Parallel kinetic private feature cost requires exact packed prepared planes");
     static_assert(sizeof(ComplexValueResult) == 48 && sizeof(ComplexValueChannel) == 32 && sizeof(std::uint64_t) == 8);
     auto actual = cost.trunk.device_bytes + 8 * (envelope_.capacity() + projections_.capacity() + masses_.capacity() + kappa_.capacity());
-    for (const auto* b : {&head_, &roots_, &inverse_, &solve_, &scratch_, &outputs_, &coefficients_, &response_, &energy_})
+    for (const auto* b : {&head_, &roots_, &inverse_, &solve_, &scratch_, &outputs_, &coefficients_, &response_, &energy_,
+             &trace_terms_, &trace_outputs_})
       actual += sizeof(cuDoubleComplex) * b->capacity();
     actual += sizeof(std::size_t) * permutation_.capacity() + 32 * channels_.capacity() + 48 + 8;
     actual += 8 * (private_features_.capacity() + private_response_.capacity() + private_status_.capacity() +
-        root_failure_.capacity());
+        root_failure_.capacity() + trace_failure_.capacity());
     if (actual != cost.device_bytes || cost.canonical_bytes != 24 * response_.capacity())
       throw std::logic_error("Complex kinetic exact inventory/24P mismatch");
   }
@@ -358,8 +388,14 @@ private:
     else if (std::abs(current.log_abs - first_amplitude_.log_abs) > 2e-11 ||
         std::hypot(current.phase.x - first_amplitude_.phase.x, current.phase.y - first_amplitude_.phase.y) > 2e-11)
       throw std::runtime_error("Complex kinetic target amplitude changed within request");
-    checkRuntime(launchComplexSpatialTraces(stream, layout_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
-        zero_cusp, scratch_.data(), outputs_.data(), outputs_.data() + 3 * k, outputs_.data() + 4 * k, status_.data()), "complex kinetic CORE traces");
+    if (cost_.concurrent_traces)
+      checkRuntime(launchComplexSpatialTracesTransactional(stream, layout_, channels_.data(), amplitude_.data(),
+          inverse_.data(), head_.data(), zero_cusp, scratch_.data(), scratch_.capacity(), trace_terms_.data(),
+          trace_terms_.capacity(), trace_outputs_.data(), trace_outputs_.capacity(), outputs_.data(), status_.data(),
+          trace_failure_.data()), "complex kinetic concurrent CORE traces");
+    else
+      checkRuntime(launchComplexSpatialTraces(stream, layout_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
+          zero_cusp, scratch_.data(), outputs_.data(), outputs_.data() + 3 * k, outputs_.data() + 4 * k, status_.data()), "complex kinetic CORE traces");
     admit();
     checkRuntime(launchComplexKineticCoefficients(stream, ticket.cusp, outputs_.data(), outputs_.data() + 3 * k,
         ticket.cusp_jets, masses_.data(), kappa_.data(), coefficients_.data(), coefficients_.data() + 3 * k,
@@ -430,6 +466,8 @@ private:
   DeviceBuffer<std::uint64_t> status_;
   DeviceBuffer<double> private_features_, private_response_;
   DeviceBuffer<std::uint64_t> private_status_, root_failure_;
+  DeviceBuffer<cuDoubleComplex> trace_terms_, trace_outputs_;
+  DeviceBuffer<std::uint64_t> trace_failure_;
   ComplexValueResult first_amplitude_;
   std::size_t generation_ = 0;
   bool ready_ = false;

@@ -3,6 +3,7 @@
 // See LICENSE file in top directory. Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 #include "PsiFormerDeviceComplexSpatialKernels.h"
+#include "PsiFormerDeviceComplexSpatialConcurrent.h"
 #include "PsiFormerDeviceComplexWeightedProducts.h"
 #include <limits>
 #include <cfloat>
@@ -268,13 +269,34 @@ __device__ bool cooperativeSpatialCombination(std::size_t determinants,
 }
 
 /// Parallel independent complex product entries; ordinary signed traces keep scalar order.
+template<bool Transactional = false>
 __global__ void tracesCooperativeKernel(std::size_t batch, std::size_t determinants,
     std::size_t n, std::size_t targets, std::size_t output_electrons, const ComplexValueChannel* channels,
     const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
     const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product,
     cuDoubleComplex* gradient, cuDoubleComplex* lap_log, cuDoubleComplex* lap_ratio,
-    std::uint64_t* status)
+    std::uint64_t* status, const cuDoubleComplex* trial = nullptr, const std::uint64_t* private_failure = nullptr)
 {
+  if constexpr (Transactional)
+  {
+    // Every speculative producer has completed on this stream. Public status is
+    // deliberately untouched on success, even if it already carries a failure.
+    if (*private_failure == ~std::uint64_t(0))
+    {
+      for (std::size_t i = threadIdx.x; i < 5 * targets; i += blockDim.x)
+      {
+        if (i < 3 * targets)
+          gradient[i] = trial[i];
+        else if (i < 4 * targets)
+          lap_log[i - 3 * targets] = trial[i];
+        else
+          lap_ratio[i - 4 * targets] = trial[i];
+      }
+      return;
+    }
+    // Failed trials never touched public outputs. Fall through to the original
+    // all-gradient-before-Laplacian body to reproduce its exact failed prefix.
+  }
   const auto b = std::size_t(blockIdx.x);
   const auto nn = n * n, matrix_span = determinants * nn, m = batch * matrix_span, planes = 1 + 4 * targets;
   const auto* records = channels + b * determinants;
@@ -415,6 +437,83 @@ Error launched()
 }
 } // namespace
 
+bool complexSpatialCooperativeTracesRequested() { return cooperativeSpatialTracesRequested(); }
+
+/// Admit all live storage before the first private write; no public field is speculative.
+Error launchComplexSpatialTracesTransactional(Stream stream, OpenOrbitalJetLayout layout,
+    const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
+    const cuDoubleComplex* head, const double* cusp, cuDoubleComplex* product, std::size_t product_capacity,
+    cuDoubleComplex* channel_terms, std::size_t term_capacity, cuDoubleComplex* trial, std::size_t trial_capacity,
+    cuDoubleComplex* outputs, std::uint64_t* status, std::uint64_t* private_failure)
+{
+  validateOpenOrbitalJetLayout(layout);
+  const auto n = layout.features.electron_count, d = layout.determinant_count;
+  const auto k = layout.orbitals.laplacian_lanes;
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Transactional complex trace extent overflow");
+  };
+  const auto m = mul(d, mul(n, n)), count = mul(5, k);
+  if (layout.features.mode != SpatialJetMode::FULL_VGL || layout.features.configuration_count != 1 ||
+      n < 64 || n > 300 || d < 2 || d > 16 || !k || k > n ||
+      layout.orbitals.element_count != m || layout.orbitals.plane_stride != m ||
+      layout.orbital_row_stride != n || layout.orbital_determinant_stride != mul(n, n) ||
+      layout.orbitals.configuration_stride != mul(layout.orbitals.plane_count, m))
+    throw std::invalid_argument("Transactional complex traces require bounded packed B1 target jets");
+  if (product_capacity < m || term_capacity < mul(4, d) || trial_capacity < count)
+    throw std::length_error("Transactional complex trace workspace is too small");
+  struct Span
+  {
+    const void* pointer;
+    std::size_t bytes;
+  };
+  const Span reads[]{{channels, mul(d, sizeof(ComplexValueChannel))}, {amplitude, sizeof(ComplexValueResult)},
+      {inverse, mul(m, sizeof(cuDoubleComplex))},
+      {head, mul(mul(layout.orbitals.plane_count, m), sizeof(cuDoubleComplex))},
+      {cusp, mul(layout.orbitals.plane_count, sizeof(double))}};
+  const Span writes[]{{product, mul(m, sizeof(cuDoubleComplex))},
+      {channel_terms, mul(mul(4, d), sizeof(cuDoubleComplex))}, {trial, mul(count, sizeof(cuDoubleComplex))},
+      {outputs, mul(count, sizeof(cuDoubleComplex))}, {status, sizeof(std::uint64_t)},
+      {private_failure, sizeof(std::uint64_t)}};
+  const auto address = [](Span span) {
+    const auto first = reinterpret_cast<std::uintptr_t>(span.pointer);
+    if (!span.pointer)
+      throw std::invalid_argument("Transactional complex trace storage is null");
+    if (span.bytes > std::numeric_limits<std::uintptr_t>::max() - first)
+      throw std::overflow_error("Transactional complex trace address overflow");
+    return first;
+  };
+  const auto overlap = [&](Span a, Span b) {
+    const auto first = address(a), second = address(b);
+    return first < second + b.bytes && second < first + a.bytes;
+  };
+  for (const auto& read : reads)
+    (void)address(read);
+  for (std::size_t i = 0; i < 6; ++i)
+  {
+    (void)address(writes[i]);
+    for (const auto& read : reads)
+      if (overlap(writes[i], read))
+        throw std::invalid_argument("Transactional complex trace input/output spans overlap");
+    for (std::size_t j = 0; j < i; ++j)
+      if (overlap(writes[i], writes[j]))
+        throw std::invalid_argument("Transactional complex trace writable spans overlap");
+  }
+#ifdef QMC_CUDA2HIP
+  auto result = hipMemsetAsync(private_failure, 0xff, sizeof(std::uint64_t), stream);
+#else
+  auto result = cudaMemsetAsync(private_failure, 0xff, sizeof(std::uint64_t), stream);
+#endif
+  if (result != success)
+    return result;
+  result = launchComplexSpatialTracesConcurrent(stream, 1, d, n, k, k, 1, channels, amplitude, inverse, head,
+      cusp, product, channel_terms, trial, trial + 3 * k, trial + 4 * k, private_failure);
+  if (result != success)
+    return result;
+  tracesCooperativeKernel<true><<<1, 128, 0, stream>>>(1, d, n, k, k, channels, amplitude, inverse, head,
+      cusp, product, outputs, outputs + 3 * k, outputs + 4 * k, status, trial, private_failure);
+  return launched();
+}
+
 /// Pack product-rule jets once without a second complex head or LU copy.
 Error launchComplexSpatialHead(Stream stream, OpenOrbitalJetLayout layout, const double* envelope,
     const double* real, const double* imag, cuDoubleComplex* head, std::uint64_t* status)
@@ -456,7 +555,7 @@ Error launchComplexSpatialTraces(Stream stream, std::size_t batch, std::size_t d
     throw std::invalid_argument("Complex FULL trace inputs are invalid");
   const auto block_count = blocks(batch);
   if (cooperativeSpatialTracesRequested() && batch <= std::numeric_limits<int>::max())
-    tracesCooperativeKernel<<<static_cast<unsigned int>(batch), 128, 0, stream>>>(
+    tracesCooperativeKernel<><<<static_cast<unsigned int>(batch), 128, 0, stream>>>(
         batch, determinants, n, n, n, channels, amplitude, inverse, head, cusp, product, gradient, lap_log, lap_ratio, status);
   else
     tracesKernel<<<block_count, 128, 0, stream>>>(batch, determinants, n, n, n, channels, amplitude,
@@ -489,7 +588,7 @@ Error launchComplexSpatialTraces(Stream stream, OpenOrbitalJetLayout layout,
   (void)spatial_detail::checkedProduct(3, spatial_detail::checkedProduct(batch, output_electrons,
       "Complex target output extent overflow"), "Complex target output extent overflow");
   if (cooperativeSpatialTracesRequested() && batch <= std::numeric_limits<int>::max())
-    tracesCooperativeKernel<<<static_cast<unsigned int>(batch), 128, 0, stream>>>(batch, layout.determinant_count, n,
+    tracesCooperativeKernel<><<<static_cast<unsigned int>(batch), 128, 0, stream>>>(batch, layout.determinant_count, n,
         layout.orbitals.laplacian_lanes, output_electrons, channels, amplitude, inverse, head, cusp, product,
         gradient, lap_log, lap_ratio, status);
   else
