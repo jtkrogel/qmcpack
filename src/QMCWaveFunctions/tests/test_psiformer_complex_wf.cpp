@@ -134,7 +134,7 @@ public:
       "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE",
       "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS",
       "PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "PSIFORMER_GPU_KFAC_AFFINE",
-      "PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS"};
+      "PSIFORMER_GPU_SOFTMAX_KEY_SHARED_MEANS", "PSIFORMER_GPU_COMPLEX_VIRTUAL_ENVELOPE_REUSE"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -165,9 +165,15 @@ const std::string coulombTerms =
 /// Small descriptor fixture exercises the same numerical owners without another Native TU.
 /// This is not a new public XML architecture; initializer production dimensions stay fixed.
 ps::InitializedPsiFormerParameters parameters(bool paired = true, bool zero_imaginary = false,
-                                             std::size_t channels_per_nucleus = 7)
+                                             std::size_t channels_per_nucleus = 7, std::size_t electron_count = 4)
 {
-  auto leaves = fixture::makeLayout(4, 2, true, 2, channels_per_nucleus);
+  auto leaves = fixture::makeLayout(electron_count, 2, true, 2, channels_per_nucleus);
+  // Keep this compact fixture at D2 even when the head's electron axis is Ne64.
+  for (auto& leaf : leaves)
+    if (leaf.module.find("exponential_envelopes") != std::string::npos)
+      leaf.shape[0] = 2 * electron_count;
+    else if (leaf.module.find("Backflow") != std::string::npos)
+      leaf.shape.back() = 2 * electron_count;
   for (auto& leaf : leaves)
     for (auto& extent : leaf.shape)
       if (extent == 256)
@@ -185,7 +191,7 @@ ps::InitializedPsiFormerParameters parameters(bool paired = true, bool zero_imag
     return std::tie(a.module, a.name) < std::tie(b.module, b.name);
   });
   ps::InitializedPsiFormerParameters result;
-  result.model_shape = {2, 2, 2, 2, 8, 2, 2};
+  result.model_shape = {electron_count / 2, electron_count - electron_count / 2, 2, 2, 8, 2, 2};
   result.profile = paired ? ps::PSIFORMER_COMPLEX_PERIODIC_V1 : ps::DEEPQMC_PSIFORMER_V1;
   result.seed = 17;
   // Imaginary leaves must not shift the real stream or be proportional to real heads.
@@ -6245,6 +6251,108 @@ TEST_CASE("PsiFormer paired virtual VALUE preserves accepted state and the sole 
 #endif
 }
 #ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer paired virtual envelopes remain request local across ragged walkers",
+          "[wavefunction][psiformer][complex_virtual_envelope]")
+{
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices) { WARN("NOT_RUN: envelope reuse requires GPU"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) { WARN("NOT_RUN: envelope reuse requires GPU"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  if (!ps::device::configuredDeviceMemoryAdmission().limit_bytes)
+  { WARN("NOT_RUN: envelope reuse requires explicit aggregate device admission"); return; }
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY", "3");
+  const SimulationCell simulation_cell(cell());
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters(true, false, 7, 64);
+  constexpr std::size_t host_cap = std::size_t(512) * 1024 * 1024;
+  constexpr std::size_t device_cap = std::size_t(2) * 1024 * 1024 * 1024;
+  auto p = electrons(simulation_cell, 32, 32), p1 = electrons(simulation_cell, 32, 32);
+  for (int e = 0; e < 64; ++e)
+    for (int d = 0; d < 3; ++d)
+    {
+      p.R[e][d] = 1.4 + 1.1 * std::sin(.29 * (3 * e + d + 1));
+      p1.R[e][d] = p.R[e][d] + .013 * (d + 1);
+    }
+  p.update(); p1.update();
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF ordinary("ordinary", initialized, p, source, host_cap, twist, device_cap);
+  auto ordinary_clone = ordinary.makeClone(p1);
+  auto& ordinary1 = dynamic_cast<PsiFormerComplexWF&>(*ordinary_clone);
+  controls.set("PSIFORMER_GPU_COMPLEX_VIRTUAL_ENVELOPE_REUSE", "1");
+  PsiFormerComplexWF cached("cached", initialized, p, source, host_cap, twist, device_cap);
+  auto cached_clone = cached.makeClone(p1);
+  auto& cached1 = dynamic_cast<PsiFormerComplexWF&>(*cached_clone);
+  const auto old_log = evaluate(ordinary, p), old_log1 = evaluate(ordinary1, p1);
+  CHECK(evaluate(cached, p) == old_log); CHECK(evaluate(cached1, p1) == old_log1);
+  const auto accepted_g = p.G;
+  const auto accepted_l = p.L;
+  RefVectorWithLeader<ParticleSet> particles(p, {p, p1});
+  RefVectorWithLeader<WaveFunctionComponent> old_components(ordinary, {ordinary, ordinary1});
+  RefVectorWithLeader<WaveFunctionComponent> new_components(cached, {cached, cached1});
+  VirtualParticleSet v0(p), v1(p1);
+  v0.makeMovesAbsolute(p, 0, {&p.R[0], 1});
+  v1.makeMovesAbsolute(p1, 63, {&p1.R[63], 1});
+  const auto scratch0 = v0.R, scratch1 = v1.R;
+  RefVectorWithLeader<VirtualParticleSet> scratch(v0, {v0, v1});
+  // Walker1 returns noncontiguously, and row changes cross a capacity3/tail boundary.
+  const std::vector<std::size_t> offsets{0, 2, 6, 7, 13};
+  const std::vector<VirtualParticleBatch::Segment> segments{{1, 63}, {0, 0}, {0, 32}, {1, 1}};
+  std::vector<ParticleSet::PosType> points;
+  for (std::size_t s = 0; s < segments.size(); ++s)
+    for (std::size_t q = offsets[s]; q < offsets[s + 1]; ++q)
+    {
+      points.push_back(particles[segments[s].walkerId()].R[segments[s].electronId()]);
+      points.back()[q % 3] += .0017 * (q + 1);
+    }
+  const VirtualParticleBatch batch(2, offsets, segments, points);
+  std::vector<C> expected(points.size()), actual(points.size(), C{71, -9});
+  const auto call = [&] { return cached.mw_evaluateVirtualRatios(new_components, particles, scratch, batch, actual); };
+  ordinary.mw_evaluateVirtualRatios(old_components, particles, scratch, batch, expected);
+  auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+  const auto warm = metrics.snapshot();
+  const auto stamp = call();
+  REQUIRE(stamp.isVersioned()); CHECK(actual == expected);
+  CHECK(call() == stamp); CHECK(actual == expected);
+  CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+  CHECK(metrics.snapshot().free_calls == warm.free_calls);
+  CHECK(cached.get_log_value() == old_log); CHECK(cached1.get_log_value() == old_log1);
+  CHECK(p.G == accepted_g); CHECK(p.L == accepted_l);
+  REQUIRE(v0.R.size() == scratch0.size()); REQUIRE(v1.R.size() == scratch1.size());
+  for (std::size_t q = 0; q < scratch0.size(); ++q)
+    for (int d = 0; d < 3; ++d) CHECK(v0.R[q][d] == scratch0[q][d]);
+  for (std::size_t q = 0; q < scratch1.size(); ++q)
+    for (int d = 0; d < 3; ++d) CHECK(v1.R[q][d] == scratch1[q][d]);
+  const auto saved = actual;
+  const auto last = points.back();
+  points.back()[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(call()); CHECK(actual == saved); points.back() = last;
+  CHECK(call() == stamp); CHECK(actual == expected);
+  p.makeMove(0, ParticleSet::PosType{.01, 0, 0}); cached.ratio(p, 0);
+  CHECK_THROWS(call()); CHECK(actual == saved);
+  cached.restore(0); p.rejectMove(0);
+  CHECK(call() == stamp); CHECK(actual == expected);
+  auto changed = cached.snapshotParameters(); changed.values[0] += .002;
+  const auto publication = cached.gpuParameterPublicationRequirements();
+  REQUIRE(cached.publishBudgetedGpuParameters(changed, changed.version,
+      publication.device_bytes, publication.host_bytes) == 1);
+  CHECK_THROWS(call()); CHECK(actual == saved);
+  evaluate(cached, p); evaluate(cached1, p1);
+  const auto rebound = metrics.snapshot();
+  CHECK(call() != stamp);
+  CHECK(metrics.snapshot().allocation_calls == rebound.allocation_calls);
+  // Source mutation is rejected atomically, rather than authorizing a stale base bank.
+  const auto before_source = actual;
+  source.R[0][0] += .01; source.update();
+  CHECK_THROWS(call()); CHECK(actual == before_source);
+  std::printf("COMPLEX_VIRTUAL_ENVELOPE_CHECKS_COMPLETED Ne=64 T=3 Q=13 W=2 old_GPU_bits=checked CSR_order=checked "
+              "scratch_unchanged=checked warm_allocations=checked publication_rebind=checked atomic_failure=checked\n");
+}
+
 TEST_CASE("PsiFormer paired virtual tiles pack independent ragged walker replacements",
           "[wavefunction][psiformer][complex_virtual_tile]")
 {

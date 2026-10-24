@@ -151,6 +151,17 @@ struct PsiFormerComplexWF::Impl
       return configuredCapacity("PSIFORMER_GPU_COMPLEX_VIRTUAL_TILE_CAPACITY");
     }
 
+    /// Capture request-local envelope reuse only for the separate ordinary virtual VALUE owner.
+    static bool configuredVirtualEnvelopeReuse()
+    {
+      const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_VIRTUAL_ENVELOPE_REUSE");
+      if (!value || std::string_view(value) == "0")
+        return false;
+      if (std::string_view(value) == "1")
+        return true;
+      throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_VIRTUAL_ENVELOPE_REUSE must be 0 or 1");
+    }
+
     /// Freeze the opt-in numerical tile width once when creating a model family.
     static std::size_t configuredCapacity(const char* name = "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY")
     {
@@ -220,7 +231,7 @@ struct PsiFormerComplexWF::Impl
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
       return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
-                           configuredVirtualCapacity(), configuredTraceTargets());
+                           configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse());
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
@@ -228,13 +239,15 @@ struct PsiFormerComplexWF::Impl
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
         std::size_t limit, psiformer::device::TargetVglPreparation preparation, std::size_t capacity = 1,
         std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {},
-        std::size_t virtual_capacity = 0, std::size_t trace_targets = 0)
+        std::size_t virtual_capacity = 0, std::size_t trace_targets = 0, bool virtual_envelope_reuse = false)
     {
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
       if (!capacity || capacity == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU tile capacity must be positive and finite");
+      if (virtual_envelope_reuse && !virtual_capacity)
+        throw std::invalid_argument("Virtual envelope reuse requires the separate complex virtual tile owner");
       if (shared_image)
       {
         shared_image->validateCurrentDevice();
@@ -269,7 +282,7 @@ struct PsiFormerComplexWF::Impl
       {
         if (plan.environment().periodic_profile || !configuredDeviceMemoryAdmission().limit_bytes)
           throw std::invalid_argument("Complex virtual tiles require legacy periodic FP64 and aggregate device admission");
-        const auto extra = estimateComplexValueCost(plan, virtual_capacity);
+        const auto extra = estimateComplexValueCost(plan, virtual_capacity, true, virtual_envelope_reuse);
         const auto add = [](std::size_t a, std::size_t b) {
           return psiformer::spatial_detail::checkedAdd(a, b, "Complex virtual tile bytes overflow");
         };
@@ -284,6 +297,7 @@ struct PsiFormerComplexWF::Impl
           throw std::length_error("Complex virtual tile exceeds conservative combined DEVICE/HOST numeric bound");
         app_log() << "  Complex virtual tile preflight: capacity=" << virtual_capacity
                   << ", extra_value_device_bytes=" << extra.device_bytes
+                  << ", envelope_anchor_device_bytes=" << extra.envelope_anchor_bytes
                   << ", combined_numeric_bytes=" << add(bytes, host)
                   << "; existing_numeric_limit=yes; aggregate_HOST_fit=no; before_allocation=yes" << std::endl;
       }
@@ -295,7 +309,7 @@ struct PsiFormerComplexWF::Impl
                   << "; image_and_vendor_bytes_excluded=yes" << std::endl;
       return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
                                                 preparation, work, bytes, host, capacity, std::move(shared_image),
-                                                virtual_capacity, trace_targets));
+                                                virtual_capacity, trace_targets, virtual_envelope_reuse));
     }
 
     /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
@@ -304,9 +318,9 @@ struct PsiFormerComplexWF::Impl
         psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
         psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host,
         std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image,
-        std::size_t virtual_capacity, std::size_t trace_targets)
+        std::size_t virtual_capacity, std::size_t trace_targets, bool virtual_envelope_reuse)
         : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity),
-          trace_targets(trace_targets), blas(queue),
+          trace_targets(trace_targets), virtual_envelope_reuse(virtual_envelope_reuse), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
                   ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
@@ -324,7 +338,7 @@ struct PsiFormerComplexWF::Impl
     {
       if (virtual_capacity)
       {
-        const auto extra = psiformer::device::estimateComplexValueCost(plan, virtual_capacity);
+        const auto extra = psiformer::device::estimateComplexValueCost(plan, virtual_capacity, true, virtual_envelope_reuse);
         int ordinal;
 #ifdef QMC_CUDA2HIP
         psiformer::device::checkRuntime(hipGetDevice(&ordinal), "complex virtual tile device");
@@ -335,7 +349,7 @@ struct PsiFormerComplexWF::Impl
         // Concurrent model allocations can still cause clean RAII rollback.
         { auto probe = psiformer::device::deviceMemoryMetrics(ordinal).reserveAllocation(extra.device_bytes); }
         virtual_value = psiformer::device::PreparedDeviceComplexValue::prepare(
-            image, virtual_capacity, queue, blas, extra.device_bytes);
+            image, virtual_capacity, queue, blas, extra.device_bytes, virtual_envelope_reuse);
       }
       const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
               sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
@@ -354,6 +368,7 @@ struct PsiFormerComplexWF::Impl
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
                 << ", tile_capacity=" << capacity
                 << ", concurrent_trace_targets=" << trace_targets
+                << ", virtual_envelope_reuse=" << virtual_envelope_reuse
                 << ", trace_storage_fingerprint=" << full->traceStorageFingerprint()
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
@@ -393,6 +408,7 @@ struct PsiFormerComplexWF::Impl
     }
 
     const std::size_t capacity, electrons, virtual_capacity, trace_targets;
+    const bool virtual_envelope_reuse;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
@@ -4472,7 +4488,8 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
   parameters.parameter_version = version;
   auto lane = std::shared_ptr<Impl::GpuLane>(Impl::GpuLane::prepareFrozen(original->plan,
       parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
-      source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets));
+      source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets,
+      source_lane->virtual_envelope_reuse));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
@@ -4687,7 +4704,8 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
       resource.gpu = Impl::GpuLane::prepareFrozen(impl_->state->plan,
           impl_->state->model.p.flat_values(), impl_->state->model.cfg.nuclei.x,
           impl_->state->model.p.version(), impl_->state->gpu_limit,
-          primary.preparation, primary.capacity, primary.image, primary.virtual_capacity, primary.trace_targets);
+          primary.preparation, primary.capacity, primary.image, primary.virtual_capacity, primary.trace_targets,
+          primary.virtual_envelope_reuse);
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes
@@ -5706,14 +5724,46 @@ WaveFunctionComponent::EvaluationStamp PsiFormerComplexWF::mw_evaluateVirtualRat
       throw std::logic_error("Complex virtual tile owner differs from its frozen family");
     std::vector<ValueType> staged(ratios.size());
     std::size_t count = 0;
+    using EnvelopeRequest = psiformer::device::PreparedDeviceComplexValue::EnvelopeRequest;
+    std::optional<EnvelopeRequest> envelope_request;
+    std::size_t envelope_walker = components.size();
+    const auto end_envelope_request = [&] {
+      lane.virtual_value->endVirtualEnvelopeBase();
+      envelope_request.reset();
+    };
     const auto flush = [&] {
       if (!count)
         return;
+      if (lane.virtual_envelope_reuse)
+      {
+        const auto first_walker = lane.virtual_indices[0][1];
+        std::size_t reusable = 0;
+        for (std::size_t local = 0; local < count; ++local)
+          reusable += lane.virtual_indices[local][1] == first_walker;
+        if (reusable < 2)
+          end_envelope_request();
+        else if (!envelope_request || envelope_walker != first_walker)
+        {
+          end_envelope_request();
+          envelope_walker = first_walker;
+          const auto& reference = particles[first_walker];
+          for (std::size_t electron = 0; electron < lane.electrons; ++electron)
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              lane.positions[3 * electron + dimension] = reference.R[electron][dimension];
+          envelope_request = lane.virtual_value->beginVirtualEnvelopeBase(lane.positions.data(), 3 * lane.electrons);
+        }
+      }
       lane.virtual_positions.resize(3 * lane.electrons * count);
       lane.virtual_amplitude.resize(count);
       {
         NativeTimerScope numerical(impl_->phase_timers.gpu_evaluate);
-        lane.virtual_value->evaluate(lane.virtual_positions);
+        if (envelope_request)
+          lane.virtual_value->evaluateVirtualTile(*envelope_request, lane.virtual_positions,
+              [&](std::size_t local) {
+                return lane.virtual_indices[local][1] == envelope_walker ? lane.virtual_indices[local][2] : lane.electrons;
+              });
+        else
+          lane.virtual_value->evaluate(lane.virtual_positions);
       }
       {
         NativeTimerScope download(impl_->phase_timers.gpu_download);
@@ -5754,6 +5804,7 @@ WaveFunctionComponent::EvaluationStamp PsiFormerComplexWF::mw_evaluateVirtualRat
         }
       }
       flush();
+      end_envelope_request();
       Impl::validateDerivativeSource(*state);
       for (std::size_t walker = 0; walker < components.size(); ++walker)
       {
@@ -5769,6 +5820,7 @@ WaveFunctionComponent::EvaluationStamp PsiFormerComplexWF::mw_evaluateVirtualRat
     }
     catch (...)
     {
+      end_envelope_request();
       lane.virtual_value->discardResults();
       throw;
     }

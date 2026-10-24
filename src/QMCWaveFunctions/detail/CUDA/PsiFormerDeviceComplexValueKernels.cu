@@ -59,6 +59,62 @@ __global__ void envelopes(OpenOrbitalJetLayout layout, periodic_geometry::Cell c
     fail(status, index);
 }
 
+/// Recover the base from the first tile without a separate coordinate upload or host fence.
+__global__ void envelopeAnchor(OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, std::size_t moved_row,
+    double base_x, double base_y, double base_z, double* output, std::uint64_t* status)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto n = layout.features.electron_count;
+  if (index >= layout.determinant_count * n * n)
+    return;
+  const auto row = (index / n) % n;
+  const double base_position[3]{base_x, base_y, base_z};
+  if (row == moved_row)
+  {
+    // VALUE-only buildElement reads exactly this row; no derivative or other electron coordinate is accessed.
+    layout.position_row_stride = 0;
+    positions = base_position;
+  }
+  if (open_orbital::buildElement(layout, nullptr, positions, nuclei, nullptr, nullptr,
+      pi_up, pi_down, zeta_up, zeta_down, 0, 0, index / (n * n), row, index % n,
+      output, nullptr, nullptr, &cell, nullptr, true) != OpenSpatialStatus::REGULAR)
+    fail(status, index);
+}
+
+/// A failed anchor is private: canonical recomputation preserves the original point's failure order.
+__global__ void virtualEnvelopes(OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const double* anchor,
+    const std::size_t* moved_rows, const std::uint64_t* anchor_status,
+    double* output, std::uint64_t* status)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto n = layout.features.electron_count, per = layout.determinant_count * n * n;
+  if (index >= layout.features.configuration_count * per)
+    return;
+  const auto local = index % per, configuration = index / per;
+  const auto row = (local / n) % n;
+  const auto moved = moved_rows[configuration];
+  if (moved > n)
+  {
+    fail(status, index);
+    return;
+  }
+  if (*anchor_status == UINT64_MAX && moved < n && row != moved)
+  {
+    const auto value = anchor[local];
+    output[index] = value;
+    if (!device_math::isFiniteBinary64(value))
+      fail(status, index);
+  }
+  else if (open_orbital::buildElement(layout, nullptr, positions, nuclei, nullptr, nullptr,
+      pi_up, pi_down, zeta_up, zeta_down, configuration, 0, local / (n * n),
+      row, local % n, output, nullptr, nullptr, &cell, nullptr, true) != OpenSpatialStatus::REGULAR)
+    fail(status, index);
+}
+
 /// Produce the complex head without aliasing projection planes or LU storage.
 __global__ void pack(std::size_t count, const double* envelope, const double* real,
     const double* imag, cuDoubleComplex* matrix, std::uint64_t* status)
@@ -480,6 +536,49 @@ Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, pe
     throw std::invalid_argument("Complex VALUE envelope input is invalid");
   envelopes<<<blocks(layout.features.configuration_count * layout.orbitals.element_count), 128, 0, stream>>>(
       layout, cell, positions, nuclei, pi_up, pi_down, zeta_up, zeta_down, envelope, status);
+  return launched();
+}
+
+/// Anchor work remains private and stream ordered behind the first tile's existing coordinate upload.
+Error launchComplexValueEnvelopeAnchor(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, std::size_t moved_row,
+    double base_x, double base_y, double base_z, double* anchor, std::uint64_t* anchor_status)
+{
+  const auto n = layout.features.electron_count;
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || n < 64 || moved_row >= n ||
+      !layout.features.configuration_count || layout.orbital_row_stride != n ||
+      layout.orbital_determinant_stride != n * n ||
+      layout.orbitals.element_count != layout.determinant_count * n * n ||
+      layout.orbitals.configuration_stride != layout.orbitals.element_count ||
+      !positions || !nuclei || !pi_up || !pi_down || !zeta_up || !zeta_down || !anchor || !anchor_status)
+    throw std::invalid_argument("Complex envelope anchor requires an ordinary VALUE base");
+  layout.features.configuration_count = layout.orbitals.configuration_count = 1;
+  envelopeAnchor<<<blocks(layout.determinant_count * n * n), 128, 0, stream>>>(layout, cell,
+      positions, nuclei, pi_up, pi_down, zeta_up, zeta_down, moved_row,
+      base_x, base_y, base_z, anchor, anchor_status);
+  return launched();
+}
+
+/// Launch only the packed ordinary VALUE layout admitted by the request owner.
+Error launchComplexValueVirtualEnvelopes(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const double* anchor,
+    const std::size_t* moved_rows, const std::uint64_t* anchor_status,
+    double* envelope, std::uint64_t* status)
+{
+  const auto n = layout.features.electron_count;
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || n < 64 || !layout.features.configuration_count ||
+      layout.orbital_row_stride != n ||
+      layout.orbital_determinant_stride != n * n ||
+      layout.orbitals.element_count != layout.determinant_count * n * n ||
+      layout.orbitals.configuration_stride != layout.orbitals.element_count ||
+      !positions || !nuclei || !pi_up || !pi_down || !zeta_up || !zeta_down ||
+      !anchor || !moved_rows || !anchor_status || !envelope || !status)
+    throw std::invalid_argument("Complex virtual envelope input requires a packed VALUE request");
+  virtualEnvelopes<<<blocks(layout.features.configuration_count * layout.orbitals.element_count), 128, 0, stream>>>(
+      layout, cell, positions, nuclei, pi_up, pi_down, zeta_up, zeta_down,
+      anchor, moved_rows, anchor_status, envelope, status);
   return launched();
 }
 

@@ -9,6 +9,8 @@
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexValueExecutor.h"
 #include <cstring>
+#include <iomanip>
+#include <exception>
 
 /// Exercise the actual eligible owner, exact admission, successor and retained-role inventory.
 void validateComplexValuePairOwner()
@@ -182,11 +184,321 @@ void validateComplexValuePairEvents()
             << " complete_result_status_bits=exact independent_event_scan=exact warm_device_allocations=0\n";
 }
 
+/// An invalid private base must fall back without changing canonical point failure priority.
+void validateComplexVirtualEnvelopeFallback()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  constexpr std::size_t n = 64, count = 2, elements = n * n;
+  const auto layout = makeOpenOrbitalJetLayout(count, 1, n, 2, 1, n / 2, SpatialJetMode::VALUE_ONLY);
+  const auto cell = periodic_geometry::makeCell({{{8., 0., 0.}, {0., 10., 0.}, {0., 0., 12.}}},
+                                               {true, true, true});
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  DeviceBuffer<double> positions(3 * count * n), nuclei(6), pi(2 * n), zeta(2 * n);
+  DeviceBuffer<double> anchor(elements), ordinary(count * elements), reused(count * elements);
+  DeviceBuffer<std::size_t> moved(count);
+  DeviceBuffer<std::uint64_t> anchor_status(1), ordinary_status(1), reused_status(1);
+  std::vector<double> coordinates(3 * count * n, 2.0), nuclear_positions(6, 0.0);
+  std::vector<double> coefficients(2 * n, .75 * std::numeric_limits<double>::max()), exponents(2 * n, 100.0);
+  nuclei.upload(nuclear_positions.data(), nuclear_positions.size());
+  pi.upload(coefficients.data(), coefficients.size());
+  zeta.upload(exponents.data(), exponents.size());
+  const std::uint64_t clear = UINT64_MAX;
+  std::vector<double> expected(count * elements), actual(count * elements);
+  for (bool repaired : {true, false})
+  {
+    std::fill(coordinates.begin(), coordinates.end(), 2.0);
+    const std::size_t row = repaired ? 0 : 1;
+    if (!repaired)
+      for (std::size_t b = 0; b < count; ++b)
+        std::fill_n(coordinates.begin() + b * 3 * n, 3, 0.0);
+    const std::size_t rows[count]{row, row};
+    positions.upload(coordinates.data(), coordinates.size());
+    moved.upload(rows, count);
+    anchor_status.upload(&clear, 1);
+    ordinary_status.upload(&clear, 1);
+    reused_status.upload(&clear, 1);
+    // For repaired=true, only the private base's row0 is at the overflowing nucleus.
+    checkRuntime(launchComplexValueEnvelopeAnchor(queue.getNative(), layout, cell, positions.data(), nuclei.data(),
+        pi.data(), pi.data(), zeta.data(), zeta.data(), row, 0, 0, 0, anchor.data(), anchor_status.data()),
+        "invalid private envelope anchor");
+    checkRuntime(launchComplexValueEnvelopes(queue.getNative(), layout, cell, positions.data(), nuclei.data(),
+        pi.data(), pi.data(), zeta.data(), zeta.data(), ordinary.data(), ordinary_status.data()),
+        "canonical fallback envelope");
+    checkRuntime(launchComplexValueVirtualEnvelopes(queue.getNative(), layout, cell, positions.data(), nuclei.data(),
+        pi.data(), pi.data(), zeta.data(), zeta.data(), anchor.data(), moved.data(), anchor_status.data(),
+        reused.data(), reused_status.data()), "private fallback envelope");
+    queue.sync();
+    std::uint64_t private_failure = clear, expected_failure = clear, actual_failure = clear;
+    anchor_status.download(&private_failure, 1);
+    ordinary_status.download(&expected_failure, 1);
+    reused_status.download(&actual_failure, 1);
+    ordinary.download(expected.data(), expected.size());
+    reused.download(actual.data(), actual.size());
+    if (private_failure == clear || expected_failure != actual_failure ||
+        (repaired ? expected_failure != clear : expected_failure == clear))
+      throw std::runtime_error("Private envelope fallback introduced or reordered a scientific failure");
+    // Failed canonical elements need not publish a value; compare all regular elements only.
+    for (std::size_t i = 0; i < actual.size(); ++i)
+      if (repaired || (i / n) % n != 0)
+        if (std::memcmp(&expected[i], &actual[i], sizeof(double)))
+          throw std::runtime_error("Private envelope fallback changed canonical regular element bits");
+  }
+  std::cout << "PASS virtual envelope fallback: repaired_base=1 unrepaired_first_failure=exact old_GPU_bits=exact\n";
+}
+
+/// Check the eligible request owner against complete CPU and old GPU VALUE, including epoch and lifetime boundaries.
+void validateComplexVirtualEnvelopeOwner()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  const auto descriptors = makeTargetCostPlan(64, true, true);
+  const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
+      PSIFORMER_COMPLEX_PERIODIC_V1, descriptors.environment());
+  const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
+  const auto n = plan.modelShape().electrons(), ni = plan.modelShape().nuclei;
+  std::vector<double> nuclei(3 * ni), base(3 * n);
+  for (std::size_t i = 0; i < nuclei.size(); ++i) nuclei[i] = .23 + .071 * i;
+  for (std::size_t i = 0; i < base.size(); ++i) base[i] = 2.0 + 1.7 * std::sin(.37 * (i + 1));
+  std::vector<pf::Layout> layouts;
+  for (const auto& tensor : initialized.layouts)
+    layouts.push_back({tensor.module, tensor.name, tensor.shape, tensor.begin, tensor.end});
+  pf::ConfigData configuration(pf::Tensor({1, n, 3}, base), pf::Tensor({ni, 3}, nuclei),
+      pf::Tensor({ni}, std::vector<double>(ni, 1)), n / 2, n - n / 2, plan.modelShape().determinants);
+  pf::PsiFormer model(pf::Parameters(initialized.values, layouts), std::move(configuration));
+  pf::DirectComplexValueExecutor cpu(model, plan);
+  auto workspace = cpu.makeWorkspace();
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  AcceleratorBlasHandle blas(queue);
+  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
+  const auto ordinary = estimateComplexValueCost(plan, 3);
+  const auto cost = estimateComplexValueCost(plan, 3, true, true);
+  if (cost.envelope_anchor_bytes != 8 * plan.modelShape().determinants * n * n ||
+      cost.device_bytes - ordinary.device_bytes != cost.envelope_anchor_bytes + 3 * sizeof(std::size_t) + 8 ||
+      cost.host_bytes - ordinary.host_bytes != 3 * n * sizeof(double) + 3 * sizeof(std::size_t))
+    throw std::runtime_error("Virtual envelope checked per-domain cost is inconsistent");
+  const auto reject = [](auto&& operation, const char* message) {
+    bool rejected = false;
+    try { operation(); }
+    catch (const std::exception&) { rejected = true; }
+    if (!rejected) throw std::runtime_error(message);
+  };
+  reject([&] { (void)estimateComplexValueCost(makeTargetCostPlan(32, true, true), 3, true, true); },
+         "Virtual envelope admitted Ne<64");
+  reject([&] { (void)estimateComplexValueCost(plan, 3, false, true); },
+         "Virtual envelope admitted retained-role costing");
+  if (estimateComplexScoreCost(plan).forward.envelope_anchor_bytes)
+    throw std::runtime_error("Retained score inherited virtual envelope storage");
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "virtual envelope owner device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "virtual envelope owner device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto before_denial = metrics.snapshot();
+  reject([&] { (void)PreparedDeviceComplexValue::prepare(image, 3, queue, blas, cost.device_bytes - 1, true); },
+         "Virtual envelope cost-minus-one allocated an owner");
+  if (metrics.snapshot().allocation_calls != before_denial.allocation_calls)
+    throw std::runtime_error("Virtual envelope budget denial allocated storage");
+  auto reference = PreparedDeviceComplexValue::prepare(image, 3, queue, blas, ordinary.device_bytes);
+  const auto before_owner = metrics.snapshot();
+  auto cached = PreparedDeviceComplexValue::prepare(image, 3, queue, blas, cost.device_bytes, true);
+  if (metrics.snapshot().live_bytes - before_owner.live_bytes != cost.device_bytes)
+    throw std::runtime_error("Virtual envelope actual DEVICE owner differs from checked cost");
+  cached->evaluate(base);
+  const auto preserved = cached->resultView();
+  std::vector<ComplexValueResult> accepted(1), observed(1);
+  cached->download(preserved, accepted);
+  const auto before_begin = metrics.snapshot();
+  auto request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  if (metrics.snapshot().uploaded_bytes != before_begin.uploaded_bytes ||
+      metrics.snapshot().downloaded_bytes != before_begin.downloaded_bytes ||
+      cached->resultView().generation != preserved.generation || cached->resultView().count != preserved.count)
+    throw std::runtime_error("Virtual envelope begin changed ordinary epoch/count or transferred storage");
+  cached->download(preserved, observed);
+  if (std::memcmp(accepted.data(), observed.data(), sizeof(ComplexValueResult)))
+    throw std::runtime_error("Virtual envelope begin changed the published ordinary amplitude");
+  auto invalid_base = base;
+  invalid_base.back() = std::numeric_limits<double>::quiet_NaN();
+  reject([&] { (void)cached->beginVirtualEnvelopeBase(invalid_base.data(), invalid_base.size()); },
+         "Virtual envelope accepted a nonfinite base");
+  reject([&] { (void)cached->beginVirtualEnvelopeBase(base.data(), base.size() - 1); },
+         "Virtual envelope accepted a truncated base");
+  cached->download(preserved, observed);
+  if (std::memcmp(accepted.data(), observed.data(), sizeof(ComplexValueResult)))
+    throw std::runtime_error("Invalid virtual envelope begin revoked or changed an ordinary amplitude");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  const auto warm = metrics.snapshot();
+  const auto fingerprint = cached->virtualEnvelopeStorageFingerprint();
+  std::size_t comparisons = 0;
+  double max_cpu_log = 0, max_cpu_phase = 0;
+  std::exception_ptr first_cpu_failure;
+  const auto compare = [&](const std::vector<std::size_t>& rows) {
+    std::vector<double> positions;
+    for (std::size_t b = 0; b < rows.size(); ++b)
+    {
+      positions.insert(positions.end(), base.begin(), base.end());
+      if (rows[b] == n)
+        for (std::size_t i = 0; i < base.size(); ++i)
+          positions[b * base.size() + i] += .041 + .003 * b;
+      else
+        positions[b * base.size() + 3 * rows[b]] += .031 + .002 * b;
+    }
+    reference->evaluate(positions);
+    std::vector<ComplexValueResult> expected(rows.size()), actual(rows.size());
+    reference->download(reference->resultView(), expected);
+    cached->evaluateVirtualTile(request, positions, [&](std::size_t b) { return rows[b]; });
+    cached->download(cached->resultView(), actual);
+    if (std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(ComplexValueResult)))
+      throw std::runtime_error("Virtual envelope complete GPU VALUE differs from ordinary GPU bits");
+    for (std::size_t b = 0; b < rows.size(); ++b)
+    {
+      workspace->setPositions(pf::GeometryPositionView::interleaved(positions.data() + b * base.size(), n));
+      const auto& result = cpu.evaluate(*workspace);
+      if (result.amplitude.isZero())
+      {
+        if (actual[b].status != 1 || cuCreal(actual[b].phase) || cuCimag(actual[b].phase))
+          throw std::runtime_error("Virtual envelope CPU node contract differs");
+      }
+      else
+      {
+        const auto phase = std::complex<double>(cuCreal(actual[b].phase), cuCimag(actual[b].phase));
+        max_cpu_log = std::max(max_cpu_log, std::abs(actual[b].log_abs - result.amplitude.log_abs));
+        max_cpu_phase = std::max(max_cpu_phase, std::abs(phase - result.amplitude.phase));
+        if (std::abs(actual[b].log_abs - result.amplitude.log_abs) > 2e-10 * (1 + std::abs(result.amplitude.log_abs)) ||
+            std::abs(phase.real() - result.amplitude.phase.real()) > 2e-10 * (1 + std::abs(result.amplitude.phase.real())) ||
+            std::abs(phase.imag() - result.amplitude.phase.imag()) > 2e-10 * (1 + std::abs(result.amplitude.phase.imag())))
+          std::cout << std::setprecision(17) << "VIRTUAL_ENVELOPE_STRICT_CPU_FAILURE b=" << b
+                    << " moved_row=" << rows[b] << " old_log=" << expected[b].log_abs
+                    << " cache_log=" << actual[b].log_abs << " cpu_log=" << result.amplitude.log_abs
+                    << " old_phase=" << cuCreal(expected[b].phase) << ',' << cuCimag(expected[b].phase)
+                    << " cache_phase=" << phase << " cpu_phase=" << result.amplitude.phase
+                    << " old_cpu_log_abs=" << std::abs(expected[b].log_abs - result.amplitude.log_abs)
+                    << " cache_cpu_log_abs=" << std::abs(actual[b].log_abs - result.amplitude.log_abs)
+                    << " old_cpu_phase_abs=" << std::abs(std::complex<double>(cuCreal(expected[b].phase),
+                         cuCimag(expected[b].phase)) - result.amplitude.phase)
+                    << " cache_cpu_phase_abs=" << std::abs(phase - result.amplitude.phase)
+                    << " old_cancel=" << expected[b].cancellation_ratio
+                    << " cache_cancel=" << actual[b].cancellation_ratio << " cpu_cancel=" << result.cancellation_ratio
+                    << " singular_channels=" << actual[b].singular_channels << " old_cache_bits=exact\n";
+        try
+        {
+          near(actual[b].log_abs, result.amplitude.log_abs, "virtual envelope CPU log", 2e-10);
+          near(phase.real(), result.amplitude.phase.real(), "virtual envelope CPU phase real", 2e-10);
+          near(phase.imag(), result.amplitude.phase.imag(), "virtual envelope CPU phase imaginary", 2e-10);
+        }
+        catch (...)
+        {
+          // Continue independent exact-GPU/lifetime checks, but retain the first strict CPU failure.
+          if (!first_cpu_failure) first_cpu_failure = std::current_exception();
+        }
+      }
+      ++comparisons;
+    }
+  };
+  compare({0, n / 2 - 1, n - 1});
+  compare({n / 2});
+  compare({n - 1, 0});
+  compare({0, n, n - 1});
+  compare({n - 1, n});
+  const auto last = cached->resultView();
+  cached->endVirtualEnvelopeBase();
+  if (cached->resultView().generation != last.generation)
+    throw std::runtime_error("Virtual envelope end changed the published amplitude epoch");
+  reject([&] { cached->evaluateVirtualTile(request, base, [](std::size_t) { return 0; }); },
+         "Virtual envelope consumed an ended request");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  auto invalid_metadata = base;
+  invalid_metadata.insert(invalid_metadata.end(), base.begin(), base.end());
+  reject([&] { cached->evaluateVirtualTile(request, invalid_metadata,
+      [&](std::size_t b) { return b ? n + 1 : 0; }); }, "Virtual envelope accepted metadata above its fallback sentinel");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  reject([&] { cached->evaluateVirtualTile(request, base, [&](std::size_t) { return n; }); },
+         "Virtual envelope admitted a first-point fallback without a named anchor row");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  auto wrong_row = base;
+  wrong_row[3] += .07;
+  reject([&] { cached->evaluateVirtualTile(request, wrong_row, [](std::size_t) { return 0; }); },
+         "Virtual envelope reused a changed unnamed row");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  compare({0, n - 1});
+  auto foreign_request = request;
+  foreign_request.owner = reference.get();
+  reject([&] { cached->evaluateVirtualTile(foreign_request, base, [](std::size_t) { return 0; }); },
+         "Virtual envelope consumed a foreign owner token");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  auto node = base;
+  std::copy_n(base.data() + 3, 3, node.data());
+  reference->evaluate(node);
+  std::vector<ComplexValueResult> old_node(1), new_node(1);
+  reference->download(reference->resultView(), old_node);
+  cached->evaluateVirtualTile(request, node, [](std::size_t) { return 0; });
+  cached->download(cached->resultView(), new_node);
+  if (std::memcmp(old_node.data(), new_node.data(), sizeof(ComplexValueResult)) || new_node[0].status != 1)
+    throw std::runtime_error("Virtual envelope changed an exact coincident-row node");
+  if (metrics.snapshot().allocation_calls != warm.allocation_calls ||
+      metrics.snapshot().free_calls != warm.free_calls || cached->virtualEnvelopeStorageFingerprint() != fingerprint)
+    throw std::runtime_error("Virtual envelope warmed request changed storage");
+  const auto stale = request;
+  auto successor = image->makeUpdatedImage(initialized.values, 1);
+  cached->validateModelRebind(successor);
+  const auto adoption = metrics.snapshot();
+  cached->adoptPreparedModel(successor);
+  reference->rebindModel(successor);
+  reject([&] { cached->evaluateVirtualTile(stale, base, [](std::size_t) { return 0; }); },
+         "Virtual envelope retained an adopted-image request");
+  if (metrics.snapshot().allocation_calls != adoption.allocation_calls)
+    throw std::runtime_error("Virtual envelope adoption allocated request storage");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  compare({0});
+  auto successor2 = successor->makeUpdatedImage(initialized.values, 2);
+  cached->rebindModel(successor2);
+  reference->rebindModel(successor2);
+  reject([&] { cached->evaluateVirtualTile(request, base, [](std::size_t) { return 0; }); },
+         "Virtual envelope retained a rebound request");
+  request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+  compare({n - 1});
+  for (int pass : {0, 1})
+    for (int action : {0, 1, 2})
+    {
+      request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+      int calls = 0;
+      reject([&] {
+        cached->evaluateVirtualTile(request, base, [&](std::size_t) {
+          if (calls++ == pass)
+          {
+            if (action == 0) cached->endVirtualEnvelopeBase();
+            else if (action == 1) (void)cached->beginVirtualEnvelopeBase(base.data(), base.size());
+            else cached->rebindModel(successor2);
+          }
+          return 0;
+        });
+      }, "Virtual envelope accepted accessor reentry during authority validation");
+      request = cached->beginVirtualEnvelopeBase(base.data(), base.size());
+      compare({0});
+    }
+  cached->endVirtualEnvelopeBase();
+  if (first_cpu_failure)
+  {
+    std::cout << "VIRTUAL_ENVELOPE_GPU_LIFECYCLE_PASS CPU_GATE_FAILED Ne=" << n
+              << " comparisons=" << comparisons << " old_GPU_bits=exact warm_allocations=0"
+              << " max_cpu_log=" << max_cpu_log << " max_cpu_phase=" << max_cpu_phase << '\n';
+    std::rethrow_exception(first_cpu_failure);
+  }
+  std::cout << "PASS virtual envelope owner: Ne=" << n << " capacity=3 CPU_comparisons=" << comparisons
+            << " max_cpu_log=" << max_cpu_log << " max_cpu_phase=" << max_cpu_phase
+            << " old_GPU_bits=exact begin_ordinary_epoch_unchanged=1 invalid_begin_preserved=1"
+            << " warm_allocations=0 exact_cost=1 stale_adopt_rebind=1\n";
+}
+
 /// Numerical-only complete VALUE gate; fixture builders are the periodic validator's.
 void validateComplexValue()
 {
   validateComplexValuePairOwner();
   validateComplexValuePairEvents();
+  validateComplexVirtualEnvelopeFallback();
+  validateComplexVirtualEnvelopeOwner();
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
   ExecutionEnvironment environment;

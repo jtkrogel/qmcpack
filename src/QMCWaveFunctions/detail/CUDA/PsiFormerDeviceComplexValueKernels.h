@@ -35,6 +35,19 @@ Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, pe
     const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status);
 
+/// Reconstruct the exact accepted base using the first point and three by-value moved-row coordinates.
+Error launchComplexValueEnvelopeAnchor(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, std::size_t moved_row,
+    double base_x, double base_y, double base_z, double* anchor, std::uint64_t* anchor_status);
+
+/// Reuse only unchanged envelope rows, or rebuild every element if private anchor preparation failed.
+Error launchComplexValueVirtualEnvelopes(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const double* anchor,
+    const std::size_t* moved_rows, const std::uint64_t* anchor_status,
+    double* envelope, std::uint64_t* status);
+
 /// Consume both real projections immediately into the one complex matrix allocation.
 Error launchComplexValuePack(Stream stream, std::size_t count, const double* envelope,
     const double* projected_real, const double* projected_imag, cuDoubleComplex* matrix, std::uint64_t* status);
