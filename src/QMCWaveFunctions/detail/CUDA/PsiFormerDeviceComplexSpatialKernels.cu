@@ -67,8 +67,9 @@ __device__ double component(const double* e, const double* z, std::size_t plane,
 }
 
 /// Pack once: contiguous value matrices become LU while derivative planes survive.
+template<bool SeparateValue = false>
 __global__ void headKernel(OpenOrbitalJetLayout layout, const double* envelope, const double* real,
-    const double* imag, cuDoubleComplex* head, std::uint64_t* status)
+    const double* imag, cuDoubleComplex* head, std::uint64_t* status, cuDoubleComplex* current_value = nullptr)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto matrix_span = layout.orbitals.element_count;
@@ -77,10 +78,19 @@ __global__ void headKernel(OpenOrbitalJetLayout layout, const double* envelope, 
     return;
   const auto plane = index / m, configuration = (index % m) / matrix_span, element = index % matrix_span;
   const auto origin = configuration * planes * matrix_span;
-  head[index] = make_cuDoubleComplex(component(envelope + origin, real + origin, plane, element,
+  const auto value = make_cuDoubleComplex(component(envelope + origin, real + origin, plane, element,
       matrix_span, layout.orbitals.laplacian_lanes), component(envelope + origin, imag + origin, plane,
       element, matrix_span, layout.orbitals.laplacian_lanes));
-  if (!finite(head[index]))
+  if constexpr (SeparateValue)
+  {
+    if (plane == 0)
+      current_value[index] = value;
+    else
+      head[index] = value;
+  }
+  else
+    head[index] = value;
+  if (!finite(value))
     fail(status, index);
 }
 
@@ -416,6 +426,22 @@ Error launchComplexSpatialHead(Stream stream, OpenOrbitalJetLayout layout, const
       layout.orbitals.configuration_stride != layout.orbitals.plane_count * layout.orbitals.element_count)
     throw std::invalid_argument("Complex FULL head requires packed real source planes");
   headKernel<<<blocks(spatialJetSpanElements(layout.orbitals)), 128, 0, stream>>>(layout, envelope, real, imag, head, status);
+  return launched();
+}
+
+/// The same product rule and failure index apply even when VALUE uses trace scratch.
+Error launchComplexSpatialHeadSeparateValue(Stream stream, OpenOrbitalJetLayout layout, const double* envelope,
+    const double* real, const double* imag, cuDoubleComplex* head, cuDoubleComplex* current_value,
+    std::uint64_t* status)
+{
+  validateOpenOrbitalJetLayout(layout);
+  if (layout.features.mode != SpatialJetMode::FULL_VGL || !envelope || !real || !imag || !head ||
+      !current_value || head == current_value || !status ||
+      layout.orbitals.plane_stride != layout.orbitals.element_count ||
+      layout.orbitals.configuration_stride != layout.orbitals.plane_count * layout.orbitals.element_count)
+    throw std::invalid_argument("Target head requires distinct packed derivative and current VALUE storage");
+  headKernel<true><<<blocks(spatialJetSpanElements(layout.orbitals)), 128, 0, stream>>>(
+      layout, envelope, real, imag, head, status, current_value);
   return launched();
 }
 

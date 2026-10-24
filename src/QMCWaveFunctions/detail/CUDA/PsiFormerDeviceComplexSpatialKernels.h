@@ -12,6 +12,11 @@ namespace qmcplusplus::psiformer::device
 Error launchComplexSpatialHead(Stream stream, OpenOrbitalJetLayout layout, const double* envelope,
     const double* real, const double* imag, cuDoubleComplex* head, std::uint64_t* status);
 
+/// Preserve canonical raw VALUE in head while current VALUE occupies dead trace scratch.
+Error launchComplexSpatialHeadSeparateValue(Stream stream, OpenOrbitalJetLayout layout, const double* envelope,
+    const double* real, const double* imag, cuDoubleComplex* head, cuDoubleComplex* current_value,
+    std::uint64_t* status);
+
 /// Require every inverse and combine physical CORE G/Llog/Lratio without conjugation.
 Error launchComplexSpatialTraces(Stream stream, std::size_t batch, std::size_t determinants, std::size_t n,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,

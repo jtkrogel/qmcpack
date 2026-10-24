@@ -163,15 +163,33 @@ __device__ bool inverseFromLu(const cuDoubleComplex* a, std::size_t n, double sc
 }
 
 /// Serial-per-channel scaled partial-pivot LU; zero pivots are singular, not errors.
-template<bool CollectPivots, bool EmitScale = false>
+template<bool CollectPivots, bool EmitScale = false, bool ReuseRaw = false>
 __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
     ComplexValueChannel* metadata, std::uint64_t* status,
-    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve, double* minimum_scaled_pivots)
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve, double* minimum_scaled_pivots,
+    cuDoubleComplex* canonical_raw = nullptr, bool reuse_previous = false, std::uint8_t* decisions = nullptr)
 {
   const auto channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= channels)
     return;
   auto* a = matrices + channel * n * n;
+  if constexpr (ReuseRaw)
+  {
+    static_assert(!CollectPivots && !EmitScale);
+    auto* canonical = canonical_raw + channel * n * n;
+    bool identical = reuse_previous && metadata[channel].status == 0;
+    for (std::size_t i = 0; identical && i < n * n; ++i)
+      identical = finite(a[i]) && finite(inverse[channel * n * n + i]) &&
+          __double_as_longlong(cuCreal(a[i])) == __double_as_longlong(cuCreal(canonical[i])) &&
+          __double_as_longlong(cuCimag(a[i])) == __double_as_longlong(cuCimag(canonical[i]));
+    if (decisions)
+      decisions[channel] = identical ? 1 : (reuse_previous ? 2 : 0);
+    // Do not reset accepted channels, permutations or inverse before this guard.
+    if (identical)
+      return;
+    for (std::size_t i = 0; i < n * n; ++i)
+      canonical[i] = a[i];
+  }
   auto* perm = permutation ? permutation + channel * n : nullptr;
   if (perm)
     for (std::size_t i = 0; i < n; ++i)
@@ -688,6 +706,25 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     factorCooperative<false><<<static_cast<unsigned>(channels), 256, 0, stream>>>(channels, n, matrix, metadata, status, nullptr);
   else
     factor<false><<<serial_blocks, 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve, nullptr);
+  return launched();
+}
+
+/// Exact raw-matrix fallback shares the unchanged scalar factor/inverse body.
+Error launchComplexTargetFactorReuse(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* current, cuDoubleComplex* canonical_raw, bool reuse_previous,
+    ComplexValueChannel* metadata, std::uint64_t* status, cuDoubleComplex* inverse,
+    std::size_t* permutation, cuDoubleComplex* solve, std::uint8_t* decisions)
+{
+  if (!channels || !n || !current || !canonical_raw || !metadata || !status || !inverse || !permutation || !solve ||
+      current == canonical_raw || canonical_raw == inverse || current == inverse)
+    throw std::invalid_argument("Target factor reuse requires distinct current/raw/inverse storage");
+  const auto elements = spatial_detail::checkedProduct(channels,
+      spatial_detail::checkedProduct(n, n, "Target factor matrix extent overflow"),
+      "Target factor matrix extent overflow");
+  if (elements - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8))
+    throw std::overflow_error("Target factor reuse exceeds status indexing");
+  factor<false, false, true><<<blocks(channels), 128, 0, stream>>>(channels, n, current, metadata, status,
+      inverse, permutation, solve, nullptr, canonical_raw, reuse_previous, decisions);
   return launched();
 }
 

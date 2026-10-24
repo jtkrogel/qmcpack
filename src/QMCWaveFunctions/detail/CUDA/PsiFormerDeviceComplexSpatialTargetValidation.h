@@ -15,6 +15,35 @@ namespace qmcplusplus::psiformer::device
 /// Test-only existing target phase access, not a production fault API.
 struct ComplexSpatialTargetValidationAccess
 {
+  /// Observe two actual owner slabs using separately charged test-only decision bytes.
+  static void factorDecisions(PreparedDeviceComplexSpatial& owner, const std::vector<double>& positions)
+  {
+    auto& t = *owner.trunk_;
+    if (!owner.factor_reuse_ || t.ne_ <= 2 * t.target_preparation_.max_targets)
+      throw std::runtime_error("Target factor decision fixture requires two complete slabs");
+    const auto channels = positions.size() / (3 * t.ne_) * t.shape_.determinants;
+    DeviceBuffer<std::uint8_t> decisions(channels);
+    std::vector<std::uint8_t> values(channels);
+    owner.invalidate();
+    t.beginCoordinateEvaluation();
+    t.setBatchCount(positions.size() / (3 * t.ne_));
+    t.positions_.upload(positions.data(), positions.size());
+    owner.prepareTarget(0, t.target_preparation_.max_targets, false, decisions.data());
+    decisions.download(values.data(), channels);
+    if (!std::all_of(values.begin(), values.end(), [](auto value) { return value == 0; }))
+      throw std::runtime_error("Target owner did not cold-factor the first request slab");
+    owner.finishTarget(0);
+    owner.prepareTarget(t.target_preparation_.max_targets, t.target_preparation_.max_targets, true, decisions.data());
+    decisions.download(values.data(), channels);
+    const auto reused = std::count(values.begin(), values.end(), std::uint8_t(1));
+    if (!reused || !std::all_of(values.begin(), values.end(), [](auto value) { return value == 1 || value == 2; }))
+      throw std::runtime_error("Target owner did not exercise guarded same-request factor reuse");
+    owner.finishTarget(t.target_preparation_.max_targets);
+    std::cout << "PASS target owner decision proof cold_channels=" << channels << " reused_channels=" << reused
+              << " fallback_channels=" << channels - reused << " test_only_device_bytes=" << channels
+              << " partial_result_published=0\n";
+  }
+
   /// Inspect omissions and inject failure on the actual last target after earlier success.
   static void failLate(PreparedDeviceComplexSpatial& owner, const std::vector<double>& positions)
   {
@@ -32,7 +61,7 @@ struct ComplexSpatialTargetValidationAccess
       for (std::size_t begin = 0; begin < t.ne_;)
       {
         const auto count = std::min(t.target_preparation_.max_targets, t.ne_ - begin);
-        owner.prepareTarget(begin, count);
+        owner.prepareTarget(begin, count, completed != 0);
         if (begin + count == t.ne_)
         {
           const auto invalid = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0);
@@ -60,19 +89,30 @@ struct ComplexSpatialTargetValidationAccess
 };
 
 /// Exercise the existing head bank with compact K/B tails and complete target products.
-inline void validateBatchedHeadTargetOwner()
+inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
 {
   constexpr std::size_t n = 64, capacity = 3, k = 7, trace_targets = 3;
   const auto descriptors = makeTargetCostPlan(n, true, true);
   const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
       PSIFORMER_COMPLEX_PERIODIC_V1, descriptors.environment());
   const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
-  const auto old_cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets);
-  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, true);
+  // Reuse compares against an already-batched baseline; the existing head test compares unbatched/batched.
+  const bool baseline_batched_projection = factor_reuse;
+  const auto old_cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, baseline_batched_projection);
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, true, factor_reuse);
   const auto pointer_bytes = 2 * orbitalProjectionPointerBytes(capacity, 1 + 4 * k,
       plan.modelShape().determinants, 2);
+  if (factor_reuse)
+  {
+    bool rejected = false;
+    try { (void)estimateComplexSpatialTargetCost(plan, k, capacity, 0, true, true); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected)
+      throw std::runtime_error("Target factor reuse admitted absent concurrent scratch");
+  }
   if (cost.projection_pointer_bytes != pointer_bytes ||
-      cost.device_bytes - old_cost.device_bytes != pointer_bytes || cost.host_bytes != old_cost.host_bytes)
+      cost.device_bytes - old_cost.device_bytes != (factor_reuse ? 0 : pointer_bytes) ||
+      cost.host_bytes != old_cost.host_bytes)
     throw std::runtime_error("Target head bank per-domain preflight differs from its exact capacity");
 
   std::vector<double> nuclei(3 * plan.modelShape().nuclei), positions(capacity * 3 * n);
@@ -101,21 +141,23 @@ inline void validateBatchedHeadTargetOwner()
   {
     bool rejected = false;
     try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-        {k, cost.device_bytes - bytes, work - !bytes}, capacity, trace_targets, true); }
+        {k, cost.device_bytes - bytes, work - !bytes}, capacity, trace_targets, true, factor_reuse); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != denied.allocation_calls)
       throw std::runtime_error("Target head cost/work-minus-one allocated numeric storage");
   }
   auto ordinary = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-      {k, old_cost.device_bytes, work}, capacity, trace_targets);
+      {k, old_cost.device_bytes, work}, capacity, trace_targets, baseline_batched_projection);
   const auto cold = metrics.snapshot();
   auto batched = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-      {k, cost.device_bytes, work}, capacity, trace_targets, true);
+      {k, cost.device_bytes, work}, capacity, trace_targets, true, factor_reuse);
   if (metrics.snapshot().live_bytes - cold.live_bytes != cost.device_bytes)
     throw std::runtime_error("Target head actual owner bytes differ from admission");
   const auto fingerprint = batched->traceStorageFingerprint();
   auto full = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas,
       estimateComplexSpatialCost(plan, 1, trace_targets).device_bytes, trace_targets);
+  if (factor_reuse)
+    ComplexSpatialTargetValidationAccess::factorDecisions(*batched, positions);
 
   double max_head = 0, max_full = 0;
   std::size_t comparisons = 0, nonexact_head = 0;
@@ -178,6 +220,12 @@ inline void validateBatchedHeadTargetOwner()
     }
   };
   for (std::size_t live : {3u, 1u, 2u}) compare(live, live == 1);
+  if (factor_reuse)
+  {
+    positions[0] += .013;
+    compare(1, false); // A different coordinate request must start cold.
+    positions[0] -= .013;
+  }
   auto parameters = initialized.values;
   for (const auto& tensor : plan.parameterTensors())
     if (tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT) parameters[tensor.begin] += .0001;
@@ -206,6 +254,7 @@ inline void validateBatchedHeadTargetOwner()
     throw std::runtime_error("Target head late failure published stale or partial products");
   compare(1, false);
   std::cout << std::setprecision(17) << "PASS target batched head Ne64 B3 K7 T3 comparisons=" << comparisons
+            << " factor_reuse=" << factor_reuse
             << " max_head=" << max_head << " nonexact_head_fields=" << nonexact_head << " max_FULL=" << max_full
             << " pointer_device_bytes=" << pointer_bytes << " pointer_host_bytes=0 cost_minus_one_noalloc=1"
             << " liveB=3,1,2 K_tail=1 active_head_rebind=1 warm_allocations=0 added_HOST_transfers=0 late_rollback=1\n";

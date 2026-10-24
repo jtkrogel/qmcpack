@@ -89,13 +89,22 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
 /// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
 inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
                                                          std::size_t batch = 1, std::size_t concurrent_targets = 0,
-                                                         bool batched_projection = false)
+                                                         bool batched_projection = false, bool factor_reuse = false)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex target extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex target bytes overflow"); };
   const auto& s = plan.modelShape();
+  if (factor_reuse)
+  {
+    if (!concurrent_targets || !supportsComplexInverseColumnsProfile(plan.environment(), s.electrons()))
+      throw std::invalid_argument("Target factor reuse requires ordinary fixed paired FP64 Ne>=64 and trace scratch");
+    const auto scratch = planComplexSpatialTraceWorkspace(batch, s.determinants, s.electrons(), targets,
+        concurrent_targets);
+    if (scratch.product_elements < base.matrices)
+      throw std::length_error("Target factor reuse cannot hold current raw matrices in trace scratch");
+  }
   const auto n = s.electrons(), bn = mul(batch, n), h = mul(add(1, mul(4, targets)), base.matrices);
   if (h - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8) ||
       (h - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
@@ -164,13 +173,14 @@ public:
   /// Explicit batch target admission precedes every prefix/head/output allocation.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation,
-      std::size_t capacity = 1, std::size_t concurrent_targets = 0, bool batched_projection = false)
+      std::size_t capacity = 1, std::size_t concurrent_targets = 0, bool batched_projection = false,
+      bool factor_reuse = false)
   {
     if (!image || !preparation.max_targets || !preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget)
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
     const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity,
-        concurrent_targets, batched_projection);
+        concurrent_targets, batched_projection, factor_reuse);
     const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Complex target VGL exceeds its per-owner byte/work caps");
@@ -180,7 +190,7 @@ public:
                 << " K=" << preparation.max_targets << " pointer_device_bytes=" << cost.projection_pointer_bytes
                 << " pointer_host_bytes=0; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
-        std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets));
+        std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets, false, factor_reuse));
   }
 
   /// Revoke all products before a same-family successor can replace the current image.
@@ -315,7 +325,8 @@ private:
   friend struct ComplexSpatialTargetValidationAccess;
 
   /// One mapped prefix/cusp plus paired head; no reverse ticket or retained tape.
-  void prepareTarget(std::size_t begin, std::size_t count)
+  void prepareTarget(std::size_t begin, std::size_t count, bool reuse_previous = false,
+      std::uint8_t* test_decisions = nullptr)
   {
     auto& t = *trunk_;
     t.setTargetRange(begin, count);
@@ -323,7 +334,7 @@ private:
     t.evaluatePreparedTrunk();
     t.evaluateCusp();
     t.checkOpen(t.batch_);
-    finishHead();
+    finishHead(nullptr, reuse_previous, test_decisions);
   }
 
   /// Write live K lanes directly into final physical output ranges, without scatter.
@@ -354,10 +365,11 @@ private:
       throw std::invalid_argument("Complex target VGL requires complete configurations within capacity");
     t.setBatchCount(positions.size() / stride);
     t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    bool reuse_previous = false;
     for (std::size_t begin = 0; begin < t.ne_;)
     {
       const auto count = std::min(t.target_preparation_.max_targets, t.ne_ - begin);
-      prepareTarget(begin, count);
+      prepareTarget(begin, count, reuse_previous);
       ComplexValueResult single;
       auto* current = target_current_.empty() ? &single : target_current_.data();
       amplitude_.downloadOnStream(current, t.batch_, t.queue_.getNative());
@@ -369,6 +381,7 @@ private:
                        cuCimag(current[b].phase) - cuCimag(canonical_[b].phase)) > 2e-11)
           throw std::runtime_error("Complex target VGL base changed within one request");
       finishTarget(begin);
+      reuse_previous = true;
       begin += count;
     }
     amplitude_.uploadOnStream(canonical_.get(), t.batch_, t.queue_.getNative());
@@ -377,7 +390,8 @@ private:
   }
 
   /// Consume the shared admitted prefix in the original paired-head/factor order.
-  void finishHead(double* minimum_scaled_pivots = nullptr)
+  void finishHead(double* minimum_scaled_pivots = nullptr, bool reuse_previous = false,
+      std::uint8_t* test_decisions = nullptr)
   {
     auto& t = *trunk_;
     // Two projections consume the SAME real FULL trunk; E supplies only radial jets.
@@ -403,8 +417,13 @@ private:
         "complex FULL envelopes");
     // Physical envelope/domain rejection is hard even during approximate execution.
     if (minimum_scaled_pivots) admitStatus(ComplexValueFailureStage::PHYSICAL_ENVELOPE);
-    checkRuntime(launchComplexSpatialHead(t.queue_.getNative(), t.orbitals_, envelope_.data(), projections_.data(),
-        projections_.data() + cost_.head_elements, head_.data(), status_.data()), "complex FULL product-rule head");
+    if (factor_reuse_)
+      checkRuntime(launchComplexSpatialHeadSeparateValue(t.queue_.getNative(), t.orbitals_, envelope_.data(),
+          projections_.data(), projections_.data() + cost_.head_elements, head_.data(), product_.data(), status_.data()),
+          "complex target product-rule head with raw VALUE scratch");
+    else
+      checkRuntime(launchComplexSpatialHead(t.queue_.getNative(), t.orbitals_, envelope_.data(), projections_.data(),
+          projections_.data() + cost_.head_elements, head_.data(), status_.data()), "complex FULL product-rule head");
     admitStatus(ComplexValueFailureStage::PACKED_HEAD);
 
     // Only the contiguous VALUE plane becomes LU; all derivative planes survive.
@@ -412,6 +431,19 @@ private:
       checkRuntime(launchComplexSpatialFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
           t.ne_, head_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data(),
           minimum_scaled_pivots), "complex FULL inverse diagnostics");
+    else if (factor_reuse_)
+    {
+      if (!factor_reuse_reported_)
+      {
+        std::clog << "  Paired target factor reuse: selected=request_local_exact Ne=" << t.ne_
+                  << " channels=" << t.batch_ * t.shape_.determinants
+                  << "; fallback=current_scalar; extra_device_bytes=0; extra_host_bytes=0; production_counters=no\n";
+        factor_reuse_reported_ = true;
+      }
+      checkRuntime(launchComplexTargetFactorReuse(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
+          product_.data(), head_.data(), reuse_previous, channels_.data(), status_.data(), inverse_.data(),
+          permutation_.data(), solve_.data(), test_decisions), "request-local complex target factors");
+    }
     else if (inverse_columns_ && !t.mixed_dense_)
     {
       if (!inverse_columns_reported_)
@@ -438,11 +470,12 @@ private:
   /// Allocate only the checked FULL trunk/head/inverse/traces inventory.
   PreparedDeviceComplexSpatial(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexSpatialCost cost,
-      TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0, bool inverse_columns = false)
+      TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0, bool inverse_columns = false,
+      bool factor_reuse = false)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), preparation, false, true)),
         capacity_electrons_(capacity * trunk_->ne_), concurrent_targets_(concurrent_targets),
-        inverse_columns_(inverse_columns),
+        inverse_columns_(inverse_columns), factor_reuse_(factor_reuse),
         trace_workspace_(planComplexSpatialTraceWorkspace(capacity, trunk_->shape_.determinants, trunk_->ne_,
             preparation.max_targets ? preparation.max_targets : trunk_->ne_, concurrent_targets)),
         envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
@@ -508,6 +541,7 @@ private:
   std::size_t capacity_electrons_;
   const std::size_t concurrent_targets_;
   const bool inverse_columns_;
+  const bool factor_reuse_;
   const ComplexSpatialTraceWorkspacePlan trace_workspace_;
   DeviceBuffer<double> envelope_, projections_;
   DeviceBuffer<cuDoubleComplex> head_, inverse_, solve_, product_, channel_terms_, outputs_;
@@ -520,6 +554,7 @@ private:
   std::size_t generation_ = 0;
   bool valid_ = false;
   bool inverse_columns_reported_ = false;
+  bool factor_reuse_reported_ = false;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif

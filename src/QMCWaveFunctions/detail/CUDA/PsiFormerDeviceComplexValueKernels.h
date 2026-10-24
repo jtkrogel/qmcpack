@@ -58,6 +58,14 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
+/// Reuse only an accepted bit-identical raw channel within one target request.
+/// Current matrices occupy dead trace scratch; canonical raw matrices survive in head VALUE.
+/// Optional per-channel decisions are test-only (0=cold,1=reuse,2=current fallback).
+Error launchComplexTargetFactorReuse(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* current, cuDoubleComplex* canonical_raw, bool reuse_previous,
+    ComplexValueChannel* metadata, std::uint64_t* status, cuDoubleComplex* inverse,
+    std::size_t* permutation, cuDoubleComplex* solve, std::uint8_t* decisions = nullptr);
+
 /// Preserve scalar LU, then solve independent inverse columns in existing private storage.
 Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
