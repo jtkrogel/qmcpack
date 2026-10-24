@@ -106,6 +106,11 @@ Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layou
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
     const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
 
+/// Pair-disjoint FULL/target periodic jets; same owners and scalar failure replay.
+Error launchPeriodicFeatureJetsCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
+
 /// Pair-disjoint periodic VALUE features with canonical GPU failure replay.
 Error launchPeriodicFeatureValuesCooperative(Stream stream, const OpenFeatureJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,

@@ -333,6 +333,111 @@ __global__ void openFeatureJetsCooperativeKernel(OpenFeatureJetLayout layout,
   }
 }
 
+/// Exact periodic branch of the scalar feature builder, restricted to FULL jets.
+/// There is no inter-pair reduction: every pair owns seven complete columns.
+__device__ bool writePeriodicFeatureJetPair(OpenFeatureJetLayout layout, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, std::size_t configuration,
+    std::size_t electron, std::size_t nucleus, double* output)
+{
+  periodic_geometry::Pair pair;
+  if (!periodic_geometry::evaluatePair(cell,
+      positions + configuration * layout.position_configuration_stride + electron * layout.position_row_stride,
+      nuclei + nucleus * layout.nucleus_row_stride, pair, true))
+    return false;
+  if (pair.radius == 0)
+    return false;
+  const auto radial = device_math::softenedRadial(pair.radius);
+  const std::size_t base = electron * layout.feature_width + 7 * nucleus;
+  output[layout.output.uncheckedValueOffset(configuration, base)] = radial.log1p_radius;
+  const bool differentiated = layout.output.containsTargetElectron(electron);
+  for (std::size_t dimension = 0; dimension < 3 && differentiated; ++dimension)
+  {
+    const auto lane = 3 * (electron - layout.output.target_electron_begin) + dimension;
+    output[layout.output.uncheckedGradientOffset(configuration, lane, base)] =
+        radial.log1p_first * pair.radius_gradient[dimension];
+  }
+  if (differentiated)
+    output[layout.output.uncheckedLaplacianOffset(configuration,
+        electron - layout.output.target_electron_begin, base)] =
+        radial.log1p_second * pair.radius_gradient_norm_squared + radial.log1p_first * pair.radius_laplacian;
+
+  for (std::size_t vector = 0; vector < 2; ++vector)
+    for (std::size_t component = 0; component < 3; ++component)
+    {
+      const double value = vector == 0 ? pair.displacement[component] : pair.complementary[component];
+      const double* jacobian = vector == 0 ? pair.jacobian[component] : pair.complementary_jacobian[component];
+      const double laplacian = vector == 0 ? pair.laplacian[component] : pair.complementary_laplacian[component];
+      const auto element = base + 1 + 3 * vector + component;
+      output[layout.output.uncheckedValueOffset(configuration, element)] = value * radial.log1p_over_radius;
+      double gradient_dot_radius = 0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        gradient_dot_radius += jacobian[dimension] * pair.radius_gradient[dimension];
+        if (differentiated)
+        {
+          const auto lane = 3 * (electron - layout.output.target_electron_begin) + dimension;
+          output[layout.output.uncheckedGradientOffset(configuration, lane, element)] =
+              jacobian[dimension] * radial.log1p_over_radius +
+              value * radial.log1p_over_radius_first * pair.radius_gradient[dimension];
+        }
+      }
+      if (differentiated)
+        output[layout.output.uncheckedLaplacianOffset(configuration,
+            electron - layout.output.target_electron_begin, element)] =
+            laplacian * radial.log1p_over_radius + 2 * radial.log1p_over_radius_first * gradient_dot_radius +
+            value * (radial.log1p_over_radius_second * pair.radius_gradient_norm_squared +
+                       radial.log1p_over_radius_first * pair.radius_laplacian);
+    }
+  return true;
+}
+
+/// Cooperative clear/pairs/scan; failure replay restores scalar partial output and precedence.
+__global__ void periodicFeatureJetsCooperativeKernel(OpenFeatureJetLayout layout,
+    periodic_geometry::Cell cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, std::size_t logical_elements, std::size_t pairs,
+    double* output, OpenSpatialStatus* status)
+{
+  const std::size_t configuration = blockIdx.x;
+  const std::size_t active = active_electrons[configuration];
+  __shared__ unsigned int failed;
+  if (threadIdx.x == 0)
+    failed = 0;
+  // Initialize logical lanes only: padding belongs to the caller.
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)] = 0.0;
+  __syncthreads();
+  if (active >= layout.output.electron_count)
+  {
+    if (threadIdx.x == 0)
+      status[configuration] = open_spatial::buildOpenFeatureJetsForConfiguration(
+          layout, positions, nuclei, configuration, active, output, &cell);
+    return; // Block-uniform: active is configuration-owned.
+  }
+  // No pair shares feature columns or performs a cross-pair numerical reduction.
+  for (std::size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x)
+    if (!writePeriodicFeatureJetPair(layout, cell, positions, nuclei, configuration,
+        pair / layout.nucleus_count, pair % layout.nucleus_count, output))
+      atomicOr(&failed, 1U);
+  // Spin values have one writer; all spin derivatives retain the cleared zero.
+  for (std::size_t electron = threadIdx.x; electron < layout.output.electron_count; electron += blockDim.x)
+    output[layout.output.uncheckedValueOffset(configuration,
+        electron * layout.feature_width + layout.feature_width - 1)] =
+        electron < layout.spin_up_count ? 1.0 : -1.0;
+  __syncthreads();
+  // Match the canonical final finite scan only after every numerical writer ends.
+  for (std::size_t logical = threadIdx.x; logical < logical_elements; logical += blockDim.x)
+    if (!device_math::isFiniteBinary64(output[layout.output.uncheckedPlaneOffset(configuration,
+        logical / layout.output.element_count, logical % layout.output.element_count)]))
+      atomicOr(&failed, 1U);
+  __syncthreads();
+  // A failed configuration is reconstructed in original scalar order, including
+  // its exact partial output and first-error/coalescence precedence.
+  if (threadIdx.x == 0)
+    status[configuration] = failed ? open_spatial::buildOpenFeatureJetsForConfiguration(
+        layout, positions, nuclei, configuration, active, output, &cell) : OpenSpatialStatus::REGULAR;
+}
+
 /// Canonical seven-column torus VALUE expressions; each pair owns disjoint outputs.
 __device__ bool writePeriodicFeatureValuePair(OpenFeatureJetLayout layout, periodic_geometry::Cell cell,
     const double* positions, const double* nuclei, std::size_t configuration,
@@ -1138,6 +1243,31 @@ Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layou
       "PsiFormer periodic feature grid exceeds device x dimension");
   boundaryFeatureJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, nuclei, active_electrons, output, status, cell);
+  return peekSpatialLaunchError();
+}
+
+/// Explicit FULL/target alternative; validates extents before the owner-free launch.
+Error launchPeriodicFeatureJetsCooperative(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.nucleus_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenFeatureJetLayout(layout, true);
+  if (!positions || !nuclei || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer cooperative periodic feature jet storage is null");
+  if (layout.output.mode != SpatialJetMode::FULL_VGL || layout.output.electron_count < 64)
+    return launchPeriodicFeatureJets(stream, layout, cell, positions, nuclei, active_electrons, output, status);
+  if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer cooperative periodic feature jet grid exceeds portable device x dimension");
+  const auto logical_elements = spatial_detail::checkedProduct(layout.output.plane_count,
+      layout.output.element_count, "PsiFormer cooperative periodic feature jet logical extent overflow");
+  const auto pairs = spatial_detail::checkedProduct(layout.output.electron_count,
+      layout.nucleus_count, "PsiFormer cooperative periodic feature jet pair extent overflow");
+  periodicFeatureJetsCooperativeKernel<<<static_cast<unsigned int>(layout.output.configuration_count),
+      spatial_block_size, 0, stream>>>(layout, cell, positions, nuclei, active_electrons,
+          logical_elements, pairs, output, status);
   return peekSpatialLaunchError();
 }
 
