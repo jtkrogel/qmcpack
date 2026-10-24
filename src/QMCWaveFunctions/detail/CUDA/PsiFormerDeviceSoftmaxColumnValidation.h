@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 #include <iostream>
 #include <limits>
 #include <utility>
@@ -20,8 +22,54 @@ namespace qmcplusplus::psiformer::device
 /// Retain the unchanged CPU row helper and original GPU row kernel as independent oracles.
 inline void validateSoftmaxColumnReverse(compute::Queue<PlatformKind::CUDA>& queue)
 {
+  /// Restore only this selector's process environment, including exceptional exits.
+  struct RestoreSelection
+  {
+    bool present;
+    std::string value;
+
+    ~RestoreSelection()
+    {
+      if (present)
+      {
+        setenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE", value.c_str(), 1);
+      }
+      else
+      {
+        unsetenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
+      }
+    }
+  };
+  const char* original_selection = std::getenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
+  RestoreSelection restore{original_selection != nullptr, original_selection ? original_selection : ""};
+  unsetenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
+  if (configuredSoftmaxColumnReverse(63) || !configuredSoftmaxColumnReverse(64) ||
+      !configuredSoftmaxColumnReverse(65))
+    throw std::runtime_error("Softmax automatic width boundary differs");
+  for (const char* selection : {"0", "1"})
+  {
+    setenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE", selection, 1);
+    for (std::size_t width : {std::size_t(63), std::size_t(64), std::size_t(65)})
+      if (configuredSoftmaxColumnReverse(width) != (selection[0] == '1'))
+        throw std::runtime_error("Softmax explicit selector did not override width");
+  }
+  setenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE", "invalid", 1);
+  bool invalid_rejected = false;
+  try
+  {
+    (void)configuredSoftmaxColumnReverse(64);
+  }
+  catch (const std::invalid_argument&)
+  {
+    invalid_rejected = true;
+  }
+  if (!invalid_rejected)
+    throw std::runtime_error("Softmax invalid selector accepted");
+  unsetenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
+
   const std::pair<std::size_t, std::size_t> cases[] = {
-      {1, 1}, {7, 7}, {17, 3}, {100, 1}, {101, 3}, {200, 1}, {203, 3}, {300, 1}, {301, 3}};
+      {1, 1}, {7, 7}, {17, 3}, {63, 1}, {64, 1}, {65, 1},
+      {100, 1}, {101, 3}, {200, 1}, {203, 3}, {300, 1}, {301, 3}};
   for (const auto& [width, targets] : cases)
   {
     const auto layout = makeSoftmaxJetRowLayout(1, 2, width, targets, SpatialJetMode::FULL_VGL,
@@ -64,6 +112,15 @@ inline void validateSoftmaxColumnReverse(compute::Queue<PlatformKind::CUDA>& que
       if (!device_math::isFiniteBinary64(columns[index]) ||
           std::abs(columns[index] - expected[index]) > 2e-12 * (1 + std::abs(expected[index])))
         throw std::runtime_error("Softmax column reverse differs from unchanged CPU row oracle/padding");
+
+    // Exercise the actual six-argument width-aware production overload too.
+    d_columns.upload(initial.data(), span);
+    checkRuntime(launchSoftmaxJetReverse(queue.getNative(), layout, d_logits.data(), d_probabilities.data(),
+        d_seed.data(), d_columns.data()), "softmax automatic width reverse");
+    queue.sync();
+    d_columns.download(columns.data(), span);
+    if (std::memcmp(original.data(), columns.data(), span * sizeof(double)) != 0)
+      throw std::runtime_error("Softmax automatic selection differs from original GPU row oracle");
 
     // Reuse fixed buffers and the original nonzero destination: no cold owner in warmed work.
     d_columns.upload(initial.data(), span);

@@ -22,11 +22,13 @@
 namespace qmcplusplus::psiformer::device
 {
 
-/// Select independent-column GPU work only by an explicit bounded opt-in.
-inline bool configuredSoftmaxColumnReverse()
+/// Select wide-row column work automatically; explicit 0/1 always overrides.
+inline bool configuredSoftmaxColumnReverse(std::size_t row_width = 0)
 {
   const char* value = std::getenv("PSIFORMER_GPU_SOFTMAX_COLUMN_REVERSE");
-  if (!value || std::string_view(value) == "0")
+  if (!value)
+    return row_width >= 64;
+  if (std::string_view(value) == "0")
     return false;
   if (std::string_view(value) == "1")
     return true;
@@ -71,7 +73,19 @@ Error launchSoftmaxJetReverse(Stream stream,
                               const double* probabilities,
                               const double* probability_adjoint,
                               double* logit_adjoint,
-                              bool differentiated_columns = configuredSoftmaxColumnReverse());
+                              bool differentiated_columns);
+
+/// Keep explicit bool oracle calls separate from width-aware production selection.
+inline Error launchSoftmaxJetReverse(Stream stream,
+                                     const SoftmaxJetRowLayout& layout,
+                                     const double* logits,
+                                     const double* probabilities,
+                                     const double* probability_adjoint,
+                                     double* logit_adjoint)
+{
+  return launchSoftmaxJetReverse(stream, layout, logits, probabilities,
+      probability_adjoint, logit_adjoint, configuredSoftmaxColumnReverse(layout.row_width));
+}
 
 Error launchAttentionContextJetReverse(
     Stream stream,

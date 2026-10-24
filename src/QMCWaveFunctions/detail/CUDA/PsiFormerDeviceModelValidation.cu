@@ -294,7 +294,8 @@ int main(int argc, char** argv)
   {
     if (argc == 2 && (std::string(argv[1]) == "--retained-open-features-only" ||
                      std::string(argv[1]) == "--retained-value-cusp-only" ||
-                     std::string(argv[1]) == "--retained-traces-only"))
+                     std::string(argv[1]) == "--retained-traces-only" ||
+                     std::string(argv[1]) == "--softmax-column-reverse-only"))
     {
       int device_count = 0;
 #ifdef QMC_CUDA2HIP
@@ -310,6 +311,8 @@ int main(int argc, char** argv)
         RetainedOpenFeatureValidationAccess::run(queue, handle);
       else if (std::string(argv[1]) == "--retained-value-cusp-only")
         RetainedValueCuspValidationAccess::run(queue, handle);
+      else if (std::string(argv[1]) == "--softmax-column-reverse-only")
+        validateSoftmaxColumnReverse(queue);
       else
         validateRetainedParallelTraceFixtures(queue, handle);
       return 0;
