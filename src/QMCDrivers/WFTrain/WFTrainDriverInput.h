@@ -36,6 +36,8 @@ public:
   enum class KFACCurvature { NATIVE_SCORE, REGISTERED_GAUSSIAN };
   enum class KFACDamping { EQUAL_SPLIT, TRACE_BALANCED };
   enum class KFACConstraint { NONE, DAMPED_KFAC };
+  /// Dense factorization/application policy; independent of curvature and restart state.
+  enum class KFACDenseBackend { HOST, DEVICE };
   /// Select fixed scaling, correlated backtracking, or sampled endpoint expansion.
   enum class LineSearch
   {
@@ -158,6 +160,7 @@ public:
   KFACCurvature getKFACCurvature() const noexcept { return kfac_curvature_; }
   KFACDamping getKFACDampingPolicy() const noexcept { return kfac_damping_policy_; }
   KFACConstraint getKFACConstraint() const noexcept { return kfac_constraint_; }
+  KFACDenseBackend getKFACDenseBackend() const noexcept { return kfac_dense_backend_; }
   double getKFACClipWidth() const noexcept { return kfac_clip_width_; }
   double getKFACComplexClipWidth() const noexcept { return kfac_complex_clip_width_; }
   double getKFACClipQuantile() const noexcept { return kfac_clip_quantile_; }
@@ -259,6 +262,7 @@ private:
   KFACCurvature kfac_curvature_{KFACCurvature::NATIVE_SCORE};
   KFACDamping kfac_damping_policy_{KFACDamping::EQUAL_SPLIT};
   KFACConstraint kfac_constraint_{KFACConstraint::NONE};
+  KFACDenseBackend kfac_dense_backend_{KFACDenseBackend::HOST};
   double kfac_clip_width_{1.0};
   double kfac_complex_clip_width_{5.0};
   double kfac_clip_quantile_{0.95};

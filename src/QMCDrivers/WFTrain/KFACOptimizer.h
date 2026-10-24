@@ -41,7 +41,8 @@ class KFACOptimizer final : public TrainingUpdateRule, public OptimizerCheckpoin
 {
 public:
   /// Bind immutable schema/block semantics and validate the selected controls.
-  KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl control);
+  KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl control,
+      std::shared_ptr<KFACDenseSolver> dense_solver = {});
 
   ~KFACOptimizer() override;
 
@@ -102,6 +103,7 @@ private:
   KFACBlockRegistry registry_;
   KFACOptimizerControl control_;
   std::string configuration_fingerprint_;
+  std::shared_ptr<KFACDenseSolver> dense_solver_;
   std::unique_ptr<State> state_;
   std::unique_ptr<Pending> pending_;
   void traceStorage() noexcept;

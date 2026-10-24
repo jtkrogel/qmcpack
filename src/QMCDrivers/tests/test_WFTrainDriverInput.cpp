@@ -326,6 +326,13 @@ TEST_CASE("Persistent KFAC inputs require explicit state ownership", "[drivers][
     return parseTrainingInput("<qmc><training optimizer='kfac'>" + controls + "</training></qmc>");
   };
   CHECK_FALSE(parse("").getKFACPersistState());
+  CHECK(parse("").getKFACDenseBackend() == WFTrainDriverInput::KFACDenseBackend::HOST);
+  CHECK(parse("<parameter name='kfac_dense_backend'>host</parameter>").getKFACDenseBackend() ==
+        WFTrainDriverInput::KFACDenseBackend::HOST);
+  CHECK(parse("<parameter name='kfac_dense_backend'>device</parameter>").getKFACDenseBackend() ==
+        WFTrainDriverInput::KFACDenseBackend::DEVICE);
+  CHECK_THROWS(parse("<parameter name='kfac_dense_backend'>auto</parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='adam'><parameter name='kfac_dense_backend'>device</parameter></training></qmc>"));
   CHECK_THROWS(parse("<parameter name='kfac_ema_decay'>0.95</parameter>"));
   const auto input = parse("<parameter name='kfac_persist_state'>yes</parameter>"
       "<parameter name='kfac_ema_decay'>0.95</parameter>"

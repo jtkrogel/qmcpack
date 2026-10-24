@@ -75,6 +75,7 @@ set(QMCDRIVERS
     WFTrain/MinimumStepStochasticReconfiguration.cpp
     WFTrain/MatrixFreeLinearMethod.cpp
     WFTrain/KFACPreconditioner.cpp
+    WFTrain/KFACDenseSolver.cpp
     WFTrain/KFACOptimizer.cpp
     WFTrain/PsiFormerKFAC.cpp
     Optimizers/DescentEngine.cpp

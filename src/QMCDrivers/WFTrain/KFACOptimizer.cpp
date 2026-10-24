@@ -3,6 +3,7 @@
 // See LICENSE file in top directory for details.
 //////////////////////////////////////////////////////////////////////////////////////
 #include "QMCDrivers/WFTrain/KFACOptimizer.h"
+#include "QMCDrivers/WFTrain/KFACDenseSolver.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "io/hdf/hdf_archive.h"
 #include <algorithm>
@@ -26,6 +27,8 @@ struct KFACOptimizer::State
   std::uint64_t inverse_step = 0;
   std::optional<KFACFactorState> factors;
   std::optional<KFACInverseState> inverse;
+  // Execution cache only: canonical HOST checkpoint/fingerprint excludes it.
+  std::shared_ptr<KFACDenseGeneration> dense_generation;
 };
 
 /// Own the next recurrence and its version-bound solve until publication succeeds.
@@ -51,9 +54,13 @@ private:
   std::unique_ptr<State> state_;
 };
 
-KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl control)
-    : registry_(std::move(registry)), control_(control), state_(std::make_unique<State>())
+KFACOptimizer::KFACOptimizer(KFACBlockRegistry registry, KFACOptimizerControl control,
+    std::shared_ptr<KFACDenseSolver> dense_solver)
+    : registry_(std::move(registry)), control_(control), dense_solver_(std::move(dense_solver)),
+      state_(std::make_unique<State>())
 {
+  if (dense_solver_ && dense_solver_->registryFingerprint() != registry_.fingerprint())
+    throw std::invalid_argument("KFAC optimizer device registry mismatch");
   if (!isFiniteTrainingReal(control_.learning_rate) || control_.learning_rate <= 0.0 ||
       !isFiniteTrainingReal(control_.learning_rate_decay) || control_.learning_rate_decay < 0.0 ||
       !isFiniteTrainingReal(control_.ema_decay) || control_.ema_decay < 0.0 || control_.ema_decay >= 1.0 ||
@@ -137,17 +144,19 @@ void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
   if (refresh)
   {
     pending->inverse = std::make_unique<KFACPreconditioner>(registry_, statistics.parameterVersion(),
-        *pending->state->factors, control_.inverse);
+        *pending->state->factors, control_.inverse, dense_solver_);
     pending->state->inverse_step = state_->step;
   }
   else
   {
     // Affine caches may be stale; diagonal blocks always use current averages.
-    pending->inverse = std::make_unique<KFACPreconditioner>(registry_, statistics.parameterVersion(), *state_->inverse);
+    pending->inverse = std::make_unique<KFACPreconditioner>(registry_, statistics.parameterVersion(), *state_->inverse,
+        dense_solver_, state_->dense_generation);
     pending->inverse->refreshFallbackDiagonal(*pending->state->factors, control_.inverse.fallback_damping);
     pending->state->inverse_step = state_->inverse_step;
   }
   pending->state->inverse = pending->inverse->exportInverseState();
+  pending->state->dense_generation = pending->inverse->denseGeneration();
   pending_ = std::move(pending);
   traceStorage();
 }
@@ -234,7 +243,7 @@ std::size_t KFACOptimizer::retainedNumericBytes() const noexcept
     return ((state.factors ? state.factors->values.capacity() : 0) +
             (state.inverse ? state.inverse->values.capacity() : 0)) * sizeof(DerivativeReal);
   };
-  return bytes(*state_) + (pending_ ? bytes(*pending_->state) +
+  return (dense_solver_ ? dense_solver_->hostBytes() : 0) + bytes(*state_) + (pending_ ? bytes(*pending_->state) +
       pending_->inverse->storageDiagnostics().retained_numeric_bytes : 0);
 }
 

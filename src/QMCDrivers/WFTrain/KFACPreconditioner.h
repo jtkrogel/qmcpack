@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,8 @@ class Communicate;
 
 namespace qmcplusplus::wftrain
 {
+class KFACDenseSolver;
+class KFACDenseGeneration;
 
 /// Sentinel for an affine KFAC block that has no associated bias tensor.
 inline constexpr std::size_t NO_KFAC_BIAS_BLOCK =
@@ -285,11 +288,15 @@ class KFACPreconditioner final : public MatrixFreePreconditioner
 {
 public:
   KFACPreconditioner(const KFACFactorAccumulator& statistics,
-                     KFACPreconditionerControl control = {});
+                     KFACPreconditionerControl control = {},
+                     std::shared_ptr<KFACDenseSolver> dense_solver = {});
   KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
-                     const KFACFactorState& state, KFACPreconditionerControl control = {});
+                     const KFACFactorState& state, KFACPreconditionerControl control = {},
+                     std::shared_ptr<KFACDenseSolver> dense_solver = {});
   KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
-                     const KFACInverseState& state);
+                     const KFACInverseState& state,
+                     std::shared_ptr<KFACDenseSolver> dense_solver = {},
+                     std::shared_ptr<KFACDenseGeneration> dense_generation = {});
   ~KFACPreconditioner() override;
 
   /// Return retained layer-factor and solve-work storage.
@@ -299,6 +306,8 @@ public:
   const KFACBlockRegistry& registry() const noexcept { return registry_; }
 
   KFACInverseState exportInverseState() const;
+  /// Borrow only a complete immutable device generation for inverse-period reuse.
+  const std::shared_ptr<KFACDenseGeneration>& denseGeneration() const noexcept { return dense_generation_; }
 
   /// Diagonal blocks use current curvature/damping even when affine caches are stale.
   void refreshFallbackDiagonal(const KFACFactorState& state, DerivativeReal damping);
@@ -317,6 +326,7 @@ private:
   KFACPreconditionerControl control_;
   KFACCurvatureConvention convention_ = KFACCurvatureConvention::NATIVE_SCORE;
   std::vector<PreparedBlock> blocks_;
+  std::shared_ptr<KFACDenseGeneration> dense_generation_;
   /// Packed in the same fallback-block/canonical-entry order as the registry.
   std::vector<DerivativeReal> fallback_inverse_diagonal_;
   mutable std::vector<DerivativeReal> matrix_scratch_;

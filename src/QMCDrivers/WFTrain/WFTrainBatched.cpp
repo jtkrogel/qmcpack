@@ -24,6 +24,7 @@
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/KFACOptimizer.h"
+#include "QMCDrivers/WFTrain/KFACDenseSolver.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/KrylovPcgControl.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
@@ -3862,6 +3863,56 @@ void WFTrainBatched::run()
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
     spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
         selected_provider_->parameterSchema(), makeSPRINGControl(training_input_));
+  std::shared_ptr<wftrain::KFACDenseSolver> kfac_dense_solver;
+  if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
+  {
+    // Backend is execution policy, not curvature/checkpoint identity. Agree it
+    // before any rank can enter a device-only preparation or sample collection.
+    std::uint64_t requested = training_input_.getKFACDenseBackend() ==
+        WFTrainDriverInput::KFACDenseBackend::DEVICE ? 1 : 0;
+    std::vector<std::uint64_t> requests(myComm->size());
+    myComm->allgather(&requested, requests.data(), 1);
+    if (!std::all_of(requests.begin(), requests.end(), [&](auto value) { return value == requested; }))
+      throw UniformCommunicateError("WFTrainBatched: KFAC dense backend differs across ranks");
+    if (requested)
+    {
+      std::exception_ptr failure;
+      try
+      {
+#if defined(ENABLE_CUDA) && !defined(MIXED_PRECISION)
+        if (!training_input_.getKFACPersistState() || !selected_provider_->usesAcceleratorParameterProducts() ||
+            !wftrain::supportsHybridKFACPolicy(training_input_) || resident_device_authority_)
+          throw std::invalid_argument("Device KFAC dense backend requires supported persistent GPU FP64 score KFAC");
+        kfac_dense_solver = wftrain::KFACDenseSolver::prepare(makeLiveKFACRegistry(*selected_provider_),
+            0, training_input_.getMaximumRetainedBytes());
+#else
+        throw std::invalid_argument("Device KFAC dense backend requires a FP64 CUDA/HIP build");
+#endif
+      }
+      catch (...) { failure = std::current_exception(); }
+      int failed = failure ? 1 : 0;
+      myComm->allreduce(failed);
+      if (failed)
+      {
+        if (failure) std::rethrow_exception(failure);
+        throw UniformCommunicateError("WFTrainBatched: another rank failed KFAC device admission before collection");
+      }
+      const std::array<std::uint64_t, 4> policy{static_cast<std::uint64_t>(kfac_dense_solver->capacity()),
+          kfac_dense_solver->workspaceBytes(), kfac_dense_solver->deviceBytes(), kfac_dense_solver->hostBytes()};
+      std::vector<std::uint64_t> policies(static_cast<std::size_t>(myComm->size()) * policy.size());
+      auto send = policy;
+      myComm->allgather(send.data(), policies.data(), static_cast<int>(policy.size()));
+      for (int rank = 0; rank < myComm->size(); ++rank)
+        if (!std::equal(policy.begin(), policy.end(), policies.begin() + rank * policy.size()))
+          throw UniformCommunicateError("WFTrainBatched: KFAC device capacity/workspace policy differs across ranks");
+      app_log() << "WFTrain KFAC dense backend=device capacity="
+                << (kfac_dense_solver->capacity() == wftrain::KFACDenseCapacity::RESIDENT ? "resident" : "one_block_streamed")
+                << " DEVICE_numeric_bytes=" << kfac_dense_solver->deviceBytes()
+                << " HOST_metadata_bound=" << kfac_dense_solver->hostBytes()
+                << " workspace_bytes=" << kfac_dense_solver->workspaceBytes()
+                << "; HOST reduction/EMA/canonical checkpoint retained; not fully resident KFAC" << std::endl;
+    }
+  }
   std::unique_ptr<wftrain::KFACOptimizer> kfac_optimizer;
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC && training_input_.getKFACPersistState())
   {
@@ -3882,7 +3933,8 @@ void WFTrainBatched::run()
     control.inverse = {training_input_.getDamping(), training_input_.getKFACFallbackDamping(),
         training_input_.getKFACDampingPolicy() == WFTrainDriverInput::KFACDamping::TRACE_BALANCED
             ? wftrain::KFACDampingPolicy::TRACE_BALANCED : wftrain::KFACDampingPolicy::EQUAL_SPLIT};
-    kfac_optimizer = std::make_unique<wftrain::KFACOptimizer>(makeLiveKFACRegistry(*selected_provider_), control);
+    kfac_optimizer = std::make_unique<wftrain::KFACOptimizer>(makeLiveKFACRegistry(*selected_provider_), control,
+        kfac_dense_solver);
   }
   wftrain::OptimizerCheckpointContributor* optimizer_checkpoint = nullptr;
   if (first_order_optimizer)

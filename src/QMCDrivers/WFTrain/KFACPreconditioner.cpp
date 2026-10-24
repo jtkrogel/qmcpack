@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
+#include "QMCDrivers/WFTrain/KFACDenseSolver.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include "Message/CommOperators.h"
@@ -808,7 +809,7 @@ KFACPreconditioner::~KFACPreconditioner() = default;
 
 KFACPreconditioner::KFACPreconditioner(
     const KFACFactorAccumulator& statistics,
-    KFACPreconditionerControl control)
+    KFACPreconditionerControl control, std::shared_ptr<KFACDenseSolver> dense_solver)
     : MatrixFreePreconditioner(statistics.registry().parameterSchema(),
                                statistics.parameterVersion()),
       registry_(statistics.registry()),
@@ -823,6 +824,12 @@ KFACPreconditioner::KFACPreconditioner(
   if (control_.damping_policy != KFACDampingPolicy::EQUAL_SPLIT &&
       control_.damping_policy != KFACDampingPolicy::TRACE_BALANCED)
     throw std::invalid_argument("KFAC damping policy is unsupported");
+  if (dense_solver)
+  {
+    if (dense_solver->registryFingerprint() != registry_.fingerprint())
+      throw std::invalid_argument("KFAC device solver registry mismatch");
+    dense_generation_ = dense_solver->beginGeneration();
+  }
   std::size_t maximum_matrix = 0;
   std::size_t maximum_dimension = 0;
   blocks_.reserve(statistics.factors().size());
@@ -890,8 +897,13 @@ KFACPreconditioner::KFACPreconditioner(
     for (std::size_t diagonal = 0; diagonal < factor.sensitivity_dimension; ++diagonal)
       prepared.sensitivity_cholesky[diagonal * factor.sensitivity_dimension + diagonal] +=
           sensitivity_damping;
-    cholesky(prepared.activation_cholesky, factor.activation_dimension);
-    cholesky(prepared.sensitivity_cholesky, factor.sensitivity_dimension);
+    if (dense_generation_)
+      dense_generation_->factorize(ordinal, prepared.activation_cholesky, prepared.sensitivity_cholesky);
+    else
+    {
+      cholesky(prepared.activation_cholesky, factor.activation_dimension);
+      cholesky(prepared.sensitivity_cholesky, factor.sensitivity_dimension);
+    }
     maximum_matrix = std::max(maximum_matrix,
                               factor.activation_dimension * factor.sensitivity_dimension);
     maximum_dimension = std::max({maximum_dimension, factor.activation_dimension,
@@ -900,6 +912,7 @@ KFACPreconditioner::KFACPreconditioner(
   }
   matrix_scratch_.resize(maximum_matrix);
   solve_scratch_.resize(2 * maximum_dimension);
+  if (dense_generation_) dense_generation_->finish();
 
   fallback_inverse_diagonal_.assign(statistics.fallbackDiagonalSum().size(), 0.0);
   if (!registry_.fallbackBlocks().empty())
@@ -953,8 +966,8 @@ KFACFactorAccumulator KFACPreconditioner::statisticsFromState(
 }
 
 KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
-    const KFACFactorState& state, KFACPreconditionerControl control)
-    : KFACPreconditioner(statisticsFromState(std::move(registry), parameter_version, state), control)
+    const KFACFactorState& state, KFACPreconditionerControl control, std::shared_ptr<KFACDenseSolver> dense_solver)
+    : KFACPreconditioner(statisticsFromState(std::move(registry), parameter_version, state), control, std::move(dense_solver))
 {}
 
 KFACInverseState KFACPreconditioner::exportInverseState() const
@@ -986,7 +999,8 @@ void KFACPreconditioner::prepareScratch()
 }
 
 KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
-    const KFACInverseState& state)
+    const KFACInverseState& state, std::shared_ptr<KFACDenseSolver> dense_solver,
+    std::shared_ptr<KFACDenseGeneration> dense_generation)
     : MatrixFreePreconditioner(registry.parameterSchema(), parameter_version), registry_(std::move(registry)),
       control_{state.damping, state.fallback_damping, state.damping_policy}, convention_(state.convention)
 {
@@ -1028,6 +1042,28 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
                    [](auto value) { return value > 0.0; }))
     throw std::invalid_argument("KFAC inverse state has invalid fallback inverse");
   prepareScratch();
+  if (dense_solver)
+  {
+    if (dense_solver->registryFingerprint() != registry_.fingerprint() ||
+        (dense_generation && dense_generation->resource() != dense_solver))
+      throw std::invalid_argument("KFAC restored device generation identity mismatch");
+    if (dense_generation)
+    {
+      for (std::size_t block = 0; block < blocks_.size(); ++block)
+        if (!dense_generation->matches(block, blocks_[block].activation_cholesky, blocks_[block].sensitivity_cholesky))
+          throw std::invalid_argument("KFAC cached device generation differs from canonical HOST factors");
+      dense_generation_ = std::move(dense_generation);
+    }
+    else
+    {
+      dense_generation_ = dense_solver->beginGeneration();
+      for (std::size_t block = 0; block < blocks_.size(); ++block)
+        dense_generation_->import(block, blocks_[block].activation_cholesky, blocks_[block].sensitivity_cholesky);
+      dense_generation_->finish();
+    }
+  }
+  else if (dense_generation)
+    throw std::invalid_argument("KFAC device generation has no resource");
   if (psiformer::memory::enabled())
     trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
         storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
@@ -1072,8 +1108,9 @@ void KFACPreconditioner::evaluate(
 {
   std::fill(result.begin(), result.end(), DerivativeValue{});
   const auto& schema_blocks = registry_.parameterSchema().blocks();
-  for (const PreparedBlock& block : blocks_)
+  for (std::size_t ordinal = 0; ordinal < blocks_.size(); ++ordinal)
   {
+    const PreparedBlock& block = blocks_[ordinal];
     const auto& descriptor = block.descriptor;
     const std::size_t activation_dimension = descriptor.input_width +
         (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
@@ -1093,26 +1130,32 @@ void KFACPreconditioner::evaluate(
             residual.values()[bias.offset + output].real();
     }
 
-    // Left solve by A.  Each output column is an independent right-hand side.
-    for (std::size_t output = 0; output < output_width; ++output)
+    if (dense_generation_)
+      dense_generation_->apply(ordinal, block.activation_cholesky, block.sensitivity_cholesky,
+          matrix_scratch_.data(), activation_dimension * output_width);
+    else
     {
-      for (std::size_t input = 0; input < activation_dimension; ++input)
-        solve_scratch_[input] = matrix_scratch_[input * output_width + output];
-      solveCholesky(block.activation_cholesky, activation_dimension,
-                    solve_scratch_.data(), solve_scratch_.data() + activation_dimension,
-                    solve_scratch_.data());
-      for (std::size_t input = 0; input < activation_dimension; ++input)
-        matrix_scratch_[input * output_width + output] =
-            solve_scratch_[activation_dimension + input];
-    }
+      // Left solve by A.  Each output column is an independent right-hand side.
+      for (std::size_t output = 0; output < output_width; ++output)
+      {
+        for (std::size_t input = 0; input < activation_dimension; ++input)
+          solve_scratch_[input] = matrix_scratch_[input * output_width + output];
+        solveCholesky(block.activation_cholesky, activation_dimension,
+                      solve_scratch_.data(), solve_scratch_.data() + activation_dimension,
+                      solve_scratch_.data());
+        for (std::size_t input = 0; input < activation_dimension; ++input)
+          matrix_scratch_[input * output_width + output] =
+              solve_scratch_[activation_dimension + input];
+      }
 
-    // Right solve by G.  G is symmetric, so solve one input row directly.
-    for (std::size_t input = 0; input < activation_dimension; ++input)
-    {
-      DerivativeReal* row = matrix_scratch_.data() + input * output_width;
-      solveCholesky(block.sensitivity_cholesky, output_width, row,
-                    solve_scratch_.data() + output_width, solve_scratch_.data());
-      std::copy_n(solve_scratch_.data() + output_width, output_width, row);
+      // Right solve by G.  G is symmetric, so solve one input row directly.
+      for (std::size_t input = 0; input < activation_dimension; ++input)
+      {
+        DerivativeReal* row = matrix_scratch_.data() + input * output_width;
+        solveCholesky(block.sensitivity_cholesky, output_width, row,
+                      solve_scratch_.data() + output_width, solve_scratch_.data());
+        std::copy_n(solve_scratch_.data() + output_width, output_width, row);
+      }
     }
 
     for (std::size_t input = 0; input < descriptor.input_width; ++input)
