@@ -32,7 +32,8 @@ public:
   }
 
   /// Admit one complete graph plus the cache/casts/pivots/diagnostics, including cold peak.
-  static std::size_t estimateDeviceBytes(const PsiFormerExecutionPlan& plan, std::size_t capacity)
+  static std::size_t estimateDeviceBytes(const PsiFormerExecutionPlan& plan, std::size_t capacity,
+      std::size_t concurrent_targets = 0)
   {
     if (!supportsMixedPairedTrunkEnvironment(plan.environment()))
       throw std::invalid_argument("Mixed paired FULL requires a fixed legacy periodic real trunk");
@@ -44,7 +45,7 @@ public:
     };
     const auto width = plan.modelShape().feature_dimension;
     const auto input = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
-    const auto graph = estimateComplexSpatialCost(plan, capacity).device_bytes;
+    const auto graph = estimateComplexSpatialCost(plan, capacity, concurrent_targets).device_bytes;
     const auto cache = checkedDeviceBytes<float>(plan.parameterCount());
     auto bytes = add(graph, cache);
     bytes = add(bytes, checkedDeviceBytes<float>(mul(maximumRows(plan, capacity), add(std::max(input, width), width))));
@@ -58,14 +59,15 @@ public:
   /// The caller's image/queue/vendor reserves are shared once and admitted separately.
   PreparedDeviceMixedComplexSpatial(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget,
-      bool allow_fp64_retry = true)
+      bool allow_fp64_retry = true, std::size_t concurrent_targets = 0)
       : model_(std::move(image)), queue_(queue), allow_retry_(allow_fp64_retry)
   {
     if (!model_) throw std::invalid_argument("Mixed paired FULL requires a canonical image");
-    const auto bytes = estimateDeviceBytes(model_->plan(), capacity);
+    const auto bytes = estimateDeviceBytes(model_->plan(), capacity, concurrent_targets);
     if (bytes > budget) throw std::length_error("Mixed paired FULL exceeds its combined owner budget");
     model_->validateCurrentDevice();
-    graph_ = PreparedDeviceComplexSpatial::prepare(model_, capacity, queue, blas, budget);
+    // One immutable trace slab belongs to this same graph on mixed and FP64 attempts.
+    graph_ = PreparedDeviceComplexSpatial::prepare(model_, capacity, queue, blas, budget, concurrent_targets);
     parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model_, queue,
         MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, allow_retry_);
     adapter_ = std::make_shared<PreparedDeviceMixedValueDense>(parameters_, maximumRows(model_->plan(), capacity), queue, blas);

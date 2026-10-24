@@ -50,7 +50,7 @@ inline void validateMixedComplexSpatialInverseDiagnostics()
 
 /// Force complete-field retries; exact nodes must preserve the canonical hard failure boundary.
 inline void validateMixedComplexSpatialFullReplays(pf::PsiFormer& model,
-    const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
+    const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan, std::size_t concurrent_targets = 0)
 {
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
@@ -116,8 +116,9 @@ inline void validateMixedComplexSpatialFullReplays(pf::PsiFormer& model,
         }
     auto image = PreparedDeviceModel::preparePairedComplexValue(plan, values, model.cfg.nuclei.x);
     PreparedDeviceMixedComplexSpatial mixed(image, 1, queue, blas,
-        PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 1));
-    auto reference = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, estimateComplexSpatialCost(plan, 1).device_bytes);
+        PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 1, concurrent_targets), true, concurrent_targets);
+    auto reference = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas,
+        estimateComplexSpatialCost(plan, 1, concurrent_targets).device_bytes, concurrent_targets);
     std::string mixed_failure, reference_failure;
     try { mixed.evaluate(positions); } catch (const std::exception& e) { mixed_failure = e.what(); }
     try { reference->evaluate(positions); } catch (const std::exception& e) { reference_failure = e.what(); }
@@ -147,13 +148,13 @@ inline void validateMixedComplexSpatialFullReplays(pf::PsiFormer& model,
       if (mixed.statistics().projections <= prior_projections)
         throw std::runtime_error("FULL failed-replay restoration silently left the affine adapter detached");
       PreparedDeviceMixedComplexSpatial fresh(regular, 1, queue, blas,
-          PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 1));
+          PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 1, concurrent_targets), true, concurrent_targets);
       fresh.evaluate(positions);
       if (!equal(fetch(mixed), fetch(fresh))) throw std::runtime_error("FULL replay failure did not restore adapter on rebind");
       std::cout << "PASS mixed FULL complete retry: kind=" << kind
                 << " canonical_failure=exact no_publication=1 restored_adapter=1";
     }
-    std::cout << " reason=" << retry_reason << '\n';
+    std::cout << " concurrent_trace_targets=" << concurrent_targets << " reason=" << retry_reason << '\n';
   }
 }
 
@@ -167,6 +168,8 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
   const auto complex = [](cuDoubleComplex z) { return C(cuCreal(z), cuCimag(z)); };
   std::cout.precision(17);
   validateMixedComplexSpatialInverseDiagnostics();
+  // Compare replay bits to the SAME trace layout; t0/t8 are not assumed bit-identical.
+  for (std::size_t concurrent_targets : {0u, 8u})
   for (std::size_t up : {2u, 1u})
   {
     ExecutionEnvironment environment;
@@ -198,19 +201,19 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
     checkRuntime(cudaGetDevice(&ordinal), "mixed FULL validation device");
 #endif
     auto& metrics = deviceMemoryMetrics(ordinal);
-    const auto budget = PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 3);
+    const auto budget = PreparedDeviceMixedComplexSpatial::estimateDeviceBytes(plan, 3, concurrent_targets);
     const auto before = metrics.snapshot();
     bool rejected = false;
-    try { PreparedDeviceMixedComplexSpatial denied(image, 3, queue, blas, budget - 1); }
+    try { PreparedDeviceMixedComplexSpatial denied(image, 3, queue, blas, budget - 1, true, concurrent_targets); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
       throw std::runtime_error("Mixed FULL cost-minus-one allocated device storage");
-    PreparedDeviceMixedComplexSpatial mixed(image, 3, queue, blas, budget);
+    PreparedDeviceMixedComplexSpatial mixed(image, 3, queue, blas, budget, true, concurrent_targets);
     if (metrics.snapshot().live_bytes - before.live_bytes != budget ||
         metrics.snapshot().peak_bytes > std::max(before.peak_bytes, before.live_bytes + budget))
       throw std::runtime_error("Mixed FULL exact/cold peak inventory differs from checked budget");
     auto fp64 = PreparedDeviceComplexSpatial::prepare(image, 3, queue, blas,
-        estimateComplexSpatialCost(plan, 3).device_bytes);
+        estimateComplexSpatialCost(plan, 3, concurrent_targets).device_bytes, concurrent_targets);
     auto oracle = std::make_unique<pf::DirectComplexSpatialExecutor>(model, plan);
     auto workspace = oracle->makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
     double amplitude_error = 0, phase_error = 0, log_error = 0, gradient_error = 0;
@@ -316,7 +319,7 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
     workspace = oracle->makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
     const std::vector<double> rebound_positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 12);
     compare(rebound_positions);
-    PreparedDeviceMixedComplexSpatial fresh(successor, 3, queue, blas, budget);
+    PreparedDeviceMixedComplexSpatial fresh(successor, 3, queue, blas, budget, true, concurrent_targets);
     fresh.evaluate(rebound_positions);
     std::vector<ComplexValueResult> rebound(1), fresh_amplitude(1);
     std::vector<cuDoubleComplex> rebound_g(12), rebound_l(4), rebound_r(4), fresh_g(12), fresh_l(4), fresh_r(4);
@@ -340,6 +343,7 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
     if (!rejected) throw std::runtime_error("Failed FULL physical input published partial authority");
     compare(rebound_positions);
     std::cout << "EVIDENCE paired mixed FULL: up=" << up << " down=" << 4 - up
+              << " concurrent_trace_targets=" << concurrent_targets
               << " graph_workspaces=1 exact_device_bytes=" << budget << " warm_allocations=0 comparisons=" << comparisons
               << " actual_mixed_requests=" << requests - replays << " complete_FP64_replays=" << replays
               << " maximum_normalized_amplitude_error=" << amplitude_error << " maximum_phase_error=" << phase_error
@@ -352,7 +356,7 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
       std::cout << "FIELD paired mixed FULL: up=" << up << " name=" << item.first
                 << " max_absolute=" << item.second[0] << " reference_magnitude_at_absolute=" << item.second[1]
                 << " max_normalized=" << item.second[2] << " reference_magnitude_at_normalized=" << item.second[3] << '\n';
-    if (up == 2) validateMixedComplexSpatialFullReplays(model, plan);
+    if (up == 2) validateMixedComplexSpatialFullReplays(model, plan, concurrent_targets);
   }
 }
 #endif
