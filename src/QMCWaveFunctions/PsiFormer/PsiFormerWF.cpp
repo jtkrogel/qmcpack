@@ -1500,6 +1500,8 @@ public:
   /// Factory lock is separate from the scratch execution lease and model lock.
   mutable std::mutex derivative_scratch_factory_mutex;
   std::weak_ptr<PsiFormerDerivativeScratch> derivative_scratch;
+  /// Independent immutable profile lane; never upgrade or alias a live complete owner.
+  std::weak_ptr<PsiFormerDerivativeScratch> score_derivative_scratch;
   /// Number of pending planned one-electron crowd transactions sharing this model.
   /// Each crowd checks in once, never once per lane.
   std::atomic<std::size_t> planned_single_transaction_count{0};
@@ -2242,7 +2244,7 @@ private:
 struct PsiFormerDerivativeScratch
 {
   PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters,
-                             std::size_t score_capacity = 1)
+                             std::size_t score_capacity = 1, bool score_only = false)
       : score(state.numerical_tile_backend ? nullptr : state.direct_score_executor.makeWorkspace()),
         kinetic(state.numerical_tile_backend ? nullptr : state.cpu_target_kinetic.targets
             ? state.direct_kinetic_executor.makeTargetWorkspace(state.cpu_target_kinetic.targets, state.cpu_target_kinetic.owner_budget)
@@ -2267,7 +2269,13 @@ struct PsiFormerDerivativeScratch
       if (!backend)
         throw std::logic_error("PsiFormer device products require the prepared numerical backend");
       device_products = backend->prepareProductSession(
-          psiformer::device::ProductSessionProfile::SCORE_AND_KINETIC, score_capacity);
+          score_only ? psiformer::device::ProductSessionProfile::SCORE_ONLY
+                     : psiformer::device::ProductSessionProfile::SCORE_AND_KINETIC, score_capacity);
+      if (score_only)
+        app_log() << "  PsiFormer GPU score-only product lane prepared: capacity=" << device_products->scoreCapacity()
+                  << ", DEVICE_bytes=" << device_products->deviceWorkspaceBytes()
+                  << ", HOST_bytes=" << device_products->hostWorkspaceBytes()
+                  << ", kinetic_owners=0; ordinary physical sampling VGL is unchanged" << std::endl;
       device_positions.resize(3 * state.execution_plan.modelShape().electrons());
       device_direction.resize(parameters);
     }
@@ -2337,14 +2345,16 @@ private:
 
 /** Obtain the prepared lane without retaining scratch permanently on the model. */
 std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
-    PsiFormerSharedState& state, std::size_t parameters, std::size_t score_capacity = 1)
+    PsiFormerSharedState& state, std::size_t parameters, std::size_t score_capacity = 1,
+    bool score_only = false)
 {
   std::lock_guard factory_lock(state.derivative_scratch_factory_mutex);
-  auto scratch = state.derivative_scratch.lock();
+  auto& lane = score_only ? state.score_derivative_scratch : state.derivative_scratch;
+  auto scratch = lane.lock();
   if (!scratch)
   {
-    scratch = std::make_shared<PsiFormerDerivativeScratch>(state, parameters, score_capacity);
-    state.derivative_scratch = scratch;
+    scratch = std::make_shared<PsiFormerDerivativeScratch>(state, parameters, score_capacity, score_only);
+    lane = scratch;
   }
   return scratch;
 }
@@ -2371,7 +2381,7 @@ public:
       std::vector<double> total_log_gradients_real,
       std::vector<double> total_log_gradients_imaginary,
       std::vector<double> inverse_masses,
-      std::size_t maximum_parameter_chunk_size)
+      std::size_t maximum_parameter_chunk_size, bool score_only = false)
       : model_state_(std::move(model_state)),
         schema_(std::move(schema)),
         parameter_version_(parameter_version),
@@ -2384,9 +2394,10 @@ public:
         total_log_gradients_imaginary_(std::move(total_log_gradients_imaginary)),
         inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
+        score_only_(score_only),
         // A retained pretraining capacity1 lane remains serial; never duplicate
         // its P-sized resources or grow it implicitly during an evaluation.
-        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount(), 4)),
+        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount(), 4, score_only_)),
         score_workspace_(shared_scratch_->score),
         kinetic_workspace_(shared_scratch_->kinetic),
         channel_accumulators_(shared_scratch_->channels),
@@ -2458,6 +2469,9 @@ public:
         wftrain::derivativeProductBit(
             wftrain::DerivativeProduct::LOCAL_ENERGY_JVP) |
         wftrain::derivativeProductBit(wftrain::DerivativeProduct::LOCAL_ENERGY_VJP);
+    if (score_only_)
+      result.product_mask = wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_VJP) |
+          wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_JVP);
     result.adjoint_mask =
         wftrain::derivativeAdjointBit(wftrain::DerivativeAdjoint::TRANSPOSE) |
         wftrain::derivativeAdjointBit(wftrain::DerivativeAdjoint::HERMITIAN);
@@ -2467,7 +2481,7 @@ public:
     // This field describes sink-visible storage, not the kernel device. The
     // Numerical products emit host complex chunks after their device contractions.
     result.execution_domain        = wftrain::DerivativeExecutionDomain::HOST;
-    result.local_energy_term_mask =
+    result.local_energy_term_mask = score_only_ ? 0 :
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
     if (ecp_replay_)
       result.local_energy_term_mask |= ecp_replay_->localEnergyTermMask();
@@ -2525,6 +2539,8 @@ public:
   void bindNonLocalECPJVPReplay(
       std::unique_ptr<wftrain::NonLocalECPJVPReplay> replay) override
   {
+    if (score_only_)
+      throw std::invalid_argument("PsiFormer score-only operator cannot bind local-energy replay");
     if (!replay)
       throw std::invalid_argument("PsiFormer cannot bind a null ECP JVP replay");
     if (ecp_replay_)
@@ -2632,6 +2648,9 @@ protected:
       wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink* sink,
       const std::function<void(std::size_t)>& terminal = {}, bool device_authority_terminal = false) const
   {
+    if (score_only_ && (terminal || device_authority_terminal || std::any_of(channels.begin(), channels.end(),
+        [](const auto& channel) { return channel.product != wftrain::DerivativeProduct::SCORE_VJP; })))
+      throw std::invalid_argument("PsiFormer score-only operator requires ordinary score VJP channels");
     NativeTimerScope timer(phase_timers_.parameter_vjp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
@@ -3084,6 +3103,8 @@ protected:
       std::uint32_t local_energy_term_mask,
       wftrain::SampleProductSink& sink) const override
   {
+    if (score_only_)
+      throw std::invalid_argument("PsiFormer score-only operator has no local-energy JVP");
     NativeTimerScope timer(phase_timers_.energy_jvp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
@@ -4021,6 +4042,7 @@ private:
   std::vector<double> total_log_gradients_imaginary_;
   std::vector<double> inverse_masses_;
   wftrain::ParameterChunkPlan chunk_plan_;
+  const bool score_only_;
   std::shared_ptr<PsiFormerDerivativeScratch> shared_scratch_;
   const std::unique_ptr<pf::DirectScoreWorkspace>& score_workspace_;
   const std::unique_ptr<pf::DirectKineticWorkspace>& kinetic_workspace_;
@@ -7346,6 +7368,38 @@ PsiFormerWF::makeStreamingDerivativeOperator(
     std::size_t sample_offset,
     std::size_t maximum_parameter_chunk_size) const
 {
+  return makeStreamingDerivativeOperatorImpl(wfc_list, p_list, batch_ordinal, sample_offset,
+      maximum_parameter_chunk_size, false);
+}
+
+/// Select a fixed GPU score-only lane without changing the generic factory.
+std::unique_ptr<wftrain::StreamingDerivativeOperator>
+PsiFormerWF::makeGpuScoreStreamingDerivativeOperator(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::size_t batch_ordinal,
+    std::size_t sample_offset,
+    std::size_t maximum_parameter_chunk_size) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  if (!usesAcceleratorParameterProducts())
+    throw std::invalid_argument("PsiFormer score-only factory requires real FP64 GPU products");
+  return makeStreamingDerivativeOperatorImpl(wfc_list, p_list, batch_ordinal, sample_offset,
+      maximum_parameter_chunk_size, true);
+#else
+  throw std::invalid_argument("PsiFormer score-only factory requires a real GPU build");
+#endif
+}
+
+/// Validate immutable samples identically for both explicitly selected profiles.
+std::unique_ptr<wftrain::StreamingDerivativeOperator>
+PsiFormerWF::makeStreamingDerivativeOperatorImpl(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::size_t batch_ordinal,
+    std::size_t sample_offset,
+    std::size_t maximum_parameter_chunk_size, bool score_only) const
+{
   NativeTimerScope timer(phase_timers_.preparation);
   if (this != &wfc_list.getLeader())
     throw std::invalid_argument(
@@ -7473,7 +7527,7 @@ PsiFormerWF::makeStreamingDerivativeOperator(
       sample_offset, sample_count, std::move(positions),
       std::move(total_log_gradients_real),
       std::move(total_log_gradients_imaginary), std::move(inverse_masses),
-      maximum_parameter_chunk_size);
+      maximum_parameter_chunk_size, score_only);
 }
 
 // Prepare copied configurations and one reusable M-channel/P-score workspace.

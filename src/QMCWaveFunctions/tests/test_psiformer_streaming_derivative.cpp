@@ -26,6 +26,7 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceAdam.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
+#include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -1378,6 +1379,159 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
 }
 
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer real GPU score-only profiles preserve complete-product lanes",
+          "[wavefunction][psiformer][training][streaming][gpu_score_scope]")
+{
+  using namespace testing::psiformer;
+  namespace ps = psiformer;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: accepted-grid GPU ECP replay requires a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: accepted-grid GPU ECP replay requires a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  // Small descriptor fixture, not a new public architecture or physical PP model.
+  auto leaves = makeLayout(4, 2, true, 1, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256 || extent == 64) extent = 8;
+  ps::InitializedPsiFormerParameters initialized;
+  initialized.model_shape = {2, 2, 2, 2, 8, 2, 1};
+  // Handcrafted tensor values do not claim a generated initialization profile.
+  initialized.seed = 37;
+  initialized.values = makeParameters("lih", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto begin = cursor; cursor += product(leaf.shape);
+    initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, begin, cursor});
+  }
+  const SimulationCell cell;
+  auto electrons = makeElectrons(cell);
+  ParticleSet ions(cell); ions.setName("ion0"); ions.create({1, 1});
+  auto& species = ions.getSpeciesSet(); species.addSpecies("Li"); species.addSpecies("H");
+  const int charge = species.addAttribute("charge"); species(charge, 0) = 3; species(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0}; ions.R[1] = {0, 0, 3.01392421}; ions.resetGroups(); ions.update();
+  auto resolution = ps::PsiFormerAcceleratorResolution{};
+#ifdef QMC_CUDA2HIP
+  resolution.backend = ps::PsiFormerAcceleratorBackend::HIP;
+#else
+  resolution.backend = ps::PsiFormerAcceleratorBackend::CUDA;
+#endif
+  resolution.reason = ps::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
+  resolution.readiness_records_consulted = 1;
+  resolution.validated_operations = ps::psiFormerAcceleratorInferenceOperations();
+  PsiFormerWF cpu("ecp_grid", initialized, electrons, ions);
+  const auto p = cpu.parameterSchema().parameterCount();
+  std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
+
+  RefVectorWithLeader<WaveFunctionComponent> cpu_components(cpu, {cpu});
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  CHECK_THROWS(cpu.makeGpuScoreStreamingDerivativeOperator(cpu_components, particles, 0, 0, 7));
+  auto reference = cpu.makeStreamingDerivativeOperator(cpu_components, particles, 0, 0, 7);
+  std::vector<DerivativeValue> weights{{.7, -.2}}, direction(p);
+  for (std::size_t i = 0; i < p; ++i) direction[i] = {.003 * (int(i % 7) - 3), 0};
+  const auto channelFor = [&](const StreamingDerivativeOperator& op, DerivativeProduct product) {
+    return VJPCoefficientChannel{"scope", product, coefficientsFor(op, weights),
+        product == DerivativeProduct::SCORE_VJP ? 0 : wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)};
+  };
+  auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+  // Both orderings must retain different live profiles, never upgrade an old lane.
+  for (bool complete_first : {false, true})
+  {
+    PsiFormerWF gpu("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+    RefVectorWithLeader<WaveFunctionComponent> components(gpu, {gpu});
+    std::unique_ptr<StreamingDerivativeOperator> complete, score;
+    if (complete_first) complete = gpu.makeStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    score = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    if (!complete_first) complete = gpu.makeStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    auto score_peer = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    const auto score_storage = score->storageDiagnostics(), full_storage = complete->storageDiagnostics();
+    CHECK(score_storage.shared_workspace_identity != full_storage.shared_workspace_identity);
+    CHECK(score_peer->storageDiagnostics().shared_workspace_identity == score_storage.shared_workspace_identity);
+    CHECK(score_storage.shared_workspace_bytes < full_storage.shared_workspace_bytes);
+    CHECK(score->capabilities().local_energy_term_mask == 0);
+    CHECK(score->capabilities().product_mask == (wftrain::derivativeProductBit(DerivativeProduct::SCORE_VJP) |
+                                                wftrain::derivativeProductBit(DerivativeProduct::SCORE_JVP)));
+    CHECK(complete->capabilities().local_energy_term_mask != 0);
+    // Exercise the producer boundary too: scalar EL does not imply a dEL owner.
+    const auto prepared = [&](std::uint32_t derivative_mask) {
+      std::vector<wftrain::PreparedEnergyGradientBatch> batches;
+      wftrain::PreparedEnergyGradientBatch batch;
+      batch.derivative_operator = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+      batch.weights = {1}; batch.local_energies = {-2};
+      batch.local_energy_term_mask = derivative_mask;
+      batches.push_back(std::move(batch));
+      return batches;
+    };
+    CHECK_THROWS(wftrain::PreparedEnergyGradientProducer(prepared(
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)), std::nullopt, true));
+    CHECK_THROWS(wftrain::PreparedEnergyGradientProducer(prepared(0)));
+    wftrain::PreparedEnergyGradientProducer producer(prepared(0), std::nullopt, true);
+    CHECK_FALSE(producer.capabilities().contains(wftrain::TrainingCapability::LOCAL_ENERGY_VJP));
+    wftrain::EnergyGradientAccumulator accumulator(gpu.parameterSchema(), score->parameterVersion(),
+        wftrain::EnergyGradientEstimator::SCORE_COVARIANCE);
+    producer.accumulate(gpu.snapshotParameters(), accumulator);
+    accumulator.completeSingleParticipantReduction();
+    const auto objective = accumulator.finalize();
+    CHECK(objective.local_energy_term_mask == 0);
+    checkClose(objective.mean_energy, {-2, 0});
+    for (auto adjoint : {wftrain::DerivativeAdjoint::TRANSPOSE, wftrain::DerivativeAdjoint::HERMITIAN})
+    {
+      auto c = channelFor(*score, DerivativeProduct::SCORE_VJP);
+      auto f = channelFor(*complete, DerivativeProduct::SCORE_VJP);
+      auto r = channelFor(*reference, DerivativeProduct::SCORE_VJP);
+      SelectedParameterSink actual(selected), full(selected), expected(selected);
+      reference->applyVJPs({&r, 1}, adjoint, expected);
+      complete->applyVJPs({&f, 1}, adjoint, full);
+      score->applyVJPs({&c, 1}, adjoint, actual);
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        checkClose(actual.results()[0][i], expected.results()[0][i]);
+        checkClose(actual.results()[0][i], full.results()[0][i]);
+      }
+    }
+    const wftrain::StructuredParameterVectorConstView tangent(score->parameterSchema(), score->parameterVersion(),
+        {direction.data(), direction.size()});
+    RecordingSampleSink actual_jvp, expected_jvp;
+    score->applyScoreJVP(tangent, actual_jvp); reference->applyScoreJVP(tangent, expected_jvp);
+    checkClose(actual_jvp.results()[0], expected_jvp.results()[0]);
+    const auto cold = metrics.snapshot();
+    const auto warm_fingerprint = score->storageDiagnostics().storage_fingerprint;
+    auto bad = channelFor(*score, DerivativeProduct::LOCAL_ENERGY_VJP);
+    SelectedParameterSink rejected(selected);
+    CHECK_THROWS(score->applyVJPs({&bad, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected));
+    CHECK(rejected.state() == DerivativeSinkState::IDLE);
+    RecordingSampleSink rejected_jvp;
+    CHECK_THROWS(score->applyLocalEnergyJVP(tangent, wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC), rejected_jvp));
+    CHECK(rejected_jvp.state() == DerivativeSinkState::IDLE);
+    CHECK_THROWS(score->bindNonLocalECPJVPReplay(nullptr));
+    auto c = channelFor(*score, DerivativeProduct::SCORE_VJP);
+    SelectedParameterSink warm(selected);
+    score->applyVJPs({&c, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, warm);
+    const auto after = metrics.snapshot();
+    CHECK(after.allocation_calls == cold.allocation_calls);
+    CHECK(after.live_bytes == cold.live_bytes);
+    CHECK(score->storageDiagnostics().storage_fingerprint == warm_fingerprint);
+    // Genuine publication invalidates old snapshots without conflating profile lanes.
+    auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
+    gpu.publishParameters(candidate, candidate.version);
+    SelectedParameterSink stale(selected);
+    CHECK_THROWS(score->applyVJPs({&c, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, stale));
+    auto successor = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    CHECK(successor->parameterVersion() == candidate.version + 1);
+    CHECK(successor->storageDiagnostics().shared_workspace_identity == score_storage.shared_workspace_identity);
+    auto next = channelFor(*successor, DerivativeProduct::SCORE_VJP);
+    SelectedParameterSink next_result(selected);
+    successor->applyVJPs({&next, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, next_result);
+    for (const auto& value : next_result.results()[0]) CHECK(std::isfinite(value.real()));
+  }
+}
+
 TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
           "[wavefunction][psiformer][training][streaming][gpu_ecp_replay]")
 {

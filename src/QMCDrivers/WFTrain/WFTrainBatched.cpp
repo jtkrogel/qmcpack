@@ -915,10 +915,6 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   // Construct both derivative owners only after canonical value/VGL refresh so
   // the kinetic tape and accepted-grid ECP response see identical reference
   // coordinates, gradients, and parameter version.
-  batch.derivative_operator =
-      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
-          twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
-          maximum_parameter_chunk_size);
 #ifndef QMC_COMPLEX
   const auto* real = dynamic_cast<const PsiFormerWF*>(twfs[0].get().getOrbitals()[0].get());
   if (score_only && real && real->usesAcceleratorParameterProducts())
@@ -926,6 +922,21 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     if (capture_ecp_jvp_replay || batch_ordinal != 0 || sample_offset != 0 ||
         !real->isPseudopotentialSystem())
       throw std::invalid_argument("GPU score-only ECP requires one physical PP batch without derivative replay");
+    if (!provider_id.empty() && provider_id != real->parameterSchema().providerId())
+      throw std::invalid_argument("GPU score-only ECP provider identity differs from the selected provider");
+    // Score covariance needs physical EL, but no local-energy parameter response.
+    // Select its immutable profile before any complete kinetic owner is prepared.
+    RefVectorWithLeader<WaveFunctionComponent> real_batch(*twfs[0].get().getOrbitals()[0]);
+    for (const auto& wavefunction : twfs)
+    {
+      if (wavefunction.get().getOrbitals().size() != 1)
+        throw std::invalid_argument("GPU score-only ECP requires one real component per walker");
+      real_batch.push_back(*wavefunction.get().getOrbitals()[0]);
+    }
+    batch.derivative_operator = real->makeGpuScoreStreamingDerivativeOperator(
+        real_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size);
+    // This mask describes derivative coverage, not the complete physical EL below.
+    batch.local_energy_term_mask = 0;
     const auto samples = walkers.size();
     const auto scalar_bytes = wftrain::NonLocalEnergyAccumulator::requiredBytes(samples);
     const auto temporary = checkedMemoryMultiply(samples, 3 * sizeof(wftrain::DerivativeValue) + 2 * sizeof(double));
@@ -972,6 +983,10 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     return batch;
   }
 #endif
+  batch.derivative_operator =
+      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+          twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
+          maximum_parameter_chunk_size);
   bool bounded_replay = false;
   for (const auto& component : twfs[0].get().getOrbitals())
     if (const auto* psiformer = dynamic_cast<const PsiFormerWF*>(component.get()))

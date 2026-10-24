@@ -459,6 +459,14 @@ public:
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const override;
 
+  /// Prepare only GPU score products; kinetic/local-energy requests remain unavailable.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeGpuScoreStreamingDerivativeOperator(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size) const;
+
   /// Construct an O(B N_e + M + P) determinant-channel overlap batch.
   std::unique_ptr<psiformer::DeterminantChannelBatch> makeDeterminantChannelBatch(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -973,6 +981,15 @@ public:
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet& particles) const override;
 
 private:
+  /// Share immutable sample validation without changing the generic complete-product contract.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperatorImpl(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size,
+      bool score_only) const;
+
   struct PsiFormerMultiWalkerResource;
 
   /// Identify the exact planned entry point whose common runtime contract is checked.
