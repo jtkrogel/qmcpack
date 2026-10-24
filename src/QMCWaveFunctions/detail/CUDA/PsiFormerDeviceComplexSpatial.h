@@ -169,10 +169,21 @@ public:
 
   /// Evaluate every live configuration before publishing any complex spatial output.
   void evaluate(const std::vector<double>& positions)
+  { evaluateCoordinates(positions, nullptr); }
+
+private:
+  friend class PreparedDeviceMixedComplexSpatial;
+
+  /// Ordinary mixed composition supplies only private pivots; default FULL is unchanged.
+  void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots)
   {
     invalidate();
+    if (minimum_scaled_pivots && !trunk_->mixed_dense_)
+      throw std::logic_error("Mixed FULL diagnostic pivots require an attached typed adapter");
     if (canonical_)
     {
+      if (minimum_scaled_pivots || trunk_->mixed_dense_)
+        throw std::invalid_argument("Mixed paired FULL does not admit target/retained execution");
       evaluateTargets(positions);
       return;
     }
@@ -183,11 +194,24 @@ public:
     t.setBatchCount(positions.size() / (3 * t.ne_));
     t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
     t.resetStatusAdmission();
-    t.evaluatePreparedTrunk();
+    PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
+    try
+    {
+      t.evaluatePreparedTrunk();
+    }
+    catch (const InferenceStatusError& error)
+    {
+      if (!t.mixed_dense_ || error.stage() == 0) throw;
+      throw MixedComplexValueFailure(ComplexValueFailureStage::AFFINE_TRUNK, error.what());
+    }
+    if (t.mixed_dense_) t.mixed_dense_->admitAffinePrefix();
     t.evaluateCusp();
     t.checkOpen(t.batch_);
 
-    finishHead();
+    finishHead(minimum_scaled_pivots);
+    if (minimum_scaled_pivots)
+      t.mixed_dense_->checkComplexValueConditioning(minimum_scaled_pivots, channels_.data(), amplitude_.data(),
+          t.batch_, t.shape_.determinants);
     if (concurrent_targets_)
       checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
           t.ne_, t.ne_, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
@@ -198,10 +222,12 @@ public:
       checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.batch_, t.shape_.determinants, t.ne_, channels_.data(),
           amplitude_.data(), inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data(),
           outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()), "complex FULL traces");
-    admitStatus();
+    admitStatus(ComplexValueFailureStage::COMBINATION);
+    mixed_attempt.finish();
     valid_ = true;
   }
 
+public:
   /// Expose only the complete current physical-core result, never head/LU pointers.
   ResultView resultView() const
   {
@@ -312,7 +338,7 @@ private:
   }
 
   /// Consume the shared admitted prefix in the original paired-head/factor order.
-  void finishHead()
+  void finishHead(double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
     // Two projections consume the SAME real FULL trunk; E supplies only radial jets.
@@ -336,13 +362,20 @@ private:
         t.positions_.data(), t.model_->nuclei(), parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN), envelope_.data(), status_.data()),
         "complex FULL envelopes");
+    // Physical envelope/domain rejection is hard even during approximate execution.
+    if (minimum_scaled_pivots) admitStatus(ComplexValueFailureStage::PHYSICAL_ENVELOPE);
     checkRuntime(launchComplexSpatialHead(t.queue_.getNative(), t.orbitals_, envelope_.data(), projections_.data(),
         projections_.data() + cost_.head_elements, head_.data(), status_.data()), "complex FULL product-rule head");
-    admitStatus();
+    admitStatus(ComplexValueFailureStage::PACKED_HEAD);
 
     // Only the contiguous VALUE plane becomes LU; all derivative planes survive.
-    checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_, head_.data(),
-        channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex FULL inverse");
+    if (minimum_scaled_pivots)
+      checkRuntime(launchComplexSpatialFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, head_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data(),
+          minimum_scaled_pivots), "complex FULL inverse diagnostics");
+    else
+      checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_, head_.data(),
+          channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex FULL inverse");
     admitStatus();
     checkRuntime(launchComplexValueReduce(t.queue_.getNative(), t.batch_, t.shape_.determinants, t.ne_,
         t.shape_.spin_up_electrons, *t.model_->periodicCell(), t.positions_.data(), channels_.data(), t.cusp_jets_.data(),
@@ -404,13 +437,16 @@ private:
   }
 
   /// Admit every numeric phase before the sole final publication flag changes.
-  void admitStatus()
+  void admitStatus(ComplexValueFailureStage stage = ComplexValueFailureStage::FACTORIZATION)
   {
     trunk_->queue_.sync();
     std::uint64_t status;
     status_.downloadOnStream(&status, 1, trunk_->queue_.getNative());
     if (status != std::numeric_limits<std::uint64_t>::max())
+    {
+      if (trunk_->mixed_dense_) throw MixedComplexValueFailure(stage, status);
       throw std::runtime_error("Complex FULL node/inverse/nonfinite admission failed, status=" + std::to_string(status));
+    }
   }
 
   ComplexSpatialCost cost_;

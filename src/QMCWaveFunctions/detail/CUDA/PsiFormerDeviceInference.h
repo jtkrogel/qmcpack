@@ -955,6 +955,7 @@ private:
   friend class PreparedDeviceKineticReverse;
   friend class PreparedDeviceComplexValue;
   friend class PreparedDeviceMixedComplexValue;
+  friend class PreparedDeviceMixedComplexSpatial;
   friend class PreparedDeviceComplexSpatial;
   friend struct ComplexSpatialTargetValidationAccess;
   friend class PreparedDeviceComplexScore;
@@ -2231,14 +2232,16 @@ public:
 
 private:
   /// Numerical paired composition only; ordinary REAL attachment remains independently restricted.
-  void setMixedDenseForPairedTrunk(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
+  void setMixedDenseForPairedTrunk(std::shared_ptr<PreparedDeviceMixedValueDense> adapter,
+                                 SpatialJetMode requested_mode = SpatialJetMode::VALUE_ONLY)
   {
-    if (adapter && (mode_ != SpatialJetMode::VALUE_ONLY || target_preparation_.max_targets ||
+    if (adapter && ((requested_mode != SpatialJetMode::VALUE_ONLY && requested_mode != SpatialJetMode::FULL_VGL) ||
+        mode_ != requested_mode || target_preparation_.max_targets ||
         !value_tape_.empty() || retained_targets_ || kinetic_trunk_only_ ||
         !supportsMixedPairedTrunkEnvironment(plan_.environment())))
-      throw std::invalid_argument("Mixed paired trunk requires ordinary legacy-torus VALUE without retained state");
+      throw std::invalid_argument("Mixed paired trunk requires ordinary legacy-torus VALUE/FULL without retained state");
     if (adapter && (adapter->modelImage().get() != model_.get() ||
-        adapter->maximumRows() < product(batch_capacity_, ne_)))
+        adapter->maximumRows() < product(product(batch_capacity_, ne_), features_.output.plane_count)))
       throw std::invalid_argument("Mixed paired trunk adapter has a foreign image or insufficient row capacity");
     mixed_dense_ = std::move(adapter);
     value_tape_valid_ = result_valid_ = false;

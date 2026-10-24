@@ -644,6 +644,19 @@ Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channel
   return launched();
 }
 
+/// Collect pivots while executing the unchanged inverse-enabled scalar LU path.
+Error launchComplexSpatialFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve,
+    double* minimum_scaled_pivots)
+{
+  if (!channels || !n || !matrix || !metadata || !status || !inverse || !permutation || !solve || !minimum_scaled_pivots)
+    throw std::invalid_argument("Complex FULL diagnostic factor storage/size is invalid");
+  factor<true><<<blocks(channels), 128, 0, stream>>>(
+      channels, n, matrix, metadata, status, inverse, permutation, solve, minimum_scaled_pivots);
+  return launched();
+}
+
 /// Preflight every launch/index bound without publishing numerical failure early.
 Error launchComplexValuePairCheck(Stream stream, std::size_t batch, std::size_t electrons,
     std::size_t spin_up, periodic_geometry::Cell cell, const double* positions, std::uint64_t* events)

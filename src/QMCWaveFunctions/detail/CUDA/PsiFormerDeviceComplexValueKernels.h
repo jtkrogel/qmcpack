@@ -63,6 +63,12 @@ Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channel
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     double* minimum_scaled_pivots);
 
+/// Numerical FULL diagnostics preserve the existing inverse arithmetic and default ABI.
+Error launchComplexSpatialFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve,
+    double* minimum_scaled_pivots);
+
 /// Record the earliest canonical same-spin zero/invalid pair without changing status/results.
 Error launchComplexValuePairCheck(Stream stream, std::size_t batch, std::size_t electrons,
     std::size_t spin_up, periodic_geometry::Cell cell, const double* positions, std::uint64_t* events);
