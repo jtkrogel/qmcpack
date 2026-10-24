@@ -842,7 +842,8 @@ __global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
                                       double* retained_backflow,
                                       double* retained_envelope,
                                       periodic_geometry::Cell cell,
-                                      const double* projected_backflow)
+                                      const double* projected_backflow,
+                                      SparseEnvelopeAnchorView anchor)
 {
   const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t electron_count = layout.features.electron_count;
@@ -855,12 +856,48 @@ __global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
   const std::size_t remainder = logical % per_configuration;
   const std::size_t determinant = remainder / (electron_count * electron_count);
   const std::size_t matrix_element = remainder % (electron_count * electron_count);
+  const std::size_t row = matrix_element / electron_count;
+  const std::size_t column = matrix_element % electron_count;
+  const std::size_t bank_element = determinant * electron_count * electron_count + matrix_element;
+  bool reuse = periodic && anchor.ready && anchor.references && anchor.changed_electrons &&
+      anchor.envelope && anchor.positions && anchor.references[configuration] == 0 &&
+      anchor.changed_electrons[configuration] < electron_count &&
+      row != anchor.changed_electrons[configuration];
+  // IEEE bits deliberately distinguish signed zero. A mismatch takes the old
+  // envelope path; malformed descriptors cannot change physical diagnostics.
+  const double* position = positions + configuration * layout.position_configuration_stride +
+      row * layout.position_row_stride;
+  for (std::size_t dimension = 0; reuse && dimension < 3; ++dimension)
+  {
+    union Bits { double value; unsigned long long bits; } current{position[dimension]},
+        original{anchor.positions[row * 3 + dimension]};
+    reuse = current.bits == original.bits;
+  }
+  const bool capture = periodic && anchor.capture && configuration == 0 && anchor.envelope &&
+      anchor.positions && anchor.references && anchor.changed_electrons &&
+      anchor.references[0] == 0 && anchor.changed_electrons[0] == electron_count;
+  if (capture && determinant == 0 && column == 0)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      anchor.positions[row * 3 + dimension] = position[dimension];
   status[logical] = open_orbital::buildElement(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, configuration,
       active_electrons[configuration], determinant,
-      matrix_element / electron_count, matrix_element % electron_count, output,
-      retained_backflow, retained_envelope, periodic ? &cell : nullptr, projected_backflow);
+      row, column, output, retained_backflow, retained_envelope, periodic ? &cell : nullptr, projected_backflow,
+      false, nullptr, reuse ? anchor.envelope + bank_element : nullptr,
+      capture ? anchor.envelope + bank_element : nullptr);
+  if (reuse && determinant == 0 && column == 0 && anchor.counters &&
+      status[logical] == OpenSpatialStatus::REGULAR)
+  {
+    auto previous = atomicCAS(anchor.counters, 0ULL, 0ULL);
+    while (previous != ~0ULL)
+    {
+      const auto observed = atomicCAS(anchor.counters, previous, previous + 1ULL);
+      if (observed == previous)
+        break;
+      previous = observed;
+    }
+  }
 }
 
 /// Share native feature/weight loads while retaining each increasing-feature sum.
@@ -1568,7 +1605,7 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
   boundaryOrbitalJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
-      retained_backflow, retained_envelope, {}, projected_backflow);
+      retained_backflow, retained_envelope, {}, projected_backflow, {});
   return peekSpatialLaunchError();
 }
 
@@ -1607,8 +1644,14 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
     const double* backflow_down, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
     double* output, OpenSpatialStatus* status, double* retained_backflow, double* retained_envelope,
-    const double* projected_backflow)
+    const double* projected_backflow, SparseEnvelopeAnchorView anchor)
 {
+  // Invalid optional views never weaken the old leaf's physical diagnostics.
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || retained_backflow || retained_envelope ||
+      projected_backflow || !anchor.references || !anchor.changed_electrons || !anchor.positions ||
+      !anchor.envelope || anchor.envelope == output || anchor.positions == positions ||
+      anchor.envelope == positions || anchor.positions == output)
+    anchor = {};
   if (layout.features.configuration_count == 0 &&
       layout.determinant_count == 0 && layout.features.electron_count == 0)
     return success;
@@ -1631,7 +1674,7 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
   boundaryOrbitalJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
-      retained_backflow, retained_envelope, cell, projected_backflow);
+      retained_backflow, retained_envelope, cell, projected_backflow, anchor);
   return peekSpatialLaunchError();
 }
 

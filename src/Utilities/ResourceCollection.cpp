@@ -24,7 +24,7 @@ ResourceCollection::ResourceCollection(const std::string& name) : name_(name), c
 {}
 
 ResourceCollection::ResourceCollection(const ResourceCollection& ref)
-    : name_(ref.getName()), cursor_index_(0), outstanding_loans_(0)
+    : name_(ref.getName()), cursor_index_(0), outstanding_loans_(0), driver_crowd_count_(ref.driver_crowd_count_)
 {
   for (auto& res : ref.collection_)
     addResource(std::unique_ptr<Resource>(res->makeClone()), true);
@@ -43,8 +43,16 @@ ResourceCollection::ResourceCollection(ResourceCollection&& ref)
   cursor_index_      = ref.cursor_index_;
   collection_        = std::move(ref.collection_);
   batch_preparation_ = std::move(ref.batch_preparation_);
+  driver_crowd_count_ = std::exchange(ref.driver_crowd_count_, 0);
   ref.cursor_index_ = 0;
   ref.batch_preparation_ = {};
+}
+
+void ResourceCollection::setDriverCrowdCount(std::size_t count)
+{
+  if (outstanding_loans_)
+    throw std::logic_error("Cannot change driver crowd evidence while resources are acquired");
+  driver_crowd_count_ = count;
 }
 
 void ResourceCollection::printResources(std::ostream& os) const
@@ -75,6 +83,7 @@ ResourceCollection ResourceCollection::makePreparedBatchResourcesAfterValidation
     const BatchResourcePreparationContext& context) const
 {
   ResourceCollection prepared(name_);
+  prepared.driver_crowd_count_ = driver_crowd_count_;
   prepared.collection_.reserve(collection_.size());
   for (const std::unique_ptr<Resource>& resource : collection_)
   {
@@ -109,6 +118,7 @@ void ResourceCollection::swapResourceStorage(ResourceCollection& other) noexcept
   swap(outstanding_loans_, other.outstanding_loans_);
   collection_.swap(other.collection_);
   swap(batch_preparation_, other.batch_preparation_);
+  swap(driver_crowd_count_, other.driver_crowd_count_);
 }
 
 void ResourceCollection::prepareBatchResources(const BatchResourcePreparationContext& context)

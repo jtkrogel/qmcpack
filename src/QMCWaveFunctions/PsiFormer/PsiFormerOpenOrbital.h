@@ -246,7 +246,9 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     double* retained_backflow = nullptr, double* retained_envelope = nullptr,
     const periodic_geometry::Cell* periodic_cell = nullptr,
     const double* projected_backflow = nullptr, bool envelope_only = false,
-    const double* precontracted_value = nullptr) noexcept
+    const double* precontracted_value = nullptr,
+    const double* cached_envelope_value = nullptr,
+    double* captured_envelope_value = nullptr) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -254,6 +256,9 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     output[layout.orbitals.uncheckedPlaneOffset(configuration, plane, element)] = 0.0;
   if (precontracted_value && (layout.features.mode != SpatialJetMode::VALUE_ONLY ||
       projected_backflow || envelope_only))
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  if ((cached_envelope_value || captured_envelope_value) &&
+      layout.features.mode != SpatialJetMode::VALUE_ONLY)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
   if (active_electron >= layout.features.electron_count)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
@@ -278,13 +283,15 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     backflow_value += feature_value * weight;
   }
 
-  double envelope_value = 0.0;
+  // Only a request-local, bitwise position-proven VALUE factor may bypass the
+  // envelope loop. The backflow validation and final product remain canonical.
+  double envelope_value = cached_envelope_value ? *cached_envelope_value : 0.0;
   double envelope_gradient[3]{0.0, 0.0, 0.0};
   double envelope_laplacian = 0.0;
   const double* electron_position = positions +
       configuration * layout.position_configuration_stride +
       row_electron * layout.position_row_stride;
-  for (std::size_t nucleus = 0; nucleus < layout.nucleus_count; ++nucleus)
+  for (std::size_t nucleus = 0; !cached_envelope_value && nucleus < layout.nucleus_count; ++nucleus)
   {
     const double* nucleus_position = nuclei + nucleus * layout.nucleus_row_stride;
     double displacement[3];
@@ -342,6 +349,8 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     retained_backflow[retained_offset] = backflow_value;
   if (retained_envelope)
     retained_envelope[retained_offset] = envelope_value;
+  if (captured_envelope_value)
+    *captured_envelope_value = envelope_value;
   for (std::size_t lane = 0; lane < layout.features.gradient_lanes; ++lane)
   {
     double backflow_gradient = !envelope_only && projected_backflow

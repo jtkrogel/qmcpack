@@ -5016,6 +5016,67 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   /// ECP-only VALUE context; never upgrades the ordinary sampler/FULL capacity.
   std::unique_ptr<pf::DirectBatchWorkspace> ecp_value_workspace;
   bool ecp_value_reported = false;
+  bool sparse_envelope_prepared = false;
+
+  /// Acquire only the existing ordinary/VALUE16 participants before ECP RNG.
+  /// Failure to fit optional reuse leaves the canonical GPU tile path available.
+  void prepareVirtualEnvelopeReuse(std::size_t live_lanes, bool declared_single_crowd)
+  {
+#ifdef ENABLE_CUDA
+    if (sparse_envelope_prepared || expected_plan || prepared_plan || acquired_from_prepared_collection ||
+        !model_state->numerical_tile_backend || model_state->resident_device_authority_requested ||
+        model_state->resident_device_authority_enabled || model_state->twist_phase.active())
+      return;
+    const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+        model_state->numerical_tile_backend.get());
+    if (!backend || !backend->sparseValueHintsRequested())
+      return;
+    sparse_envelope_prepared = true;
+    if (!declared_single_crowd)
+    {
+      app_log() << "  PsiFormer REAL virtual envelope preparation: effective=0 reason=total_driver_crowds_unknown_or_multiple\n";
+      return;
+    }
+    const char* value16 = std::getenv("PSIFORMER_GPU_ECP_VALUE_TILE16");
+    if (value16 && std::strcmp(value16, "0") != 0 && std::strcmp(value16, "1") != 0)
+      throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_TILE16 must be 0 or 1");
+    const bool dedicated_value16 = value16 && std::strcmp(value16, "1") == 0;
+    // The dedicated baseline already requires lazy preparation; do not change
+    // that admission or create an unrequested spatial owner for its VALUE graph.
+    if (dedicated_value16 && !backend->lazySpatialPreparation())
+      return;
+    try
+    {
+      // VALUE16 owns virtual points independently. Its ordinary owner therefore
+      // needs only the existing physical walker occupancy, not sixteen FULLs.
+      batch_workspace->prepareSparseValueContext(dedicated_value16
+          ? std::min(live_lanes, batch_workspace->tileCapacity()) : batch_workspace->tileCapacity());
+      if (dedicated_value16 && !ecp_value_workspace)
+      {
+        auto candidate = model_state->direct_batch_executor.makeWorkspace();
+        candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, 16);
+        candidate->prepareSparseValueContext();
+        ecp_value_workspace = std::move(candidate);
+      }
+      backend->prepareSparseValueReuse(batch_workspace->numericalSamplingWorkspace(),
+          dedicated_value16 ? &ecp_value_workspace->numericalSamplingWorkspace() : nullptr);
+    }
+    catch (const std::length_error&)
+    {
+      app_log() << "  PsiFormer REAL virtual envelope preparation: effective=0 reason=baseline_preparation_fit\n";
+    }
+    catch (const std::bad_alloc&)
+    {
+      app_log() << "  PsiFormer REAL virtual envelope preparation: effective=0 reason=baseline_HOST_allocation\n";
+    }
+    catch (const std::runtime_error& error)
+    {
+      if (!psiformer::device::recoverOptionalEnvelopeAllocation(error))
+        throw;
+      app_log() << "  PsiFormer REAL virtual envelope preparation: effective=0 reason=baseline_DEVICE_allocation\n";
+    }
+#endif
+  }
 
   /// Keep virtual-only batching independent of ordinary spatial/sampler owners.
   pf::DirectBatchWorkspace& virtualValueWorkspace(const VirtualParticleBatch& virtual_batch)
@@ -8390,6 +8451,7 @@ void PsiFormerWF::acquireResource(
             ? std::optional<std::size_t>(collection_provenance.crowd_index)
             : std::nullopt,
         wfc_list.size());
+    candidate_handle.getResource().prepareVirtualEnvelopeReuse(wfc_list.size(), collection.hasSingleDriverCrowd());
   }
   catch (...)
   {

@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -59,6 +60,62 @@ enum class DirectBatchValueInput
 {
   DENSE_CONFIGURATIONS,
   SPARSE_REPLACEMENTS
+};
+
+/// Stable cold-owned state: moving a workspace never moves its active cookie.
+struct DirectSparseValueRequestState
+{
+  std::atomic<bool> active{false};
+  std::atomic<std::size_t> cookie{0};
+  std::size_t sequence = 0;
+};
+
+/// One synchronous sparse call; failed reentry never clears another caller's cookie.
+class DirectSparseValueRequestGuard
+{
+public:
+  explicit DirectSparseValueRequestGuard(DirectSparseValueRequestState* state) : state_(state)
+  {
+    if (!state_)
+      return;
+    bool expected = false;
+    if (!state_->active.compare_exchange_strong(expected, true, std::memory_order_acquire))
+      throw std::logic_error("Sparse VALUE request cannot re-enter its workspace");
+    if (state_->sequence == std::numeric_limits<std::size_t>::max())
+    {
+      state_->active.store(false, std::memory_order_release);
+      throw std::overflow_error("Sparse VALUE request generation exhausted");
+    }
+    state_->cookie.store(++state_->sequence, std::memory_order_release);
+  }
+
+  ~DirectSparseValueRequestGuard()
+  {
+    if (state_)
+    {
+      state_->cookie.store(0, std::memory_order_release);
+      state_->active.store(false, std::memory_order_release);
+    }
+  }
+
+  DirectSparseValueRequestGuard(const DirectSparseValueRequestGuard&) = delete;
+  DirectSparseValueRequestGuard& operator=(const DirectSparseValueRequestGuard&) = delete;
+
+private:
+  DirectSparseValueRequestState* const state_;
+};
+
+/// Borrowed only during the tile call; no backend may retain these HOST spans.
+struct DirectSparseValueTileHint
+{
+  const void* request_owner = nullptr;
+  const std::atomic<std::size_t>* live_cookie = nullptr;
+  std::size_t request_generation = 0;
+  std::size_t reference_count = 0;
+  std::size_t logical_begin = 0;
+  bool last_tile = false;
+  const std::size_t* references = nullptr;
+  const std::size_t* changed_electrons = nullptr;
 };
 
 /** Own backend-specific prepared tile resources without exposing vendor types. */
@@ -102,6 +159,17 @@ public:
   virtual DirectBatchTileResultView evaluate(DirectBatchTileBackendWorkspace& workspace,
       DirectBatchMode mode, const double* coordinates, std::size_t size,
       std::size_t parameter_version) const = 0;
+
+  /// Opt-in preparation only; the default route retains its original storage.
+  virtual bool sparseValueHintsRequested() const noexcept { return false; }
+
+  /// Keep original packing/math for backends without request-local VALUE reuse.
+  virtual DirectBatchTileResultView evaluateSparseValueTile(DirectBatchTileBackendWorkspace& workspace,
+      const double* coordinates, std::size_t size, std::size_t version,
+      const DirectSparseValueTileHint&) const
+  {
+    return evaluate(workspace, DirectBatchMode::VALUE_ONLY, coordinates, size, version);
+  }
 
   /// Report genuine numerical submissions; ordinary CPU execution reports zero.
   virtual std::size_t numericalTileCount() const noexcept { return 0; }
@@ -163,6 +231,8 @@ public:
         spatial_executor.valueExecutorIdentity() != &value_executor)
       throw std::invalid_argument(
           "PsiFormer batch executors do not share one parameter layout");
+    if (tile_backend_ && tile_backend_->sparseValueHintsRequested())
+      sparse_request_ = std::make_unique<DirectSparseValueRequestState>();
   }
 
   DirectBatchWorkspace(const DirectBatchWorkspace&) = delete;
@@ -176,6 +246,20 @@ public:
     if (!backend_workspace_)
       throw std::logic_error("Prepare ordinary numerical batch storage before sampling");
     return *backend_workspace_;
+  }
+
+  /// Opt-in cold preparation without changing logical inputs, outputs or tile order.
+  /// Resource acquisition calls this before quadrature can consume random numbers.
+  void prepareSparseValueContext(std::size_t capacity = 0)
+  {
+    if (tile_backend_ && sparse_request_)
+    {
+      if (!capacity)
+        capacity = tileCapacity();
+      if (capacity > tileCapacity())
+        throw std::invalid_argument("Sparse VALUE cold capacity exceeds existing tile selection");
+      prepareScratch(DirectBatchMode::VALUE_ONLY, capacity);
+    }
   }
 
   /** Select a nonzero execution tile capacity and prepare the current request.
@@ -866,6 +950,12 @@ public:
     {
     case DirectBatchMode::VALUE_ONLY:
       mix_vector(sparse_tile_positions_);
+      if (sparse_request_)
+      {
+        mix_vector(sparse_tile_references_);
+        mix_vector(sparse_tile_electrons_);
+        mix_value(reinterpret_cast<std::uintptr_t>(sparse_request_.get()));
+      }
       mix_vector(value_geometries_);
       mix_vector(raw_features_);
       mix_vector(features_a_);
@@ -991,6 +1081,12 @@ public:
                  pending_parameter_version_.capacity(), sizeof(std::size_t),
                  "PsiFormer logical output storage bytes overflowed");
     storage.sparse_tile_positions = sparseTilePositionBytes();
+    for (const auto* map : {&sparse_tile_references_, &sparse_tile_electrons_})
+      add_capacity(storage.sparse_tile_positions, map->capacity(), sizeof(std::size_t),
+                   "PsiFormer sparse hint bytes overflowed");
+    if (sparse_request_)
+      addStorageBytes(storage.sparse_tile_positions, sizeof(DirectSparseValueRequestState),
+                      "PsiFormer sparse request metadata bytes overflowed");
 
     for (const auto* buffer : {&raw_features_, &features_a_, &features_b_,
                                &query_, &key_, &projected_value_, &attention_,
@@ -1229,6 +1325,11 @@ private:
   {
     if (tile_backend_)
     {
+      if (sparse_request_)
+      {
+        growVector(sparse_tile_references_, capacity);
+        growVector(sparse_tile_electrons_, capacity);
+      }
       if (capacity > backend_capacity_)
       {
         auto prepared = tile_backend_->prepare(capacity);
@@ -1512,6 +1613,15 @@ private:
                  sparse_tile_positions_.capacity(), sparse_tile_positions,
                  sizeof(double),
                  "PsiFormer prospective sparse tile bytes overflowed");
+    if (sparse_request_)
+    {
+      for (const auto* map : {&sparse_tile_references_, &sparse_tile_electrons_})
+        add_capacity(result.sparse_tile_positions, map->capacity(),
+                     std::max({value_tile, full_tile, active_tile}), sizeof(std::size_t),
+                     "PsiFormer prospective sparse hint bytes overflowed");
+      addStorageBytes(result.sparse_tile_positions, sizeof(DirectSparseValueRequestState),
+                      "PsiFormer prospective sparse request metadata bytes overflowed");
+    }
 
     const ValueScratchExtents value_extents = valueScratchExtents(value_tile);
     add_capacity(result.value_tile, raw_features_.capacity(), value_extents.raw,
@@ -1888,6 +1998,8 @@ private:
   std::size_t electron_count_;
   std::shared_ptr<const DirectBatchTileBackend> tile_backend_;
   std::unique_ptr<DirectBatchTileBackendWorkspace> backend_workspace_;
+  std::unique_ptr<DirectSparseValueRequestState> sparse_request_;
+  std::vector<std::size_t> sparse_tile_references_, sparse_tile_electrons_;
   std::size_t backend_capacity_ = 0;
   DirectBatchMode active_mode_ = DirectBatchMode::VALUE_ONLY;
   DirectBatchValueInput active_value_input_ =
@@ -1971,6 +2083,7 @@ public:
   /** Evaluate a true tiled value batch without invoking the scalar value executor. */
   DirectBatchValueResultView evaluateValues(DirectBatchWorkspace& workspace) const
   {
+    DirectSparseValueRequestGuard request_guard(workspace.sparse_request_.get());
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::VALUE_ONLY);
     if (workspace.active_value_input_ ==
@@ -2012,8 +2125,26 @@ public:
         tile_positions = workspace.electron_positions_.data() +
             tile_begin * workspace.electron_count_ * 3;
       if (tile_backend_)
+      {
+        std::optional<DirectSparseValueTileHint> hint;
+        if (workspace.sparse_request_ && workspace.active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
+        {
+          for (std::size_t local = 0; local < tile_size; ++local)
+          {
+            const auto logical = tile_begin + local;
+            const bool reference = logical < workspace.active_reference_count_;
+            const auto replacement = reference ? 0 : logical - workspace.active_reference_count_;
+            workspace.sparse_tile_references_[local] = reference ? logical : workspace.replacement_references_[replacement];
+            workspace.sparse_tile_electrons_[local] = reference ? workspace.electron_count_ : workspace.replacement_electrons_[replacement];
+          }
+          hint = DirectSparseValueTileHint{workspace.sparse_request_.get(), &workspace.sparse_request_->cookie,
+              workspace.sparse_request_->cookie.load(std::memory_order_acquire), workspace.active_reference_count_,
+              tile_begin, tile_begin + tile_size == workspace.active_size_, workspace.sparse_tile_references_.data(),
+              workspace.sparse_tile_electrons_.data()};
+        }
         evaluateBackendTile(workspace, DirectBatchMode::VALUE_ONLY, tile_begin, tile_size,
-                            tile_positions, nullptr, parameter_version);
+                            tile_positions, nullptr, parameter_version, hint ? &*hint : nullptr);
+      }
       else
         evaluateValueTile(workspace, tile_begin, tile_size, tile_positions, parameters,
                           parameter_version, statistics);
@@ -2949,11 +3080,14 @@ private:
    */
   void evaluateBackendTile(DirectBatchWorkspace& workspace, DirectBatchMode mode,
       std::size_t begin, std::size_t size, const double* positions,
-      const std::size_t* active_electrons, std::size_t version) const
+      const std::size_t* active_electrons, std::size_t version,
+      const DirectSparseValueTileHint* sparse_hint = nullptr) const
   {
     if (!workspace.backend_workspace_ || size > workspace.backend_capacity_)
       throw std::logic_error("Numerical tile resources were not prepared for this request");
-    const auto result = tile_backend_->evaluate(*workspace.backend_workspace_, mode, positions, size, version);
+    const auto result = sparse_hint
+        ? tile_backend_->evaluateSparseValueTile(*workspace.backend_workspace_, positions, size, version, *sparse_hint)
+        : tile_backend_->evaluate(*workspace.backend_workspace_, mode, positions, size, version);
     if (result.size != size || result.parameter_version != version ||
         !result.sign || !result.logabs || result.value_stride == 0)
       throw std::logic_error("Numerical tile returned inconsistent values or model version");

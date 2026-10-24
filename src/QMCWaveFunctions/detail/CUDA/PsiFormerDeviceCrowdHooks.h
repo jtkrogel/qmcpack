@@ -278,6 +278,7 @@ public:
 private:
   // The named sampler borrows this crowd's existing VALUE graph under its lease.
   friend class PreparedDeviceBatchBackend;
+  friend struct RealEnvelopeValidationAccess;
 
   /// Cold-upgrade released VALUE storage without replacing its graph or borrowers.
   bool prepareSpatialGraph()

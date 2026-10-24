@@ -15,6 +15,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 #include "psiformer_test_utils.h"
 
 namespace
@@ -25,7 +26,30 @@ class SyntheticTileBackend final : public pf::DirectBatchTileBackend
 {
 public:
   /// Retain only the electron count needed to generate independent lane labels.
-  explicit SyntheticTileBackend(std::size_t electrons) : electrons_(electrons) {}
+  explicit SyntheticTileBackend(std::size_t electrons, bool hints = false) : hints_enabled(hints), electrons_(electrons) {}
+
+  bool sparseValueHintsRequested() const noexcept override { return hints_enabled; }
+
+  /// Observe the borrowed protocol, then exercise the unchanged default delegate.
+  pf::DirectBatchTileResultView evaluateSparseValueTile(pf::DirectBatchTileBackendWorkspace& workspace,
+      const double* positions, std::size_t count, std::size_t version,
+      const pf::DirectSparseValueTileHint& hint) const override
+  {
+    REQUIRE(hint.live_cookie != nullptr);
+    REQUIRE(hint.request_generation != 0);
+    CHECK(hint.live_cookie->load() == hint.request_generation);
+    observed_cookie = hint.live_cookie;
+    observed_generation = hint.request_generation;
+    REQUIRE(hint.logical_begin + count <= observed_references.size());
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      observed_references[hint.logical_begin + i] = hint.references[i];
+      observed_electrons[hint.logical_begin + i] = hint.changed_electrons[i];
+    }
+    if (during_sparse_tile)
+      during_sparse_tile();
+    return DirectBatchTileBackend::evaluateSparseValueTile(workspace, positions, count, version, hint);
+  }
 
   /// Preallocate padded result storage; evaluation must never grow these vectors.
   std::unique_ptr<pf::DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const override
@@ -70,6 +94,11 @@ public:
   std::size_t nonfinite_call = std::numeric_limits<std::size_t>::max();
   std::size_t nodal_call = std::numeric_limits<std::size_t>::max();
   bool wrong_version = false;
+  const bool hints_enabled;
+  mutable const std::atomic<std::size_t>* observed_cookie = nullptr;
+  mutable std::size_t observed_generation = 0;
+  mutable std::array<std::size_t, 16> observed_references{}, observed_electrons{};
+  std::function<void()> during_sparse_tile;
 
 private:
   /** Own padded numerical result arrays without model data or runtime handles. */
@@ -88,6 +117,111 @@ private:
 };
 
 } // namespace
+
+/// Opt-in protocol must preserve original order, noexcept moves and atomic failure.
+TEST_CASE("PsiFormer sparse VALUE hints have scoped move-safe request cookies",
+          "[wavefunction][psiformer][batch][sparse-value-hints]")
+{
+  using namespace qmcplusplus::testing::psiformer;
+  static_assert(std::is_nothrow_move_constructible_v<pf::DirectBatchWorkspace>);
+  static_assert(std::is_nothrow_move_assignable_v<pf::DirectBatchWorkspace>);
+  auto files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters.string(), files.configuration.string());
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, 2, model.ndet, model.dim, model.heads, model.blocks});
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor spatial(model, value, plan);
+  auto tiles = std::make_shared<SyntheticTileBackend>(model.ne, true);
+  pf::DirectBatchExecutor batch(value, spatial, tiles);
+  auto workspace = batch.makeWorkspace();
+  workspace->prepareTileCapacity(2);
+  workspace->resizeSparseValues(2, 3);
+  for (std::size_t reference = 0; reference < 2; ++reference)
+  {
+    auto positions = model.cfg.configuration(0);
+    positions.x[0] = 0.1 + 0.1 * reference;
+    workspace->setReferenceConfiguration(reference,
+        pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+  }
+  workspace->setVirtualReplacement(0, 1, 0, pf::GeometryPosition{0.7, 0.2, 0.3});
+  workspace->setVirtualReplacement(1, 0, 1, pf::GeometryPosition{0.8, 0.2, 0.3});
+  workspace->setVirtualReplacement(2, 1, 2, pf::GeometryPosition{0.9, 0.2, 0.3});
+  const auto fingerprint = workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY);
+  auto moved = std::make_unique<pf::DirectBatchWorkspace>(std::move(*workspace));
+  workspace = std::move(moved);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) == fingerprint);
+  tiles->during_sparse_tile = [&] {
+    const auto cookie = tiles->observed_cookie->load();
+    CHECK_THROWS_AS(batch.evaluateValues(*workspace), std::logic_error);
+    CHECK(tiles->observed_cookie->load() == cookie);
+  };
+  auto result = batch.evaluateValues(*workspace);
+  CHECK(tiles->observed_cookie->load() == 0);
+  const std::array<std::size_t, 5> references{0, 1, 1, 0, 1};
+  const std::array<std::size_t, 5> electrons{model.ne, model.ne, 0, 1, 2};
+  for (std::size_t i = 0; i < references.size(); ++i)
+  {
+    CHECK(tiles->observed_references[i] == references[i]);
+    CHECK(tiles->observed_electrons[i] == electrons[i]);
+  }
+  const std::vector<double> before(result.logabs, result.logabs + result.size);
+  const auto generation = tiles->observed_generation;
+  tiles->nonfinite_call = tiles->calls + 2;
+  CHECK_THROWS_AS(batch.evaluateValues(*workspace), std::runtime_error);
+  CHECK(tiles->observed_cookie->load() == 0);
+  CHECK(tiles->observed_generation > generation);
+  for (std::size_t i = 0; i < before.size(); ++i)
+    CHECK(result.logabs[i] == before[i]);
+  tiles->nonfinite_call = std::numeric_limits<std::size_t>::max();
+  CHECK_NOTHROW(batch.evaluateValues(*workspace));
+  CHECK(tiles->observed_cookie->load() == 0);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) == fingerprint);
+}
+
+TEST_CASE("PsiFormer cached VALUE envelopes preserve product bits and backflow admission",
+          "[wavefunction][psiformer][batch][sparse-envelope-factor]")
+{
+  using namespace qmcplusplus::psiformer;
+  const auto layout = makeOpenOrbitalJetLayout(1, 2, 2, 2, 3, 1, SpatialJetMode::VALUE_ONLY);
+  const auto cell = periodic_geometry::makeCell({{{9., .3, .1}, {0., 10., .2}, {.1, 0., 11.}}},
+                                                {{true, true, true}});
+  const double positions[]{.2, .3, .4, .7, .8, .9};
+  const double nuclei[]{.1, .3, .4, 1.1, 1.3, 1.4};
+  std::vector<double> features(spatialJetSpanElements(layout.features), .37);
+  std::vector<double> up(openOrbitalBackflowSpan(layout), .21), down(up.size(), -.13);
+  std::vector<double> pi(openOrbitalEnvelopeSpan(layout), .71), zeta(pi.size(), -.83);
+  std::vector<double> expected(spatialJetSpanElements(layout.orbitals), 41.), actual(expected), bank(expected.size());
+  // Finite zero factors and EI coalescence remain legal VALUE cases, without division.
+  for (const int variant : {0, 1, 2})
+  {
+    auto coordinates = std::vector<double>(positions, positions + 6);
+    auto coefficients = pi;
+    if (variant == 1)
+      std::fill(coefficients.begin(), coefficients.end(), 0.);
+    if (variant == 2)
+      std::copy_n(nuclei, 3, coordinates.data());
+    for (std::size_t d = 0; d < 2; ++d)
+      for (std::size_t r = 0; r < 2; ++r)
+        for (std::size_t o = 0; o < 2; ++o)
+        {
+          const auto element = open_orbital::outputElement(layout, d, r, o);
+          REQUIRE(open_orbital::buildElement(layout, features.data(), coordinates.data(), nuclei,
+              up.data(), down.data(), coefficients.data(), coefficients.data(), zeta.data(), zeta.data(),
+              0, 0, d, r, o, expected.data(), nullptr, nullptr, &cell, nullptr, false, nullptr,
+              nullptr, bank.data() + element) == OpenSpatialStatus::REGULAR);
+          REQUIRE(open_orbital::buildElement(layout, features.data(), coordinates.data(), nuclei,
+              up.data(), down.data(), coefficients.data(), coefficients.data(), zeta.data(), zeta.data(),
+              0, 0, d, r, o, actual.data(), nullptr, nullptr, &cell, nullptr, false, nullptr,
+              bank.data() + element) == OpenSpatialStatus::REGULAR);
+        }
+    CHECK(std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(double)) == 0);
+  }
+  up[open_orbital::weightOffset(layout, 0, 0, 0)] = std::numeric_limits<double>::quiet_NaN();
+  CHECK(open_orbital::buildElement(layout, features.data(), positions, nuclei,
+      up.data(), down.data(), pi.data(), pi.data(), zeta.data(), zeta.data(), 0, 0, 0, 0, 0,
+      actual.data(), nullptr, nullptr, &cell, nullptr, false, nullptr, bank.data()) ==
+      OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT);
+}
 
 /// Test tails, arbitrary strides and active lanes through the ordinary native ABI.
 TEST_CASE("PsiFormer numerical tiles preserve atomic native publication",

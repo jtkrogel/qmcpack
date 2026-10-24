@@ -179,6 +179,8 @@ TEST_CASE("ResourceCollection", "[utilities]")
     auto& res_handle = wfc.getResourceHandle();
     REQUIRE(res_handle);
     CHECK(res_collection.getOutstandingLoanCount() == 1);
+    CHECK_THROWS_AS(res_collection.setDriverCrowdCount(1), std::logic_error);
+    CHECK_FALSE(res_collection.hasSingleDriverCrowd());
 
     MemoryResource& mem_res             = res_handle;
     const MemoryResource& const_mem_res = res_handle;
@@ -194,6 +196,34 @@ TEST_CASE("ResourceCollection", "[utilities]")
   res_collection.prepareBatchResources({nullptr, 0});
 }
 
+
+TEST_CASE("ResourceCollection total driver crowd evidence is explicit and copied",
+          "[utilities][driver_crowd_evidence]")
+{
+  ResourceCollection unknown("unknown_topology");
+  CHECK(unknown.getDriverCrowdCount() == 0);
+  CHECK_FALSE(unknown.hasSingleDriverCrowd());
+  ResourceCollection unknown_copy(unknown);
+  CHECK_FALSE(unknown_copy.hasSingleDriverCrowd());
+
+  unknown.setDriverCrowdCount(2);
+  CHECK_FALSE(unknown.hasSingleDriverCrowd());
+  ResourceCollection multiple(unknown);
+  CHECK(multiple.getDriverCrowdCount() == 2);
+  CHECK_FALSE(multiple.hasSingleDriverCrowd());
+  multiple.prepareBatchResources({nullptr, 0});
+  CHECK(multiple.getDriverCrowdCount() == 2);
+  CHECK_FALSE(multiple.hasSingleDriverCrowd());
+
+  unknown.setDriverCrowdCount(1);
+  ResourceCollection single(unknown);
+  CHECK(single.hasSingleDriverCrowd());
+  ResourceCollection moved(std::move(single));
+  CHECK(moved.hasSingleDriverCrowd());
+  CHECK_FALSE(single.hasSingleDriverCrowd());
+  moved.prepareBatchResources({nullptr, 0});
+  CHECK(moved.hasSingleDriverCrowd());
+}
 
 TEST_CASE("ResourceCollection::printResources", "[utilities]")
 {

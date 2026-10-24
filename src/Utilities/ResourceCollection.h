@@ -59,6 +59,12 @@ public:
   size_t size() const { return collection_.size(); }
   bool empty() const { return collection_.size() == 0; }
 
+  /// Actual total driver crowds, not the maximum concurrent accelerator leases.
+  /// Zero is UNKNOWN; only the driver sets this on idle golden storage before copies.
+  void setDriverCrowdCount(std::size_t count);
+  std::size_t getDriverCrowdCount() const noexcept { return driver_crowd_count_; }
+  bool hasSingleDriverCrowd() const noexcept { return driver_crowd_count_ == 1; }
+
   /** Return immutable preparation provenance for acquisition-time validation. */
   const BatchResourcePreparationProvenance& getBatchResourcePreparationProvenance() const noexcept
   {
@@ -147,6 +153,7 @@ private:
   size_t outstanding_loans_;
   std::vector<std::unique_ptr<Resource>> collection_;
   BatchResourcePreparationProvenance batch_preparation_;
+  std::size_t driver_crowd_count_ = 0;
 
   friend struct DriverWalkerResourceCollection;
   template<class CONSUMER>

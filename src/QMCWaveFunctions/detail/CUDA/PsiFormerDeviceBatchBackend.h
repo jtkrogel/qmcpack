@@ -55,6 +55,26 @@ inline bool supportsLazyRealInferenceEnvironment(const ExecutionEnvironment& env
       environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
 }
 
+/// Recognize only DeviceBuffer's labelled malloc OOM for optional preparation.
+/// Other device, stream and context errors must keep their original failure.
+inline bool recoverOptionalEnvelopeAllocation(const std::runtime_error& error)
+{
+  const std::string_view message(error.what());
+  if ((message.substr(0, 11) != "cudaMalloc:" && message.substr(0, 10) != "hipMalloc:") ||
+      message.find("out of memory") == std::string_view::npos)
+    return false;
+#ifdef QMC_CUDA2HIP
+  const auto last = hipGetLastError();
+  if (last != hipSuccess && last != hipErrorOutOfMemory)
+    checkRuntime(last, "Sparse VALUE allocation recovery");
+#else
+  const auto last = cudaGetLastError();
+  if (last != cudaSuccess && last != cudaErrorMemoryAllocation)
+    checkRuntime(last, "Sparse VALUE allocation recovery");
+#endif
+  return true;
+}
+
 /** Supply exclusive GPU scratch per batch workspace and one shared model image.
  * The control mutex protects non-atomic model leases. The first synchronous
  * default serializes submissions. Explicit bounded FP64 inference leases allow
@@ -62,6 +82,7 @@ inline bool supportsLazyRealInferenceEnvironment(const ExecutionEnvironment& env
  */
 class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
 {
+  friend struct RealEnvelopeValidationAccess;
   /// Shared cold receipt survives either backend/context destruction order.
   struct MixedFinalStatistics
   {
@@ -89,6 +110,13 @@ public:
                                       bool outer_twist = false)
       : image_(checkedImage(std::move(image))),
         preparation_(validatedPreparation(image_->plan(), precision, preparation)), lazy_spatial_(lazy_spatial),
+        sparse_envelope_requested_(configuredRealVirtualEnvelopeReuse()),
+        sparse_envelope_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
+            !preparation_.select_vgl_targets &&
+            !preparation_.metropolis_workspace_budget_bytes && !preparation_.metropolis_drift_budget_bytes &&
+            preparation_.active_inference_crowds == 1 && image_->plan().modelShape().electrons() >= 64 &&
+            image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
+            supportsLazyRealInferenceEnvironment(image_->plan().environment())),
         inference_concurrency_(preparation_.active_inference_crowds),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
@@ -107,6 +135,8 @@ public:
     }
     else if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
+    if (sparse_envelope_requested_ && !sparse_envelope_eligible_)
+      std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=profile_or_automatic_target_selection\n";
   }
 
   // Contexts retain references to the owner/mutex, so this backend is address-stable.
@@ -155,6 +185,28 @@ public:
       pf::DirectBatchMode mode, const double* coordinates, std::size_t size,
       std::size_t parameter_version) const override
   {
+    return evaluateTile(workspace, mode, coordinates, size, parameter_version, nullptr);
+  }
+
+  /// Freeze hint storage only for the bounded ordinary legacy Gamma FP64 route.
+  bool sparseValueHintsRequested() const noexcept override
+  {
+    return sparse_envelope_requested_ && sparse_envelope_eligible_;
+  }
+
+  /// Preserve the original numerical tile method when no scoped hints are present.
+  pf::DirectBatchTileResultView evaluateSparseValueTile(pf::DirectBatchTileBackendWorkspace& workspace,
+      const double* coordinates, std::size_t size, std::size_t parameter_version,
+      const pf::DirectSparseValueTileHint& hint) const override
+  {
+    return evaluateTile(workspace, pf::DirectBatchMode::VALUE_ONLY, coordinates, size, parameter_version, &hint);
+  }
+
+private:
+  pf::DirectBatchTileResultView evaluateTile(pf::DirectBatchTileBackendWorkspace& workspace,
+      pf::DirectBatchMode mode, const double* coordinates, std::size_t size,
+      std::size_t parameter_version, const pf::DirectSparseValueTileHint* hint) const
+  {
     auto inference_lease = inference_concurrency_.acquire();
     std::unique_lock<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
@@ -175,6 +227,32 @@ public:
       context->hooks.rebindModel(image_, mixed_parameters_);
     if (spatial && context->hooks.prepareSpatialGraph())
       reportSpatialPreparation(context->hooks.target_preparation_, context->capacity);
+    // The existing context lock excludes reuse/reentry. Never retain borrowed
+    // HOST spans or cookie pointers beyond this synchronous tile submission.
+    auto* value_graph = context->hooks.values_.get();
+    struct SparseTileScope
+    {
+      PreparedDeviceInference* graph;
+      bool completed = false;
+      bool last = true;
+      void invalidate() noexcept
+      {
+        if (graph)
+          graph->endSparseEnvelopeTile(false, true);
+        graph = nullptr;
+      }
+      ~SparseTileScope() { if (graph) graph->endSparseEnvelopeTile(completed, last); }
+    } sparse_scope{value_graph};
+    const bool valid_hint = value_graph && !spatial && hint && hint->request_owner && hint->live_cookie &&
+        hint->request_generation && hint->live_cookie->load(std::memory_order_acquire) == hint->request_generation;
+    if (valid_hint)
+    {
+      value_graph->beginSparseEnvelopeTile(hint->request_owner, hint->request_generation,
+          hint->reference_count, hint->logical_begin, hint->references, hint->changed_electrons, size);
+      sparse_scope.last = hint->last_tile;
+    }
+    else if (value_graph)
+      value_graph->endSparseEnvelopeTile(false, true);
     const auto count = spatial_detail::checkedProduct(size,
         spatial_detail::checkedProduct(3, image_->plan().modelShape().electrons(), "Device tile coordinates overflow"),
         "Device tile coordinate extent overflow");
@@ -202,6 +280,8 @@ public:
     }
     catch (...)
     {
+      // Recovery may replace the graph. Revoke its anchor before retiring it.
+      sparse_scope.invalidate();
       if (!lock.owns_lock())
         lock.lock();
       if (context->crowd.poisoned())
@@ -250,7 +330,106 @@ public:
       std::clog << "PsiFormer explicit mixed inference completed: mixed_batches=" << context->hooks.mixedBatches()
                 << ", whole_fp64_retries=" << context->hooks.mixedRetries()
                 << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
+    if (valid_hint && hint->live_cookie->load(std::memory_order_acquire) != hint->request_generation)
+      throw std::logic_error("Sparse VALUE request cookie changed before tile publication");
+    sparse_scope.completed = true;
     return result;
+  }
+
+public:
+
+  /** Cold pre-RNG admission for the ordinary and optional dedicated VALUE16 owner.
+   * A lazy ordinary FULL uses the existing conservative target-graph bound.
+   * All actual allocations still use the existing aggregate DEVICE pool.
+   */
+  bool prepareSparseValueReuse(pf::DirectBatchTileBackendWorkspace& ordinary_workspace,
+      pf::DirectBatchTileBackendWorkspace* value16_workspace = nullptr) const
+  {
+    if (!sparseValueHintsRequested())
+      return false;
+    std::lock_guard lock(control_mutex_);
+    auto* ordinary = dynamic_cast<Context*>(&ordinary_workspace);
+    auto* value16 = dynamic_cast<Context*>(value16_workspace);
+    if (!ordinary || ordinary->owner != this ||
+        (value16_workspace && (!value16 || value16->owner != this || value16 == ordinary)))
+      throw std::invalid_argument("Sparse VALUE preparation requires two distinct bound contexts");
+    std::unique_lock first_lock(ordinary->evaluation_mutex, std::try_to_lock);
+    std::unique_lock<std::mutex> second_lock;
+    if (value16)
+      second_lock = std::unique_lock(value16->evaluation_mutex, std::try_to_lock);
+    if (!first_lock.owns_lock() || (value16 && !second_lock.owns_lock()))
+      throw std::logic_error("Sparse VALUE preparation requires released contexts");
+    if (ordinary->sparse_preparation_checked)
+      return ordinary->sparse_preparation_effective;
+    ordinary->sparse_preparation_checked = true;
+    auto& first = ordinary->hooks.values_;
+    auto* second = value16 ? value16->hooks.values_.get() : nullptr;
+    if (!first || !first->admitsSparseEnvelopeAnchor() ||
+        (value16 && (!second || !second->admitsSparseEnvelopeAnchor())) ||
+        !configuredDeviceMemoryAdmission().limit_bytes)
+    {
+      std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=unbounded_or_ineligible_baseline\n";
+      return false;
+    }
+    const auto& plan = image_->plan();
+    const auto future_full = ordinary->hooks.spatial_ ? 0 :
+        (ordinary->hooks.target_preparation_.max_targets
+          ? estimatePreparedTargetVglCost(plan, ordinary->capacity, ordinary->hooks.target_preparation_).device_workspace_bytes
+          : estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes);
+    const auto extra = spatial_detail::checkedAdd(first->sparseEnvelopeDeviceBytes(),
+        second ? second->sparseEnvelopeDeviceBytes() : 0, "Sparse VALUE two-owner bytes overflow");
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&ordinal), "Sparse VALUE preparation current device");
+#else
+    checkRuntime(cudaGetDevice(&ordinal), "Sparse VALUE preparation current device");
+#endif
+    auto rollback = [&] {
+      first->discardSparseEnvelopeAnchor();
+      if (second)
+        second->discardSparseEnvelopeAnchor();
+    };
+    try
+    {
+      auto future_reservation = deviceMemoryMetrics(ordinal).reserveAllocation(future_full);
+      { auto optional_preflight = deviceMemoryMetrics(ordinal).reserveAllocation(extra); }
+      first->prepareSparseEnvelopeAnchor();
+      if (second)
+        second->prepareSparseEnvelopeAnchor();
+    }
+    catch (const std::length_error&)
+    {
+      rollback();
+      std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=aggregate_fit requested_device_bytes="
+                << extra << " future_FULL_numeric_bound=" << future_full << '\n';
+      return false;
+    }
+    catch (const std::bad_alloc&)
+    {
+      rollback();
+      std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=optional_HOST_allocation\n";
+      return false;
+    }
+    catch (const std::runtime_error& error)
+    {
+      rollback();
+      if (!recoverOptionalEnvelopeAllocation(error))
+        throw;
+      std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=optional_DEVICE_allocation\n";
+      return false;
+    }
+    catch (...)
+    {
+      rollback();
+      throw;
+    }
+    ordinary->sparse_preparation_effective = true;
+    if (value16)
+      value16->sparse_preparation_checked = value16->sparse_preparation_effective = true;
+    std::clog << "PsiFormer REAL virtual envelope preparation: effective=1 participants=" << (value16 ? 2 : 1)
+              << " requested_device_bytes=" << extra << " future_FULL_numeric_bound=" << future_full
+              << " HOST_scope=numeric_not_aggregate_fit\n";
+    return true;
   }
 
   /// Host permit evidence only, not a claim of simultaneous kernel execution.
@@ -645,6 +824,9 @@ private:
     /// Collect existing counters only; do not create graphs or synchronize a queue.
     ~Context() override
     {
+      // The existing destruction boundary, not the virtual-request hot path.
+      try { if (hooks.values_) hooks.values_->reportSparseEnvelopeAnchor(); }
+      catch (...) {} // Optional diagnostics cannot interfere with retirement.
       if (mixed_statistics)
       {
         mixed_statistics->successes.fetch_add(hooks.mixedBatches(), std::memory_order_relaxed);
@@ -666,6 +848,7 @@ private:
     std::vector<std::size_t> sampler_indices;
     std::size_t sampler_version = 0;
     bool resident_coordinates = false;
+    bool sparse_preparation_checked = false, sparse_preparation_effective = false;
     std::vector<double> positions;
     std::size_t coordinate_generation = 0;
     bool parallel_batch_reported = false;
@@ -738,6 +921,8 @@ private:
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
   const DeviceExecutionPreparation preparation_;
   const bool lazy_spatial_;
+  const bool sparse_envelope_requested_;
+  const bool sparse_envelope_eligible_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;

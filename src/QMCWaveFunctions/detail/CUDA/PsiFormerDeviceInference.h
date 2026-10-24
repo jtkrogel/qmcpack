@@ -438,6 +438,17 @@ inline bool configuredPeriodicValueGeometryCooperative()
   throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_COOPERATIVE must be 0 or 1");
 }
 
+/// Freeze optional ordinary REAL request-local envelope reuse at backend preparation.
+inline bool configuredRealVirtualEnvelopeReuse()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_REAL_VIRTUAL_ENVELOPE_REUSE");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_REAL_VIRTUAL_ENVELOPE_REUSE must be 0 or 1");
+}
+
 /// Freeze retained OPEN feature admission independently of ordinary inference.
 inline bool configuredRetainedOpenFeatures()
 {
@@ -952,6 +963,7 @@ private:
   friend struct RetainedTraceValidationAccess;
   friend struct RetainedValueCuspValidationAccess;
   friend struct PeriodicFeatureJetsValidationAccess;
+  friend struct RealEnvelopeValidationAccess;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -1522,6 +1534,20 @@ private:
   void finishPreparedTile(MixedValueAttempt& mixed_attempt, bool reuse_target_base = false)
   {
     const auto stream = queue_.getNative();
+    if (sparse_envelope_ && sparse_envelope_->tile.references)
+    {
+      // The owner retains this HOST vector through the existing physical fence
+      // below. Unlike the general synchronous upload helper, add no new fence.
+      const auto bytes = checkedDeviceBytes<std::size_t>(product(2, batch_capacity_));
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipMemcpyAsync(sparse_envelope_->descriptors.data(), sparse_envelope_->packed.data(),
+          bytes, hipMemcpyHostToDevice, stream), "Sparse envelope descriptors H2D");
+#else
+      checkRuntime(cudaMemcpyAsync(sparse_envelope_->descriptors.data(), sparse_envelope_->packed.data(),
+          bytes, cudaMemcpyHostToDevice, stream), "Sparse envelope descriptors H2D");
+#endif
+      deviceMemoryMetrics(sparse_envelope_->descriptors.deviceOrdinal()).uploaded(bytes);
+    }
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
     if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicOrbitalJets(stream, orbitals_, *cell, a_.data(), positions_.data(), model_->nuclei(),
@@ -1530,7 +1556,8 @@ private:
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
           active_.data(), orbital_jets_.data(), open_status_.data(),
           value_tape_.empty() ? nullptr : retained_backflow_.data(),
-          value_tape_.empty() ? nullptr : retained_envelope_.data()), "model periodic orbital VGL");
+          value_tape_.empty() ? nullptr : retained_envelope_.data(), nullptr,
+          sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}), "model periodic orbital VGL");
     else if (usesTiledValueOrbitals())
       checkRuntime(launchOpenOrbitalValuesTiled(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
@@ -1546,6 +1573,10 @@ private:
         value_tape_.empty() ? nullptr : retained_backflow_.data(),
           value_tape_.empty() ? nullptr : retained_envelope_.data()), "model open orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
+    // This existing physical admission is the only capture publication boundary.
+    // The request wrapper revokes it if any later determinant/result stage fails.
+    if (sparse_envelope_ && sparse_envelope_->tile.capture)
+      sparse_envelope_->ready = true;
 
     // Only values need compact packing for factorization and the score-head ABI.
     // Spatial traces borrow the existing orbital planes with a configuration stride,
@@ -1889,6 +1920,7 @@ private:
    */
   void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
   {
+    endSparseEnvelopeTile(false, true);
     cusp_state_valid_ = false;
     model_ = successor;
     value_tape_valid_ = false;
@@ -1898,6 +1930,134 @@ private:
   }
 
 public:
+  /// Only ordinary fixed legacy Gamma FP64 VALUE may retain one reference bank.
+  bool admitsSparseEnvelopeAnchor() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY && value_tape_.empty() &&
+        !retained_targets_ && !kinetic_trunk_only_ && !mixed_dense_ && !mixed_open_features_excluded_ &&
+        environment.fixed_nuclei && environment.boundary == BoundaryCondition::PERIODIC &&
+        !environment.periodic_profile && environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+        environment.head_representation == HeadRepresentation::REAL &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL &&
+        environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+  }
+
+  /// Numeric added owner bytes, independent of reference/walker count.
+  std::size_t sparseEnvelopeDeviceBytes() const
+  {
+    if (!admitsSparseEnvelopeAnchor())
+      return 0;
+    return spatial_detail::checkedAdd(checkedDeviceBytes<double>(spatial_detail::checkedAdd(
+        matrices_per_configuration_, product(3, ne_), "Envelope anchor extent overflow")),
+        spatial_detail::checkedAdd(checkedDeviceBytes<std::size_t>(product(2, batch_capacity_)),
+            checkedDeviceBytes<unsigned long long>(4), "Envelope anchor counter bytes overflow"),
+        "Envelope anchor device bytes overflow");
+  }
+
+  /// Caller proves complete baseline overlap before RNG; actual allocations use
+  /// the existing aggregate pool. A partial candidate never becomes live state.
+  void prepareSparseEnvelopeAnchor()
+  {
+    if (sparse_envelope_ || !admitsSparseEnvelopeAnchor())
+      return;
+    auto candidate = std::make_unique<SparseEnvelopeAnchor>();
+    candidate->packed.resize(product(2, batch_capacity_));
+    candidate->envelope.reserveNamed(matrices_per_configuration_, "Inference::sparse_envelope", __FILE__, __LINE__);
+    candidate->positions.reserveNamed(product(3, ne_), "Inference::sparse_base_positions", __FILE__, __LINE__);
+    candidate->descriptors.reserveNamed(product(2, batch_capacity_), "Inference::sparse_descriptors", __FILE__, __LINE__);
+    candidate->counters.reserveNamed(4, "Inference::sparse_counters", __FILE__, __LINE__);
+    const unsigned long long zero[4]{};
+    candidate->counters.upload(zero, 4);
+    sparse_envelope_ = std::move(candidate);
+  }
+
+  /// Roll back optional preparation without touching baseline scratch.
+  void discardSparseEnvelopeAnchor() noexcept { sparse_envelope_.reset(); }
+
+  /// Cold destruction diagnostic only; never transfer counters on a virtual tile.
+  void reportSparseEnvelopeAnchor() const
+  {
+    if (!sparse_envelope_)
+      return;
+    unsigned long long counters[4]{};
+    sparse_envelope_->counters.download(counters, 4);
+    std::clog << "PsiFormer REAL virtual envelope summary: anchor_references=1 requests_R1="
+              << sparse_envelope_->requests_r1 << " requests_Rmultiple=" << sparse_envelope_->requests_multiple
+              << " potential_anchor_rows=" << sparse_envelope_->potential_rows
+              << " actual_reused_rows=" << counters[0] << " scope=destroyed_context\n";
+  }
+
+  /// Borrow a checked hint only within the synchronous backend tile call.
+  void beginSparseEnvelopeTile(const void* owner, std::size_t generation, std::size_t references,
+      std::size_t logical_begin, const std::size_t* reference_indices,
+      const std::size_t* changed_electrons, std::size_t count)
+  {
+    if (!sparse_envelope_)
+      return;
+    auto& anchor = *sparse_envelope_;
+    anchor.tile = {};
+    if (!admitsSparseEnvelopeAnchor() || !owner || !generation || !references ||
+        !reference_indices || !changed_electrons || !count || count > batch_capacity_ ||
+        logical_begin > std::numeric_limits<std::size_t>::max() - count)
+    {
+      anchor.ready = false;
+      return;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+      if (reference_indices[i] >= references || changed_electrons[i] > ne_ ||
+          (logical_begin + i < references &&
+           (reference_indices[i] != logical_begin + i || changed_electrons[i] != ne_)) ||
+          (logical_begin + i >= references && changed_electrons[i] >= ne_))
+      {
+        anchor.ready = false;
+        return;
+      }
+    if (logical_begin == 0)
+    {
+      anchor.ready = false;
+      anchor.owner = owner;
+      anchor.generation = generation;
+      anchor.model = model_.get();
+      auto& requests = references == 1 ? anchor.requests_r1 : anchor.requests_multiple;
+      if (requests != std::numeric_limits<std::size_t>::max())
+        ++requests;
+    }
+    if (anchor.owner != owner || anchor.generation != generation || anchor.model != model_.get())
+    {
+      anchor.ready = false;
+      return;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      anchor.packed[i] = reference_indices[i];
+      anchor.packed[batch_capacity_ + i] = changed_electrons[i];
+      if (reference_indices[i] == 0 && changed_electrons[i] < ne_)
+      {
+        const auto maximum = std::numeric_limits<std::size_t>::max();
+        anchor.potential_rows = ne_ - 1 > maximum - anchor.potential_rows
+            ? maximum : anchor.potential_rows + ne_ - 1;
+      }
+    }
+    anchor.tile = {anchor.descriptors.data(), anchor.descriptors.data() + batch_capacity_,
+        anchor.positions.data(), anchor.envelope.data(), anchor.counters.data(), logical_begin == 0, anchor.ready};
+  }
+
+  /// Last-tile completion, dense calls, exceptions and rebind all revoke reuse.
+  void endSparseEnvelopeTile(bool completed, bool last) noexcept
+  {
+    if (!sparse_envelope_)
+      return;
+    sparse_envelope_->tile = {};
+    if (!completed || last)
+    {
+      sparse_envelope_->ready = false;
+      sparse_envelope_->owner = nullptr;
+    }
+  }
+
   /// Return prepared capacity independently of the most recent logical batch.
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
 
@@ -2025,7 +2185,9 @@ public:
   /// Count retained host status arrays, separately from vendor allocations.
   std::size_t hostWorkspaceBytes() const
   {
-    return checkedDeviceBytes<OpenSpatialStatus>(host_status_.capacity()) +
+    return (sparse_envelope_ ? sizeof(SparseEnvelopeAnchor) +
+        checkedDeviceBytes<std::size_t>(sparse_envelope_->packed.capacity()) : 0) +
+        checkedDeviceBytes<OpenSpatialStatus>(host_status_.capacity()) +
         checkedDeviceBytes<device_math::JetMathStatus>(host_jet_status_.capacity()) +
         checkedDeviceBytes<double>(tile_phase_.capacity() + tile_log_.capacity() +
             canonical_phase_.capacity() + canonical_log_.capacity()) +
@@ -2057,6 +2219,12 @@ public:
     if (parallel_traces_) add(parallel_traces_->deviceWorkspaceBytes());
     for (const auto& tape : value_tape_)
       add(tape->storageBytes());
+    if (sparse_envelope_)
+    {
+      add(checkedDeviceBytes<double>(sparse_envelope_->envelope.capacity() + sparse_envelope_->positions.capacity()));
+      add(checkedDeviceBytes<std::size_t>(sparse_envelope_->descriptors.capacity()));
+      add(checkedDeviceBytes<unsigned long long>(sparse_envelope_->counters.capacity()));
+    }
     return bytes;
   }
 
@@ -2426,6 +2594,20 @@ private:
   bool status_pending_ = false;
   std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
+  /// Cold-only optional ownership; ordinary/retained/mixed defaults own no bank.
+  struct SparseEnvelopeAnchor
+  {
+    DeviceBuffer<double> envelope, positions;
+    DeviceBuffer<std::size_t> descriptors;
+    DeviceBuffer<unsigned long long> counters;
+    std::vector<std::size_t> packed;
+    SparseEnvelopeAnchorView tile;
+    const void* owner = nullptr;
+    const PreparedDeviceModel* model = nullptr;
+    std::size_t generation = 0, requests_r1 = 0, requests_multiple = 0, potential_rows = 0;
+    bool ready = false;
+  };
+  std::unique_ptr<SparseEnvelopeAnchor> sparse_envelope_;
   DeviceBuffer<double> full_phase_, full_output_, full_lap_ratio_;
   std::vector<double> tile_phase_, tile_log_, canonical_phase_, canonical_log_;
   std::vector<device_determinant::CombinationMetadata> host_combinations_;

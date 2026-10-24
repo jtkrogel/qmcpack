@@ -216,6 +216,18 @@ Error launchOpenOrbitalValuesTiled(Stream stream, const OpenOrbitalJetLayout& la
     const double* pi_up, const double* pi_down, const double* zeta_up, const double* zeta_down,
     const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
 
+/// One immutable reference-zero envelope bank; no neural or determinant reuse.
+struct SparseEnvelopeAnchorView
+{
+  const std::size_t* references = nullptr;
+  const std::size_t* changed_electrons = nullptr;
+  double* positions = nullptr;
+  double* envelope = nullptr;
+  unsigned long long* counters = nullptr;
+  bool capture = false;
+  bool ready = false;
+};
+
 /// Build real Gamma-periodic orbital jets and optional retained product factors.
 Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* features,
@@ -224,7 +236,8 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
     double* output, OpenSpatialStatus* status,
     double* retained_backflow = nullptr, double* retained_envelope = nullptr,
-    const double* projected_backflow = nullptr);
+    const double* projected_backflow = nullptr,
+    SparseEnvelopeAnchorView anchor = {});
 
 } // namespace qmcplusplus::psiformer::device
 

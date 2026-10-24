@@ -141,6 +141,10 @@ void QMCDriverNew::initPopulationAndCrowds(const AdjustedWalkerCounts& awc)
 
   crowds_.resize(awc.walkers_per_crowd.size());
 
+  // Copy actual total-crowd evidence with the golden wavefunction resources.
+  // Accelerator lease capacity alone does not prove single-crowd ownership.
+  golden_resource_.twf_res.setDriverCrowdCount(awc.walkers_per_crowd.size());
+
   // at this point we can finally construct the Crowd objects.
   for (int i = 0; i < crowds_.size(); ++i)
   {
