@@ -3299,6 +3299,100 @@ TEST_CASE("PsiFormer retained ENERGY replay requires exact current FULL cache ev
   }
 }
 
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixed context",
+          "[wavefunction][psiformer][immediate_full_replay]")
+{
+  Lattice lattice;
+  lattice.R = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  SimulationCell cell(lattice);
+  auto live = makeLiHElectrons(cell, "lih_pp");
+  WaveFunctionComponentBuilder::PSetMap sources;
+  auto ions = makeLiHIons(cell, "lih_pp");
+  auto* source = ions.get();
+  sources.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, live, sources);
+  auto component = buildInternalPsiFormer(builder, "pf_immediate", 23, "pseudopotential", "0 257",
+                                         "periodic_torus_v1");
+  live.G = ValueType(0);
+  live.L = ValueType(0);
+  const auto log = component->evaluateLog(live, live.G, live.L);
+  const auto version = component->parameterVersion();
+  ParticleSet saved(live);
+  std::vector<ValueType> gradient, laplacian;
+  for (int electron = 0; electron < live.getTotalNum(); ++electron)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      gradient.push_back(live.G[electron][dimension]);
+    laplacian.push_back(live.L[electron]);
+  }
+  REQUIRE(component->validatedReplaySource() == source);
+  REQUIRE(component->canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian, source, version,
+                                                        std::real(log), std::imag(log)));
+  bool positive = false;
+  const ParticleSet* expected_source = source;
+  auto expected_version = version;
+  SECTION("retained derivative payload can be old while the copied fresh views prove replay")
+  {
+    saved.G[0][0] += .25;
+    saved.L[0] -= .5;
+    CHECK_FALSE(component->canReuseFullSpatialReplay(live, saved, version, std::real(log), std::imag(log)));
+    positive = true;
+  }
+  SECTION("null source") { expected_source = nullptr; }
+  SECTION("foreign source") { expected_source = &saved; }
+  SECTION("wrong version") { ++expected_version; }
+  SECTION("fresh gradient changed") { gradient[0] += .125; }
+  SECTION("fresh Laplacian changed") { laplacian[0] += .125; }
+  SECTION("fresh view extent changed") { gradient.pop_back(); }
+  SECTION("nonfinite fresh derivative") { laplacian[0] = std::numeric_limits<double>::infinity(); }
+  SECTION("fixed source positions changed") { source->R[0][0] += .125; }
+  SECTION("fixed effective charge changed")
+  {
+    auto& species = source->getSpeciesSet();
+    species(species.findAttribute("charge"), 0) += .125;
+  }
+  SECTION("same coordinates but changed shared CELL")
+  {
+    cell.getLattice().R(0, 0) += .125;
+    cell.getLattice().reset();
+    // Both ParticleSets see the mutation: copying a ParticleSet was not a CELL snapshot.
+    CHECK(saved.getLattice().R(0, 0) == live.getLattice().R(0, 0));
+    CHECK(component->canReuseFullSpatialReplay(live, saved, version, std::real(log), std::imag(log)));
+  }
+  SECTION("active ParticleSet move without a component proposal")
+  {
+    live.makeMove(0, ParticleSet::PosType{.01, 0, 0});
+  }
+  SECTION("nonfinite CELL") { cell.getLattice().R(0, 0) = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("spin metadata changed") { saved.spins[0] += .125; }
+  SECTION("proposal pending") { testing::TestPsiFormerWF::markScalarProposalPending(*component, 0); }
+  SECTION("restore pending") { testing::TestPsiFormerWF::makeReplayCacheIneligible(*component, true); }
+  SECTION("FULL unavailable") { testing::TestPsiFormerWF::makeReplayCacheIneligible(*component, false); }
+  SECTION("clone preserves source binding without permitting a foreign live lane")
+  {
+    ParticleSet clone_live(live);
+    auto clone_base = component->makeClone(clone_live);
+    auto& clone = dynamic_cast<PsiFormerWF&>(*clone_base);
+    CHECK(clone.validatedReplaySource() == source);
+    CHECK(clone.canReuseImmediateFullSpatialReplay(clone_live, saved, gradient, laplacian, source, version,
+                                                  std::real(log), std::imag(log)));
+    CHECK_FALSE(component->canReuseImmediateFullSpatialReplay(clone_live, saved, gradient, laplacian, source, version,
+                                                             std::real(log), std::imag(log)));
+    positive = true;
+  }
+  const auto state = testing::TestPsiFormerWF::scalarStateSnapshot(*component);
+  const auto workspace = testing::TestPsiFormerWF::directWorkspaceDiagnostics(*component);
+  for (int repeat = 0; repeat < 2; ++repeat)
+    CHECK(component->canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian, expected_source,
+                                                       expected_version, std::real(log), std::imag(log)) == positive);
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(*component, state));
+  checkScalarWorkspaceStorage(testing::TestPsiFormerWF::directWorkspaceDiagnostics(*component), workspace);
+}
+#endif
+
 TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycle",
           "[wavefunction][psiformer][cpu_target_binding]")
 {

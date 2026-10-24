@@ -6711,6 +6711,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
           other.complete_batch_memory_accounting_for_testing_),
       system_kind_(other.system_kind_),
       bound_particle_set_(other.bound_particle_set_),
+      validated_source_(other.validated_source_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
       restore_validation_pending_(other.restore_validation_pending_),
@@ -10508,6 +10509,19 @@ bool PsiFormerWF::canReuseFullSpatialReplay(const ParticleSet& live,
                                            double expected_phase) const
 {
   PsiFormerReadTransaction transaction(*model_state_, model_state_->resident_device_authority_enabled);
+  return canReuseFullSpatialReplayUnderRead(transaction, live, saved, expected_version, expected_log, expected_phase);
+}
+
+// Read either the original snapshot G/L or the freshly captured immediate-handoff views.
+bool PsiFormerWF::canReuseFullSpatialReplayUnderRead(const PsiFormerReadTransaction& transaction,
+                                                   const ParticleSet& live,
+                                                   const ParticleSet& saved,
+                                                   std::size_t expected_version,
+                                                   double expected_log,
+                                                   double expected_phase,
+                                                   const ValueType* fresh_gradient,
+                                                   const ValueType* fresh_laplacian) const
+{
   const auto count = static_cast<std::size_t>(live.getTotalNum());
   if (live.R.size() != count || saved.R.size() != count ||
       live.GroupID.size() != count || saved.GroupID.size() != count)
@@ -10542,21 +10556,90 @@ bool PsiFormerWF::canReuseFullSpatialReplay(const ParticleSet& live,
         live.spins[electron] != saved.spins[electron] || live.GroupID[electron] != saved.GroupID[electron] ||
         !walkerBufferScalarIsFinite(live.Z[electron]) || !walkerBufferScalarIsFinite(saved.Z[electron]) ||
         live.Z[electron] != saved.Z[electron] || !walkerBufferScalarIsFinite(live.L[electron]) ||
-        !walkerBufferScalarIsFinite(saved.L[electron]) || !walkerBufferScalarIsFinite(accepted_laplacian_[electron]) ||
-        live.L[electron] != saved.L[electron] || live.L[electron] != accepted_laplacian_[electron])
+        !walkerBufferScalarIsFinite(fresh_laplacian ? fresh_laplacian[electron] : saved.L[electron]) ||
+        !walkerBufferScalarIsFinite(accepted_laplacian_[electron]) ||
+        live.L[electron] != (fresh_laplacian ? fresh_laplacian[electron] : saved.L[electron]) ||
+        live.L[electron] != accepted_laplacian_[electron])
       return false;
     for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
       if (!walkerBufferScalarIsFinite(live.R[electron][dimension]) ||
           !walkerBufferScalarIsFinite(saved.R[electron][dimension]) ||
           live.R[electron][dimension] != saved.R[electron][dimension] ||
           !walkerBufferScalarIsFinite(live.G[electron][dimension]) ||
-          !walkerBufferScalarIsFinite(saved.G[electron][dimension]) ||
+          !walkerBufferScalarIsFinite(fresh_gradient ? fresh_gradient[3 * electron + dimension] : saved.G[electron][dimension]) ||
           !walkerBufferScalarIsFinite(accepted_gradient_[electron][dimension]) ||
-          live.G[electron][dimension] != saved.G[electron][dimension] ||
+          live.G[electron][dimension] != (fresh_gradient ? fresh_gradient[3 * electron + dimension] : saved.G[electron][dimension]) ||
           live.G[electron][dimension] != accepted_gradient_[electron][dimension])
         return false;
   }
   return true;
+}
+
+// This stricter read-only context proof never refreshes, publishes, or changes an ECP grid.
+bool PsiFormerWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live,
+                                                    const ParticleSet& saved,
+                                                    const std::vector<ValueType>& fresh_gradient,
+                                                    const std::vector<ValueType>& fresh_laplacian,
+                                                    const ParticleSet* expected_source,
+                                                    std::size_t expected_version,
+                                                    double expected_log,
+                                                    double expected_phase) const
+{
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
+  return false;
+#else
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  const auto& state = transaction.state();
+  const auto& environment = state.execution_plan.environment();
+  const auto count = static_cast<std::size_t>(live.getTotalNum());
+  if (!expected_source || expected_source != validated_source_ || bound_particle_set_ != &live ||
+      live.getActivePtcl() != -1 || state.resident_device_authority_enabled || system_kind_ != "pseudopotential" ||
+      state.precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE || environment.periodic_profile ||
+      environment.boundary != psiformer::BoundaryCondition::PERIODIC ||
+      environment.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+      state.twist_phase.active() || fresh_gradient.size() != 3 * count || fresh_laplacian.size() != count)
+    return false;
+  const auto& source = *expected_source;
+  for (const auto* particles : {&live, &source})
+  {
+    if (particles->getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+      return false;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      if (!walkerBufferScalarIsFinite(particles->getTwist()[axis]) || particles->getTwist()[axis] != 0)
+        return false;
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        const auto actual = particles->getLattice().R(axis, dimension);
+        const auto expected = environment.lattice_vectors[axis][dimension];
+        if (!walkerBufferScalarIsFinite(actual) || !walkerBufferScalarIsFinite(expected) || actual != expected)
+          return false;
+      }
+    }
+  }
+  const auto ions = static_cast<std::size_t>(source.getTotalNum());
+  if (state.model.cfg.nuclei.shape.size() != 2 || state.model.cfg.nuclei.shape[0] != ions ||
+      state.model.cfg.nuclei.shape[1] != 3 || state.model.cfg.nuclei.x.size() != 3 * ions ||
+      source.R.size() != ions || source.GroupID.size() != ions || state.model.cfg.charges.x.size() != ions)
+    return false;
+  const auto& species = source.getSpeciesSet();
+  const auto charge = species.findAttribute("charge");
+  if (charge < 0)
+    return false;
+  for (std::size_t ion = 0; ion < ions; ++ion)
+  {
+    const auto group = source.GroupID[ion];
+    if (group < 0 || group >= species.getTotalNum() || !walkerBufferScalarIsFinite(species(charge, group)) ||
+        species(charge, group) != state.model.cfg.charges.x[ion])
+      return false;
+    for (int dimension = 0; dimension < 3; ++dimension)
+      if (!walkerBufferScalarIsFinite(source.R[ion][dimension]) ||
+          source.R[ion][dimension] != state.model.cfg.nuclei.x[3 * ion + dimension])
+        return false;
+  }
+  return canReuseFullSpatialReplayUnderRead(transaction, live, saved, expected_version, expected_log, expected_phase,
+                                           fresh_gradient.data(), fresh_laplacian.data());
+#endif
 }
 
 // Accumulate only this component's persisted derivatives into the TWF totals.
@@ -12490,6 +12573,7 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
         "Cannot rebind a PsiFormer system while a proposal is pending");
   system_kind_ = system_kind;
   bound_particle_set_ = &electrons;
+  validated_source_ = &ions;
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": validated " << system_kind_
             << " system metadata against electron and ion particle sets" << std::endl;
 }

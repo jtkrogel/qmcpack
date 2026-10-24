@@ -391,6 +391,19 @@ public:
                                 double expected_log,
                                 double expected_phase) const;
 
+  /// Borrow the fixed source already validated by construction; ownership remains in the particle pool.
+  const ParticleSet* validatedReplaySource() const noexcept { return validated_source_; }
+
+  /// CPU-safe read-only physical proof; the driver separately admits GPU score-KFAC execution.
+  bool canReuseImmediateFullSpatialReplay(const ParticleSet& live,
+                                         const ParticleSet& saved,
+                                         const std::vector<ValueType>& fresh_gradient,
+                                         const std::vector<ValueType>& fresh_laplacian,
+                                         const ParticleSet* expected_source,
+                                         std::size_t expected_version,
+                                         double expected_log,
+                                         double expected_phase) const;
+
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
@@ -981,6 +994,16 @@ public:
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet& particles) const override;
 
 private:
+  /// Share the accepted-FULL predicate; null views preserve the original saved ParticleSet contract.
+  bool canReuseFullSpatialReplayUnderRead(const PsiFormerReadTransaction& transaction,
+                                         const ParticleSet& live,
+                                         const ParticleSet& saved,
+                                         std::size_t expected_version,
+                                         double expected_log,
+                                         double expected_phase,
+                                         const ValueType* fresh_gradient = nullptr,
+                                         const ValueType* fresh_laplacian = nullptr) const;
+
   /// Share immutable sample validation without changing the generic complete-product contract.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperatorImpl(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -1812,6 +1835,8 @@ private:
   std::string system_kind_ = "unvalidated";
   /// Non-owning lane identity established by system validation or clone construction.
   const ParticleSet* bound_particle_set_ = nullptr;
+  /// Nonowning fixed-ion binding, copied to clones and used only by immediate replay observation.
+  const ParticleSet* validated_source_ = nullptr;
   /// Borrowed collection identity retained while the leader owns its crowd resource.
   const ResourceCollection* acquired_resource_collection_ = nullptr;
   /// Exact cursor and loan counts immediately after this component acquired its resource.

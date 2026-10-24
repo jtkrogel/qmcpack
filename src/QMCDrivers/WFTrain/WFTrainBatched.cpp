@@ -89,6 +89,9 @@ namespace qmcplusplus
 namespace
 {
 
+std::size_t checkedMemoryAdd(std::size_t lhs, std::size_t rhs);
+std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs);
+
 /** Retain one crowd snapshot without retaining a samples-by-parameters matrix.
  *
  * Particle copies preserve positions, masses and total log gradients. Frozen
@@ -107,6 +110,233 @@ struct RetainedCrowdSamples
   psiformer::memory::HostCapacity trace_scalar_capacity;
   psiformer::memory::HostCapacity trace_particle_capacity;
 };
+
+/// Only the copied fresh derivatives are new; retained snapshots already own the physical metadata.
+struct ImmediateFullReplayLane
+{
+  const PsiFormerWF* component;
+  const TrialWaveFunction* wavefunction;
+  const ParticleSet *live, *saved;
+  std::size_t version;
+  double log, phase;
+  int boundary;
+  std::array<double, 12> cell_twist;
+  std::vector<WaveFunctionComponent::ValueType> gradient, laplacian;
+};
+
+/// Synchronous one-use HOST evidence, never a persistent cache or a ParticleSet clone.
+struct ImmediateFullReplayReceipt
+{
+  const Crowd* crowd;
+  const ParticleSet* source;
+  int source_boundary;
+  std::array<double, 12> source_cell_twist;
+  std::vector<ParticleSet::PosType> source_positions;
+  std::vector<double> source_charges;
+  std::vector<int> source_groups;
+  std::vector<std::string> source_species;
+  std::vector<ImmediateFullReplayLane> lanes;
+  bool consumed = false;
+
+  /// Conservative owned HOST capacity charge; no allocator/RSS or aggregate HOST-fit claim.
+  std::size_t retainedBytes() const
+  {
+    auto bytes = checkedMemoryAdd(sizeof(*this), checkedMemoryMultiply(lanes.capacity(), sizeof(lanes[0])));
+    for (const auto& lane : lanes)
+      bytes = checkedMemoryAdd(bytes, checkedMemoryMultiply(
+          checkedMemoryAdd(lane.gradient.capacity(), lane.laplacian.capacity()), sizeof(lane.gradient[0])));
+    bytes = checkedMemoryAdd(bytes, checkedMemoryMultiply(source_positions.capacity(), sizeof(source_positions[0])));
+    bytes = checkedMemoryAdd(bytes, checkedMemoryMultiply(source_charges.capacity(), sizeof(source_charges[0])));
+    bytes = checkedMemoryAdd(bytes, checkedMemoryMultiply(source_groups.capacity(), sizeof(source_groups[0])));
+    bytes = checkedMemoryAdd(bytes, checkedMemoryMultiply(source_species.capacity(), sizeof(source_species[0])));
+    // Counting SSO capacity again is conservative metadata accounting, not measured physical memory.
+    for (const auto& name : source_species)
+      bytes = checkedMemoryAdd(bytes, checkedMemoryAdd(name.capacity(), 1));
+    return bytes;
+  }
+};
+
+/// SimulationCell is shared by ParticleSet copies: capture numeric values explicitly.
+std::array<double, 12> immediateReplayCell(const ParticleSet& particles)
+{
+  std::array<double, 12> result;
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      result[3 * axis + dimension] = particles.getLattice().R(axis, dimension);
+    result[9 + axis] = particles.getTwist()[axis];
+  }
+  return result;
+}
+
+/// Capture only after fresh replay, before any accepted-grid draw; unproved or oversized evidence is a miss.
+std::optional<ImmediateFullReplayReceipt> captureImmediateFullReplay(
+    Crowd& crowd, const RetainedCrowdSamples& samples, std::size_t version, std::size_t available_bytes)
+{
+#ifdef QMC_COMPLEX
+  return std::nullopt;
+#else
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& wavefunctions = crowd.get_walker_twfs();
+  if (!crowd.size() || samples.particles.size() != crowd.size() || !available_bytes)
+    return std::nullopt;
+  const auto& components = wavefunctions[0].get().getOrbitals();
+  const auto* leader = components.size() == 1 ? dynamic_cast<const PsiFormerWF*>(components[0].get()) : nullptr;
+  const auto* source = leader ? leader->validatedReplaySource() : nullptr;
+  if (!source)
+    return std::nullopt;
+  const auto ions = static_cast<std::size_t>(source->getTotalNum());
+  const auto& species = source->getSpeciesSet();
+  const auto charge = species.findAttribute("charge");
+  if (charge < 0 || source->R.size() != ions || source->GroupID.size() != ions)
+    return std::nullopt;
+  auto required = checkedMemoryAdd(sizeof(ImmediateFullReplayReceipt),
+      checkedMemoryMultiply(crowd.size(), sizeof(ImmediateFullReplayLane)));
+  required = checkedMemoryAdd(required, checkedMemoryMultiply(ions,
+      sizeof(ParticleSet::PosType) + sizeof(double) + sizeof(int)));
+  for (int group = 0; group < species.getTotalNum(); ++group)
+    required = checkedMemoryAdd(required, checkedMemoryAdd(sizeof(std::string),
+        // Include the supported string ABI's empty/SSO capacity before allocating.
+        // Actual retained capacities are checked again before the receipt is usable.
+        checkedMemoryAdd(std::max(species.getSpeciesName(group).capacity(), std::string{}.capacity()), 1)));
+  for (const auto& particles : electrons)
+    required = checkedMemoryAdd(required, checkedMemoryMultiply(
+        static_cast<std::size_t>(particles.get().getTotalNum()), 4 * sizeof(WaveFunctionComponent::ValueType)));
+  if (required > available_bytes)
+    return std::nullopt;
+
+  ImmediateFullReplayReceipt receipt{&crowd, source, source->getLattice().getSuperCellEnum(),
+                                    immediateReplayCell(*source)};
+  receipt.source_positions.reserve(ions);
+  receipt.source_charges.reserve(ions);
+  receipt.source_groups.reserve(ions);
+  receipt.source_species.reserve(species.getTotalNum());
+  receipt.lanes.reserve(crowd.size());
+  for (int group = 0; group < species.getTotalNum(); ++group)
+    receipt.source_species.push_back(species.getSpeciesName(group));
+  for (std::size_t ion = 0; ion < ions; ++ion)
+  {
+    const auto group = source->GroupID[ion];
+    if (group < 0 || group >= species.getTotalNum())
+      return std::nullopt;
+    receipt.source_positions.push_back(source->R[ion]);
+    receipt.source_groups.push_back(group);
+    receipt.source_charges.push_back(species(charge, group));
+  }
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+  {
+    const auto& live = electrons[sample].get();
+    const auto& twf = wavefunctions[sample].get();
+    const auto& orbitals = twf.getOrbitals();
+    const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerWF*>(orbitals[0].get()) : nullptr;
+    if (!component)
+      return std::nullopt;
+    ImmediateFullReplayLane lane{component, &twf, &live, samples.particles[sample].get(), version,
+        twf.getLogPsi(), twf.getPhase(), live.getLattice().getSuperCellEnum(), immediateReplayCell(live)};
+    const auto count = static_cast<std::size_t>(live.getTotalNum());
+    if (live.G.size() != count || live.L.size() != count)
+      return std::nullopt;
+    lane.gradient.reserve(3 * count);
+    lane.laplacian.reserve(count);
+    for (std::size_t electron = 0; electron < count; ++electron)
+    {
+      for (int dimension = 0; dimension < 3; ++dimension)
+        lane.gradient.push_back(live.G[electron][dimension]);
+      lane.laplacian.push_back(live.L[electron]);
+    }
+    if (!component->canReuseImmediateFullSpatialReplay(live, *lane.saved, lane.gradient, lane.laplacian,
+                                                       source, version, lane.log, lane.phase))
+      return std::nullopt;
+    receipt.lanes.push_back(std::move(lane));
+  }
+  if (receipt.retainedBytes() > available_bytes)
+    return std::nullopt;
+  return std::optional<ImmediateFullReplayReceipt>(std::move(receipt));
+#endif
+}
+
+/// Recheck the complete crowd after mw_update; a miss consumes the evidence and uses canonical refresh.
+bool consumeImmediateFullReplay(Crowd& crowd, ImmediateFullReplayReceipt& receipt)
+{
+  if (std::exchange(receipt.consumed, true) || receipt.crowd != &crowd || receipt.lanes.size() != crowd.size())
+    return false;
+  const auto& source = *receipt.source;
+  const auto& species = source.getSpeciesSet();
+  const auto charge = species.findAttribute("charge");
+  if (charge < 0 || source.getLattice().getSuperCellEnum() != receipt.source_boundary ||
+      immediateReplayCell(source) != receipt.source_cell_twist ||
+      source.R.size() != receipt.source_positions.size() || source.GroupID.size() != receipt.source_groups.size() ||
+      species.getTotalNum() != receipt.source_species.size())
+    return false;
+  for (int group = 0; group < species.getTotalNum(); ++group)
+    if (species.getSpeciesName(group) != receipt.source_species[group])
+      return false;
+  for (std::size_t ion = 0; ion < receipt.source_positions.size(); ++ion)
+  {
+    const auto group = source.GroupID[ion];
+    if (group != receipt.source_groups[ion] || group < 0 || group >= species.getTotalNum() ||
+        species(charge, group) != receipt.source_charges[ion])
+      return false;
+    for (int dimension = 0; dimension < 3; ++dimension)
+      if (source.R[ion][dimension] != receipt.source_positions[ion][dimension])
+        return false;
+  }
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+  {
+    const auto& lane = receipt.lanes[sample];
+    const auto& live = crowd.get_walker_elecs()[sample].get();
+    const auto& twf = crowd.get_walker_twfs()[sample].get();
+    const auto& components = twf.getOrbitals();
+    if (lane.live != &live || lane.wavefunction != &twf || components.size() != 1 ||
+        components[0].get() != lane.component || twf.getLogPsi() != lane.log || twf.getPhase() != lane.phase ||
+        live.getLattice().getSuperCellEnum() != lane.boundary || immediateReplayCell(live) != lane.cell_twist ||
+        !lane.component->canReuseImmediateFullSpatialReplay(live, *lane.saved, lane.gradient, lane.laplacian,
+                                                           receipt.source, lane.version, lane.log, lane.phase))
+      return false;
+  }
+  return true;
+}
+
+/// The unchanged scalar accumulator/temporary overlap is reserved before receipt allocation.
+std::size_t scoreOnlyECPCaptureNamedBytes(const wftrain::StreamingDerivativeOperator& score, std::size_t samples)
+{
+  const auto temporary = checkedMemoryMultiply(samples, 3 * sizeof(wftrain::DerivativeValue) + 2 * sizeof(double));
+  return checkedMemoryAdd(score.storageDiagnostics().retained_numeric_bytes, temporary);
+}
+
+/// Prepare exactly the ordinary score-only owner; the caller holds both crowd resource guards.
+std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealGpuScoreBatchUnderLocks(
+    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk)
+{
+  const auto& twfs = crowd.get_walker_twfs();
+  const auto& electrons = crowd.get_walker_elecs();
+  RefVectorWithLeader<ParticleSet> particles(electrons[0], electrons);
+  const auto& leader_orbitals = twfs[0].get().getOrbitals();
+  const auto* real = leader_orbitals.size() == 1 ? dynamic_cast<const PsiFormerWF*>(leader_orbitals[0].get()) : nullptr;
+  if (!real)
+    throw std::invalid_argument("GPU score-only ECP requires one real component per walker");
+  RefVectorWithLeader<WaveFunctionComponent> components(*leader_orbitals[0]);
+  for (const auto& wavefunction : twfs)
+  {
+    if (wavefunction.get().getOrbitals().size() != 1)
+      throw std::invalid_argument("GPU score-only ECP requires one real component per walker");
+    components.push_back(*wavefunction.get().getOrbitals()[0]);
+  }
+  return real->makeGpuScoreStreamingDerivativeOperator(components, particles, batch, offset, chunk);
+}
+
+/// The early factory copies fresh replay state but performs no derivatives or accepted-grid RNG.
+std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBatch(
+    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk)
+{
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& twfs = crowd.get_walker_twfs();
+  RefVectorWithLeader<ParticleSet> particles(electrons[0], electrons);
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(twfs[0], twfs);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, particles);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, wavefunctions);
+  return makeRealGpuScoreBatchUnderLocks(crowd, batch, offset, chunk);
+}
 
 /// One scalar private evaluator reused by every retained conventional replay view.
 struct ConventionalReplayWorker
@@ -236,7 +466,7 @@ private:
  * positions. No MC proposals or parameter publications occur during replay.
  * An exact current resident snapshot may reuse FULL; all cheap replay operations remain.
  */
-void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
+bool replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
                        std::optional<std::size_t> reuse_version = std::nullopt)
 {
   const auto& electrons = crowd.get_walker_elecs();
@@ -300,6 +530,7 @@ void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
                                        wavefunctions[sample].get().getPhase(),
                                        samples.local_energies[sample]);
   }
+  return !reuse_full;
 }
 
 /** Record publication without performing fallible work in the transaction callback. */
@@ -665,7 +896,9 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     const WFTrainDriverInput::ComplexGpuTraining* gpu_training = nullptr,
     wftrain::PairedFixedGridNativeEnergy* fixed_grid = nullptr,
     std::size_t scalar_ecp_budget = 0,
-    bool capture_inline_ecp_vjp = false)
+    bool capture_inline_ecp_vjp = false,
+    ImmediateFullReplayReceipt* full_handoff = nullptr,
+    std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score = nullptr)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -910,7 +1143,27 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(
       crowd.getSharedResource().ham_res, hamiltonian_batch);
   ParticleSet::mw_update(electron_batch);
-  TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+  bool reuse_immediate_full = false;
+#ifndef QMC_COMPLEX
+  if (full_handoff && score_only && !capture_ecp_jvp_replay && batch_ordinal == 0 && sample_offset == 0)
+  {
+    const auto& components = twfs[0].get().getOrbitals();
+    const auto* real = components.size() == 1 ? dynamic_cast<const PsiFormerWF*>(components[0].get()) : nullptr;
+    reuse_immediate_full = real && real->usesAcceleratorParameterProducts() &&
+        real->isPseudopotentialSystem() && consumeImmediateFullReplay(crowd, *full_handoff);
+  }
+#endif
+  if (!reuse_immediate_full)
+  {
+    // An old-version or stale-context owner must die BEFORE canonical refresh/recreation.
+    prepared_score.reset();
+    TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+  }
+  if (full_handoff)
+    app_log() << "KFAC immediate ECP FULL handoff: full_elided=" << reuse_immediate_full
+              << " full_evaluations=" << !reuse_immediate_full
+              << " host_capacity_bytes=" << full_handoff->retainedBytes()
+              << "; accepted ECP grid traversal and RNG unchanged" << std::endl;
 
   // Construct both derivative owners only after canonical value/VGL refresh so
   // the kinetic tape and accepted-grid ECP response see identical reference
@@ -926,21 +1179,13 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       throw std::invalid_argument("GPU score-only ECP provider identity differs from the selected provider");
     // Score covariance needs physical EL, but no local-energy parameter response.
     // Select its immutable profile before any complete kinetic owner is prepared.
-    RefVectorWithLeader<WaveFunctionComponent> real_batch(*twfs[0].get().getOrbitals()[0]);
-    for (const auto& wavefunction : twfs)
-    {
-      if (wavefunction.get().getOrbitals().size() != 1)
-        throw std::invalid_argument("GPU score-only ECP requires one real component per walker");
-      real_batch.push_back(*wavefunction.get().getOrbitals()[0]);
-    }
-    batch.derivative_operator = real->makeGpuScoreStreamingDerivativeOperator(
-        real_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size);
+    batch.derivative_operator = prepared_score ? std::move(prepared_score) :
+        makeRealGpuScoreBatchUnderLocks(crowd, batch_ordinal, sample_offset, maximum_parameter_chunk_size);
     // This mask describes derivative coverage, not the complete physical EL below.
     batch.local_energy_term_mask = 0;
     const auto samples = walkers.size();
     const auto scalar_bytes = wftrain::NonLocalEnergyAccumulator::requiredBytes(samples);
-    const auto temporary = checkedMemoryMultiply(samples, 3 * sizeof(wftrain::DerivativeValue) + 2 * sizeof(double));
-    const auto named = checkedMemoryAdd(batch.derivative_operator->storageDiagnostics().retained_numeric_bytes, temporary);
+    const auto named = scoreOnlyECPCaptureNamedBytes(*batch.derivative_operator, samples);
     if (!scalar_ecp_budget || scalar_ecp_budget == std::numeric_limits<std::size_t>::max() || named > scalar_ecp_budget)
       throw std::length_error("GPU score-only ECP numeric owners exceed remaining maximum_retained_bytes");
     logTrainingAllocation("score_ecp_scalar_capture", samples,
@@ -3540,6 +3785,24 @@ void WFTrainBatched::run()
       device_provider->usesAcceleratorParameterProducts() &&
       population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
       crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
+  const char* immediate_optin = std::getenv("PSIFORMER_GPU_KFAC_ECP_FULL_HANDOFF");
+  if (immediate_optin && std::string(immediate_optin) != "0" && std::string(immediate_optin) != "1")
+    throw UniformCommunicateError("PSIFORMER_GPU_KFAC_ECP_FULL_HANDOFF must be 0 or 1");
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  constexpr bool immediate_real_fp64_build = true;
+#else
+  constexpr bool immediate_real_fp64_build = false;
+#endif
+  const bool kfac_ecp_full_handoff = immediate_optin && std::string(immediate_optin) == "1" &&
+      immediate_real_fp64_build && score_kfac_training && !complex_training && !resident_device_authority_ &&
+      std::is_same_v<WaveFunctionComponent::ValueType, double> && device_provider &&
+      device_provider->usesAcceleratorParameterProducts() &&
+      device_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+      crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
+  if (immediate_optin && std::string(immediate_optin) == "1")
+    app_log() << "KFAC immediate ECP FULL handoff: eligible=" << kfac_ecp_full_handoff
+              << "; only the second synchronous FULL may be elided" << std::endl;
   if (kfac_replay_optin && std::string(kfac_replay_optin) == "1")
     app_log() << "KFAC single-snapshot FULL replay: eligible=" << kfac_single_replay
               << "; exact current version/coordinate/spatial cache checks remain required" << std::endl;
@@ -4405,7 +4668,7 @@ void WFTrainBatched::run()
                  (!has_nonlocal_ecp || resident_device_authority_))) && !complex_training &&
                 retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
-            replayCrowdSamples(crowd, samples, resident_single_snapshot
+            const bool fresh_full = replayCrowdSamples(crowd, samples, resident_single_snapshot
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
             std::size_t scalar_ecp_budget = 0;
             if (!complex_training && score_training && has_nonlocal_ecp &&
@@ -4418,6 +4681,22 @@ void WFTrainBatched::run()
                 throw std::length_error("GPU score-only ECP requires one retained batch with remaining numeric budget");
               scalar_ecp_budget = training_input_.getMaximumRetainedBytes() - live;
             }
+            std::optional<ImmediateFullReplayReceipt> full_handoff;
+            std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score;
+            if (kfac_ecp_full_handoff && fresh_full && retained_samples.size() == 1 &&
+                score_training && has_nonlocal_ecp && !capture_ecp_jvp_replay)
+            {
+              prepared_score = prepareImmediateGpuScoreBatch(crowd, batch_ordinal, sample_offset,
+                                                             training_input_.getParameterChunkSize());
+              const auto named = scoreOnlyECPCaptureNamedBytes(*prepared_score, crowd.size());
+              if (named < scalar_ecp_budget)
+                full_handoff = captureImmediateFullReplay(crowd, samples, training_state.parameter_version,
+                                                          scalar_ecp_budget - named);
+              if (full_handoff)
+                scalar_ecp_budget -= full_handoff->retainedBytes();
+              else
+                prepared_score.reset();
+            }
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
@@ -4428,7 +4707,8 @@ void WFTrainBatched::run()
 #else
                 nullptr,
 #endif
-                scalar_ecp_budget, usesInlinePairedECPResponse(training_input_)));
+                scalar_ecp_budget, usesInlinePairedECPResponse(training_input_),
+                full_handoff ? &*full_handoff : nullptr, std::move(prepared_score)));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
