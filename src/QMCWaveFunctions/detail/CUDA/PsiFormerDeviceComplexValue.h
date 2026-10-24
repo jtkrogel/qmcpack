@@ -515,6 +515,10 @@ private:
     if (minimum_scaled_pivots)
       checkRuntime(launchComplexValueFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
           t.ne_, matrix_.data(), channels_.data(), status_.data(), minimum_scaled_pivots), "complex VALUE diagnostic factorization");
+    else if (score_inverse_columns_)
+      checkRuntime(launchComplexSpatialInverseColumns(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()),
+          "complex retained SCORE inverse columns");
     else
       checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
           matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex VALUE factorization");
@@ -638,8 +642,9 @@ private:
   /// Prepare no real head/determinant/reverse buffers; assert the exact allocation inventory.
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost,
-      bool retain_score = false, bool retain_inverse = true)
-      : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
+      bool retain_score = false, bool retain_inverse = true, bool score_inverse_columns = false)
+      : cost_(cost), score_inverse_columns_(score_inverse_columns),
+        trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true)),
         envelope_(cost.matrices, "ComplexValue::envelope_", __FILE__, __LINE__),
         projections_(2 * cost.matrices, "ComplexValue::projections_", __FILE__, __LINE__),
@@ -657,6 +662,8 @@ private:
         envelope_rows_(cost.envelope_anchor_bytes ? capacity : 0, "ComplexValue::request_rows_", __FILE__, __LINE__),
         envelope_anchor_status_(cost.envelope_anchor_bytes ? 1 : 0, "ComplexValue::request_status_", __FILE__, __LINE__)
   {
+    if (score_inverse_columns_ && (!retain_score || !retain_inverse || !inverse_.capacity()))
+      throw std::logic_error("Inverse columns require the retained SCORE inverse owner");
     if (cost.projection_pointer_bytes)
       for (auto& bank : projection_banks_)
         bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
@@ -719,6 +726,8 @@ private:
   }
 
   const ComplexValueCost cost_;
+  // One immutable selector only; inverse/permutation/solve remain the existing retained banks.
+  const bool score_inverse_columns_;
   std::unique_ptr<PreparedDeviceInference> trunk_;
   std::array<std::unique_ptr<PreparedDeviceOrbitalProjection>, 2> projection_banks_;
   DeviceBuffer<double> envelope_, projections_;
