@@ -810,14 +810,26 @@ KFACPreconditioner::~KFACPreconditioner() = default;
 KFACPreconditioner::KFACPreconditioner(
     const KFACFactorAccumulator& statistics,
     KFACPreconditionerControl control, std::shared_ptr<KFACDenseSolver> dense_solver)
-    : MatrixFreePreconditioner(statistics.registry().parameterSchema(),
-                               statistics.parameterVersion()),
-      registry_(statistics.registry()),
-      control_(control),
-      convention_(statistics.curvatureConvention())
+    : MatrixFreePreconditioner(statistics.registry().parameterSchema(), statistics.parameterVersion()),
+      registry_(statistics.registry()), control_(control), convention_(statistics.curvatureConvention())
 {
   if (statistics.sampleActive() || statistics.sampleCount() == 0 || !statistics.affineStatisticsComplete())
     throw std::invalid_argument("KFAC preconditioner requires complete nonempty statistics");
+  beginPreparation(std::move(dense_solver));
+  for (std::size_t ordinal = 0; ordinal < statistics.factors().size(); ++ordinal)
+  {
+    const auto& factor = statistics.factors()[ordinal];
+    prepareBlock(ordinal, factor.activation_dimension, factor.sensitivity_dimension,
+        {factor.activation_outer_sum.data(), factor.activation_outer_sum.size()},
+        {factor.sensitivity_outer_sum.data(), factor.sensitivity_outer_sum.size()},
+        factor.sample_weight_sum, factor.row_weight_sum, factor.row_count);
+  }
+  finishPreparation(statistics.fallbackDiagonalSum(), statistics.fallbackWeightSum());
+}
+
+// Validate shared controls before constructing any factor generation.
+void KFACPreconditioner::beginPreparation(std::shared_ptr<KFACDenseSolver> dense_solver)
+{
   if (!finite(control_.damping) || control_.damping <= 0.0 ||
       !finite(control_.fallback_damping) || control_.fallback_damping <= 0.0)
     throw std::invalid_argument("KFAC damping values must be finite and positive");
@@ -830,96 +842,98 @@ KFACPreconditioner::KFACPreconditioner(
       throw std::invalid_argument("KFAC device solver registry mismatch");
     dense_generation_ = dense_solver->beginGeneration();
   }
-  std::size_t maximum_matrix = 0;
-  std::size_t maximum_dimension = 0;
-  blocks_.reserve(statistics.factors().size());
-  for (std::size_t ordinal = 0; ordinal < statistics.factors().size(); ++ordinal)
+  blocks_.reserve(registry_.affineBlocks().size());
+}
+
+// Both input routes retain the same normalization, damping, and factorization order.
+void KFACPreconditioner::prepareBlock(std::size_t ordinal, std::size_t activation_dimension,
+    std::size_t sensitivity_dimension, DerivativeArrayView<const DerivativeReal> activation,
+    DerivativeArrayView<const DerivativeReal> sensitivity, DerivativeReal sample_weight,
+    DerivativeReal row_weight, std::size_t row_count)
+{
+  if (!finite(sample_weight) || sample_weight <= 0.0 ||
+      !finite(row_weight) || row_weight <= 0.0 ||
+      row_count == 0)
+    throw std::invalid_argument("KFAC factor has no positive finite row weight");
+  PreparedBlock prepared;
+  prepared.descriptor = registry_.affineBlocks()[ordinal];
+  const DerivativeReal repeats = row_weight / sample_weight;
+  if (!finite(repeats) || repeats <= 0.0)
+    throw std::invalid_argument("KFAC factor has an invalid repeated-row count");
+  prepared.curvature_inverse_scale = repeats;
+  prepared.activation_cholesky.assign(activation.begin(), activation.end());
+  prepared.sensitivity_cholesky.assign(sensitivity.begin(), sensitivity.end());
+  for (DerivativeReal& value : prepared.activation_cholesky)
+    value /= sample_weight;
+  for (DerivativeReal& value : prepared.sensitivity_cholesky)
+    value /= sample_weight;
+  const DerivativeReal effective_damping = control_.damping * repeats;
+  if (!finite(effective_damping))
+    throw MatrixFreeNumericalError("KFAC repeated-block damping overflowed");
+  DerivativeReal activation_damping = std::sqrt(effective_damping);
+  DerivativeReal sensitivity_damping = activation_damping;
+  if (control_.damping_policy == KFACDampingPolicy::TRACE_BALANCED)
   {
-    const KFACFactorStatistics& factor = statistics.factors()[ordinal];
-    if (!finite(factor.sample_weight_sum) || factor.sample_weight_sum <= 0.0 ||
-        !finite(factor.row_weight_sum) || factor.row_weight_sum <= 0.0 ||
-        factor.row_count == 0)
-      throw std::invalid_argument("KFAC factor has no positive finite row weight");
-    PreparedBlock prepared;
-    prepared.descriptor = registry_.affineBlocks()[ordinal];
-    const DerivativeReal repeats = factor.row_weight_sum / factor.sample_weight_sum;
-    if (!finite(repeats) || repeats <= 0.0)
-      throw std::invalid_argument("KFAC factor has an invalid repeated-row count");
-    prepared.curvature_inverse_scale = repeats;
-    prepared.activation_cholesky = factor.activation_outer_sum;
-    prepared.sensitivity_cholesky = factor.sensitivity_outer_sum;
-    for (DerivativeReal& value : prepared.activation_cholesky)
-      value /= factor.sample_weight_sum;
-    for (DerivativeReal& value : prepared.sensitivity_cholesky)
-      value /= factor.sample_weight_sum;
-    const DerivativeReal effective_damping = control_.damping * repeats;
-    if (!finite(effective_damping))
-      throw MatrixFreeNumericalError("KFAC repeated-block damping overflowed");
-    DerivativeReal activation_damping = std::sqrt(effective_damping);
-    DerivativeReal sensitivity_damping = activation_damping;
-    if (control_.damping_policy == KFACDampingPolicy::TRACE_BALANCED)
+    DerivativeReal a = 0.0, b = 0.0;
+    for (std::size_t i = 0; i < activation_dimension; ++i)
+      a += prepared.activation_cholesky[i * activation_dimension + i] /
+          static_cast<DerivativeReal>(activation_dimension);
+    for (std::size_t i = 0; i < sensitivity_dimension; ++i)
+      b += prepared.sensitivity_cholesky[i * sensitivity_dimension + i] /
+          static_cast<DerivativeReal>(sensitivity_dimension);
+    if (!finite(a) || !finite(b) || a < 0.0 || b < 0.0)
+      throw MatrixFreeNumericalError("KFAC trace-balanced factor trace is invalid");
+    if (a == 0.0 || b == 0.0)
     {
-      DerivativeReal a = 0.0, b = 0.0;
-      for (std::size_t i = 0; i < factor.activation_dimension; ++i)
-        a += prepared.activation_cholesky[i * factor.activation_dimension + i] /
-            static_cast<DerivativeReal>(factor.activation_dimension);
-      for (std::size_t i = 0; i < factor.sensitivity_dimension; ++i)
-        b += prepared.sensitivity_cholesky[i * factor.sensitivity_dimension + i] /
-            static_cast<DerivativeReal>(factor.sensitivity_dimension);
-      if (!finite(a) || !finite(b) || a < 0.0 || b < 0.0)
-        throw MatrixFreeNumericalError("KFAC trace-balanced factor trace is invalid");
-      if (a == 0.0 || b == 0.0)
-      {
-        // The zero-factor branch represents damping*I.
-        std::fill(prepared.activation_cholesky.begin(), prepared.activation_cholesky.end(), 0.0);
-        std::fill(prepared.sensitivity_cholesky.begin(), prepared.sensitivity_cholesky.end(), 0.0);
-      }
-      else if (factor.activation_dimension == 1)
-      {
-        activation_damping = 0.0;
-        sensitivity_damping = effective_damping / a;
-      }
-      else if (factor.sensitivity_dimension == 1)
-      {
-        activation_damping = effective_damping / b;
-        sensitivity_damping = 0.0;
-      }
-      else
-      {
-        // sqrt ratios avoid unnecessary overflow of a/b or damping*a.
-        activation_damping *= std::sqrt(a) / std::sqrt(b);
-        sensitivity_damping *= std::sqrt(b) / std::sqrt(a);
-      }
+      // The zero-factor branch represents damping*I.
+      std::fill(prepared.activation_cholesky.begin(), prepared.activation_cholesky.end(), 0.0);
+      std::fill(prepared.sensitivity_cholesky.begin(), prepared.sensitivity_cholesky.end(), 0.0);
     }
-    for (std::size_t diagonal = 0; diagonal < factor.activation_dimension; ++diagonal)
-      prepared.activation_cholesky[diagonal * factor.activation_dimension + diagonal] +=
-          activation_damping;
-    for (std::size_t diagonal = 0; diagonal < factor.sensitivity_dimension; ++diagonal)
-      prepared.sensitivity_cholesky[diagonal * factor.sensitivity_dimension + diagonal] +=
-          sensitivity_damping;
-    if (dense_generation_)
-      dense_generation_->factorize(ordinal, prepared.activation_cholesky, prepared.sensitivity_cholesky);
+    else if (activation_dimension == 1)
+    {
+      activation_damping = 0.0;
+      sensitivity_damping = effective_damping / a;
+    }
+    else if (sensitivity_dimension == 1)
+    {
+      activation_damping = effective_damping / b;
+      sensitivity_damping = 0.0;
+    }
     else
     {
-      cholesky(prepared.activation_cholesky, factor.activation_dimension);
-      cholesky(prepared.sensitivity_cholesky, factor.sensitivity_dimension);
+      // sqrt ratios avoid unnecessary overflow of a/b or damping*a.
+      activation_damping *= std::sqrt(a) / std::sqrt(b);
+      sensitivity_damping *= std::sqrt(b) / std::sqrt(a);
     }
-    maximum_matrix = std::max(maximum_matrix,
-                              factor.activation_dimension * factor.sensitivity_dimension);
-    maximum_dimension = std::max({maximum_dimension, factor.activation_dimension,
-                                  factor.sensitivity_dimension});
-    blocks_.push_back(std::move(prepared));
   }
-  matrix_scratch_.resize(maximum_matrix);
-  solve_scratch_.resize(2 * maximum_dimension);
+  for (std::size_t diagonal = 0; diagonal < activation_dimension; ++diagonal)
+    prepared.activation_cholesky[diagonal * activation_dimension + diagonal] +=
+        activation_damping;
+  for (std::size_t diagonal = 0; diagonal < sensitivity_dimension; ++diagonal)
+    prepared.sensitivity_cholesky[diagonal * sensitivity_dimension + diagonal] +=
+        sensitivity_damping;
+  if (dense_generation_)
+    dense_generation_->factorize(ordinal, prepared.activation_cholesky, prepared.sensitivity_cholesky);
+  else
+  {
+    cholesky(prepared.activation_cholesky, activation_dimension);
+    cholesky(prepared.sensitivity_cholesky, sensitivity_dimension);
+  }
+  blocks_.push_back(std::move(prepared));
+}
+
+// Complete the generation and diagonal fallback in the original publication order.
+void KFACPreconditioner::finishPreparation(DerivativeArrayView<const DerivativeReal> fallback,
+    DerivativeReal fallback_weight)
+{
+  prepareScratch();
   if (dense_generation_) dense_generation_->finish();
 
-  fallback_inverse_diagonal_.assign(statistics.fallbackDiagonalSum().size(), 0.0);
+  fallback_inverse_diagonal_.assign(fallback.size(), 0.0);
   if (!registry_.fallbackBlocks().empty())
   {
-    if (!finite(statistics.fallbackWeightSum()) || statistics.fallbackWeightSum() <= 0.0)
+    if (!finite(fallback_weight) || fallback_weight <= 0.0)
       throw std::invalid_argument("KFAC fallback diagonal has no positive finite sample weight");
-    const auto diagonal = statistics.fallbackDiagonalSum();
     std::size_t packed = 0;
     for (std::size_t block_index : registry_.fallbackBlocks())
     {
@@ -929,7 +943,7 @@ KFACPreconditioner::KFACPreconditioner(
            ++parameter)
       {
         const DerivativeReal curvature =
-            diagonal[packed] / statistics.fallbackWeightSum();
+            fallback[packed] / fallback_weight;
         if (!finite(curvature) || curvature < 0.0)
           throw MatrixFreeNumericalError("KFAC fallback diagonal is invalid");
         fallback_inverse_diagonal_[packed++] =
@@ -942,33 +956,34 @@ KFACPreconditioner::KFACPreconditioner(
         storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
-KFACFactorAccumulator KFACPreconditioner::statisticsFromState(
-    KFACBlockRegistry registry, std::size_t parameter_version, const KFACFactorState& state)
-{
-  validateKFACFactorState(registry, state);
-  KFACFactorAccumulator statistics(std::move(registry), parameter_version, state.convention);
-  std::size_t offset = 0;
-  for (auto& factor : statistics.factors_)
-  {
-    for (auto* matrix : {&factor.activation_outer_sum, &factor.sensitivity_outer_sum})
-      for (auto& value : *matrix)
-        value = state.values[offset++];
-    factor.sample_weight_sum = 1.0;
-    factor.row_weight_sum = state.values[offset++];
-    factor.row_count = 1; // Virtual normalized batch, not a physical sample receipt.
-  }
-  for (auto& value : statistics.fallback_diagonal_sum_)
-    value = state.values[offset++];
-  statistics.fallback_weight_sum_ = 1.0;
-  statistics.sample_count_ = 1;
-  statistics.globally_reduced_ = true;
-  return statistics;
-}
-
+// Prepare owned solve factors directly from an immutable normalized snapshot.
 KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
     const KFACFactorState& state, KFACPreconditionerControl control, std::shared_ptr<KFACDenseSolver> dense_solver)
-    : KFACPreconditioner(statisticsFromState(std::move(registry), parameter_version, state), control, std::move(dense_solver))
-{}
+    : MatrixFreePreconditioner(registry.parameterSchema(), parameter_version),
+      registry_(std::move(registry)), control_(control), convention_(state.convention)
+{
+  validateKFACFactorState(registry_, state);
+  beginPreparation(std::move(dense_solver));
+  // Borrow only immutable normalized spans during construction. No virtual sample
+  // accumulator or pending transaction banks are needed for an already complete state.
+  std::size_t offset = 0;
+  for (std::size_t ordinal = 0; ordinal < registry_.affineBlocks().size(); ++ordinal)
+  {
+    const auto& descriptor = registry_.affineBlocks()[ordinal];
+    const auto input = descriptor.input_width + (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
+    const auto activation_size = input * input;
+    const auto sensitivity_size = descriptor.output_width * descriptor.output_width;
+    const auto* activation = state.values.data() + offset;
+    offset += activation_size;
+    const auto* sensitivity = state.values.data() + offset;
+    offset += sensitivity_size;
+    const auto repeats = state.values[offset++];
+    prepareBlock(ordinal, input, descriptor.output_width, {activation, activation_size},
+        {sensitivity, sensitivity_size}, 1.0, repeats, 1);
+  }
+  const auto* fallback = state.values.empty() ? nullptr : state.values.data() + offset;
+  finishPreparation({fallback, state.values.size() - offset}, 1.0);
+}
 
 KFACInverseState KFACPreconditioner::exportInverseState() const
 {

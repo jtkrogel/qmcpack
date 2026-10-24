@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -930,6 +931,104 @@ TEST_CASE("KFAC inverse snapshots rebind exactly and refresh only current diagon
   const auto unchanged = stale.exportInverseState().values;
   CHECK_THROWS(stale.refreshFallbackDiagonal(next, -1));
   CHECK(stale.exportInverseState().values == unchanged);
+}
+
+TEST_CASE("KFAC normalized state prepares exact raw-route factors without sample banks",
+          "[drivers][wftrain][kfac][kfac_state]")
+{
+  for (const auto convention : {KFACCurvatureConvention::NATIVE_SCORE,
+                                KFACCurvatureConvention::REGISTERED_GAUSSIAN})
+    for (const auto policy : {KFACDampingPolicy::EQUAL_SPLIT, KFACDampingPolicy::TRACE_BALANCED})
+      for (const bool zero : {false, true})
+      {
+        const auto registry = makeRegistry();
+        const std::array<DerivativeReal, 4> x = zero ? std::array<DerivativeReal, 4>{0, -0., 0, 0}
+                                                    : std::array<DerivativeReal, 4>{1, 0, 0, 2};
+        const std::array<DerivativeReal, 4> dy{2, 0, 0, 1};
+        const std::array<DerivativeReal, 9> score{0, 0, 0, 0, 0, 0, 3, 4, 0};
+        KFACFactorAccumulator statistics(registry, 0, convention);
+        addSample(statistics, 1, x, dy, score);
+        addSample(statistics, 1, x, dy, score);
+        reduceKFACFactorStatistics(statistics);
+        const auto state = updateKFACFactorState(nullptr, statistics, 0.95);
+        const auto unchanged = state.values;
+        const KFACPreconditionerControl control{0.1, 0.2, policy};
+        const KFACPreconditioner raw(statistics, control);
+        const KFACPreconditioner normalized(registry, 7, state, control);
+        const auto expected = raw.exportInverseState(), actual = normalized.exportInverseState();
+        REQUIRE(actual.values.size() == expected.values.size());
+        CHECK(std::memcmp(actual.values.data(), expected.values.data(),
+                          actual.values.size() * sizeof(DerivativeReal)) == 0);
+        CHECK(state.values == unchanged);
+        CHECK(normalized.storageDiagnostics().retained_numeric_bytes ==
+              raw.storageDiagnostics().retained_numeric_bytes);
+        const std::array<DerivativeValue, 9> gradient{{1., -2., 3., -4., 5., -6., 7., -8., 0.}};
+        std::vector<DerivativeValue> a(gradient.size()), b(gradient.size());
+        raw.apply({registry.parameterSchema(), 0, {gradient.data(), gradient.size()}}, {a.data(), a.size()});
+        normalized.apply({registry.parameterSchema(), 7, {gradient.data(), gradient.size()}}, {b.data(), b.size()});
+        CHECK(a == b);
+        const KFACPreconditioner restored(registry, 8, actual);
+        restored.apply({registry.parameterSchema(), 8, {gradient.data(), gradient.size()}}, {a.data(), a.size()});
+        CHECK(a == b);
+        CHECK_THROWS(normalized.apply({registry.parameterSchema(), 6, {gradient.data(), gradient.size()}},
+                                      {a.data(), a.size()}));
+        CHECK(state.values == unchanged);
+
+        // Invalid snapshots must fail before they can publish a prepared inverse.
+        for (const auto value : {std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::infinity(), -1.0})
+        {
+          auto invalid = state;
+          invalid.values[0] = value;
+          CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        }
+        auto invalid = state;
+        invalid.registry_fingerprint = "foreign";
+        CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        invalid = state;
+        invalid.values.pop_back();
+        CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        invalid = state;
+        invalid.values[1] += 1;
+        CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        invalid = state;
+        invalid.values[13] = 0; // Repeat normalization follows the 3x3 and 2x2 factors.
+        CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        invalid = state;
+        invalid.values.back() = -1;
+        CHECK_THROWS(KFACPreconditioner(registry, 7, invalid, control));
+        CHECK_THROWS(KFACPreconditioner(registry, 7, state, {-1, 0.2, policy}));
+        CHECK(state.values == unchanged);
+      }
+}
+
+TEST_CASE("KFAC normalized construction preserves diagonal-only and frozen registries",
+          "[drivers][wftrain][kfac][kfac_state]")
+{
+  for (bool frozen : {false, true})
+  {
+    const StructuredParameterSchema schema{"kfac/diagonal",
+        {{"scalar", {1}, 0, 1, ParameterScalarDomain::REAL64, !frozen, "network"}}};
+    const KFACBlockRegistry registry(schema, {}, frozen ? std::vector<std::size_t>{}
+                                                       : std::vector<std::size_t>{0});
+    KFACFactorAccumulator statistics(registry, 0);
+    statistics.beginSample(1);
+    const std::array<DerivativeReal, 1> score{2};
+    if (!frozen)
+      statistics.addFallbackScores({score.data(), score.size()});
+    statistics.endSample();
+    reduceKFACFactorStatistics(statistics);
+    const auto state = updateKFACFactorState(nullptr, statistics, 0.95);
+    const KFACPreconditioner raw(statistics), normalized(registry, 1, state);
+    CHECK(raw.exportInverseState().values == normalized.exportInverseState().values);
+    const std::array<DerivativeValue, 1> gradient{{3.}};
+    std::array<DerivativeValue, 1> expected{}, actual{};
+    raw.apply({schema, 0, {gradient.data(), gradient.size()}}, {expected.data(), expected.size()});
+    normalized.apply({schema, 1, {gradient.data(), gradient.size()}}, {actual.data(), actual.size()});
+    CHECK(actual == expected);
+    if (frozen)
+      CHECK(actual[0] == DerivativeValue{});
+  }
 }
 
 #ifdef HAVE_MPI

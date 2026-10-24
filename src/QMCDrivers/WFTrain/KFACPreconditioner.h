@@ -318,8 +318,14 @@ protected:
 
 private:
   struct PreparedBlock;
-  static KFACFactorAccumulator statisticsFromState(KFACBlockRegistry registry,
-      std::size_t parameter_version, const KFACFactorState& state);
+  /// Shared ordered preparation without owning a synthetic statistics transaction.
+  void beginPreparation(std::shared_ptr<KFACDenseSolver> dense_solver);
+  void prepareBlock(std::size_t ordinal, std::size_t activation_dimension,
+      std::size_t sensitivity_dimension, DerivativeArrayView<const DerivativeReal> activation,
+      DerivativeArrayView<const DerivativeReal> sensitivity, DerivativeReal sample_weight,
+      DerivativeReal row_weight, std::size_t row_count);
+  /// Publish only complete factors, scratch, and fallback inverse ownership.
+  void finishPreparation(DerivativeArrayView<const DerivativeReal> fallback, DerivativeReal fallback_weight);
   void prepareScratch();
 
   KFACBlockRegistry registry_;
