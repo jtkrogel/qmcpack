@@ -266,7 +266,8 @@ struct PsiFormerComplexWF::Impl
       return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
                            configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse(),
                            configuredHeadDeterminantBatch(), configuredFullInverseColumns(), configuredTargetFactorReuse(),
-                           psiformer::device::configuredPeriodicValueGeometryTiled());
+                           psiformer::device::configuredPeriodicValueGeometryTiled(),
+                           psiformer::device::configuredComplexTargetColdCooperativeLu());
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
@@ -276,7 +277,7 @@ struct PsiFormerComplexWF::Impl
         std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {},
         std::size_t virtual_capacity = 0, std::size_t trace_targets = 0, bool virtual_envelope_reuse = false,
         bool head_determinant_batch = false, bool full_inverse_columns = false, bool target_factor_reuse = false,
-        bool periodic_value_tiling = false)
+        bool periodic_value_tiling = false, bool target_cold_cooperative_lu = false)
     {
       using namespace psiformer::device;
       // Freeze one effective choice for every simultaneous ordinary VALUE owner.
@@ -295,7 +296,7 @@ struct PsiFormerComplexWF::Impl
                   << "; unchanged_baseline_owners=yes" << std::endl;
         return prepareFrozen(plan, parameters, nuclei, version, limit, preparation, capacity, shared_image,
             virtual_capacity, trace_targets, virtual_envelope_reuse, head_determinant_batch,
-            full_inverse_columns, target_factor_reuse, false);
+            full_inverse_columns, target_factor_reuse, false, target_cold_cooperative_lu);
       };
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
@@ -305,6 +306,8 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Virtual envelope reuse requires the separate complex virtual tile owner");
       if (target_factor_reuse && !preparation.max_targets)
         throw std::invalid_argument("Request-local factor reuse requires explicit paired VGL targets");
+      if (target_cold_cooperative_lu && (!target_factor_reuse || !preparation.max_targets))
+        throw std::invalid_argument("Cooperative cold target LU requires explicit targets and request-local factor reuse");
       if (full_inverse_columns)
       {
         if (preparation.max_targets)
@@ -323,7 +326,7 @@ struct PsiFormerComplexWF::Impl
           periodic_value_tiling);
       const auto spatial = preparation.max_targets
           ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets,
-                head_determinant_batch, target_factor_reuse, preparation.reuse_cusp_state)
+                head_determinant_batch, target_factor_reuse, preparation.reuse_cusp_state, target_cold_cooperative_lu)
           : estimateComplexSpatialCost(plan, capacity, trace_targets, head_determinant_batch);
       const auto work = preparation.max_targets
           ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity,
@@ -399,7 +402,7 @@ struct PsiFormerComplexWF::Impl
         return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
             preparation, work, bytes, host, capacity, shared_image, virtual_capacity, trace_targets,
             virtual_envelope_reuse, head_determinant_batch, full_inverse_columns,
-            target_factor_reuse, periodic_value_tiling));
+            target_factor_reuse, periodic_value_tiling, target_cold_cooperative_lu));
       }
       catch (const std::length_error&)
       {
@@ -425,11 +428,11 @@ struct PsiFormerComplexWF::Impl
         std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image,
         std::size_t virtual_capacity, std::size_t trace_targets, bool virtual_envelope_reuse,
         bool head_determinant_batch, bool full_inverse_columns, bool target_factor_reuse,
-        bool periodic_value_tiling)
+        bool periodic_value_tiling, bool target_cold_cooperative_lu)
         : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity),
           trace_targets(trace_targets), virtual_envelope_reuse(virtual_envelope_reuse),
           head_determinant_batch(head_determinant_batch), full_inverse_columns(full_inverse_columns),
-          target_factor_reuse(target_factor_reuse),
+          target_factor_reuse(target_factor_reuse), target_cold_cooperative_lu(target_cold_cooperative_lu),
           periodic_value_tiling(periodic_value_tiling), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
@@ -439,7 +442,7 @@ struct PsiFormerComplexWF::Impl
               value_cost.device_bytes, false, head_determinant_batch, periodic_value_tiling)),
           full(preparation.max_targets
               ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity,
-                    trace_targets, head_determinant_batch, target_factor_reuse)
+                    trace_targets, head_determinant_batch, target_factor_reuse, target_cold_cooperative_lu)
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
                     spatial_cost.device_bytes, trace_targets, head_determinant_batch, full_inverse_columns)),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
@@ -486,6 +489,7 @@ struct PsiFormerComplexWF::Impl
                 << ", head_determinant_batch=" << head_determinant_batch
                 << ", full_inverse_columns=" << full_inverse_columns
                 << ", target_factor_reuse=" << target_factor_reuse
+                << ", target_cold_cooperative_lu=" << target_cold_cooperative_lu
                 << ", trace_storage_fingerprint=" << full->traceStorageFingerprint()
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
@@ -530,6 +534,7 @@ struct PsiFormerComplexWF::Impl
     const bool head_determinant_batch;
     const bool full_inverse_columns;
     const bool target_factor_reuse;
+    const bool target_cold_cooperative_lu;
     const bool periodic_value_tiling;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
@@ -4612,7 +4617,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
       parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
       source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets,
       source_lane->virtual_envelope_reuse, source_lane->head_determinant_batch, source_lane->full_inverse_columns,
-      source_lane->target_factor_reuse, source_lane->periodic_value_tiling));
+      source_lane->target_factor_reuse, source_lane->periodic_value_tiling, source_lane->target_cold_cooperative_lu));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
@@ -4829,7 +4834,7 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
           impl_->state->model.p.version(), impl_->state->gpu_limit,
           primary.preparation, primary.capacity, primary.image, primary.virtual_capacity, primary.trace_targets,
           primary.virtual_envelope_reuse, primary.head_determinant_batch, primary.full_inverse_columns,
-          primary.target_factor_reuse, primary.periodic_value_tiling);
+          primary.target_factor_reuse, primary.periodic_value_tiling, primary.target_cold_cooperative_lu);
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes

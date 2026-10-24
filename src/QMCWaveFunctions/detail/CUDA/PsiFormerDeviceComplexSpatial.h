@@ -7,6 +7,8 @@
 #include "PsiFormerDeviceComplexValue.h"
 #include "PsiFormerDeviceComplexSpatialKernels.h"
 #include "PsiFormerDeviceComplexSpatialConcurrent.h"
+#include <cstdlib>
+#include <string_view>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -34,6 +36,15 @@ inline void validateComplexInverseColumnsProfile(const PsiFormerExecutionPlan& p
 {
   if (!supportsComplexInverseColumnsProfile(plan.environment(), plan.modelShape().electrons()))
     throw std::invalid_argument("Parallel inverse columns require ordinary fixed legacy-torus paired FP64 Ne>=64");
+}
+
+/// Freeze the target-only cold schedule once, never during an active request.
+inline bool configuredComplexTargetColdCooperativeLu()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU must be 0 or 1");
 }
 
 /// Replace only the legacy product scratch with an explicitly admitted immutable slab.
@@ -90,8 +101,13 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
 inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
                                                          std::size_t batch = 1, std::size_t concurrent_targets = 0,
                                                          bool batched_projection = false, bool factor_reuse = false,
-                                                         bool reuse_cusp_state = false)
+                                                         bool reuse_cusp_state = false,
+                                                         bool cold_cooperative_lu = false)
 {
+  if (cold_cooperative_lu && (!factor_reuse || !targets || targets >= plan.modelShape().electrons() ||
+      plan.modelShape().electrons() > 300 || !concurrent_targets ||
+      !supportsComplexInverseColumnsProfile(plan.environment(), plan.modelShape().electrons())))
+    throw std::invalid_argument("Cooperative cold target LU requires compact paired FP64 targets and factor reuse");
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch, reuse_cusp_state);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex target extent overflow"); };
@@ -175,13 +191,13 @@ public:
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation,
       std::size_t capacity = 1, std::size_t concurrent_targets = 0, bool batched_projection = false,
-      bool factor_reuse = false)
+      bool factor_reuse = false, bool cold_cooperative_lu = false)
   {
     if (!image || !preparation.max_targets || !preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget)
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
     const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity,
-        concurrent_targets, batched_projection, factor_reuse, preparation.reuse_cusp_state);
+        concurrent_targets, batched_projection, factor_reuse, preparation.reuse_cusp_state, cold_cooperative_lu);
     const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity,
         preparation.reuse_cusp_state);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
@@ -192,7 +208,8 @@ public:
                 << " K=" << preparation.max_targets << " pointer_device_bytes=" << cost.projection_pointer_bytes
                 << " pointer_host_bytes=0; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
-        std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets, false, factor_reuse));
+        std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets, false, factor_reuse,
+        cold_cooperative_lu));
   }
 
   /// Revoke all products before a same-family successor can replace the current image.
@@ -313,6 +330,7 @@ public:
 
   /// Expose the frozen effective owner choice, not the mutable process selector.
   bool usesCuspStateReuse() const noexcept { return trunk_->cusp_state_enabled_; }
+  bool usesColdCooperativeLu() const noexcept { return cold_cooperative_lu_; }
 
   /// Track scratch identity/capacity across warm evaluation and same-shape successors.
   std::size_t traceStorageFingerprint() const noexcept
@@ -442,12 +460,18 @@ private:
       {
         std::clog << "  Paired target factor reuse: selected=request_local_exact Ne=" << t.ne_
                   << " channels=" << t.batch_ * t.shape_.determinants
+                  << "; cold_cooperative_lu=" << cold_cooperative_lu_
                   << "; fallback=current_scalar; extra_device_bytes=0; extra_host_bytes=0; production_counters=no\n";
         factor_reuse_reported_ = true;
       }
-      checkRuntime(launchComplexTargetFactorReuse(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
-          product_.data(), head_.data(), reuse_previous, channels_.data(), status_.data(), inverse_.data(),
-          permutation_.data(), solve_.data(), test_decisions), "request-local complex target factors");
+      if (cold_cooperative_lu_ && !reuse_previous)
+        checkRuntime(launchComplexTargetCooperativeColdFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+            t.ne_, product_.data(), head_.data(), channels_.data(), status_.data(), inverse_.data(),
+            permutation_.data(), solve_.data(), test_decisions), "cooperative cold complex target factors");
+      else
+        checkRuntime(launchComplexTargetFactorReuse(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
+            product_.data(), head_.data(), reuse_previous, channels_.data(), status_.data(), inverse_.data(),
+            permutation_.data(), solve_.data(), test_decisions), "request-local complex target factors");
     }
     else if (inverse_columns_ && !t.mixed_dense_)
     {
@@ -476,11 +500,11 @@ private:
   PreparedDeviceComplexSpatial(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexSpatialCost cost,
       TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0, bool inverse_columns = false,
-      bool factor_reuse = false)
+      bool factor_reuse = false, bool cold_cooperative_lu = false)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), preparation, false, true)),
         capacity_electrons_(capacity * trunk_->ne_), concurrent_targets_(concurrent_targets),
-        inverse_columns_(inverse_columns), factor_reuse_(factor_reuse),
+        inverse_columns_(inverse_columns), factor_reuse_(factor_reuse), cold_cooperative_lu_(cold_cooperative_lu),
         trace_workspace_(planComplexSpatialTraceWorkspace(capacity, trunk_->shape_.determinants, trunk_->ne_,
             preparation.max_targets ? preparation.max_targets : trunk_->ne_, concurrent_targets)),
         envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
@@ -547,6 +571,7 @@ private:
   const std::size_t concurrent_targets_;
   const bool inverse_columns_;
   const bool factor_reuse_;
+  const bool cold_cooperative_lu_;
   const ComplexSpatialTraceWorkspacePlan trace_workspace_;
   DeviceBuffer<double> envelope_, projections_;
   DeviceBuffer<cuDoubleComplex> head_, inverse_, solve_, product_, channel_terms_, outputs_;

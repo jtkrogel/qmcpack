@@ -66,6 +66,13 @@ Error launchComplexTargetFactorReuse(Stream stream, std::size_t channels, std::s
     ComplexValueChannel* metadata, std::uint64_t* status, cuDoubleComplex* inverse,
     std::size_t* permutation, cuDoubleComplex* solve, std::uint8_t* decisions = nullptr);
 
+/// Private cold-call alternative; preserve raw bytes before cooperative LU and canonical failure replay.
+/// Existing later-packet reuse is unchanged; optional test decisions are always0 on a cold call.
+Error launchComplexTargetCooperativeColdFactor(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* current, cuDoubleComplex* canonical_raw, ComplexValueChannel* metadata,
+    std::uint64_t* status, cuDoubleComplex* inverse, std::size_t* permutation,
+    cuDoubleComplex* solve, std::uint8_t* decisions = nullptr);
+
 /// Preserve scalar LU, then solve independent inverse columns in existing private storage.
 Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,

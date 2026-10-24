@@ -534,6 +534,23 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   }
 }
 
+/// Raw target replay uses only complex loads/stores, retaining signed-zero and nonfinite payloads.
+template<bool FailedOnly>
+__global__ void copyTargetRaw(std::size_t n, const ComplexValueChannel* metadata,
+    const cuDoubleComplex* source, cuDoubleComplex* destination, std::uint8_t* decisions)
+{
+  const auto channel = std::size_t(blockIdx.x);
+  if constexpr (FailedOnly)
+    if (metadata[channel].status == 0)
+      return;
+  if constexpr (!FailedOnly)
+    if (!threadIdx.x && decisions)
+      decisions[channel] = 0;
+  const auto begin = channel * n * n;
+  for (auto local = std::size_t(threadIdx.x); local < n * n; local += blockDim.x)
+    destination[begin + local] = source[begin + local];
+}
+
 /// Restore failed speculative LU from retained providers, never from the inverse owner.
 __global__ void restoreFailedPacked(std::size_t n, const ComplexValueChannel* metadata,
     const double* envelope, const double* real, const double* imag, cuDoubleComplex* matrix)
@@ -784,6 +801,67 @@ Error launchComplexTargetFactorReuse(Stream stream, std::size_t channels, std::s
     throw std::overflow_error("Target factor reuse exceeds status indexing");
   factor<false, false, true><<<blocks(channels), 128, 0, stream>>>(channels, n, current, metadata, status,
       inverse, permutation, solve, nullptr, canonical_raw, reuse_previous, decisions);
+  return launched();
+}
+
+/// Private cold target factorization with an exact existing raw bank and no added owner.
+Error launchComplexTargetCooperativeColdFactor(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* current, cuDoubleComplex* canonical_raw, ComplexValueChannel* metadata,
+    std::uint64_t* status, cuDoubleComplex* inverse, std::size_t* permutation,
+    cuDoubleComplex* solve, std::uint8_t* decisions)
+{
+  if (!channels || !n || n > 300 || !current || !canonical_raw || !metadata || !status ||
+      !inverse || !permutation || !solve)
+    throw std::invalid_argument("Cold target factors require complete distinct raw/LU/inverse storage and n<=300");
+  const auto elements = spatial_detail::checkedProduct(channels,
+      spatial_detail::checkedProduct(n, n, "Cold target matrix extent overflow"),
+      "Cold target matrix extent overflow");
+  const auto rows = spatial_detail::checkedProduct(channels, n, "Cold target row extent overflow");
+  if (channels > std::size_t(std::numeric_limits<int>::max()) ||
+      elements - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8))
+    throw std::overflow_error("Cold target factors exceed launch/status bounds");
+  const auto bytes = [](std::size_t count, std::size_t size) {
+    return spatial_detail::checkedProduct(count, size, "Cold target byte extent overflow");
+  };
+  const void* owners[]{current, canonical_raw, inverse, metadata, status, permutation, solve, decisions};
+  const std::size_t spans[]{bytes(elements, sizeof(cuDoubleComplex)), bytes(elements, sizeof(cuDoubleComplex)),
+      bytes(elements, sizeof(cuDoubleComplex)), bytes(channels, sizeof(ComplexValueChannel)), sizeof(std::uint64_t),
+      bytes(rows, sizeof(std::size_t)), bytes(rows, sizeof(cuDoubleComplex)), bytes(channels, sizeof(std::uint8_t))};
+  const auto count = decisions ? std::size_t(8) : std::size_t(7);
+  for (std::size_t i = 0; i < count; ++i)
+  {
+    const auto begin = reinterpret_cast<std::uintptr_t>(owners[i]);
+    if (spans[i] > std::numeric_limits<std::uintptr_t>::max() - begin)
+      throw std::overflow_error("Cold target address span overflow");
+    for (std::size_t j = 0; j < i; ++j)
+    {
+      const auto other = reinterpret_cast<std::uintptr_t>(owners[j]);
+      if (begin < other + spans[j] && other < begin + spans[i])
+        throw std::invalid_argument("Cold target writable owners overlap");
+    }
+  }
+  copyTargetRaw<false><<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+      n, metadata, current, canonical_raw, decisions);
+  auto result = launched();
+  if (result != success)
+    return result;
+  factorCooperative<false, true><<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+      channels, n, current, metadata, status, nullptr, permutation, solve);
+  result = launched();
+  if (result != success)
+    return result;
+  copyTargetRaw<true><<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+      n, metadata, canonical_raw, current, nullptr);
+  result = launched();
+  if (result != success)
+    return result;
+  factor<false, true, false, true><<<blocks(channels), 128, 0, stream>>>(
+      channels, n, current, metadata, status, nullptr, permutation, solve, nullptr);
+  result = launched();
+  if (result != success)
+    return result;
+  inverseColumns<<<static_cast<unsigned>(channels), 128, 0, stream>>>(
+      n, current, metadata, status, inverse, permutation, solve);
   return launched();
 }
 

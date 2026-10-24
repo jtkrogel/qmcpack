@@ -90,11 +90,13 @@ struct ComplexSpatialTargetValidationAccess
     t.setBatchCount(positions.size() / (3 * t.ne_));
     t.positions_.upload(positions.data(), positions.size());
     owner.prepareTarget(0, t.target_preparation_.max_targets, false, decisions.data());
+    t.queue_.sync();
     decisions.download(values.data(), channels);
     if (!std::all_of(values.begin(), values.end(), [](auto value) { return value == 0; }))
       throw std::runtime_error("Target owner did not cold-factor the first request slab");
     owner.finishTarget(0);
     owner.prepareTarget(t.target_preparation_.max_targets, t.target_preparation_.max_targets, true, decisions.data());
+    t.queue_.sync();
     decisions.download(values.data(), channels);
     const auto reused = std::count(values.begin(), values.end(), std::uint8_t(1));
     if (!reused || !std::all_of(values.begin(), values.end(), [](auto value) { return value == 1 || value == 2; }))
@@ -150,7 +152,7 @@ struct ComplexSpatialTargetValidationAccess
 };
 
 /// Exercise the existing head bank with compact K/B tails and complete target products.
-inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
+inline void validateBatchedHeadTargetOwner(bool factor_reuse = false, bool cold_cooperative_lu = false)
 {
   constexpr std::size_t n = 64, capacity = 3, k = 7, trace_targets = 3;
   const auto descriptors = makeTargetCostPlan(n, true, true);
@@ -159,8 +161,10 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
   const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
   // Reuse compares against an already-batched baseline; the existing head test compares unbatched/batched.
   const bool baseline_batched_projection = factor_reuse;
-  const auto old_cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, baseline_batched_projection);
-  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, true, factor_reuse);
+  const auto old_cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets,
+      baseline_batched_projection, cold_cooperative_lu);
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, true, factor_reuse,
+      false, cold_cooperative_lu);
   const auto pointer_bytes = 2 * orbitalProjectionPointerBytes(capacity, 1 + 4 * k,
       plan.modelShape().determinants, 2);
   if (factor_reuse)
@@ -196,22 +200,71 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
   checkRuntime(cudaGetDevice(&ordinal), "target head owner device");
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
+  if (cold_cooperative_lu)
+  {
+    // Restore caller controls even when an admission or exact-output assertion throws.
+    struct RestoreOption
+    {
+      bool present;
+      std::string previous;
+      ~RestoreOption()
+      {
+        if (present) setenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU", previous.c_str(), 1);
+        else unsetenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU");
+      }
+    } restore{std::getenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU") != nullptr,
+        std::getenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU") ?
+        std::getenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU") : ""};
+    unsetenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU");
+    if (configuredComplexTargetColdCooperativeLu()) throw std::runtime_error("Cold LU default is not OFF");
+    for (const char* value : {"0", "1", "", "2", "true", "-1"})
+    {
+      if (setenv("PSIFORMER_GPU_COMPLEX_TARGET_COLD_COOPERATIVE_LU", value, 1))
+        throw std::runtime_error("Cold LU fixture cannot set option");
+      bool rejected = false, actual = false;
+      try { actual = configuredComplexTargetColdCooperativeLu(); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      const bool valid = std::string(value) == "0" || std::string(value) == "1";
+      if (rejected == valid || (valid && actual != (std::string(value) == "1")))
+        throw std::runtime_error("Cold LU strict option admission changed");
+    }
+    const auto before = metrics.snapshot();
+    for (const auto invalid : {std::pair<std::size_t, bool>{n, true}, {k, false}})
+    {
+      bool rejected = false;
+      try { (void)estimateComplexSpatialTargetCost(plan, invalid.first, capacity, trace_targets,
+          true, invalid.second, false, true); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+        throw std::runtime_error("Cold LU admitted FULL targets or absent factor reuse");
+      rejected = false;
+      try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+          {invalid.first, cost.device_bytes, std::numeric_limits<std::size_t>::max()}, capacity,
+          trace_targets, true, invalid.second, true); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+        throw std::runtime_error("Cold LU invalid create allocated numeric storage");
+    }
+  }
   const auto work = estimateHeadFreeTargetPrefixCost(plan, k, capacity).charged_scalar_work_units;
   const auto denied = metrics.snapshot();
   for (bool bytes : {false, true})
   {
     bool rejected = false;
     try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-        {k, cost.device_bytes - bytes, work - !bytes}, capacity, trace_targets, true, factor_reuse); }
+        {k, cost.device_bytes - bytes, work - !bytes}, capacity, trace_targets, true, factor_reuse,
+        cold_cooperative_lu); }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || metrics.snapshot().allocation_calls != denied.allocation_calls)
       throw std::runtime_error("Target head cost/work-minus-one allocated numeric storage");
   }
   auto ordinary = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-      {k, old_cost.device_bytes, work}, capacity, trace_targets, baseline_batched_projection);
+      {k, old_cost.device_bytes, work}, capacity, trace_targets, baseline_batched_projection, cold_cooperative_lu);
   const auto cold = metrics.snapshot();
   auto batched = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
-      {k, cost.device_bytes, work}, capacity, trace_targets, true, factor_reuse);
+      {k, cost.device_bytes, work}, capacity, trace_targets, true, factor_reuse, cold_cooperative_lu);
+  if (batched->usesColdCooperativeLu() != cold_cooperative_lu || ordinary->usesColdCooperativeLu())
+    throw std::runtime_error("Cold LU owner did not freeze its admitted selection");
   if (metrics.snapshot().live_bytes - cold.live_bytes != cost.device_bytes)
     throw std::runtime_error("Target head actual owner bytes differ from admission");
   const auto fingerprint = batched->traceStorageFingerprint();
@@ -228,6 +281,8 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
     if (!std::isfinite(reference) || !std::isfinite(actual) || error > 2e-11 * (1 + std::abs(reference)))
       throw std::runtime_error("Target head component exceeds existing spatial FP64 contract");
     nonexact_head += head && reference != actual;
+    if (cold_cooperative_lu && head && std::memcmp(&reference, &actual, sizeof(double)))
+      throw std::runtime_error("Cold LU owner changed exact paired target output bits");
     ++comparisons;
   };
   const auto complex = [&](cuDoubleComplex reference, cuDoubleComplex actual, double& maximum, bool head) {
@@ -250,6 +305,8 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
     std::vector<cuDoubleComplex> ag(live * 3 * n), bg(ag.size()), al(live * n), bl(al.size()), ar(al.size()), br(al.size());
     ordinary->download(ordinary->resultView(), a, ag, al, ar);
     batched->download(batched->resultView(), b, bg, bl, br);
+    if (cold_cooperative_lu && std::memcmp(a.data(), b.data(), live * sizeof(ComplexValueResult)))
+      throw std::runtime_error("Cold LU owner changed complete amplitude metadata bits");
     for (std::size_t i = 0; i < live; ++i)
     {
       if (a[i].status || b[i].status)
@@ -293,6 +350,8 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
   auto successor = image->makeUpdatedImage(parameters, 1);
   ordinary->rebindModel(successor);
   batched->rebindModel(successor);
+  if (batched->usesColdCooperativeLu() != cold_cooperative_lu)
+    throw std::runtime_error("Cold LU rebind changed frozen selection");
   full->rebindModel(successor);
   compare(3, true);
 
@@ -316,9 +375,12 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false)
   compare(1, false);
   std::cout << std::setprecision(17) << "PASS target batched head Ne64 B3 K7 T3 comparisons=" << comparisons
             << " factor_reuse=" << factor_reuse
+            << " cold_cooperative_lu=" << cold_cooperative_lu
             << " max_head=" << max_head << " nonexact_head_fields=" << nonexact_head << " max_FULL=" << max_full
             << " pointer_device_bytes=" << pointer_bytes << " pointer_host_bytes=0 cost_minus_one_noalloc=1"
             << " liveB=3,1,2 K_tail=1 active_head_rebind=1 warm_allocations=0 added_HOST_transfers=0 late_rollback=1\n";
+  if (factor_reuse && !cold_cooperative_lu)
+    validateBatchedHeadTargetOwner(true, true);
 }
 } // namespace qmcplusplus::psiformer::device
 
@@ -328,9 +390,30 @@ void validateComplexSpatialTargetCosts()
   using namespace qmcplusplus::psiformer::device;
   const auto before = deviceMemoryMetrics(0).snapshot();
   const auto work_budget = std::numeric_limits<std::size_t>::max();
+  struct InvalidProfile { std::size_t electrons; bool periodic, paired; };
+  for (const auto invalid : {InvalidProfile{32, true, true}, {302, true, true},
+                            {100, false, true}, {100, true, false}})
+  {
+    bool rejected = false;
+    try
+    {
+      const auto plan = makeTargetCostPlan(invalid.electrons, invalid.periodic, invalid.paired);
+      (void)estimateComplexSpatialTargetCost(plan, 7, 2, 3, true, true, false, true);
+    }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected || deviceMemoryMetrics(0).snapshot().allocation_calls != before.allocation_calls)
+      throw std::runtime_error("Cold target factor admitted unsupported profile or allocated on denial");
+  }
   for (std::size_t n : {std::size_t(100), std::size_t(200), std::size_t(300)})
   {
     const auto plan = makeTargetCostPlan(n, true, true);
+    const auto scalar_cold = estimateComplexSpatialTargetCost(plan, 7, 2, 3, true, true, true);
+    const auto cooperative_cold = estimateComplexSpatialTargetCost(plan, 7, 2, 3, true, true, true, true);
+    if (scalar_cold.device_bytes != cooperative_cold.device_bytes ||
+        scalar_cold.host_bytes != cooperative_cold.host_bytes ||
+        scalar_cold.trunk_bytes != cooperative_cold.trunk_bytes ||
+        scalar_cold.projection_pointer_bytes != cooperative_cold.projection_pointer_bytes)
+      throw std::runtime_error("Cold target cooperative schedule changed admitted owner bytes");
     const auto plain_cusp = estimateComplexSpatialTargetCost(plan, 3, 2);
     const auto cached_cusp = estimateComplexSpatialTargetCost(plan, 3, 2, 0, false, false, true);
     const auto extra_cusp = checkedDeviceBytes<double>(2 * (1 + 4 * n)) + checkedDeviceBytes<OpenSpatialStatus>(2);
