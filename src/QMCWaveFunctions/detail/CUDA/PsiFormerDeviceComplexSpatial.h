@@ -17,6 +17,25 @@ struct ComplexSpatialCost
   std::size_t projection_pointer_bytes = 0;
 };
 
+/// The optional inverse schedule changes no owner byte count or physical model.
+inline bool supportsComplexInverseColumnsProfile(const ExecutionEnvironment& e, std::size_t electrons)
+{
+  return electrons >= 64 && !e.periodic_profile && e.fixed_nuclei &&
+      e.boundary == BoundaryCondition::PERIODIC &&
+      e.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      e.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
+      e.parameter_scalar_domain == ScalarDomain::REAL && e.compute_scalar_domain == ScalarDomain::REAL &&
+      e.amplitude_scalar_domain == ScalarDomain::COMPLEX &&
+      std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; });
+}
+
+/// Reject unsupported option metadata before image or numeric-owner allocation.
+inline void validateComplexInverseColumnsProfile(const PsiFormerExecutionPlan& plan)
+{
+  if (!supportsComplexInverseColumnsProfile(plan.environment(), plan.modelShape().electrons()))
+    throw std::invalid_argument("Parallel inverse columns require ordinary fixed legacy-torus paired FP64 Ne>=64");
+}
+
 /// Replace only the legacy product scratch with an explicitly admitted immutable slab.
 inline ComplexSpatialCost withConcurrentSpatialTraceCost(ComplexSpatialCost cost,
     const PsiFormerExecutionPlan& plan, std::size_t batch, std::size_t targets, std::size_t concurrent_targets)
@@ -111,11 +130,13 @@ public:
   /// Reject malformed profiles/extents and byte limits BEFORE preparing numeric buffers.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget,
-      std::size_t concurrent_targets = 0, bool batched_projection = false)
+      std::size_t concurrent_targets = 0, bool batched_projection = false, bool inverse_columns = false)
   {
     if (!image)
       throw std::invalid_argument("Complex FULL requires a paired numerical image");
     image->validateCurrentDevice();
+    if (inverse_columns)
+      validateComplexInverseColumnsProfile(image->plan());
     const auto cost = estimateComplexSpatialCost(image->plan(), capacity, concurrent_targets, batched_projection);
     if (cost.device_bytes > budget)
       throw std::length_error("Complex FULL exceeds its standalone owner workspace budget");
@@ -125,7 +146,7 @@ public:
                 << " pointer_device_bytes=" << cost.projection_pointer_bytes
                 << " pointer_host_bytes=0; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
-        std::move(image), capacity, queue, blas, cost, {}, concurrent_targets));
+        std::move(image), capacity, queue, blas, cost, {}, concurrent_targets, inverse_columns));
   }
 
   /// Explicit batch target admission precedes every prefix/head/output allocation.
@@ -373,6 +394,19 @@ private:
       checkRuntime(launchComplexSpatialFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
           t.ne_, head_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data(),
           minimum_scaled_pivots), "complex FULL inverse diagnostics");
+    else if (inverse_columns_ && !t.mixed_dense_)
+    {
+      if (!inverse_columns_reported_)
+      {
+        std::clog << "  Paired FULL inverse: selected=column_parallel Ne=" << t.ne_
+                  << " channels=" << t.batch_ * t.shape_.determinants
+                  << "; lu=canonical_scalar; extra_device_bytes=0; extra_host_bytes=0\n";
+        inverse_columns_reported_ = true;
+      }
+      checkRuntime(launchComplexSpatialInverseColumns(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, head_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()),
+          "complex FULL inverse columns");
+    }
     else
       checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_, head_.data(),
           channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex FULL inverse");
@@ -386,10 +420,11 @@ private:
   /// Allocate only the checked FULL trunk/head/inverse/traces inventory.
   PreparedDeviceComplexSpatial(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexSpatialCost cost,
-      TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0)
+      TargetVglPreparation preparation = {}, std::size_t concurrent_targets = 0, bool inverse_columns = false)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), preparation, false, true)),
         capacity_electrons_(capacity * trunk_->ne_), concurrent_targets_(concurrent_targets),
+        inverse_columns_(inverse_columns),
         trace_workspace_(planComplexSpatialTraceWorkspace(capacity, trunk_->shape_.determinants, trunk_->ne_,
             preparation.max_targets ? preparation.max_targets : trunk_->ne_, concurrent_targets)),
         envelope_(cost.head_elements, "ComplexSpatial::envelope_", __FILE__, __LINE__),
@@ -454,6 +489,7 @@ private:
   std::array<std::unique_ptr<PreparedDeviceOrbitalProjection>, 2> projection_banks_;
   std::size_t capacity_electrons_;
   const std::size_t concurrent_targets_;
+  const bool inverse_columns_;
   const ComplexSpatialTraceWorkspacePlan trace_workspace_;
   DeviceBuffer<double> envelope_, projections_;
   DeviceBuffer<cuDoubleComplex> head_, inverse_, solve_, product_, channel_terms_, outputs_;
@@ -465,6 +501,7 @@ private:
   std::vector<ComplexValueResult> target_current_;
   std::size_t generation_ = 0;
   bool valid_ = false;
+  bool inverse_columns_reported_ = false;
 };
 } // namespace qmcplusplus::psiformer::device
 #endif

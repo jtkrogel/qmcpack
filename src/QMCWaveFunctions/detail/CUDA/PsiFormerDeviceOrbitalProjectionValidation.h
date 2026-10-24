@@ -17,7 +17,7 @@
 namespace qmcplusplus::psiformer::device
 {
 /// Reuse the exact Ne64 seed/geometry and compare complete physical complex G/L.
-inline void validateBatchedHeadFullOwner()
+inline void validateBatchedHeadFullOwner(bool inverse_columns = false)
 {
   const auto descriptors = makeTargetCostPlan(64, true, true);
   const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
@@ -35,7 +35,7 @@ inline void validateBatchedHeadFullOwner()
   compute::Queue<PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
   auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
-  const auto old_cost = estimateComplexSpatialCost(plan, 1, 8, false);
+  const auto old_cost = estimateComplexSpatialCost(plan, 1, 8, inverse_columns);
   const auto cost = estimateComplexSpatialCost(plan, 1, 8, true);
   int ordinal = -1;
 #ifdef QMC_CUDA2HIP
@@ -44,11 +44,20 @@ inline void validateBatchedHeadFullOwner()
   checkRuntime(cudaGetDevice(&ordinal), "FULL head supplement device");
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
-  auto ordinary = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, old_cost.device_bytes, 8, false);
+  if (inverse_columns)
+  {
+    const auto before = metrics.snapshot();
+    bool rejected = false;
+    try { (void)PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, cost.device_bytes - 1, 8, true, true); }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+      throw std::runtime_error("Inverse-column cost-minus-one did not reject before numeric allocation");
+  }
+  auto ordinary = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, old_cost.device_bytes, 8, inverse_columns);
   const auto cold = metrics.snapshot();
-  auto batched = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, cost.device_bytes, 8, true);
+  auto batched = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, cost.device_bytes, 8, true, inverse_columns);
   if (metrics.snapshot().live_bytes - cold.live_bytes != cost.device_bytes ||
-      cost.device_bytes - old_cost.device_bytes != cost.projection_pointer_bytes ||
+      cost.device_bytes - old_cost.device_bytes != (inverse_columns ? 0 : cost.projection_pointer_bytes) ||
       cost.host_bytes != old_cost.host_bytes)
     throw std::runtime_error("FULL head supplement owner differs from exact preflight");
 
@@ -98,7 +107,30 @@ inline void validateBatchedHeadFullOwner()
   ordinary->rebindModel(successor);
   batched->rebindModel(successor);
   compare();
-  std::cout << std::setprecision(17) << "PASS direct batched paired Ne64 FULL G/L comparisons=" << comparisons
+  if (inverse_columns)
+  {
+    const auto stale = batched->resultView();
+    bool rejected_input = false, rejected_view = false;
+    try { batched->evaluate({}); }
+    catch (const std::invalid_argument&) { rejected_input = true; }
+    std::vector<ComplexValueResult> amplitude(1);
+    amplitude[0].status = 777;
+    const auto marker = make_cuDoubleComplex(13, -9);
+    std::vector<cuDoubleComplex> gradient(192, marker), lap_log(64, marker), lap_ratio(64, marker);
+    try { batched->download(stale, amplitude, gradient, lap_log, lap_ratio); }
+    catch (const std::invalid_argument&) { rejected_view = true; }
+    const auto unchanged = [&](const auto& values) {
+      return std::all_of(values.begin(), values.end(), [&](const auto value) {
+        return cuCreal(value) == 13 && cuCimag(value) == -9;
+      });
+    };
+    if (!rejected_input || !rejected_view || amplitude[0].status != 777 ||
+        !unchanged(gradient) || !unchanged(lap_log) || !unchanged(lap_ratio))
+      throw std::runtime_error("Inverse-column failed evaluation exposed stale or partial outputs");
+    compare();
+  }
+  std::cout << std::setprecision(17) << "PASS direct " << (inverse_columns ? "inverse-column" : "batched")
+            << " paired Ne64 FULL G/L comparisons=" << comparisons << " inverse_columns=" << inverse_columns
             << " max_G=" << max_g << " max_Llog=" << max_l << " max_Lratio=" << max_ratio
             << " max_amplitude=" << max_amplitude << " active_head_rebind=1 warm_allocations=0 added_host_uploads=0"
             << " pointer_device_bytes=" << cost.projection_pointer_bytes << " pointer_host_bytes=0\n";

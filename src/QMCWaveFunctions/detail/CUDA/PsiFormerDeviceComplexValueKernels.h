@@ -58,6 +58,11 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
+/// Preserve scalar LU, then solve independent inverse columns in existing private storage.
+Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve);
+
 /// Mixed-only conditioning evidence in a separate bank; channel ABI and FP64 entry point are unchanged.
 Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,

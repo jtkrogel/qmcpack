@@ -163,7 +163,7 @@ __device__ bool inverseFromLu(const cuDoubleComplex* a, std::size_t n, double sc
 }
 
 /// Serial-per-channel scaled partial-pivot LU; zero pivots are singular, not errors.
-template<bool CollectPivots>
+template<bool CollectPivots, bool EmitScale = false>
 __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
     ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve, double* minimum_scaled_pivots)
@@ -270,10 +270,73 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
     return;
   }
   metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
+  if constexpr (EmitScale)
+    solve[channel * n] = make_cuDoubleComplex(scale, 0);
   if (inverse && !inverseFromLu(a, n, scale, perm, inverse + channel * n * n, solve + channel * n))
     fail(status, channel);
   if constexpr (CollectPivots)
     minimum_scaled_pivots[channel] = minimum_pivot;
+}
+
+/** Independent columns retain the canonical forward/backward arithmetic order.
+ * The private inverse column first holds forward y, then descending rows replace
+ * y with x. Scaling is deferred until that complete backward solve has finished.
+ * No other column or consumer observes this scratch before the stream boundary.
+ */
+__global__ void inverseColumns(std::size_t n, const cuDoubleComplex* matrices,
+    const ComplexValueChannel* metadata, std::uint64_t* status, cuDoubleComplex* inverses,
+    const std::size_t* permutation, const cuDoubleComplex* solve)
+{
+  const auto channel = std::size_t(blockIdx.x);
+  if (metadata[channel].status)
+    return;
+  const auto* a = matrices + channel * n * n;
+  const auto* perm = permutation + channel * n;
+  auto* inverse = inverses + channel * n * n;
+  const double scale = cuCreal(solve[channel * n]);
+  for (std::size_t column = threadIdx.x; column < n; column += blockDim.x)
+  {
+    bool regular = true;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      auto value = make_cuDoubleComplex(perm[i] == column ? 1 : 0, 0);
+      for (std::size_t j = 0; j < i; ++j)
+        value = QMC_PF_COMPLEX_SUB(value, QMC_PF_COMPLEX_MUL(a[i * n + j], inverse[j * n + column]));
+      if (!finite(value))
+      {
+        regular = false;
+        break;
+      }
+      inverse[i * n + column] = value;
+    }
+    if (regular)
+      for (std::size_t i = n; i-- > 0;)
+      {
+        auto value = inverse[i * n + column];
+        for (std::size_t j = i + 1; j < n; ++j)
+          value = QMC_PF_COMPLEX_SUB(value, QMC_PF_COMPLEX_MUL(a[i * n + j], inverse[j * n + column]));
+        inverse[i * n + column] = QMC_PF_COMPLEX_DIV(value, a[i * n + i]);
+        if (!finite(inverse[i * n + column]))
+        {
+          regular = false;
+          break;
+        }
+      }
+    // Higher x entries must remain unscaled until all backward substitutions end.
+    if (regular)
+      for (std::size_t i = 0; i < n; ++i)
+      {
+        const auto value = inverse[i * n + column];
+        inverse[i * n + column] = make_cuDoubleComplex(cuCreal(value) / scale, cuCimag(value) / scale);
+        if (!finite(inverse[i * n + column]))
+        {
+          regular = false;
+          break;
+        }
+      }
+    if (!regular)
+      fail(status, channel);
+  }
 }
 
 /// Inverse-null alternative: one block owns one in-place LU, with scalar phase/log.
@@ -625,6 +688,31 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     factorCooperative<false><<<static_cast<unsigned>(channels), 256, 0, stream>>>(channels, n, matrix, metadata, status, nullptr);
   else
     factor<false><<<serial_blocks, 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve, nullptr);
+  return launched();
+}
+
+/// The scalar phase emits only a private scale; the second launch owns columns.
+Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve)
+{
+  if (!channels || !n || !matrix || !metadata || !status || !inverse || !permutation || !solve)
+    throw std::invalid_argument("Complex inverse columns require complete existing FULL storage");
+  const auto elements = spatial_detail::checkedProduct(channels,
+      spatial_detail::checkedProduct(n, n, "Complex inverse matrix extent overflow"),
+      "Complex inverse matrix extent overflow");
+  if (channels > std::size_t(std::numeric_limits<int>::max()) ||
+      n > std::size_t(std::numeric_limits<int>::max()) ||
+      elements - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8))
+    throw std::overflow_error("Complex inverse columns exceed launch/status bounds");
+  const auto serial_blocks = blocks(channels);
+  factor<false, true><<<serial_blocks, 128, 0, stream>>>(
+      channels, n, matrix, metadata, status, nullptr, permutation, solve, nullptr);
+  const auto result = launched();
+  if (result != success)
+    return result;
+  inverseColumns<<<static_cast<unsigned>(channels), 128, 0, stream>>>(
+      n, matrix, metadata, status, inverse, permutation, solve);
   return launched();
 }
 
