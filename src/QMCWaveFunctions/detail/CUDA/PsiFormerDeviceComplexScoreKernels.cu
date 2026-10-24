@@ -77,6 +77,115 @@ __global__ void weightedInverses(std::size_t d, std::size_t n, const ComplexValu
     fail(status, 0);
 }
 
+/// Preserve scalar normalization and failure prefixes while distributing independent entries.
+__global__ void weightedInversesCooperative(std::size_t d, std::size_t n, const ComplexValueChannel* channels,
+    cuDoubleComplex* inverse, const double* cusp, ComplexValueResult* amplitude, std::uint64_t* status)
+{
+  __shared__ double shift, log_total, log_weights[16];
+  __shared__ cuDoubleComplex phase, ratios[16];
+  __shared__ unsigned long long first_bad;
+  __shared__ bool rejected;
+  const auto count = d * n * n;
+  if (threadIdx.x == 0)
+  {
+    rejected = false;
+    first_bad = ~0ULL;
+    shift = -DBL_MAX;
+    // Metadata precedes every inverse check, exactly as in the scalar entry.
+    for (std::size_t channel = 0; channel < d; ++channel)
+    {
+      if (channels[channel].status || amplitude->status || !device_math::isFiniteBinary64(channels[channel].log_abs) ||
+          !device_math::isFiniteBinary64(cuCreal(channels[channel].phase)) ||
+          !device_math::isFiniteBinary64(cuCimag(channels[channel].phase)))
+      {
+        fail(status, channel);
+        rejected = true;
+        break;
+      }
+      shift = fmax(shift, channels[channel].log_abs);
+    }
+  }
+  __syncthreads();
+  if (rejected) return;
+
+  // Admit the whole untouched inverse epoch, selecting the canonical first index.
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x)
+    if (!device_math::isFiniteBinary64(cuCreal(inverse[i])) || !device_math::isFiniteBinary64(cuCimag(inverse[i])))
+      atomicMin(&first_bad, static_cast<unsigned long long>(i));
+  __syncthreads();
+  if (first_bad != ~0ULL)
+  {
+    if (threadIdx.x == 0) fail(status, first_bad);
+    return;
+  }
+  if (threadIdx.x == 0)
+  {
+    device_determinant::CompensatedSumBinary64 re, im;
+    for (std::size_t channel = 0; channel < d; ++channel)
+    {
+      const auto factor = exp(channels[channel].log_abs - shift);
+      re.add(factor * cuCreal(channels[channel].phase));
+      im.add(factor * cuCimag(channels[channel].phase));
+    }
+    const auto scale = fmax(fabs(re.value()), fabs(im.value()));
+    if (!(scale > 0) || !device_math::isFiniteBinary64(re.value()) || !device_math::isFiniteBinary64(im.value()))
+    {
+      fail(status, 0);
+      rejected = true;
+    }
+    else
+    {
+      const auto ur = re.value() / scale, ui = im.value() / scale, norm = hypot(ur, ui);
+      phase = make_cuDoubleComplex(ur / norm, ui / norm);
+      log_total = log(scale) + log(norm);
+      for (std::size_t channel = 0; channel < d; ++channel)
+      {
+        log_weights[channel] = (channels[channel].log_abs - shift) - log_total;
+        ratios[channel] = QMC_PF_DIV(channels[channel].phase, phase);
+      }
+    }
+  }
+  __syncthreads();
+  if (rejected) return;
+
+  // No writes until every weighted product admits; failed replay needs original inputs.
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x)
+  {
+    cuDoubleComplex candidate;
+    const auto channel = i / (n * n);
+    if (!complex_detail::weightedProduct(log_weights[channel], ratios[channel], inverse[i], candidate))
+      atomicMin(&first_bad, static_cast<unsigned long long>(i));
+  }
+  __syncthreads();
+  if (first_bad != ~0ULL)
+  {
+    // Reproduce the scalar failed prefix INCLUDING its failing output element.
+    if (threadIdx.x == 0)
+      for (std::size_t channel = 0; channel < d; ++channel)
+        for (std::size_t i = channel * n * n; i < (channel + 1) * n * n; ++i)
+          if (!complex_detail::weightedProduct(log_weights[channel], ratios[channel], inverse[i], inverse[i]))
+          {
+            fail(status, i);
+            return;
+          }
+    return;
+  }
+
+  // Independent output arithmetic is identical; publication follows the complete store barrier.
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x)
+  {
+    const auto channel = i / (n * n);
+    complex_detail::weightedProduct(log_weights[channel], ratios[channel], inverse[i], inverse[i]);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+  {
+    amplitude->phase = phase;
+    amplitude->log_abs = shift + log_total + cusp[0];
+    if (!device_math::isFiniteBinary64(amplitude->log_abs)) fail(status, 0);
+  }
+}
+
 /// Reuse one realM scratch for four spin/head affine seeds, then the envelope seed.
 __global__ void headSeed(std::size_t d, std::size_t n, std::size_t spin_up,
     const cuDoubleComplex* inverse, const double* envelope, const double* real, const double* imag,
@@ -144,6 +253,17 @@ Error launchComplexScoreWeightedInverses(Stream stream, std::size_t d, std::size
     ComplexValueResult* amplitude, std::uint64_t* status)
 {
   weightedInverses<<<1, 1, 0, stream>>>(d, n, channels, inverse, cusp, amplitude, status);
+  return launched();
+}
+
+/// One existing launch and fixed shared scratch, with the general scalar route preserved.
+Error launchComplexScoreWeightedInversesCooperative(Stream stream, std::size_t d, std::size_t n,
+    const ComplexValueChannel* channels, cuDoubleComplex* inverse, const double* cusp,
+    ComplexValueResult* amplitude, std::uint64_t* status)
+{
+  if (n < 64 || n > 300 || d == 0 || d > 16)
+    return launchComplexScoreWeightedInverses(stream, d, n, channels, inverse, cusp, amplitude, status);
+  weightedInversesCooperative<<<1, 128, 0, stream>>>(d, n, channels, inverse, cusp, amplitude, status);
   return launched();
 }
 

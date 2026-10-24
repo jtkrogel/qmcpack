@@ -13,6 +13,11 @@ Error launchComplexScoreWeightedInverses(Stream stream, std::size_t determinants
     const ComplexValueChannel* channels, cuDoubleComplex* inverse, const double* cusp,
     ComplexValueResult* amplitude, std::uint64_t* status);
 
+/// Optional bounded single-block route; unsupported dimensions retain the scalar entry.
+Error launchComplexScoreWeightedInversesCooperative(Stream stream, std::size_t determinants, std::size_t n,
+    const ComplexValueChannel* channels, cuDoubleComplex* inverse, const double* cusp,
+    ComplexValueResult* amplitude, std::uint64_t* status);
+
 /// Select an objective/head component and spin mask, or envelope H*Z without A/E.
 Error launchComplexScoreHeadSeed(Stream stream, std::size_t determinants, std::size_t n, std::size_t spin_up,
     const cuDoubleComplex* weighted_inverse, const double* envelope, const double* real, const double* imag,

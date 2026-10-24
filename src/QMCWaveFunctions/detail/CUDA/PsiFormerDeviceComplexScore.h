@@ -10,6 +10,18 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Capture the score-only option once; no hot-loop environment or numeric owner.
+inline bool configuredComplexScoreWeightedInversesCooperative()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_SCORE_WEIGHTED_INVERSES_COOPERATIVE");
+    if (!value || std::string_view(value) == "0") return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_SCORE_WEIGHTED_INVERSES_COOPERATIVE must be 0 or 1");
+  }();
+  return enabled;
+}
+
 /// Standalone B1 score inventory; canonical bytes are exactly realP+complexP=24P.
 struct ComplexScoreCost { ComplexValueCost forward; std::size_t device_bytes, host_bytes, canonical_bytes; };
 
@@ -115,6 +127,9 @@ public:
       throw std::length_error("Complex orbital VJP exceeds its standalone owner budget");
     return std::unique_ptr<PreparedDeviceComplexScore>(new PreparedDeviceComplexScore(std::move(image), queue, blas, cost, true));
   }
+
+  /// Report the immutable cold selection without changing execution or ownership.
+  bool usesCooperativeWeightedInverses() const noexcept { return cooperative_weighted_inverses_; }
 
   /// Reuse one tape and oneP scratch for both real objectives before publishing.
   void evaluate(const std::vector<double>& positions)
@@ -258,7 +273,11 @@ private:
   /// Allocate one paired tape and realP; only log-score mode adds complexP/inverses.
   PreparedDeviceComplexScore(std::shared_ptr<const PreparedDeviceModel> image, compute::Queue<PlatformKind::CUDA>& queue,
       AcceleratorBlasHandle& blas, ComplexScoreCost cost, bool orbital_only = false)
-      : cost_(cost), orbital_only_(orbital_only), forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true, !orbital_only)),
+      : cost_(cost), orbital_only_(orbital_only),
+        cooperative_weighted_inverses_(!orbital_only && configuredComplexScoreWeightedInversesCooperative() &&
+            image->plan().modelShape().electrons() >= 64 && image->plan().modelShape().electrons() <= 300 &&
+            image->plan().modelShape().determinants >= 1 && image->plan().modelShape().determinants <= 16),
+        forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true, !orbital_only)),
         network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
         feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension, "ComplexScore::feature_", __FILE__, __LINE__),
         ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei, "ComplexScore::ion_", __FILE__, __LINE__),
@@ -304,7 +323,9 @@ private:
     ++generation_;
     forward_->evaluate(positions);
     auto& t = *forward_->trunk_;
-    checkRuntime(launchComplexScoreWeightedInverses(t.queue_.getNative(), t.shape_.determinants, t.ne_,
+    const auto weighted_inverse = cooperative_weighted_inverses_ ? launchComplexScoreWeightedInversesCooperative :
+        launchComplexScoreWeightedInverses;
+    checkRuntime(weighted_inverse(t.queue_.getNative(), t.shape_.determinants, t.ne_,
         forward_->channels_.data(), forward_->inverse_.data(), t.cusp_jets_.data(), forward_->results_.data(),
         forward_->status_.data()), "complex score weighted inverse epoch");
     forward_->admitStatus();
@@ -407,6 +428,7 @@ private:
 
   ComplexScoreCost cost_;
   const bool orbital_only_;
+  const bool cooperative_weighted_inverses_;
   std::unique_ptr<PreparedDeviceComplexValue> forward_;
   std::unique_ptr<PreparedDeviceNetworkReverse> network_;
   DeviceBuffer<double> seed_, feature_, ion_, pair_;
