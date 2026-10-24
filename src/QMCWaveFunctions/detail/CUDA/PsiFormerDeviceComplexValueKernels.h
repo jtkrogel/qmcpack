@@ -45,10 +45,14 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
+/// Record the earliest canonical same-spin zero/invalid pair without changing status/results.
+Error launchComplexValuePairCheck(Stream stream, std::size_t batch, std::size_t electrons,
+    std::size_t spin_up, periodic_geometry::Cell cell, const double* positions, std::uint64_t* events);
+
 /// Compensate both Cartesian components at one log shift; exact cancellation is a valid node.
 Error launchComplexValueReduce(Stream stream, std::size_t batch, std::size_t determinants,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
     const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status,
-    std::size_t cusp_stride = 1);
+    std::size_t cusp_stride = 1, const std::uint64_t* pair_events = nullptr);
 } // namespace qmcplusplus::psiformer::device
 #endif

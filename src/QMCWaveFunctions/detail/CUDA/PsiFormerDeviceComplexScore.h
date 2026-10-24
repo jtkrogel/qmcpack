@@ -16,7 +16,7 @@ struct ComplexScoreCost { ComplexValueCost forward; std::size_t device_bytes, ho
 /// Count the head-free retained VALUE profile, one network lane and one complexP.
 inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& plan)
 {
-  auto forward = estimateComplexValueCost(plan, 1);
+  auto forward = estimateComplexValueCost(plan, 1, false);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex score extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex score bytes overflow"); };
   const auto& s = plan.modelShape();

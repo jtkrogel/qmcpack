@@ -5,12 +5,188 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_VALUE_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_VALUE_VALIDATION_H
 #include "PsiFormerDeviceComplexValue.h"
+#include "PsiFormerDeviceComplexScore.h"
+#include "PsiFormerDeviceTargetCostValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexValueExecutor.h"
 #include <cstring>
+
+/// Exercise the actual eligible owner, exact admission, successor and retained-role inventory.
+void validateComplexValuePairOwner()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  const auto descriptors = makeTargetCostPlan(64, true, true);
+  const auto& environment = descriptors.environment();
+  const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
+      PSIFORMER_COMPLEX_PERIODIC_V1, environment);
+  const PsiFormerExecutionPlan plan(descriptors.modelShape(), initialized.layouts, environment);
+  std::vector<double> nuclei(3 * plan.modelShape().nuclei), positions(2 * 3 * 64);
+  for (std::size_t i = 0; i < nuclei.size(); ++i) nuclei[i] = 0.23 + 0.071 * i;
+  for (std::size_t i = 0; i < positions.size(); ++i)
+    positions[i] = 2.0 + 1.7 * std::sin(0.37 * (i + 1));
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  AcceleratorBlasHandle blas(queue);
+  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
+  const auto cost = estimateComplexValueCost(plan, 2);
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "pair owner device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "pair owner device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto before = metrics.snapshot();
+  bool denied = false;
+  try { (void)PreparedDeviceComplexValue::prepare(image, 2, queue, blas, cost.device_bytes - 1); }
+  catch (const std::length_error&) { denied = true; }
+  if (!denied || metrics.snapshot().allocation_calls != before.allocation_calls)
+    throw std::runtime_error("Eligible pair owner cost-minus-one allocated storage");
+  auto owner = PreparedDeviceComplexValue::prepare(image, 2, queue, blas, cost.device_bytes);
+  if (metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
+    throw std::runtime_error("Eligible pair owner differs from exact device cost");
+  const auto warm = metrics.snapshot();
+  std::vector<ComplexValueResult> results(2);
+  for (std::size_t live : {2u, 1u, 2u})
+  {
+    owner->evaluate(std::vector<double>(positions.begin(), positions.begin() + 3 * 64 * live));
+    results.resize(live);
+    owner->download(owner->resultView(), results);
+  }
+  if (warm.allocation_calls != metrics.snapshot().allocation_calls || warm.free_calls != metrics.snapshot().free_calls)
+    throw std::runtime_error("Eligible pair owner warmed evaluation allocated device storage");
+  const auto stale = owner->resultView();
+  auto successor = image->makeUpdatedImage(initialized.values, 1);
+  const auto rebind = metrics.snapshot();
+  owner->rebindModel(successor);
+  if (rebind.allocation_calls != metrics.snapshot().allocation_calls)
+    throw std::runtime_error("Eligible pair owner successor allocated device storage");
+  bool revoked = false;
+  try { owner->download(stale, results); }
+  catch (const std::invalid_argument&) { revoked = true; }
+  if (!revoked) throw std::runtime_error("Eligible pair owner retained an old-image result");
+  owner->evaluate(positions);
+  // The retained score constructor checks its actual full inventory; no pair buffer is charged or owned.
+  const auto score_cost = estimateComplexScoreCost(plan);
+  const auto score_before = metrics.snapshot();
+  auto score = PreparedDeviceComplexScore::prepare(successor, queue, blas, score_cost.device_bytes);
+  if (score_cost.forward.pair_event_bytes || metrics.snapshot().live_bytes - score_before.live_bytes != score_cost.device_bytes)
+    throw std::runtime_error("Eligible retained score inherited ordinary pair ownership");
+  std::cout << "PASS eligible complex VALUE pair owner: Ne=64 capacity=2 event_device_owner_bytes="
+            << cost.pair_event_bytes << " exact_cost=1 cost_minus_one_denied=1 warm_allocations=0 rebind=1 retained_score_excluded=1\n";
+}
+
+/// Compare complete old/new reduction bits and independently enumerate event priority.
+void validateComplexValuePairEvents()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  const auto cell = periodic_geometry::makeCell({{{8., 0., 0.}, {0., 10., 0.}, {0., 0., 12.}}}, {true, true, true});
+  std::size_t comparisons = 0;
+  for (std::size_t n : {63u, 64u, 65u, 100u, 200u})
+  {
+    const auto plan = makeTargetCostPlan(n, true, true);
+    const auto old_cost = estimateComplexValueCost(plan, 3, false);
+    const auto cost = estimateComplexValueCost(plan, 3);
+    const auto bytes = configuredComplexValuePairCheck() && n >= 64 ? 3 * sizeof(std::uint64_t) : 0;
+    if (old_cost.pair_event_bytes || cost.pair_event_bytes != bytes ||
+        cost.device_bytes != old_cost.device_bytes + bytes || cost.host_bytes != old_cost.host_bytes ||
+        complex_detail::baseCost(plan, 3, SpatialJetMode::FULL_VGL).pair_event_bytes)
+      throw std::runtime_error("Ordinary pair record cost leaked into retained/derivative role or wrong domain");
+  }
+  for (std::size_t n : {63u, 64u, 65u, 100u, 200u})
+  {
+    constexpr std::size_t capacity = 3, determinants = 2;
+    const auto spin = n / 2;
+    DeviceBuffer<double> positions(3 * capacity * n), cusp(capacity);
+    DeviceBuffer<ComplexValueChannel> channels(capacity * determinants);
+    DeviceBuffer<ComplexValueResult> old_result(capacity), new_result(capacity);
+    DeviceBuffer<std::uint64_t> events(capacity), old_status(1), new_status(1);
+    const auto before = deviceMemoryMetrics(positions.deviceOrdinal()).snapshot();
+    for (std::size_t live : {3u, 1u, 2u})
+      for (std::size_t variant = 0; variant != 12; ++variant)
+      {
+        std::vector<double> r(3 * capacity * n), c(capacity, 0.125);
+        std::vector<ComplexValueChannel> ch(capacity * determinants, {make_cuDoubleComplex(1, 0), 0, 0});
+        std::vector<std::uint64_t> expected(capacity, UINT64_MAX), actual(capacity, UINT64_MAX);
+        for (std::size_t b = 0; b < capacity; ++b)
+        {
+          auto* p = r.data() + 3 * b * n;
+          for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t d = 0; d < 3; ++d)
+              p[3 * i + d] = 0.1 * b + (0.011 + 0.006 * d) * (i + 1);
+          if (variant == 1 || variant == 2 || variant == 4 || variant == 8 || variant == 9)
+            std::copy_n(p, 3, p + 3);
+          if (variant == 2)
+          {
+            p[0] = p[3] = 0;
+            p[3] += 8;
+          }
+          if (variant == 3) std::copy_n(p, 3, p + 3 * spin);
+          if (variant == 4 || variant == 6 || variant == 7 || variant == 11)
+            p[3 * (n - 1)] = std::numeric_limits<double>::quiet_NaN();
+          if (variant == 5)
+          {
+            p[0] = std::numeric_limits<double>::quiet_NaN();
+            std::copy_n(p + 3 * (n - 2), 3, p + 3 * (n - 1));
+          }
+          if (variant == 6)
+            ch[2 * b].status = ch[2 * b + 1].status = 1;
+          if (variant == 7) ch[2 * b + 1].phase = make_cuDoubleComplex(-1, 0);
+          if (variant == 8) ch[2 * b].phase = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0);
+          if (variant == 9 || variant == 10) c[b] = std::numeric_limits<double>::quiet_NaN();
+          for (std::size_t i = 0; i < n && expected[b] == UINT64_MAX; ++i)
+            for (std::size_t j = i + 1; j < n; ++j)
+              if ((i < spin) == (j < spin))
+              {
+                periodic_geometry::Pair pair;
+                if (!periodic_geometry::evaluatePair(cell, p + 3 * i, p + 3 * j, pair))
+                { expected[b] = 2 * (i * n + j) + 1; break; }
+                if (pair.radius == 0)
+                { expected[b] = 2 * (i * n + j); break; }
+              }
+        }
+        positions.upload(r.data(), r.size()); cusp.upload(c.data(), c.size()); channels.upload(ch.data(), ch.size());
+        if (((variant == 1 || variant == 2 || variant == 4 || variant == 8 || variant == 9) && expected[0] != 2) ||
+            (variant == 3 && expected[0] != UINT64_MAX) || (variant == 5 && expected[0] != 3))
+          throw std::runtime_error("Pair-event fixture lost exact periodic node or event-order distinction");
+        const std::uint64_t clear = UINT64_MAX;
+        old_status.upload(&clear, 1); new_status.upload(&clear, 1); events.upload(actual.data(), actual.size());
+        checkRuntime(launchComplexValuePairCheck(queue.getNative(), live, n, spin, cell, positions.data(), events.data()),
+                     "pair-event validation precheck");
+        queue.sync();
+        events.download(actual.data(), capacity);
+        std::uint64_t old_failure, new_failure;
+        new_status.download(&new_failure, 1);
+        if (new_failure != clear) throw std::runtime_error("Pair precheck changed numerical status early");
+        for (std::size_t b = 0; b < capacity; ++b)
+          if (actual[b] != (b < live ? expected[b] : clear))
+            throw std::runtime_error("Pair precheck ordinal/type or live tail differs from independent scalar scan");
+        checkRuntime(launchComplexValueReduce(queue.getNative(), live, determinants, n, spin, cell, positions.data(),
+            channels.data(), cusp.data(), old_result.data(), old_status.data()), "old pair reduction");
+        checkRuntime(launchComplexValueReduce(queue.getNative(), live, determinants, n, spin, cell, positions.data(),
+            channels.data(), cusp.data(), new_result.data(), new_status.data(), 1, events.data()), "new pair reduction");
+        queue.sync();
+        std::vector<ComplexValueResult> a(live), b(live);
+        old_result.download(a.data(), live); new_result.download(b.data(), live);
+        old_status.download(&old_failure, 1); new_status.download(&new_failure, 1);
+        if (old_failure != new_failure || std::memcmp(a.data(), b.data(), live * sizeof(ComplexValueResult)))
+          throw std::runtime_error("Pair precheck changed complete reduction bits or first failure");
+        ++comparisons;
+      }
+    const auto after = deviceMemoryMetrics(positions.deviceOrdinal()).snapshot();
+    if (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls)
+      throw std::runtime_error("Pair precheck warmed evaluation allocated device storage");
+  }
+  std::cout << "PASS complex VALUE pair events: comparisons=" << comparisons
+            << " complete_result_status_bits=exact independent_event_scan=exact warm_device_allocations=0\n";
+}
 
 /// Numerical-only complete VALUE gate; fixture builders are the periodic validator's.
 void validateComplexValue()
 {
+  validateComplexValuePairOwner();
+  validateComplexValuePairEvents();
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
   ExecutionEnvironment environment;

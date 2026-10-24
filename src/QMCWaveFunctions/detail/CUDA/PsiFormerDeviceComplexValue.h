@@ -14,6 +14,7 @@ namespace qmcplusplus::psiformer::device
 struct ComplexValueCost
 {
   std::size_t trunk_bytes, device_bytes, host_bytes, matrices;
+  std::size_t pair_event_bytes = 0;
 };
 
 namespace complex_detail
@@ -53,10 +54,37 @@ inline ComplexValueCost baseCost(const PsiFormerExecutionPlan& plan, std::size_t
 }
 } // namespace complex_detail
 
-/// Preserve the qualified VALUE estimate and allocation inventory exactly.
-inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+/// Capture the ordinary VALUE option once; retained/derivative roles never parse it.
+inline bool configuredComplexValuePairCheck()
 {
-  return complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_VALUE_COOPERATIVE_PAIR_CHECK");
+    if (!value || std::string_view(value) == "0") return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_VALUE_COOPERATIVE_PAIR_CHECK must be 0 or 1");
+  }();
+  return enabled;
+}
+
+/// Count an ordinary VALUE owner, including its admitted optional pair records.
+inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
+                                               bool allow_pair_check = true)
+{
+  auto cost = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
+  const auto& e = plan.environment();
+  const auto n = plan.modelShape().electrons();
+  if (allow_pair_check && configuredComplexValuePairCheck() && n >= 64 && !e.periodic_profile &&
+      e.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
+  {
+    const auto pairs = spatial_detail::checkedProduct(n, n, "Complex pair event extent overflow");
+    if (pairs > std::numeric_limits<std::uint64_t>::max() / 2)
+      throw std::overflow_error("Complex pair event encoding exceeds uint64 admission");
+    cost.pair_event_bytes = checkedDeviceBytes<std::uint64_t>(batch);
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, cost.pair_event_bytes,
+                                                  "Complex pair event bytes overflow");
+  }
+  return cost;
 }
 
 /** Complete numerical-only complex VALUE over ONE real trunk and canonical image.
@@ -93,6 +121,10 @@ public:
     const auto cost = estimateComplexValueCost(image->plan(), capacity);
     if (cost.device_bytes > budget)
       throw std::length_error("Numerical complex VALUE exceeds its standalone owner budget");
+    if (cost.pair_event_bytes)
+      std::clog << "  Complex VALUE pair-check preparation: selected=cooperative Ne="
+                << image->plan().modelShape().electrons() << " capacity=" << capacity
+                << " event_device_owner_bytes=" << cost.pair_event_bytes << "; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexValue>(new PreparedDeviceComplexValue(std::move(image), capacity, queue, blas, cost));
   }
 
@@ -224,9 +256,12 @@ private:
     checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
         matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex VALUE factorization");
     admitStatus();
+    if (pair_events_.capacity())
+      checkRuntime(launchComplexValuePairCheck(t.queue_.getNative(), t.batch_, t.ne_, t.shape_.spin_up_electrons,
+          *t.model_->periodicCell(), t.positions_.data(), pair_events_.data()), "complex VALUE pair check");
     checkRuntime(launchComplexValueReduce(t.queue_.getNative(), t.batch_, t.shape_.determinants,
         t.ne_, t.shape_.spin_up_electrons, *t.model_->periodicCell(), t.positions_.data(),
-        channels_.data(), t.cusp_jets_.data(), results_.data(), status_.data()), "complex VALUE mixture");
+        channels_.data(), t.cusp_jets_.data(), results_.data(), status_.data(), 1, pair_events_.data()), "complex VALUE mixture");
     admitStatus();
     t.value_tape_valid_ = !t.value_tape_.empty();
     valid_ = true;
@@ -315,12 +350,17 @@ private:
         status_(1, "ComplexValue::status_", __FILE__, __LINE__),
         inverse_(retain_score && retain_inverse ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
         solve_(retain_score && retain_inverse ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
-        permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__)
+        permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__),
+        pair_events_(cost.pair_event_bytes / sizeof(std::uint64_t), "ComplexValue::pair_events_", __FILE__, __LINE__)
   {
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +
         channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8 +
-        (inverse_.capacity() + solve_.capacity()) * sizeof(cuDoubleComplex) + permutation_.capacity() * sizeof(std::size_t);
+        (inverse_.capacity() + solve_.capacity()) * sizeof(cuDoubleComplex) + permutation_.capacity() * sizeof(std::size_t) +
+        pair_events_.capacity() * sizeof(std::uint64_t);
+    if ((cost.pair_event_bytes && (retain_score || pair_events_.capacity() != capacity)) ||
+        pair_events_.capacity() * sizeof(std::uint64_t) != cost.pair_event_bytes)
+      throw std::logic_error("Complex VALUE pair records differ from admitted ordinary owner");
     if (actual != cost.device_bytes || trunk_->deviceWorkspaceBytes() != cost.trunk_bytes ||
         trunk_->hostWorkspaceBytes() != cost.host_bytes)
       throw std::logic_error("Complex VALUE owned storage differs from exact preflight");
@@ -368,6 +408,7 @@ private:
   DeviceBuffer<std::uint64_t> status_;
   DeviceBuffer<cuDoubleComplex> inverse_, solve_;
   DeviceBuffer<std::size_t> permutation_;
+  DeviceBuffer<std::uint64_t> pair_events_;
   std::size_t generation_ = 0;
   bool valid_ = false;
 };

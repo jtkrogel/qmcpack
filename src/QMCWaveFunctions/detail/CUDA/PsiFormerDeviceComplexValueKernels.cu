@@ -345,10 +345,39 @@ bool cooperativeFactorEnabled()
   return enabled;
 }
 
+/// Integer-only earliest-event reduction preserves the scalar i,j scan order.
+__global__ void pairCheck(std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell,
+    const double* positions, std::uint64_t* events)
+{
+  __shared__ unsigned long long earliest;
+  if (!threadIdx.x)
+    earliest = UINT64_MAX;
+  __syncthreads();
+  const auto* r = positions + 3 * std::size_t(blockIdx.x) * electrons;
+  std::uint64_t local = UINT64_MAX;
+  for (std::size_t p = threadIdx.x; p < electrons * electrons; p += blockDim.x)
+  {
+    const auto i = p / electrons, j = p % electrons;
+    if (i >= j || (i < spin_up) != (j < spin_up))
+      continue;
+    periodic_geometry::Pair pair;
+    if (!periodic_geometry::evaluatePair(cell, r + 3 * i, r + 3 * j, pair))
+      local = local < 2 * p + 1 ? local : 2 * p + 1;
+    else if (pair.radius == 0)
+      local = local < 2 * p ? local : 2 * p;
+  }
+  // Each lane contributes only its earliest integer event, never a numerical status.
+  atomicMin(&earliest, static_cast<unsigned long long>(local));
+  __syncthreads();
+  if (!threadIdx.x)
+    events[blockIdx.x] = earliest;
+}
+
 /// Mix channels at a common shift; node outputs never require logarithmic derivatives.
 __global__ void reduce(std::size_t batch, std::size_t determinants, const ComplexValueChannel* channels,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
-    const double* cusp, ComplexValueResult* result, std::uint64_t* status, std::size_t cusp_stride)
+    const double* cusp, ComplexValueResult* result, std::uint64_t* status, std::size_t cusp_stride,
+    const std::uint64_t* pair_events)
 {
   const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration >= batch)
@@ -382,21 +411,35 @@ __global__ void reduce(std::size_t batch, std::size_t determinants, const Comple
   }
   if (magnitude == 0)
     return;
-  // Preserve the CPU's exact same-spin physical node, including periodic images.
-  for (std::size_t i = 0; i < electrons; ++i)
-    for (std::size_t j = i + 1; j < electrons; ++j)
-      if ((i < spin_up) == (j < spin_up))
-      {
-        periodic_geometry::Pair pair;
-        if (!periodic_geometry::evaluatePair(cell, positions + 3 * (configuration * electrons + i),
-              positions + 3 * (configuration * electrons + j), pair))
+  // Consume speculative pair records only at the original observable checkpoint.
+  if (pair_events)
+  {
+    const auto event = pair_events[configuration];
+    if (event != UINT64_MAX)
+    {
+      if (event & 1)
+        fail(status, configuration);
+      return;
+    }
+  }
+  else
+  {
+    // Preserve the CPU's exact same-spin physical node, including periodic images.
+    for (std::size_t i = 0; i < electrons; ++i)
+      for (std::size_t j = i + 1; j < electrons; ++j)
+        if ((i < spin_up) == (j < spin_up))
         {
-          fail(status, configuration);
-          return;
+          periodic_geometry::Pair pair;
+          if (!periodic_geometry::evaluatePair(cell, positions + 3 * (configuration * electrons + i),
+                positions + 3 * (configuration * electrons + j), pair))
+          {
+            fail(status, configuration);
+            return;
+          }
+          if (pair.radius == 0)
+            return;
         }
-        if (pair.radius == 0)
-          return;
-      }
+  }
   const double log_abs = shift + log(magnitude) + cusp[configuration * cusp_stride];
   if (!device_math::isFiniteBinary64(log_abs))
   {
@@ -465,16 +508,30 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
   return launched();
 }
 
+/// Preflight every launch/index bound without publishing numerical failure early.
+Error launchComplexValuePairCheck(Stream stream, std::size_t batch, std::size_t electrons,
+    std::size_t spin_up, periodic_geometry::Cell cell, const double* positions, std::uint64_t* events)
+{
+  if (!batch || batch > std::size_t(std::numeric_limits<int>::max()) || !electrons ||
+      spin_up > electrons || !positions || !events)
+    throw std::invalid_argument("Complex VALUE pair-check input is invalid");
+  if (electrons > (std::numeric_limits<std::uint64_t>::max() / 2) / electrons ||
+      electrons > std::numeric_limits<std::size_t>::max() / 3 / batch)
+    throw std::overflow_error("Complex VALUE pair-check index exceeds admission");
+  pairCheck<<<static_cast<unsigned>(batch), 128, 0, stream>>>(electrons, spin_up, cell, positions, events);
+  return launched();
+}
+
 /// Publish only the core amplitude and numerical channel diagnostics.
 Error launchComplexValueReduce(Stream stream, std::size_t batch, std::size_t determinants,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
     const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status,
-    std::size_t cusp_stride)
+    std::size_t cusp_stride, const std::uint64_t* pair_events)
 {
   if (!determinants || !electrons || spin_up > electrons || !positions || !metadata || !cusp || !result || !status || !cusp_stride)
     throw std::invalid_argument("Complex VALUE reduction input is invalid");
   reduce<<<blocks(batch), 128, 0, stream>>>(batch, determinants, metadata,
-      electrons, spin_up, cell, positions, cusp, result, status, cusp_stride);
+      electrons, spin_up, cell, positions, cusp, result, status, cusp_stride, pair_events);
   return launched();
 }
 } // namespace qmcplusplus::psiformer::device
