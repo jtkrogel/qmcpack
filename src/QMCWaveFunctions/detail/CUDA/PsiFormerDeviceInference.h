@@ -63,6 +63,19 @@ inline bool configuredCuspStateReuse()
   throw std::invalid_argument("PSIFORMER_GPU_CUSP_STATE_REUSE requires 0 or 1");
 }
 
+/// Only ordinary paired compact-target prefixes may share the canonical cusp state.
+inline bool supportsHeadFreeTargetCuspReuse(const PsiFormerExecutionPlan& plan, std::size_t targets)
+{
+  const auto& e = plan.environment();
+  return targets && targets < plan.modelShape().electrons() &&
+      e.boundary == BoundaryCondition::PERIODIC && e.fixed_nuclei && !e.periodic_profile &&
+      e.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      e.periodic_axes[0] && e.periodic_axes[1] && e.periodic_axes[2] &&
+      e.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
+      e.amplitude_scalar_domain == ScalarDomain::COMPLEX &&
+      e.parameter_scalar_domain == ScalarDomain::REAL && e.compute_scalar_domain == ScalarDomain::REAL;
+}
+
 /** Explicit numerical-only target preparation; all-zero keeps the reference graph.
  * Budgets charge this graph's device storage and a deterministic scalar-work
  * proxy. Shared model images/vendor storage and total runtime need separate admission.
@@ -88,7 +101,7 @@ struct TargetVglCost
 
 /// Count the bounded batch max-K real prefix: no real head, retained tapes or responseP.
 inline TargetVglCost estimateHeadFreeTargetPrefixCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
-                                                    std::size_t batch = 1)
+                                                    std::size_t batch = 1, bool reuse_cusp_state = false)
 {
   const auto& s = plan.modelShape();
   const auto n = s.electrons(), f = s.feature_dimension;
@@ -100,9 +113,12 @@ inline TargetVglCost estimateHeadFreeTargetPrefixCost(const PsiFormerExecutionPl
   const auto raw = mul(n, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
   const auto host = mul(batch, add(mul(u, sizeof(OpenSpatialStatus)),
       mul(mul(s.attention_heads, n), sizeof(device_math::JetMathStatus))));
-  const auto bytes = add(mul(8, mul(batch, add(mul(3, n),
+  auto bytes = add(mul(8, mul(batch, add(mul(3, n),
       mul(planes, add(add(raw, mul(8, u)), add(mul(s.attention_heads, nn), 1)))))),
       add(host, add(mul(batch, sizeof(std::size_t)), sizeof(InferenceStatusWord))));
+  if (reuse_cusp_state && supportsHeadFreeTargetCuspReuse(plan, targets))
+    bytes = add(bytes, add(checkedDeviceBytes<double>(mul(batch, add(1, mul(4, n)))),
+        checkedDeviceBytes<OpenSpatialStatus>(batch)));
   const auto tiles = n / targets + (n % targets != 0);
   const auto work = mul(batch, add(mul(3, mul(s.determinants, mul(nn, nn))),
       mul(4, mul(s.determinants, mul(tiles, mul(nn, n))))));
@@ -1067,7 +1083,8 @@ private:
       if (mode_ != SpatialJetMode::FULL_VGL || retain_score_tape || retain_spatial_tape ||
           !target_preparation_.device_workspace_budget_bytes || !target_preparation_.scalar_work_budget)
         throw std::invalid_argument("Private forward target prefix requires FULL, no tapes and positive caps");
-      target_cost_ = estimateHeadFreeTargetPrefixCost(plan_, target_preparation_.max_targets, batch_capacity_);
+      target_cost_ = estimateHeadFreeTargetPrefixCost(plan_, target_preparation_.max_targets, batch_capacity_,
+          target_preparation_.reuse_cusp_state);
       if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
           target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
         throw std::length_error("Private forward target prefix exceeds byte/work caps");
@@ -1104,9 +1121,13 @@ private:
     orbitals_ = makeOpenOrbitalJetLayout(batch_, shape_.determinants, ne_, shape_.nuclei,
                                          width, shape_.spin_up_electrons, mode_);
     cusp_ = makeOpenCuspJetLayout(batch_, ne_, shape_.spin_up_electrons, mode_);
+    const bool paired_target_cusp = head_free_targets && !kinetic_trunk_only &&
+        !retain_score_tape && !retain_spatial_tape &&
+        supportsHeadFreeTargetCuspReuse(plan_, target_preparation_.max_targets);
     cusp_state_enabled_ = target_preparation_.reuse_cusp_state &&
         target_preparation_.max_targets && target_preparation_.max_targets < ne_ &&
-        mode_ == SpatialJetMode::FULL_VGL && !retained_targets_ && !real_trunk_only;
+        mode_ == SpatialJetMode::FULL_VGL && !retained_targets_ && (!real_trunk_only || paired_target_cusp);
+    paired_cusp_state_ = cusp_state_enabled_ && paired_target_cusp;
     if (cusp_state_enabled_) cusp_state_layout_ = cusp_;
     final_ = makeFinalSpatialJetLayout(batch_, ne_, mode_);
     result_layout_ = final_.output;
@@ -1307,6 +1328,7 @@ private:
   void beginCoordinateEvaluation()
   {
     cusp_state_valid_ = false;
+    cusp_state_canonical_replay_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -2004,6 +2026,7 @@ private:
   {
     endSparseEnvelopeTile(false, true);
     cusp_state_valid_ = false;
+    cusp_state_canonical_replay_ = false;
     model_ = successor;
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -2455,6 +2478,19 @@ private:
    * The same affine weight acts independently on every jet plane. No mathematical
    * coupling crosses configurations; only the BLAS row dimension is enlarged.
    */
+  /// Admit one paired complete state; failed states use the original target kernel.
+  void admitPairedCuspState()
+  {
+    if (!paired_cusp_state_ || !cusp_state_valid_)
+      throw std::logic_error("Paired cusp admission requires a complete request-local state");
+    cusp_state_valid_ = false;
+    // Existing host scratch and one stream-ordered fence per new complete cache.
+    cusp_state_status_.downloadOnStream(host_status_.data(), batch_, queue_.getNative());
+    cusp_state_canonical_replay_ = std::any_of(host_status_.begin(), host_status_.begin() + batch_,
+        [](OpenSpatialStatus status) { return status != OpenSpatialStatus::REGULAR; });
+    cusp_state_valid_ = true;
+  }
+
   /// Evaluate the same physical cusp geometry used by feature and orbital layers.
   void evaluateCusp()
   {
@@ -2476,6 +2512,16 @@ private:
         cusp_state_model_ = model_.get();
         cusp_state_batch_ = batch_;
         cusp_state_valid_ = true;
+        if (paired_cusp_state_)
+          admitPairedCuspState();
+      }
+      if (paired_cusp_state_ && cusp_state_canonical_replay_)
+      {
+        // Reuse the exact canonical compiled kernel, not its inlined gather fallback.
+        checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *model_->periodicCell(),
+            positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
+            cusp_jets_.data(), open_status_.data()), "paired canonical target cusp replay");
+        return;
       }
       checkRuntime(launchGatherCuspTargets(queue_.getNative(), cusp_state_layout_, cusp_,
           positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
@@ -2709,6 +2755,7 @@ private:
   OpenCuspJetLayout cusp_;
   OpenCuspJetLayout cusp_state_layout_;
   bool cusp_state_enabled_ = false, cusp_state_valid_ = false;
+  bool paired_cusp_state_ = false, cusp_state_canonical_replay_ = false;
   std::size_t cusp_state_generation_ = 0, cusp_state_batch_ = 0;
   const PreparedDeviceModel* cusp_state_model_ = nullptr;
   DeviceBuffer<double> cusp_state_;

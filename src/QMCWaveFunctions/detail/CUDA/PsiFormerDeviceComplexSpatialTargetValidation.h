@@ -19,6 +19,63 @@ namespace qmcplusplus::psiformer::device
 /// Test-only existing target phase access, not a production fault API.
 struct ComplexSpatialTargetValidationAccess
 {
+  /// A failed unrequested cached derivative must replay only the requested canonical leaf.
+  static void cuspFailedCache(PreparedDeviceComplexSpatial& cached, PreparedDeviceComplexSpatial& original,
+      const std::vector<double>& positions)
+  {
+    for (auto* owner : {&cached, &original})
+    {
+      auto& t = *owner->trunk_;
+      owner->invalidate(); t.beginCoordinateEvaluation();
+      t.setBatchCount(positions.size() / (3 * t.ne_));
+      t.positions_.upload(positions.data(), positions.size());
+      owner->prepareTarget(0, 1);
+      // Fault injection uses host copies, so join this owner's nonblocking queue first.
+      t.queue_.sync();
+    }
+    auto& t = *cached.trunk_;
+    if (!t.cusp_state_enabled_ || !t.cusp_state_valid_ || t.ne_ < 2)
+      throw std::runtime_error("Paired cusp cache fixture did not enable complete state");
+    const auto invalid = std::numeric_limits<double>::quiet_NaN();
+    const auto offset = t.cusp_state_layout_.output.uncheckedGradientOffset(0, 3 * (t.ne_ - 1), 0);
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpy(t.cusp_state_.data() + offset, &invalid, sizeof(invalid), hipMemcpyHostToDevice),
+        "unrequested cusp cache failure injection");
+#else
+    checkRuntime(cudaMemcpy(t.cusp_state_.data() + offset, &invalid, sizeof(invalid), cudaMemcpyHostToDevice),
+        "unrequested cusp cache failure injection");
+#endif
+    std::vector<OpenSpatialStatus> status(t.batch_, OpenSpatialStatus::REGULAR);
+    status[0] = OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+    t.cusp_state_status_.upload(status.data(), status.size());
+    // Model a failed cold cache before admission, not external mutation after admission.
+    t.admitPairedCuspState();
+    cached.prepareTarget(0, 1);
+    t.queue_.sync();
+    auto& reference = *original.trunk_;
+    std::vector<double> actual(t.cusp_jets_.capacity()), expected(reference.cusp_jets_.capacity());
+    t.cusp_jets_.download(actual.data(), actual.size());
+    reference.cusp_jets_.download(expected.data(), expected.size());
+    const auto& layout = t.cusp_.output;
+    const auto compare = [&](std::size_t index) {
+      if (std::memcmp(&actual[index], &expected[index], sizeof(double)))
+      {
+        std::cerr << "failed_cusp_cache index=" << index << " actual=" << std::hexfloat
+                  << actual[index] << " expected=" << expected[index] << std::defaultfloat << '\n';
+        throw std::runtime_error("Failed complete cusp cache changed requested leaf bits");
+      }
+    };
+    for (std::size_t b = 0; b < t.batch_; ++b)
+    {
+      compare(layout.uncheckedValueOffset(b, 0));
+      for (std::size_t d = 0; d < 3; ++d) compare(layout.uncheckedGradientOffset(b, d, 0));
+      compare(layout.uncheckedLaplacianOffset(b, 0, 0));
+    }
+    bool rejected = false;
+    try { (void)cached.resultView(); } catch (const std::logic_error&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("Partial cusp target was published");
+  }
+
   /// Observe two actual owner slabs using separately charged test-only decision bytes.
   static void factorDecisions(PreparedDeviceComplexSpatial& owner, const std::vector<double>& positions)
   {
@@ -274,6 +331,17 @@ void validateComplexSpatialTargetCosts()
   for (std::size_t n : {std::size_t(100), std::size_t(200), std::size_t(300)})
   {
     const auto plan = makeTargetCostPlan(n, true, true);
+    const auto plain_cusp = estimateComplexSpatialTargetCost(plan, 3, 2);
+    const auto cached_cusp = estimateComplexSpatialTargetCost(plan, 3, 2, 0, false, false, true);
+    const auto extra_cusp = checkedDeviceBytes<double>(2 * (1 + 4 * n)) + checkedDeviceBytes<OpenSpatialStatus>(2);
+    if (cached_cusp.device_bytes != plain_cusp.device_bytes + extra_cusp ||
+        cached_cusp.trunk_bytes != plain_cusp.trunk_bytes + extra_cusp ||
+        cached_cusp.host_bytes != plain_cusp.host_bytes ||
+        estimateComplexSpatialTargetCost(plan, n, 2, 0, false, false, true).device_bytes !=
+            estimateComplexSpatialTargetCost(plan, n, 2).device_bytes)
+      throw std::runtime_error("Paired compact cusp cache cost/full-target exclusion changed");
+    if (n == 200 && extra_cusp != 12818)
+      throw std::runtime_error("N200 B2 cusp cache exact owner charge changed");
     const auto full = estimateComplexSpatialCost(plan, 1);
     std::size_t previous = 0;
     for (std::size_t k : {std::size_t(1), std::size_t(3), std::size_t(32), n})
@@ -298,6 +366,141 @@ void validateComplexSpatialTargetCosts()
     throw std::runtime_error("Metadata-only complex target cost check allocated device memory");
   std::cout << "PASS complex target metadata-only costs: numeric_P_model_graph_allocations=0 runtime_claim=none\n";
 }
+
+/// Exercise exact cached state through the existing small paired target owner.
+namespace qmcplusplus::psiformer::device
+{
+inline void validateComplexTargetCuspStateOwner(std::shared_ptr<const PreparedDeviceModel> image,
+    compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
+    const std::vector<double>& positions, const std::vector<double>& parameters)
+{
+  const char* configured = std::getenv("PSIFORMER_GPU_CUSP_STATE_REUSE");
+  // Restore caller state even when selector rejection or an exact comparison fails.
+  struct RestoreCuspOption
+  {
+    bool existed;
+    std::string value;
+    ~RestoreCuspOption()
+    {
+      if (existed) ::setenv("PSIFORMER_GPU_CUSP_STATE_REUSE", value.c_str(), 1);
+      else ::unsetenv("PSIFORMER_GPU_CUSP_STATE_REUSE");
+    }
+  } restore{configured != nullptr, configured ? configured : ""};
+  if (::setenv("PSIFORMER_GPU_CUSP_STATE_REUSE", "invalid", 1))
+    throw std::runtime_error("Cusp selector setup failed");
+  bool invalid_rejected = false;
+  try { (void)configuredCuspStateReuse(); } catch (const std::invalid_argument&) { invalid_rejected = true; }
+  if (!invalid_rejected || ::setenv("PSIFORMER_GPU_CUSP_STATE_REUSE", "0", 1))
+    throw std::runtime_error("Cusp selector did not reject malformed value");
+  constexpr std::size_t capacity = 3, k = 3;
+  const auto& plan = image->plan();
+  const auto n = plan.modelShape().electrons();
+  if (n != 4 || positions.size() != capacity * 3 * n)
+    throw std::runtime_error("Paired cusp state fixture shape changed");
+  const auto plain = estimateComplexSpatialTargetCost(plan, k, capacity);
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, 0, false, false, true);
+  const auto work = estimateHeadFreeTargetPrefixCost(plan, k, capacity, true).charged_scalar_work_units;
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "paired cusp metrics");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "paired cusp metrics");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto before = metrics.snapshot();
+  bool rejected = false;
+  try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, cost.device_bytes - 1, work, 0, true}, capacity); }
+  catch (const std::length_error&) { rejected = true; }
+  if (!rejected || metrics.snapshot().allocation_calls != before.allocation_calls)
+    throw std::runtime_error("Paired cached cusp underbudget allocated");
+  auto cached = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, cost.device_bytes, work, 0, true}, capacity);
+  if (!cached->usesCuspStateReuse() || metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
+    throw std::runtime_error("Paired cusp state actual owner differs from admission");
+  auto original = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, plain.device_bytes, work, 0, false}, capacity);
+  if (::setenv("PSIFORMER_GPU_CUSP_STATE_REUSE", "1", 1))
+    throw std::runtime_error("Cusp FULL-exclusion selector setup failed");
+  auto full = PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
+      estimateComplexSpatialCost(plan, capacity).device_bytes);
+  const auto all_targets_cost = estimateComplexSpatialTargetCost(plan, n, capacity, 0, false, false, true);
+  auto all_targets = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {n, all_targets_cost.device_bytes,
+       estimateHeadFreeTargetPrefixCost(plan, n, capacity, true).charged_scalar_work_units, 0, true}, capacity);
+  if (::setenv("PSIFORMER_GPU_CUSP_STATE_REUSE", "0", 1))
+    throw std::runtime_error("Cusp frozen-selector setup failed");
+  if (original->usesCuspStateReuse() || full->usesCuspStateReuse() || all_targets->usesCuspStateReuse())
+    throw std::runtime_error("Cusp cache escaped its explicit compact-target selection");
+  const auto compare = [&](const std::vector<double>& input) {
+    const auto batch = input.size() / (3 * n);
+    std::vector<ComplexValueResult> a(batch), b(batch);
+    std::vector<cuDoubleComplex> ag(3 * batch * n), bg(ag.size()), al(batch * n), bl(al.size()), ar(al.size()), br(al.size());
+    cached->evaluate(input); cached->download(cached->resultView(), a, ag, al, ar);
+    original->evaluate(input); original->download(original->resultView(), b, bg, bl, br);
+    for (std::size_t i = 0; i < batch; ++i)
+      if (std::memcmp(&a[i].log_abs, &b[i].log_abs, sizeof(double)) ||
+          std::memcmp(&a[i].phase, &b[i].phase, sizeof(cuDoubleComplex)) ||
+          std::memcmp(&a[i].cancellation_ratio, &b[i].cancellation_ratio, sizeof(double)) ||
+          a[i].status != b[i].status || a[i].singular_channels != b[i].singular_channels)
+        throw std::runtime_error("Paired cusp cache amplitude bits changed");
+    for (const auto pair : {std::make_pair(&ag, &bg), std::make_pair(&al, &bl), std::make_pair(&ar, &br)})
+      if (std::memcmp(pair.first->data(), pair.second->data(), pair.first->size() * sizeof(cuDoubleComplex)))
+        throw std::runtime_error("Paired cusp cache complete G/L/ratio bits changed");
+  };
+  compare(positions);
+  const auto old = cached->resultView();
+  const auto warm = metrics.snapshot();
+  for (const std::size_t live : {1, 2, 3})
+    compare(std::vector<double>(positions.begin(), positions.begin() + 3 * n * live));
+  auto moved = positions; moved[0] += .013; compare(moved);
+  if (metrics.snapshot().allocation_calls != warm.allocation_calls || metrics.snapshot().free_calls != warm.free_calls)
+    throw std::runtime_error("Paired cusp state warm evaluation allocated");
+  rejected = false;
+  try { std::vector<ComplexValueResult> a(3); std::vector<cuDoubleComplex> g(36), l(12), r(12);
+    cached->download(old, a, g, l, r); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected) throw std::runtime_error("Paired cusp cache admitted stale request view");
+  auto updated = parameters; updated[0] += .01;
+  auto successor = image->makeUpdatedImage(updated, image->version() + 1);
+  cached->rebindModel(successor); original->rebindModel(successor);
+  if (!cached->usesCuspStateReuse() || original->usesCuspStateReuse())
+    throw std::runtime_error("Cusp successor reread mutable selector instead of frozen preparation");
+  compare(positions);
+  ComplexSpatialTargetValidationAccess::cuspFailedCache(*cached, *original, positions);
+  compare(positions);
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                          std::numeric_limits<double>::max(), 0.0})
+  {
+    auto input = positions;
+    if (bad == 0.0) std::copy_n(input.begin(), 3, input.begin() + 3);
+    else if (bad == std::numeric_limits<double>::max())
+    {
+      input[0] = bad;
+      input[3] = -bad; // Finite coordinates, but canonical pair subtraction overflows.
+    }
+    else input[0] = bad;
+    for (auto* owner : {cached.get(), original.get()})
+    {
+      rejected = false;
+      try { owner->evaluate(input); } catch (const std::runtime_error&) { rejected = true; }
+      if (!rejected) throw std::runtime_error("Paired cusp state admitted failed request");
+      rejected = false;
+      try { (void)owner->resultView(); } catch (const std::logic_error&) { rejected = true; }
+      if (!rejected) throw std::runtime_error("Paired cusp state published failed request");
+    }
+    compare(positions);
+  }
+  ComplexSpatialTargetValidationAccess::failLate(*cached, positions);
+  rejected = false;
+  try { (void)cached->resultView(); } catch (const std::logic_error&) { rejected = true; }
+  if (!rejected) throw std::runtime_error("Paired cached cusp published late failure");
+  compare(positions);
+  std::cout << "PASS paired compact cusp state B3/live1/2/3 K3-tail exact_bits=1 owner_bytes=" << cost.device_bytes
+            << " extra_bytes=" << cost.device_bytes - plain.device_bytes
+            << " warm_allocations=0 rebind=1 failed_unrequested_cache_replay=1 stale=1 no_partial_publication=1\n";
+}
+} // namespace qmcplusplus::psiformer::device
 
 /// Compare ordered trace schedules, including a target-slab tail and failed partial terms.
 void validateComplexSpatialTraceSplit()
@@ -655,5 +858,6 @@ void validateComplexSpatialTargets(std::size_t concurrent_targets = 0)
   std::cout << "PASS complex batched target B3 live3/1/2/3 K3-tail CPU/FULL max_error=" << max_batched
             << " trace_targets=" << concurrent_targets
             << " warm_allocations=0 late_nonzero_walker_failure=1 recovery=1 rebind=1\n";
+  if (!concurrent_targets) validateComplexTargetCuspStateOwner(image, queue, blas, packed, parameters);
 }
 #endif

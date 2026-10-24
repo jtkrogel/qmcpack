@@ -323,10 +323,11 @@ struct PsiFormerComplexWF::Impl
           periodic_value_tiling);
       const auto spatial = preparation.max_targets
           ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets,
-                head_determinant_batch, target_factor_reuse)
+                head_determinant_batch, target_factor_reuse, preparation.reuse_cusp_state)
           : estimateComplexSpatialCost(plan, capacity, trace_targets, head_determinant_batch);
       const auto work = preparation.max_targets
-          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity).charged_scalar_work_units : 0;
+          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity,
+                preparation.reuse_cusp_state).charged_scalar_work_units : 0;
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
                                      work > preparation.scalar_work_budget))
         throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
@@ -488,6 +489,7 @@ struct PsiFormerComplexWF::Impl
                 << ", trace_storage_fingerprint=" << full->traceStorageFingerprint()
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
+                << ", cusp_state_reuse=" << (full ? full->usesCuspStateReuse() : false)
                 << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
     }
 

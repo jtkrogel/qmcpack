@@ -89,10 +89,11 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
 /// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
 inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
                                                          std::size_t batch = 1, std::size_t concurrent_targets = 0,
-                                                         bool batched_projection = false, bool factor_reuse = false)
+                                                         bool batched_projection = false, bool factor_reuse = false,
+                                                         bool reuse_cusp_state = false)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
-  const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch);
+  const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch, reuse_cusp_state);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex target extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex target bytes overflow"); };
   const auto& s = plan.modelShape();
@@ -180,8 +181,9 @@ public:
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
     const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity,
-        concurrent_targets, batched_projection, factor_reuse);
-    const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity);
+        concurrent_targets, batched_projection, factor_reuse, preparation.reuse_cusp_state);
+    const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity,
+        preparation.reuse_cusp_state);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Complex target VGL exceeds its per-owner byte/work caps");
     if (cost.projection_pointer_bytes)
@@ -308,6 +310,9 @@ public:
 
   /// Expose immutable admission rather than mutable process controls.
   std::size_t concurrentTraceTargets() const noexcept { return concurrent_targets_; }
+
+  /// Expose the frozen effective owner choice, not the mutable process selector.
+  bool usesCuspStateReuse() const noexcept { return trunk_->cusp_state_enabled_; }
 
   /// Track scratch identity/capacity across warm evaluation and same-shape successors.
   std::size_t traceStorageFingerprint() const noexcept
