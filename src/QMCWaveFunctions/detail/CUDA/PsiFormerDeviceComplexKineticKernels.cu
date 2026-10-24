@@ -8,6 +8,7 @@
 #include <limits>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 // Keep vendor arithmetic selection local; all products below are ordinary complex.
 #ifdef QMC_CUDA2HIP
@@ -413,6 +414,127 @@ __device__ bool accumulate(double& destination, double term)
 }
 
 /// True B*E reverse: preserve all-row VALUE terms and pi responses at zero E.
+template<int Owner = 0>
+__device__ void headReverseBody(ComplexKineticHeadLayout l, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* p, const double* features,
+    const double* envelope, const double* real, const double* imag, const C* roots,
+    std::size_t selected, double* feature_seed, double* response, std::uint64_t* status,
+    std::size_t owned = 0)
+{
+  const auto& layout = l.real.forward;
+  const auto n = layout.features.electron_count, m = layout.orbitals.element_count;
+  const auto u = layout.features.element_count, k = layout.orbitals.laplacian_lanes;
+  // Owner 1: spin/f/d/orbital; owner 2: plane/row/f; owner 3: spin/d/orbital/atom.
+  const auto width = layout.feature_width, determinants = layout.determinant_count;
+  const auto orbital_owner = Owner == 3 ? owned / layout.nucleus_count % n : owned % n;
+  const auto determinant_owner = Owner == 3 ? owned / layout.nucleus_count / n % determinants : owned / n % determinants;
+  const auto feature_owner = Owner == 1 ? owned / n / determinants % width : owned % width;
+  const auto spin_owner = Owner == 3 ? owned / layout.nucleus_count / n / determinants : owned / n / determinants / width;
+  const auto row_owner = owned / width % n, plane_owner = owned / width / n;
+  const auto row_begin = Owner == 2 ? row_owner :
+      ((Owner == 1 || Owner == 3) && spin_owner ? layout.spin_up_count : 0);
+  const auto row_end = Owner == 2 ? row_owner + 1 :
+      ((Owner == 1 || Owner == 3) && !spin_owner ? layout.spin_up_count : n);
+  for (std::size_t row = row_begin; row < row_end; ++row)
+  {
+    if constexpr (Owner == 1 || Owner == 3)
+      if ((row < layout.spin_up_count ? 0u : 1u) != spin_owner) continue;
+    if constexpr (Owner == 2)
+      if (row != row_owner) continue;
+    for (std::size_t d = (Owner == 1 || Owner == 3) ? determinant_owner : 0;
+         d < ((Owner == 1 || Owner == 3) ? determinant_owner + 1 : layout.determinant_count); ++d)
+      for (std::size_t orbital = (Owner == 1 || Owner == 3) ? orbital_owner : 0;
+           orbital < ((Owner == 1 || Owner == 3) ? orbital_owner + 1 : n); ++orbital)
+      {
+        if constexpr (Owner == 1 || Owner == 3)
+          if (d != determinant_owner || orbital != orbital_owner) continue;
+        const bool up = row < layout.spin_up_count;
+        const auto wr = up ? l.real.backflow_up_response_offset : l.real.backflow_down_response_offset;
+        const auto wi = up ? l.imaginary_up : l.imaginary_down;
+        const auto pi = up ? l.real.envelope_pi_up_response_offset : l.real.envelope_pi_down_response_offset;
+        const auto zeta = up ? l.real.envelope_zeta_up_response_offset : l.real.envelope_zeta_down_response_offset;
+        const auto element = open_orbital::outputElement(layout, d, row, orbital);
+        Sum qb0, qe0;
+        for (std::size_t plane = 0; plane < layout.orbitals.plane_count; ++plane)
+        {
+          const auto offset = plane * m + element;
+          const auto b = make_cuDoubleComplex(real[offset], imag[offset]);
+          const auto qb = scale(roots[offset], envelope[offset]), qe = QMC_PF_MUL(roots[offset], b);
+          if (!finite(qb) || !finite(qe)) { fail(status); return; }
+          qb0.push(qb); qe0.push(qe);
+        }
+        // Affine head and feature pullback, including cross terms of the jet product.
+        if constexpr (Owner != 3)
+        for (std::size_t plane = Owner == 2 ? plane_owner : 0;
+             plane < (Owner == 2 ? plane_owner + 1 : layout.orbitals.plane_count); ++plane)
+        {
+          auto qb = plane ? scale(roots[plane * m + element], envelope[element]) : qb0.value();
+          if (plane && plane <= 3 * k)
+            qb = add(qb, scale(roots[(1 + 3 * k + (plane - 1) / 3) * m + element], 2 * envelope[plane * m + element]));
+          if (!finite(qb)) { fail(status); return; }
+          for (std::size_t f = (Owner == 1 || Owner == 2) ? feature_owner : 0;
+               f < ((Owner == 1 || Owner == 2) ? feature_owner + 1 : layout.feature_width); ++f)
+          {
+            if constexpr (Owner == 1 || Owner == 2)
+              if (f != feature_owner) continue;
+            const auto index = open_orbital::weightOffset(layout, f, d, orbital);
+            const auto input = plane * u + row * layout.feature_row_stride + f;
+            const auto weight = make_cuDoubleComplex(p[wr + index], p[wi + index]);
+            const auto head = scale(qb, features[input]), seed = QMC_PF_MUL(qb, weight);
+            if (!finite(head) || !finite(seed)) { fail(status); return; }
+            if constexpr (Owner != 2)
+              if (!accumulate(response[wr + index], component(head, selected)) ||
+                  !accumulate(response[wi + index], selected ? cuCreal(head) : -cuCimag(head)))
+              { fail(status); return; }
+            if constexpr (Owner != 1)
+              if (!accumulate(feature_seed[input], component(seed, selected))) { fail(status); return; }
+          }
+        }
+        // Envelope parameter jets use the established torus radial/subgradient convention.
+        const bool targeted = layout.orbitals.containsTargetElectron(row);
+        const auto local = targeted ? row - layout.orbitals.target_electron_begin : 0;
+        const auto qlap = targeted ? roots[(1 + 3 * k + local) * m + element] : make_cuDoubleComplex(0, 0);
+        const auto b0 = make_cuDoubleComplex(real[element], imag[element]);
+        if constexpr (Owner == 0 || Owner == 3)
+        for (std::size_t atom = Owner == 3 ? owned % layout.nucleus_count : 0;
+             atom < (Owner == 3 ? owned % layout.nucleus_count + 1 : layout.nucleus_count); ++atom)
+        {
+          if constexpr (Owner == 3)
+            if (atom != owned % layout.nucleus_count) continue;
+          periodic_geometry::Pair pair;
+          if (!periodic_geometry::evaluatePair(cell, positions + row * layout.position_row_stride,
+              nuclei + atom * layout.nucleus_row_stride, pair, true) || !(pair.radius > 0)) { fail(status); return; }
+          const auto index = open_orbital::envelopeOffset(layout, d, orbital, atom);
+          const auto z = p[zeta + index], az = fabs(z), sign = z > 0 ? 1.0 : (z < 0 ? -1.0 : 0.0);
+          const auto decay = exp(-az * pair.radius), weighted = p[pi + index] * decay;
+          for (std::size_t direction = 0; direction < 2; ++direction)
+          {
+            const auto v = direction ? -sign * pair.radius * weighted : decay;
+            const auto first = direction ? sign * weighted * (az * pair.radius - 1) : -az * decay;
+            const auto second = direction ? sign * weighted * (-pair.radius * az * az + 2 * az) : az * az * decay;
+            auto result = scale(qe0.value(), v);
+            if (targeted)
+            {
+              result = add(result, scale(QMC_PF_MUL(qlap, b0),
+                  second * pair.radius_gradient_norm_squared + first * pair.radius_laplacian));
+              for (std::size_t mu = 0; mu < 3; ++mu)
+              {
+                const auto offset = (1 + 3 * local + mu) * m + element;
+                const auto b = make_cuDoubleComplex(real[offset], imag[offset]);
+                const auto term = add(QMC_PF_MUL(roots[offset], b0), scale(QMC_PF_MUL(qlap, b), 2));
+                if (!finite(term)) { fail(status); return; }
+                result = add(result, scale(term, first * pair.radius_gradient[mu]));
+              }
+            }
+            if (!finite(result) || !accumulate(response[(direction ? zeta : pi) + index], component(result, selected)))
+            { fail(status); return; }
+          }
+        }
+      }
+  }
+}
+
+/// Legacy single-thread entry retains canonical row/determinant/orbital/plane order.
 __global__ void headReverse(ComplexKineticHeadLayout l, periodic_geometry::Cell cell,
     const double* positions, const double* nuclei, const double* p, const double* features,
     const double* envelope, const double* real, const double* imag, const C* roots,
@@ -495,6 +617,48 @@ __global__ void headReverse(ComplexKineticHeadLayout l, periodic_geometry::Cell 
           }
         }
       }
+}
+
+/// Copy original destination bits before any private arithmetic; initialize only private failure.
+__global__ void beginHeadReverse(std::size_t p, std::size_t f, const double* response,
+    const double* feature, double* private_response, double* private_feature, std::uint64_t* failure)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < p) private_response[i] = response[i];
+  if (i < f) private_feature[i] = feature[i];
+  if (i == 0) *failure = ~std::uint64_t{0};
+}
+
+/// Each thread owns complete increasing-order reductions for disjoint output addresses.
+template<int Owner>
+__global__ void parallelHeadReverse(std::size_t count, ComplexKineticHeadLayout l, periodic_geometry::Cell cell,
+    const double* positions, const double* nuclei, const double* p, const double* features,
+    const double* envelope, const double* real, const double* imag, const C* roots,
+    std::size_t selected, double* feature_seed, double* response, std::uint64_t* failure)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count)
+    headReverseBody<Owner>(l, cell, positions, nuclei, p, features, envelope, real, imag, roots,
+        selected, feature_seed, response, failure, i);
+}
+
+/// Stream-ordered publication or canonical failure replay never exposes private failed prefixes.
+__global__ void finishHeadReverse(std::size_t pcount, std::size_t fcount, ComplexKineticHeadLayout l,
+    periodic_geometry::Cell cell, const double* positions, const double* nuclei, const double* p,
+    const double* features, const double* envelope, const double* real, const double* imag, const C* roots,
+    std::size_t selected, double* feature_seed, double* response, std::uint64_t* status,
+    const double* private_feature, const double* private_response, const std::uint64_t* failure)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (*failure != ~std::uint64_t{0})
+  {
+    if (i == 0)
+      headReverseBody(l, cell, positions, nuclei, p, features, envelope, real, imag, roots,
+          selected, feature_seed, response, status);
+    return;
+  }
+  if (i < pcount) response[i] = private_response[i];
+  if (i < fcount) feature_seed[i] = private_feature[i];
 }
 
 /// Fixed physical masses/kappa generate ordinary complex roots and exactly one tile energy.
@@ -598,7 +762,7 @@ Error launchComplexKineticMatrixRoots(Stream stream, OpenOrbitalJetLayout layout
 }
 
 /// One selected real objective; all canonical intervals checked before its serial launch.
-Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout l,
+static void validateComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout l,
     const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const double* p,
     const double* features, const double* envelope, const double* real, const double* imag,
     const C* roots, std::size_t selected, double* feature_seed, double* response, std::uint64_t* status)
@@ -624,7 +788,80 @@ Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout l,
   const void* reads[]{positions, nuclei, p, features, envelope, real, imag, roots};
   const void* outputs[]{feature_seed, response, status};
   rejectAliasedStorage(reads, outputs, "Complex kinetic head storage aliases");
+}
+
+/// Strict cold capture is shared by enclosing cost and leaf preparation.
+bool complexKineticHeadParallelRequested()
+{
+  static const bool requested = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_KINETIC_HEAD_PARALLEL");
+    if (!value || std::strcmp(value, "0") == 0) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_KINETIC_HEAD_PARALLEL must be 0 or 1");
+  }();
+  return requested;
+}
+
+/// Default entry retains its original single-thread arithmetic and destination semantics.
+Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout l,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const double* p,
+    const double* features, const double* envelope, const double* real, const double* imag,
+    const C* roots, std::size_t selected, double* feature_seed, double* response, std::uint64_t* status)
+{
+  validateComplexKineticHeadReverse(stream, l, cell, positions, nuclei, p, features, envelope, real, imag,
+      roots, selected, feature_seed, response, status);
   headReverse<<<1, 1, 0, stream>>>(l, cell, positions, nuclei, p, features, envelope, real, imag, roots, selected, feature_seed, response, status);
+  return launched();
+}
+
+/// Independent output reductions use complete private storage and one ordered publish/replay boundary.
+Error launchComplexKineticHeadReverseParallel(Stream stream, ComplexKineticHeadLayout l,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const double* p,
+    const double* features, const double* envelope, const double* real, const double* imag,
+    const C* roots, std::size_t selected, double* feature_seed, double* response, std::uint64_t* status,
+    double* private_features, std::size_t feature_capacity, double* private_response,
+    std::size_t response_capacity, std::uint64_t* private_status)
+{
+  validateComplexKineticHeadReverse(stream, l, cell, positions, nuclei, p, features, envelope, real, imag,
+      roots, selected, feature_seed, response, status);
+  const auto& layout = l.real.forward;
+  const auto n = layout.features.electron_count, d = layout.determinant_count;
+  if (n < 64 || n > 300 || d > 16 || cell.separate_ion_cell)
+    return launchComplexKineticHeadReverse(stream, l, cell, positions, nuclei, p, features, envelope, real, imag,
+        roots, selected, feature_seed, response, status);
+  const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Parallel kinetic head extent overflow"); };
+  const auto fcount = mul(layout.features.element_count, layout.orbitals.plane_count);
+  const auto pcount = l.real.response_count;
+  const auto weight_count = mul(2, mul(layout.feature_width, mul(d, n)));
+  const auto feature_count = mul(layout.orbitals.plane_count, mul(n, layout.feature_width));
+  const auto envelope_count = mul(2, mul(d, mul(n, layout.nucleus_count)));
+  const auto blocks = [](std::size_t count) {
+    if (!count || (count - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Parallel kinetic head grid exceeds admission");
+    return static_cast<unsigned>((count - 1) / 128 + 1);
+  };
+  const auto publish_blocks = blocks(std::max(pcount, fcount));
+  const auto wb = blocks(weight_count), fb = blocks(feature_count), eb = blocks(envelope_count);
+  if (!private_features || !private_response || !private_status || feature_capacity < fcount || response_capacity < pcount)
+    throw std::invalid_argument("Parallel kinetic head private capacity is insufficient");
+  const void* reads[]{positions, nuclei, p, features, envelope, real, imag, roots, feature_seed, response, status};
+  const void* outputs[]{private_features, private_response, private_status};
+  open_kinetic_reverse_detail::rejectAliasedStorage(reads, outputs, "Parallel kinetic private storage aliases");
+  beginHeadReverse<<<publish_blocks, 128, 0, stream>>>(pcount, fcount, response, feature_seed,
+      private_response, private_features, private_status);
+  if (auto error = launched(); error != success) return error;
+  parallelHeadReverse<1><<<wb, 128, 0, stream>>>(weight_count, l, cell, positions, nuclei, p, features,
+      envelope, real, imag, roots, selected, private_features, private_response, private_status);
+  if (auto error = launched(); error != success) return error;
+  parallelHeadReverse<2><<<fb, 128, 0, stream>>>(feature_count, l, cell, positions, nuclei, p, features,
+      envelope, real, imag, roots, selected, private_features, private_response, private_status);
+  if (auto error = launched(); error != success) return error;
+  parallelHeadReverse<3><<<eb, 128, 0, stream>>>(envelope_count, l, cell, positions, nuclei, p, features,
+      envelope, real, imag, roots, selected, private_features, private_response, private_status);
+  if (auto error = launched(); error != success) return error;
+  finishHeadReverse<<<publish_blocks, 128, 0, stream>>>(pcount, fcount, l, cell, positions, nuclei, p, features,
+      envelope, real, imag, roots, selected, feature_seed, response, status,
+      private_features, private_response, private_status);
   return launched();
 }
 

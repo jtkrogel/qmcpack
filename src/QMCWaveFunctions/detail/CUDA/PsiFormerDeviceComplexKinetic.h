@@ -16,10 +16,13 @@ struct ComplexKineticCost
 {
   KineticTrunkCost trunk;
   std::size_t device_bytes, host_bytes, canonical_bytes, matrix_work, matrices, head_elements;
+  std::size_t private_features, private_parameters;
+  bool parallel_head;
 };
 
 /// Exact combined preflight: one real trunk/P, max-K mixed jets and complexP.
-inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPlan& plan, std::size_t targets)
+inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
+    bool parallel_requested = complexKineticHeadParallelRequested())
 {
   complex_detail::baseCost(plan, 1, SpatialJetMode::VALUE_ONLY);
   const auto t = estimateKineticTrunkCost(plan, targets);
@@ -35,9 +38,19 @@ inline ComplexKineticCost estimateComplexKineticCost(const PsiFormerExecutionPla
   auto bytes = add(t.device_bytes, add(mul(56, h), mul(16, m)));
   bytes = add(bytes, add(mul(16 + sizeof(std::size_t), mul(d, n)), mul(48, nn)));
   bytes = add(bytes, add(mul(144, targets), add(mul(16, p), add(mul(8, n), add(mul(32, d), 96)))));
+  // Only ordinary fixed legacy-torus FP64 owners enter this independent-output route.
+  const auto& environment = plan.environment();
+  const bool parallel_head = parallel_requested && n >= 64 && n <= 300 && d <= 16 &&
+      !environment.periodic_profile && environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+  const auto private_features = parallel_head ? mul(add(1, mul(4, targets)), mul(n, s.feature_dimension)) : 0;
+  const auto private_parameters = parallel_head ? p : 0;
+  if (parallel_head)
+    bytes = add(bytes, add(mul(8, add(private_features, private_parameters)), sizeof(std::uint64_t)));
   // Matrix-contraction sites only, not neural/head FLOPs or a throughput estimate.
   const auto work = add(mul(14, mul(d, mul(nn, nn))), mul(4, mul(d, mul(tiles, mul(nn, n)))));
-  return {t, bytes, add(t.host_bytes, sizeof(ComplexValueResult)), mul(24, p), work, m, h};
+  return {t, bytes, add(t.host_bytes, sizeof(ComplexValueResult)), mul(24, p), work, m, h,
+      private_features, private_parameters, parallel_head};
 }
 
 /** B1 numerical dK/d(real parameters), with learned paired-head complex phase.
@@ -60,12 +73,13 @@ public:
   /// Reject both whole-request caps BEFORE any trunk or mixed numeric allocation.
   static std::unique_ptr<PreparedDeviceComplexKinetic> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
-      std::size_t budget, std::size_t matrix_work_budget)
+      std::size_t budget, std::size_t matrix_work_budget,
+      bool parallel_requested = complexKineticHeadParallelRequested())
   {
     if (!image)
       throw std::invalid_argument("Complex kinetic requires a paired numerical image");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexKineticCost(image->plan(), targets);
+    const auto cost = estimateComplexKineticCost(image->plan(), targets, parallel_requested);
     if (cost.device_bytes > budget || cost.matrix_work > matrix_work_budget)
       throw std::length_error("Complex kinetic exceeds its per-owner byte or matrix-work cap");
     return std::unique_ptr<PreparedDeviceComplexKinetic>(new PreparedDeviceComplexKinetic(image, targets, queue, blas, cost));
@@ -156,15 +170,24 @@ private:
         permutation_(solve_.capacity(), "ComplexKinetic::permutation_", __FILE__, __LINE__),
         channels_(image->plan().modelShape().determinants, "ComplexKinetic::channels_", __FILE__, __LINE__),
         amplitude_(1, "ComplexKinetic::amplitude_", __FILE__, __LINE__),
-        status_(1, "ComplexKinetic::status_", __FILE__, __LINE__)
+        status_(1, "ComplexKinetic::status_", __FILE__, __LINE__),
+        private_features_(cost.private_features, "ComplexKinetic::private_features_", __FILE__, __LINE__),
+        private_response_(cost.private_parameters, "ComplexKinetic::private_response_", __FILE__, __LINE__),
+        private_status_(cost.parallel_head ? 1 : 0, "ComplexKinetic::private_status_", __FILE__, __LINE__)
   {
     layout_.features = withSpatialTargetRange(layout_.features, 0, targets);
     layout_.orbitals = withSpatialTargetRange(layout_.orbitals, 0, targets);
+    // Prepared trunk feature planes are packed; generic padded leaves charge their own full span.
+    if (cost.parallel_head && (layout_.feature_row_stride != image->plan().modelShape().feature_dimension ||
+        layout_.features.element_count != image->plan().modelShape().electrons() * image->plan().modelShape().feature_dimension ||
+        cost.private_features != layout_.orbitals.plane_count * layout_.features.element_count))
+      throw std::logic_error("Parallel kinetic private feature cost requires exact packed prepared planes");
     static_assert(sizeof(ComplexValueResult) == 48 && sizeof(ComplexValueChannel) == 32 && sizeof(std::uint64_t) == 8);
     auto actual = cost.trunk.device_bytes + 8 * (envelope_.capacity() + projections_.capacity() + masses_.capacity() + kappa_.capacity());
     for (const auto* b : {&head_, &roots_, &inverse_, &solve_, &scratch_, &outputs_, &coefficients_, &response_, &energy_})
       actual += sizeof(cuDoubleComplex) * b->capacity();
     actual += sizeof(std::size_t) * permutation_.capacity() + 32 * channels_.capacity() + 48 + 8;
+    actual += 8 * (private_features_.capacity() + private_response_.capacity() + private_status_.capacity());
     if (actual != cost.device_bytes || cost.canonical_bytes != 24 * response_.capacity())
       throw std::logic_error("Complex kinetic exact inventory/24P mismatch");
   }
@@ -285,7 +308,14 @@ private:
         offset(ParameterRole::BACKFLOW_DOWN_WEIGHT), offset(ParameterRole::ENVELOPE_PI_UP), offset(ParameterRole::ENVELOPE_PI_DOWN),
         offset(ParameterRole::ENVELOPE_ZETA_UP), offset(ParameterRole::ENVELOPE_ZETA_DOWN)},
         offset(ParameterRole::BACKFLOW_UP_WEIGHT, HeadTensorComponent::IMAG), offset(ParameterRole::BACKFLOW_DOWN_WEIGHT, HeadTensorComponent::IMAG)};
-    checkRuntime(launchComplexKineticHeadReverse(queue_.getNative(), head_layout, *image_->periodicCell(), ticket.positions,
+    if (cost_.parallel_head)
+      checkRuntime(launchComplexKineticHeadReverseParallel(queue_.getNative(), head_layout, *image_->periodicCell(), ticket.positions,
+          image_->nuclei(), image_->parameters(), ticket.final_features, envelope_.data(), projections_.data(),
+          projections_.data() + cost_.head_elements, roots_.data(), component, feature, response, status_.data(),
+          private_features_.data(), private_features_.capacity(), private_response_.data(), private_response_.capacity(),
+          private_status_.data()), "complex kinetic parallel paired reverse");
+    else
+      checkRuntime(launchComplexKineticHeadReverse(queue_.getNative(), head_layout, *image_->periodicCell(), ticket.positions,
         image_->nuclei(), image_->parameters(), ticket.final_features, envelope_.data(), projections_.data(),
         projections_.data() + cost_.head_elements, roots_.data(), component, feature, response, status_.data()), "complex kinetic paired reverse");
     checkRuntime(launchComplexKineticCuspSeed(queue_.getNative(), ticket.features.laplacian_lanes, coefficients_.data(),
@@ -316,6 +346,8 @@ private:
   DeviceBuffer<ComplexValueChannel> channels_;
   DeviceBuffer<ComplexValueResult> amplitude_;
   DeviceBuffer<std::uint64_t> status_;
+  DeviceBuffer<double> private_features_, private_response_;
+  DeviceBuffer<std::uint64_t> private_status_;
   ComplexValueResult first_amplitude_;
   std::size_t generation_ = 0;
   bool ready_ = false;

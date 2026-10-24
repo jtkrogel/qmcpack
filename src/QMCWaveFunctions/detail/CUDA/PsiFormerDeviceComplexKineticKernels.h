@@ -16,6 +16,18 @@ struct ComplexKineticHeadLayout
   std::size_t imaginary_up, imaginary_down;
 };
 
+/// Capture the strict, default-off disjoint-output reverse selector once per process.
+bool complexKineticHeadParallelRequested();
+
+/// Parallel private destinations publish only after complete numerical admission.
+/// Capacities are in doubles; a failed attempt replays onto untouched original outputs.
+Error launchComplexKineticHeadReverseParallel(Stream stream, ComplexKineticHeadLayout layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei, const double* parameters,
+    const double* features, const double* envelope, const double* real, const double* imag,
+    const cuDoubleComplex* roots, std::size_t component, double* feature_seed, double* response,
+    std::uint64_t* status, double* private_features, std::size_t feature_capacity,
+    double* private_response, std::size_t response_capacity, std::uint64_t* private_status);
+
 /// Reverse ordinary complex CORE G/L roots; caller owns three complex N*N scratch matrices.
 /// Requires finite unweighted A/B/C/combined terms; no Wide-domain fallback.
 /// Cold PSIFORMER_GPU_COOPERATIVE_COMPLEX_KINETIC_ROOTS=1 opts into independent-entry work only.
