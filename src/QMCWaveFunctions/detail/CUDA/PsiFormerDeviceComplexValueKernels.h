@@ -71,6 +71,12 @@ Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, st
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve);
 
+/// Cooperate retained SCORE LU and replay failed packed channels canonically, using no extra owner.
+Error launchComplexScoreCooperativeInverseColumns(Stream stream, std::size_t channels, std::size_t n,
+    const double* envelope, const double* real, const double* imag,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve);
+
 /// Mixed-only conditioning evidence in a separate bank; channel ABI and FP64 entry point are unchanged.
 Error launchComplexValueFactorWithDiagnostics(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,

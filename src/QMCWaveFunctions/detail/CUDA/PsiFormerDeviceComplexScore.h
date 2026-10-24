@@ -71,6 +71,20 @@ inline bool complexScorePeriodicGeometryEligible(const PsiFormerExecutionPlan& p
   return complexScoreInverseColumnsEligible(plan);
 }
 
+/// Capture the retained-only LU policy once; diagnostics and raw VJP do not consult this option.
+inline bool configuredComplexScoreCooperativeLu()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_SCORE_COOPERATIVE_LU");
+    if (!value || std::string_view(value) == "0")
+      return false;
+    if (std::string_view(value) == "1")
+      return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_SCORE_COOPERATIVE_LU must be 0 or 1");
+  }();
+  return enabled;
+}
+
 /// Standalone B1 score inventory; canonical bytes are exactly realP+complexP=24P.
 struct ComplexScoreCost { ComplexValueCost forward; std::size_t device_bytes, host_bytes, canonical_bytes; };
 
@@ -163,7 +177,7 @@ public:
       throw std::length_error("Complex score exceeds its standalone owner budget");
     return std::unique_ptr<PreparedDeviceComplexScore>(new PreparedDeviceComplexScore(
         std::move(image), queue, blas, cost, false, configuredComplexScoreInverseColumns(),
-        configuredComplexScorePeriodicGeometry()));
+        configuredComplexScorePeriodicGeometry(), configuredComplexScoreCooperativeLu()));
   }
 
   /// Prepare raw-orbital mode separately; ordinary score ownership is unchanged.
@@ -187,6 +201,9 @@ public:
 
   /// Report the immutable retained primal geometry policy without hot-loop environment access.
   bool usesPeriodicGeometry() const noexcept { return periodic_geometry_; }
+
+  /// Report the frozen LU policy without changing the existing inverse-column and publication contracts.
+  bool usesCooperativeLu() const noexcept { return cooperative_lu_; }
 
   /// Reuse one tape and oneP scratch for both real objectives before publishing.
   void evaluate(const std::vector<double>& positions)
@@ -332,16 +349,18 @@ private:
   /// Allocate one paired tape and realP; only log-score mode adds complexP/inverses.
   PreparedDeviceComplexScore(std::shared_ptr<const PreparedDeviceModel> image, compute::Queue<PlatformKind::CUDA>& queue,
       AcceleratorBlasHandle& blas, ComplexScoreCost cost, bool orbital_only = false, bool inverse_columns = false,
-      bool periodic_geometry = false)
+      bool periodic_geometry = false, bool cooperative_lu = false)
       : cost_(cost), orbital_only_(orbital_only),
         inverse_columns_(!orbital_only && inverse_columns &&
             complexScoreInverseColumnsEligible(image->plan())),
         periodic_geometry_(!orbital_only && periodic_geometry && complexScorePeriodicGeometryEligible(image->plan())),
+        cooperative_lu_(!orbital_only && cooperative_lu && inverse_columns_ &&
+            complexScoreInverseColumnsEligible(image->plan())),
         cooperative_weighted_inverses_(!orbital_only && configuredComplexScoreWeightedInversesCooperative() &&
             image->plan().modelShape().electrons() >= 64 && image->plan().modelShape().electrons() <= 300 &&
             image->plan().modelShape().determinants >= 1 && image->plan().modelShape().determinants <= 16),
         forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true, !orbital_only,
-            inverse_columns_, periodic_geometry_)),
+            inverse_columns_, periodic_geometry_, cooperative_lu_)),
         network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
         feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension, "ComplexScore::feature_", __FILE__, __LINE__),
         ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei, "ComplexScore::ion_", __FILE__, __LINE__),
@@ -494,6 +513,7 @@ private:
   const bool orbital_only_;
   const bool inverse_columns_;
   const bool periodic_geometry_;
+  const bool cooperative_lu_;
   const bool cooperative_weighted_inverses_;
   std::unique_ptr<PreparedDeviceComplexValue> forward_;
   std::unique_ptr<PreparedDeviceNetworkReverse> network_;

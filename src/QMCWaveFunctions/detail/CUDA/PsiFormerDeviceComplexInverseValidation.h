@@ -16,7 +16,7 @@
 namespace qmcplusplus::psiformer::device
 {
 /// Preserve canonical factors, inverse failures and complete paired FULL products under column scheduling.
-inline void validateComplexInverseColumns()
+inline void validateComplexInverseColumns(bool cooperative_score_lu = false)
 {
   using C = std::complex<double>;
   compute::Queue<PlatformKind::CUDA> queue;
@@ -28,8 +28,11 @@ inline void validateComplexInverseColumns()
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
   std::size_t comparisons = 0;
+  bool checked_cooperative_admission = false;
   double maximum_residual = 0, maximum_cpu = 0;
-  const auto compare = [&](std::size_t n, const std::vector<C>& input, bool inverse_failure = false) {
+  const auto compare = [&](std::size_t n, const std::vector<C>& input, bool inverse_failure = false,
+                           std::uint64_t incoming_status = std::numeric_limits<std::uint64_t>::max(),
+                           bool nonunit_provider = false) {
     const auto channels = input.size() / (n * n);
     std::vector<cuDoubleComplex> packed(input.size()), sentinel(input.size(), make_cuDoubleComplex(37, -19));
     for (std::size_t i = 0; i < input.size(); ++i)
@@ -40,19 +43,74 @@ inline void validateComplexInverseColumns()
     DeviceBuffer<std::size_t> old_permutation(channels * n), new_permutation(channels * n);
     DeviceBuffer<ComplexValueChannel> old_metadata(channels), new_metadata(channels);
     DeviceBuffer<std::uint64_t> old_status(1), new_status(1);
+    DeviceBuffer<double> envelope(cooperative_score_lu ? input.size() : 0);
+    DeviceBuffer<double> real(envelope.capacity()), imag(envelope.capacity());
     const auto clear = std::numeric_limits<std::uint64_t>::max();
     old_matrix.upload(packed.data(), packed.size());
     new_matrix.upload(packed.data(), packed.size());
     old_inverse.upload(sentinel.data(), sentinel.size());
     new_inverse.upload(sentinel.data(), sentinel.size());
-    old_status.upload(&clear, 1);
-    new_status.upload(&clear, 1);
-    checkRuntime(launchComplexValueFactor(queue.getNative(), channels, n, old_matrix.data(), old_metadata.data(),
-        old_status.data(), old_inverse.data(), old_permutation.data(), old_solve.data()), "old inverse oracle");
+    old_status.upload(&incoming_status, 1);
+    new_status.upload(&incoming_status, 1);
+    if (cooperative_score_lu)
+    {
+      const double provider_scale = nonunit_provider ? 2 : 1;
+      std::vector<double> e(input.size(), provider_scale), r(input.size()), im(input.size());
+      for (std::size_t i = 0; i < input.size(); ++i)
+      {
+        r[i] = input[i].real() / provider_scale;
+        im[i] = input[i].imag() / provider_scale;
+      }
+      envelope.upload(e.data(), e.size());
+      real.upload(r.data(), r.size());
+      imag.upload(im.data(), im.size());
+      if (!checked_cooperative_admission)
+      {
+        const auto before_admission = metrics.snapshot();
+        for (int fault = 0; fault < 3; ++fault)
+        {
+          bool rejected = false;
+          try
+          {
+            launchComplexScoreCooperativeInverseColumns(queue.getNative(), channels, fault == 2 ? 301 : n,
+                fault == 0 ? nullptr : envelope.data(), real.data(), imag.data(), new_matrix.data(),
+                new_metadata.data(), new_status.data(), fault == 1 ? new_matrix.data() : new_inverse.data(),
+                new_permutation.data(), new_solve.data());
+          }
+          catch (const std::invalid_argument&) { rejected = true; }
+          if (!rejected)
+            throw std::runtime_error("Cooperative LU admitted null/alias/out-of-range metadata");
+        }
+        const auto after_admission = metrics.snapshot();
+        if (before_admission.allocation_calls != after_admission.allocation_calls ||
+            before_admission.uploaded_bytes != after_admission.uploaded_bytes)
+          throw std::runtime_error("Cooperative LU invalid admission allocated or uploaded");
+        checked_cooperative_admission = true;
+      }
+      const std::vector<cuDoubleComplex> solve_sentinel(channels * n, make_cuDoubleComplex(71, -13));
+      old_solve.upload(solve_sentinel.data(), solve_sentinel.size());
+      new_solve.upload(solve_sentinel.data(), solve_sentinel.size());
+      // BOTH oracles start from the original pack, including NaN/signed-zero behavior.
+      for (auto* matrix : {&old_matrix, &new_matrix})
+        checkRuntime(launchComplexValuePack(queue.getNative(), input.size(), envelope.data(), real.data(),
+            imag.data(), matrix->data(), matrix == &old_matrix ? old_status.data() : new_status.data()),
+            "cooperative LU fixture original packed matrix");
+      checkRuntime(launchComplexSpatialInverseColumns(queue.getNative(), channels, n, old_matrix.data(),
+          old_metadata.data(), old_status.data(), old_inverse.data(), old_permutation.data(), old_solve.data()),
+          "canonical scalar LU plus inverse columns");
+    }
+    else
+      checkRuntime(launchComplexValueFactor(queue.getNative(), channels, n, old_matrix.data(), old_metadata.data(),
+          old_status.data(), old_inverse.data(), old_permutation.data(), old_solve.data()), "old inverse oracle");
     queue.sync();
     const auto warm = metrics.snapshot();
-    checkRuntime(launchComplexSpatialInverseColumns(queue.getNative(), channels, n, new_matrix.data(), new_metadata.data(),
-        new_status.data(), new_inverse.data(), new_permutation.data(), new_solve.data()), "parallel inverse oracle");
+    if (cooperative_score_lu)
+      checkRuntime(launchComplexScoreCooperativeInverseColumns(queue.getNative(), channels, n, envelope.data(),
+          real.data(), imag.data(), new_matrix.data(), new_metadata.data(), new_status.data(), new_inverse.data(),
+          new_permutation.data(), new_solve.data()), "cooperative LU plus canonical failure replay");
+    else
+      checkRuntime(launchComplexSpatialInverseColumns(queue.getNative(), channels, n, new_matrix.data(), new_metadata.data(),
+          new_status.data(), new_inverse.data(), new_permutation.data(), new_solve.data()), "parallel inverse oracle");
     queue.sync();
     const auto after = metrics.snapshot();
     if (after.allocation_calls != warm.allocation_calls || after.free_calls != warm.free_calls ||
@@ -78,8 +136,20 @@ inline void validateComplexInverseColumns()
     new_permutation.download(new_perm.data(), new_perm.size());
     if (old_perm != new_perm)
       throw std::runtime_error("Inverse columns changed canonical pivot ties/permutations");
+    if (cooperative_score_lu)
+    {
+      old_inverse.download(a.data(), a.size());
+      new_inverse.download(b.data(), b.size());
+      if (std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])))
+        throw std::runtime_error("Cooperative LU inverse bits/failed prefix differ");
+      std::vector<cuDoubleComplex> old_scale(channels * n), new_scale(channels * n);
+      old_solve.download(old_scale.data(), old_scale.size());
+      new_solve.download(new_scale.data(), new_scale.size());
+      if (std::memcmp(old_scale.data(), new_scale.data(), old_scale.size() * sizeof(old_scale[0])))
+        throw std::runtime_error("Cooperative LU scale/untouched solve-tail bits differ");
+    }
     ++comparisons;
-    // Failed scratch is private; only its canonical status and metadata are observable.
+    // The legacy full-scalar versus columns oracle observes only status/metadata on inverse failure.
     if (old_code != clear)
     {
       if (inverse_failure && (old_code != 1 || new_records[0].status != 0))
@@ -141,7 +211,31 @@ inline void validateComplexInverseColumns()
   auto invalid = std::vector<C>{C(2), C(0), C(0), C(3), C(1), C(0), C(0), C(1)};
   invalid[4] = C(std::numeric_limits<double>::quiet_NaN());
   compare(2, invalid);
-  compare(2, {C(1e-310), C(0), C(0), C(1e-310)}, true);
+  if (cooperative_score_lu)
+    // Pivot squared norms=1e-220 stay normal; inverse(0,2)=1e330 overflows only in the solve.
+    compare(3, {C(1e-110), C(1), C(0), C(0), C(1e-110), C(1), C(0), C(0), C(1e-110)}, true);
+  else
+    compare(2, {C(1e-310), C(0), C(0), C(1e-310)}, true);
+  if (cooperative_score_lu)
+  {
+    compare(2, {C(2, -0.), C(0., -0.), C(-0., 0.), C(3, 0.)});
+    compare(3, {C(1), C(2), C(3), C(0), C(1), C(2), C(0), C(0), C(0)});
+    // Exact power-of-two providers exercise nonunit repack after a partial singular LU.
+    compare(3, {C(1), C(2), C(3), C(0), C(1), C(2), C(0), C(0), C(0)}, false,
+        std::numeric_limits<std::uint64_t>::max(), true);
+    compare(2, {C(1), C(2), C(1), C(3)}, false, 7);
+    compare(2, invalid, false, 7);
+    auto infinite = invalid;
+    infinite[4] = C(std::numeric_limits<double>::infinity());
+    compare(2, infinite);
+    // One cheap matrix-only maximum-size case covers row strides beyond the 256-thread block.
+    std::vector<C> maximum(300 * 300);
+    for (std::size_t i = 0; i < 300; ++i)
+      for (std::size_t j = 0; j < 300; ++j)
+        maximum[i * 300 + j] = i == j ? C(2 + .001 * i, .05) :
+            C(.01 * std::sin(.31 * (1 + i + 3 * j)), .007 * std::cos(.17 * (2 + 2 * i + j)));
+    compare(300, maximum);
+  }
   const auto plan = makeTargetCostPlan(64, true, true);
   for (int fault = 0; fault < 6; ++fault)
   {
@@ -157,8 +251,10 @@ inline void validateComplexInverseColumns()
   }
   if (supportsComplexInverseColumnsProfile(plan.environment(), 63))
     throw std::runtime_error("Inverse columns admitted Ne below64");
-  validateBatchedHeadFullOwner(true);
-  std::cout << std::setprecision(17) << "PASS inverse columns comparisons=" << comparisons
+  if (!cooperative_score_lu)
+    validateBatchedHeadFullOwner(true);
+  std::cout << std::setprecision(17) << (cooperative_score_lu ? "PASS cooperative score LU comparisons=" :
+      "PASS inverse columns comparisons=") << comparisons
             << " max_CPU_determinant=" << maximum_cpu << " max_inverse_residual=" << maximum_residual
             << " old_GPU_LU_inverse_metadata_permutation_bits=exact warm_allocations=0 added_host_uploads=0\n";
 }

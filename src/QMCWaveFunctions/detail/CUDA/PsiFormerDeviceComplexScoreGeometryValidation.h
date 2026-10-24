@@ -14,15 +14,17 @@ namespace qmcplusplus::psiformer::device
 /// Construct explicit immutable old/new policies without changing the cold environment oracle.
 struct ComplexScoreGeometryValidationAccess
 {
-  /// Keep explicit scalar/cooperative geometry oracles independent of the process-cached selector.
+  /// Keep explicit primal-policy oracles independent of the process-cached selectors.
   static std::unique_ptr<PreparedDeviceComplexScore> prepare(std::shared_ptr<const PreparedDeviceModel> image,
-      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, bool geometry)
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, bool geometry,
+      bool cooperative_lu = false)
   {
     const auto cost = estimateComplexScoreCost(image->plan());
     auto owner = std::unique_ptr<PreparedDeviceComplexScore>(
-        new PreparedDeviceComplexScore(std::move(image), queue, blas, cost, false, true, geometry));
-    if (owner->forward_->trunk_->usesCooperativePeriodicValueGeometry() != geometry)
-      throw std::runtime_error("Retained geometry owner did not dispatch its explicit primal policy");
+        new PreparedDeviceComplexScore(std::move(image), queue, blas, cost, false, true, geometry, cooperative_lu));
+    if (owner->forward_->trunk_->usesCooperativePeriodicValueGeometry() != geometry ||
+        owner->forward_->score_cooperative_lu_ != cooperative_lu)
+      throw std::runtime_error("Retained score owner did not dispatch its explicit primal policies");
     return owner;
   }
 
@@ -56,8 +58,8 @@ struct ComplexScoreGeometryValidationAccess
   }
 };
 
-/// Compare complete retained objectives, publication and same-family rebind under both geometry policies.
-inline void validateComplexScorePeriodicGeometry()
+/// Compare retained objectives, publication and rebind under geometry or cooperative-LU policies.
+inline void validateComplexScorePeriodicGeometry(bool qualify_cooperative_lu = false)
 {
   const auto descriptor = makeTargetCostPlan(64, true, true);
   const auto initialized = initializePsiFormerParameters(descriptor.modelShape(), 1729,
@@ -83,13 +85,16 @@ inline void validateComplexScorePeriodicGeometry()
     throw std::runtime_error("Retained geometry minus-one allocated");
   auto selected = PreparedDeviceComplexScore::prepare(image, queue, blas, cost.device_bytes);
   if (selected->usesPeriodicGeometry() != configuredComplexScorePeriodicGeometry() ||
+      (qualify_cooperative_lu && (selected->usesCooperativeLu() != configuredComplexScoreCooperativeLu() ||
+          !selected->usesPeriodicGeometry() || !selected->usesInverseColumns())) ||
       metrics.snapshot().live_bytes - before.live_bytes != cost.device_bytes)
     throw std::runtime_error("Retained geometry selector or exact unchanged cost differs");
   selected.reset();
-  auto scalar = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, false);
-  auto cooperative_owner = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, true);
-  if (scalar->usesPeriodicGeometry() || !cooperative_owner->usesPeriodicGeometry())
-    throw std::runtime_error("Explicit retained geometry oracles not distinct");
+  auto scalar = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, qualify_cooperative_lu);
+  auto cooperative_owner = ComplexScoreGeometryValidationAccess::prepare(image, queue, blas, true, qualify_cooperative_lu);
+  if ((qualify_cooperative_lu ? scalar->usesCooperativeLu() || !cooperative_owner->usesCooperativeLu() :
+          scalar->usesPeriodicGeometry() || !cooperative_owner->usesPeriodicGeometry()))
+    throw std::runtime_error("Explicit retained score primal oracles not distinct");
   std::vector<cuDoubleComplex> reference(plan.parameterCount()), actual(plan.parameterCount());
   ComplexValueResult expected_amplitude{}, actual_amplitude{};
   const auto compare = [&] {
@@ -166,7 +171,7 @@ inline void validateComplexScorePeriodicGeometry()
   compare();
   const auto raw_cost = estimateComplexOrbitalVJPCost(plan);
   auto raw = PreparedDeviceComplexScore::prepareOrbitalVJP(successor, queue, blas, raw_cost.device_bytes);
-  if (raw->usesPeriodicGeometry())
+  if (raw->usesPeriodicGeometry() || raw->usesCooperativeLu())
     throw std::runtime_error("Raw-orbital VJP admitted geometry-only selection");
   for (const auto n : {63, 64, 300, 301})
     if (complexScorePeriodicGeometryEligible(makeTargetCostPlan(n, true, true)) != (n >= 64 && n <= 300))
@@ -216,9 +221,11 @@ inline void validateComplexScorePeriodicGeometry()
     }
     catch (const std::invalid_argument&) {}
   }
-  std::cout << "PASS retained_score_periodic_geometry raw_tape_allP_amplitude_bits=exact objectives=2 changed_alpha_embedding_image=1"
+  std::cout << (qualify_cooperative_lu ? "PASS retained_score_cooperative_lu " : "PASS retained_score_periodic_geometry ")
+            << "raw_tape_allP_amplitude_bits=exact objectives=2 changed_alpha_embedding_image=1"
             << " stale_rejected=1 second_failure_hidden=1 warm_allocations=0 minus_one=1 raw_excluded=1"
-            << " extra_device_bytes=0 selected=" << configuredComplexScorePeriodicGeometry() << '\n';
+            << " extra_device_bytes=0 selected="
+            << (qualify_cooperative_lu ? configuredComplexScoreCooperativeLu() : configuredComplexScorePeriodicGeometry()) << '\n';
 }
 } // namespace qmcplusplus::psiformer::device
 #endif

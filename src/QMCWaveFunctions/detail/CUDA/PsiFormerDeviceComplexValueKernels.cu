@@ -163,7 +163,7 @@ __device__ bool inverseFromLu(const cuDoubleComplex* a, std::size_t n, double sc
 }
 
 /// Serial-per-channel scaled partial-pivot LU; zero pivots are singular, not errors.
-template<bool CollectPivots, bool EmitScale = false, bool ReuseRaw = false>
+template<bool CollectPivots, bool EmitScale = false, bool ReuseRaw = false, bool FailedOnly = false>
 __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
     ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve, double* minimum_scaled_pivots,
@@ -172,6 +172,9 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
   const auto channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= channels)
     return;
+  if constexpr (FailedOnly)
+    if (metadata[channel].status == 0)
+      return;
   auto* a = matrices + channel * n * n;
   if constexpr (ReuseRaw)
   {
@@ -357,11 +360,12 @@ __global__ void inverseColumns(std::size_t n, const cuDoubleComplex* matrices,
   }
 }
 
-/// Inverse-null alternative: one block owns one in-place LU, with scalar phase/log.
+/// One block owns one in-place LU, with scalar phase/log and optional inverse-column scale.
 /// Every entry keeps the serial k-order and vendor operations; no sums are reordered.
-template<bool CollectPivots>
+template<bool CollectPivots, bool EmitScale = false>
 __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
-    ComplexValueChannel* metadata, std::uint64_t* status, double* minimum_scaled_pivots)
+    ComplexValueChannel* metadata, std::uint64_t* status, double* minimum_scaled_pivots,
+    std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr)
 {
   const auto channel = std::size_t(blockIdx.x), lane = std::size_t(threadIdx.x);
   if (channel >= channels)
@@ -374,6 +378,9 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   __shared__ std::size_t pivot;
   __shared__ unsigned bad;
   auto* a = matrices + channel * n * n;
+  if constexpr (EmitScale)
+    for (auto i = lane; i < n; i += 256)
+      permutation[channel * n + i] = i;
   if (!lane)
   {
     metadata[channel] = {make_cuDoubleComplex(0, 0), nodeLog(), 1};
@@ -401,7 +408,8 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   if (!lane)
   {
     scale = magnitudes[0];
-    if (bad) fail(status, channel);
+    if constexpr (!EmitScale)
+      if (bad) fail(status, channel);
     phase = make_cuDoubleComplex(1, 0);
     log_abs = double(n) * log(scale);
   }
@@ -433,7 +441,12 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
     {
       pivot = rows[0];
       pivot_magnitude = magnitudes[0];
-      if (!device_math::isFiniteBinary64(pivot_magnitude)) { bad = 1; fail(status, channel); }
+      if (!device_math::isFiniteBinary64(pivot_magnitude))
+      {
+        bad = 1;
+        if constexpr (!EmitScale)
+          fail(status, channel);
+      }
       if constexpr (CollectPivots)
         minimum_pivot = fmin(minimum_pivot, pivot_magnitude);
     }
@@ -449,11 +462,26 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
     __syncthreads();
     if (!lane)
     {
-      if (pivot != k) phase = make_cuDoubleComplex(-cuCreal(phase), -cuCimag(phase));
+      if (pivot != k)
+      {
+        phase = make_cuDoubleComplex(-cuCreal(phase), -cuCimag(phase));
+        if constexpr (EmitScale)
+        {
+          auto* perm = permutation + channel * n;
+          const auto temporary = perm[k];
+          perm[k] = perm[pivot];
+          perm[pivot] = temporary;
+        }
+      }
       phase = QMC_PF_COMPLEX_MUL(phase, make_cuDoubleComplex(cuCreal(a[k * n + k]) / pivot_magnitude,
           cuCimag(a[k * n + k]) / pivot_magnitude));
       log_abs += log(pivot_magnitude);
-      if (!finite(phase) || !device_math::isFiniteBinary64(log_abs)) { bad = 1; fail(status, channel); }
+      if (!finite(phase) || !device_math::isFiniteBinary64(log_abs))
+      {
+        bad = 1;
+        if constexpr (!EmitScale)
+          fail(status, channel);
+      }
     }
     __syncthreads();
     if (bad) return;
@@ -463,7 +491,12 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
       if (!finite(a[i * n + k])) atomicOr(&bad, 1u);
     }
     __syncthreads();
-    if (bad) { if (!lane) fail(status, channel); return; }
+    if (bad)
+    {
+      if constexpr (!EmitScale)
+        if (!lane) fail(status, channel);
+      return;
+    }
     const auto trailing = n - k - 1;
     for (auto index = lane; index < trailing * trailing; index += 256)
     {
@@ -472,7 +505,12 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
       if (!finite(a[i * n + j])) atomicOr(&bad, 1u);
     }
     __syncthreads();
-    if (bad) { if (!lane) fail(status, channel); return; }
+    if (bad)
+    {
+      if constexpr (!EmitScale)
+        if (!lane) fail(status, channel);
+      return;
+    }
   }
   for (auto i = lane; i < n * n; i += 256)
     if (!finite(a[i])) atomicOr(&bad, 1u);
@@ -481,13 +519,34 @@ __global__ void factorCooperative(std::size_t channels, std::size_t n, cuDoubleC
   {
     const double magnitude = QMC_PF_COMPLEX_ABS(phase);
     if (bad || !device_math::isFiniteBinary64(log_abs) || !finite(phase) || !(magnitude > 0))
-      fail(status, channel);
+    {
+      if constexpr (!EmitScale)
+        fail(status, channel);
+    }
     else
     {
       metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
+      if constexpr (EmitScale)
+        solve[channel * n] = make_cuDoubleComplex(scale, 0);
       if constexpr (CollectPivots)
         minimum_scaled_pivots[channel] = minimum_pivot;
     }
+  }
+}
+
+/// Restore failed speculative LU from retained providers, never from the inverse owner.
+__global__ void restoreFailedPacked(std::size_t n, const ComplexValueChannel* metadata,
+    const double* envelope, const double* real, const double* imag, cuDoubleComplex* matrix)
+{
+  const auto channel = std::size_t(blockIdx.x);
+  if (metadata[channel].status == 0)
+    return;
+  const auto begin = channel * n * n;
+  for (auto local = std::size_t(threadIdx.x); local < n * n; local += blockDim.x)
+  {
+    const auto index = begin + local;
+    // Identical to the original pack; canonical scalar replay alone publishes failure.
+    matrix[index] = make_cuDoubleComplex(envelope[index] * real[index], envelope[index] * imag[index]);
   }
 }
 
@@ -746,6 +805,66 @@ Error launchComplexSpatialInverseColumns(Stream stream, std::size_t channels, st
   factor<false, true><<<serial_blocks, 128, 0, stream>>>(
       channels, n, matrix, metadata, status, nullptr, permutation, solve, nullptr);
   const auto result = launched();
+  if (result != success)
+    return result;
+  inverseColumns<<<static_cast<unsigned>(channels), 128, 0, stream>>>(
+      n, matrix, metadata, status, inverse, permutation, solve);
+  return launched();
+}
+
+/// Reuse retained packed providers for exact failure replay without another numeric bank.
+Error launchComplexScoreCooperativeInverseColumns(Stream stream, std::size_t channels, std::size_t n,
+    const double* envelope, const double* real, const double* imag,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve)
+{
+  if (!channels || !n || n > 300 || !envelope || !real || !imag || !matrix || !metadata || !status ||
+      !inverse || !permutation || !solve)
+    throw std::invalid_argument("Cooperative score LU requires complete retained packed providers/storage");
+  const auto elements = spatial_detail::checkedProduct(channels,
+      spatial_detail::checkedProduct(n, n, "Cooperative score matrix extent overflow"),
+      "Cooperative score matrix extent overflow");
+  const auto rows = spatial_detail::checkedProduct(channels, n, "Cooperative score row extent overflow");
+  if (channels > std::size_t(std::numeric_limits<int>::max()) ||
+      elements - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8))
+    throw std::overflow_error("Cooperative score LU exceeds launch/status bounds");
+  const auto overlap = [](const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
+    const auto first = reinterpret_cast<std::uintptr_t>(a), second = reinterpret_cast<std::uintptr_t>(b);
+    if (a_bytes > std::numeric_limits<std::uintptr_t>::max() - first ||
+        b_bytes > std::numeric_limits<std::uintptr_t>::max() - second)
+      throw std::overflow_error("Cooperative score address span overflow");
+    return first < second + b_bytes && second < first + a_bytes;
+  };
+  const void* destinations[]{matrix, inverse, metadata, status, permutation, solve};
+  const auto bytes = [](std::size_t count, std::size_t element_bytes) {
+    return spatial_detail::checkedProduct(count, element_bytes, "Cooperative score byte extent overflow");
+  };
+  const std::size_t sizes[]{bytes(elements, sizeof(cuDoubleComplex)), bytes(elements, sizeof(cuDoubleComplex)),
+      bytes(channels, sizeof(ComplexValueChannel)), sizeof(std::uint64_t),
+      bytes(rows, sizeof(std::size_t)), bytes(rows, sizeof(cuDoubleComplex))};
+  for (std::size_t i = 0; i < 6; ++i)
+  {
+    for (const auto* provider : {envelope, real, imag})
+      if (overlap(destinations[i], sizes[i], provider, bytes(elements, sizeof(double))))
+        throw std::invalid_argument("Cooperative score packed providers alias writable scratch");
+    for (std::size_t j = 0; j < i; ++j)
+      if (overlap(destinations[i], sizes[i], destinations[j], sizes[j]))
+        throw std::invalid_argument("Cooperative score writable owners overlap");
+  }
+  factorCooperative<false, true><<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+      channels, n, matrix, metadata, status, nullptr, permutation, solve);
+  auto result = launched();
+  if (result != success)
+    return result;
+  restoreFailedPacked<<<static_cast<unsigned>(channels), 256, 0, stream>>>(
+      n, metadata, envelope, real, imag, matrix);
+  result = launched();
+  if (result != success)
+    return result;
+  // Singular and failed sentinels both replay the unchanged canonical initialization/body.
+  factor<false, true, false, true><<<blocks(channels), 128, 0, stream>>>(
+      channels, n, matrix, metadata, status, nullptr, permutation, solve, nullptr);
+  result = launched();
   if (result != success)
     return result;
   inverseColumns<<<static_cast<unsigned>(channels), 128, 0, stream>>>(
