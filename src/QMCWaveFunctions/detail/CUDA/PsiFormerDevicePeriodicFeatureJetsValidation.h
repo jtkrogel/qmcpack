@@ -181,8 +181,8 @@ struct PeriodicFeatureJetsValidationAccess
           scalar->hostWorkspaceBytes() != candidate->hostWorkspaceBytes())
         throw std::runtime_error("Periodic feature jets admission or exact owner cost differs");
       candidate->mixed_open_features_excluded_ = true;
-      if (candidate->usesCooperativePeriodicFeatureJets())
-        throw std::runtime_error("Periodic feature jets bypassed sticky mixed exclusion");
+      if (!candidate->usesCooperativePeriodicFeatureJets())
+        throw std::runtime_error("FP64 periodic geometry changed with an unrelated OPEN mixed exclusion");
       candidate->mixed_open_features_excluded_ = false;
 
       std::vector<double> positions(3 * shape.electrons());
@@ -208,7 +208,7 @@ struct PeriodicFeatureJetsValidationAccess
           before.allocation_calls != after.allocation_calls || before.live_bytes != after.live_bytes)
         throw std::runtime_error("Periodic feature jet owner prefix bits/allocation differ");
     }
-    std::cout << "PASS periodic_feature_jet_owners real paired exact_bytes raw_bits cold_flag sticky_mixed\n";
+    std::cout << "PASS periodic_feature_jet_owners real paired exact_bytes raw_bits cold_flag immutable_periodic\n";
   }
 };
 } // namespace qmcplusplus::psiformer::device

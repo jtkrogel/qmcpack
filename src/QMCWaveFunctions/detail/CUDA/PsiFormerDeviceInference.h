@@ -1795,7 +1795,7 @@ public:
         environment.compute_scalar_domain == ScalarDomain::REAL;
   }
 
-  /// Ordinary legacy-torus VALUE only: retained/reverse, target and mixed graphs stay unchanged.
+  /// Legacy-torus FP64 geometry precedes affine precision and is identical on mixed/replay graphs.
   bool usesCooperativePeriodicValueGeometry() const noexcept
   {
     const auto& environment = plan_.environment();
@@ -1805,7 +1805,7 @@ public:
          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
     return periodic_value_geometry_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
         value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
-        !mixed_open_features_excluded_ && !mixed_dense_ && environment.fixed_nuclei &&
+        environment.fixed_nuclei &&
         environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
         environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
         environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2] &&
@@ -1813,7 +1813,7 @@ public:
         environment.compute_scalar_domain == ScalarDomain::REAL && head;
   }
 
-  /// Ordinary legacy-torus FULL/target jets, never retained or mixed paths.
+  /// FP64 legacy-torus FULL/target jets; mixed attachment does not change this immutable map.
   bool usesCooperativePeriodicFeatureJets() const noexcept
   {
     const auto& environment = plan_.environment();
@@ -1823,7 +1823,7 @@ public:
          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
     return periodic_feature_jets_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::FULL_VGL &&
         value_tape_.empty() && !retained_targets_ && !kinetic_trunk_only_ &&
-        !mixed_open_features_excluded_ && !mixed_dense_ && environment.fixed_nuclei &&
+        environment.fixed_nuclei &&
         environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
         environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
         environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2] &&
@@ -2441,6 +2441,7 @@ private:
  * Spatial planes follow the standard mixed-AD convention; reverse tapes remain unavailable. */
 class PreparedDeviceMixedInference
 {
+  friend struct MixedPeriodicGeometryValidationAccess;
 public:
   /// Prepare both routes up front; parameter conversion hazards may select FP64-only operation.
   PreparedDeviceMixedInference(std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
@@ -2544,6 +2545,22 @@ public:
   {
     return selected_ ? selected_->usesCooperativeOpenFeatures() :
         reference_.usesCooperativeOpenFeatures() || (approximate_ && approximate_->usesCooperativeOpenFeatures());
+  }
+
+  /// Report the effective graph after admission, including complete FP64 recovery.
+  bool usesCooperativePeriodicValueGeometry() const noexcept
+  {
+    return selected_ ? selected_->usesCooperativePeriodicValueGeometry() :
+        reference_.usesCooperativePeriodicValueGeometry() ||
+        (approximate_ && approximate_->usesCooperativePeriodicValueGeometry());
+  }
+
+  /// Mixed and shadow graphs retain their constructor-bound FP64 feature map.
+  bool usesCooperativePeriodicFeatureJets() const noexcept
+  {
+    return selected_ ? selected_->usesCooperativePeriodicFeatureJets() :
+        reference_.usesCooperativePeriodicFeatureJets() ||
+        (approximate_ && approximate_->usesCooperativePeriodicFeatureJets());
   }
 
   /// Describe the last numerical or preparation hazard selecting the reference route.
