@@ -10,6 +10,7 @@
 #include "PsiFormerDeviceComplexSpatialConcurrent.h"
 #include "PsiFormerDeviceComplexWeightedProducts.h"
 #include <cfloat>
+#include <cstdlib>
 
 #ifdef QMC_CUDA2HIP
 #define QMC_PF_TRACE_MUL hipCmul
@@ -67,6 +68,7 @@ __device__ cuDoubleComplex trace(const cuDoubleComplex* inverse, const cuDoubleC
 }
 
 /// Each independent determinant/target owns one N*N product and four channel terms.
+template<bool split_traces>
 __global__ void channelKernel(std::size_t batch, std::size_t determinants, std::size_t n,
     std::size_t targets, std::size_t begin, std::size_t live, std::size_t capacity,
     const cuDoubleComplex* inverse, const cuDoubleComplex* head, cuDoubleComplex* product,
@@ -80,7 +82,20 @@ __global__ void channelKernel(std::size_t batch, std::size_t determinants, std::
   auto* scratch = product + slot * nn;
   auto* channel_terms = terms + 4 * slot;
   ComplexSum channel;
-  if (threadIdx.x == 0)
+  __shared__ cuDoubleComplex independent_traces[4];
+  if constexpr (split_traces)
+  {
+    // Separate scalar sums keep each original i,j order and share only completed traces.
+    if (threadIdx.x < 4)
+    {
+      const auto plane = threadIdx.x == 0 ? 1 + 3 * targets + e : 1 + 3 * e + threadIdx.x - 1;
+      independent_traces[threadIdx.x] = trace(matrix_inverse, head + plane * m + offset, n);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+      channel.add(independent_traces[0]);
+  }
+  else if (threadIdx.x == 0)
     channel.add(trace(matrix_inverse, head + (1 + 3 * targets + e) * m + offset, n));
   for (std::size_t mu = 0; mu < 3; ++mu)
   {
@@ -96,7 +111,7 @@ __global__ void channelKernel(std::size_t batch, std::size_t determinants, std::
     __syncthreads();
     if (threadIdx.x == 0)
     {
-      const auto t = trace(matrix_inverse, derivative, n);
+      const auto t = split_traces ? independent_traces[1 + mu] : trace(matrix_inverse, derivative, n);
       channel_terms[mu] = t;
       channel.add(QMC_PF_TRACE_SUB(QMC_PF_TRACE_MUL(t, t), trace(scratch, scratch, n)));
       if (!finite(t))
@@ -245,11 +260,19 @@ Error launchComplexSpatialTracesConcurrent(Stream stream, std::size_t batch, std
   (void)mul(planes, mul(mul(batch, determinants), mul(n, n)));
   (void)mul(std::size_t(3), mul(batch, output_electrons));
   (void)mul(batch, planes);
+  const char* split_option = std::getenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT");
+  if (split_option && ((split_option[0] != '0' && split_option[0] != '1') || split_option[1] != '\0'))
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT must be 0 or 1");
+  const bool split_traces = split_option && split_option[0] == '1';
   for (std::size_t begin = 0; begin < targets;)
   {
     const auto live = std::min(plan.target_capacity, targets - begin);
-    channelKernel<<<static_cast<unsigned int>(batch * live * determinants), 128, 0, stream>>>(batch,
-        determinants, n, targets, begin, live, plan.target_capacity, inverse, head, product, channel_terms, status);
+    if (split_traces)
+      channelKernel<true><<<static_cast<unsigned int>(batch * live * determinants), 128, 0, stream>>>(batch,
+          determinants, n, targets, begin, live, plan.target_capacity, inverse, head, product, channel_terms, status);
+    else
+      channelKernel<false><<<static_cast<unsigned int>(batch * live * determinants), 128, 0, stream>>>(batch,
+          determinants, n, targets, begin, live, plan.target_capacity, inverse, head, product, channel_terms, status);
     auto result = launched();
     if (result != success)
       return result;

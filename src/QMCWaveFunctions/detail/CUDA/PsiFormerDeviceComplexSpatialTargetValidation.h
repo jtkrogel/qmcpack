@@ -8,7 +8,11 @@
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
+#include <limits>
+#include <string>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -295,9 +299,99 @@ void validateComplexSpatialTargetCosts()
   std::cout << "PASS complex target metadata-only costs: numeric_P_model_graph_allocations=0 runtime_claim=none\n";
 }
 
+/// Compare ordered trace schedules, including a target-slab tail and failed partial terms.
+void validateComplexSpatialTraceSplit()
+{
+  const char* configured = std::getenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT");
+  // Restore the caller's selector even when a validation check throws.
+  struct RestoreOption
+  {
+    bool existed;
+    std::string value;
+    ~RestoreOption()
+    {
+      if (existed)
+        ::setenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT", value.c_str(), 1);
+      else
+        ::unsetenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT");
+    }
+  } restore{configured != nullptr, configured ? configured : ""};
+  constexpr std::size_t batch = 2, determinants = 3, n = 7, targets = 5, capacity = 3;
+  constexpr std::size_t matrix_span = batch * determinants * n * n;
+  const auto plan = planComplexSpatialTraceWorkspace(batch, determinants, n, targets, capacity);
+  std::vector<cuDoubleComplex> inverse(matrix_span), head((1 + 4 * targets) * matrix_span);
+  for (std::size_t i = 0; i < inverse.size(); ++i)
+    inverse[i] = make_cuDoubleComplex(0.03 * std::sin(double(i + 1)), 0.02 * std::cos(double(3 * i + 2)));
+  for (std::size_t i = 0; i < head.size(); ++i)
+    head[i] = make_cuDoubleComplex(0.01 * std::sin(double(2 * i + 1)), 0.007 * std::cos(double(5 * i + 3)));
+  const std::vector<ComplexValueChannel> channels(batch * determinants, {make_cuDoubleComplex(1, 0), 0, 0});
+  const std::vector<ComplexValueResult> amplitude(batch, {make_cuDoubleComplex(1, 0), std::log(double(determinants)), 1, 0, 0});
+  const std::vector<double> cusp(batch * (1 + 4 * targets), 0);
+  const auto sentinel = make_cuDoubleComplex(-7.25, 0.125);
+  std::vector<cuDoubleComplex> terms(plan.channel_elements, sentinel), outputs(5 * batch * n, sentinel);
+  DeviceBuffer<cuDoubleComplex> di(inverse.size()), dh(head.size()), product(plan.product_elements), dt(terms.size()), dout(outputs.size());
+  DeviceBuffer<ComplexValueChannel> dc(channels.size());
+  DeviceBuffer<ComplexValueResult> da(amplitude.size());
+  DeviceBuffer<double> dcu(cusp.size());
+  DeviceBuffer<std::uint64_t> status(1);
+  di.upload(inverse.data(), inverse.size()); dc.upload(channels.data(), channels.size());
+  da.upload(amplitude.data(), amplitude.size()); dcu.upload(cusp.data(), cusp.size());
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  const auto launch = [&] {
+    checkRuntime(launchComplexSpatialTracesConcurrent(queue.getNative(), batch, determinants, n, targets, n,
+        capacity, dc.data(), da.data(), di.data(), dh.data(), dcu.data(), product.data(), dt.data(),
+        dout.data(), dout.data() + 3 * batch * n, dout.data() + 4 * batch * n, status.data()), "ordered trace split fixture");
+  };
+  for (bool nonfinite : {false, true})
+  {
+    if (nonfinite) head[3 * matrix_span + 7] = make_cuDoubleComplex(std::numeric_limits<double>::quiet_NaN(), 0.125);
+    dh.upload(head.data(), head.size());
+    std::vector<cuDoubleComplex> reference_terms, reference_outputs;
+    std::uint64_t reference_status = UINT64_MAX;
+    for (const char* option : {"0", "1"})
+    {
+      if (::setenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT", option, 1))
+        throw std::runtime_error("Cannot configure ordered trace split fixture");
+      std::fill(terms.begin(), terms.end(), sentinel); std::fill(outputs.begin(), outputs.end(), sentinel);
+      dt.upload(terms.data(), terms.size()); dout.upload(outputs.data(), outputs.size());
+      std::uint64_t result = UINT64_MAX; status.upload(&result, 1);
+      launch(); queue.sync();
+      status.download(&result, 1); dt.download(terms.data(), terms.size()); dout.download(outputs.data(), outputs.size());
+      if ((result != UINT64_MAX) != nonfinite)
+        throw std::runtime_error("Ordered trace split fixture returned an incorrect failure status");
+      for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t e = targets; e < n; ++e)
+          for (std::size_t lane = 0; lane < 5; ++lane)
+          {
+            const auto index = lane < 3 ? 3 * (b * n + e) + lane : lane * batch * n + b * n + e;
+            if (std::memcmp(&outputs[index], &sentinel, sizeof(sentinel)))
+              throw std::runtime_error("Ordered trace split wrote beyond its target extent");
+          }
+      if (option[0] == '0')
+      {
+        reference_terms = terms;
+        reference_outputs = outputs;
+        reference_status = result;
+      }
+      else if (result != reference_status || std::memcmp(terms.data(), reference_terms.data(), terms.size() * sizeof(sentinel)) ||
+          std::memcmp(outputs.data(), reference_outputs.data(), outputs.size() * sizeof(sentinel)))
+        throw std::runtime_error("Ordered trace split changed finite/failed terms, outputs or status bits");
+    }
+  }
+  if (::setenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT", "invalid", 1))
+    throw std::runtime_error("Cannot configure invalid ordered trace selector");
+  bool rejected = false;
+  try { launch(); }
+  catch (const std::invalid_argument& error)
+  { rejected = std::string(error.what()) == "PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT must be 0 or 1"; }
+  if (!rejected) throw std::runtime_error("Ordered trace split admitted an invalid selector");
+  std::cout << "PASS ordered complex trace split B2/D3/N7/K5/T3 finite/NaN partial terms, status, outputs and tails exact; invalid selector rejected\n";
+}
+
 /// Target forward-only oracle/legacy parity, physical outputs, generations and budgets.
 void validateComplexSpatialTargets(std::size_t concurrent_targets = 0)
 {
+  if (concurrent_targets == 8) validateComplexSpatialTraceSplit();
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
   using C = std::complex<double>;
