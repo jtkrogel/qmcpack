@@ -88,7 +88,8 @@ inline ComplexSpatialCost estimateComplexSpatialCost(const PsiFormerExecutionPla
 
 /// Count the bounded forward-only paired target profile, never a kinetic/reverse owner.
 inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
-                                                         std::size_t batch = 1, std::size_t concurrent_targets = 0)
+                                                         std::size_t batch = 1, std::size_t concurrent_targets = 0,
+                                                         bool batched_projection = false)
 {
   const auto base = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto prefix = estimateHeadFreeTargetPrefixCost(plan, targets, batch);
@@ -105,9 +106,20 @@ inline ComplexSpatialCost estimateComplexSpatialTargetCost(const PsiFormerExecut
               add(mul(batch, sizeof(ComplexValueResult)), 8))))))));
   // B1 keeps its original stack current-amplitude staging; batches retain both arrays.
   const auto amplitude_host = mul(mul(batch, batch > 1 ? 2 : 1), sizeof(ComplexValueResult));
-  return withConcurrentSpatialTraceCost(
+  auto cost = withConcurrentSpatialTraceCost(
       {prefix.device_workspace_bytes, bytes, add(prefix.host_workspace_bytes, amplitude_host), base.matrices, h},
       plan, batch, targets, concurrent_targets);
+  if (batched_projection)
+  {
+    const auto planes = add(1, mul(4, targets));
+    cost.projection_pointer_bytes = mul(planes,
+        estimateComplexValueCost(plan, batch, true, false, true).projection_pointer_bytes);
+    // The same checked layout bound applies before either component bank allocates.
+    (void)orbitalProjectionPointerBytes(batch, planes, s.determinants,
+        (s.spin_up_electrons != 0) + (s.spin_up_electrons != n));
+    cost.device_bytes = add(cost.device_bytes, cost.projection_pointer_bytes);
+  }
+  return cost;
 }
 
 /** Numerical CORE FULL_VGL over one real trunk, paired head and canonical image.
@@ -152,15 +164,21 @@ public:
   /// Explicit batch target admission precedes every prefix/head/output allocation.
   static std::unique_ptr<PreparedDeviceComplexSpatial> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, TargetVglPreparation preparation,
-      std::size_t capacity = 1, std::size_t concurrent_targets = 0)
+      std::size_t capacity = 1, std::size_t concurrent_targets = 0, bool batched_projection = false)
   {
     if (!image || !preparation.max_targets || !preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget)
       throw std::invalid_argument("Complex target VGL requires a paired image, positive K and explicit caps");
     image->validateCurrentDevice();
-    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity, concurrent_targets);
+    const auto cost = estimateComplexSpatialTargetCost(image->plan(), preparation.max_targets, capacity,
+        concurrent_targets, batched_projection);
     const auto prefix = estimateHeadFreeTargetPrefixCost(image->plan(), preparation.max_targets, capacity);
     if (cost.device_bytes > preparation.device_workspace_budget_bytes || prefix.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Complex target VGL exceeds its per-owner byte/work caps");
+    if (cost.projection_pointer_bytes)
+      std::clog << "  Paired head projection preparation: mode=EXPLICIT_TARGET selected=determinant_batched D="
+                << image->plan().modelShape().determinants << " capacity=" << capacity
+                << " K=" << preparation.max_targets << " pointer_device_bytes=" << cost.projection_pointer_bytes
+                << " pointer_host_bytes=0; before_allocation=yes\n";
     return std::unique_ptr<PreparedDeviceComplexSpatial>(new PreparedDeviceComplexSpatial(
         std::move(image), capacity, queue, blas, cost, preparation, concurrent_targets));
   }

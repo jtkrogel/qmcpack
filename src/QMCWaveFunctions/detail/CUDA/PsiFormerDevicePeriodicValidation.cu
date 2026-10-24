@@ -681,7 +681,10 @@ int main(int argc, char** argv)
       qmcplusplus::psiformer::device::PeriodicFeatureJetsValidationAccess::run(queue);
     }
     else if (argc == 2 && std::string_view(argv[1]) == "--head-determinant-batch-only")
+    {
       qmcplusplus::psiformer::device::validateOrbitalDeterminantBatches();
+      qmcplusplus::psiformer::device::validateBatchedHeadTargetOwner();
+    }
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-inverse-columns-only")
       qmcplusplus::psiformer::device::validateComplexInverseColumns();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-roots-only")

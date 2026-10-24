@@ -6,6 +6,9 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_TARGET_VALIDATION_H
 #include "PsiFormerDeviceComplexSpatial.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include <cmath>
+#include <iomanip>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -55,6 +58,158 @@ struct ComplexSpatialTargetValidationAccess
       throw std::runtime_error("Forward paired target late physical-tail failure not exercised");
   }
 };
+
+/// Exercise the existing head bank with compact K/B tails and complete target products.
+inline void validateBatchedHeadTargetOwner()
+{
+  constexpr std::size_t n = 64, capacity = 3, k = 7, trace_targets = 3;
+  const auto descriptors = makeTargetCostPlan(n, true, true);
+  const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
+      PSIFORMER_COMPLEX_PERIODIC_V1, descriptors.environment());
+  const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
+  const auto old_cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets);
+  const auto cost = estimateComplexSpatialTargetCost(plan, k, capacity, trace_targets, true);
+  const auto pointer_bytes = 2 * orbitalProjectionPointerBytes(capacity, 1 + 4 * k,
+      plan.modelShape().determinants, 2);
+  if (cost.projection_pointer_bytes != pointer_bytes ||
+      cost.device_bytes - old_cost.device_bytes != pointer_bytes || cost.host_bytes != old_cost.host_bytes)
+    throw std::runtime_error("Target head bank per-domain preflight differs from its exact capacity");
+
+  std::vector<double> nuclei(3 * plan.modelShape().nuclei), positions(capacity * 3 * n);
+  for (std::size_t i = 0; i < nuclei.size(); ++i) nuclei[i] = .23 + .071 * i;
+  const double irrational[3]{.6180339887498948, .4142135623730951, .7320508075688772};
+  for (std::size_t b = 0; b < capacity; ++b)
+    for (std::size_t e = 0; e < n; ++e)
+      for (std::size_t d = 0; d < 3; ++d)
+      {
+        const double fraction = (e + 1) * irrational[d] + .13 * (d + 1) + .017 * b;
+        positions[b * 3 * n + 3 * e + d] = 8 * (fraction - std::floor(fraction));
+      }
+  compute::Queue<PlatformKind::CUDA> queue;
+  AcceleratorBlasHandle blas(queue);
+  auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "target head owner device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "target head owner device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto work = estimateHeadFreeTargetPrefixCost(plan, k, capacity).charged_scalar_work_units;
+  const auto denied = metrics.snapshot();
+  for (bool bytes : {false, true})
+  {
+    bool rejected = false;
+    try { (void)PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+        {k, cost.device_bytes - bytes, work - !bytes}, capacity, trace_targets, true); }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected || metrics.snapshot().allocation_calls != denied.allocation_calls)
+      throw std::runtime_error("Target head cost/work-minus-one allocated numeric storage");
+  }
+  auto ordinary = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, old_cost.device_bytes, work}, capacity, trace_targets);
+  const auto cold = metrics.snapshot();
+  auto batched = PreparedDeviceComplexSpatial::prepare(image, queue, blas,
+      {k, cost.device_bytes, work}, capacity, trace_targets, true);
+  if (metrics.snapshot().live_bytes - cold.live_bytes != cost.device_bytes)
+    throw std::runtime_error("Target head actual owner bytes differ from admission");
+  const auto fingerprint = batched->traceStorageFingerprint();
+  auto full = PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas,
+      estimateComplexSpatialCost(plan, 1, trace_targets).device_bytes, trace_targets);
+
+  double max_head = 0, max_full = 0;
+  std::size_t comparisons = 0, nonexact_head = 0;
+  const auto scalar = [&](double reference, double actual, double& maximum, bool head) {
+    const double error = std::abs(reference - actual);
+    maximum = std::max(maximum, error);
+    if (!std::isfinite(reference) || !std::isfinite(actual) || error > 2e-11 * (1 + std::abs(reference)))
+      throw std::runtime_error("Target head component exceeds existing spatial FP64 contract");
+    nonexact_head += head && reference != actual;
+    ++comparisons;
+  };
+  const auto complex = [&](cuDoubleComplex reference, cuDoubleComplex actual, double& maximum, bool head) {
+    scalar(cuCreal(reference), cuCreal(actual), maximum, head);
+    scalar(cuCimag(reference), cuCimag(actual), maximum, head);
+  };
+  const auto compare = [&](std::size_t live, bool check_full) {
+    const std::vector<double> input(positions.begin(), positions.begin() + live * 3 * n);
+    const auto warm = metrics.snapshot();
+    ordinary->evaluate(input);
+    const auto middle = metrics.snapshot();
+    batched->evaluate(input);
+    const auto after = metrics.snapshot();
+    if (warm.allocation_calls != after.allocation_calls || warm.free_calls != after.free_calls ||
+        middle.uploaded_bytes - warm.uploaded_bytes != after.uploaded_bytes - middle.uploaded_bytes ||
+        middle.downloaded_bytes - warm.downloaded_bytes != after.downloaded_bytes - middle.downloaded_bytes ||
+        batched->traceStorageFingerprint() != fingerprint)
+      throw std::runtime_error("Target head warm path allocated or added HOST transfers");
+    std::vector<ComplexValueResult> a(live), b(live);
+    std::vector<cuDoubleComplex> ag(live * 3 * n), bg(ag.size()), al(live * n), bl(al.size()), ar(al.size()), br(al.size());
+    ordinary->download(ordinary->resultView(), a, ag, al, ar);
+    batched->download(batched->resultView(), b, bg, bl, br);
+    for (std::size_t i = 0; i < live; ++i)
+    {
+      if (a[i].status || b[i].status)
+        throw std::runtime_error("Target head comparison requires successful physical owners");
+      scalar(a[i].log_abs, b[i].log_abs, max_head, true);
+      complex(a[i].phase, b[i].phase, max_head, true);
+    }
+    for (std::size_t i = 0; i < ag.size(); ++i) complex(ag[i], bg[i], max_head, true);
+    for (std::size_t i = 0; i < al.size(); ++i)
+    {
+      complex(al[i], bl[i], max_head, true);
+      complex(ar[i], br[i], max_head, true);
+    }
+    if (check_full)
+    {
+      full->evaluate(std::vector<double>(input.begin(), input.begin() + 3 * n));
+      std::vector<ComplexValueResult> f(1);
+      std::vector<cuDoubleComplex> fg(3 * n), fl(n), fr(n);
+      full->download(full->resultView(), f, fg, fl, fr);
+      if (f[0].status) throw std::runtime_error("Target head FULL reference failed");
+      scalar(f[0].log_abs, b[0].log_abs, max_full, false);
+      complex(f[0].phase, b[0].phase, max_full, false);
+      for (std::size_t i = 0; i < fg.size(); ++i) complex(fg[i], bg[i], max_full, false);
+      for (std::size_t i = 0; i < n; ++i)
+      {
+        complex(fl[i], bl[i], max_full, false);
+        complex(fr[i], br[i], max_full, false);
+      }
+    }
+  };
+  for (std::size_t live : {3u, 1u, 2u}) compare(live, live == 1);
+  auto parameters = initialized.values;
+  for (const auto& tensor : plan.parameterTensors())
+    if (tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT) parameters[tensor.begin] += .0001;
+  auto successor = image->makeUpdatedImage(parameters, 1);
+  ordinary->rebindModel(successor);
+  batched->rebindModel(successor);
+  full->rebindModel(successor);
+  compare(3, true);
+
+  const auto stale = batched->resultView();
+  ComplexSpatialTargetValidationAccess::failLate(*batched, positions);
+  std::vector<ComplexValueResult> amplitude(capacity);
+  for (auto& value : amplitude) value.status = 777;
+  const auto marker = make_cuDoubleComplex(13, -9);
+  std::vector<cuDoubleComplex> gradient(capacity * 3 * n, marker), lap_log(capacity * n, marker), lap_ratio(lap_log);
+  bool stale_rejected = false;
+  try { batched->download(stale, amplitude, gradient, lap_log, lap_ratio); }
+  catch (const std::invalid_argument&) { stale_rejected = true; }
+  const auto unchanged = [&](const auto& values) {
+    return std::all_of(values.begin(), values.end(), [&](const auto value) {
+      return cuCreal(value) == 13 && cuCimag(value) == -9;
+    });
+  };
+  if (!stale_rejected || !std::all_of(amplitude.begin(), amplitude.end(), [](const auto& value) { return value.status == 777; }) ||
+      !unchanged(gradient) || !unchanged(lap_log) || !unchanged(lap_ratio))
+    throw std::runtime_error("Target head late failure published stale or partial products");
+  compare(1, false);
+  std::cout << std::setprecision(17) << "PASS target batched head Ne64 B3 K7 T3 comparisons=" << comparisons
+            << " max_head=" << max_head << " nonexact_head_fields=" << nonexact_head << " max_FULL=" << max_full
+            << " pointer_device_bytes=" << pointer_bytes << " pointer_host_bytes=0 cost_minus_one_noalloc=1"
+            << " liveB=3,1,2 K_tail=1 active_head_rebind=1 warm_allocations=0 added_HOST_transfers=0 late_rollback=1\n";
+}
 } // namespace qmcplusplus::psiformer::device
 
 /// Reuse metadata-only canonical descriptors; no numeric P/model/driver allocation.

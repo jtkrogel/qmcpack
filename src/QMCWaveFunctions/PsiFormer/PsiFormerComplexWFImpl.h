@@ -288,7 +288,8 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Dense complex GPU tiles require native aggregate device admission");
       const auto value = estimateComplexValueCost(plan, capacity, true, false, head_determinant_batch);
       const auto spatial = preparation.max_targets
-          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets)
+          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets,
+                head_determinant_batch)
           : estimateComplexSpatialCost(plan, capacity, trace_targets, head_determinant_batch);
       const auto work = preparation.max_targets
           ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity).charged_scalar_work_units : 0;
@@ -361,7 +362,8 @@ struct PsiFormerComplexWF::Impl
           value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas,
               value_cost.device_bytes, false, head_determinant_batch)),
           full(preparation.max_targets
-              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity, trace_targets)
+              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity,
+                    trace_targets, head_determinant_batch)
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
                     spatial_cost.device_bytes, trace_targets, head_determinant_batch, full_inverse_columns)),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
