@@ -105,12 +105,34 @@ inline bool complexScorePairCheckEligible(const PsiFormerExecutionPlan& plan)
   return complexScoreInverseColumnsEligible(plan);
 }
 
+/// Capture only the retained SCORE grid; explicit primitive oracles do not consult it.
+inline bool configuredComplexScoreWeightedGrid()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_SCORE_WEIGHTED_INVERSES_GRID");
+    if (!value || std::string_view(value) == "0") return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_SCORE_WEIGHTED_INVERSES_GRID must be 0 or 1");
+  }();
+  return enabled;
+}
+
+/// Keep six-launch overhead outside small or unqualified physical SCORE profiles.
+inline bool complexScoreWeightedGridEligible(const PsiFormerExecutionPlan& plan)
+{
+  return complexScoreInverseColumnsEligible(plan) && plan.modelShape().electrons() >= 100;
+}
+
 /// Standalone B1 score inventory; canonical bytes are exactly realP+complexP=24P.
-struct ComplexScoreCost { ComplexValueCost forward; std::size_t device_bytes, host_bytes, canonical_bytes; };
+struct ComplexScoreCost
+{
+  ComplexValueCost forward;
+  std::size_t device_bytes, host_bytes, canonical_bytes, weighted_grid_bytes;
+};
 
 /// Count the head-free retained VALUE profile, one network lane and one complexP.
 inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& plan,
-    bool pair_check = configuredComplexScorePairCheck())
+    bool pair_check = configuredComplexScorePairCheck(), bool weighted_grid = configuredComplexScoreWeightedGrid())
 {
   auto forward = estimateComplexValueCost(plan, 1, false);
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex score extent overflow"); };
@@ -136,8 +158,9 @@ inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& p
   const auto finite = mul(p / 4096 + (p % 4096 != 0), sizeof(DerivativeFiniteStatus));
   const auto reverse = add(mul(8, add(add(mul(10, nf), probability), p)), finite);
   const auto scratch = add(mul(8, add(add(forward.matrices, nf), add(mul(n, s.nuclei), add(q, 1)))), q);
-  return {forward, add(add(forward.device_bytes, reverse), add(mul(16, p), scratch)),
-      add(forward.host_bytes, finite), mul(24, p)};
+  const auto grid_bytes = weighted_grid && complexScoreWeightedGridEligible(plan) ? sizeof(ComplexScoreWeightedGridState) : 0;
+  return {forward, add(add(add(forward.device_bytes, reverse), add(mul(16, p), scratch)), grid_bytes),
+      add(forward.host_bytes, finite), mul(24, p), grid_bytes};
 }
 
 /// Raw scalar-objective VJP retains one tape/realP, with no inverse or complexP.
@@ -146,7 +169,7 @@ inline ComplexScoreCost estimateComplexOrbitalVJPCost(const PsiFormerExecutionPl
   if (plan.environment().periodic_profile ||
       plan.environment().geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
     throw std::invalid_argument("Paired raw-orbital VJP requires the qualified periodic_torus_v1 profile");
-  auto cost = estimateComplexScoreCost(plan, false);
+  auto cost = estimateComplexScoreCost(plan, false, false);
   const auto multiply = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex orbital VJP bytes overflow"); };
   const auto& shape = plan.modelShape();
   const auto inverse_bytes = spatial_detail::checkedAdd(multiply(16, cost.forward.matrices),
@@ -224,6 +247,9 @@ public:
 
   /// Report the immutable cold selection without changing execution or ownership.
   bool usesCooperativeWeightedInverses() const noexcept { return cooperative_weighted_inverses_; }
+
+  /// The preflight cost, not a second environment read, owns the grid selection.
+  bool usesWeightedInverseGrid() const noexcept { return weighted_grid_.capacity() != 0; }
 
   /// Report the frozen retained inverse choice without consulting hot-loop environment state.
   bool usesInverseColumns() const noexcept { return inverse_columns_; }
@@ -402,13 +428,18 @@ private:
         same_(pair_.capacity(), "ComplexScore::same_", __FILE__, __LINE__),
         unit_(1, "ComplexScore::unit_", __FILE__, __LINE__),
         score_(orbital_only ? 0 : forward_->trunk_->plan_.parameterCount(), "ComplexScore::score_", __FILE__, __LINE__),
-        orbital_cotangents_(orbital_only ? cost.forward.matrices : 0, "ComplexScore::orbital_cotangents_", __FILE__, __LINE__)
+        orbital_cotangents_(orbital_only ? cost.forward.matrices : 0, "ComplexScore::orbital_cotangents_", __FILE__, __LINE__),
+        weighted_grid_(cost.weighted_grid_bytes ? 1 : 0, "ComplexScore::weighted_grid_", __FILE__, __LINE__)
   {
+    if ((cost.weighted_grid_bytes != 0 && cost.weighted_grid_bytes != sizeof(ComplexScoreWeightedGridState)) ||
+        (cost.weighted_grid_bytes && (orbital_only || !complexScoreWeightedGridEligible(forward_->trunk_->plan_))))
+      throw std::logic_error("Complex score grid differs from its frozen admission");
     const double one = 1;
     unit_.upload(&one, 1);
     const auto actual = forward_->cost().device_bytes + network_->deviceWorkspaceBytes() +
         8 * (seed_.capacity() + feature_.capacity() + ion_.capacity() + pair_.capacity() + unit_.capacity()) +
-        same_.capacity() + 16 * (score_.capacity() + orbital_cotangents_.capacity());
+        same_.capacity() + 16 * (score_.capacity() + orbital_cotangents_.capacity()) +
+        sizeof(ComplexScoreWeightedGridState) * weighted_grid_.capacity();
     if (actual != cost.device_bytes || forward_->cost().host_bytes + network_->hostWorkspaceBytes() != cost.host_bytes ||
         8 * network_->response_.capacity() + 16 * score_.capacity() != cost.canonical_bytes)
       throw std::logic_error("Complex score inventory differs from exact preflight/24P");
@@ -442,9 +473,14 @@ private:
     auto& t = *forward_->trunk_;
     const auto weighted_inverse = cooperative_weighted_inverses_ ? launchComplexScoreWeightedInversesCooperative :
         launchComplexScoreWeightedInverses;
-    checkRuntime(weighted_inverse(t.queue_.getNative(), t.shape_.determinants, t.ne_,
-        forward_->channels_.data(), forward_->inverse_.data(), t.cusp_jets_.data(), forward_->results_.data(),
-        forward_->status_.data()), "complex score weighted inverse epoch");
+    if (usesWeightedInverseGrid())
+      checkRuntime(launchComplexScoreWeightedInversesGrid(t.queue_.getNative(), t.shape_.determinants, t.ne_,
+          forward_->channels_.data(), forward_->inverse_.data(), t.cusp_jets_.data(), forward_->results_.data(),
+          forward_->status_.data(), weighted_grid_.data(), weighted_grid_.capacity()), "complex score weighted grid epoch");
+    else
+      checkRuntime(weighted_inverse(t.queue_.getNative(), t.shape_.determinants, t.ne_,
+          forward_->channels_.data(), forward_->inverse_.data(), t.cusp_jets_.data(), forward_->results_.data(),
+          forward_->status_.data()), "complex score weighted inverse epoch");
     forward_->admitStatus();
     checkRuntime(launchScoreGeometry(t.queue_.getNative(), 1, t.ne_, t.shape_.nuclei, t.shape_.spin_up_electrons,
         t.positions_.data(), t.model_->nuclei(), ion_.data(), pair_.data(), same_.data(), t.model_->periodicCell()), "complex score geometry");
@@ -556,6 +592,7 @@ private:
   DeviceBuffer<std::uint8_t> same_;
   DeviceBuffer<double> unit_;
   DeviceBuffer<cuDoubleComplex> score_, orbital_cotangents_;
+  DeviceBuffer<ComplexScoreWeightedGridState> weighted_grid_;
   std::size_t generation_ = 0;
   bool ready_ = false;
   bool orbital_forward_ready_ = false;

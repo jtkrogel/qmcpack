@@ -186,6 +186,119 @@ __global__ void weightedInversesCooperative(std::size_t d, std::size_t n, const 
   }
 }
 
+/// Metadata has canonical priority over every inverse-entry failure.
+__global__ void weightedGridBegin(std::size_t d, const ComplexValueChannel* channels,
+    const ComplexValueResult* amplitude, std::uint64_t* status, ComplexScoreWeightedGridState* state)
+{
+  state->first_bad = ~std::uint64_t(0);
+  state->rejected = 0;
+  state->shift = -DBL_MAX;
+  for (std::size_t channel = 0; channel < d; ++channel)
+  {
+    if (channels[channel].status || amplitude->status || !device_math::isFiniteBinary64(channels[channel].log_abs) ||
+        !device_math::isFiniteBinary64(cuCreal(channels[channel].phase)) ||
+        !device_math::isFiniteBinary64(cuCimag(channels[channel].phase)))
+    {
+      fail(status, channel);
+      state->rejected = 1;
+      return;
+    }
+    state->shift = fmax(state->shift, channels[channel].log_abs);
+  }
+}
+
+/// Globally admit the untouched inverse before scalar determinant normalization.
+__global__ void weightedGridFinite(std::size_t count, const cuDoubleComplex* inverse,
+    ComplexScoreWeightedGridState* state)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (state->rejected || i >= count) return;
+  if (!device_math::isFiniteBinary64(cuCreal(inverse[i])) || !device_math::isFiniteBinary64(cuCimag(inverse[i])))
+    atomicMin(reinterpret_cast<unsigned long long*>(&state->first_bad), static_cast<unsigned long long>(i));
+}
+
+/// Keep the original increasing-channel compensated normalization and per-channel arithmetic.
+__global__ void weightedGridNormalize(std::size_t d, const ComplexValueChannel* channels,
+    std::uint64_t* status, ComplexScoreWeightedGridState* state)
+{
+  if (state->rejected) return;
+  if (state->first_bad != ~std::uint64_t(0))
+  {
+    fail(status, state->first_bad);
+    state->rejected = 1;
+    return;
+  }
+  device_determinant::CompensatedSumBinary64 re, im;
+  for (std::size_t channel = 0; channel < d; ++channel)
+  {
+    const auto factor = exp(channels[channel].log_abs - state->shift);
+    re.add(factor * cuCreal(channels[channel].phase));
+    im.add(factor * cuCimag(channels[channel].phase));
+  }
+  const auto scale = fmax(fabs(re.value()), fabs(im.value()));
+  if (!(scale > 0) || !device_math::isFiniteBinary64(re.value()) || !device_math::isFiniteBinary64(im.value()))
+  {
+    fail(status, 0);
+    state->rejected = 1;
+    return;
+  }
+  const auto ur = re.value() / scale, ui = im.value() / scale, norm = hypot(ur, ui);
+  state->phase = make_cuDoubleComplex(ur / norm, ui / norm);
+  state->log_total = log(scale) + log(norm);
+  for (std::size_t channel = 0; channel < d; ++channel)
+  {
+    state->log_weights[channel] = (channels[channel].log_abs - state->shift) - state->log_total;
+    state->ratios[channel] = QMC_PF_DIV(channels[channel].phase, state->phase);
+  }
+}
+
+/// No mutation until ALL independent weighted products have admitted.
+__global__ void weightedGridValidate(std::size_t d, std::size_t n, const cuDoubleComplex* inverse,
+    ComplexScoreWeightedGridState* state)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (state->rejected || i >= d * n * n) return;
+  const auto channel = i / (n * n);
+  cuDoubleComplex candidate;
+  if (!complex_detail::weightedProduct(state->log_weights[channel], state->ratios[channel], inverse[i], candidate))
+    atomicMin(reinterpret_cast<unsigned long long*>(&state->first_bad), static_cast<unsigned long long>(i));
+}
+
+/// Successful entries are disjoint; failure replays the original prefix on untouched inputs.
+__global__ void weightedGridStore(std::size_t d, std::size_t n, cuDoubleComplex* inverse,
+    std::uint64_t* status, const ComplexScoreWeightedGridState* state)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (state->rejected) return;
+  if (state->first_bad != ~std::uint64_t(0))
+  {
+    if (index == 0)
+      for (std::size_t channel = 0; channel < d; ++channel)
+        for (std::size_t i = channel * n * n; i < (channel + 1) * n * n; ++i)
+          if (!complex_detail::weightedProduct(state->log_weights[channel], state->ratios[channel], inverse[i], inverse[i]))
+          {
+            fail(status, i);
+            return;
+          }
+    return;
+  }
+  if (index < d * n * n)
+  {
+    const auto channel = index / (n * n);
+    complex_detail::weightedProduct(state->log_weights[channel], state->ratios[channel], inverse[index], inverse[index]);
+  }
+}
+
+/// A separate launch is the required GLOBAL store barrier before amplitude publication.
+__global__ void weightedGridPublish(const double* cusp, ComplexValueResult* amplitude,
+    std::uint64_t* status, const ComplexScoreWeightedGridState* state)
+{
+  if (state->rejected || state->first_bad != ~std::uint64_t(0)) return;
+  amplitude->phase = state->phase;
+  amplitude->log_abs = state->shift + state->log_total + cusp[0];
+  if (!device_math::isFiniteBinary64(amplitude->log_abs)) fail(status, 0);
+}
+
 /// Reuse one realM scratch for four spin/head affine seeds, then the envelope seed.
 __global__ void headSeed(std::size_t d, std::size_t n, std::size_t spin_up,
     const cuDoubleComplex* inverse, const double* envelope, const double* real, const double* imag,
@@ -264,6 +377,44 @@ Error launchComplexScoreWeightedInversesCooperative(Stream stream, std::size_t d
   if (n < 64 || n > 300 || d == 0 || d > 16)
     return launchComplexScoreWeightedInverses(stream, d, n, channels, inverse, cusp, amplitude, status);
   weightedInversesCooperative<<<1, 128, 0, stream>>>(d, n, channels, inverse, cusp, amplitude, status);
+  return launched();
+}
+
+/// Preserve the old entries while distributing only independent inverse output work.
+Error launchComplexScoreWeightedInversesGrid(Stream stream, std::size_t d, std::size_t n,
+    const ComplexValueChannel* channels, cuDoubleComplex* inverse, const double* cusp,
+    ComplexValueResult* amplitude, std::uint64_t* status,
+    ComplexScoreWeightedGridState* state, std::size_t state_count)
+{
+  if (!n || !d)
+    throw std::invalid_argument("Weighted grid dimensions must be positive");
+  if (n < 100 || n > 300 || d > 16)
+    return launchComplexScoreWeightedInversesCooperative(stream, d, n, channels, inverse, cusp, amplitude, status);
+  if (!channels || !inverse || !cusp || !amplitude || !status || !state || state_count < 1)
+    throw std::invalid_argument("Weighted grid requires complete inputs and one private state");
+  const auto count = d * n * n;
+  const auto overlap = [](const void* a, std::size_t bytes, const void* b, std::size_t other) {
+    const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+    return x <= y ? y - x < bytes : x - y < other;
+  };
+  if (overlap(state, sizeof(*state), inverse, count * sizeof(*inverse)) ||
+      overlap(state, sizeof(*state), channels, d * sizeof(*channels)) ||
+      overlap(state, sizeof(*state), cusp, sizeof(*cusp)) ||
+      overlap(state, sizeof(*state), amplitude, sizeof(*amplitude)) ||
+      overlap(state, sizeof(*state), status, sizeof(*status)))
+    throw std::invalid_argument("Weighted grid private state aliases an input or public output");
+  const auto blocks = static_cast<unsigned>((count + 127) / 128);
+  weightedGridBegin<<<1, 1, 0, stream>>>(d, channels, amplitude, status, state);
+  auto error = launched(); if (error != 0) return error;
+  weightedGridFinite<<<blocks, 128, 0, stream>>>(count, inverse, state);
+  error = launched(); if (error != 0) return error;
+  weightedGridNormalize<<<1, 1, 0, stream>>>(d, channels, status, state);
+  error = launched(); if (error != 0) return error;
+  weightedGridValidate<<<blocks, 128, 0, stream>>>(d, n, inverse, state);
+  error = launched(); if (error != 0) return error;
+  weightedGridStore<<<blocks, 128, 0, stream>>>(d, n, inverse, status, state);
+  error = launched(); if (error != 0) return error;
+  weightedGridPublish<<<1, 1, 0, stream>>>(cusp, amplitude, status, state);
   return launched();
 }
 
