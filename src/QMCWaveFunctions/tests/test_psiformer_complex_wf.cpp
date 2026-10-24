@@ -614,6 +614,107 @@ TEST_CASE("PsiFormer paired system metadata survives private ownership",
   std::filesystem::remove(path);
 }
 
+#ifndef MIXED_PRECISION
+TEST_CASE("PsiFormer paired immediate FULL replay proves fresh physical products and weak identity",
+          "[wavefunction][psiformer][complex_wf][immediate_full_replay]")
+{
+  SimulationCell simulation_cell(cell());
+  auto live = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const std::array<double, 3> twist{.125, -.0625, .03125};
+  live.setTwist(ParticleSet::PosType{twist[0], twist[1], twist[2]});
+  PsiFormerComplexWF component("replay", parameters(), live, source, clone_cap, twist, 0, {}, "pseudopotential");
+  CHECK_FALSE(component.canReuseImmediateFullSpatialReplay(live, live, {}, {},
+      component.immediateFullReplayContext(), 0, 0));
+  live.G = C{};
+  live.L = C{};
+  const auto log = component.evaluateLog(live, live.G, live.L);
+  ParticleSet saved(live);
+  auto context = component.immediateFullReplayContext();
+  std::vector<WaveFunctionComponent::ValueType> gradient, laplacian;
+  for (int e = 0; e < live.getTotalNum(); ++e)
+  {
+    for (int d = 0; d < 3; ++d)
+      gradient.push_back(live.G[e][d]);
+    laplacian.push_back(live.L[e]);
+  }
+  double expected_log = std::real(log), expected_phase = std::imag(log);
+  auto matches = [&] {
+    return component.canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian,
+                                                         context, expected_log, expected_phase);
+  };
+  REQUIRE(matches());
+  const auto storage = component.numericStorage();
+  bool positive = false;
+  SECTION("fresh proof is independent of stale retained derivatives")
+  {
+    saved.G[0][0] += C{.1, .2};
+    saved.L[0] -= C{.3, .4};
+    positive = true;
+  }
+  SECTION("imaginary fresh gradient changed") { gradient[0] += C{0, .125}; }
+  SECTION("real fresh Laplacian changed") { laplacian[0] += C{.125, 0}; }
+  SECTION("live derivatives changed") { live.G[0][0] += C{.125, 0}; }
+  SECTION("fresh extent changed") { gradient.pop_back(); }
+  SECTION("live coordinate extent changed") { live.R.resize(1); }
+  SECTION("saved spin extent changed") { saved.spins.resize(1); }
+  SECTION("nonfinite fresh view") { laplacian[0] = C{0, std::numeric_limits<double>::infinity()}; }
+  SECTION("coordinates changed") { live.R[0][0] += .125; }
+  SECTION("saved coordinates changed") { saved.R[0][0] += .125; }
+  SECTION("spin changed") { saved.spins[0] += .125; }
+  SECTION("group changed") { saved.GroupID[0] = 1; }
+  SECTION("mass stamp changed") { context.masses[0] += .125; }
+  SECTION("source changed") { source.R[0][0] += .125; }
+  SECTION("source charge changed")
+  {
+    auto& species = source.getSpeciesSet();
+    species(species.findAttribute("charge"), 0) += .125;
+  }
+  SECTION("shared cell changed") { simulation_cell.getLattice().R(0, 0) += .125; }
+  SECTION("sub-tolerance shared cell change is not exact evidence")
+  {
+    auto& r = simulation_cell.getLattice().R(0, 0);
+    r = std::nextafter(r, std::numeric_limits<double>::infinity());
+  }
+  SECTION("nonfinite shared cell")
+  {
+    simulation_cell.getLattice().R(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  }
+  SECTION("twist changed") { live.setTwist(ParticleSet::PosType{}); }
+  SECTION("foreign source stamp") { context.source = &saved; }
+  SECTION("stale version stamp") { ++context.version; }
+  SECTION("expired model stamp") { context.model.reset(); }
+  SECTION("foreign live target")
+  {
+    ParticleSet foreign(live);
+    CHECK_FALSE(component.canReuseImmediateFullSpatialReplay(foreign, saved, gradient, laplacian,
+                                                             context, expected_log, expected_phase));
+    positive = true;
+  }
+  SECTION("foreign same-shape model stamp")
+  {
+    PsiFormerComplexWF foreign("foreign", parameters(), live, source, clone_cap, twist, 0, {}, "pseudopotential");
+    context.model = foreign.immediateFullReplayContext().model;
+    CHECK_FALSE(matches());
+  }
+  SECTION("missing device image") { context.device_image = true; }
+  SECTION("log changed") { expected_log += .125; }
+  SECTION("phase changed") { expected_phase += .125; }
+  SECTION("active unresolved proposal") { live.makeMove(0, ParticleSet::PosType{.01, 0, 0}); }
+  SECTION("same-family parameter publication invalidates proof")
+  {
+    const auto original = component.snapshotParameters();
+    auto changed = original;
+    changed.values[0] += .001;
+    component.publishParameters(changed, original.version);
+  }
+  SECTION("isolated model replacement invalidates weak ownership") { component.isolateParameterState(); }
+  CHECK(matches() == positive);
+  CHECK(matches() == positive);
+  CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+}
+#endif
+
 TEST_CASE("PsiFormer standalone native real Gamma remains a real model in a complex build",
           "[wavefunction][psiformer][complex_wf][model_file]")
 {
@@ -5034,6 +5135,133 @@ TEST_CASE("PsiFormer explicit GPU parameter publication reuses inference storage
 #endif
 
 #ifdef ENABLE_CUDA
+#ifndef MIXED_PRECISION
+TEST_CASE("PsiFormer paired B2 immediate replay owns every live tile and tail product",
+          "[wavefunction][psiformer][complex_gpu_immediate_full_replay]")
+{
+  namespace dev = ps::device;
+  int count = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  REQUIRE(hipGetDeviceCount(&count) == hipSuccess);
+  REQUIRE(count > 0);
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
+  REQUIRE(count > 0);
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  REQUIRE(dev::configuredDeviceMemoryAdmission().limit_bytes != 0);
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "1");
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  {
+    const SimulationCell simulation_cell(cell());
+    auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell), p2 = electrons(simulation_cell);
+    auto source = ions(simulation_cell);
+    const std::array<double, 3> twist{.125, -.0625, .03125};
+    std::array<ParticleSet*, 3> particles{&p0, &p1, &p2};
+    for (auto* p : particles)
+      p->setTwist(ParticleSet::PosType{twist[0], twist[1], twist[2]});
+    p1.R[0][0] += .11;
+    p2.R[3][1] -= .09;
+    p1.update();
+    p2.update();
+    PsiFormerComplexWF gpu("replay_b2", parameters(), p0, source, clone_cap, twist,
+                           64 * 1024 * 1024, {}, "pseudopotential");
+    auto clone1 = gpu.makeClone(p1), clone2 = gpu.makeClone(p2);
+    std::array<PsiFormerComplexWF*, 3> components{
+        &gpu, dynamic_cast<PsiFormerComplexWF*>(clone1.get()), dynamic_cast<PsiFormerComplexWF*>(clone2.get())};
+    REQUIRE(components[1] != nullptr);
+    REQUIRE(components[2] != nullptr);
+    RefVectorWithLeader<WaveFunctionComponent> team(gpu, {gpu, *clone1, *clone2});
+    RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1, p2});
+    RefVector<ParticleSet::ParticleGradient> gradients{p0.G, p1.G, p2.G};
+    RefVector<ParticleSet::ParticleLaplacian> laplacians{p0.L, p1.L, p2.L};
+    ResourceCollection resource("paired B2 immediate replay");
+    gpu.createResource(resource);
+    using Value = WaveFunctionComponent::ValueType;
+    std::array<std::unique_ptr<ParticleSet>, 3> saved;
+    std::array<PsiFormerComplexWF::ImmediateFullReplayContext, 3> contexts;
+    std::array<std::vector<Value>, 3> fresh_g, fresh_l;
+    std::array<WaveFunctionComponent::LogValue, 3> logs;
+    const auto matches = [&](std::size_t i) {
+      return components[i]->canReuseImmediateFullSpatialReplay(*particles[i], *saved[i],
+          fresh_g[i], fresh_l[i], contexts[i], std::real(logs[i]), std::imag(logs[i]));
+    };
+    const auto capture = [&] {
+      for (std::size_t i = 0; i < particles.size(); ++i)
+      {
+        saved[i] = std::make_unique<ParticleSet>(*particles[i]);
+        contexts[i] = components[i]->immediateFullReplayContext();
+        logs[i] = components[i]->get_log_value();
+        fresh_g[i].clear();
+        fresh_l[i].clear();
+        for (int e = 0; e < particles[i]->getTotalNum(); ++e)
+        {
+          for (int d = 0; d < 3; ++d)
+            fresh_g[i].push_back(particles[i]->G[e][d]);
+          fresh_l[i].push_back(particles[i]->L[e]);
+        }
+        REQUIRE(matches(i));
+      }
+    };
+
+    // Three walkers exercise a full B2 tile and its live one-walker tail.
+    for (int acquisition = 0; acquisition < 2; ++acquisition)
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lease(resource, team);
+      for (auto* p : particles) { p->G = 0; p->L = 0; }
+      gpu.mw_evaluateLog(team, targets, gradients, laplacians);
+      capture();
+      const auto warm = metrics.snapshot();
+      for (std::size_t i = 0; i < particles.size(); ++i)
+      {
+        CHECK(matches(i));
+        CHECK(matches(i)); // The component proof is read-only, not the driver's one-use receipt.
+      }
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+      CHECK(metrics.snapshot().free_calls == warm.free_calls);
+
+      // Overwrite the shared lane with walker0 without invalidating copied walker1/tail products.
+      p0.G = 0;
+      p0.L = 0;
+      gpu.evaluateLog(p0, p0.G, p0.L);
+      CHECK(matches(1));
+      CHECK(matches(2));
+      const auto coordinate = p2.R[0][0];
+      p2.R[0][0] = std::numeric_limits<double>::quiet_NaN();
+      CHECK_FALSE(matches(2));
+      CHECK_THROWS(gpu.mw_evaluateLog(team, targets, gradients, laplacians));
+      p2.R[0][0] = coordinate;
+      CHECK(matches(1));
+      CHECK(matches(2)); // Failed whole-team preparation cannot partially publish any clone.
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+      CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    }
+
+    // A frozen B2 family remains B2; new image/version invalidates all old clone proofs.
+    const auto publication = gpu.gpuParameterPublicationRequirements();
+    auto candidate = gpu.snapshotParameters();
+    candidate.values[0] += .001;
+    controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "4");
+    REQUIRE(gpu.publishBudgetedGpuParameters(candidate, candidate.version,
+        publication.device_bytes, publication.host_bytes) == candidate.version + 1);
+    for (std::size_t i = 0; i < particles.size(); ++i)
+      CHECK_FALSE(matches(i));
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lease(resource, team);
+      for (auto* p : particles) { p->G = 0; p->L = 0; }
+      gpu.mw_evaluateLog(team, targets, gradients, laplacians);
+      capture();
+    }
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+  CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
+}
+#endif
+
 TEST_CASE("PsiFormer paired GPU B1 retains complete collective products across walker tiles",
           "[wavefunction][psiformer][complex_gpu_collective_b1]")
 {

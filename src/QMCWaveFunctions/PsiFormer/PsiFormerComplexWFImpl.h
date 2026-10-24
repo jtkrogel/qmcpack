@@ -3742,6 +3742,129 @@ bool PsiFormerComplexWF::matchesLegacyTorusPseudopotentialTarget(const ParticleS
   return true;
 }
 
+/// Weak identity stamps do not extend the lifetime of a retired inference generation.
+PsiFormerComplexWF::ImmediateFullReplayContext PsiFormerComplexWF::immediateFullReplayContext() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  ImmediateFullReplayContext result;
+  result.model = impl_->state;
+  result.source = impl_->state->source;
+  result.version = impl_->state->model.p.version();
+  const auto& masses = impl_->particles->get_mass_by_group();
+  if (masses.size() == result.masses.size())
+    std::copy(masses.begin(), masses.end(), result.masses.begin());
+#ifdef ENABLE_CUDA
+  if (impl_->state->gpu)
+  {
+    result.device_image = true;
+    result.image = impl_->state->gpu->image;
+  }
+#endif
+  return result;
+}
+
+/// Prove fresh sole-component products without a scatter, refresh, or accepted-grid draw.
+bool PsiFormerComplexWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live, const ParticleSet& saved,
+    const std::vector<ValueType>& fresh_gradient, const std::vector<ValueType>& fresh_laplacian,
+    const ImmediateFullReplayContext& context, double expected_log, double expected_phase) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto model = context.model.lock();
+  const auto& state = *impl_->state;
+  if (!model || model.get() != impl_->state.get() || context.model.owner_before(impl_->state) ||
+      impl_->state.owner_before(context.model) || context.source != state.source ||
+      context.version != state.model.p.version() || impl_->pending || impl_->collective_pending ||
+      state.pending_proposals.load(std::memory_order_relaxed) != 0 ||
+      live.getActivePtcl() != -1 || saved.getActivePtcl() != -1 ||
+      state.system_kind != "pseudopotential" || state.environment.periodic_profile ||
+      state.environment.boundary != psiformer::BoundaryCondition::PERIODIC ||
+      state.environment.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+      !isFiniteWavefunctionValue(log_value_) || std::real(log_value_) != expected_log ||
+      std::imag(log_value_) != expected_phase || impl_->accepted.isZero())
+    return false;
+#ifdef ENABLE_CUDA
+  if (bool(state.gpu) != context.device_image)
+    return false;
+  if (state.gpu)
+  {
+    const auto image = context.image.lock();
+    if (!image || image.get() != state.gpu->image.get() || context.image.owner_before(state.gpu->image) ||
+        state.gpu->image.owner_before(context.image) || state.gpu->image->version() != context.version ||
+        (state.gpu->capacity != 1 && state.gpu->capacity != 2) || state.gpu_crowds != 1 ||
+        state.gpu->preparation.max_targets || !state.gpu->value || !state.gpu->full)
+      return false;
+  }
+#else
+  if (context.device_image)
+    return false;
+#endif
+  // Canonical lattice admission is tolerant; this one-use proof requires exact finite context.
+  for (const auto* particles : {&live, &saved, state.source})
+  {
+    if (particles->getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+      return false;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      if (!psiformer::determinant::isFiniteReal(particles->getTwist()[axis]))
+        return false;
+      for (int d = 0; d < 3; ++d)
+        if (!psiformer::determinant::isFiniteReal(particles->getLattice().R(axis, d)) ||
+            particles->getLattice().R(axis, d) != state.environment.lattice_vectors[axis][d])
+          return false;
+    }
+  }
+  // Invalid fixed context is a miss; canonical FULL retains its original validation/error ordering.
+  try
+  {
+    impl_->validate(live);
+    validateRuntimeLattice(saved, state.environment, "Paired immediate FULL saved target");
+    Impl::validateDerivativeSource(state);
+  }
+  catch (const std::exception&)
+  {
+    return false;
+  }
+  const auto n = state.model.ne;
+  if (live.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
+      saved.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
+      saved.getTotalNum() != n || saved.groups() != 2 || live.R.size() != n || saved.R.size() != n ||
+      live.spins.size() != n || saved.spins.size() != n || live.GroupID.size() != n || saved.GroupID.size() != n ||
+      fresh_gradient.size() != 3 * n || fresh_laplacian.size() != n ||
+      live.G.size() != n || live.L.size() != n || impl_->own_gradient.size() != n || impl_->own_laplacian.size() != n)
+    return false;
+  // The configuration fingerprint traverses R/GroupID: extent proof must precede it.
+  if (!impl_->fullMatches(live))
+    return false;
+  for (int group = 0; group < 2; ++group)
+    if (saved.groupsize(group) != live.groupsize(group) ||
+        live.get_mass_by_group().size() != 2 || saved.get_mass_by_group().size() != 2 ||
+        !psiformer::determinant::isFiniteReal(context.masses[group]) || context.masses[group] <= 0 ||
+        live.get_mass_by_group()[group] != context.masses[group] ||
+        saved.get_mass_by_group()[group] != context.masses[group])
+      return false;
+  for (int axis = 0; axis < 3; ++axis)
+    if (live.getTwist()[axis] != state.reduced_twist[axis] || saved.getTwist()[axis] != state.reduced_twist[axis])
+      return false;
+  for (std::size_t e = 0; e < n; ++e)
+  {
+    if (live.GroupID[e] != saved.GroupID[e])
+      return false;
+    for (int d = 0; d < 3; ++d)
+      if (!psiformer::determinant::isFiniteReal(live.R[e][d]) || live.R[e][d] != saved.R[e][d] ||
+          !isFiniteWavefunctionValue(fresh_gradient[3 * e + d]) ||
+          fresh_gradient[3 * e + d] != live.G[e][d] ||
+          fresh_gradient[3 * e + d] != ValueType{} + impl_->own_gradient[e][d])
+        return false;
+    if (!isFiniteWavefunctionValue(fresh_laplacian[e]) || fresh_laplacian[e] != live.L[e] ||
+        fresh_laplacian[e] != ValueType{} + impl_->own_laplacian[e])
+      return false;
+  }
+  for (std::size_t e = 0; e < live.spins.size(); ++e)
+    if (!psiformer::determinant::isFiniteReal(live.spins[e]) || live.spins[e] != saved.spins[e])
+      return false;
+  return true;
+}
+
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {

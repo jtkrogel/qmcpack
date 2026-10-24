@@ -228,6 +228,24 @@ public:
   /// Prepared GPU inference profile; opt-in dense teams remain serialized and inference-only.
   bool gpuInferenceEnabled() const noexcept;
 
+  /// One synchronous replay's identity evidence; weak stamps never retain retired model images.
+  struct ImmediateFullReplayContext
+  {
+    std::weak_ptr<const void> model, image;
+    const ParticleSet* source = nullptr;
+    std::size_t version = 0;
+    std::array<double, 2> masses{};
+    bool device_image = false;
+  };
+
+  /// Capture current identity only; this does not refresh or publish spatial products.
+  ImmediateFullReplayContext immediateFullReplayContext() const;
+
+  /// Read-only exact proof for the driver's one-use second-FULL handoff.
+  bool canReuseImmediateFullSpatialReplay(const ParticleSet& live, const ParticleSet& saved,
+      const std::vector<ValueType>& fresh_gradient, const std::vector<ValueType>& fresh_laplacian,
+      const ImmediateFullReplayContext& context, double expected_log, double expected_phase) const;
+
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
   LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&) override;
 
