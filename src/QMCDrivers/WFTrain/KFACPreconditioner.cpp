@@ -39,6 +39,14 @@ std::size_t checkedProduct(std::size_t left, std::size_t right, const char* what
   return left * right;
 }
 
+/// Add packed export extents without wrapping before vector reservation.
+std::size_t checkedSum(std::size_t left, std::size_t right, const char* what)
+{
+  if (right > std::numeric_limits<std::size_t>::max() - left)
+    throw std::overflow_error(std::string(what) + " size overflow");
+  return left + right;
+}
+
 /// Extend a compact FNV-1a registry identity with one byte interval.
 void extendHash(std::uint64_t& hash, const void* bytes, std::size_t bytes_count) noexcept
 {
@@ -813,7 +821,20 @@ struct KFACAffineInverseGeneration
   KFACDampingPolicy damping_policy;
   DerivativeReal damping;
   std::vector<Block> blocks;
+  // Non-null only for fresh, explicitly admitted resident-authoritative factors.
+  std::shared_ptr<KFACDenseGeneration> resident_authority;
   psiformer::memory::HostCapacity trace_capacity;
+
+  // Explicit HOST access may materialize; resident solve never calls this helper.
+  const std::vector<double>& activation(std::size_t block) const
+  {
+    return resident_authority ? resident_authority->materialize(block).activation : blocks.at(block).activation_cholesky;
+  }
+  // Return the same immutable HOST sensitivity image on repeated cold accesses.
+  const std::vector<double>& sensitivity(std::size_t block) const
+  {
+    return resident_authority ? resident_authority->materialize(block).sensitivity : blocks.at(block).sensitivity_cholesky;
+  }
 
   // Count allocation capacity once, independently of snapshot/reference counts.
   std::size_t numericBytes() const noexcept
@@ -821,13 +842,22 @@ struct KFACAffineInverseGeneration
     std::size_t elements = 0;
     for (const auto& block : blocks)
       elements += block.activation_cholesky.capacity() + block.sensitivity_cholesky.capacity();
-    return elements * sizeof(DerivativeReal);
+    return elements * sizeof(DerivativeReal) + (resident_authority ? resident_authority->materializedBytes() : 0);
   }
 };
 
 // Freeze only complete builder storage; the trace follows its unique allocation owner.
 void KFACPreconditioner::publishAffineGeneration()
 {
+  if (dense_generation_ && dense_generation_->deviceAuthority())
+  {
+    if (!dense_generation_->complete() ||
+        !std::all_of(building_->blocks.begin(), building_->blocks.end(), [](const auto& block) {
+          return block.activation_cholesky.empty() && block.sensitivity_cholesky.empty();
+        }))
+      throw std::logic_error("KFAC resident publication has mixed factor authority");
+    building_->resident_authority = dense_generation_;
+  }
   if (psiformer::memory::enabled())
     building_->trace_capacity.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::immutable_affine_generation",
         building_->numericBytes(), reinterpret_cast<std::uintptr_t>(building_.get()), -1, parameterVersion());
@@ -1042,12 +1072,22 @@ KFACInverseState KFACInverseSnapshot::exportInverseState() const
   KFACInverseState state{registry_fingerprint, convention, damping_policy, damping, fallback_damping, {}};
   std::size_t size = fallback.size();
   for (const auto& block : affine->blocks)
-    size += block.activation_cholesky.size() + block.sensitivity_cholesky.size() + 1;
-  state.values.reserve(size);
-  for (const auto& block : affine->blocks)
   {
-    state.values.insert(state.values.end(), block.activation_cholesky.begin(), block.activation_cholesky.end());
-    state.values.insert(state.values.end(), block.sensitivity_cholesky.begin(), block.sensitivity_cholesky.end());
+    const auto input = checkedSum(block.descriptor.input_width,
+        block.descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1, "KFAC inverse input");
+    size = checkedSum(size, checkedProduct(input, input, "KFAC inverse activation"), "KFAC inverse export");
+    size = checkedSum(size, checkedProduct(block.descriptor.output_width, block.descriptor.output_width,
+        "KFAC inverse sensitivity"), "KFAC inverse export");
+    size = checkedSum(size, 1, "KFAC inverse repeat");
+  }
+  state.values.reserve(size);
+  for (std::size_t ordinal = 0; ordinal < affine->blocks.size(); ++ordinal)
+  {
+    const auto& block = affine->blocks[ordinal];
+    const auto& activation = affine->activation(ordinal);
+    const auto& sensitivity = affine->sensitivity(ordinal);
+    state.values.insert(state.values.end(), activation.begin(), activation.end());
+    state.values.insert(state.values.end(), sensitivity.begin(), sensitivity.end());
     state.values.push_back(block.curvature_inverse_scale);
   }
   state.values.insert(state.values.end(), fallback.begin(), fallback.end());
@@ -1167,6 +1207,17 @@ void KFACPreconditioner::bindDenseGeneration(std::shared_ptr<KFACDenseSolver> de
     if (dense_solver->registryFingerprint() != registry_.fingerprint() ||
         (dense_generation && dense_generation->resource() != dense_solver))
       throw std::invalid_argument("KFAC restored device generation identity mismatch");
+    if (affine_->resident_authority)
+    {
+      // The immutable snapshot binds the exact generation object, not a HOST hash
+      // or device pointer. Parameter/fallback version checks remain at the caller.
+      const auto& authority = affine_->resident_authority;
+      if (!authority->complete() || authority->resource() != dense_solver ||
+          (dense_generation && dense_generation != authority))
+        throw std::invalid_argument("KFAC resident snapshot generation mismatch");
+      dense_generation_ = authority;
+      return;
+    }
     if (dense_generation)
     {
       for (std::size_t block = 0; block < affine_->blocks.size(); ++block)
@@ -1214,9 +1265,7 @@ KFACStorageDiagnostics KFACPreconditioner::storageDiagnostics() const noexcept
 {
   std::size_t factor_elements = 0;
   if (affine_)
-    for (const auto& block : affine_->blocks)
-      factor_elements += block.activation_cholesky.capacity() +
-          block.sensitivity_cholesky.capacity();
+    factor_elements = affine_->numericBytes() / sizeof(DerivativeReal);
   const std::size_t scratch = matrix_scratch_.capacity() + solve_scratch_.capacity() +
       fallback_inverse_diagonal_.capacity();
   return {registry_.parameterSchema().parameterCount(), affine_ ? affine_->blocks.size() : 0, factor_elements,
@@ -1252,16 +1301,27 @@ void KFACPreconditioner::evaluate(
     }
 
     if (dense_generation_)
-      dense_generation_->apply(ordinal, block.activation_cholesky, block.sensitivity_cholesky,
-          matrix_scratch_.data(), activation_dimension * output_width);
+    {
+      if (affine_->resident_authority)
+      {
+        if (affine_->resident_authority != dense_generation_)
+          throw std::logic_error("KFAC evaluation generation differs from immutable snapshot");
+        dense_generation_->applyResident(ordinal, matrix_scratch_.data(), activation_dimension * output_width);
+      }
+      else
+        dense_generation_->apply(ordinal, block.activation_cholesky, block.sensitivity_cholesky,
+            matrix_scratch_.data(), activation_dimension * output_width);
+    }
     else
     {
+      const auto& activation = affine_->activation(ordinal);
+      const auto& sensitivity = affine_->sensitivity(ordinal);
       // Left solve by A.  Each output column is an independent right-hand side.
       for (std::size_t output = 0; output < output_width; ++output)
       {
         for (std::size_t input = 0; input < activation_dimension; ++input)
           solve_scratch_[input] = matrix_scratch_[input * output_width + output];
-        solveCholesky(block.activation_cholesky, activation_dimension,
+        solveCholesky(activation, activation_dimension,
                       solve_scratch_.data(), solve_scratch_.data() + activation_dimension,
                       solve_scratch_.data());
         for (std::size_t input = 0; input < activation_dimension; ++input)
@@ -1273,7 +1333,7 @@ void KFACPreconditioner::evaluate(
       for (std::size_t input = 0; input < activation_dimension; ++input)
       {
         DerivativeReal* row = matrix_scratch_.data() + input * output_width;
-        solveCholesky(block.sensitivity_cholesky, output_width, row,
+        solveCholesky(sensitivity, output_width, row,
                       solve_scratch_.data() + output_width, solve_scratch_.data());
         std::copy_n(solve_scratch_.data() + output_width, output_width, row);
       }

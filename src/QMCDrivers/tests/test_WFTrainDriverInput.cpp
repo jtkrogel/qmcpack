@@ -320,6 +320,33 @@ TEST_CASE("Typed curvature bundles expand before explicit controls without chang
   CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='kfac' defaults='jaqmc'/></qmc>"));
 }
 
+TEST_CASE("KFAC factor authority is explicit independent execution policy", "[drivers][wf_train][kfac]")
+{
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  const std::string authority = "<parameter name='kfac_factor_authority'>device</parameter>";
+  const std::string backend = "<parameter name='kfac_dense_backend'>device</parameter>";
+  const std::string persistent = "<parameter name='kfac_persist_state'>yes</parameter>";
+  CHECK(parse("").getKFACFactorAuthority() == WFTrainDriverInput::KFACFactorAuthority::HOST);
+  CHECK(parse("<parameter name='kfac_factor_authority'>host</parameter>").getKFACFactorAuthority() ==
+      WFTrainDriverInput::KFACFactorAuthority::HOST);
+  CHECK(parse(authority + backend + persistent).getKFACFactorAuthority() == WFTrainDriverInput::KFACFactorAuthority::DEVICE);
+  CHECK_THROWS(parse(authority));
+  CHECK_THROWS(parse(authority + backend));
+  CHECK_THROWS(parse(authority + persistent));
+  CHECK_THROWS(parse(authority + persistent + "<parameter name='kfac_dense_backend'>host</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_factor_authority'>auto</parameter>"));
+  CHECK_THROWS(parse("<parameter name='kfac_factor_authority'></parameter>"));
+  CHECK_THROWS(parseTrainingInput("<qmc><training optimizer='adam'>" + authority + "</training></qmc>"));
+  WFTrainDriverInput reused = parse(authority + backend + persistent);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<qmc><training optimizer='kfac'/></qmc>"));
+  reused.readXML(document.getRoot());
+  CHECK(reused.getKFACFactorAuthority() == WFTrainDriverInput::KFACFactorAuthority::HOST);
+  CHECK(reused.getKFACDenseBackend() == WFTrainDriverInput::KFACDenseBackend::HOST);
+}
+
 TEST_CASE("Persistent KFAC inputs require explicit state ownership", "[drivers][wf_train][kfac]")
 {
   const auto parse = [](const std::string& controls) {

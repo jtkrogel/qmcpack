@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 96> allowed_controls{
+constexpr std::array<std::string_view, 97> allowed_controls{
     "gradient_estimator",
     "defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
@@ -36,7 +36,7 @@ constexpr std::array<std::string_view, 96> allowed_controls{
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "kfac_objective", "kfac_clip_mode", "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width",
     "kfac_complex_clip_width",
-    "kfac_curvature", "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_dense_backend",
+    "kfac_curvature", "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_dense_backend", "kfac_factor_authority",
     "kfac_persist_state", "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay",
     "kfac_schedule_precision", "kfac_momentum", "kfac_burn_in", "kfac_curvature_period",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
@@ -277,6 +277,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   kfac_damping_policy_ = KFACDamping::EQUAL_SPLIT;
   kfac_constraint_ = KFACConstraint::NONE;
   kfac_dense_backend_ = KFACDenseBackend::HOST;
+  kfac_factor_authority_ = KFACFactorAuthority::HOST;
   kfac_clip_width_ = 1.0;
   kfac_complex_clip_width_ = 5.0;
   kfac_clip_quantile_ = 0.95;
@@ -880,7 +881,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
         "kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
         "kfac_clip_width", "kfac_clip_quantile", "kfac_exclude_width", "kfac_curvature",
         "kfac_complex_clip_width",
-        "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_persist_state", "kfac_dense_backend",
+        "kfac_damping_policy", "kfac_constraint", "kfac_norm_constraint", "kfac_persist_state", "kfac_dense_backend", "kfac_factor_authority",
         "kfac_ema_decay", "kfac_inverse_period", "kfac_learning_rate_decay", "kfac_schedule_precision",
         "kfac_momentum", "kfac_burn_in", "kfac_curvature_period"}, "selected optimizer");
   else
@@ -891,6 +892,13 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       if (value == "host") kfac_dense_backend_ = KFACDenseBackend::HOST;
       else if (value == "device") kfac_dense_backend_ = KFACDenseBackend::DEVICE;
       else throw UniformCommunicateError("WFTrainDriverInput: kfac_dense_backend must be host or device");
+    }
+    if (seen_controls.count("kfac_factor_authority"))
+    {
+      const auto& value = readControl("kfac_factor_authority");
+      if (value == "host") kfac_factor_authority_ = KFACFactorAuthority::HOST;
+      else if (value == "device") kfac_factor_authority_ = KFACFactorAuthority::DEVICE;
+      else throw UniformCommunicateError("WFTrainDriverInput: kfac_factor_authority must be host or device");
     }
     if (seen_controls.count("kfac_gradient_convention"))
     {
@@ -997,6 +1005,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
         throw UniformCommunicateError("WFTrainDriverInput: kfac_persist_state must be yes or no");
       kfac_persist_state_ = value == "yes";
     }
+    if (kfac_factor_authority_ == KFACFactorAuthority::DEVICE &&
+        (kfac_dense_backend_ != KFACDenseBackend::DEVICE || !kfac_persist_state_))
+      throw UniformCommunicateError("WFTrainDriverInput: device factor authority requires persistent device dense KFAC");
     if (!kfac_persist_state_)
     {
       if (kfac_update_order_ != KFACUpdateOrder::POST_INVERSE_RATE ||

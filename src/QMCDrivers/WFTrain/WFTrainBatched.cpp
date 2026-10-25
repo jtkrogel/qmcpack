@@ -3914,11 +3914,16 @@ void WFTrainBatched::run()
     // before any rank can enter a device-only preparation or sample collection.
     std::uint64_t requested = training_input_.getKFACDenseBackend() ==
         WFTrainDriverInput::KFACDenseBackend::DEVICE ? 1 : 0;
+    const bool device_factor_authority = training_input_.getKFACFactorAuthority() ==
+        WFTrainDriverInput::KFACFactorAuthority::DEVICE;
+    requested |= device_factor_authority ? 2 : 0;
     std::vector<std::uint64_t> requests(myComm->size());
     myComm->allgather(&requested, requests.data(), 1);
     if (!std::all_of(requests.begin(), requests.end(), [&](auto value) { return value == requested; }))
-      throw UniformCommunicateError("WFTrainBatched: KFAC dense backend differs across ranks");
-    if (requested)
+      throw UniformCommunicateError("WFTrainBatched: KFAC dense backend/factor authority differs across ranks");
+    if (device_factor_authority && !(requested & 1))
+      throw UniformCommunicateError("WFTrainBatched: device factor authority requires the device dense backend");
+    if (requested & 1)
     {
       std::exception_ptr failure;
       try
@@ -3928,7 +3933,9 @@ void WFTrainBatched::run()
             !wftrain::supportsHybridKFACPolicy(training_input_) || resident_device_authority_)
           throw std::invalid_argument("Device KFAC dense backend requires supported persistent GPU FP64 score KFAC");
         kfac_dense_solver = wftrain::KFACDenseSolver::prepare(makeLiveKFACRegistry(*selected_provider_),
-            0, training_input_.getMaximumRetainedBytes());
+            0, training_input_.getMaximumRetainedBytes(),
+            device_factor_authority ? wftrain::KFACDenseCapacity::RESIDENT : wftrain::KFACDenseCapacity::AUTO,
+            device_factor_authority);
 #else
         throw std::invalid_argument("Device KFAC dense backend requires a FP64 CUDA/HIP build");
 #endif
@@ -3941,8 +3948,9 @@ void WFTrainBatched::run()
         if (failure) std::rethrow_exception(failure);
         throw UniformCommunicateError("WFTrainBatched: another rank failed KFAC device admission before collection");
       }
-      const std::array<std::uint64_t, 4> policy{static_cast<std::uint64_t>(kfac_dense_solver->capacity()),
-          kfac_dense_solver->workspaceBytes(), kfac_dense_solver->deviceBytes(), kfac_dense_solver->hostBytes()};
+      const std::array<std::uint64_t, 5> policy{static_cast<std::uint64_t>(kfac_dense_solver->capacity()),
+          kfac_dense_solver->workspaceBytes(), kfac_dense_solver->deviceBytes(), kfac_dense_solver->hostBytes(),
+          static_cast<std::uint64_t>(kfac_dense_solver->deviceAuthority())};
       std::vector<std::uint64_t> policies(static_cast<std::size_t>(myComm->size()) * policy.size());
       auto send = policy;
       myComm->allgather(send.data(), policies.data(), static_cast<int>(policy.size()));
@@ -3954,6 +3962,8 @@ void WFTrainBatched::run()
                 << " DEVICE_numeric_bytes=" << kfac_dense_solver->deviceBytes()
                 << " HOST_metadata_bound=" << kfac_dense_solver->hostBytes()
                 << " workspace_bytes=" << kfac_dense_solver->workspaceBytes()
+                << " factor_authority=" << (device_factor_authority ? "device" : "host")
+                << " HOST_factor_materialization=" << (device_factor_authority ? "checkpoint_or_explicit_HOST" : "eager")
                 << "; HOST reduction/EMA/canonical checkpoint retained; not fully resident KFAC" << std::endl;
     }
   }

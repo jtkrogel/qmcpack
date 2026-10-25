@@ -5,6 +5,7 @@
 #include "KFACDenseSolver.h"
 #include "KFACPreconditioner.h"
 #include "TrainingNumerics.h"
+#include "OutputManager.h"
 #include "config.h"
 #include <algorithm>
 #include <array>
@@ -15,6 +16,7 @@
 
 #if defined(ENABLE_CUDA)
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceDerivativeKernels.h"
 #ifdef QMC_CUDA2HIP
 #include <rocsolver/rocsolver.h>
 #else
@@ -128,6 +130,20 @@ public:
     checkRuntime(cudaStreamSynchronize(stream_), "KFAC cudaStreamSynchronize");
 #endif
   }
+
+  /// Copy only a strided diagonal; no quadratic factor materialization.
+  void downloadDiagonal(double* target, const double* source, std::size_t n) const
+  {
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpy2DAsync(target, sizeof(double), source, mul(add(n, 1), sizeof(double)),
+        sizeof(double), n, hipMemcpyDeviceToHost, stream_), "KFAC diagonal D2H");
+#else
+    checkRuntime(cudaMemcpy2DAsync(target, sizeof(double), source, mul(add(n, 1), sizeof(double)),
+        sizeof(double), n, cudaMemcpyDeviceToHost, stream_), "KFAC diagonal D2H");
+#endif
+    psiformer::device::deviceMemoryMetrics(device_).downloaded(mul(n, sizeof(double)));
+  }
+  Stream stream() const noexcept { return stream_; }
 
   /// Upload deliberate staging traffic and charge existing transfer diagnostics.
   template<class T> void upload(T* target, const T* source, std::size_t count) const
@@ -272,6 +288,7 @@ struct KFACDenseSolver::Impl
   std::string fingerprint;
   std::vector<Layout> blocks;
   KFACDenseCapacity capacity = KFACDenseCapacity::STREAMED;
+  bool device_authority = false;
   std::size_t factor_elements = 0, block_elements = 0, rhs_elements = 0;
   std::size_t device_bytes = 0, host_bytes = 0, workspace_bytes = 0;
   std::array<bool, 2> occupied{};
@@ -282,6 +299,9 @@ struct KFACDenseSolver::Impl
   DeviceBuffer<double> rhs;
   DeviceBuffer<unsigned char> workspace;
   DeviceBuffer<int> info;
+  DeviceBuffer<psiformer::device::DerivativeFiniteStatus> finite_status;
+  std::vector<psiformer::device::DerivativeFiniteStatus> host_status;
+  std::vector<double> host_diagonal;
 
   /// Close the queue before its attached buffers are destroyed.
   ~Impl()
@@ -312,9 +332,11 @@ std::size_t KFACDenseSolver::hostBytes() const noexcept { return impl_->host_byt
 std::size_t KFACDenseSolver::workspaceBytes() const noexcept { return impl_->workspace_bytes; }
 
 const std::string& KFACDenseSolver::registryFingerprint() const noexcept { return impl_->fingerprint; }
+bool KFACDenseSolver::deviceAuthority() const noexcept { return impl_->device_authority; }
 
 std::shared_ptr<KFACDenseSolver> KFACDenseSolver::prepare(const KFACBlockRegistry& registry,
-    std::size_t maximum_device_bytes, std::size_t maximum_host_bytes, KFACDenseCapacity preference)
+    std::size_t maximum_device_bytes, std::size_t maximum_host_bytes, KFACDenseCapacity preference,
+    bool device_authority)
 {
 #if defined(ENABLE_CUDA)
   if (!maximum_device_bytes)
@@ -337,6 +359,7 @@ std::shared_ptr<KFACDenseSolver> KFACDenseSolver::prepare(const KFACBlockRegistr
   if (!maximum_device_bytes || !maximum_host_bytes)
     throw std::length_error("KFAC device solver requires existing DEVICE and HOST numeric admission");
   auto p = std::make_unique<Impl>();
+  p->device_authority = device_authority;
   p->fingerprint = registry.fingerprint();
   p->blocks.reserve(registry.affineBlocks().size());
   for (const auto& block : registry.affineBlocks())
@@ -353,8 +376,21 @@ std::shared_ptr<KFACDenseSolver> KFACDenseSolver::prepare(const KFACBlockRegistr
   if (p->blocks.empty()) throw std::invalid_argument("KFAC device solver requires affine blocks");
   p->host_bytes = add(mul(p->blocks.capacity(), sizeof(Layout)),
       add(mul(p->blocks.size(), 2 * (sizeof(unsigned char) + sizeof(std::uint64_t))), sizeof(int) * 2));
+  std::size_t status_count = 0, diagonal_count = 0;
+  if (device_authority)
+  {
+    status_count = p->block_elements / 4096 + (p->block_elements % 4096 != 0);
+    for (const auto& block : p->blocks) diagonal_count = std::max(diagonal_count, add(block.a, block.g));
+    p->host_bytes = add(p->host_bytes, add(mul(status_count, sizeof(psiformer::device::DerivativeFiniteStatus)),
+        mul(diagonal_count, sizeof(double))));
+    p->host_bytes = add(p->host_bytes, mul(mul(p->blocks.size(), 2), sizeof(KFACDenseGeneration::CanonicalBlock)));
+    // Reserve admission for two future HOST checkpoint images, without allocating them now.
+    if (add(p->host_bytes, mul(mul(p->factor_elements, 2), sizeof(double))) > maximum_host_bytes)
+      throw std::length_error("KFAC authority future HOST materialization exceeds admission");
+  }
   if (p->host_bytes > maximum_host_bytes) throw std::length_error("KFAC solver HOST metadata exceeds admission");
-  const auto base = add(mul(p->rhs_elements, sizeof(double)), sizeof(int) * 2);
+  const auto base = add(add(mul(p->rhs_elements, sizeof(double)), sizeof(int) * 2),
+      mul(status_count, sizeof(psiformer::device::DerivativeFiniteStatus)));
   if (add(base, mul(p->block_elements, sizeof(double))) > maximum_device_bytes)
     throw std::length_error("KFAC one-block device solver exceeds admission");
   p->rhs.reserveNamed(p->rhs_elements, "KFAC dense RHS", __FILE__, __LINE__);
@@ -369,6 +405,8 @@ std::shared_ptr<KFACDenseSolver> KFACDenseSolver::prepare(const KFACBlockRegistr
       (resident <= maximum_device_bytes ? KFACDenseCapacity::RESIDENT : KFACDenseCapacity::STREAMED);
   if (preference == KFACDenseCapacity::RESIDENT && p->capacity != preference)
     throw std::length_error("KFAC resident test capacity exceeds device admission");
+  if (device_authority && p->capacity != KFACDenseCapacity::RESIDENT)
+    throw std::length_error("KFAC device authority requires admitted resident generations");
   if (p->capacity == KFACDenseCapacity::RESIDENT)
   {
     query.reset();
@@ -377,6 +415,12 @@ std::shared_ptr<KFACDenseSolver> KFACDenseSolver::prepare(const KFACBlockRegistr
   }
   else { p->factors = std::move(query); p->device_bytes = streamed; }
   p->workspace.reserveNamed(p->workspace_bytes, "KFAC vendor workspace", __FILE__, __LINE__);
+  if (device_authority)
+  {
+    p->finite_status.reserveNamed(status_count, "KFAC authority finite statuses", __FILE__, __LINE__);
+    p->host_status.resize(status_count);
+    p->host_diagonal.resize(diagonal_count);
+  }
   p->queue.attach(p->workspace.data(), p->workspace_bytes);
   if (psiformer::memory::enabled())
     p->host_trace.snapshotAt(__FILE__, __LINE__, "KFACDenseSolver::HOST_numeric_metadata_bound", p->host_bytes);
@@ -399,7 +443,8 @@ std::shared_ptr<KFACDenseGeneration> KFACDenseSolver::beginGeneration()
 }
 
 KFACDenseGeneration::KFACDenseGeneration(std::shared_ptr<KFACDenseSolver> resource, std::size_t slot, std::size_t blocks)
-    : resource_(std::move(resource)), slot_(slot), prepared_(blocks, 0), fingerprints_(blocks, 0) {}
+    : resource_(std::move(resource)), slot_(slot), prepared_(blocks, 0), fingerprints_(blocks, 0),
+      host_cache_(resource_->deviceAuthority() ? blocks : 0) {}
 
 KFACDenseGeneration::~KFACDenseGeneration() { resource_->impl_->occupied[slot_] = false; }
 
@@ -407,6 +452,8 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
 {
 #if defined(ENABLE_CUDA)
   auto& p = *resource_->impl_;
+  if (p.device_authority && imported_)
+    throw std::logic_error("KFAC generation cannot mix imported HOST and resident factor authority");
   if (complete_ || failed_ || block >= prepared_.size() || prepared_[block])
     throw std::logic_error("KFAC factor generation is not writable");
   const auto& layout = p.blocks.at(block);
@@ -422,10 +469,38 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
     p.queue.factor(static_cast<int>(layout.g), G, p.workspace.data(), p.workspace_bytes, p.info.data() + 1);
     std::array<int, 2> status{};
     p.queue.download(status.data(), p.info.data(), status.size());
-    p.queue.download(activation.data(), A, activation.size());
-    p.queue.download(sensitivity.data(), G, sensitivity.size());
+    if (p.device_authority)
+    {
+      const auto cells = add(activation.size(), sensitivity.size());
+      const auto pieces = cells / 4096 + (cells % 4096 != 0);
+      checkRuntime(psiformer::device::launchDerivativeFiniteScan(p.queue.stream(),
+          {cells, 4096, pieces, 0, 1}, A, p.finite_status.data()), "KFAC authority finite scan");
+      p.queue.download(p.host_status.data(), p.finite_status.data(), pieces);
+      p.queue.downloadDiagonal(p.host_diagonal.data(), A, layout.a);
+      p.queue.downloadDiagonal(p.host_diagonal.data() + layout.a, G, layout.g);
+    }
+    else
+    {
+      p.queue.download(activation.data(), A, activation.size());
+      p.queue.download(sensitivity.data(), G, sensitivity.size());
+    }
     p.queue.sync();
     if (status[0] || status[1]) throw MatrixFreeNumericalError("KFAC vendor Cholesky rejected non-SPD factor");
+    if (p.device_authority)
+    {
+      const auto cells = add(activation.size(), sensitivity.size());
+      const auto pieces = cells / 4096 + (cells % 4096 != 0);
+      for (std::size_t i = 0; i < pieces; ++i)
+        if (p.host_status[i].nonfinite_count) throw MatrixFreeNumericalError("KFAC resident factor is nonfinite");
+      for (std::size_t i = 0; i < add(layout.a, layout.g); ++i)
+        if (!isFiniteTrainingReal(p.host_diagonal[i]) || p.host_diagonal[i] <= 0.)
+          throw MatrixFreeNumericalError("KFAC resident factor diagonal is invalid");
+      std::vector<double>().swap(activation);
+      std::vector<double>().swap(sensitivity);
+      factorized_ = true;
+      prepared_[block] = 1;
+      return;
+    }
     for (auto item : {std::make_pair(&activation, layout.a), std::make_pair(&sensitivity, layout.g)})
       for (std::size_t row = 0; row < item.second; ++row)
       {
@@ -449,6 +524,8 @@ void KFACDenseGeneration::import(std::size_t block, const std::vector<double>& a
 {
 #if defined(ENABLE_CUDA)
   auto& p = *resource_->impl_;
+  if (p.device_authority && factorized_)
+    throw std::logic_error("KFAC generation cannot mix resident factors and imported HOST authority");
   if (complete_ || failed_ || block >= prepared_.size() || prepared_[block])
     throw std::logic_error("KFAC factor generation is not writable");
   const auto& layout = p.blocks.at(block);
@@ -465,6 +542,7 @@ void KFACDenseGeneration::import(std::size_t block, const std::vector<double>& a
       p.queue.sync();
     }
     fingerprints_[block] = fingerprint(activation, sensitivity);
+    imported_ = true;
     prepared_[block] = 1;
   }
   catch (...) { failed_ = true; try { p.queue.sync(); } catch (...) {} throw; }
@@ -483,13 +561,115 @@ void KFACDenseGeneration::finish()
 bool KFACDenseGeneration::matches(std::size_t block, const std::vector<double>& activation,
     const std::vector<double>& sensitivity) const
 {
+  if (deviceAuthority())
+  {
+    if (!complete() || block >= prepared_.size()) return false;
+    // Explicit legacy HOST matching is a cold materialization request. Internal
+    // resident snapshots bypass this API and bind immutable shared identity.
+    const auto& canonical = materialize(block);
+    if (activation.size() != canonical.activation.size() || sensitivity.size() != canonical.sensitivity.size())
+      return false;
+    return fingerprint(canonical.activation, canonical.sensitivity) == fingerprint(activation, sensitivity);
+  }
   return complete_ && !failed_ && block < fingerprints_.size() &&
       fingerprints_[block] == fingerprint(activation, sensitivity);
+}
+
+bool KFACDenseGeneration::deviceAuthority() const noexcept { return resource_->deviceAuthority() && !imported_; }
+
+std::size_t KFACDenseGeneration::materializedBytes() const noexcept
+{
+  return host_cache_bytes_.load(std::memory_order_relaxed);
+}
+
+// Cache only complete, validated HOST images; a failed copy leaves device authority intact.
+const KFACDenseGeneration::CanonicalBlock& KFACDenseGeneration::materialize(std::size_t block) const
+{
+#if defined(ENABLE_CUDA)
+  auto& p = *resource_->impl_;
+  if (!complete() || !deviceAuthority() || p.capacity != KFACDenseCapacity::RESIDENT || block >= prepared_.size())
+    throw std::logic_error("KFAC HOST materialization requires a complete resident authority");
+  std::lock_guard<std::mutex> lock(host_mutex_);
+  auto& cached = host_cache_.at(block);
+  if (!cached.activation.empty()) return cached;
+  const auto& layout = p.blocks.at(block);
+  CanonicalBlock candidate;
+  const auto a_elements = mul(layout.a, layout.a), g_elements = mul(layout.g, layout.g);
+  const auto planned_bytes = mul(add(a_elements, g_elements), sizeof(double));
+  app_log() << "KFAC allocation before owner=canonical_HOST_materialization block=" << block
+            << " activation_dimension=" << layout.a << " sensitivity_dimension=" << layout.g
+            << " planned_numeric_bytes=" << planned_bytes
+            << " authority=immutable_resident_generation lifetime=generation_cache"
+            << " slot=" << slot_ << " (numeric_intent_not_RSS_or_checkpoint_peak)" << std::endl;
+  candidate.activation.resize(a_elements);
+  candidate.sensitivity.resize(g_elements);
+  p.queue.current();
+  auto* A = p.blockPointer(slot_, block);
+  try
+  {
+    p.queue.download(candidate.activation.data(), A, candidate.activation.size());
+    p.queue.download(candidate.sensitivity.data(), A + candidate.activation.size(), candidate.sensitivity.size());
+    p.queue.sync();
+  }
+  catch (...) { try { p.queue.sync(); } catch (...) {} throw; }
+  for (auto item : {std::make_pair(&candidate.activation, layout.a), std::make_pair(&candidate.sensitivity, layout.g)})
+    for (std::size_t row = 0; row < item.second; ++row)
+    {
+      for (std::size_t col = 0; col <= row; ++col)
+        if (!isFiniteTrainingReal((*item.first)[row * item.second + col]) ||
+            (row == col && (*item.first)[row * item.second + col] <= 0.))
+          throw MatrixFreeNumericalError("KFAC materialized factor is invalid");
+      std::fill(item.first->begin() + row * item.second + row + 1,
+          item.first->begin() + (row + 1) * item.second, 0.);
+    }
+  const auto bytes = mul(add(candidate.activation.capacity(), candidate.sensitivity.capacity()), sizeof(double));
+  cached = std::move(candidate);
+  host_cache_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (psiformer::memory::enabled())
+    host_cache_trace_.snapshotAt(__FILE__, __LINE__, "KFACDenseGeneration::canonical_HOST_materialization",
+        materializedBytes(), reinterpret_cast<std::uintptr_t>(this), -1, slot_);
+  return cached;
+#else
+  throw std::logic_error("KFAC device backend unavailable");
+#endif
+}
+
+// Applying this authority neither reads nor hashes a HOST factor vector.
+void KFACDenseGeneration::applyResident(std::size_t block, double* matrix, std::size_t count) const
+{
+#if defined(ENABLE_CUDA)
+  auto& p = *resource_->impl_;
+  if (!complete() || !deviceAuthority() || p.capacity != KFACDenseCapacity::RESIDENT)
+    throw std::logic_error("KFAC resident authority cannot apply");
+  const auto& layout = p.blocks.at(block);
+  if (!matrix || count != mul(layout.a, layout.g)) throw std::invalid_argument("KFAC resident RHS extent mismatch");
+  try
+  {
+    p.queue.current();
+    auto* A = p.blockPointer(slot_, block);
+    auto* G = A + mul(layout.a, layout.a);
+    p.queue.upload(p.rhs.data(), matrix, count);
+    p.queue.apply(static_cast<int>(layout.a), static_cast<int>(layout.g), A, G, p.rhs.data());
+    p.queue.download(matrix, p.rhs.data(), count);
+    p.queue.sync();
+    if (!std::all_of(matrix, matrix + count, isFiniteTrainingReal))
+      throw MatrixFreeNumericalError("KFAC resident solve produced nonfinite output");
+  }
+  catch (...) { try { p.queue.sync(); } catch (...) {} throw; }
+#else
+  throw std::logic_error("KFAC device backend unavailable");
+#endif
 }
 
 void KFACDenseGeneration::apply(std::size_t block, const std::vector<double>& activation,
     const std::vector<double>& sensitivity, double* matrix, std::size_t count) const
 {
+  if (deviceAuthority())
+  {
+    if (!matches(block, activation, sensitivity))
+      throw std::invalid_argument("KFAC supplied HOST factors differ from resident authority");
+    return applyResident(block, matrix, count);
+  }
 #if defined(ENABLE_CUDA)
   auto& p = *resource_->impl_;
   if (!complete_ || failed_) throw std::logic_error("KFAC factor generation cannot apply");

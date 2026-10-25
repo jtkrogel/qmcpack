@@ -12,9 +12,12 @@
 #ifndef QMCPLUSPLUS_KFAC_DENSE_SOLVER_H
 #define QMCPLUSPLUS_KFAC_DENSE_SOLVER_H
 
+#include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -33,7 +36,7 @@ public:
   /// Prepare before collection; zero DEVICE uses remaining existing aggregate admission.
   static std::shared_ptr<KFACDenseSolver> prepare(const KFACBlockRegistry& registry,
       std::size_t maximum_device_bytes, std::size_t maximum_host_bytes,
-      KFACDenseCapacity preference = KFACDenseCapacity::AUTO);
+      KFACDenseCapacity preference = KFACDenseCapacity::AUTO, bool device_authority = false);
   ~KFACDenseSolver();
   KFACDenseSolver(const KFACDenseSolver&) = delete;
   KFACDenseSolver& operator=(const KFACDenseSolver&) = delete;
@@ -45,6 +48,7 @@ public:
   std::size_t hostBytes() const noexcept;
   std::size_t workspaceBytes() const noexcept;
   const std::string& registryFingerprint() const noexcept;
+  bool deviceAuthority() const noexcept;
 
 private:
   struct Impl;
@@ -78,6 +82,19 @@ public:
   void apply(std::size_t block, const std::vector<double>& activation,
       const std::vector<double>& sensitivity, double* matrix, std::size_t count) const;
 
+  /// Optional resident authority never hashes or downloads factors at cache bind.
+  bool deviceAuthority() const noexcept;
+  bool complete() const noexcept { return complete_ && !failed_; }
+  void applyResident(std::size_t block, double* matrix, std::size_t count) const;
+  /// One lazily published canonical HOST image, owned only by its generation.
+  struct CanonicalBlock
+  {
+    std::vector<double> activation, sensitivity;
+  };
+  /// One immutable HOST materialization per block; legacy packing stays unchanged.
+  const CanonicalBlock& materialize(std::size_t block) const;
+  std::size_t materializedBytes() const noexcept;
+
   const std::shared_ptr<KFACDenseSolver>& resource() const noexcept { return resource_; }
 
 private:
@@ -89,6 +106,12 @@ private:
   std::vector<std::uint64_t> fingerprints_;
   bool complete_ = false;
   bool failed_ = false;
+  bool imported_ = false;
+  bool factorized_ = false;
+  mutable std::mutex host_mutex_;
+  mutable std::vector<CanonicalBlock> host_cache_;
+  mutable std::atomic<std::size_t> host_cache_bytes_{0};
+  mutable psiformer::memory::HostCapacity host_cache_trace_;
 };
 }
 #endif
