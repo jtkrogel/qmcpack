@@ -797,13 +797,42 @@ KFACFactorState updateKFACFactorState(const KFACFactorState* previous,
   return next;
 }
 
-struct KFACPreconditioner::PreparedBlock
+// One physical affine owner survives every version-bound preconditioner alias.
+struct KFACAffineInverseGeneration
 {
-  KFACAffineBlockDescriptor descriptor;
-  DerivativeReal curvature_inverse_scale = 1.0;
-  std::vector<DerivativeReal> activation_cholesky;
-  std::vector<DerivativeReal> sensitivity_cholesky;
+  // Canonical per-block vectors retain the existing dense-solver vector interface.
+  struct Block
+  {
+    KFACAffineBlockDescriptor descriptor;
+    DerivativeReal curvature_inverse_scale = 1.0;
+    std::vector<DerivativeReal> activation_cholesky;
+    std::vector<DerivativeReal> sensitivity_cholesky;
+  };
+  std::string registry_fingerprint;
+  KFACCurvatureConvention convention;
+  KFACDampingPolicy damping_policy;
+  DerivativeReal damping;
+  std::vector<Block> blocks;
+  psiformer::memory::HostCapacity trace_capacity;
+
+  // Count allocation capacity once, independently of snapshot/reference counts.
+  std::size_t numericBytes() const noexcept
+  {
+    std::size_t elements = 0;
+    for (const auto& block : blocks)
+      elements += block.activation_cholesky.capacity() + block.sensitivity_cholesky.capacity();
+    return elements * sizeof(DerivativeReal);
+  }
 };
+
+// Freeze only complete builder storage; the trace follows its unique allocation owner.
+void KFACPreconditioner::publishAffineGeneration()
+{
+  if (psiformer::memory::enabled())
+    building_->trace_capacity.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::immutable_affine_generation",
+        building_->numericBytes(), reinterpret_cast<std::uintptr_t>(building_.get()), -1, parameterVersion());
+  affine_ = std::move(building_);
+}
 
 KFACPreconditioner::~KFACPreconditioner() = default;
 
@@ -842,7 +871,12 @@ void KFACPreconditioner::beginPreparation(std::shared_ptr<KFACDenseSolver> dense
       throw std::invalid_argument("KFAC device solver registry mismatch");
     dense_generation_ = dense_solver->beginGeneration();
   }
-  blocks_.reserve(registry_.affineBlocks().size());
+  building_ = std::make_unique<KFACAffineInverseGeneration>();
+  building_->registry_fingerprint = registry_.fingerprint();
+  building_->convention = convention_;
+  building_->damping_policy = control_.damping_policy;
+  building_->damping = control_.damping;
+  building_->blocks.reserve(registry_.affineBlocks().size());
 }
 
 // Both input routes retain the same normalization, damping, and factorization order.
@@ -855,7 +889,7 @@ void KFACPreconditioner::prepareBlock(std::size_t ordinal, std::size_t activatio
       !finite(row_weight) || row_weight <= 0.0 ||
       row_count == 0)
     throw std::invalid_argument("KFAC factor has no positive finite row weight");
-  PreparedBlock prepared;
+  KFACAffineInverseGeneration::Block prepared;
   prepared.descriptor = registry_.affineBlocks()[ordinal];
   const DerivativeReal repeats = row_weight / sample_weight;
   if (!finite(repeats) || repeats <= 0.0)
@@ -919,7 +953,7 @@ void KFACPreconditioner::prepareBlock(std::size_t ordinal, std::size_t activatio
     cholesky(prepared.activation_cholesky, activation_dimension);
     cholesky(prepared.sensitivity_cholesky, sensitivity_dimension);
   }
-  blocks_.push_back(std::move(prepared));
+  building_->blocks.push_back(std::move(prepared));
 }
 
 // Complete the generation and diagonal fallback in the original publication order.
@@ -951,9 +985,12 @@ void KFACPreconditioner::finishPreparation(DerivativeArrayView<const DerivativeR
       }
     }
   }
+  // Only complete factors and fallback may acquire shared immutable authority.
+  publishAffineGeneration();
   if (psiformer::memory::enabled())
-    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
-        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::fallback_and_solve_scratch",
+        storageDiagnostics().solve_scratch_elements * sizeof(DerivativeReal),
+        reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 // Prepare owned solve factors directly from an immutable normalized snapshot.
@@ -987,17 +1024,40 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
 
 KFACInverseState KFACPreconditioner::exportInverseState() const
 {
-  KFACInverseState state{registry_.fingerprint(), convention_, control_.damping_policy,
-                         control_.damping, control_.fallback_damping, {}};
-  state.values.reserve(packedStateSize(registry_));
-  for (const auto& block : blocks_)
+  return inverseSnapshot().exportInverseState();
+}
+
+// Share affine storage without sharing version-bound scratch or fallback mutation.
+KFACInverseSnapshot KFACPreconditioner::inverseSnapshot() const
+{
+  return {registry_.fingerprint(), convention_, control_.damping_policy, control_.damping,
+          control_.fallback_damping, affine_, fallback_inverse_diagonal_};
+}
+
+// Materialize exactly the legacy checkpoint byte sequence at an explicit boundary.
+KFACInverseState KFACInverseSnapshot::exportInverseState() const
+{
+  if (!affine)
+    throw std::logic_error("KFAC inverse snapshot has no affine generation");
+  KFACInverseState state{registry_fingerprint, convention, damping_policy, damping, fallback_damping, {}};
+  std::size_t size = fallback.size();
+  for (const auto& block : affine->blocks)
+    size += block.activation_cholesky.size() + block.sensitivity_cholesky.size() + 1;
+  state.values.reserve(size);
+  for (const auto& block : affine->blocks)
   {
     state.values.insert(state.values.end(), block.activation_cholesky.begin(), block.activation_cholesky.end());
     state.values.insert(state.values.end(), block.sensitivity_cholesky.begin(), block.sensitivity_cholesky.end());
     state.values.push_back(block.curvature_inverse_scale);
   }
-  state.values.insert(state.values.end(), fallback_inverse_diagonal_.begin(), fallback_inverse_diagonal_.end());
+  state.values.insert(state.values.end(), fallback.begin(), fallback.end());
   return state;
+}
+
+// Logical reachability is distinct from the generation's unique physical trace.
+std::size_t KFACInverseSnapshot::affineNumericBytes() const noexcept
+{
+  return affine ? affine->numericBytes() : 0;
 }
 
 void KFACPreconditioner::prepareScratch()
@@ -1027,10 +1087,16 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
       state.values.size() != packedStateSize(registry_) ||
       !std::all_of(state.values.begin(), state.values.end(), finite))
     throw std::invalid_argument("KFAC inverse state identity, controls or packing are invalid");
+  building_ = std::make_unique<KFACAffineInverseGeneration>();
+  building_->registry_fingerprint = registry_.fingerprint();
+  building_->convention = convention_;
+  building_->damping_policy = control_.damping_policy;
+  building_->damping = control_.damping;
+  building_->blocks.reserve(registry_.affineBlocks().size());
   std::size_t offset = 0;
   for (const auto& descriptor : registry_.affineBlocks())
   {
-    PreparedBlock block;
+    KFACAffineInverseGeneration::Block block;
     block.descriptor = descriptor;
     const auto input = descriptor.input_width + (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
     for (auto pair : {std::make_pair(&block.activation_cholesky, input),
@@ -1050,13 +1116,52 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
     block.curvature_inverse_scale = state.values[offset++];
     if (block.curvature_inverse_scale <= 0.0)
       throw std::invalid_argument("KFAC inverse state has invalid repeat scale");
-    blocks_.push_back(std::move(block));
+    building_->blocks.push_back(std::move(block));
   }
   fallback_inverse_diagonal_.assign(state.values.begin() + offset, state.values.end());
   if (!std::all_of(fallback_inverse_diagonal_.begin(), fallback_inverse_diagonal_.end(),
                    [](auto value) { return value > 0.0; }))
     throw std::invalid_argument("KFAC inverse state has invalid fallback inverse");
   prepareScratch();
+  publishAffineGeneration();
+  bindDenseGeneration(std::move(dense_solver), std::move(dense_generation));
+  if (psiformer::memory::enabled())
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::fallback_and_solve_scratch",
+        storageDiagnostics().solve_scratch_elements * sizeof(DerivativeReal),
+        reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
+}
+
+// A snapshot can only share a fully validated, immutable affine generation.
+KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+    const KFACInverseSnapshot& state, std::shared_ptr<KFACDenseSolver> dense_solver,
+    std::shared_ptr<KFACDenseGeneration> dense_generation)
+    : MatrixFreePreconditioner(registry.parameterSchema(), parameter_version), registry_(std::move(registry)),
+      control_{state.damping, state.fallback_damping, state.damping_policy}, convention_(state.convention)
+{
+  std::size_t fallback_size = 0;
+  for (const auto block : registry_.fallbackBlocks())
+    fallback_size += registry_.parameterSchema().blocks()[block].count;
+  if (!state.affine || state.registry_fingerprint != registry_.fingerprint() ||
+      state.affine->registry_fingerprint != state.registry_fingerprint ||
+      state.affine->convention != state.convention || state.affine->damping_policy != state.damping_policy ||
+      state.affine->damping != state.damping || !finite(state.fallback_damping) || state.fallback_damping <= 0.0 ||
+      state.fallback.size() != fallback_size ||
+      !std::all_of(state.fallback.begin(), state.fallback.end(), [](auto value) { return finite(value) && value > 0.0; }))
+    throw std::invalid_argument("KFAC inverse snapshot identity or fallback is invalid");
+  affine_ = state.affine;
+  fallback_inverse_diagonal_ = state.fallback;
+  prepareScratch();
+  bindDenseGeneration(std::move(dense_solver), std::move(dense_generation));
+  if (psiformer::memory::enabled())
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::fallback_and_solve_scratch",
+        storageDiagnostics().solve_scratch_elements * sizeof(DerivativeReal),
+        reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
+}
+
+// Match or import the unchanged canonical vectors without copying HOST factors.
+void KFACPreconditioner::bindDenseGeneration(std::shared_ptr<KFACDenseSolver> dense_solver,
+    std::shared_ptr<KFACDenseGeneration> dense_generation)
+{
   if (dense_solver)
   {
     if (dense_solver->registryFingerprint() != registry_.fingerprint() ||
@@ -1064,24 +1169,23 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
       throw std::invalid_argument("KFAC restored device generation identity mismatch");
     if (dense_generation)
     {
-      for (std::size_t block = 0; block < blocks_.size(); ++block)
-        if (!dense_generation->matches(block, blocks_[block].activation_cholesky, blocks_[block].sensitivity_cholesky))
+      for (std::size_t block = 0; block < affine_->blocks.size(); ++block)
+        if (!dense_generation->matches(block, affine_->blocks[block].activation_cholesky,
+                                      affine_->blocks[block].sensitivity_cholesky))
           throw std::invalid_argument("KFAC cached device generation differs from canonical HOST factors");
       dense_generation_ = std::move(dense_generation);
     }
     else
     {
       dense_generation_ = dense_solver->beginGeneration();
-      for (std::size_t block = 0; block < blocks_.size(); ++block)
-        dense_generation_->import(block, blocks_[block].activation_cholesky, blocks_[block].sensitivity_cholesky);
+      for (std::size_t block = 0; block < affine_->blocks.size(); ++block)
+        dense_generation_->import(block, affine_->blocks[block].activation_cholesky,
+                                  affine_->blocks[block].sensitivity_cholesky);
       dense_generation_->finish();
     }
   }
   else if (dense_generation)
     throw std::invalid_argument("KFAC device generation has no resource");
-  if (psiformer::memory::enabled())
-    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
-        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 void KFACPreconditioner::refreshFallbackDiagonal(const KFACFactorState& state, DerivativeReal damping)
@@ -1101,19 +1205,21 @@ void KFACPreconditioner::refreshFallbackDiagonal(const KFACFactorState& state, D
   fallback_inverse_diagonal_.swap(inverse);
   control_.fallback_damping = damping;
   if (psiformer::memory::enabled())
-    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::factors_inverse_and_solve",
-        storageDiagnostics().retained_numeric_bytes, reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
+    trace_capacity_.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::fallback_and_solve_scratch",
+        storageDiagnostics().solve_scratch_elements * sizeof(DerivativeReal),
+        reinterpret_cast<std::uintptr_t>(this), -1, parameterVersion());
 }
 
 KFACStorageDiagnostics KFACPreconditioner::storageDiagnostics() const noexcept
 {
   std::size_t factor_elements = 0;
-  for (const PreparedBlock& block : blocks_)
-    factor_elements += block.activation_cholesky.capacity() +
-        block.sensitivity_cholesky.capacity();
+  if (affine_)
+    for (const auto& block : affine_->blocks)
+      factor_elements += block.activation_cholesky.capacity() +
+          block.sensitivity_cholesky.capacity();
   const std::size_t scratch = matrix_scratch_.capacity() + solve_scratch_.capacity() +
       fallback_inverse_diagonal_.capacity();
-  return {registry_.parameterSchema().parameterCount(), blocks_.size(), factor_elements,
+  return {registry_.parameterSchema().parameterCount(), affine_ ? affine_->blocks.size() : 0, factor_elements,
           scratch, (factor_elements + scratch) * sizeof(DerivativeReal)};
 }
 
@@ -1123,9 +1229,9 @@ void KFACPreconditioner::evaluate(
 {
   std::fill(result.begin(), result.end(), DerivativeValue{});
   const auto& schema_blocks = registry_.parameterSchema().blocks();
-  for (std::size_t ordinal = 0; ordinal < blocks_.size(); ++ordinal)
+  for (std::size_t ordinal = 0; ordinal < affine_->blocks.size(); ++ordinal)
   {
-    const PreparedBlock& block = blocks_[ordinal];
+    const auto& block = affine_->blocks[ordinal];
     const auto& descriptor = block.descriptor;
     const std::size_t activation_dimension = descriptor.input_width +
         (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);

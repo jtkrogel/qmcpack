@@ -283,6 +283,27 @@ struct KFACStorageDiagnostics
   std::size_t retained_numeric_bytes = 0;
 };
 
+struct KFACAffineInverseGeneration;
+
+/** Internal recurrence snapshot: immutable affine factors, independent fallback.
+ * Legacy checkpoint packing remains the public KFACInverseState contract.
+ */
+struct KFACInverseSnapshot
+{
+  std::string registry_fingerprint;
+  KFACCurvatureConvention convention = KFACCurvatureConvention::NATIVE_SCORE;
+  KFACDampingPolicy damping_policy = KFACDampingPolicy::EQUAL_SPLIT;
+  DerivativeReal damping = 1.0e-3;
+  DerivativeReal fallback_damping = 1.0e-3;
+  std::shared_ptr<const KFACAffineInverseGeneration> affine;
+  std::vector<DerivativeReal> fallback;
+
+  /// Materialize the unchanged legacy order only at explicit export boundaries.
+  KFACInverseState exportInverseState() const;
+  /// Logical reachability; shared physical bytes are accounted once by generation.
+  std::size_t affineNumericBytes() const noexcept;
+};
+
 /** Apply split-damped Kronecker inverses as a checked Task-19 preconditioner. */
 class KFACPreconditioner final : public MatrixFreePreconditioner
 {
@@ -297,15 +318,23 @@ public:
                      const KFACInverseState& state,
                      std::shared_ptr<KFACDenseSolver> dense_solver = {},
                      std::shared_ptr<KFACDenseGeneration> dense_generation = {});
+  /// Rebind immutable affine factors while owning independent fallback and scratch.
+  KFACPreconditioner(KFACBlockRegistry registry, std::size_t parameter_version,
+                    const KFACInverseSnapshot& state,
+                    std::shared_ptr<KFACDenseSolver> dense_solver = {},
+                    std::shared_ptr<KFACDenseGeneration> dense_generation = {});
   ~KFACPreconditioner() override;
 
-  /// Return retained layer-factor and solve-work storage.
+  /// Return reachable layer-factor and private solve storage, not alias ownership.
   KFACStorageDiagnostics storageDiagnostics() const noexcept;
 
   /// Return the immutable registry copied into this prepared inverse.
   const KFACBlockRegistry& registry() const noexcept { return registry_; }
 
   KFACInverseState exportInverseState() const;
+  KFACInverseSnapshot inverseSnapshot() const;
+  /// Identity is diagnostic only; it grants no mutable factor authority.
+  const void* affineGenerationIdentity() const noexcept { return affine_.get(); }
   /// Borrow only a complete immutable device generation for inverse-period reuse.
   const std::shared_ptr<KFACDenseGeneration>& denseGeneration() const noexcept { return dense_generation_; }
 
@@ -317,7 +346,6 @@ protected:
                 DerivativeArrayView<DerivativeValue> result) const override;
 
 private:
-  struct PreparedBlock;
   /// Shared ordered preparation without owning a synthetic statistics transaction.
   void beginPreparation(std::shared_ptr<KFACDenseSolver> dense_solver);
   void prepareBlock(std::size_t ordinal, std::size_t activation_dimension,
@@ -327,11 +355,16 @@ private:
   /// Publish only complete factors, scratch, and fallback inverse ownership.
   void finishPreparation(DerivativeArrayView<const DerivativeReal> fallback, DerivativeReal fallback_weight);
   void prepareScratch();
+  void publishAffineGeneration();
+  void bindDenseGeneration(std::shared_ptr<KFACDenseSolver> dense_solver,
+                           std::shared_ptr<KFACDenseGeneration> dense_generation);
 
   KFACBlockRegistry registry_;
   KFACPreconditionerControl control_;
   KFACCurvatureConvention convention_ = KFACCurvatureConvention::NATIVE_SCORE;
-  std::vector<PreparedBlock> blocks_;
+  // Builder ownership never escapes; completed affine storage is immutable.
+  std::unique_ptr<KFACAffineInverseGeneration> building_;
+  std::shared_ptr<const KFACAffineInverseGeneration> affine_;
   std::shared_ptr<KFACDenseGeneration> dense_generation_;
   /// Packed in the same fallback-block/canonical-entry order as the registry.
   std::vector<DerivativeReal> fallback_inverse_diagonal_;

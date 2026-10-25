@@ -26,7 +26,7 @@ struct KFACOptimizer::State
   std::uint64_t data_seen = 0;
   std::uint64_t inverse_step = 0;
   std::optional<KFACFactorState> factors;
-  std::optional<KFACInverseState> inverse;
+  std::optional<KFACInverseSnapshot> inverse;
   // Execution cache only: canonical HOST checkpoint/fingerprint excludes it.
   std::shared_ptr<KFACDenseGeneration> dense_generation;
 };
@@ -155,7 +155,7 @@ void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
     pending->inverse->refreshFallbackDiagonal(*pending->state->factors, control_.inverse.fallback_damping);
     pending->state->inverse_step = state_->inverse_step;
   }
-  pending->state->inverse = pending->inverse->exportInverseState();
+  pending->state->inverse = pending->inverse->inverseSnapshot();
   pending->state->dense_generation = pending->inverse->denseGeneration();
   pending_ = std::move(pending);
   traceStorage();
@@ -222,29 +222,33 @@ void KFACOptimizer::proposalRejected() noexcept
 void KFACOptimizer::traceStorage() noexcept
 {
   if (!psiformer::memory::enabled()) return;
-  // The same vector-capacity ownership used by retainedNumericBytes(), separated
-  // by acceptance lifetime. Exported inverse banks own distinct vectors.
+  // Affine generations report their capacity once at their shared owner.
+  // These observations retain only state-specific fallback ownership.
   // Retire pending observations before publishing accepted capacities so a
   // successful ownership transfer cannot manufacture a double-counted peak.
   trace_storage_[2].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::pending_factors",
       pending_ && pending_->state->factors ? pending_->state->factors->values.capacity() * sizeof(DerivativeReal) : 0);
   trace_storage_[3].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::pending_inverse",
-      pending_ && pending_->state->inverse ? pending_->state->inverse->values.capacity() * sizeof(DerivativeReal) : 0);
+      pending_ && pending_->state->inverse ? pending_->state->inverse->fallback.capacity() * sizeof(DerivativeReal) : 0);
   // The prepared preconditioner reports its own capacity, also for stateless KFAC.
   trace_storage_[0].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::accepted_factors",
       state_->factors ? state_->factors->values.capacity() * sizeof(DerivativeReal) : 0);
   trace_storage_[1].snapshotAt(__FILE__, __LINE__, "KFACOptimizer::accepted_inverse",
-      state_->inverse ? state_->inverse->values.capacity() * sizeof(DerivativeReal) : 0);
+      state_->inverse ? state_->inverse->fallback.capacity() * sizeof(DerivativeReal) : 0);
 }
 
 std::size_t KFACOptimizer::retainedNumericBytes() const noexcept
 {
   const auto bytes = [](const State& state) {
     return ((state.factors ? state.factors->values.capacity() : 0) +
-            (state.inverse ? state.inverse->values.capacity() : 0)) * sizeof(DerivativeReal);
+            (state.inverse ? state.inverse->fallback.capacity() : 0)) * sizeof(DerivativeReal);
   };
+  std::size_t affine_bytes = state_->inverse ? state_->inverse->affineNumericBytes() : 0;
+  if (pending_ && pending_->state->inverse &&
+      (!state_->inverse || state_->inverse->affine != pending_->state->inverse->affine))
+    affine_bytes += pending_->state->inverse->affineNumericBytes();
   return (dense_solver_ ? dense_solver_->hostBytes() : 0) + bytes(*state_) + (pending_ ? bytes(*pending_->state) +
-      pending_->inverse->storageDiagnostics().retained_numeric_bytes : 0);
+      pending_->inverse->storageDiagnostics().solve_scratch_elements * sizeof(DerivativeReal) : 0) + affine_bytes;
 }
 
 std::string KFACOptimizer::stateFingerprint(const State& state) const
@@ -260,7 +264,7 @@ std::string KFACOptimizer::stateFingerprint(const State& state) const
       std::to_string(state.inverse_step) + ":" +
       (state.factors ? std::to_string(state.factors->update_count) + ":" +
           TrainingCheckpoint::valuesFingerprint(state.factors->values) : "empty") + ":" +
-      (state.inverse ? TrainingCheckpoint::valuesFingerprint(state.inverse->values) : "empty") + ":" +
+      (state.inverse ? TrainingCheckpoint::valuesFingerprint(state.inverse->exportInverseState().values) : "empty") + ":" +
       TrainingCheckpoint::valuesFingerprint(scalars);
 }
 
@@ -280,7 +284,8 @@ void KFACOptimizer::writeCheckpointPayload(hdf_archive& archive) const
   archive.write(state_->factors->normalizer, "factor_normalizer");
   archive.write(state_->factors->update_count, "factor_update_count");
   archive.write(state_->factors->values, "factor_values");
-  archive.write(state_->inverse->values, "inverse_values");
+  // Explicit legacy packing is transient, never a second persistent affine bank.
+  archive.write(state_->inverse->exportInverseState().values, "inverse_values");
   archive.write(state_->inverse->damping, "inverse_damping");
   archive.write(state_->inverse->fallback_damping, "inverse_fallback_damping");
 }
@@ -301,9 +306,8 @@ std::unique_ptr<OptimizerCheckpointContributor::PreparedRestore> KFACOptimizer::
   if (state->step != 0)
   {
     state->factors.emplace();
-    state->inverse.emplace();
     auto& factors = *state->factors;
-    auto& inverse = *state->inverse;
+    KFACInverseState inverse;
     factors.registry_fingerprint = inverse.registry_fingerprint = registry_.fingerprint();
     factors.convention = inverse.convention = control_.convention;
     inverse.damping_policy = control_.inverse.damping_policy;
@@ -315,6 +319,7 @@ std::unique_ptr<OptimizerCheckpointContributor::PreparedRestore> KFACOptimizer::
       throw std::runtime_error("KFAC checkpoint recurrence payload is missing");
     validateKFACFactorState(registry_, factors);
     KFACPreconditioner checked_inverse(registry_, 0, inverse);
+    state->inverse = checked_inverse.inverseSnapshot();
     if (factors.update_count != state->step || state->data_seen < state->step ||
         state->inverse_step != ((state->step - 1) / control_.inverse_period) * control_.inverse_period ||
         inverse.damping != control_.inverse.damping || inverse.fallback_damping != control_.inverse.fallback_damping)

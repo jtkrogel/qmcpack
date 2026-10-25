@@ -933,6 +933,68 @@ TEST_CASE("KFAC inverse snapshots rebind exactly and refresh only current diagon
   CHECK(stale.exportInverseState().values == unchanged);
 }
 
+TEST_CASE("KFAC immutable affine snapshots share factors but isolate fallback and lifetime",
+          "[drivers][wftrain][kfac][kfac_state]")
+{
+  const auto registry = makeRegistry();
+  const std::array<DerivativeReal, 4> x{1, 0, 0, 2}, dy{2, 0, 0, 1};
+  const std::array<DerivativeReal, 9> score{0, 0, 0, 0, 0, 0, 3, 4, 0};
+  KFACFactorAccumulator batch(registry, 0);
+  addSample(batch, 1, x, dy, score);
+  reduceKFACFactorStatistics(batch);
+  const auto factors = updateKFACFactorState(nullptr, batch, 0.0);
+
+  // The snapshot outlives its producing preconditioner and owns its fallback copy.
+  KFACInverseSnapshot snapshot;
+  KFACInverseState legacy;
+  {
+    const KFACPreconditioner producer(registry, 1, factors);
+    snapshot = producer.inverseSnapshot();
+    legacy = producer.exportInverseState();
+    CHECK(snapshot.affine.get() == producer.affineGenerationIdentity());
+    CHECK(snapshot.affineNumericBytes() ==
+          producer.storageDiagnostics().factor_elements * sizeof(DerivativeReal));
+  }
+  REQUIRE(snapshot.affine);
+  CHECK(snapshot.affineNumericBytes() == 13 * sizeof(DerivativeReal));
+  CHECK(snapshot.exportInverseState().values == legacy.values);
+  KFACPreconditioner first(registry, 2, snapshot), second(registry, 3, snapshot);
+  CHECK(first.affineGenerationIdentity() == second.affineGenerationIdentity());
+  CHECK(first.affineGenerationIdentity() == snapshot.affine.get());
+  const auto before = snapshot.exportInverseState().values;
+
+  // Stale affine reuse refreshes only the caller's fallback, never accepted state.
+  first.refreshFallbackDiagonal(factors, 0.7);
+  const auto refreshed = first.inverseSnapshot();
+  CHECK(refreshed.affine == snapshot.affine);
+  CHECK(refreshed.fallback.data() != snapshot.fallback.data());
+  CHECK(refreshed.fallback != snapshot.fallback);
+  CHECK(second.exportInverseState().values == before);
+  CHECK(snapshot.exportInverseState().values == before);
+  CHECK_THROWS(first.refreshFallbackDiagonal(factors, -1));
+  CHECK(first.exportInverseState().values == refreshed.exportInverseState().values);
+
+  // Shared construction preserves exact products, version checks and legacy restore.
+  const std::array<DerivativeValue, 9> gradient{{1., 2., 3., 4., 5., 6., 7., 8., 9.}};
+  std::array<DerivativeValue, 9> a{}, b{};
+  const KFACPreconditioner restored(registry, 3, legacy);
+  second.apply({registry.parameterSchema(), 3, {gradient.data(), gradient.size()}}, {a.data(), a.size()});
+  restored.apply({registry.parameterSchema(), 3, {gradient.data(), gradient.size()}}, {b.data(), b.size()});
+  CHECK(a == b);
+  CHECK_THROWS(second.apply({registry.parameterSchema(), 2, {gradient.data(), gradient.size()}}, {a.data(), a.size()}));
+  CHECK(restored.affineGenerationIdentity() != snapshot.affine.get());
+  auto invalid = snapshot;
+  invalid.damping *= 2;
+  CHECK_THROWS(KFACPreconditioner(registry, 4, invalid));
+  invalid = snapshot;
+  invalid.fallback[0] = 0;
+  CHECK_THROWS(KFACPreconditioner(registry, 4, invalid));
+  invalid = snapshot;
+  invalid.affine.reset();
+  CHECK_THROWS(KFACPreconditioner(registry, 4, invalid));
+  CHECK(second.exportInverseState().values == before);
+}
+
 TEST_CASE("KFAC normalized state prepares exact raw-route factors without sample banks",
           "[drivers][wftrain][kfac][kfac_state]")
 {
