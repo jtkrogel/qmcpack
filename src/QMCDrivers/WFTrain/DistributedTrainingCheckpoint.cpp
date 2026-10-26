@@ -14,6 +14,7 @@
 
 #include "Message/CommOperators.h"
 #include "io/hdf/hdf_archive.h"
+#include "QMCWaveFunctions/FrozenReferenceResidualWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
@@ -366,6 +367,8 @@ void DistributedTrainingCheckpoint::saveIterationBundle(
       else if (const auto* paired = dynamic_cast<const PsiFormerComplexWF*>(&provider))
         paired->exportModel(temporary_parameters.string());
 #endif
+      else if (const auto* parent = dynamic_cast<const FrozenReferenceResidualWF*>(&provider))
+        parent->exportModel(temporary_parameters.string());
       else if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
         conventional->exportModel(temporary_parameters);
       else
@@ -373,6 +376,8 @@ void DistributedTrainingCheckpoint::saveIterationBundle(
       const auto saved = TrainingCheckpoint::readModelParameters(staging / (root + ".state.h5"),
                                                                 provider.parameterSchema());
       const auto exported = [&]() {
+        if (const auto* parent = dynamic_cast<const FrozenReferenceResidualWF*>(&provider))
+          return parent->readModel(temporary_parameters.string()).values;
         if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
           return conventional->readModel(temporary_parameters).values;
         return psiformer::readPsiFormerModelFile(temporary_parameters.string()).parameters.values;

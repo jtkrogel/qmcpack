@@ -288,11 +288,11 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
-    // A complete CPU VMC profile is not an implicit optimization or DMC qualification.
+    // The bounded sum supports native CPU VMC and its explicitly admitted training profile.
     for (const auto& component : primaryPsi.getOrbitals())
       if (dynamic_cast<const FrozenReferenceResidualWF*>(component.get()) &&
-          das.new_run_type != QMCRunType::VMC_BATCH)
-        throw UniformCommunicateError("Frozen reference sum currently supports the batched CPU VMC driver only");
+          das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
+        throw UniformCommunicateError("Frozen reference sum requires batched CPU VMC or structured training");
     bool imported_md_orbital_ecp = false;
     if (const auto* request = wavefunction_pool.getParameterFileRequest(primaryPsi.getName()))
     {

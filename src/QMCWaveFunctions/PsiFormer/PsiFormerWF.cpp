@@ -8228,6 +8228,15 @@ std::string PsiFormerWF::trainingConfigurationFingerprint() const
                        state.physical_source, state.physical_species);
 }
 
+/// Bind composite models to neural physics without binding an import pathname or random seed.
+std::string PsiFormerWF::residualConfigurationFingerprint() const
+{
+  PsiFormerReadTransaction transaction(*model_state_, true);
+  const auto& state = transaction.state();
+  return system_kind_ + "/" + modelFingerprint(state.model, "", "", 0, state.execution_plan.environment(),
+      state.twist_phase.reduced, state.twist_phase.cartesian, state.physical_source, state.physical_species);
+}
+
 void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const

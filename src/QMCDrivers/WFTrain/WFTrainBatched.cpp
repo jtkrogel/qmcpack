@@ -52,6 +52,7 @@
 #include "QMCHamiltonians/CoulombPBCAB.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/FrozenReferenceResidualWF.h"
 #include "QMCWaveFunctions/detail/PsiFormerMemoryTrace.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
@@ -1147,6 +1148,24 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     return batch;
   }
 #endif
+
+  // Score-covariance updates differentiate log(parent), not the local energy or the ECP grid.
+  // Sample collection already evaluated the actual complete Hamiltonian at these saved positions.
+  const auto& parent_components = twfs[0].get().getOrbitals();
+  const auto* frozen_sum = parent_components.size() == 1
+      ? dynamic_cast<const FrozenReferenceResidualWF*>(parent_components[0].get()) : nullptr;
+  if (frozen_sum && score_only)
+  {
+    if (capture_ecp_jvp_replay)
+      throw std::invalid_argument("Frozen reference sum does not expose local-energy parameter response");
+    batch.local_energy_term_mask = 0;
+    batch.derivative_operator = TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+        twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset, maximum_parameter_chunk_size);
+    batch.local_energies.reserve(walkers.size());
+    for (const auto& walker : walkers)
+      batch.local_energies.emplace_back(walker.get().Properties(WalkerProperties::LOCALENERGY));
+    return batch;
+  }
 
   if (!has_nonlocal_ecp)
   {
@@ -3046,6 +3065,20 @@ void WFTrainBatched::process(xmlNodePtr node)
                                       requested_provider);
     }
 
+    if (const auto* parent = dynamic_cast<const FrozenReferenceResidualWF*>(selected_provider_))
+    {
+      using O = WFTrainDriverInput::Optimizer;
+      const auto optimizer = training_input_.getOptimizer();
+      if (student_prototype_.getOrbitals().size() != 1 ||
+          training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+          (optimizer != O::ADAM && optimizer != O::KFAC) ||
+          !wftrain::usesEnergyScoreEstimator(training_input_, false) ||
+          training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+          parent->frozenModelIdentity().empty())
+        throw UniformCommunicateError("Frozen reference sum requires a sole CPU ENERGY Adam/KFAC provider, "
+            "score covariance, line_search=off and reproducible frozen reference content");
+    }
+
     // Visible device ordinals may differ under rank-local GPU masks. Agree on
     // physical identities before sampling or entering optimizer collectives.
     const bool explicit_kfac_policy = wftrain::hasExplicitKFACPolicy(training_input_);
@@ -3083,7 +3116,8 @@ void WFTrainBatched::process(xmlNodePtr node)
 #endif
     int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
         (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
-        (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !complex_training_component_) ||
+        (!dynamic_cast<PsiFormerWF*>(selected_provider_) &&
+         !dynamic_cast<FrozenReferenceResidualWF*>(selected_provider_) && !complex_training_component_) ||
         training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF));
     int hybrid_ranks = hybrid_score_kfac ? 1 : 0;
     // Every rank agrees admission before placement and later optimizer collectives.
@@ -3731,6 +3765,27 @@ void WFTrainBatched::run()
             population_.get_golden_hamiltonian());
     }
 #endif
+    if (const auto* parent = dynamic_cast<const FrozenReferenceResidualWF*>(selected_provider_))
+    {
+      const auto& hamiltonian = population_.get_golden_hamiltonian();
+      std::ostringstream identity;
+      identity << parent->frozenModelIdentity();
+      if (const auto& provenance = hamiltonian.ecpModelProvenance())
+        identity << ";ordinary_ecp=" << provenance->ordinary_locality_vp << ";ecp="
+                 << provenance->scientific_definition;
+      // Preserve actual Ewald settings and physical operator topology across restart.
+      for (int i = 0; i < hamiltonian.size(); ++i)
+      {
+        const auto* term = hamiltonian.getComponent(i);
+        identity << ';' << term->getClassName() << ':' << term->getName();
+        if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(term))
+          identity << ':' << aa->ewaldModelDefinition();
+        if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(term))
+          identity << ':' << ab->ewaldModelDefinition();
+      }
+      complex_physical_identity = identity.str();
+      physical_agreement_identity = complex_physical_identity;
+    }
     if (physical_agreement_identity.empty())
       physical_agreement_identity = complex_physical_identity;
     if (!physical_agreement_identity.empty())
@@ -4028,6 +4083,8 @@ void WFTrainBatched::run()
                                     overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0, resident_sr_budget.first != 0)};
   if (conventional_binding_)
     stage_state.configuration_fingerprint += ":" + conventional_binding_->modelIdentity();
+  if (const auto* parent = dynamic_cast<const FrozenReferenceResidualWF*>(selected_provider_))
+    stage_state.configuration_fingerprint += ":" + parent->frozenModelIdentity();
   if (resident_device_authority_)
     stage_state.configuration_fingerprint += ":resident-device-authority-v1";
   DirtyCacheObserver cache_observer;

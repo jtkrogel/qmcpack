@@ -18,6 +18,7 @@
 #include "OhmmsData/Libxml2Doc.h"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <sstream>
 
 namespace qmcplusplus
@@ -310,6 +311,36 @@ TEST_CASE("Frozen reference CPU sum supports diamond derivatives moves and clone
   CHECK(residualLog(sum, electrons) == frozen);
   CHECK(reference.evaluateLog(clone_particles) == Catch::Approx(reference_log).margin(2e-10));
   CHECK_THROWS(dynamic_cast<FrozenReferenceResidualWF&>(*exact.getOrbitals()[0]).enableNeuralTraining());
+
+  // A model artifact reconstructs the complete sum contract and rejects a different relative scale.
+  const auto model_file = "residual_parent_model_rank_" + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  sum.exportModel(model_file);
+  CHECK(sum.readModel(model_file).values == sum.snapshotParameters().values);
+  CHECK(trained_clone.frozenModelIdentity() == sum.frozenModelIdentity());
+  auto imported_base = sum.makeClone(clone_particles);
+  auto& imported = dynamic_cast<FrozenReferenceResidualWF&>(*imported_base);
+  imported.isolateParameterState();
+  imported.importModel(model_file);
+  CHECK(residualLog(imported, electrons) == frozen);
+  FrozenReferenceResidualWF different_coefficient(electrons, reference, neural, coefficient * 1.1);
+  CHECK_THROWS(different_coefficient.readModel(model_file));
+  // Mutating the external named reference must not leak into the parent's frozen Jastrow.
+  OptVariables reference_variables;
+  reference.checkInVariables(reference_variables);
+  reference.checkOutVariables(reference_variables);
+  REQUIRE(reference_variables.size() > 0);
+  reference_variables[0] += 0.03;
+  reference.resetParameters(reference_variables);
+  electrons.R[0][0] += .013;
+  electrons.update();
+  residualLog(sum, electrons);
+  electrons.R[0][0] -= .013;
+  electrons.update();
+  CHECK(residualLog(sum, electrons) == frozen);
+  FrozenReferenceResidualWF changed_reference(electrons, reference, neural, coefficient);
+  CHECK(changed_reference.frozenModelIdentity() != sum.frozenModelIdentity());
+  CHECK_THROWS(changed_reference.readModel(model_file));
+  std::filesystem::remove(model_file);
 
   Libxml2Document bad_xml;
   REQUIRE(bad_xml.parseFromString(

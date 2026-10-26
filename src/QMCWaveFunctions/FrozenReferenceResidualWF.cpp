@@ -9,12 +9,101 @@
 #include "Fermion/SlaterDet.h"
 #include "PsiFormer/PsiFormerWF.h"
 #include "Particle/VirtualParticleSet.h"
+#include "Particle/DistanceTable.h"
+#include "BsplineFactory/BsplineSet.h"
+#include "Jastrow/BsplineFunctor.h"
+#include "io/hdf/hdf_archive.h"
+#include "PsiFormer/PsiFormerModelFile.h"
+#include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace qmcplusplus
 {
+
+namespace
+{
+/// Hash fixed physical inputs by content, excluding source file paths from restart identity.
+std::string referenceIdentity(ParticleSet& particles, TrialWaveFunction& reference, SlaterDet& slater,
+                              const TrialWaveFunction& original, double coefficient)
+{
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  const auto mix = [&hash](const std::string& text) {
+    for (unsigned char byte : text)
+    {
+      hash ^= byte;
+      hash *= UINT64_C(1099511628211);
+    }
+    hash ^= 0;
+    hash *= UINT64_C(1099511628211);
+  };
+  const auto number = [&mix](double value) {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    mix(std::to_string(bits));
+  };
+  if (!original.getNode())
+    return {}; // Evaluation can proceed, but training/export needs a reproducible definition.
+  std::unique_ptr<xmlNode, decltype(&xmlFreeNode)> node(xmlCopyNode(original.getNode(), 1), xmlFreeNode);
+  const auto remove_paths = [&](auto&& self, xmlNodePtr current) -> void {
+    for (; current; current = current->next)
+    {
+      if (current->type == XML_ELEMENT_NODE)
+        xmlUnsetProp(current, BAD_CAST "href");
+      self(self, current->children);
+    }
+  };
+  remove_paths(remove_paths, node.get());
+  xmlBufferPtr buffer = xmlBufferCreate();
+  if (!node || !buffer)
+    throw std::bad_alloc();
+  xmlNodeDump(buffer, nullptr, node.get(), 0, 0);
+  mix(reinterpret_cast<const char*>(xmlBufferContent(buffer)));
+  xmlBufferFree(buffer);
+
+  // Include realized orbital content, not just the XML pathname or nominal basis settings.
+  for (int spin = 0; spin < slater.getNumDets(); ++spin)
+  {
+    const auto* spline = dynamic_cast<const BsplineSet*>(&slater.getPhi(spin));
+    if (!spline || !spline->sourceIdentity() || !spline->sourceIdentity()->image_hex ||
+        spline->sourceIdentity()->effective_table_fingerprint.empty())
+      return {};
+    mix(*spline->sourceIdentity()->image_hex);
+    mix(spline->sourceIdentity()->effective_table_fingerprint);
+  }
+  OptVariables variables;
+  reference.checkInVariables(variables);
+  for (std::size_t i = 0; i < variables.size(); ++i)
+  {
+    mix(variables.name(i));
+    number(variables[i]);
+  }
+  number(coefficient);
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      number(particles.getLattice().R(i, j));
+  for (int table = 0; table < particles.getNumDistTables(); ++table)
+  {
+    const auto& source = particles.getDistTable(table).get_origin();
+    if (&source == &particles || source.getName() == particles.getName())
+      continue;
+    mix(source.getName());
+    for (int atom = 0; atom < source.getTotalNum(); ++atom)
+    {
+      mix(std::to_string(source.GroupID[atom]));
+      for (int d = 0; d < 3; ++d)
+        number(source.R[atom][d]);
+    }
+  }
+  std::ostringstream result;
+  result << "frozen_sj_v1:" << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return result.str();
+}
+} // namespace
 
 /// Create the initial frozen model family, detached from a separately runnable neural definition.
 FrozenReferenceResidualWF::FrozenReferenceResidualWF(ParticleSet& target, const TrialWaveFunction& reference,
@@ -58,8 +147,21 @@ FrozenReferenceResidualWF::FrozenReferenceResidualWF(ParticleSet& target, const 
   if (!slater_ || neural_->getOrbitals().size() != 1 ||
       !(neural_component_ = dynamic_cast<PsiFormerWF*>(neural_->getOrbitals()[0].get())))
     throw std::invalid_argument("Frozen reference sum requires a complete SJ reference and a sole real PsiFormer child");
+  for (int spin = 0; spin < slater_->getNumDets(); ++spin)
+    if (slater_->getPhi(spin).isOptimizable())
+      throw std::invalid_argument("Frozen reference sum currently requires fixed reference orbitals");
   if (detach_neural)
+  {
+    // Ordinary Jastrow clones share physical spline coefficients. Freeze a private bank once;
+    // subsequent parent walker clones may safely share this already detached, read-only image.
+    for (OptimizableObject& object : reference_->extractOptimizableObjectRefs())
+      if (auto* spline = dynamic_cast<BsplineFunctor<RealType>*>(&object))
+        spline->isolateOptimizationState();
     neural_component_->isolateParameterState();
+    frozen_model_identity_ = referenceIdentity(*reference_particles_, *reference_, *slater_, reference, coefficient_);
+    if (!frozen_model_identity_.empty())
+      frozen_model_identity_ += ":" + neural_component_->residualConfigurationFingerprint();
+  }
   parameter_schema_ = std::make_unique<wftrain::StructuredParameterSchema>(
       "frozen_reference_sum/" + neural_component_->parameterSchema().providerId(),
       neural_component_->parameterSchema().blocks());
@@ -73,6 +175,8 @@ void FrozenReferenceResidualWF::enableNeuralTraining()
 {
   if (coefficient_ == 0)
     throw std::invalid_argument("Neural training requires a nonzero frozen reference sum coefficient");
+  if (frozen_model_identity_.empty())
+    throw std::invalid_argument("Frozen reference sum training requires reproducible fixed spline/SJ content");
   training_enabled_ = true;
 }
 
@@ -158,6 +262,74 @@ void FrozenReferenceResidualWF::observeAffineScores(const ParticleSet& particles
     wftrain::AffineScoreObserver& observer, std::vector<double>& score) const
 {
   evaluateParameterScore(particles, score, &observer);
+}
+
+/// Keep a directly readable neural model plus explicit metadata for the complete sum.
+void FrozenReferenceResidualWF::exportModel(const std::string& path) const
+{
+  if (frozen_model_identity_.empty())
+    throw std::invalid_argument("Frozen reference sum export requires reproducible reference content");
+  const auto version = currentParameterVersion();
+  neural_component_->exportModel(path);
+  hdf_archive output;
+  if (!output.open(path, H5F_ACC_RDWR))
+    throw std::runtime_error("Cannot append frozen reference sum model metadata");
+  output.push("frozen_reference_sum");
+  output.write(1, "format_version");
+  output.write(frozen_model_identity_, "frozen_identity");
+  output.write(coefficient_, "coefficient");
+  output.write(parameter_schema_->fingerprint(), "schema_fingerprint");
+  output.write(static_cast<std::uint64_t>(version), "source_parameter_version");
+  if (version != currentParameterVersion())
+    throw std::runtime_error("Frozen reference sum changed during model export");
+}
+
+/// Validate the frozen branch, coefficient and tensor contract before any state mutation.
+wftrain::StructuredParameterSnapshot FrozenReferenceResidualWF::readModel(const std::string& path) const
+{
+  hdf_archive input;
+  int format = 0;
+  double coefficient = 0;
+  std::string identity, fingerprint;
+  if (frozen_model_identity_.empty() || !input.open(path, H5F_ACC_RDONLY) ||
+      !input.is_group("frozen_reference_sum"))
+    throw std::invalid_argument("Not a reconstructible frozen reference sum model");
+  input.push("frozen_reference_sum", false);
+  if (!input.readEntry(format, "format_version") || format != 1 ||
+      !input.readEntry(identity, "frozen_identity") || identity != frozen_model_identity_ ||
+      !input.readEntry(coefficient, "coefficient") || !residual::finiteReal(coefficient) || coefficient != coefficient_ ||
+      !input.readEntry(fingerprint, "schema_fingerprint") || fingerprint != parameter_schema_->fingerprint())
+    throw std::invalid_argument("Frozen reference sum model differs from its reference/coefficient/schema contract");
+  const auto model = psiformer::readPsiFormerModelFile(path);
+  auto result = snapshotParameters();
+  if (model.paired_complex || !model.periodic || model.parameters.values.size() != result.values.size())
+    throw std::invalid_argument("Frozen reference sum neural model representation or extent differs");
+  const auto& blocks = parameter_schema_->blocks();
+  if (model.parameters.layouts.size() != blocks.size())
+    throw std::invalid_argument("Frozen reference sum neural tensor count differs");
+  for (std::size_t i = 0; i < blocks.size(); ++i)
+  {
+    const auto& tensor = model.parameters.layouts[i];
+    if (tensor.module + "/" + tensor.name != blocks[i].id || tensor.shape != blocks[i].shape ||
+        tensor.begin != blocks[i].offset || tensor.end - tensor.begin != blocks[i].count)
+      throw std::invalid_argument("Frozen reference sum neural tensor layout differs");
+  }
+  for (double value : model.parameters.values)
+    if (!residual::finiteReal(value))
+      throw std::invalid_argument("Frozen reference sum model contains a nonfinite neural parameter");
+  result.values = model.parameters.values;
+  return result;
+}
+
+/// Reuse child atomic validation while permitting a fixed-parameter VMC import.
+void FrozenReferenceResidualWF::importModel(const std::string& path)
+{
+  if (proposal_pending_)
+    throw std::logic_error("Cannot import a frozen reference sum during a pending move");
+  auto candidate = readModel(path);
+  candidate.schema_fingerprint = neural_component_->parameterSchema().fingerprint();
+  neural_component_->publishParameters(candidate, candidate.version);
+  accepted_valid_ = false;
 }
 
 /// Evaluate SJ amplitude derivatives without an inverse at a reference determinant node.
@@ -535,6 +707,7 @@ std::unique_ptr<WaveFunctionComponent> FrozenReferenceResidualWF::makeClone(Part
   auto clone = std::unique_ptr<FrozenReferenceResidualWF>(
       new FrozenReferenceResidualWF(particles, *reference_, *neural_, coefficient_, false));
   clone->training_enabled_ = training_enabled_;
+  clone->frozen_model_identity_ = frozen_model_identity_;
   clone->derivative_workspace_ = derivative_workspace_;
   return clone;
 }

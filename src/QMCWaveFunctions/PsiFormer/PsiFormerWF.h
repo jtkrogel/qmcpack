@@ -535,6 +535,9 @@ public:
   /// Validate electron spins and ionic geometry/effective charges against the export.
   void validateSystem(const ParticleSet& electrons, const ParticleSet& ions, const std::string& system_kind);
 
+  /// Identify physical neural semantics independently of parameter values and input file paths.
+  std::string residualConfigurationFingerprint() const;
+
   /// Produce the parent's neural score and optional affine observations with a finite parent denominator.
   void evaluateResidualParameterScore(const ParticleSet& particles, long double coefficient,
       long double parent_log_abs, int parent_sign, std::vector<double>& score,

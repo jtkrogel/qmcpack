@@ -128,12 +128,13 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
     {
       if (!named_wavefunction_resolver_)
         throw UniformCommunicateError("frozen_reference_sum requires named definitions in the wavefunction pool");
-      std::string reference_name, neural_name, coefficient_text, optimize = "no";
+      std::string reference_name, neural_name, coefficient_text, optimize = "no", parameter_file;
       OhmmsAttributeSet attributes;
       attributes.add(reference_name, "reference");
       attributes.add(neural_name, "neural");
       attributes.add(coefficient_text, "coefficient");
       attributes.add(optimize, "optimize");
+      attributes.add(parameter_file, "parameters");
       attributes.put(cur);
       if (reference_name.empty() || neural_name.empty() || coefficient_text.empty() ||
           reference_name == neural_name || reference_name == psi_name || neural_name == psi_name)
@@ -141,7 +142,7 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
       for (xmlAttrPtr attribute = cur->properties; attribute; attribute = attribute->next)
       {
         const std::string key(reinterpret_cast<const char*>(attribute->name));
-        if (key != "reference" && key != "neural" && key != "coefficient" && key != "optimize")
+        if (key != "reference" && key != "neural" && key != "coefficient" && key != "optimize" && key != "parameters")
           throw UniformCommunicateError("Unknown frozen_reference_sum attribute: " + key);
       }
       for (xmlNodePtr child = cur->children; child; child = child->next)
@@ -164,6 +165,8 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
       const auto& reference = named_wavefunction_resolver_(reference_name);
       const auto& neural = named_wavefunction_resolver_(neural_name);
       auto sum = std::make_unique<FrozenReferenceResidualWF>(targetPtcl, reference, neural, coefficient);
+      if (!parameter_file.empty())
+        sum->importModel(parameter_file);
       if (optimize == "yes")
         sum->enableNeuralTraining();
       targetPsi->addComponent(std::move(sum));

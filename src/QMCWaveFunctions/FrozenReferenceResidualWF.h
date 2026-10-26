@@ -24,7 +24,7 @@ class PsiFormerWF;
 class SlaterDet;
 struct FrozenResidualDerivativeWorkspace;
 
-/** Own independent child evaluation state while sharing frozen read-only model storage.
+/** Own independent child evaluation state, versioned neural weights and frozen reference storage.
  * Neural training uses the total parent score; reference parameters remain private and frozen.
  */
 class FrozenReferenceResidualWF final : public WaveFunctionComponent, public wftrain::StructuredParameterProvider
@@ -92,6 +92,18 @@ public:
       const RefVectorWithLeader<WaveFunctionComponent>& components,
       const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal,
       std::size_t sample_offset, std::size_t maximum_parameter_chunk_size) const override;
+
+  /// Identify immutable reference content and the fixed relative coefficient for restart checks.
+  const std::string& frozenModelIdentity() const noexcept { return frozen_model_identity_; }
+
+  /// Export neural topology/weights together with the frozen-reference reconstruction contract.
+  void exportModel(const std::string& path) const;
+
+  /// Read and validate a composite model before publishing any neural values.
+  wftrain::StructuredParameterSnapshot readModel(const std::string& path) const;
+
+  /// Import a composite parameter artifact for VMC or a fresh training stage.
+  void importModel(const std::string& path);
 
   /// Return the accepted total log gradient for one electron.
   GradType evalGrad(ParticleSet& particles, int electron) override;
@@ -184,6 +196,7 @@ private:
 
   mutable std::shared_ptr<FrozenResidualDerivativeWorkspace> derivative_workspace_;
   const double coefficient_;
+  std::string frozen_model_identity_;
   bool training_enabled_ = false;
   std::unique_ptr<wftrain::StructuredParameterSchema> parameter_schema_;
   std::unique_ptr<ParticleSet> reference_particles_;
