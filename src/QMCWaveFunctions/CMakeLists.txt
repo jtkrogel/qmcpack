@@ -44,6 +44,7 @@ set(WFBASE_SRCS
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
     FrozenReferenceResidualWF.cpp
+    FrozenReferenceResidualDerivative.cpp
     PsiFormer/PsiFormerAcceleratorPlanning.cpp
     PsiFormer/PsiFormerAcceleratorExecutor.cpp
     PsiFormer/PsiFormerAcceleratorSchedule.cpp

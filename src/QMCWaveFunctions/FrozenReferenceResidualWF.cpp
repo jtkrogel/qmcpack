@@ -25,7 +25,8 @@ FrozenReferenceResidualWF::FrozenReferenceResidualWF(ParticleSet& target, const 
 /// Validate the bounded physical profile and allocate only clone-private child state.
 FrozenReferenceResidualWF::FrozenReferenceResidualWF(ParticleSet& target, const TrialWaveFunction& reference,
     const TrialWaveFunction& neural, double coefficient, bool detach_neural)
-    : WaveFunctionComponent("frozen_reference_sum"), coefficient_(coefficient),
+    : WaveFunctionComponent("frozen_reference_sum"), derivative_workspace_(createDerivativeWorkspace()),
+      coefficient_(coefficient),
       reference_particles_(std::make_unique<ParticleSet>(target)),
       neural_particles_(std::make_unique<ParticleSet>(target))
 {
@@ -59,10 +60,105 @@ FrozenReferenceResidualWF::FrozenReferenceResidualWF(ParticleSet& target, const 
     throw std::invalid_argument("Frozen reference sum requires a complete SJ reference and a sole real PsiFormer child");
   if (detach_neural)
     neural_component_->isolateParameterState();
+  parameter_schema_ = std::make_unique<wftrain::StructuredParameterSchema>(
+      "frozen_reference_sum/" + neural_component_->parameterSchema().providerId(),
+      neural_component_->parameterSchema().blocks());
 }
 
 /// Defined here because the privately owned child types are forward declared in the header.
 FrozenReferenceResidualWF::~FrozenReferenceResidualWF() = default;
+
+/// Require a nonzero residual before exposing neural tensors to the training driver.
+void FrozenReferenceResidualWF::enableNeuralTraining()
+{
+  if (coefficient_ == 0)
+    throw std::invalid_argument("Neural training requires a nonzero frozen reference sum coefficient");
+  training_enabled_ = true;
+}
+
+/// Keep the frozen reference outside the parent's optimization schema.
+const wftrain::StructuredParameterSchema& FrozenReferenceResidualWF::parameterSchema() const noexcept
+{
+  return *parameter_schema_;
+}
+
+/// Inspect model identity without allocating a parameter-vector copy.
+std::size_t FrozenReferenceResidualWF::currentParameterVersion() const
+{
+  return neural_component_->parameterVersion();
+}
+
+/// Relabel one transactionally consistent child snapshot without copying reference parameters.
+wftrain::StructuredParameterSnapshot FrozenReferenceResidualWF::snapshotParameters() const
+{
+  auto result = neural_component_->snapshotParameters();
+  result.schema_fingerprint = parameter_schema_->fingerprint();
+  return result;
+}
+
+/// Reject a mismatched parent before delegating all-value validation and atomic publication.
+std::size_t FrozenReferenceResidualWF::publishParameters(
+    const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version)
+{
+  if (!training_enabled_ || candidate.schema_fingerprint != parameter_schema_->fingerprint())
+    throw std::invalid_argument("Frozen reference sum publication requires its selected parent schema");
+  if (proposal_pending_)
+    throw std::logic_error("Cannot update a frozen reference sum during a pending move");
+  auto child_candidate = candidate;
+  child_candidate.schema_fingerprint = neural_component_->parameterSchema().fingerprint();
+  const auto version = neural_component_->publishParameters(child_candidate, expected_version);
+  accepted_valid_ = false;
+  return version;
+}
+
+/// Candidate evaluation owns a new neural family; the complete reference remains frozen.
+void FrozenReferenceResidualWF::isolateParameterState()
+{
+  if (proposal_pending_)
+    throw std::logic_error("Cannot isolate a frozen reference sum during a pending move");
+  neural_component_->isolateParameterState();
+  derivative_workspace_ = createDerivativeWorkspace();
+  accepted_valid_ = false;
+}
+
+/// Reuse the neural tensor decay selection without introducing reference weights.
+std::vector<std::string> FrozenReferenceResidualWF::neuralWeightBlocks() const
+{
+  return neural_component_->neuralWeightBlocks();
+}
+
+/// Keep affine indices identical to the canonical neural tensor layout.
+std::vector<wftrain::AffineParameterBlock> FrozenReferenceResidualWF::affineParameterBlocks() const
+{
+  return neural_component_->affineParameterBlocks();
+}
+
+/// Preserve non-affine neural fallback blocks in the same canonical layout.
+std::vector<std::size_t> FrozenReferenceResidualWF::genericKFACParameterBlocks() const
+{
+  return neural_component_->genericKFACParameterBlocks();
+}
+
+/// Differentiate c*N/parent directly, so a zero neural amplitude need not divide by itself.
+void FrozenReferenceResidualWF::evaluateParameterScore(const ParticleSet& particles,
+    std::vector<double>& score, wftrain::AffineScoreObserver* observer) const
+{
+  // Spatial scratch is clone-private. A concurrent publication invalidates the whole sample.
+  auto& self = const_cast<FrozenReferenceResidualWF&>(*this);
+  const auto version = neural_component_->parameterVersion();
+  self.ensureAccepted(particles);
+  neural_component_->evaluateResidualParameterScore(particles, coefficient_,
+      accepted_.spatial.log_abs, accepted_.spatial.sign, score, observer);
+  if (version != neural_component_->parameterVersion())
+    throw std::runtime_error("Frozen reference sum parameters changed during a score sample");
+}
+
+/// Send parent-weighted affine observations through the existing factor interface.
+void FrozenReferenceResidualWF::observeAffineScores(const ParticleSet& particles,
+    wftrain::AffineScoreObserver& observer, std::vector<double>& score) const
+{
+  evaluateParameterScore(particles, score, &observer);
+}
 
 /// Evaluate SJ amplitude derivatives without an inverse at a reference determinant node.
 residual::ScaledSpatialJet FrozenReferenceResidualWF::referenceAmplitude()
@@ -130,12 +226,16 @@ FrozenReferenceResidualWF::State FrozenReferenceResidualWF::evaluateAt(const std
     reference_particles_->R[e] = positions[e];
     neural_particles_->R[e] = positions[e];
   }
+  const auto version = neural_component_->parameterVersion();
   reference_particles_->update();
   auto amplitude = referenceAmplitude();
   if (coefficient_ != 0)
     amplitude = residual::sum(amplitude, neural_component_->evaluateResidualAmplitude(*neural_particles_), coefficient_);
   State result;
   result.positions = positions;
+  result.parameter_version = version;
+  if (version != neural_component_->parameterVersion())
+    throw std::runtime_error("Frozen reference sum parameters changed during spatial evaluation");
   if (amplitude.jet.value == 0)
   {
     // A proposed total node is a zero-weight move; do not invent a nodal log derivative.
@@ -159,7 +259,8 @@ FrozenReferenceResidualWF::State FrozenReferenceResidualWF::evaluateAt(const std
 void FrozenReferenceResidualWF::ensureAccepted(const ParticleSet& particles)
 {
   const std::vector<PosType> positions(particles.R.begin(), particles.R.end());
-  if (!accepted_valid_ || positions != accepted_.positions)
+  if (!accepted_valid_ || positions != accepted_.positions ||
+      accepted_.parameter_version != neural_component_->parameterVersion())
   {
     if (proposal_pending_)
       throw std::logic_error("Cannot refresh a frozen reference sum during a pending proposal");
@@ -256,8 +357,9 @@ FrozenReferenceResidualWF::PsiValue FrozenReferenceResidualWF::ratioGrad(Particl
 /// Publish a fully prepared nonzero cache with no child inverse/proposal dependency.
 void FrozenReferenceResidualWF::commitProposal()
 {
-  if (!proposal_pending_ || !residual::finiteReal(proposed_.spatial.log_abs))
-    throw std::logic_error("Cannot commit a missing or zero-weight frozen reference sum proposal");
+  if (!proposal_pending_ || !residual::finiteReal(proposed_.spatial.log_abs) ||
+      proposed_.parameter_version != neural_component_->parameterVersion())
+    throw std::logic_error("Cannot commit a missing, stale or zero-weight frozen reference sum proposal");
   accepted_ = std::move(proposed_);
   accepted_valid_ = true;
   proposal_pending_ = false;
@@ -332,6 +434,7 @@ void FrozenReferenceResidualWF::mw_accept_rejectMultiParticleMove(
   {
     const auto& component = dynamic_cast<const FrozenReferenceResidualWF&>(components[lane]);
     if (!component.proposal_pending_ || component.proposal_fingerprint_ != moves.fingerprint() ||
+        component.proposed_.parameter_version != component.neural_component_->parameterVersion() ||
         (accepted[lane] && !residual::finiteReal(component.proposed_.spatial.log_abs)))
       throw std::logic_error("Frozen reference sum selected acceptance is stale or has zero weight");
   }
@@ -413,23 +516,27 @@ void FrozenReferenceResidualWF::copyFromBuffer(ParticleSet& particles, WFBufferT
     x = value;
   }
   accepted_.positions.assign(particles.R.begin(), particles.R.end());
-  accepted_valid_ = true;
+  // Buffers contain spatial state only: after a model update, reconstruct rather than trust it.
+  accepted_valid_ = false;
   proposal_pending_ = false;
-  log_value_ = nativeLog(accepted_);
+  ensureAccepted(particles);
 }
 
-/// Do not advertise optimization simply because the private neural branch has derivatives.
+/// Keep legacy full local-energy response separate from the implemented structured score interface.
 void FrozenReferenceResidualWF::evaluateDerivatives(ParticleSet&, const OptVariables&,
                                                    Vector<ValueType>&, Vector<ValueType>&)
 {
-  throw std::invalid_argument("Frozen reference sum parameter optimization is not implemented; use fixed-parameter CPU VMC");
+  throw std::invalid_argument("Frozen reference sum requires structured score-covariance training; legacy full-response derivatives are unsupported");
 }
 
 /// Share only the already isolated frozen neural image across walker clones.
 std::unique_ptr<WaveFunctionComponent> FrozenReferenceResidualWF::makeClone(ParticleSet& particles) const
 {
-  return std::unique_ptr<WaveFunctionComponent>(
+  auto clone = std::unique_ptr<FrozenReferenceResidualWF>(
       new FrozenReferenceResidualWF(particles, *reference_, *neural_, coefficient_, false));
+  clone->training_enabled_ = training_enabled_;
+  clone->derivative_workspace_ = derivative_workspace_;
+  return clone;
 }
 
 } // namespace qmcplusplus

@@ -128,11 +128,12 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
     {
       if (!named_wavefunction_resolver_)
         throw UniformCommunicateError("frozen_reference_sum requires named definitions in the wavefunction pool");
-      std::string reference_name, neural_name, coefficient_text;
+      std::string reference_name, neural_name, coefficient_text, optimize = "no";
       OhmmsAttributeSet attributes;
       attributes.add(reference_name, "reference");
       attributes.add(neural_name, "neural");
       attributes.add(coefficient_text, "coefficient");
+      attributes.add(optimize, "optimize");
       attributes.put(cur);
       if (reference_name.empty() || neural_name.empty() || coefficient_text.empty() ||
           reference_name == neural_name || reference_name == psi_name || neural_name == psi_name)
@@ -140,12 +141,14 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
       for (xmlAttrPtr attribute = cur->properties; attribute; attribute = attribute->next)
       {
         const std::string key(reinterpret_cast<const char*>(attribute->name));
-        if (key != "reference" && key != "neural" && key != "coefficient")
+        if (key != "reference" && key != "neural" && key != "coefficient" && key != "optimize")
           throw UniformCommunicateError("Unknown frozen_reference_sum attribute: " + key);
       }
       for (xmlNodePtr child = cur->children; child; child = child->next)
         if (child->type == XML_ELEMENT_NODE)
           throw UniformCommunicateError("frozen_reference_sum does not accept nested component or training controls");
+      if (optimize != "yes" && optimize != "no")
+        throw UniformCommunicateError("frozen_reference_sum optimize must be yes or no");
       double coefficient;
       try
       {
@@ -160,7 +163,10 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
       }
       const auto& reference = named_wavefunction_resolver_(reference_name);
       const auto& neural = named_wavefunction_resolver_(neural_name);
-      targetPsi->addComponent(std::make_unique<FrozenReferenceResidualWF>(targetPtcl, reference, neural, coefficient));
+      auto sum = std::make_unique<FrozenReferenceResidualWF>(targetPtcl, reference, neural, coefficient);
+      if (optimize == "yes")
+        sum->enableNeuralTraining();
+      targetPsi->addComponent(std::move(sum));
       targetPsi->setTwist(reference.twist());
       contains_frozen_sum = true;
       app_log() << "  Frozen reference sum: reference=" << reference_name << ", neural=" << neural_name
