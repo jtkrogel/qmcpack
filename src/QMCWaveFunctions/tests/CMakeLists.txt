@@ -101,6 +101,7 @@ endif()
 
 set(COMMON_SRC test_variable_set.cpp test_OptimizableObject.cpp test_NaNguard.cpp)
 set(TRIALWF_SRC
+    test_FrozenReferenceSumMath.cpp
     test_batch_execution_wavefunction.cpp
     test_trial_wavefunction_memory_policy.cpp
     test_TrialWaveFunction.cpp
