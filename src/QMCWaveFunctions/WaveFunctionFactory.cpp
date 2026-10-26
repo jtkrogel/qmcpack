@@ -20,6 +20,9 @@
  *@brief Definition of a WaveFunctionFactory
  */
 #include "WaveFunctionFactory.h"
+#include "FrozenReferenceResidualWF.h"
+#include "Message/UniformCommunicateError.h"
+#include <cmath>
 #include "QMCWaveFunctions/Jastrow/JastrowBuilder.h"
 #include "QMCWaveFunctions/Fermion/SlaterDetBuilder.h"
 #include "QMCWaveFunctions/LatticeGaussianProductBuilder.h"
@@ -34,8 +37,10 @@
 #include "OhmmsData/AttributeSet.h"
 namespace qmcplusplus
 {
-WaveFunctionFactory::WaveFunctionFactory(ParticleSet& qp, const PSetMap& pset, Communicate* c)
-    : MPIObjectBase(c), targetPtcl(qp), ptclPool(pset), class_name_("WaveFunctionFactory")
+WaveFunctionFactory::WaveFunctionFactory(ParticleSet& qp, const PSetMap& pset, Communicate* c,
+    NamedWaveFunctionResolver resolver)
+    : MPIObjectBase(c), targetPtcl(qp), ptclPool(pset), class_name_("WaveFunctionFactory"),
+      named_wavefunction_resolver_(std::move(resolver))
 {}
 
 WaveFunctionFactory::~WaveFunctionFactory() = default;
@@ -69,6 +74,7 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
   SPOSetBuilderFactory sposet_builder_factory(myComm, targetPtcl, ptclPool);
 
   std::string vp_file_to_load;
+  bool contains_frozen_sum = false;
   cur = cur->children;
   while (cur != NULL)
   {
@@ -118,6 +124,48 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
       auto builder = std::make_unique<PsiFormerWaveFunctionBuilder>(myComm, targetPtcl, ptclPool);
       targetPsi->addComponent(builder->buildComponent(cur));
     }
+    else if (cname == "frozen_reference_sum")
+    {
+      if (!named_wavefunction_resolver_)
+        throw UniformCommunicateError("frozen_reference_sum requires named definitions in the wavefunction pool");
+      std::string reference_name, neural_name, coefficient_text;
+      OhmmsAttributeSet attributes;
+      attributes.add(reference_name, "reference");
+      attributes.add(neural_name, "neural");
+      attributes.add(coefficient_text, "coefficient");
+      attributes.put(cur);
+      if (reference_name.empty() || neural_name.empty() || coefficient_text.empty() ||
+          reference_name == neural_name || reference_name == psi_name || neural_name == psi_name)
+        throw UniformCommunicateError("frozen_reference_sum requires distinct prior reference/neural names and explicit coefficient");
+      for (xmlAttrPtr attribute = cur->properties; attribute; attribute = attribute->next)
+      {
+        const std::string key(reinterpret_cast<const char*>(attribute->name));
+        if (key != "reference" && key != "neural" && key != "coefficient")
+          throw UniformCommunicateError("Unknown frozen_reference_sum attribute: " + key);
+      }
+      for (xmlNodePtr child = cur->children; child; child = child->next)
+        if (child->type == XML_ELEMENT_NODE)
+          throw UniformCommunicateError("frozen_reference_sum does not accept nested component or training controls");
+      double coefficient;
+      try
+      {
+        std::size_t consumed = 0;
+        coefficient = std::stod(coefficient_text, &consumed);
+        if (consumed != coefficient_text.size() || !residual::finiteReal(coefficient))
+          throw std::invalid_argument("not a finite complete scalar");
+      }
+      catch (const std::exception&)
+      {
+        throw UniformCommunicateError("frozen_reference_sum coefficient must be a finite real scalar");
+      }
+      const auto& reference = named_wavefunction_resolver_(reference_name);
+      const auto& neural = named_wavefunction_resolver_(neural_name);
+      targetPsi->addComponent(std::make_unique<FrozenReferenceResidualWF>(targetPtcl, reference, neural, coefficient));
+      targetPsi->setTwist(reference.twist());
+      contains_frozen_sum = true;
+      app_log() << "  Frozen reference sum: reference=" << reference_name << ", neural=" << neural_name
+                << ", fixed coefficient=" << coefficient << ", CPU FP64 Gamma VMC" << std::endl;
+    }
     else if (cname == "override_variational_parameters")
     {
       OhmmsAttributeSet attribs;
@@ -127,6 +175,8 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
 
     cur = cur->next;
   }
+  if (contains_frozen_sum && (targetPsi->getOrbitals().size() != 1 || !vp_file_to_load.empty()))
+    throw UniformCommunicateError("frozen_reference_sum must be the sole parent component with no parameter override");
   //{
   //  ReportEngine PREA("TrialWaveFunction","print");
   //  targetPsi->VarList.print(app_log());

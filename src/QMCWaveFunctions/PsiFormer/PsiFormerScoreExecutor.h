@@ -37,6 +37,7 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_SCORE_EXECUTOR_H
 #define QMCPLUSPLUS_PSIFORMER_SCORE_EXECUTOR_H
 
+#include "QMCWaveFunctions/FrozenReferenceSumMath.h"
 #include "PsiFormerDirectKernels.h"
 #include "PsiFormerDeterminant.h"
 #include "PsiFormerStorageRequirements.h"
@@ -875,6 +876,70 @@ public:
     workspace.observed_parameter_version_ = parameters_.version();
     return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()},
             workspace.observed_parameter_version_};
+  }
+
+  /** Differentiate c*N/Psi_parent through primal determinant cofactors, not log|N|.
+   * The parent denominator is frozen for this VJP; a zero neural sum is valid.
+   */
+  DirectWeightedChannelScoreResult evaluateResidualScore(DirectScoreWorkspace& workspace,
+      long double coefficient, long double parent_log_abs, int parent_sign,
+      DirectAffineObservationSink* observer = nullptr) const
+  {
+    namespace residual = qmcplusplus::residual;
+    requireFullProfile();
+    validateWorkspaceAndParameters(workspace);
+    if (!residual::finiteReal(coefficient) || !residual::finiteReal(parent_log_abs) ||
+        (parent_sign != 1 && parent_sign != -1) || workspace.electrons_ > 12)
+      throw std::invalid_argument("Residual parameter score requires a finite small-system real parent");
+    std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
+    if (coefficient == 0)
+    {
+      if (observer)
+        throw std::invalid_argument("Residual neural KFAC cannot train with a fixed zero coefficient");
+      return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()}, parameters_.version()};
+    }
+
+    const double* values = parameters_.flat_values().data();
+    buildTrunk(values, workspace);
+    buildOrbitals(values, workspace);
+    const double cusp = cuspValueAndReverse(values, workspace, 0.0);
+    const long double log_seed = std::log(std::abs(coefficient)) + cusp - parent_log_abs;
+    const int seed_sign = coefficient < 0 ? -parent_sign : parent_sign;
+    const std::size_t elements = workspace.electrons_ * workspace.electrons_;
+    long double cusp_seed = 0;
+    for (std::size_t channel = 0; channel < workspace.determinants_; ++channel)
+    {
+      const auto begin = workspace.orbital_matrices_.begin() + channel * elements;
+      const auto cofactor = residual::determinantAdjoints(std::vector<double>(begin, begin + elements),
+                                                         workspace.electrons_);
+      const long double factor = seed_sign * std::exp(log_seed + cofactor.log_scale);
+      cusp_seed += factor * cofactor.value;
+      for (std::size_t k = 0; k < elements; ++k)
+      {
+        const double adjoint = static_cast<double>(factor * cofactor.matrix_adjoints[k]);
+        if (!residual::finiteReal(adjoint))
+          throw std::overflow_error("Residual neural matrix sensitivity is nonfinite");
+        workspace.matrix_adjoints_[channel * elements + k] = adjoint;
+      }
+    }
+    const double native_cusp_seed = static_cast<double>(cusp_seed);
+    if (!residual::finiteReal(native_cusp_seed))
+      throw std::overflow_error("Residual neural cusp sensitivity is nonfinite");
+    cuspValueAndReverse(values, workspace, native_cusp_seed);
+
+    // The ordinary reverse traversal now sees parent-scaled sensitivities exactly once.
+    reverseOrbitals(values, workspace, observer);
+    reverseFeatures(values, workspace, observer);
+    if (observer)
+      observer->observe({ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
+                         qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
+                         workspace.raw_features_.data(), workspace.feature_adjoint_a_.data(),
+                         workspace.electrons_, workspace.input_width_, workspace.width_});
+    for (double value : workspace.parameter_score_)
+      if (!residual::finiteReal(value))
+        throw std::overflow_error("Residual neural reverse traversal produced a nonfinite score");
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()}, parameters_.version()};
   }
 
   /** Evaluate a score while streaming every supported affine layer boundary. */

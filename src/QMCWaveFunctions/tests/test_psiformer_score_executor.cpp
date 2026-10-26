@@ -801,3 +801,100 @@ TEST_CASE("PsiFormer determinant overlap rejects nodes cancellation and bad life
   CHECK_THROWS_AS(valid.channelScoreWeights(one, &one, &zero, 1, &score_weight),
                   std::domain_error);
 }
+
+
+TEST_CASE("Residual parent score and affine sensitivities use the complete amplitude",
+          "[wavefunction][psiformer][residual]")
+{
+  using namespace qmcplusplus::testing::psiformer;
+  for (bool periodic : {false, true})
+  {
+    CAPTURE(periodic);
+    GeneratedFiles files = generateFiles("lih", 4, periodic ? 7 : 4);
+    pf::PsiFormer model(files.parameters, files.configuration);
+    qmcplusplus::psiformer::ExecutionEnvironment environment;
+    if (periodic)
+    {
+      environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+      environment.geometry_feature_policy = qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+      environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+      environment.periodic_axes = {{true, true, true}};
+    }
+    const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
+        {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+         model.dim, model.heads, model.blocks}, environment);
+    pf::DirectScoreExecutor executor(model, plan);
+    auto workspace = executor.makeWorkspace();
+    const auto positions = model.cfg.configuration(0);
+    workspace->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+    CapturingAffineSink original_affine;
+    const auto original = executor.evaluateWithAffineObservations(*workspace, original_affine);
+    const std::vector<double> original_score(original.parameter_score.begin(), original.parameter_score.end());
+    CapturingAffineSink parent_affine;
+    // At this point Phi equals the frozen initial N, so the neural parent score is O_N/2.
+    const auto parent = executor.evaluateResidualScore(*workspace, 1,
+        original.logabs + std::log(2.0), static_cast<int>(original.sign), &parent_affine);
+    double maximum_error = 0;
+    for (std::size_t p = 0; p < original_score.size(); ++p)
+      maximum_error = std::max(maximum_error, std::abs(parent.parameter_score[p] - .5*original_score[p]));
+    CHECK(maximum_error < 2e-8);
+    REQUIRE(parent_affine.observations.size() == original_affine.observations.size());
+    for (std::size_t layer = 0; layer < original_affine.observations.size(); ++layer)
+    {
+      const auto& original_layer = original_affine.observations[layer];
+      const auto& parent_layer = parent_affine.observations[layer];
+      REQUIRE(parent_layer.sensitivities.size() == original_layer.sensitivities.size());
+      CHECK(parent_layer.activations == original_layer.activations);
+      double error = 0;
+      for (std::size_t k = 0; k < parent_layer.sensitivities.size(); ++k)
+        error = std::max(error, std::abs(parent_layer.sensitivities[k] - .5*original_layer.sensitivities[k]));
+      CHECK(error < 2e-8);
+    }
+
+    // Make channels zero except an identical/opposite pair: N=0 but dN/dtheta need not vanish.
+    auto values = model.p.flat_values();
+    for (const auto& layout : model.p.layouts)
+    {
+      if (layout.module.find("Backflow") != std::string::npos && layout.name == "w")
+        for (std::size_t feature = 0; feature < layout.shape[0]; ++feature)
+          for (std::size_t channel = 1; channel < model.ndet; ++channel)
+            for (std::size_t orbital = 0; orbital < model.ne; ++orbital)
+            {
+              const auto first = layout.begin + feature * model.ndet * model.ne + orbital;
+              const auto selected = first + channel * model.ne;
+              values[selected] = channel == 1 ? (orbital == 0 ? -values[first] : values[first]) : 0;
+            }
+      if (layout.module.find("exponential_envelopes") != std::string::npos)
+      {
+        const std::size_t per_channel = (layout.end-layout.begin)/model.ndet;
+        std::copy_n(values.begin()+layout.begin, per_channel, values.begin()+layout.begin+per_channel);
+      }
+    }
+    model.p.set_flat_values(values);
+    std::vector<double> phases(model.ndet), logs(model.ndet);
+    executor.evaluateChannelAmplitudes(*workspace, phases.data(), logs.data(), model.ndet);
+    REQUIRE(phases[0] == -phases[1]);
+    CHECK(logs[0] == logs[1]);
+    CHECK_THROWS(executor.evaluate(*workspace));
+    const long double coefficient = std::exp(-static_cast<long double>(logs[0]));
+    const auto at_node = executor.evaluateResidualScore(*workspace, coefficient, 0, 1);
+    const std::vector<double> node_score(at_node.parameter_score.begin(), at_node.parameter_score.end());
+    const auto largest = std::max_element(node_score.begin(), node_score.end(),
+        [](double a, double b) { return std::abs(a)<std::abs(b); });
+    REQUIRE(largest != node_score.end());
+    CHECK(std::abs(*largest) > 1e-4);
+    const std::size_t parameter = largest - node_score.begin();
+    const double initial = values[parameter], h=1e-6;
+    auto total_log = [&](double value) {
+      model.p.set_flat_value(parameter, value);
+      executor.evaluateChannelAmplitudes(*workspace, phases.data(), logs.data(), model.ndet);
+      long double neural = 0;
+      for (std::size_t k=0; k<model.ndet; ++k)
+        if (phases[k] != 0)
+          neural += phases[k]*std::exp(static_cast<long double>(logs[k]));
+      return std::log(std::abs(1+coefficient*neural));
+    };
+    const long double plus=total_log(initial+h), minus=total_log(initial-h);
+    CHECK(static_cast<double>((plus-minus)/(2*h)) == Catch::Approx(*largest).epsilon(2e-4).margin(2e-4));
+  }
+}

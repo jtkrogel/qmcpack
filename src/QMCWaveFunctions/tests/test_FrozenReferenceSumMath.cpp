@@ -104,3 +104,21 @@ TEST_CASE("Residual amplitude product uses per-electron gradient cross terms", "
   CHECK(product.laplacian[0] == 51);
   CHECK(product.laplacian[1] == -20);
 }
+
+
+TEST_CASE("Residual matrix adjoints preserve node-safe parameter seeds", "[wavefunction][residual]")
+{
+  const auto singular = determinantAdjoints({1,1,1,1}, 2);
+  CHECK(singular.value == 0);
+  CHECK(singular.matrix_adjoints == std::vector<long double>{1,-1,-1,1});
+  const auto zero_row = determinantAdjoints({0,0,0,1}, 2);
+  CHECK(zero_row.value == 0);
+  CHECK(zero_row.matrix_adjoints == std::vector<long double>{1,0,0,0});
+  const auto regular = determinantAdjoints({2,3,5,7}, 2);
+  const long double scale = std::exp(regular.log_scale);
+  CHECK(static_cast<double>(scale*regular.value) == Approx(-1));
+  const double expected[] = {7,-5,-3,2};
+  for (std::size_t k=0; k<4; ++k)
+    CHECK(static_cast<double>(scale*regular.matrix_adjoints[k]) == Approx(expected[k]));
+  CHECK_THROWS_AS(determinantAdjoints({1,2,3}, 2), std::invalid_argument);
+}

@@ -43,6 +43,7 @@ set(WFBASE_SRCS
     HarmonicOscillator/SHOSetBuilder.cpp
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
+    FrozenReferenceResidualWF.cpp
     PsiFormer/PsiFormerAcceleratorPlanning.cpp
     PsiFormer/PsiFormerAcceleratorExecutor.cpp
     PsiFormer/PsiFormerAcceleratorSchedule.cpp

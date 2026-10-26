@@ -564,3 +564,48 @@ TEST_CASE("PsiFormer target spatial admission and lifecycle fail closed",
   CHECK(target->storageFingerprint() == fingerprint);
   CHECK(target->requiredStorageBytes() == bytes);
 }
+
+
+TEST_CASE("Residual neural amplitude agrees with real open and periodic spatial evaluation",
+          "[wavefunction][psiformer][residual]")
+{
+  for (const std::string system : {"lih", "lih_pair"})
+    for (const bool periodic : {false, true})
+    {
+      CAPTURE(system, periodic);
+      GeneratedFiles files = generateFiles(system, 4, periodic ? 7 : 4);
+      pf::PsiFormer model(files.parameters, files.configuration);
+      qmcplusplus::psiformer::ExecutionEnvironment environment;
+      if (periodic)
+      {
+        environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+        environment.geometry_feature_policy = qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+        environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+        environment.periodic_axes = {{true, true, true}};
+      }
+      const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
+          {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+           model.dim, model.heads, model.blocks}, environment);
+      pf::DirectValueExecutor value(model, plan);
+      pf::DirectSpatialExecutor executor(model, value, plan);
+      auto full = executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+      const auto positions = model.cfg.configuration(0);
+      full->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+      const auto reference = executor.evaluateFull(*full);
+      const auto amplitude = executor.evaluateAmplitudeFull(*full);
+      const auto result = qmcplusplus::residual::logarithmic(amplitude);
+      CHECK(result.sign == reference.sign);
+      checkClose(static_cast<double>(result.log_abs), reference.logabs);
+      for (std::size_t lane = 0; lane < result.gradient.size(); ++lane)
+        checkClose(static_cast<double>(result.gradient[lane]), reference.gradient[lane]);
+      for (std::size_t electron = 0; electron < result.laplacian.size(); ++electron)
+        checkClose(static_cast<double>(result.laplacian[electron]), reference.lap_log[electron]);
+
+      // A zero neural branch is a valid amplitude input to a nonzero reference sum.
+      for (std::size_t parameter = 0; parameter < model.p.flat_values().size(); ++parameter)
+        model.p.set_flat_value(parameter, 0.0);
+      const auto zero = executor.evaluateAmplitudeFull(*full);
+      CHECK(zero.jet.value == 0);
+      zero.jet.validate();
+    }
+}

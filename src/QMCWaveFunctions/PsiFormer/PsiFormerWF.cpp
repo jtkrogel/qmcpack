@@ -13023,6 +13023,60 @@ pf::DirectValueResult PsiFormerWF::evaluateDirectValuePositionsUnderRead(
   return result;
 }
 
+/** Reverse the neural branch using the complete sum's normalization and sampling measure. */
+void PsiFormerWF::evaluateResidualParameterScore(const ParticleSet& particles, long double coefficient,
+    long double parent_log_abs, int parent_sign, std::vector<double>& score,
+    wftrain::AffineScoreObserver* observer) const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto& state = transaction.state();
+  if (state.accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU ||
+      state.precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE || state.twist_phase.active() ||
+      state.execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+    throw std::invalid_argument("Residual parameter scores require a real FP64 CPU model");
+  validateRuntimeLattice(particles, state.execution_plan.environment(), "Residual parameter score");
+  if (particles.getTotalNum() != static_cast<int>(transaction.model().ne))
+    throw std::invalid_argument("Residual parameter score has the wrong electron count");
+  if (!residual_score_workspace_)
+    residual_score_workspace_ = state.direct_score_executor.makeWorkspace();
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+    for (int d = 0; d < 3; ++d)
+      residual_score_workspace_->setPosition(electron, d, particles.R[electron][d]);
+  if (observer)
+  {
+    const auto blocks = nativeAffineParameterBlocks(state.execution_plan, *structured_parameter_schema_);
+    NativeAffineScoreObserver sink(state.execution_plan, *structured_parameter_schema_, blocks, *observer);
+    const auto result = state.direct_score_executor.evaluateResidualScore(*residual_score_workspace_, coefficient,
+        parent_log_abs, parent_sign, &sink);
+    score.assign(result.parameter_score.begin(), result.parameter_score.end());
+  }
+  else
+  {
+    const auto result = state.direct_score_executor.evaluateResidualScore(*residual_score_workspace_, coefficient,
+        parent_log_abs, parent_sign);
+    score.assign(result.parameter_score.begin(), result.parameter_score.end());
+  }
+}
+
+/** Keep complete neural amplitude numerators finite at a child node of the sum. */
+residual::ScaledSpatialJet PsiFormerWF::evaluateResidualAmplitude(const ParticleSet& particles)
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto& state = transaction.state();
+  if (state.accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU ||
+      state.precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE || state.twist_phase.active() ||
+      state.execution_plan.environment().amplitude_scalar_domain != psiformer::ScalarDomain::REAL)
+    throw std::invalid_argument("Residual neural amplitude supports only CPU real FP64 models");
+  if (static_cast<std::size_t>(particles.getTotalNum()) != transaction.model().ne)
+    throw std::invalid_argument("Residual neural amplitude electron count differs from its model");
+  if (!residual_spatial_workspace_)
+    residual_spatial_workspace_ = state.direct_spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+    for (int d = 0; d < 3; ++d)
+      residual_spatial_workspace_->setPosition(electron, d, particles.R[electron][d]);
+  return state.direct_spatial_executor.evaluateAmplitudeFull(*residual_spatial_workspace_);
+}
+
 pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead(
     const PsiFormerReadTransaction& transaction,
     const ParticleSet& p,

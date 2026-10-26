@@ -24,6 +24,8 @@
 #include "QMCWaveFunctions/SPOSetBuilderFactory.h"
 #include "Message/MPIObjectBase.h"
 #include "Utilities/RuntimeOptions.h"
+#include <functional>
+
 namespace qmcplusplus
 {
 /** Factory class to build a many-body wavefunction
@@ -40,7 +42,11 @@ public:
    * @param c  communicator
    * @param c  using tasking inside TWF
    */
-  WaveFunctionFactory(ParticleSet& qp, const PSetMap& pset, Communicate* c);
+  /// Optional read-only lookup used only to clone complete named frozen-sum branches.
+  using NamedWaveFunctionResolver = std::function<const TrialWaveFunction&(const std::string&)>;
+
+  WaveFunctionFactory(ParticleSet& qp, const PSetMap& pset, Communicate* c,
+                      NamedWaveFunctionResolver resolver = {});
 
   ///destructor
   ~WaveFunctionFactory();
@@ -61,6 +67,8 @@ private:
   const PSetMap& ptclPool;
   /// class name
   const std::string class_name_;
+  /// Scoped resolver; never retained by a constructed wavefunction component.
+  NamedWaveFunctionResolver named_wavefunction_resolver_;
 };
 
 } // namespace qmcplusplus

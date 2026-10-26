@@ -30,6 +30,7 @@
 #include "QMCWaveFunctions/WaveFunctionPool.h"
 #include "QMCHamiltonians/HamiltonianPool.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/FrozenReferenceResidualWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "PsiHamNamePairReader.h"
@@ -287,6 +288,11 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
+    // A complete CPU VMC profile is not an implicit optimization or DMC qualification.
+    for (const auto& component : primaryPsi.getOrbitals())
+      if (dynamic_cast<const FrozenReferenceResidualWF*>(component.get()) &&
+          das.new_run_type != QMCRunType::VMC_BATCH)
+        throw UniformCommunicateError("Frozen reference sum currently supports the batched CPU VMC driver only");
     bool imported_md_orbital_ecp = false;
     if (const auto* request = wavefunction_pool.getParameterFileRequest(primaryPsi.getName()))
     {

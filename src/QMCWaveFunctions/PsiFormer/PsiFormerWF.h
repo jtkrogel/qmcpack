@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMERWF_H
 
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "QMCWaveFunctions/FrozenReferenceSumMath.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
@@ -533,6 +534,14 @@ public:
 
   /// Validate electron spins and ionic geometry/effective charges against the export.
   void validateSystem(const ParticleSet& electrons, const ParticleSet& ions, const std::string& system_kind);
+
+  /// Produce the parent's neural score and optional affine observations with a finite parent denominator.
+  void evaluateResidualParameterScore(const ParticleSet& particles, long double coefficient,
+      long double parent_log_abs, int parent_sign, std::vector<double>& score,
+      wftrain::AffineScoreObserver* observer = nullptr) const;
+
+  /// Evaluate node-safe scaled amplitude VGL for the bounded fixed-reference CPU sum.
+  residual::ScaledSpatialJet evaluateResidualAmplitude(const ParticleSet& particles);
 
   /// Evaluate log(psi), gradients, and logarithmic Laplacians for a full configuration.
   LogValue evaluateLog(const ParticleSet& particles,
@@ -1779,6 +1788,10 @@ private:
   std::vector<double> direct_total_log_gradient_;
   /// Exclusive FULL or bounded TARGET storage selected once for this clone family.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_full_spatial_workspace_;
+  /// Clone-local reverse tape for parent-scaled score/affine observations.
+  mutable std::unique_ptr<pf::DirectScoreWorkspace> residual_score_workspace_;
+  /// Separate node-safe amplitude scratch; never aliases the ordinary log-VGL state.
+  std::unique_ptr<pf::DirectSpatialWorkspace> residual_spatial_workspace_;
   /// Lazily present first-order-only storage reused for active-electron gradients.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_active_spatial_workspace_;
   /// Lazily present batch scratch used by scalar all-to-one and virtual-ratio calls.

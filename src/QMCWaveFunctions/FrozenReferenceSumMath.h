@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -21,6 +23,44 @@
 
 namespace qmcplusplus::residual
 {
+
+/** Classify real intermediates by exponent bits, preserving guards under finite-math flags.
+ * Covers binary64, x87 extended and IEEE binary128 long-double representations.
+ */
+inline bool finiteReal(long double value)
+{
+  if constexpr (std::numeric_limits<long double>::digits == 53)
+  {
+    const double scalar = static_cast<double>(value);
+    std::uint64_t bits;
+    std::memcpy(&bits, &scalar, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  }
+  else if constexpr (std::numeric_limits<long double>::max_exponent == 16384 &&
+                     (std::numeric_limits<long double>::digits == 64 ||
+                      std::numeric_limits<long double>::digits == 113))
+  {
+    unsigned char bytes[sizeof(long double)];
+    std::memcpy(bytes, &value, sizeof(value));
+    const std::uint16_t probe = 1;
+    unsigned char endian;
+    std::memcpy(&endian, &probe, 1);
+    const bool little = endian == 1;
+    const std::size_t offset = little ?
+        (std::numeric_limits<long double>::digits == 64 ? 8 : 14) : 0;
+    const unsigned exponent = little ? bytes[offset] | (unsigned(bytes[offset + 1]) << 8) :
+                                      (unsigned(bytes[offset]) << 8) | bytes[offset + 1];
+    return (exponent & 0x7fffU) != 0x7fffU;
+  }
+  else
+  {
+    // Unusual host representations use a conservative binary64 admission check.
+    const double scalar = static_cast<double>(value);
+    std::uint64_t bits;
+    std::memcpy(&bits, &scalar, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  }
+}
 
 /** Value, Cartesian first derivatives and per-electron Laplacian of an amplitude. */
 struct SpatialJet
@@ -39,9 +79,9 @@ struct SpatialJet
   {
     if (gradient.size() != 3 * laplacian.size())
       throw std::invalid_argument("Residual amplitude jet has inconsistent derivative extents");
-    if (!std::isfinite(value) ||
-        !std::all_of(gradient.begin(), gradient.end(), [](long double x) { return std::isfinite(x); }) ||
-        !std::all_of(laplacian.begin(), laplacian.end(), [](long double x) { return std::isfinite(x); }))
+    if (!finiteReal(value) ||
+        !std::all_of(gradient.begin(), gradient.end(), [](long double x) { return finiteReal(x); }) ||
+        !std::all_of(laplacian.begin(), laplacian.end(), [](long double x) { return finiteReal(x); }))
       throw std::invalid_argument("Residual amplitude jet contains a nonfinite numerator");
   }
 };
@@ -94,7 +134,7 @@ inline ScaledSpatialJet sum(const ScaledSpatialJet& reference, const ScaledSpati
 {
   reference.jet.validate();
   neural.jet.validate();
-  if (!std::isfinite(coefficient) || !std::isfinite(reference.log_scale) || !std::isfinite(neural.log_scale))
+  if (!finiteReal(coefficient) || !finiteReal(reference.log_scale) || !finiteReal(neural.log_scale))
     throw std::invalid_argument("Residual amplitude sum requires finite coefficients and scales");
   if (coefficient == 0)
     return reference;
@@ -124,7 +164,7 @@ struct LogSpatialJet
 inline LogSpatialJet logarithmic(const ScaledSpatialJet& amplitude)
 {
   amplitude.jet.validate();
-  if (!std::isfinite(amplitude.log_scale))
+  if (!finiteReal(amplitude.log_scale))
     throw std::invalid_argument("Residual amplitude has a nonfinite common scale");
   if (amplitude.jet.value == 0)
     throw std::domain_error("Residual total amplitude is zero; logarithmic derivatives are undefined");
@@ -204,6 +244,78 @@ inline ScaledSpatialJet determinant(std::vector<SpatialJet> matrix, std::size_t 
   }
   partial.back().validate();
   return {log_scale, std::move(partial.back())};
+}
+
+/** Determinant value and its matrix sensitivities in one common positive scale. */
+struct ScaledDeterminantAdjoints
+{
+  long double log_scale = 0;
+  long double value = 0;
+  std::vector<long double> matrix_adjoints;
+};
+
+/** Reverse a small division-free determinant expansion without an inverse or log seed.
+ * Matrix adjoints remain finite at a singular channel and can seed the ordinary trunk VJP.
+ */
+inline ScaledDeterminantAdjoints determinantAdjoints(const std::vector<double>& input, std::size_t order)
+{
+  if (order == 0 || order > 12 || input.size() != order * order)
+    throw std::invalid_argument("Residual cofactor evaluation requires a square matrix of order 1 through 12");
+  std::vector<long double> matrix(input.begin(), input.end()), row_scales(order, 1);
+  ScaledDeterminantAdjoints result;
+  result.matrix_adjoints.resize(order * order);
+  for (std::size_t row = 0; row < order; ++row)
+  {
+    long double scale = 0;
+    for (std::size_t col = 0; col < order; ++col)
+    {
+      const auto value = matrix[row * order + col];
+      if (!finiteReal(value))
+        throw std::invalid_argument("Residual cofactor input contains a nonfinite matrix entry");
+      scale = std::max(scale, std::abs(value));
+    }
+    // A zero row can have nonzero cofactors; do not return early at a child node.
+    if (scale != 0)
+      row_scales[row] = scale;
+    result.log_scale += std::log(row_scales[row]);
+    for (std::size_t col = 0; col < order; ++col)
+      matrix[row * order + col] /= row_scales[row];
+  }
+
+  const std::size_t states = std::size_t(1) << order;
+  std::vector<long double> partial(states), adjoint(states);
+  std::vector<std::size_t> counts(states);
+  partial[0] = 1;
+  for (std::size_t mask = 1; mask < states; ++mask)
+  {
+    counts[mask] = counts[mask >> 1] + (mask & 1);
+    const std::size_t row = counts[mask] - 1;
+    std::size_t selected_column = 0;
+    for (std::size_t col = 0; col < order; ++col)
+      if (mask & (std::size_t(1) << col))
+      {
+        const long double sign = ((row + selected_column) & 1) ? -1 : 1;
+        partial[mask] += sign * matrix[row * order + col] * partial[mask ^ (std::size_t(1) << col)];
+        ++selected_column;
+      }
+  }
+  result.value = partial.back();
+  adjoint.back() = 1;
+  for (std::size_t mask = states - 1; mask != 0; --mask)
+  {
+    const std::size_t row = counts[mask] - 1;
+    std::size_t selected_column = 0;
+    for (std::size_t col = 0; col < order; ++col)
+      if (mask & (std::size_t(1) << col))
+      {
+        const auto previous = mask ^ (std::size_t(1) << col);
+        const long double seed = ((row + selected_column) & 1) ? -adjoint[mask] : adjoint[mask];
+        adjoint[previous] += seed * matrix[row * order + col];
+        result.matrix_adjoints[row * order + col] += seed * partial[previous] / row_scales[row];
+        ++selected_column;
+      }
+  }
+  return result;
 }
 
 } // namespace qmcplusplus::residual

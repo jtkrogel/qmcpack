@@ -37,6 +37,7 @@
 
 #include "PsiFormerDenseKernels.h"
 #include "PsiFormerOrbitalProjection.h"
+#include "QMCWaveFunctions/FrozenReferenceSumMath.h"
 
 #include <algorithm>
 #include <cmath>
@@ -694,6 +695,10 @@ public:
     workspace.active_electron_ = 0;
     return evaluateImpl(workspace);
   }
+
+  /** Return scaled amplitude derivatives without dividing by an isolated neural value.
+   * The bounded small-system path is used only by a frozen-reference CPU sum. */
+  qmcplusplus::residual::ScaledSpatialJet evaluateAmplitudeFull(DirectSpatialWorkspace& workspace) const;
 
   /// Evaluate one admitted physical target interval using the existing complete algebra.
   DirectSpatialResultView evaluateTarget(DirectSpatialWorkspace& workspace,
@@ -1649,6 +1654,66 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
     }
   }
   return cusp_value;
+}
+
+/** Evaluate the ordinary trunk/head but replace logarithmic determinant algebra by jets.
+ * Division-free small determinants retain derivatives through individual channel nodes.
+ */
+inline qmcplusplus::residual::ScaledSpatialJet DirectSpatialExecutor::evaluateAmplitudeFull(
+    DirectSpatialWorkspace& workspace) const
+{
+  namespace residual = qmcplusplus::residual;
+  workspace.invalidateResult();
+  requireRealWavefunction();
+  const std::size_t electrons = layout_->electronCount();
+  if (workspace.mode_ != DirectSpatialMode::FULL_VGL || electrons == 0 || electrons > 12)
+    throw std::invalid_argument("Residual neural amplitude requires a CPU FULL workspace with 1 through 12 electrons");
+  layout_->validateParameterStore(parameters_);
+  if (workspace.geometry_.electronCount() != electrons ||
+      workspace.geometry_.nucleusCount() != layout_->nucleusCount())
+    throw std::invalid_argument("Residual neural amplitude workspace belongs to a different model");
+  workspace.active_electron_ = 0;
+  const double* values = parameters_.flat_values().data();
+  refreshGeometry(workspace);
+  buildTrunk(values, workspace);
+  buildOrbitalMatrices(values, workspace);
+
+  // All channels share the same electron-space derivative lanes and physical cusp.
+  const auto& orbitals = workspace.orbital_matrices_;
+  const std::size_t matrix_elements = electrons * electrons;
+  const std::size_t all_elements = orbitals.value.size();
+  residual::ScaledSpatialJet amplitude{0, residual::SpatialJet(electrons)};
+  for (std::size_t channel = 0; channel < layout_->determinantCount(); ++channel)
+  {
+    std::vector<residual::SpatialJet> matrix(matrix_elements, residual::SpatialJet(electrons));
+    for (std::size_t element = 0; element < matrix_elements; ++element)
+    {
+      const std::size_t index = channel * matrix_elements + element;
+      auto& jet = matrix[element];
+      jet.value = orbitals.value[index];
+      for (std::size_t lane = 0; lane < 3 * electrons; ++lane)
+        jet.gradient[lane] = orbitals.gradient[lane * all_elements + index];
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+        jet.laplacian[electron] = orbitals.laplacian[electron * all_elements + index];
+    }
+    amplitude = residual::sum(amplitude, residual::determinant(std::move(matrix), electrons), 1);
+  }
+
+  // exp(cusp) contributes g_cusp and Delta(cusp)+g_cusp.g_cusp to primal derivatives.
+  const double cusp = accumulateCusp(values, workspace);
+  residual::SpatialJet cusp_jet(electrons, 1);
+  for (std::size_t lane = 0; lane < 3 * electrons; ++lane)
+    cusp_jet.gradient[lane] = workspace.scalar_gradient_scratch_[lane];
+  for (std::size_t electron = 0; electron < electrons; ++electron)
+  {
+    cusp_jet.laplacian[electron] = workspace.scalar_laplacian_scratch_[electron];
+    for (std::size_t d = 0; d < 3; ++d)
+      cusp_jet.laplacian[electron] += cusp_jet.gradient[3 * electron + d] * cusp_jet.gradient[3 * electron + d];
+  }
+  amplitude = residual::multiply(amplitude, {cusp, std::move(cusp_jet)});
+  amplitude.jet.validate();
+  workspace.observed_parameter_version_ = parameters_.version();
+  return amplitude;
 }
 
 inline DirectSpatialResultView DirectSpatialExecutor::evaluateImpl(

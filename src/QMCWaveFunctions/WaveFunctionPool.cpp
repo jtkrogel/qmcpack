@@ -57,7 +57,25 @@ bool WaveFunctionPool::put(xmlNodePtr cur)
     throw UniformCommunicateError("\"" + psi_name +
                                   "\" already exists in the wavefunction pool. Please rename this wavefunction node.");
 
-  WaveFunctionFactory psiFactory(*qp, ptcl_pool_.getPool(), myComm);
+  // Resolve only completed prior definitions; pending conventional imports are not frozen values.
+  WaveFunctionFactory psiFactory(*qp, ptcl_pool_.getPool(), myComm,
+      [this, target](const std::string& name) -> const TrialWaveFunction& {
+        if (const auto* request = getParameterFileRequest(name))
+          if (!request->imported_hamiltonian)
+            throw UniformCommunicateError("Frozen reference sum cannot clone a pending conventional parameter_file import: " + name);
+        auto wavefunction = getWaveFunction(name);
+        if (!wavefunction)
+          throw UniformCommunicateError("Frozen reference sum requires a previously defined wavefunction: " + name);
+        auto* definition = wavefunction->get().getNode();
+        std::string branch_target("e");
+        OhmmsAttributeSet attributes;
+        attributes.add(branch_target, "target");
+        attributes.add(branch_target, "ref");
+        attributes.put(definition);
+        if (branch_target != target)
+          throw UniformCommunicateError("Frozen reference sum branches must target the same particle set");
+        return *wavefunction;
+      });
   std::unique_ptr<TrialWaveFunction> psi;
   if (xmlHasProp(cur, BAD_CAST "parameter_file"))
   {
