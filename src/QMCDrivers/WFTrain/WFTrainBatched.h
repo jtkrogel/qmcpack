@@ -110,6 +110,7 @@ private:
   PsiFormerComplexWF* complex_training_component_ = nullptr;
   /// Resolved once during pre-draw process admission, never re-read mid-run.
   std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
+  bool resident_score_adam_ = false;
   bool resident_device_authority_ = false;
   /// Complete resident observation is a separate sole-AE W2 opt-in, not implied by parameter authority.
   bool resident_open_observation_ = false;

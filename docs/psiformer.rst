@@ -658,6 +658,20 @@ damping, optimizer state and inverse cadence retain their separate controls.
 Raw first-order checkpoint identities remain compatible; selecting a soft residual
 changes the checkpoint configuration identity.
 
+For the real/open ECP GPU profile, explicit ``gradient_estimator=score_covariance``
+plus ``PSIFORMER_GPU_ADAM_BYTES`` and ``PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES``
+selects an optional ordered EO/O Adam update bridge. It requires one rank, crowd,
+block and step, at least seven walkers, FP64, and the fixed unmodified Adam step.
+Raw and soft residuals share the coefficients above. The second budget admits only
+the two score-contraction arrays and norm scratch; model, score tapes, sampling,
+coefficients, vendor storage and checkpoints require separate accounting.
+
+This bridge retains HOST-controlled sampling, physical local energy, scalar
+statistics and parameter publication. Requested DEVICE parameter authority is
+rejected until physical PP observations are implemented. Periodic and complex
+model heads require separate implementations. The legacy full-response T/EO/O
+bridge retains its existing contract and checkpoint identity.
+
 Sampled linear methods
 ~~~~~~~~~~~~~~~~~~~~~~
 

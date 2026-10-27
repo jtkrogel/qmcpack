@@ -2171,7 +2171,8 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendStageFingerprint(hash, schema.fingerprint());
   if (resident_energy_adam)
-    extendStageFingerprint(hash, std::string("resident-energy-c3-adam-v1"));
+    extendStageFingerprint(hash, std::string(training.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE
+        ? "resident-score-c2-adam-host-v1" : "resident-energy-c3-adam-v1"));
   if (resident_energy_sr)
     extendStageFingerprint(hash, std::string("resident-energy-c3-sr-v1"));
   if (training.getComplexGpuTraining().enabled())
@@ -3314,11 +3315,12 @@ void WFTrainBatched::process(xmlNodePtr node)
                 << (ecp_score_c2 ? "host_batch_dispatch" : "shared_derivative_lane") << std::endl;
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
-    if (resident_adam_budget_ &&
-        training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE)
-      throw UniformCommunicateError("Resident ENERGY Adam does not implement the explicit score_covariance estimator");
+    resident_score_adam_ = resident_adam_budget_ &&
+        training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE;
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
     resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
+    if (resident_score_adam_ && resident_device_authority_)
+      throw UniformCommunicateError("Score Adam C2 bridge requires HOST parameter authority until physical PP DEVICE observations are implemented");
     if (const auto* optin = std::getenv("PSIFORMER_GPU_RESIDENT_OPEN_OBSERVATION"))
     {
       if (std::string(optin) != "1")
@@ -3372,9 +3374,19 @@ void WFTrainBatched::process(xmlNodePtr node)
           training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
           (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
         throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7 (DEVICE authority B>0), fixed unmodified step and explicit caps");
-      validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
+      if (resident_score_adam_)
+      {
+        if (!population_.get_golden_hamiltonian().hasPhysicalNLPP())
+          throw UniformCommunicateError("Score Adam C2 driver bridge currently requires an actual open ECP Hamiltonian");
+        auto& provider = *dynamic_cast<PsiFormerWF*>(selected_provider_);
+        (void)wftrain::realECPPhysicalIdentity(provider, population_.get_golden_electrons(), population_.get_golden_hamiltonian());
+      }
+      else
+        validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
       if (resident_adam_budget_)
-        resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
+        resident_norm_bytes_ = resident_score_adam_
+            ? device_provider->prepareResidentScoreAdam(resident_adam_budget_)
+            : device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
       else
         resident_sr_incremental_bytes_ = device_provider->prepareResidentEnergySR(crowds_.front()->size(), resident_sr_budget_);
       // Authority activation borrows the admitted C3 lane; it allocates no new image.
@@ -3490,6 +3502,7 @@ void WFTrainBatched::run()
 
   auto* device_provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
+  const bool resident_score_adam = resident_score_adam_;
   const auto cold_moment_allowance = resident_device_authority_ && resident_adam_budget
       ? checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 2 * sizeof(double)) : 0;
   const auto resident_sr_budget = resident_sr_budget_;
@@ -4036,7 +4049,8 @@ void WFTrainBatched::run()
   if (resident_adam_budget)
   {
     first_order_optimizer->prepareResidentAdamNorm(resident_norm_bytes);
-    app_log() << "Resident ENERGY Adam bridge device cap(C3+norm only)=" << resident_adam_budget
+    app_log() << (resident_score_adam ? "Resident score Adam bridge device cap(C2+norm only)="
+                                   : "Resident ENERGY Adam bridge device cap(C3+norm only)=") << resident_adam_budget
               << ", norm device bytes=" << resident_norm_bytes << ", norm host bytes=" << resident_norm_bytes
               << "; existing derivative tapes/host compatibility channels retained once, not eliminated; not a process feasibility budget" << std::endl;
   }
@@ -5039,8 +5053,15 @@ void WFTrainBatched::run()
         }
         if (resident_adam_budget || resident_sr_budget.first)
         {
-          validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
-          const auto resident_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
+          if (resident_score_adam)
+          {
+            auto& provider = *dynamic_cast<PsiFormerWF*>(selected_provider_);
+            (void)wftrain::realECPPhysicalIdentity(provider, population_.get_golden_electrons(), population_.get_golden_hamiltonian());
+          }
+          else
+            validateResidentCoulomb(population_.get_golden_hamiltonian(), resident_device_authority_);
+          const auto resident_mask = resident_score_adam ? 0 :
+              wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) |
               (resident_device_authority_ && has_nonlocal_ecp
                   ? wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) : 0);
           std::optional<wftrain::StructuredParameterSnapshot> parameters;
@@ -5059,13 +5080,26 @@ void WFTrainBatched::run()
           for (const auto energy : batch.local_energies)
             if (energy.imag() != 0)
               throw std::invalid_argument("Resident ENERGY requires real physical local energies");
+          std::optional<wftrain::EnergyClippingTransform> clipping;
+          if (resident_score_adam && training_input_.getScoreResidualPolicy().transform ==
+                  wftrain::ScoreResidualTransform::SOFT_SQUEEZE)
+            clipping = makeScoreResidualTransform(*myComm, batches, training_input_,
+                checkedMemoryAdd(first_order_optimizer->retainedBytes(), checkedMemoryAdd(
+                    retained_configuration_bytes, storage_diagnostics.retained_numeric_bytes)));
           const auto coefficients = wftrain::prepareEnergyCoefficients(*batch.derivative_operator,
               {batch.weights.data(), batch.weights.size()}, {batch.local_energies.data(), batch.local_energies.size()},
-              wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN);
+              resident_score_adam ? wftrain::EnergyGradientEstimator::SCORE_COVARIANCE
+                                  : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+              clipping ? &*clipping : nullptr);
           if (coefficients.weight_sum <= 0)
             throw std::invalid_argument("Resident ENERGY requires positive total sample weight");
           const auto generic = coefficients.channels(*batch.derivative_operator, batch.local_energy_term_mask);
-          const std::array<wftrain::VJPCoefficientChannel, 3> channels{{generic[2], generic[1], generic[0]}}; // T/EO/O
+          const std::array<wftrain::VJPCoefficientChannel, 3> channels = resident_score_adam
+              ? std::array<wftrain::VJPCoefficientChannel, 3>{{generic[1], generic[0], {}}}
+              : std::array<wftrain::VJPCoefficientChannel, 3>{{generic[2], generic[1], generic[0]}};
+          const std::size_t channel_count = resident_score_adam ? 2 : 3;
+          const double score_center = clipping ? coefficients.clipped_weighted_energy_sum.real() / coefficients.weight_sum
+                                              : coefficients.weighted_energy_sum.real() / coefficients.weight_sum;
           auto pending = training_state; // Fallible fingerprint copy precedes proposal/publication.
           ++pending.completed_iterations;
           resident_diagnostics.emplace(ResidentEnergyDiagnostics{batch.weights.size(),
@@ -5098,7 +5132,7 @@ void WFTrainBatched::run()
               try
               {
                 auto candidate = device_provider->consumeResidentEnergySRDevice(*batch.derivative_operator,
-                    {channels.data(), channels.size()}, batch.weights, coefficients.weight_sum,
+                    {channels.data(), channel_count}, batch.weights, coefficients.weight_sum,
                     resident_diagnostics->mean, training_input_.getDamping(), training_input_.getLearningRate(),
                     makeKrylovControl(training_input_), resident_sr_budget, resident_snapshot_cap_);
                 if (!candidate || candidate->sourceVersion() != source_version)
@@ -5138,7 +5172,7 @@ void WFTrainBatched::run()
                 first_order_optimizer->proposeResidentDeviceAdam(schema, source_version,
                   [&](const auto& adam, double b1, double b2, double c1, double c2, double epsilon) {
                     candidate = device_provider->consumeResidentEnergyAdamDevice(*batch.derivative_operator,
-                        {channels.data(), channels.size()}, adam, coefficients.weight_sum,
+                        {channels.data(), channel_count}, adam, coefficients.weight_sum,
                         resident_diagnostics->mean, b1, b2, c1, c2, epsilon, resident_snapshot_cap_);
                     if (!candidate || candidate->sourceVersion() != source_version)
                       throw std::invalid_argument("Resident DEVICE candidate source is incompatible");
@@ -5168,7 +5202,7 @@ void WFTrainBatched::run()
               {
                 candidate = *parameters;
                 const auto diagnostics = device_provider->consumeResidentEnergySR(*batch.derivative_operator,
-                    {channels.data(), channels.size()}, batch.weights, parameters->values, coefficients.weight_sum,
+                    {channels.data(), channel_count}, batch.weights, parameters->values, coefficients.weight_sum,
                     resident_diagnostics->mean, training_input_.getDamping(), training_input_.getLearningRate(),
                     makeKrylovControl(training_input_), resident_sr_budget, candidate.values);
                 resident_diagnostics->gradient_norm = diagnostics.gradient_norm;
@@ -5181,8 +5215,12 @@ void WFTrainBatched::run()
               else
                 candidate = first_order_optimizer->proposeResidentAdam(schema, *parameters,
                   [&](auto& adam, double b1, double b2, double c1, double c2, double epsilon, auto& values) {
+                    if (resident_score_adam)
+                      return device_provider->consumeResidentScoreAdam(*batch.derivative_operator,
+                          {channels.data(), channel_count}, adam, parameters->values, coefficients.weight_sum,
+                          score_center, b1, b2, c1, c2, epsilon, values);
                     return device_provider->consumeResidentEnergyAdam(*batch.derivative_operator,
-                        {channels.data(), channels.size()}, adam, parameters->values, coefficients.weight_sum,
+                        {channels.data(), channel_count}, adam, parameters->values, coefficients.weight_sum,
                         resident_diagnostics->mean, b1, b2, c1, c2, epsilon, values);
                   }, resident_diagnostics->gradient_norm);
               // Legacy routes retain their owning HOST candidate and full validation.
