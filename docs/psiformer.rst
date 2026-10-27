@@ -631,6 +631,33 @@ alongside the moments and accepted update count. Rejected proposals do not advan
 these recurrence states. All first-order methods can also optimize the existing
 ``determinant_overlap`` objective.
 
+Score residual policy
+~~~~~~~~~~~~~~~~~~~~~
+
+``gradient_estimator=score_covariance`` selects the physical energy gradient from
+score products without local-energy parameter responses. Its first-order default
+is the raw covariance residual. ``score_residual_policy=raw`` makes that choice
+explicit; ``score_residual_policy=soft_squeeze`` opts into the existing exact
+median/linear-quantile transform with logarithmic tails. The soft policy accepts
+``score_residual_width`` (positive, default 1) and ``score_residual_quantile``
+(in ``(0,1]``, default 0.95). Those controls require the soft policy declaration.
+
+The transform is prepared once from the full retained energy population across
+crowds and MPI ranks. Its scalar statistics are computed on the host; device
+score products consume the same coefficients. The transform changes the real
+energy component and preserves the imaginary component. Transformed energies
+are centered by their population mean for the score covariance; reported energies
+and variances remain raw. The current soft policy requires unit sample weights.
+
+These controls require an ENERGY score estimator, a first-order optimizer or KFAC,
+and ``line_search=off``. They do not select a derivative family implicitly. KFAC
+may retain its explicit legacy score-gradient convention and update scaling.
+Compatible KFAC clipping aliases resolve to the same scalar policy; contradictory
+objectives, hard windows, exclusion, widths or quantiles are rejected. Curvature,
+damping, optimizer state and inverse cadence retain their separate controls.
+Raw first-order checkpoint identities remain compatible; selecting a soft residual
+changes the checkpoint configuration identity.
+
 Sampled linear methods
 ~~~~~~~~~~~~~~~~~~~~~~
 

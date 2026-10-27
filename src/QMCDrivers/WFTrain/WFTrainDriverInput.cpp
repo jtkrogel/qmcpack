@@ -29,8 +29,8 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 97> allowed_controls{
-    "gradient_estimator",
+constexpr std::array<std::string_view, 100> allowed_controls{
+    "gradient_estimator", "score_residual_policy", "score_residual_width", "score_residual_quantile",
     "defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
@@ -286,6 +286,8 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   warmup_steps_ = 0;
   objective_                        = Objective::ENERGY;
   gradient_estimator_ = GradientEstimator::LEGACY;
+  score_residual_policy_ = {};
+  explicit_score_residual_policy_ = false;
   orbital_target_                    = OrbitalTarget::SINGLE_REFERENCE;
   momentum_decay_ = 0.9;
   rms_decay_ = 0.9;
@@ -905,6 +907,35 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   else if (optimizer_ != Optimizer::ACCELERATED_LINEAR_METHOD)
     rejectControls(seen_controls, {"lm_inner_iterations", "lm_inner_restart_length",
         "lm_inner_relative_tolerance"}, "lm");
+  explicit_score_residual_policy_ = seen_controls.count("score_residual_policy");
+  if (!explicit_score_residual_policy_)
+    rejectControls(seen_controls, {"score_residual_width", "score_residual_quantile"}, "unspecified score residual policy");
+  else
+  {
+    using T = wftrain::ScoreResidualTransform;
+    const auto& value = readControl("score_residual_policy");
+    if (value == "raw") score_residual_policy_.transform = T::RAW;
+    else if (value == "soft_squeeze") score_residual_policy_.transform = T::SOFT_SQUEEZE;
+    else throw UniformCommunicateError("WFTrainDriverInput: score_residual_policy must be raw or soft_squeeze");
+    if (score_residual_policy_.transform == T::RAW)
+      rejectControls(seen_controls, {"score_residual_width", "score_residual_quantile"}, "raw score residual policy");
+    if (seen_controls.count("score_residual_width"))
+      score_residual_policy_.width = parseNonnegativeReal(readControl("score_residual_width"), "score_residual_width");
+    if (seen_controls.count("score_residual_quantile"))
+      score_residual_policy_.quantile = parseNonnegativeReal(readControl("score_residual_quantile"), "score_residual_quantile");
+    if (score_residual_policy_.width <= 0 || score_residual_policy_.quantile <= 0 || score_residual_policy_.quantile > 1)
+      throw UniformCommunicateError("WFTrainDriverInput: invalid score residual width or quantile");
+    if (optimizer_ == Optimizer::KFAC)
+    {
+      const auto desired = score_residual_policy_.transform == T::RAW ? KFACObjective::RAW_COVARIANCE
+                                                                    : KFACObjective::CLIPPED_COVARIANCE;
+      if (seen_controls.count("defaults") && kfac_objective_ != desired)
+        throw UniformCommunicateError("WFTrainDriverInput: score residual policy contradicts KFAC preset");
+      kfac_objective_ = desired;
+      if (seen_controls.count("score_residual_width")) kfac_clip_width_ = score_residual_policy_.width;
+      if (seen_controls.count("score_residual_quantile")) kfac_clip_quantile_ = score_residual_policy_.quantile;
+    }
+  }
   if (optimizer_ != Optimizer::KFAC)
     rejectControls(seen_controls, {"defaults", "kfac_gradient_convention", "kfac_update_order", "kfac_schedule_arithmetic",
         "kfac_fallback_damping", "kfac_objective", "kfac_clip_mode",
@@ -1076,6 +1107,41 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
         parsePositiveSize(readControl("kfac_curvature_period"), "kfac_curvature_period") != 1)
       throw UniformCommunicateError("WFTrainDriverInput: persistent KFAC requires kfac_curvature_period=1");
   }
+  if (explicit_score_residual_policy_)
+  {
+    using T = wftrain::ScoreResidualTransform;
+    const bool score = gradient_estimator_ == GradientEstimator::SCORE_COVARIANCE ||
+        (optimizer_ == Optimizer::KFAC && gradient_estimator_ == GradientEstimator::LEGACY &&
+         (kfac_defaults_ != KFACDefaults::LEGACY || kfac_gradient_ != KFACGradient::LEGACY));
+    if (objective_ != Objective::ENERGY || (!first_order && optimizer_ != Optimizer::KFAC) || !score ||
+        line_search_ != LineSearch::OFF)
+      throw UniformCommunicateError("WFTrainDriverInput: score residual policy requires an energy score estimator with line_search=off");
+    if (optimizer_ == Optimizer::KFAC)
+    {
+      const bool raw = score_residual_policy_.transform == T::RAW;
+      if (kfac_objective_ != (raw ? KFACObjective::RAW_COVARIANCE : KFACObjective::CLIPPED_COVARIANCE) ||
+          (!raw && (kfac_clip_mode_ != KFACClipMode::SOFT_MEDIAN ||
+                    !wftrain::isPositiveInfinityTrainingReal(kfac_exclude_width_))) ||
+          (seen_controls.count("score_residual_width") && kfac_clip_width_ != score_residual_policy_.width) ||
+          (seen_controls.count("score_residual_quantile") && kfac_clip_quantile_ != score_residual_policy_.quantile))
+        throw UniformCommunicateError("WFTrainDriverInput: score residual policy contradicts KFAC clipping controls");
+    }
+  }
+  // Resolve legacy aliases into the same scalar descriptor without changing their meaning.
+  if (optimizer_ == Optimizer::KFAC)
+  {
+    using T = wftrain::ScoreResidualTransform;
+    score_residual_policy_.transform = kfac_objective_ == KFACObjective::RAW_COVARIANCE ? T::RAW
+        : kfac_objective_ == KFACObjective::COMPONENTWISE_MAD_COVARIANCE ? T::COMPONENTWISE_MAD
+        : kfac_objective_ == KFACObjective::COMPONENTWISE_MEAN_RESIDUAL ? T::COMPONENTWISE_MEAN
+        : kfac_clip_mode_ == KFACClipMode::SOFT_MEDIAN ? T::SOFT_SQUEEZE
+        : kfac_clip_mode_ == KFACClipMode::HARD_MEDIAN ? T::HARD_MEDIAN : T::HARD_MEAN;
+    score_residual_policy_.width = kfac_objective_ == KFACObjective::COMPONENTWISE_MAD_COVARIANCE ||
+        kfac_objective_ == KFACObjective::COMPONENTWISE_MEAN_RESIDUAL ? kfac_complex_clip_width_ : kfac_clip_width_;
+    score_residual_policy_.quantile = kfac_clip_quantile_;
+    score_residual_policy_.excludes_samples = !wftrain::isPositiveInfinityTrainingReal(kfac_exclude_width_);
+    score_residual_policy_.exclusion_width = score_residual_policy_.excludes_samples ? kfac_exclude_width_ : 0;
+  }
   if (gradient_estimator_ != GradientEstimator::LEGACY)
   {
     if (objective_ != Objective::ENERGY || (!first_order && optimizer_ != Optimizer::KFAC))
@@ -1085,8 +1151,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (gradient_estimator_ == GradientEstimator::SCORE_COVARIANCE && optimizer_ == Optimizer::KFAC &&
         (kfac_defaults_ != KFACDefaults::LEGACY ||
          (kfac_gradient_ != KFACGradient::LEGACY && kfac_gradient_ != KFACGradient::PHYSICAL_COVARIANCE) ||
-         kfac_objective_ != KFACObjective::RAW_COVARIANCE))
-      throw UniformCommunicateError("WFTrainDriverInput: score_covariance requires raw physical covariance without a KFAC preset");
+         (kfac_objective_ != KFACObjective::RAW_COVARIANCE &&
+          !(explicit_score_residual_policy_ && score_residual_policy_.transform == wftrain::ScoreResidualTransform::SOFT_SQUEEZE))))
+      throw UniformCommunicateError("WFTrainDriverInput: score_covariance requires physical covariance without a KFAC preset");
     if (line_search_ != LineSearch::OFF)
       throw UniformCommunicateError("WFTrainDriverInput: explicit gradient_estimator currently requires line_search=off");
   }

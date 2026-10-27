@@ -9,6 +9,7 @@
 #define QMCPLUSPLUS_WFTRAIN_DRIVER_INPUT_H
 
 #include "Configuration.h"
+#include "ScoreResidualPolicy.h"
 #include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
 
 #include <cstddef>
@@ -118,6 +119,8 @@ public:
   enum class GradientEstimator { LEGACY, SCORE_COVARIANCE, FULL_LOCAL_ENERGY_RESPONSE };
   GradientEstimator getGradientEstimator() const noexcept { return gradient_estimator_; }
   Objective getObjective() const noexcept { return objective_; }
+  const wftrain::ScoreResidualPolicy& getScoreResidualPolicy() const noexcept { return score_residual_policy_; }
+  bool hasExplicitScoreResidualPolicy() const noexcept { return explicit_score_residual_policy_; }
 
   OrbitalSampling getOrbitalSampling() const noexcept { return orbital_sampling_; }
 
@@ -259,6 +262,8 @@ private:
   double lm_inner_relative_tolerance_{0.1};
   double kfac_fallback_damping_{1.0e-3};
   GradientEstimator gradient_estimator_{GradientEstimator::LEGACY};
+  wftrain::ScoreResidualPolicy score_residual_policy_;
+  bool explicit_score_residual_policy_ = false;
   KFACObjective kfac_objective_{KFACObjective::RAW_COVARIANCE};
   KFACDefaults kfac_defaults_{KFACDefaults::LEGACY};
   KFACGradient kfac_gradient_{KFACGradient::LEGACY};

@@ -1785,8 +1785,8 @@ std::size_t kfacStatisticsBytes(const wftrain::KFACBlockRegistry& registry)
   return checkedMemoryMultiply(elements, sizeof(wftrain::DerivativeReal));
 }
 
-/// Prepare scalar-only complex weighting after every rank has completed product preparation.
-wftrain::EnergyClippingTransform makeComplexKFACClipping(Communicate& communicator,
+/// Prepare one population-wide scalar weighting after all ranks finish product preparation.
+wftrain::EnergyClippingTransform makeScoreResidualTransform(Communicate& communicator,
     const std::vector<wftrain::PreparedEnergyGradientBatch>& batches,
     const WFTrainDriverInput& input, std::size_t already_retained_bytes)
 {
@@ -1816,25 +1816,27 @@ wftrain::EnergyClippingTransform makeComplexKFACClipping(Communicate& communicat
   {
     if (failure)
       std::rethrow_exception(failure);
-    throw UniformCommunicateError("Another rank failed preparing complex KFAC clipping samples");
+    throw UniformCommunicateError("Another rank failed preparing score residual samples");
   }
   const auto clipping = [&]() {
-    using O = WFTrainDriverInput::KFACObjective;
-    if (input.getKFACObjective() == O::COMPONENTWISE_MEAN_RESIDUAL)
+    using T = wftrain::ScoreResidualTransform;
+    const auto& policy = input.getScoreResidualPolicy();
+    if (policy.transform == T::COMPONENTWISE_MEAN)
       return wftrain::prepareMeanResidualEnergyClippingTransform({energies.data(), energies.size()},
-          {weights.data(), weights.size()}, input.getKFACComplexClipWidth(), &communicator);
-    if (input.getKFACObjective() == O::CLIPPED_COVARIANCE)
+          {weights.data(), weights.size()}, policy.width, &communicator);
+    if (policy.transform == T::SOFT_SQUEEZE ||
+        input.getKFACObjective() == WFTrainDriverInput::KFACObjective::CLIPPED_COVARIANCE)
     {
       int nonuniform = std::any_of(weights.begin(), weights.end(), [](double weight) { return weight != 1; });
       communicator.allreduce(nonuniform);
       if (nonuniform)
-        throw UniformCommunicateError("Complex soft weighting requires unit statistical weights on every rank");
+        throw UniformCommunicateError("Soft score weighting requires unit statistical weights on every rank");
       return wftrain::prepareEnergyClippingTransform({energies.data(), energies.size()},
           {wftrain::EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE,
-           input.getKFACClipWidth(), input.getKFACClipQuantile()}, &communicator);
+           policy.width, policy.quantile}, &communicator);
     }
     return wftrain::prepareComplexEnergyClippingTransform({energies.data(), energies.size()},
-        {weights.data(), weights.size()}, input.getKFACComplexClipWidth(), &communicator);
+        {weights.data(), weights.size()}, policy.width, &communicator);
   }();
   if (communicator.rank() == 0)
   {
@@ -1843,7 +1845,7 @@ wftrain::EnergyClippingTransform makeComplexKFACClipping(Communicate& communicat
               << " real_scale=" << descriptor.scale << " imaginary_center=" << descriptor.imaginary_center
               << " imaginary_scale=" << descriptor.imaginary_scale
               << " width_multiplier=" << descriptor.policy.width_multiplier
-              << " raw_energy_reporting=unchanged" << std::endl;
+              << " statistics=global_energy_only_host raw_energy_reporting=unchanged" << std::endl;
   }
   return clipping;
 }
@@ -2189,6 +2191,14 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   {
     extendStageFingerprint(hash, std::string("energy-gradient-estimator-v1"));
     extendStageFingerprint(hash, static_cast<int>(training.getGradientEstimator()));
+  }
+  if (training.getOptimizer() != WFTrainDriverInput::Optimizer::KFAC &&
+      training.getScoreResidualPolicy().transform != wftrain::ScoreResidualTransform::RAW)
+  {
+    extendStageFingerprint(hash, std::string("score-residual-policy-v1"));
+    extendStageFingerprint(hash, static_cast<int>(training.getScoreResidualPolicy().transform));
+    extendStageFingerprint(hash, training.getScoreResidualPolicy().width);
+    extendStageFingerprint(hash, training.getScoreResidualPolicy().quantile);
   }
   if (training.samplesOrbitalStudent())
     extendStageFingerprint(hash, std::string("orbital-student-measure-energy-off-v1"));
@@ -3980,6 +3990,13 @@ void WFTrainBatched::run()
                   energy_estimator == wftrain::EnergyGradientEstimator::REAL_CENTERED_SCORE_RESIDUAL ? "real_centered_score_residual" :
                   energy_estimator == wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY ? "pathwise_local_energy" :
                   "symmetrized_hamiltonian") << std::endl;
+  if (training_input_.hasExplicitScoreResidualPolicy() && myComm->rank() == 0)
+    app_log() << "WFTrain score residual policy="
+              << (training_input_.getScoreResidualPolicy().transform == wftrain::ScoreResidualTransform::RAW
+                      ? "raw" : "soft_squeeze")
+              << " width=" << training_input_.getScoreResidualPolicy().width
+              << " quantile=" << training_input_.getScoreResidualPolicy().quantile
+              << " derivative_family=score parameter_response_mask=0" << std::endl;
   wftrain::HighParameterTraining trainer(
       requirements, energy_estimator,
       reduction);
@@ -5311,7 +5328,7 @@ void WFTrainBatched::run()
           wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
           std::optional<wftrain::EnergyClippingTransform> clipping;
           if (training_input_.getKFACObjective() != WFTrainDriverInput::KFACObjective::RAW_COVARIANCE)
-            clipping = makeComplexKFACClipping(*myComm, batches, training_input_,
+            clipping = makeScoreResidualTransform(*myComm, batches, training_input_,
                 checkedMemoryAdd(retained_configuration_bytes, checkedMemoryAdd(
                     storage_diagnostics.retained_numeric_bytes, statistics->retainedNumericBytes())));
           preparation_failure = {};
@@ -5380,12 +5397,18 @@ void WFTrainBatched::run()
         }
         else if (isFirstOrder(optimizer_kind))
         {
+          std::optional<wftrain::EnergyClippingTransform> clipping;
+          if (score_training && training_input_.getScoreResidualPolicy().transform ==
+                  wftrain::ScoreResidualTransform::SOFT_SQUEEZE)
+            clipping = makeScoreResidualTransform(*myComm, batches, training_input_,
+                checkedMemoryAdd(first_order_optimizer->retainedBytes(), checkedMemoryAdd(
+                    retained_configuration_bytes, storage_diagnostics.retained_numeric_bytes)));
           std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
           std::exception_ptr producer_failure;
           try
           {
             producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
-                std::move(batches), std::nullopt, score_training);
+                std::move(batches), std::move(clipping), score_training);
           }
           catch (...)
           {

@@ -14,6 +14,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Message/Communicate.h"
+#include "OhmmsData/Libxml2Doc.h"
+#include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 
@@ -680,6 +682,73 @@ TEST_CASE("Distributed clipping failures are rank uniform before selection",
       prepareEnergyClippingTransform({energies.data(), energies.size()}, policy,
                                      &communicator),
       Catch::Matchers::ContainsSubstring("preflight failed"));
+}
+
+TEST_CASE("Common soft score policy shares legacy coefficients across unequal batches",
+          "[drivers][training][clipping][score_residual_policy]")
+{
+  Libxml2Document document;
+  REQUIRE(document.parseFromString(R"(<qmc><training optimizer='adam'>
+    <parameter name='gradient_estimator'>score_covariance</parameter>
+    <parameter name='score_residual_policy'>soft_squeeze</parameter>
+    <parameter name='score_residual_width'>0.5</parameter>
+    <parameter name='score_residual_quantile'>0.75</parameter>
+  </training></qmc>)"));
+  WFTrainDriverInput input;
+  input.readXML(document.getRoot());
+  const auto& policy = input.getScoreResidualPolicy();
+  REQUIRE(policy.transform == ScoreResidualTransform::SOFT_SQUEEZE);
+  const std::vector<DerivativeValue> energies{{-7, 1}, {1, 2}, {2, -3}, {40, 4}};
+  const std::vector<double> real_energies{-7, 1, 2, 40}, weights(4, 1);
+  const std::vector<std::vector<DerivativeValue>> scores{
+      {{1, .5}, {-2, 1}}, {{2, -.25}, {3, 0}}, {{-.5, 2}, {1, -1}}, {{3, 1}, {-1, 2}}};
+  const auto transform = prepareEnergyClippingTransform({energies.data(), energies.size()},
+      {EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE, policy.width, policy.quantile});
+  ClippedScoreObjectiveControl legacy;
+  legacy.width = policy.width;
+  legacy.quantile = policy.quantile;
+  const auto legacy_result = prepareClippedScoreObjective({real_energies.data(), 4}, {weights.data(), 4}, legacy);
+  DerivativeValue transformed_mean{}, raw_mean{};
+  for (const auto energy : energies)
+  {
+    transformed_mean += transform.apply(energy) / 4.0;
+    raw_mean += energy / 4.0;
+    CHECK(transform.apply(energy).imag() == energy.imag());
+  }
+  for (std::size_t i = 0; i < 4; ++i)
+    CHECK((transform.apply(energies[i]).real() - transformed_mean.real()) / 4 ==
+          Approx(legacy_result.coefficients[i].real()).margin(2e-14));
+  const auto schema = makeClippingSchema();
+  for (const std::vector<std::size_t> counts :
+       {std::vector<std::size_t>{4}, {1, 3}, {3, 1}, {1, 1, 1, 1}})
+  {
+    EnergyGradientAccumulator accumulator(schema, 0, EnergyGradientEstimator::SCORE_COVARIANCE);
+    std::size_t offset = 0;
+    for (const auto count : counts)
+    {
+      ClippingStreamingOperator derivative(schema,
+          {scores.begin() + offset, scores.begin() + offset + count},
+          std::vector<std::vector<DerivativeValue>>(count));
+      EnergyGradientAccumulator partial(schema, 0, EnergyGradientEstimator::SCORE_COVARIANCE);
+      accumulateEnergyGradientBatch(derivative, {weights.data() + offset, count},
+          {energies.data() + offset, count}, 0, partial, DerivativeAdjoint::TRANSPOSE, &transform);
+      accumulator.merge(partial);
+      offset += count;
+    }
+    accumulator.completeSingleParticipantReduction();
+    const auto result = accumulator.finalize();
+    CHECK(result.sample_count == 4);
+    CHECK(result.local_energy_term_mask == 0);
+    CHECK(result.mean_energy == raw_mean);
+    for (std::size_t p = 0; p < 2; ++p)
+    {
+      double expected = 0;
+      for (std::size_t i = 0; i < 4; ++i)
+        expected += 2 * std::real(std::conj(scores[i][p]) *
+            (transform.apply(energies[i]) - transformed_mean)) / 4;
+      CHECK(result.gradient[p] == Approx(expected).margin(2e-13));
+    }
+  }
 }
 
 } // namespace qmcplusplus::wftrain

@@ -1278,4 +1278,71 @@ TEST_CASE("WFTrainDriverInput validates complete bounded complex GPU opt-in",
   CHECK(reused.getOptimizer() == defaults.getOptimizer());
 }
 
+TEST_CASE("Common score residual policies resolve independently of optimizer scaling",
+          "[drivers][wf_train][score_residual_policy]")
+{
+  using T = wftrain::ScoreResidualTransform;
+  const auto parameter = [](const std::string& name, const std::string& value) {
+    return "<parameter name='" + name + "'>" + value + "</parameter>";
+  };
+  const auto parse = [](const std::string& controls, const std::string& optimizer = "adam") {
+    return parseTrainingInput("<qmc><training optimizer='" + optimizer + "'>" + controls + "</training></qmc>");
+  };
+  const auto score = parameter("gradient_estimator", "score_covariance");
+  const auto soft = parameter("score_residual_policy", "soft_squeeze");
+  const auto raw = parameter("score_residual_policy", "raw");
+  CHECK(parse("").getScoreResidualPolicy().transform == T::RAW);
+  CHECK_FALSE(parse(score).hasExplicitScoreResidualPolicy());
+  for (const std::string optimizer : {"adam", "sgd", "momentum_sgd", "rmsprop", "amsgrad", "kfac"})
+  {
+    const auto input = parse(score + soft, optimizer);
+    CHECK(input.hasExplicitScoreResidualPolicy());
+    CHECK(input.getScoreResidualPolicy().transform == T::SOFT_SQUEEZE);
+    CHECK(input.getScoreResidualPolicy().width == 1);
+    CHECK(input.getScoreResidualPolicy().quantile == Catch::Approx(.95));
+    CHECK_FALSE(input.getScoreResidualPolicy().excludes_samples);
+    CHECK(wftrain::energyGradientEstimator(input, false) == wftrain::EnergyGradientEstimator::SCORE_COVARIANCE);
+    CHECK(parse(score + raw, optimizer).getScoreResidualPolicy().transform == T::RAW);
+  }
+  const auto selected = parse(score + soft + parameter("score_residual_width", "2") +
+      parameter("score_residual_quantile", ".75"));
+  CHECK(selected.getScoreResidualPolicy().width == 2);
+  CHECK(selected.getScoreResidualPolicy().quantile == .75);
+  const auto legacy = parse(parameter("kfac_gradient_convention", "half_covariance") +
+      parameter("kfac_objective", "clipped_covariance") + parameter("kfac_clip_width", "2") +
+      parameter("kfac_clip_quantile", ".75"), "kfac");
+  const auto common = parse(parameter("kfac_gradient_convention", "half_covariance") + soft +
+      parameter("score_residual_width", "2") + parameter("score_residual_quantile", ".75"), "kfac");
+  CHECK(common.getScoreResidualPolicy().transform == legacy.getScoreResidualPolicy().transform);
+  CHECK(common.getScoreResidualPolicy().width == legacy.getScoreResidualPolicy().width);
+  CHECK(common.getScoreResidualPolicy().quantile == legacy.getScoreResidualPolicy().quantile);
+  CHECK(common.getKFACObjective() == legacy.getKFACObjective());
+  CHECK(common.getKFACGradient() == legacy.getKFACGradient());
+  CHECK(common.getKFACCurvature() == legacy.getKFACCurvature());
+  CHECK(common.getKFACDampingPolicy() == legacy.getKFACDampingPolicy());
+  CHECK_THROWS(parse(soft));
+  CHECK_THROWS(parse(parameter("gradient_estimator", "full_local_energy_response") + soft));
+  CHECK_THROWS(parse(score + parameter("score_residual_policy", "unknown")));
+  CHECK_THROWS(parse(score + parameter("score_residual_width", "2")));
+  CHECK_THROWS(parse(score + raw + parameter("score_residual_quantile", ".75")));
+  for (const auto* value : {"0", "-1", "nan", "inf"})
+    CHECK_THROWS(parse(score + soft + parameter("score_residual_width", value)));
+  for (const auto* value : {"0", "1.01", "nan"})
+    CHECK_THROWS(parse(score + soft + parameter("score_residual_quantile", value)));
+  CHECK_THROWS(parse(score + soft + parameter("line_search", "reference")));
+  CHECK_THROWS(parse(score + soft + parameter("kfac_objective", "raw_covariance"), "kfac"));
+  CHECK_THROWS(parse(score + soft + parameter("kfac_clip_mode", "hard_median"), "kfac"));
+  CHECK_THROWS(parse(score + soft + parameter("kfac_exclude_width", "2"), "kfac"));
+  CHECK_THROWS(parse(score + soft + parameter("score_residual_width", "2") +
+      parameter("kfac_clip_width", "3"), "kfac"));
+  CHECK_THROWS(parse(score + soft + parameter("score_residual_quantile", ".75") +
+      parameter("kfac_clip_quantile", ".5"), "kfac"));
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<qmc><training/></qmc>"));
+  auto reused = selected;
+  reused.readXML(document.getRoot());
+  CHECK(reused.getScoreResidualPolicy().transform == T::RAW);
+  CHECK_FALSE(reused.hasExplicitScoreResidualPolicy());
+}
+
 } // namespace qmcplusplus
