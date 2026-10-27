@@ -1,6 +1,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerResidualPair.h"
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 using namespace qmcplusplus::psiformer;
 namespace {
@@ -58,6 +59,17 @@ int main()
   try { ResidualPairGeometry invalid({1,1,1,2.1}, lattice); }
   catch (const std::invalid_argument&) { bad_cutoff = true; }
   check(bad_cutoff);
+  bool invalid_provenance = false;
+  try { ResidualPairGeometry invalid({1,1,1,1.7,"invalid"}, lattice); }
+  catch (const std::invalid_argument&) { invalid_provenance = true; }
+  check(invalid_provenance);
+  for (double invalid : {std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()})
+  {
+    bool rejected_nonfinite = false;
+    try { residualPairJet(.1,invalid,1,2,.5); }
+    catch (const std::invalid_argument&) { rejected_nonfinite = true; }
+    check(rejected_nonfinite);
+  }
   bool rejected = false;
   try { residualPairJet(.1, 1000, 1, 2, .5); } catch (const std::overflow_error&) { rejected = true; }
   check(rejected);

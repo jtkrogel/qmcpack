@@ -392,7 +392,8 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
     throw std::invalid_argument("Residual pair metadata requires its explicit Jastrow initialization profile");
   if (environment.residual_pair && (environment.boundary != BoundaryCondition::PERIODIC ||
       environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
-      environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL || environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei ||
       environment.head_representation != HeadRepresentation::REAL ||
       !std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool x) { return x; })))
     throw std::invalid_argument("Residual pair profile requires real fully periodic torus metadata");

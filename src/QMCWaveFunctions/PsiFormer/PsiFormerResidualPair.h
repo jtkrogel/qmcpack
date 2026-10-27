@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace qmcplusplus::psiformer
 {
@@ -30,6 +31,8 @@ struct ResidualPairMetadata
   double same_reference = 1;
   double opposite_reference = 1;
   double cutoff = 0;
+  /// Optional provenance of an explicit legacy-to-residual model conversion.
+  std::string conversion_source_sha256;
 };
 
 /// Value, spatial radial jets and log-length score; first/r has a finite coalescence limit.
@@ -38,9 +41,10 @@ struct ResidualPairJet
   double value, radial_first, radial_second, radial_first_over_r, score;
 };
 
-/// Evaluate the residual and its radial derivatives without subtracting rounded cusps.
+/// Evaluate radial jets without subtracting rounded cusps. Geometry callers pass
+/// their original squared displacement so the cutoff polynomial avoids a sqrt round trip.
 inline ResidualPairJet residualPairJet(double r, double lambda, double reference,
-                                       double cutoff, double factor)
+                                       double cutoff, double factor, double squared_radius = -1)
 {
   if (!residualPairFinite(r) || r < 0 || !residualPairFinite(lambda) ||
       !residualPairFinite(reference) || reference <= 0 || !residualPairFinite(cutoff) || cutoff <= 0)
@@ -49,7 +53,10 @@ inline ResidualPairJet residualPairJet(double r, double lambda, double reference
   const double delta = reference * std::expm1(lambda);
   if (!residualPairFinite(alpha) || alpha <= 0 || !residualPairFinite(delta))
     throw std::overflow_error("Residual pair length is not finite and positive");
-  if (r >= cutoff)
+  if (squared_radius < 0) squared_radius = r*r;
+  if (!residualPairFinite(squared_radius) || squared_radius < 0)
+    throw std::invalid_argument("Invalid residual pair squared radius");
+  if (squared_radius >= cutoff*cutoff)
     return {0, 0, 0, 0, 0};
 
   // Factor every spatial derivative by delta, preserving exact zero at lambda=0.
@@ -65,11 +72,11 @@ inline ResidualPairJet residualPairJet(double r, double lambda, double reference
 
   // The polynomial cutoff and its first two derivatives vanish at the boundary.
   const double inv_c2 = 1 / (cutoff * cutoff);
-  const double u = 1 - r * r * inv_c2;
+  const double u = 1 - squared_radius * inv_c2;
   const double chi = u * u * u;
   const double chi1r = -6 * inv_c2 * u * u;
   const double chi1 = r * chi1r;
-  const double chi2 = chi1r + 24 * r * r * inv_c2 * inv_c2 * u;
+  const double chi2 = chi1r + 24 * squared_radius * inv_c2 * inv_c2 * u;
   const double score = -factor * alpha * (alpha / ar) * ((alpha + 2 * r) / ar);
   ResidualPairJet result{chi * q, chi1 * q + chi * q1,
       chi2 * q + 2 * chi1 * q1 + chi * q2, chi1r * q + chi * qr, chi * score};
@@ -95,6 +102,10 @@ public:
       throw std::invalid_argument("Invalid residual pair metadata");
 
     // Reciprocal face distances give a conservative unique-image sphere even for skew cells.
+    if (!metadata.conversion_source_sha256.empty() &&
+        (metadata.conversion_source_sha256.size() != 64 ||
+         metadata.conversion_source_sha256.find_first_not_of("0123456789abcdef") != std::string::npos))
+      throw std::invalid_argument("Invalid residual pair conversion provenance");
     auto cross = [](const Position& a, const Position& b) {
       return Position{a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
     };
@@ -136,7 +147,7 @@ public:
     for (double x : displacement) squared += x*x;
     return residualPairJet(std::sqrt(squared), lambda,
         same_spin ? metadata_.same_reference : metadata_.opposite_reference,
-        metadata_.cutoff, same_spin ? .25 : .5);
+        metadata_.cutoff, same_spin ? .25 : .5, squared);
   }
 
   /// Expose fixed model metadata for persistence and identity checks.

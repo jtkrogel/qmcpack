@@ -287,6 +287,8 @@ void mixPeriodicProfile(std::uint64_t& hash, const psiformer::ExecutionEnvironme
     mixPersistentDouble(hash, metadata.same_reference);
     mixPersistentDouble(hash, metadata.opposite_reference);
     mixPersistentDouble(hash, metadata.cutoff);
+    if (!metadata.conversion_source_sha256.empty())
+      mixPersistentString(hash, metadata.conversion_source_sha256);
   }
   const auto& profile = environment.periodic_profile;
   if (!profile) return;
@@ -854,6 +856,21 @@ InitializedNativeModel makeInitializedNativeModel(
     const ParticleSet& ions)
 {
   const psiformer::ModelShape& shape = initialized.model_shape;
+  if (const auto& residual = initialized.environment.residual_pair)
+  {
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
+    throw std::invalid_argument("Residual pair model construction requires a real full-precision CPU build");
+#endif
+    const psiformer::PsiFormerExecutionPlan validation(shape, initialized.layouts, initialized.environment);
+    if (initialized.values.size() != validation.parameterCount())
+      throw std::invalid_argument("Imported residual model parameter extent mismatch");
+    const auto& metadata = residual->metadata();
+    for (const auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA, psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA})
+      if (validation.hasParameter(role))
+        psiformer::residualPairJet(0, initialized.values[validation.parameter(role).begin],
+            role == psiformer::ParameterRole::CUSP_SAME_ALPHA ? metadata.same_reference : metadata.opposite_reference,
+            metadata.cutoff, .5);
+  }
   if (electrons.groups() != 2 || electrons.groupsize(0) <= 0 || electrons.groupsize(1) <= 0)
     throw std::invalid_argument(
         "Internally initialized PsiFormer requires two nonempty electron spin groups");
@@ -7838,6 +7855,81 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
       capture_jvp_replay, replay_only);
 }
 
+bool PsiFormerWF::isJastrowAugmented() const noexcept
+{
+  return static_cast<bool>(model_state_->execution_plan.environment().residual_pair);
+}
+
+bool PsiFormerWF::matchesJastrowCorrelation(const psiformer::ExecutionEnvironment& candidate) const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto& current = transaction.state().execution_plan.environment();
+  if (!current.residual_pair || !candidate.residual_pair || current.lattice_vectors != candidate.lattice_vectors ||
+      current.geometry_feature_policy != candidate.geometry_feature_policy || current.boundary != candidate.boundary ||
+      current.head_representation != candidate.head_representation || current.periodic_axes != candidate.periodic_axes)
+    return false;
+  const auto& left = current.residual_pair->metadata();
+  const auto& right = candidate.residual_pair->metadata();
+  return left.version == right.version && left.same_reference == right.same_reference &&
+      left.opposite_reference == right.opposite_reference && left.cutoff == right.cutoff &&
+      left.conversion_source_sha256 == right.conversion_source_sha256;
+}
+
+void PsiFormerWF::adoptPreparedParameterState(const PsiFormerWF& prepared) noexcept
+{
+  direct_value_workspace_.reset();
+  direct_score_workspace_.reset();
+  direct_kinetic_workspace_.reset();
+  direct_full_spatial_workspace_.reset();
+  direct_active_spatial_workspace_.reset();
+  direct_batch_workspace_.reset();
+  residual_score_workspace_.reset();
+  residual_spatial_workspace_.reset();
+  model_state_ = prepared.model_state_;
+  invalidateParameterCaches(model_state_->model.p.version());
+}
+
+/// Keep the native owner/resource identity while resolving all fallible replacement work.
+struct PsiFormerWF::CpuParameterPublication final : PreparedCpuParameterPublication
+{
+  CpuParameterPublication(PsiFormerWF& component, const wftrain::StructuredParameterSnapshot& candidate,
+      std::size_t expected_version)
+      : component(component), state(component.model_state_), lock(state->mutex),
+        replacement(state->model.p.prepare_flat_values(candidate.values, expected_version))
+  {}
+
+  std::size_t commit() noexcept override
+  {
+    const auto version = replacement.commit();
+    state->host_mirror_version = version;
+    component.invalidateParameterCaches(version);
+    return version;
+  }
+
+  PsiFormerWF& component;
+  std::shared_ptr<PsiFormerSharedState> state;
+  std::unique_lock<std::shared_mutex> lock;
+  pf::Parameters::PreparedFlatValues replacement;
+};
+
+std::unique_ptr<PsiFormerWF::PreparedCpuParameterPublication> PsiFormerWF::prepareCpuParameterPublication(
+    const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version)
+{
+  if (!isJastrowAugmented() || usesAcceleratorParameterProducts() ||
+      candidate.schema_fingerprint != structured_parameter_schema_->fingerprint() ||
+      candidate.values.size() != structured_parameter_schema_->parameterCount() || candidate.version != expected_version)
+    throw std::invalid_argument("Prepared CPU publication requires a matching residual profile candidate");
+  requireNoPlannedProposalMutation("prepared CPU parameter publication");
+  const auto& plan = model_state_->execution_plan;
+  const auto& metadata = plan.environment().residual_pair->metadata();
+  for (const auto role : {psiformer::ParameterRole::CUSP_SAME_ALPHA, psiformer::ParameterRole::CUSP_OPPOSITE_ALPHA})
+    if (plan.hasParameter(role))
+      psiformer::residualPairJet(0, candidate.values[plan.parameter(role).begin],
+          role == psiformer::ParameterRole::CUSP_SAME_ALPHA ? metadata.same_reference : metadata.opposite_reference,
+          metadata.cutoff, .5);
+  return std::make_unique<CpuParameterPublication>(*this, candidate, expected_version);
+}
+
 void PsiFormerWF::isolateParameterState()
 {
   requireNoPlannedProposalMutation("candidate model isolation");
@@ -12179,6 +12271,8 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
     output.write(metadata.same_reference, "same_reference");
     output.write(metadata.opposite_reference, "opposite_reference");
     output.write(metadata.cutoff, "cutoff");
+    if (!metadata.conversion_source_sha256.empty())
+      output.write(metadata.conversion_source_sha256, "conversion_source_sha256");
     output.pop();
   }
   output.write(selected_indices, "selected_flat_indices");
@@ -12389,6 +12483,8 @@ void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
     output.write(metadata.same_reference, "same_reference");
     output.write(metadata.opposite_reference, "opposite_reference");
     output.write(metadata.cutoff, "cutoff");
+    if (!metadata.conversion_source_sha256.empty())
+      output.write(metadata.conversion_source_sha256, "conversion_source_sha256");
     output.pop();
   }
   if (versioned)
@@ -12515,6 +12611,9 @@ psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::strin
     const bool complete = input.readEntry(metadata.version, "version") && input.readEntry(policy, "policy") &&
         input.readEntry(metadata.same_reference, "same_reference") &&
         input.readEntry(metadata.opposite_reference, "opposite_reference") && input.readEntry(metadata.cutoff, "cutoff");
+    if (input.is_dataset("conversion_source_sha256") &&
+        !input.readEntry(metadata.conversion_source_sha256, "conversion_source_sha256"))
+      throw std::runtime_error("Invalid residual pair conversion provenance metadata");
     input.pop();
     if (!complete || policy != "zero_residual_pair_v1")
       throw std::runtime_error("Residual pair model has incomplete or unknown correlation policy");

@@ -37,6 +37,10 @@ TEST_CASE("Residual pair CPU value VGL and score agree", "[psiformer][residual_p
       ps::ResidualPairMetadata{1, 1.2, .9, 3}, environment.lattice_vectors);
   const auto plan = ps::PsiFormerExecutionPlan::fromParameters(model.p,
       {2,2,2,model.ndet,model.dim,model.heads,model.blocks}, environment);
+  auto missing_policy = environment;
+  missing_policy.residual_pair.reset();
+  CHECK_THROWS(ps::PsiFormerExecutionPlan::fromParameters(model.p,plan.modelShape(),missing_policy));
+  CHECK_THROWS(ps::PsiFormerExecutionPlan::fromParameters(original.p,plan.modelShape(),environment));
   pf::DirectValueExecutor value(model, plan);
   pf::DirectSpatialExecutor spatial(model, value, plan);
   pf::DirectScoreExecutor score(model, plan);

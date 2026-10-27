@@ -302,6 +302,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   // file. Strict requests therefore fail without HDF5 or ParticleSet effects;
   // auto records an explicit CPU fallback for unsupported operations/geometries.
   const bool optimization_enabled = parseOptimizationFlag(optimize);
+  if (jastrow_profile && optimization_enabled)
+    throw std::invalid_argument("Jastrow profile uses structured WFTrain registration; legacy scalar optimize must be no");
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
   const auto pair_request = normalizedAcceleratorRequest(gpu);

@@ -354,6 +354,9 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
       throw std::invalid_argument("PsiFormer parameter tensor shape does not match its flat interval");
 
     const auto [role, block, component] = classifyParameter(layout);
+    if ((role == ParameterRole::CUSP_SAME_ALPHA || role == ParameterRole::CUSP_OPPOSITE_ALPHA) &&
+        endsWith(layout.module, "/residual_pair_v1") != static_cast<bool>(environment_.residual_pair))
+      throw std::invalid_argument("Pair correlation tensor names and immutable residual policy disagree");
     if ((role == ParameterRole::PAIR_ATTENTION_WEIGHT || role == ParameterRole::PAIR_ATTENTION_BIAS) &&
         !environment_.periodic_profile)
       throw std::invalid_argument("Pair-attention tensors require a versioned periodic profile");
