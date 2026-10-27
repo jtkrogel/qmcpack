@@ -4251,6 +4251,86 @@ TEST_CASE("PsiFormer CPU pathwise gradient differentiates the complete reweighte
   CHECK(wrong_twist.trainingConfigurationFingerprint() != identity);
 }
 #ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer complex C2 score lanes preserve weighted partition sums",
+          "[wavefunction][psiformer][complex_gpu_score_crowds]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: C2 scores require a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: C2 scores require a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  if (!dev::configuredDeviceMemoryAdmission().limit_bytes)
+  { WARN("NOT_RUN: C2 scores require PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES"); return; }
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "2");
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell), p2 = electrons(simulation_cell);
+  p1.R[1][0] += .017; p1.update(); p2.R[2][1] -= .031; p2.update();
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  const std::array<double, 3> twist{.17, -.11, .07};
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("score_crowds", initialized, p0, source, clone_cap, twist,
+                                                  64 * 1024 * 1024);
+  auto& gpu = *owner;
+  trial.addComponent(std::move(owner));
+  auto trial1 = trial.makeClone(p1), trial2 = trial.makeClone(p2);
+  auto& gpu1 = dynamic_cast<PsiFormerComplexWF&>(*trial1->getOrbitals()[0]);
+  RefVectorWithLeader<TrialWaveFunction> trials0(trial, {trial}), trials1(*trial1, {*trial1, *trial2});
+  RefVectorWithLeader<ParticleSet> particles0(p0, {p0}), particles1(p1, {p1, p2});
+  constexpr auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+  const auto r0 = gpu.gpuDerivativeRequirements(1, 1, 1, 7, scope);
+  const auto r1 = gpu1.gpuDerivativeRequirements(2, 2, 1, 7, scope);
+  auto first = gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 0, 0, 1, 1, 7,
+      r0.device_bytes, r0.host_bytes, r0.matrix_work, scope);
+  auto second = gpu1.makeBudgetedGpuDerivativeOperator(trials1, particles1, 1, 1, 2, 1, 7,
+      r1.device_bytes, r1.host_bytes, r1.matrix_work, scope);
+  CHECK(first->storageDiagnostics().shared_workspace_identity != second->storageDiagnostics().shared_workspace_identity);
+  CHECK_THROWS(gpu.gpuDerivativeRequirements(1, 1, 1, 7));
+  CHECK_THROWS(gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 2, 2, 1, 1, 7,
+      r0.device_bytes, r0.host_bytes, r0.matrix_work, scope));
+  PsiFormerComplexWF cpu("score_crowds", initialized, p0, source, clone_cap, twist);
+  auto cpu1 = cpu.makeClone(p1), cpu2 = cpu.makeClone(p2);
+  RefVectorWithLeader<WaveFunctionComponent> components(cpu, {cpu, *cpu1, *cpu2});
+  RefVectorWithLeader<ParticleSet> all(p0, {p0, p1, p2});
+  auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(components, all, 0, 0, 7,
+      cpu.streamingDerivativeRequiredBytes(3));
+  const std::vector<C> coefficients{{.7, -.2}, {-.3, .1}, {.4, .05}};
+  const auto contract = [&](const StreamingDerivativeOperator& op, std::size_t batch, std::size_t offset) {
+#ifdef QMC_CUDA2HIP
+    dev::checkRuntime(hipSetDevice(ordinal), "bind complex score worker");
+#else
+    dev::checkRuntime(cudaSetDevice(ordinal), "bind complex score worker");
+#endif
+    const CoefficientView weights{op.parameterSchema().providerId(), op.parameterSchema().fingerprint(),
+        op.parameterVersion(), batch, offset, {coefficients.data() + offset, op.sampleCount()}};
+    const VJPCoefficientChannel channel{"score", DerivativeProduct::SCORE_VJP, weights, 0};
+    ComplexStreamingSink sink;
+    op.applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, sink);
+    return sink.values[0];
+  };
+  // Uneven 1+2 crowd tails use separate queues; the complete weighted population
+  // has the same contraction as the independent CPU three-sample oracle.
+  auto left = std::async(std::launch::async, [&] { return contract(*first, 0, 0); });
+  auto right = std::async(std::launch::async, [&] { return contract(*second, 1, 1); });
+  const auto expected = contract(*oracle, 0, 0);
+  const auto a = left.get(), b = right.get();
+  REQUIRE(a.size() == expected.size()); REQUIRE(b.size() == expected.size());
+  for (std::size_t i = 0; i < a.size(); ++i) close(a[i] + b[i], expected[i], 3e-9);
+  auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
+  const auto q = gpu.gpuParameterPublicationRequirements();
+  gpu.publishBudgetedGpuParameters(candidate, candidate.version, q.device_bytes, q.host_bytes);
+  CHECK_THROWS(contract(*first, 0, 0)); CHECK_THROWS(contract(*second, 1, 1));
+}
+
 TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical products",
           "[wavefunction][psiformer][complex_gpu_derivatives]")
 {

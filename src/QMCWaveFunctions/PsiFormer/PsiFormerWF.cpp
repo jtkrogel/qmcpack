@@ -1503,6 +1503,8 @@ public:
   std::weak_ptr<PsiFormerDerivativeScratch> derivative_scratch;
   /// Independent immutable profile lane; never upgrade or alias a live complete owner.
   std::weak_ptr<PsiFormerDerivativeScratch> score_derivative_scratch;
+  /// Bounded GPU score lanes: snapshots retain scratch, never dormant walkers.
+  std::array<std::weak_ptr<PsiFormerDerivativeScratch>, 2> score_crowd_scratch;
   /// Number of pending planned one-electron crowd transactions sharing this model.
   /// Each crowd checks in once, never once per lane.
   std::atomic<std::size_t> planned_single_transaction_count{0};
@@ -2239,8 +2241,8 @@ private:
  * owners count a lane once rather than once per retained snapshot.
  */
 /** Reusable O(P) execution scratch, independent of immutable retained samples.
- * One exclusive lease serializes products sharing this lane; separate models and
- * MPI processes have separate lanes. Scratch is released with its last owner.
+ * One exclusive lease serializes products sharing this lane. Admitted C2 GPU
+ * score crowds use distinct lanes; scratch is released with its last owner.
  */
 struct PsiFormerDerivativeScratch
 {
@@ -2347,10 +2349,21 @@ private:
 /** Obtain the prepared lane without retaining scratch permanently on the model. */
 std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
     PsiFormerSharedState& state, std::size_t parameters, std::size_t score_capacity = 1,
-    bool score_only = false)
+    bool score_only = false, std::size_t crowd_ordinal = 0)
 {
   std::lock_guard factory_lock(state.derivative_scratch_factory_mutex);
-  auto& lane = score_only ? state.score_derivative_scratch : state.derivative_scratch;
+  auto* selected = score_only ? &state.score_derivative_scratch : &state.derivative_scratch;
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      state.numerical_tile_backend.get());
+  if (score_only && backend && backend->activeInferenceCrowdCapacity() == 2)
+  {
+    if (crowd_ordinal >= state.score_crowd_scratch.size())
+      throw std::invalid_argument("GPU score crowd ordinal exceeds its admitted two lanes");
+    selected = &state.score_crowd_scratch[crowd_ordinal];
+  }
+#endif
+  auto& lane = *selected;
   auto scratch = lane.lock();
   if (!scratch)
   {
@@ -2396,9 +2409,9 @@ public:
         inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
         score_only_(score_only),
-        // A retained pretraining capacity1 lane remains serial; never duplicate
-        // its P-sized resources or grow it implicitly during an evaluation.
-        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount(), 4, score_only_)),
+        // C2 score operators own bounded independent lanes; complete products
+        // retain their existing shared lane and never upgrade it implicitly.
+        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount(), 4, score_only_, batch_ordinal_)),
         score_workspace_(shared_scratch_->score),
         kinetic_workspace_(shared_scratch_->kinetic),
         channel_accumulators_(shared_scratch_->channels),
@@ -8064,7 +8077,10 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   if (!usesDeviceAffineStatistics() || samples.empty())
     throw std::invalid_argument("Device affine collection requires enabled statistics and samples");
-  auto scratch = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount());
+  // C2 already retains score lane0. Reuse it over the complete rank population
+  // rather than creating a third complete-product owner just for affine sums.
+  const bool independent_score = activeAcceleratorInferenceCrowdCapacity() == 2;
+  auto scratch = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount(), 1, independent_score);
   PsiFormerDerivativeLease scratch_lease(*scratch);
   PsiFormerReadTransaction transaction(*model_state_);
   const auto& state = transaction.state();

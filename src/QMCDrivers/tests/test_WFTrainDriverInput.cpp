@@ -162,6 +162,17 @@ TEST_CASE("Hybrid KFAC input admission requires bounded covariance score policie
       "<parameter name='kfac_exclude_width'>2</parameter>")));
 }
 
+TEST_CASE("GPU ECP score crowds require two independent populated lanes",
+          "[drivers][wf_train][crowd_policy]")
+{
+  for (const auto crowds : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{4}})
+    for (const auto lanes : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{4}})
+    {
+      CHECK(wftrain::supportsGpuScoreECPCrowds(crowds, true, lanes) == (crowds == 2 && lanes == 2));
+      CHECK_FALSE(wftrain::supportsGpuScoreECPCrowds(crowds, false, lanes));
+    }
+}
+
 TEST_CASE("Hybrid KFAC crowd admission preserves isolated single-crowd profiles",
           "[drivers][wf_train][kfac][crowd_policy]")
 {

@@ -227,8 +227,10 @@ public:
       std::size_t score_capacity = 1) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    if (preparation_.active_inference_crowds != 1)
-      throw std::invalid_argument("Concurrent GPU inference does not admit parameter-product or training sessions");
+    const bool independent_score_lane = preparation_.active_inference_crowds == 2 &&
+        profile == ProductSessionProfile::SCORE_ONLY;
+    if (preparation_.active_inference_crowds != 1 && !independent_score_lane)
+      throw std::invalid_argument("Concurrent GPU parameter products require two score-only lanes");
     if (mixed_parameters_)
       throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
     // The eager ordinary context is already live. Reserve the unchanged B1
@@ -302,7 +304,8 @@ public:
     else if (large_score_requested_ && score_capacity > 1)
       std::clog << "PsiFormer large REAL score preparation: selected=1 reason=profile_topology_or_unbounded_admission\n";
     return std::make_unique<PreparedDeviceProductSession>(
-        image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_);
+        image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_, false,
+        independent_score_lane);
   }
 
   /// Return typed device products while leaving host publication to the caller.

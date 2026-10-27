@@ -286,8 +286,9 @@ public:
                                ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
                                std::size_t score_capacity = 1,
                                DeviceExecutionPreparation preparation = {},
-                               bool admit_large_score = false)
-      : active_image_(active_image), image_(active_image), owner_(owner), mutex_(control_mutex),
+                               bool admit_large_score = false, bool independent_score_lane = false)
+      : active_image_(active_image), image_(active_image), owner_(owner),
+        mutex_(independent_score_lane ? lane_mutex_ : control_mutex),
         profile_(validatedProfile(profile)),
         score_capacity_(admit_large_score ? validatedScoreCapacity(score_capacity)
                                          : admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
@@ -309,6 +310,8 @@ public:
         orbital_backflow_(channel_coefficients_.size() * masses_.size() * masses_.size()),
         orbital_envelope_(orbital_backflow_.size()), orbital_seeds_(orbital_backflow_.size())
   {
+    if (independent_score_lane && profile_ != ProductSessionProfile::SCORE_ONLY)
+      throw std::invalid_argument("Independent product lanes require score-only preparation");
     // Logical single-root sizes stay 3Ne even when position capacity admits tiles.
     positions_.reserve(spatial_detail::checkedProduct(positions_.size(), score_capacity_,
         "Device score tile position extent overflow"));
@@ -1306,6 +1309,10 @@ private:
   const std::shared_ptr<const PreparedDeviceModel>& active_image_;
   std::shared_ptr<const PreparedDeviceModel> image_;
   PsiFormerAcceleratorSharedModel& owner_;
+  // Independent score lanes execute under their provider's shared model read.
+  // Publication holds model write authority; the backend control lock is not a
+  // numerical execution lane and must not serialize their distinct queues.
+  std::mutex lane_mutex_;
   std::mutex& mutex_;
   const ProductSessionProfile profile_;
   const std::size_t score_capacity_;

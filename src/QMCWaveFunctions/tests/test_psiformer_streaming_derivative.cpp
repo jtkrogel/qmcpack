@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1530,6 +1531,42 @@ TEST_CASE("PsiFormer real GPU score-only profiles preserve complete-product lane
     successor->applyVJPs({&next, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, next_result);
     for (const auto& value : next_result.results()[0]) CHECK(std::isfinite(value.real()));
   }
+  // The process-wide aggregate admission is fixed before any GPU allocation.
+  // C2 runs in the bounded GPU suite with that policy explicitly supplied.
+  if (ps::device::configuredDeviceMemoryAdmission().limit_bytes)
+  {
+    ScopedEnvironmentVariable crowds("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "2");
+    PsiFormerWF gpu("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+    RefVectorWithLeader<WaveFunctionComponent> components(gpu, {gpu});
+    auto first = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    auto second = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 1, 1, 7);
+    CHECK(first->storageDiagnostics().shared_workspace_identity != second->storageDiagnostics().shared_workspace_identity);
+    CHECK_THROWS(gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 2, 2, 7));
+    CHECK_THROWS(gpu.makeStreamingDerivativeOperator(components, particles, 0, 0, 7));
+    const wftrain::StructuredParameterVectorConstView tangent(gpu.parameterSchema(), first->parameterVersion(),
+        {direction.data(), direction.size()});
+    const auto run = [&](const StreamingDerivativeOperator& op) {
+#ifdef QMC_CUDA2HIP
+      ps::device::checkRuntime(hipSetDevice(ordinal), "bind independent score worker");
+#else
+      ps::device::checkRuntime(cudaSetDevice(ordinal), "bind independent score worker");
+#endif
+      RecordingSampleSink sink;
+      op.applyScoreJVP(tangent, sink);
+      return sink.results()[0];
+    };
+    auto left = std::async(std::launch::async, [&] { return run(*first); });
+    auto right = std::async(std::launch::async, [&] { return run(*second); });
+    RecordingSampleSink expected;
+    reference->applyScoreJVP(tangent, expected);
+    checkClose(left.get(), expected.results()[0]);
+    checkClose(right.get(), expected.results()[0]);
+    auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
+    gpu.publishParameters(candidate, candidate.version);
+    CHECK_THROWS(run(*first)); CHECK_THROWS(run(*second));
+  }
+  else
+    WARN("NOT_RUN: C2 score-lane qualification requires PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES");
 }
 
 TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",

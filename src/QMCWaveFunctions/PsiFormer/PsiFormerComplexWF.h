@@ -227,6 +227,8 @@ public:
 
   /// Prepared GPU inference profile; opt-in dense teams remain serialized and inference-only.
   bool gpuInferenceEnabled() const noexcept;
+  /// Frozen inference capacity; score derivative owners have independent queues.
+  std::size_t activeAcceleratorInferenceCrowdCapacity() const noexcept;
 
   /// One synchronous replay's identity evidence; weak stamps never retain retired model images.
   struct ImmediateFullReplayContext

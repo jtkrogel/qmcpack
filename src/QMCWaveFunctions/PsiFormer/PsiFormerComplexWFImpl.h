@@ -719,6 +719,8 @@ struct PsiFormerComplexWF::Impl
     std::weak_ptr<DerivativeLane> derivative_lane;
 #ifdef ENABLE_CUDA
     std::weak_ptr<GpuDerivativeLane> gpu_derivative_lane;
+    /// Only active retained score batches hold these two numerical owners alive.
+    std::array<std::weak_ptr<GpuDerivativeLane>, 2> gpu_score_crowd_lanes;
 #endif
   };
 
@@ -995,10 +997,10 @@ struct PsiFormerComplexWF::Impl
     /// Allocate only after both domains and maximum request work have been admitted.
     GpuDerivativeLane(std::shared_ptr<Model> model, std::size_t maximum_samples, std::size_t targets,
         std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget, GpuDerivativeScope scope)
-        : state(std::move(model)), generation(state->gpu), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
-          scope(scope),
-          products(Products::prepare(generation->image, targets, maximum_samples, 3, chunk,
-              generation->queue, generation->blas, budget.device_bytes,
+        : state(std::move(model)), generation(state->gpu), image(generation->image),
+          maximum_samples(maximum_samples), targets(targets), chunk(chunk), scope(scope), blas(queue),
+          products(Products::prepare(image, targets, maximum_samples, 3, chunk,
+              queue, blas, budget.device_bytes,
               budget.host_bytes - maximum_samples * sizeof(C), std::max(std::size_t{1}, budget.matrix_work),
               psiformer::device::ComplexProductsHostOutput::CHUNKED, numericalScope(scope))),
           zeros(maximum_samples), channels(3)
@@ -1007,9 +1009,14 @@ struct PsiFormerComplexWF::Impl
     const std::shared_ptr<Model> state;
     /// Declare before Products: borrowers die before their exact queue/BLAS/image generation.
     const std::shared_ptr<GpuLane> generation;
+    // Pin the immutable image separately: publication rebinds inference lanes.
+    const std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
     const std::size_t maximum_samples, targets, chunk;
     const GpuDerivativeScope scope;
+    compute::Queue<PlatformKind::CUDA> queue;
+    psiformer::device::AcceleratorBlasHandle blas;
     const std::unique_ptr<Products> products;
+    std::mutex device_mutex;
     const std::vector<C> zeros;
     std::vector<Products::Channel> channels;
     std::mutex execution_mutex;
@@ -1255,7 +1262,7 @@ struct PsiFormerComplexWF::Impl
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU score JVP snapshot is stale or family has a pending move");
-        std::unique_lock gpu(lane->generation->mutex);
+        std::unique_lock gpu(lane->device_mutex);
         validateDerivativeSource(*lane->state);
         {
           NativeTimerScope host_timer(phase_timers.gpu_call);
@@ -1298,7 +1305,7 @@ struct PsiFormerComplexWF::Impl
         requireCurrent();
         if (!replay) throw std::invalid_argument("Complex local-energy JVP requires bound replay");
         const auto terms = localTerms(mask);
-        std::unique_lock gpu(lane->generation->mutex);
+        std::unique_lock gpu(lane->device_mutex);
         lane->products->evaluateLocalEnergyJVPReplacements(positions, replacementAccessor(), references, complete_weights,
             inverse_masses, lane->state->cartesian_twist, terms, direction.values().data(), direction.values().size());
         const auto result = lane->products->localEnergyJvpView(); lane->products->validate(result); output = result.data;
@@ -1341,7 +1348,7 @@ struct PsiFormerComplexWF::Impl
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
-        std::unique_lock gpu(lane->generation->mutex);
+        std::unique_lock gpu(lane->device_mutex);
         validateDerivativeSource(*lane->state);
         for (auto& channel : lane->channels)
           channel = {GpuDerivativeLane::Products::Role::SCORE, lane->zeros.data(), samples};
@@ -1373,7 +1380,7 @@ struct PsiFormerComplexWF::Impl
           {
             // The leased old owner/image remain valid even if a prior callback published.
             // Never acquire Model authority here, or hold this lane lock through a callback.
-            std::unique_lock gpu(lane->generation->mutex);
+            std::unique_lock gpu(lane->device_mutex);
             output = lane->products->downloadCompletedChunk(result, c, chunk.parameter_offset, chunk.count);
           }
           sink.add(c, {chunk, {output, chunk.count}});
@@ -2381,7 +2388,7 @@ struct PsiFormerComplexWF::Impl
         if (gpu_lane)
         {
           std::shared_lock read(model->mutex);
-          std::unique_lock gpu(gpu_lane->generation->mutex);
+          std::unique_lock gpu(gpu_lane->device_mutex);
           gpu_lane->products->beginStreamingNonlocalVJP(pf::checkedStorageSum(expected, source.sampleCount(),
               "Complex inline ECP score count overflow"));
         }
@@ -2445,7 +2452,7 @@ struct PsiFormerComplexWF::Impl
       {
         if (model->gpu != gpu_lane->generation)
           throw std::logic_error("Complex inline ECP image changed");
-        std::unique_lock gpu(gpu_lane->generation->mutex);
+        std::unique_lock gpu(gpu_lane->device_mutex);
         const psiformer::device::ComplexVirtualReplacement move{electron, replacement ? *replacement : std::array<double, 3>{}};
         gpu_lane->products->accumulateStreamingNonlocalScore(positions, sample, replacement ? &move : nullptr,
             coefficients[sample], weight);
@@ -2484,7 +2491,7 @@ struct PsiFormerComplexWF::Impl
             if (model->model.p.version() != source.parameterVersion() || model->gpu != gpu_lane->generation ||
                 model->pending_proposals.load(std::memory_order_relaxed))
               throw std::logic_error("Complex inline ECP source changed before publication");
-            std::unique_lock gpu(gpu_lane->generation->mutex);
+            std::unique_lock gpu(gpu_lane->device_mutex);
             gpu_lane->products->finishStreamingNonlocalVJP();
             receipt = gpu_lane->products->completedResult();
           }
@@ -2492,7 +2499,7 @@ struct PsiFormerComplexWF::Impl
           {
             const C* output;
             {
-              std::unique_lock gpu(gpu_lane->generation->mutex);
+              std::unique_lock gpu(gpu_lane->device_mutex);
               output = gpu_lane->products->downloadCompletedChunk(receipt, 0, chunk.parameter_offset, chunk.count);
             }
             sink->add(0, {chunk, {output, chunk.count}});
@@ -4153,10 +4160,11 @@ PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeR
   if (gpuInferenceEnabled())
   {
     std::shared_lock read(impl_->state->mutex);
-    // Dense inference owns separate graphs; reverse products remain B1 per sample.
-    // Multiple inference crowds still cannot share the serialized training lane.
-    if (impl_->state->gpu_crowds > 1)
-      throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
+    // Multi-crowd derivatives require independent score-only owners. Complete
+    // local-energy responses retain their separately qualified C1 contract.
+    if (impl_->state->gpu_crowds != 1 &&
+        (impl_->state->gpu_crowds != 2 || scope != GpuDerivativeScope::SCORE_ECP_ONLY))
+      throw std::logic_error("Concurrent complex derivatives require two score-only lanes");
     return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk, scope);
   }
 #endif
@@ -4177,9 +4185,11 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     const auto state = impl_->state;
     {
       std::shared_lock read(state->mutex);
-      // Product capacity is independent of the dense inference graph capacity.
-      if (state->gpu_crowds > 1)
-        throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
+      // Score and inference capacity are independent; the ordinal selects a
+      // bounded derivative owner, never an inference resource lease.
+      if (state->gpu_crowds != 1 && (state->gpu_crowds != 2 || ordinal >= 2 ||
+          scope != GpuDerivativeScope::SCORE_ECP_ONLY))
+        throw std::logic_error("Concurrent complex derivatives require two score-only lanes");
     }
     const auto samples = particles.size(), n = state->model.ne;
     const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk, scope);
@@ -4227,8 +4237,9 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
       }
     }
     std::lock_guard preparation(state->derivative_factory_mutex);
-    auto lane = state->gpu_derivative_lane.lock();
-    if (lane && lane->generation != state->gpu)
+    auto& selected = state->gpu_crowds == 2 ? state->gpu_score_crowd_lanes[ordinal] : state->gpu_derivative_lane;
+    auto lane = selected.lock();
+    if (lane && (lane->generation != state->gpu || lane->image != state->gpu->image))
       lane.reset();
     if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk || lane->scope != scope))
       throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
@@ -4248,7 +4259,10 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     }
     if (result->storageDiagnostics().retained_numeric_bytes != required.device_bytes + required.host_bytes)
       throw std::logic_error("Complex GPU derivative numeric capacity differs from exact admission");
-    state->gpu_derivative_lane = lane;
+    selected = lane;
+    // Affine collection is rank-global and sequential, using the first score
+    // lane over all retained coordinates without creating another owner.
+    if (ordinal == 0) state->gpu_derivative_lane = lane;
     return result;
   }
 #endif
@@ -4279,6 +4293,9 @@ bool PsiFormerComplexWF::isMultiDet() const
 
 /// The profile is immutable for the complete shared model lifetime.
 bool PsiFormerComplexWF::gpuInferenceEnabled() const noexcept { return impl_->state->gpu_limit != 0; }
+
+std::size_t PsiFormerComplexWF::activeAcceleratorInferenceCrowdCapacity() const noexcept
+{ return gpuInferenceEnabled() ? impl_->state->gpu_crowds : 0; }
 
 /// Immutable schema ownership is stable across every clone and publication; no read lock is needed.
 const wftrain::StructuredParameterSchema& PsiFormerComplexWF::parameterSchema() const noexcept
@@ -4381,7 +4398,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
     if (pf::checkedStorageSum(requirement.device_bytes, requirement.host_bytes,
         "Complex DEVICE affine combined bound overflow") > maximum_numeric_bytes)
       throw std::length_error("Paired DEVICE affine collection exceeds its combined numeric bound");
-    std::unique_lock gpu(lane->generation->mutex);
+    std::unique_lock gpu(lane->device_mutex);
     factors = lane->products->prepareAffineStatistics(descriptors, gaussian,
         Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), expected_version);
   }
@@ -4409,7 +4426,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
       {
         std::shared_lock read(state->mutex);
         current();
-        std::unique_lock gpu(lane->generation->mutex);
+        std::unique_lock gpu(lane->device_mutex);
         factors->beginSample(expected_version);
         lane->products->affineFallbackComplexScore(positions, *factors, real, imaginary);
       }
@@ -4418,7 +4435,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
       {
         std::shared_lock read(state->mutex);
         current();
-        std::unique_lock gpu(lane->generation->mutex);
+        std::unique_lock gpu(lane->device_mutex);
         prepared.emplace(factors->prepareSampleCommit());
       }
       sink.endSample();
@@ -4443,7 +4460,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
   {
     std::shared_lock read(state->mutex);
     current();
-    std::unique_lock gpu(lane->generation->mutex);
+    std::unique_lock gpu(lane->device_mutex);
     factors->download(downloaded);
     current();
   }

@@ -64,6 +64,14 @@ inline bool usesEnergyScoreEstimator(const WFTrainDriverInput& input, bool paire
   return usesKFACScoreEstimator(input, paired_complex);
 }
 
+/// ECP score C2 requires two independent prepared GPU lanes and populated crowds.
+/// Geometry, Hamiltonian provenance and optimizer controls remain driver checks.
+inline bool supportsGpuScoreECPCrowds(std::size_t crowds, bool all_nonempty,
+                                      std::size_t active_gpu_capacity) noexcept
+{
+  return all_nonempty && crowds == 2 && active_gpu_capacity == 2;
+}
+
 /// Preserve C1 admission and bound additional crowds to one or two serialized real-open AE ranks.
 inline bool supportsHybridKFACPopulation(bool real_open_ae, std::size_t ranks, std::size_t crowds,
                                         bool all_nonempty, std::size_t active_gpu_capacity) noexcept

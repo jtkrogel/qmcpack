@@ -1223,9 +1223,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   const auto* real = dynamic_cast<const PsiFormerWF*>(twfs[0].get().getOrbitals()[0].get());
   if (score_only && real && real->usesAcceleratorParameterProducts())
   {
-    if (capture_ecp_jvp_replay || batch_ordinal != 0 || sample_offset != 0 ||
-        !real->isPseudopotentialSystem())
-      throw std::invalid_argument("GPU score-only ECP requires one physical PP batch without derivative replay");
+    if (capture_ecp_jvp_replay || !real->isPseudopotentialSystem())
+      throw std::invalid_argument("GPU score-only ECP requires physical PP batches without derivative replay");
     if (!provider_id.empty() && provider_id != real->parameterSchema().providerId())
       throw std::invalid_argument("GPU score-only ECP provider identity differs from the selected provider");
     // Score covariance needs physical EL, but no local-energy parameter response.
@@ -3197,6 +3196,34 @@ void WFTrainBatched::process(xmlNodePtr node)
                     walker_counts.walkers_per_crowd.end(), [](auto n) { return n > 0; })
                 << " precision=fp64 admission=pending" << std::endl;
     initPopulationAndCrowds(walker_counts);
+    // Only physical ECP score Adam/KFAC may use the new independent C2 owners.
+    // All other operations retain their original topology restrictions.
+    bool ecp_score_c2 = false;
+    int score_lane_failure = 0;
+    if (selected_provider_->usesAcceleratorParameterProducts() &&
+        population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        wftrain::usesEnergyScoreEstimator(training_input_, bool(complex_training_component_)) &&
+        training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
+        (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM || hybrid_score_kfac))
+    {
+      try
+      {
+        std::size_t lanes = 0;
+        if (const auto* real = dynamic_cast<const PsiFormerWF*>(selected_provider_))
+          lanes = real->activeAcceleratorInferenceCrowdCapacity();
+#ifdef QMC_COMPLEX
+        else if (complex_gpu_provider_ && legacy_paired_score_ecp)
+          lanes = complex_training_component_->activeAcceleratorInferenceCrowdCapacity();
+#endif
+        const bool nonempty = std::all_of(crowds_.begin(), crowds_.end(),
+            [](const auto& crowd) { return crowd->size() != 0; });
+        ecp_score_c2 = wftrain::supportsGpuScoreECPCrowds(crowds_.size(), nonempty, lanes);
+      }
+      catch (...) { score_lane_failure = 1; }
+    }
+    myComm->allreduce(score_lane_failure);
+    if (score_lane_failure)
+      throw UniformCommunicateError("GPU ECP score lane capacity discovery failed before sampling");
     // Independent score selection must retain the qualified scalar ECP topology.
     int invalid_score_ecp = 0;
     if (!complex_training_component_ && wftrain::usesEnergyScoreEstimator(training_input_, false) &&
@@ -3209,7 +3236,7 @@ void WFTrainBatched::process(xmlNodePtr node)
       invalid_score_ecp = !real || !real->isPseudopotentialSystem() ||
           student_prototype_.getOrbitals().size() != 1 || !metadata || !metadata->ordinary_locality_vp ||
           metadata->scientific_definition.empty() || !cap || cap == std::numeric_limits<std::size_t>::max() ||
-          crowds_.size() != 1 || crowds_.front()->size() == 0 || qmcdriver_input_.get_max_blocks() != 1 ||
+          (crowds_.size() != 1 && !ecp_score_c2) || crowds_.front()->size() == 0 || qmcdriver_input_.get_max_blocks() != 1 ||
           steps_per_block_ != 1 ||
           (population_.get_golden_electrons().getLattice().SuperCellEnum != SUPERCELL_OPEN &&
            !real->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())) ||
@@ -3217,7 +3244,7 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     myComm->allreduce(invalid_score_ecp);
     if (invalid_score_ecp)
-      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN or legacy torus Gamma PP provider, finite cap, nonempty crowd1/block1/step1 and PBYP or supported all-electron/no drift on every rank");
+      throw UniformCommunicateError("GPU score-only ECP requires a sole physical OPEN or legacy torus Gamma PP provider, finite cap, nonempty C1 or independent C2/block1/step1 and PBYP or supported all-electron/no drift on every rank");
     if (hybrid_score_kfac)
     {
       bool real_open_ae = false;
@@ -3242,12 +3269,13 @@ void WFTrainBatched::process(xmlNodePtr node)
 #endif
       const bool all_nonempty = std::all_of(crowds_.begin(), crowds_.end(),
           [](const auto& crowd) { return crowd->size() != 0; });
-      int invalid_population = capacity_failure || !wftrain::supportsHybridKFACPopulation(real_open_ae,
-          static_cast<std::size_t>(myComm->size()), crowds_.size(), all_nonempty, active_gpu_capacity);
+      int invalid_population = capacity_failure || (!ecp_score_c2 && !wftrain::supportsHybridKFACPopulation(real_open_ae,
+          static_cast<std::size_t>(myComm->size()), crowds_.size(), all_nonempty, active_gpu_capacity));
       myComm->allreduce(invalid_population);
       if (invalid_population)
         throw UniformCommunicateError("Hybrid score KFAC requires nonempty crowds; C2/C4 require "
-            "REAL OPEN AE FP64 MPI1/MPI2 and one prepared GPU inference lease per rank before sampling");
+            "REAL OPEN AE FP64 MPI1/MPI2 and one prepared GPU inference lease per rank, "
+            "or ECP C2 with two independent score lanes before sampling");
       if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
           (qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
         throw UniformCommunicateError("GPU score-only ECP requires block1/step1 before sampling");
@@ -3258,20 +3286,22 @@ void WFTrainBatched::process(xmlNodePtr node)
                    "parameter authority=HOST, local energy=native Hamiltonian, reduction=HOST raw sums, ranks="
                 << myComm->size() << std::endl;
     }
-    // Each statistical block retains its own samples; one serialized Products
-    // lane is shared across those snapshots under the checked S=W*blocks preflight.
-    if (complex_gpu_provider_ && (crowds_.size() != 1 || steps_per_block_ != 1))
-      throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/steps1 before sampling");
+    // Each statistical block retains its own samples. C1 shares its Products
+    // lane across snapshots; ECP C2 has one independent score owner per crowd.
+    if (complex_gpu_provider_ && ((crowds_.size() != 1 && !ecp_score_c2) || steps_per_block_ != 1))
+      throw UniformCommunicateError("WFTrainBatched: paired GPU requires C1 or independent ECP score C2, steps1 before sampling");
     if (complex_gpu_provider_ && population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
         qmcdriver_input_.get_max_blocks() != 1)
       throw UniformCommunicateError("WFTrainBatched: paired ECP requires one block before sampling");
     if (selected_provider_->usesAcceleratorParameterProducts() &&
         wftrain::usesEnergyScoreEstimator(training_input_, bool(complex_training_component_)))
-      app_log() << "WFTrain effective score execution: derivative_lanes=1 derivative_dispatch=serialized"
+      app_log() << "WFTrain effective score execution: derivative_lanes=" << (ecp_score_c2 ? 2 : 1)
+                << " derivative_dispatch=serialized_batches independent_queues=" << ecp_score_c2
                 << " retained_crowds=" << crowds_.size()
                 << " statistics=rank_global_then_mpi updates_per_iteration=1"
                 << " local_energy=native parameter_authority=host"
-                << " residency=host_mediated fallback_reason=shared_derivative_lane" << std::endl;
+                << " residency=host_mediated fallback_reason="
+                << (ecp_score_c2 ? "host_batch_dispatch" : "shared_derivative_lane") << std::endl;
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     if (resident_adam_budget_ &&
@@ -3535,8 +3565,22 @@ void WFTrainBatched::run()
             PsiFormerComplexWF::GpuDerivativeScope::COMPLETE;
         const auto points = ecp && !scalar_ecp && !inline_ecp ?
             pairedECPPointCapacity(population_.get_golden_hamiltonian(), target, largest_batch) : 0;
-        const auto r = complex->gpuDerivativeRequirements(samples, checkedMemoryAdd(largest_batch, points), limits.kinetic_targets,
+        auto r = complex->gpuDerivativeRequirements(samples, checkedMemoryAdd(largest_batch, points), limits.kinetic_targets,
             std::min(p, training_input_.getParameterChunkSize()), scope);
+        if (scalar_ecp && crowds_.size() == 2 && complex->activeAcceleratorInferenceCrowdCapacity() == 2)
+        {
+          // C2 owns one score tape/queue per crowd. Sum exact crowd capacities,
+          // including uneven tails, before sampling; immutable weights stay shared.
+          r = {};
+          for (const auto& crowd : crowds_)
+          {
+            const auto lane = complex->gpuDerivativeRequirements(crowd->size(), crowd->size(),
+                limits.kinetic_targets, std::min(p, training_input_.getParameterChunkSize()), scope);
+            r.device_bytes = checkedMemoryAdd(r.device_bytes, lane.device_bytes);
+            r.host_bytes = checkedMemoryAdd(r.host_bytes, lane.host_bytes);
+            r.matrix_work = std::max(r.matrix_work, lane.matrix_work);
+          }
+        }
         const auto replay_bytes = ecp && !scalar_ecp && !inline_ecp ?
             complex->gpuNonLocalReplayRequirements(largest_batch, points).bound_host_extra_bytes : 0;
         if (ecp && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
@@ -4861,8 +4905,11 @@ void WFTrainBatched::run()
               auto live = checkedMemoryAdd(retained_configuration_bytes,
                   kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0);
               live = checkedMemoryAdd(live, first_order_optimizer ? first_order_optimizer->retainedBytes() : 0);
-              if (retained_samples.size() != 1 || live >= training_input_.getMaximumRetainedBytes())
-                throw std::length_error("GPU score-only ECP requires one retained batch with remaining numeric budget");
+              // Earlier crowds remain live until the global producer finishes.
+              // Charge their shared/private numerical owners before the next lane.
+              live = checkedMemoryAdd(live, preparedStorageDiagnostics(batches).retained_numeric_bytes);
+              if (live >= training_input_.getMaximumRetainedBytes())
+                throw std::length_error("GPU score-only ECP batches exceed remaining numeric budget");
               scalar_ecp_budget = training_input_.getMaximumRetainedBytes() - live;
             }
             std::optional<ImmediateFullReplayReceipt> full_handoff;
