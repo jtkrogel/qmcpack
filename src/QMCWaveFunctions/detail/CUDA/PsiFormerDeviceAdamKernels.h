@@ -15,6 +15,11 @@ Error launchAdamEnergyGradient(Stream stream, std::size_t count, const double* c
     const double* parameters, const double* image_parameters, double weight, double energy,
     double* gradient, double* norm_partials, std::uint64_t* status);
 
+/// Physical score covariance from ordered EO/O sums, with no response channel.
+Error launchAdamScoreCovarianceGradient(Stream stream, std::size_t count, const double* channels,
+    const double* parameters, const double* image_parameters, double weight, double energy,
+    double* gradient, double* norm_partials, std::uint64_t* status);
+
 /// Compact immutable schema blocks; no per-parameter rate/trainability tensor.
 struct AdamBlock
 {

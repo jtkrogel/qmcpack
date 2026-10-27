@@ -191,17 +191,26 @@ private:
         correction1, correction2, epsilon, &candidate);
   }
 
+  /// Consume the independently tagged physical score covariance, retaining HOST publication.
+  double proposeScoreCovariance(const PreparedDeviceScoreContraction& source, const double* image_parameters,
+      const std::vector<double>& parameters, double weight, double energy, double beta1, double beta2,
+      double correction1, double correction2, double epsilon, std::vector<double>& candidate)
+  {
+    return proposeEnergyImpl(source, image_parameters, &parameters, weight, energy, beta1, beta2,
+        correction1, correction2, epsilon, &candidate, nullptr, true);
+  }
+
   /// Share unchanged recurrence/status kernels; the optional HOST boundary stays explicit.
   double proposeEnergyImpl(const PreparedDeviceScoreContraction& source, const double* image_parameters,
       const std::vector<double>* parameters, double weight, double energy, double beta1, double beta2,
       double correction1, double correction2, double epsilon, std::vector<double>* candidate,
-      double* displacement_norm = nullptr)
+      double* displacement_norm = nullptr, bool score_covariance = false)
   {
     validateDevice();
     revokeCandidate();
     pending_ = false;
     if (!seeded_ || (parameters && parameters->size() != count_) || (candidate && candidate->size() != count_) || !image_parameters ||
-        !source.ready_ || source.channels_ != 3 || source.parameters_ != count_ ||
+        !source.ready_ || source.channels_ != (score_covariance ? 2 : 3) || source.parameters_ != count_ ||
         norm_host_.size() != energyGradientRequiredBytes(count_) / sizeof(double) ||
         norm_partials_.capacity() != norm_host_.size() ||
         !device_math::isFiniteBinary64(weight) || weight <= 0 || !device_math::isFiniteBinary64(energy) ||
@@ -210,14 +219,17 @@ private:
         !device_math::isFiniteBinary64(correction1) || correction1 <= 0 || correction1 > 1 ||
         !device_math::isFiniteBinary64(correction2) || correction2 <= 0 || correction2 > 1 ||
         !device_math::isFiniteBinary64(epsilon) || epsilon <= 0)
-      throw std::invalid_argument("Device ENERGY Adam inputs, C3 provenance or preparation are invalid");
+      throw std::invalid_argument(score_covariance
+          ? "Device score Adam inputs, C2 provenance or preparation are invalid"
+          : "Device ENERGY Adam inputs, C3 provenance or preparation are invalid");
     if (parameters)
       parameters_.upload(parameters->data(), count_);
     const double* current = parameters ? parameters_.data() : image_parameters;
     resetStatus();
-    checkRuntime(launchAdamEnergyGradient(queue_.getNative(), count_, source.sums_.data(), current,
+    const auto gradient_launch = score_covariance ? launchAdamScoreCovarianceGradient : launchAdamEnergyGradient;
+    checkRuntime(gradient_launch(queue_.getNative(), count_, source.sums_.data(), current,
         image_parameters, weight, energy, gradient_candidate_.data(), norm_partials_.data(), status_.data()),
-        "Device ENERGY gradient");
+        score_covariance ? "Device score covariance gradient" : "Device ENERGY gradient");
     admitStatus();
     norm_partials_.download(norm_host_.data(), norm_host_.size());
     double norm = 0;

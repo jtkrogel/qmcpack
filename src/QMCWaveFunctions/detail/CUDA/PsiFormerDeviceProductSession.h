@@ -32,8 +32,8 @@
 
 namespace qmcplusplus::psiformer::device
 {
-/// Ordered ENERGY channels: local-energy response, energy-times-score, then score.
-enum class ScoreContractionRole { GENERIC, ENERGY_T_EO_O };
+/// Explicit terminal roles separate full response T/EO/O from score covariance EO/O.
+enum class ScoreContractionRole { GENERIC, ENERGY_T_EO_O, SCORE_EO_O };
 
 
 /** Fix the numerical roots and their scratch at an explicit preparation boundary. */
@@ -498,11 +498,13 @@ public:
     if (contraction_transaction_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Device score contraction transaction generation exhausted");
     if (role != ScoreContractionRole::GENERIC &&
-        (role != ScoreContractionRole::ENERGY_T_EO_O || channels != 3 || image_->periodicCell() ||
+        (((role != ScoreContractionRole::ENERGY_T_EO_O || channels != 3) &&
+          (role != ScoreContractionRole::SCORE_EO_O || channels != 2)) || image_->periodicCell() ||
          image_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL))
-      throw std::invalid_argument("Device ENERGY contraction requires ordered real/open C3 channels");
+      throw std::invalid_argument("Device Adam contraction requires ordered real/open T/EO/O or EO/O channels");
     score_contraction_->begin(channels);
     energy_image_ = role == ScoreContractionRole::ENERGY_T_EO_O ? image_.get() : nullptr;
+    score_covariance_image_ = role == ScoreContractionRole::SCORE_EO_O ? image_.get() : nullptr;
     return ++contraction_transaction_;
   }
 
@@ -518,6 +520,30 @@ public:
       if (energy_image_ != image_.get() || generation != contraction_transaction_ || !score_contraction_)
         throw std::invalid_argument("Device ENERGY contraction owner/image/generation is stale or untagged");
       const auto norm = adam.proposeEnergy(*score_contraction_, image_->parameters(), parameters,
+          weight, energy, beta1, beta2, correction1, correction2, epsilon, candidate);
+      invalidateScoreContraction();
+      return norm;
+    }
+    catch (...)
+    {
+      adam.reject();
+      invalidateScoreContraction();
+      throw;
+    }
+  }
+
+  /// Consume only an EO/O score transaction; full-response roles cannot enter this path.
+  double consumeScoreAdam(PreparedDeviceAdam& adam, std::size_t version, std::size_t generation,
+      const std::vector<double>& parameters, double weight, double energy, double beta1, double beta2,
+      double correction1, double correction2, double epsilon, std::vector<double>& candidate)
+  {
+    std::lock_guard lock(mutex_);
+    try
+    {
+      validateContractionControl(version);
+      if (score_covariance_image_ != image_.get() || generation != contraction_transaction_ || !score_contraction_)
+        throw std::invalid_argument("Device score covariance source/image/generation is stale or untagged");
+      const auto norm = adam.proposeScoreCovariance(*score_contraction_, image_->parameters(), parameters,
           weight, energy, beta1, beta2, correction1, correction2, epsilon, candidate);
       invalidateScoreContraction();
       return norm;
@@ -1110,6 +1136,7 @@ private:
       else ++resident_open_->epoch;
     }
     energy_image_ = nullptr;
+    score_covariance_image_ = nullptr;
     if (score_contraction_)
       score_contraction_->invalidate();
   }
@@ -1328,6 +1355,7 @@ private:
   std::unique_ptr<PreparedDeviceTargetKinetic> target_kinetic_;
   std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
   const PreparedDeviceModel* energy_image_ = nullptr;
+  const PreparedDeviceModel* score_covariance_image_ = nullptr;
   std::size_t contraction_transaction_ = 0;
   // Publish metadata without exposing a concurrently replaced lazy owner.
   // Provider diagnostics hold the outer scratch mutex for a coherent snapshot.

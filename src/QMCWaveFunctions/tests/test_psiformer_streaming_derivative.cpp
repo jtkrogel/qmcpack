@@ -1567,6 +1567,115 @@ TEST_CASE("PsiFormer real GPU score-only profiles preserve complete-product lane
   }
   else
     WARN("NOT_RUN: C2 score-lane qualification requires PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES");
+
+  // Real/open bridge only: complex coefficients still project onto real model scores.
+  // Complex model heads and physical DEVICE observations need separate admission.
+  for (const bool soft : {false, true})
+  {
+    PsiFormerWF oracle_cpu("score_covariance_bridge", initialized, electrons, ions);
+    PsiFormerWF gpu("score_covariance_bridge", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+    CHECK_THROWS(oracle_cpu.prepareResidentScoreAdam(32 * p + 4096));
+    CHECK_THROWS(gpu.prepareResidentScoreAdam(1));
+    const auto norm_bytes = gpu.prepareResidentScoreAdam(
+        ps::device::PreparedDeviceScoreContraction::requiredBytes(p, 2) +
+        ps::device::PreparedDeviceAdam::energyGradientRequiredBytes(p));
+    std::vector<ps::device::AdamBlock> blocks;
+    for (const auto& block : gpu.parameterSchema().blocks())
+      blocks.push_back({block.offset, block.count, block.trainable ? .0017 : 0, block.trainable ? 1u : 0u});
+    auto adam = ps::device::PreparedDeviceAdam::prepare(p, blocks, ps::device::estimateAdamBytes(p, blocks.size()));
+    std::vector<double> first(p), second(p), candidate(p);
+    adam->seed(first, second);
+    adam->prepareEnergyGradient(norm_bytes);
+    std::vector<std::unique_ptr<ParticleSet>> samples;
+    std::vector<std::unique_ptr<PsiFormerWF>> gpu_clones, cpu_clones;
+    RefVectorWithLeader<WaveFunctionComponent> gc(gpu, {gpu}), cc(oracle_cpu, {oracle_cpu});
+    for (std::size_t sample = 0; sample < 7; ++sample)
+    {
+      samples.push_back(std::make_unique<ParticleSet>(electrons));
+      samples.back()->R[0][0] += .013 * sample;
+      samples.back()->update();
+      if (sample)
+      {
+        gpu_clones.push_back(std::make_unique<PsiFormerWF>(gpu));
+        cpu_clones.push_back(std::make_unique<PsiFormerWF>(oracle_cpu));
+        gc.push_back(*gpu_clones.back()); cc.push_back(*cpu_clones.back());
+      }
+    }
+    RefVectorWithLeader<ParticleSet> batch(*samples.front());
+    for (auto& sample : samples) batch.push_back(*sample);
+    const std::vector<DerivativeValue> energies{{-4, 1}, {-2, -1}, {-1, .5}, {0, 2}, {1, -2}, {3, 1}, {10, -.5}};
+    const std::vector<double> weights = soft ? std::vector<double>(7, 1) : std::vector<double>{1, .5, 2, 1, .5, 2, 1};
+    std::optional<wftrain::EnergyClippingTransform> transform;
+    if (soft)
+      transform = wftrain::prepareEnergyClippingTransform({energies.data(), energies.size()},
+          {wftrain::EnergyClippingScaleRule::LINEAR_QUANTILE_SOFT_SQUEEZE, .5, .75});
+    std::size_t lane_identity = 0;
+    for (std::size_t step = 1; step <= 2; ++step)
+    {
+      for (auto& sample : samples)
+      {
+        sample->G = QMCTraits::GradType{}; sample->L = QMCTraits::ValueType{};
+        oracle_cpu.evaluateLog(*sample, sample->G, sample->L);
+      }
+      auto co = oracle_cpu.makeStreamingDerivativeOperator(cc, batch, 0, 0, 7);
+      auto go = gpu.makeGpuScoreStreamingDerivativeOperator(gc, batch, 0, 0, 7);
+      REQUIRE(go->capabilities().local_energy_term_mask == 0);
+      const auto identity = go->storageDiagnostics().shared_workspace_identity;
+      if (step == 1) lane_identity = identity;
+      else CHECK(identity == lane_identity);
+      wftrain::EnergyGradientAccumulator accumulator(oracle_cpu.parameterSchema(), co->parameterVersion(),
+          wftrain::EnergyGradientEstimator::SCORE_COVARIANCE);
+      wftrain::accumulateEnergyGradientBatch(*co, {weights.data(), 7}, {energies.data(), 7}, 0,
+          accumulator, wftrain::DerivativeAdjoint::TRANSPOSE, transform ? &*transform : nullptr);
+      accumulator.completeSingleParticipantReduction();
+      const auto expected_gradient = accumulator.finalize();
+      std::vector<DerivativeValue> w(7), ew(7);
+      double weight = 0, mean = 0;
+      for (std::size_t i = 0; i < 7; ++i)
+      {
+        const auto energy = transform ? transform->apply(energies[i]) : energies[i];
+        w[i] = weights[i]; ew[i] = weights[i] * std::conj(energy);
+        weight += weights[i]; mean += weights[i] * energy.real();
+      }
+      mean /= weight;
+      std::array<VJPCoefficientChannel, 2> channels{{
+          {wftrain::EnergyGradientAccumulator::ENERGY_WEIGHTED_SCORE_CHANNEL, DerivativeProduct::SCORE_VJP, coefficientsFor(*go, ew)},
+          {wftrain::EnergyGradientAccumulator::WEIGHTED_SCORE_CHANNEL, DerivativeProduct::SCORE_VJP, coefficientsFor(*go, w)}}};
+      auto swapped = channels; std::swap(swapped[0], swapped[1]);
+      auto expected = gpu.snapshotParameters();
+      CHECK_THROWS(gpu.consumeResidentScoreAdam(*go, {swapped.data(), 2}, *adam, expected.values,
+          weight, mean, .9, .99, .1, .01, 1e-8, candidate));
+      CHECK_THROWS(gpu.consumeResidentEnergyAdam(*go, {channels.data(), 2}, *adam, expected.values,
+          weight, mean, .9, .99, .1, .01, 1e-8, candidate));
+      CHECK_THROWS(gpu.consumeResidentScoreAdam(*co, {channels.data(), 2}, *adam, expected.values,
+          weight, mean, .9, .99, .1, .01, 1e-8, candidate));
+      auto response = channels; response[0].local_energy_term_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+      CHECK_THROWS(gpu.consumeResidentScoreAdam(*go, {response.data(), 2}, *adam, expected.values,
+          weight, mean, .9, .99, .1, .01, 1e-8, candidate));
+      const double correction1 = 1 - std::pow(.9, step), correction2 = 1 - std::pow(.99, step);
+      const auto norm = gpu.consumeResidentScoreAdam(*go, {channels.data(), 2}, *adam, expected.values,
+          weight, mean, .9, .99, correction1, correction2, 1e-8, candidate);
+      double expected_norm = 0;
+      for (const auto& block : gpu.parameterSchema().blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          const double g = expected_gradient.gradient[i]; expected_norm = std::hypot(expected_norm, g);
+          if (block.trainable)
+          {
+            first[i] = .9 * first[i] + .1 * g; second[i] = .99 * second[i] + .01 * g * g;
+            expected.values[i] -= .0017 * (first[i] / correction1) / (std::sqrt(second[i] / correction2) + 1e-8);
+          }
+          CHECK(candidate[i] == Catch::Approx(expected.values[i]).epsilon(2e-8).margin(2e-10));
+        }
+      CHECK(norm == Catch::Approx(expected_norm).epsilon(2e-8).margin(2e-8));
+      auto published = gpu.snapshotParameters(); published.values = candidate;
+      gpu.publishParameters(published, published.version);
+      oracle_cpu.publishParameters(published, published.version);
+      adam->accept();
+      CHECK_THROWS(gpu.consumeResidentScoreAdam(*go, {channels.data(), 2}, *adam, published.values,
+          weight, mean, .9, .99, correction1, correction2, 1e-8, candidate));
+    }
+  }
 }
 
 TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",

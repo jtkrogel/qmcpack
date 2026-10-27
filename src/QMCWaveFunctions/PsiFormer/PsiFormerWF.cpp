@@ -1561,6 +1561,8 @@ public:
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
   /// Explicit resident ENERGY keeps one existing lane/tapes alive across iterations.
   std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_scratch;
+  /// Separate SCORE_ONLY owner; never upgrade the legacy complete-response lane.
+  std::shared_ptr<PsiFormerDerivativeScratch> resident_score_adam_scratch;
 #ifdef ENABLE_CUDA
   psiformer::device::DeviceMemorySnapshot resident_transfer_baseline;
   bool resident_transfer_window_active = false;
@@ -2660,9 +2662,12 @@ protected:
   /// A terminal consumer shares physical arithmetic but bypasses host P emission.
   void evaluateVJPsImpl(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink* sink,
-      const std::function<void(std::size_t)>& terminal = {}, bool device_authority_terminal = false) const
+      const std::function<void(std::size_t)>& terminal = {}, bool device_authority_terminal = false,
+      bool score_covariance_terminal = false) const
   {
-    if (score_only_ && (terminal || device_authority_terminal || std::any_of(channels.begin(), channels.end(),
+    if (score_covariance_terminal && (!score_only_ || !terminal || device_authority_terminal || channels.size() != 2))
+      throw std::invalid_argument("Resident score covariance requires an explicit SCORE_ONLY C2 host terminal");
+    if (score_only_ && ((terminal && !score_covariance_terminal) || device_authority_terminal || std::any_of(channels.begin(), channels.end(),
         [](const auto& channel) { return channel.product != wftrain::DerivativeProduct::SCORE_VJP; })))
       throw std::invalid_argument("PsiFormer score-only operator requires ordinary score VJP channels");
     NativeTimerScope timer(phase_timers_.parameter_vjp);
@@ -2746,8 +2751,8 @@ protected:
       const bool retained_score_input = retained_coordinates_ && !needs_kinetic && !needs_ecp;
       const auto& contracted_channels = resident_kinetic ? device_channels : score_channels;
       const auto contracted_count = resident_kinetic ? device_channel_count : score_channel_count;
-      if (terminal && !resident_kinetic)
-        throw std::invalid_argument("Resident ENERGY requires the qualified fused kinetic traversal");
+      if (terminal && !resident_kinetic && !(score_covariance_terminal && resident_scores))
+        throw std::invalid_argument("Resident Adam requires its qualified kinetic or score-only traversal");
       std::size_t contraction_generation = 0;
       psiformer::device::DeviceMemorySnapshot transfer_before;
       // The existing weighted reverse contracts one real channel. Exact API
@@ -2768,8 +2773,9 @@ protected:
         // the same admitted channel count reuse it without allocation.
         session.prepareScoreContractions(contracted_count, parameter_version_);
         contraction_generation = session.beginScoreContraction(contracted_count, parameter_version_,
-            terminal ? psiformer::device::ScoreContractionRole::ENERGY_T_EO_O
-                     : psiformer::device::ScoreContractionRole::GENERIC);
+            score_covariance_terminal ? psiformer::device::ScoreContractionRole::SCORE_EO_O
+                : terminal ? psiformer::device::ScoreContractionRole::ENERGY_T_EO_O
+                           : psiformer::device::ScoreContractionRole::GENERIC);
       }
 #endif
 
@@ -14040,6 +14046,43 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
 #endif
 }
 
+/// Prepare the independent C2 optimizer seam; sampler and local energy remain native HOST work.
+std::size_t PsiFormerWF::prepareResidentScoreAdam(std::size_t budget) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+  std::size_t p = 0, c2 = 0, norm = 0;
+  {
+    PsiFormerReadTransaction read(*model_state_);
+    const auto& environment = model_state_->execution_plan.environment();
+    if (!model_state_->numerical_tile_backend || model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL ||
+        environment.boundary != psiformer::BoundaryCondition::OPEN ||
+        std::any_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Resident score Adam bridge requires real/open/FP64 GPU products");
+    p = structured_parameter_schema_->parameterCount();
+    c2 = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(p, 2);
+    norm = psiformer::device::PreparedDeviceAdam::energyGradientRequiredBytes(p);
+    if (!budget || budget == std::numeric_limits<std::size_t>::max() ||
+        checkedBatchMemoryAdd(c2, norm, "Resident score bridge") > budget)
+      throw std::length_error("Resident score C2+norm exceeds its explicit device bridge cap");
+    scratch = acquireDerivativeScratch(*model_state_, p, 4, true);
+  }
+  PsiFormerDerivativeLease lease(*scratch);
+  PsiFormerReadTransaction read(*model_state_);
+  scratch->device_products->prepareScoreContractions(2, model_state_->model.p.version(), c2);
+  app_log() << "Resident score Adam bridge admitted: C2_device_bytes=" << c2
+            << " norm_device_bytes=" << norm << " derivative_response_mask=0"
+            << " sampling=host local_energy=host parameter_publication=host"
+            << "; cap covers C2+norm only; model/tapes/coefficients/vendor/checkpoint bytes excluded" << std::endl;
+  std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+  model_state_->resident_score_adam_scratch = std::move(scratch);
+  return norm;
+#else
+  throw std::invalid_argument("Resident score Adam bridge requires a real GPU build");
+#endif
+}
+
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
 namespace
 {
@@ -14229,6 +14272,37 @@ double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivative
   return norm;
 #else
   throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
+#endif
+}
+
+/// Consume only a bound EO/O score transaction, preserving the legacy C3 interface.
+double PsiFormerWF::consumeResidentScoreAdam(const wftrain::StreamingDerivativeOperator& derivative,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    psiformer::device::PreparedDeviceAdam& adam, const std::vector<double>& parameters,
+    double weight, double transformed_mean, double beta1, double beta2, double correction1, double correction2,
+    double epsilon, std::vector<double>& candidate) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (!source || !source->score_only_ || source->model_state_.get() != model_state_.get() ||
+      source->shared_scratch_ != model_state_->resident_score_adam_scratch || derivative.sampleCount() < 7)
+    throw std::invalid_argument("Resident score Adam requires this provider's current SCORE_ONLY batch with at least seven samples");
+  (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
+  if (channels.size() != 2 || channels[0].id != "energy/energy_weighted_score" ||
+      channels[1].id != "energy/weighted_score" ||
+      std::any_of(channels.begin(), channels.end(), [](const auto& channel) {
+        return channel.product != wftrain::DerivativeProduct::SCORE_VJP || channel.local_energy_term_mask != 0;
+      }))
+    throw std::invalid_argument("Resident score Adam requires ordered energy-weighted-score/weighted-score C2 channels");
+  double norm = 0;
+  source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
+    auto& session = *source->shared_scratch_->device_products;
+    norm = session.consumeScoreAdam(adam, derivative.parameterVersion(), generation,
+        parameters, weight, transformed_mean, beta1, beta2, correction1, correction2, epsilon, candidate);
+  }, false, true);
+  return norm;
+#else
+  throw std::invalid_argument("Resident score Adam bridge requires a real GPU build");
 #endif
 }
 

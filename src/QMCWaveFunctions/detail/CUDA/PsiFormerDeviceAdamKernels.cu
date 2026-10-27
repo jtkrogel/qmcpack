@@ -39,6 +39,7 @@ __device__ void stablePartial(const double* values, double* partials)
 }
 
 /// One bounded partial per block avoids squaring large finite gradients directly.
+template<bool ScoreOnly>
 __global__ void energyGradient(std::size_t count, const double* channels, const double* parameters,
     const double* image_parameters, double weight, double energy, double* gradient,
     double* partials, std::uint64_t* status)
@@ -48,8 +49,11 @@ __global__ void energyGradient(std::size_t count, const double* channels, const 
   double g = 0;
   if (index < count)
   {
-    g = 2.0 * (channels[2 * index] + channels[2 * count + 2 * index] -
-        energy * channels[4 * count + 2 * index]) / weight;
+    if constexpr (ScoreOnly)
+      g = 2.0 * (channels[2 * index] - energy * channels[2 * count + 2 * index]) / weight;
+    else
+      g = 2.0 * (channels[2 * index] + channels[2 * count + 2 * index] -
+          energy * channels[4 * count + 2 * index]) / weight;
     gradient[index] = g;
     if (!device_math::isFiniteBinary64(g) || !device_math::isFiniteBinary64(parameters[index]) ||
         parameters[index] != image_parameters[index])
@@ -122,7 +126,21 @@ Error launchAdamEnergyGradient(Stream stream, std::size_t count, const double* c
     const double* parameters, const double* image_parameters, double weight, double energy,
     double* gradient, double* norm_partials, std::uint64_t* status)
 {
-  energyGradient<<<static_cast<unsigned>((count - 1) / 128 + 1), 128, 0, stream>>>(
+  energyGradient<false><<<static_cast<unsigned>((count - 1) / 128 + 1), 128, 0, stream>>>(
+      count, channels, parameters, image_parameters, weight, energy, gradient, norm_partials, status);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+/// EO/O storage is admitted separately from the full-response T/EO/O contract.
+Error launchAdamScoreCovarianceGradient(Stream stream, std::size_t count, const double* channels,
+    const double* parameters, const double* image_parameters, double weight, double energy,
+    double* gradient, double* norm_partials, std::uint64_t* status)
+{
+  energyGradient<true><<<static_cast<unsigned>((count - 1) / 128 + 1), 128, 0, stream>>>(
       count, channels, parameters, image_parameters, weight, energy, gradient, norm_partials, status);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();

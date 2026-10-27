@@ -667,6 +667,9 @@ public:
   /// Retain one shared lane and admit C3; return separately charged norm bytes.
   std::size_t prepareResidentEnergyAdam(std::size_t budget) const;
 
+  /// Retain a SCORE_ONLY lane and ordered C2 contractions; physical EL/sampling remain HOST.
+  std::size_t prepareResidentScoreAdam(std::size_t budget) const;
+
   /// Scalar-only accepted DEVICE observations; the owner pins the derivative session.
   class ResidentOpenObservationBatch
   {
@@ -710,6 +713,13 @@ public:
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       psiformer::device::PreparedDeviceAdam& adam, const std::vector<double>& parameters,
       double weight, double energy, double beta1, double beta2, double correction1, double correction2,
+      double epsilon, std::vector<double>& candidate) const;
+
+  /// Consume canonical energy-weighted-score/weighted-score channels with HOST publication.
+  double consumeResidentScoreAdam(const wftrain::StreamingDerivativeOperator& derivative,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      psiformer::device::PreparedDeviceAdam& adam, const std::vector<double>& parameters,
+      double weight, double transformed_mean, double beta1, double beta2, double correction1, double correction2,
       double epsilon, std::vector<double>& candidate) const;
 
   /// Advance native-engine substeps; default exports R for immediate HOST FULL,
