@@ -14,6 +14,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
@@ -67,6 +69,48 @@ private:
 constexpr std::uint64_t LAYOUT = UINT64_C(0x4d4f44454c);
 
 } // namespace
+
+TEST_CASE("PsiFormer independent lanes preserve every concurrent image lease",
+          "[wavefunction][psiformer][accelerator][concurrency]")
+{
+  constexpr auto backend = PsiFormerAcceleratorBackend::CUDA;
+  PsiFormerAcceleratorExecutor executor(backend, acceleratorOperationBit(PsiFormerAcceleratorOperation::PARAMETER_SCORE));
+  // Repeated bursts exercise acquire/release contention without publishing while
+  // readers hold shared authority. Each lane has independent hook/crowd state.
+  for (int burst = 0; burst < 64; ++burst)
+  {
+    PsiFormerAcceleratorSharedModel model(backend, LAYOUT, 1);
+    std::array<std::thread, 8> workers;
+    std::atomic<std::size_t> acquired{0}, failures{0};
+    std::atomic<bool> start{false}, release{false};
+    for (std::size_t i = 0; i < workers.size(); ++i)
+      workers[i] = std::thread([&, i] {
+        BoundedRecorder hooks;
+        PsiFormerAcceleratorCrowdState crowd(i + 1);
+        try
+        {
+          executor.prepare(crowd, LAYOUT, 1, hooks);
+          while (!start.load()) std::this_thread::yield();
+          executor.acquire(model, crowd, hooks);
+        }
+        catch (...) { ++failures; }
+        ++acquired;
+        while (!release.load()) std::this_thread::yield();
+        try { executor.release(model, crowd, hooks); }
+        catch (...) { ++failures; }
+      });
+    start = true;
+    while (acquired.load() != workers.size()) std::this_thread::yield();
+    release = true;
+    for (auto& worker : workers) worker.join();
+    CHECK(failures.load() == 0);
+    // Every lease has drained, so both image slots must be reusable.
+    BoundedRecorder publication;
+    model.stage(LAYOUT, 2, publication);
+    model.complete(2, publication);
+    CHECK_NOTHROW(model.stage(LAYOUT, 3, publication));
+  }
+}
 
 TEST_CASE("PsiFormer accelerator state owners are address stable",
           "[wavefunction][psiformer][accelerator]")

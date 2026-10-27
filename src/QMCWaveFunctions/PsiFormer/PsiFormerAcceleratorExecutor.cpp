@@ -168,7 +168,12 @@ void PsiFormerAcceleratorSharedModel::acquireLease(
   if (!(activeProvenance() == provenance))
     throw std::logic_error("PsiFormer accelerator lease requested for stale active provenance");
   auto& count = slot_leases_[provenance.active_slot];
-  count.store(nextGeneration(count.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+  auto observed = count.load(std::memory_order_relaxed);
+  // Independent numerical lanes acquire under shared model authority. A load/store
+  // increment loses leases when submissions overlap and can retire a live image.
+  while (!count.compare_exchange_weak(observed, nextGeneration(observed),
+                                     std::memory_order_relaxed, std::memory_order_relaxed))
+  {}
 }
 
 void PsiFormerAcceleratorSharedModel::releaseLease(
