@@ -1822,10 +1822,10 @@ private:
   /// Layout evidence for externally owned persistent walker-record regions.
   pf::WalkerBufferLayout prepared_walker_buffer_layout_;
   /// Fixed allocation identities published immediately before the preparation marker.
-  const GradType* prepared_accepted_gradient_data_ = nullptr;
-  const ValueType* prepared_accepted_laplacian_data_ = nullptr;
-  const GradType* prepared_proposed_gradient_data_ = nullptr;
-  const ValueType* prepared_proposed_laplacian_data_ = nullptr;
+  const ParticleSet::ParticleGradient::value_type* prepared_accepted_gradient_data_ = nullptr;
+  const ParticleSet::ParticleLaplacian::value_type* prepared_accepted_laplacian_data_ = nullptr;
+  const ParticleSet::ParticleGradient::value_type* prepared_proposed_gradient_data_ = nullptr;
+  const ParticleSet::ParticleLaplacian::value_type* prepared_proposed_laplacian_data_ = nullptr;
   /// Exact admitted capacities paired with the retained allocation identities.
   std::size_t prepared_accepted_gradient_capacity_ = 0;
   std::size_t prepared_accepted_laplacian_capacity_ = 0;

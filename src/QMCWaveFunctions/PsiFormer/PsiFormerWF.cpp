@@ -11630,7 +11630,7 @@ void PsiFormerWF::probePlannedWalkerBufferBetweenPhaseFaultForTesting(
                 BatchExecutionParticipantPlan>);
   const BatchExecutionParticipantPlan saved_plan = batch_execution_plan_;
   const pf::WalkerBufferLayout saved_layout = prepared_walker_buffer_layout_;
-  const GradType* const saved_prepared_gradient =
+  const auto* const saved_prepared_gradient =
       prepared_accepted_gradient_data_;
   FullPrecRealType* const saved_scalar_pointer = buffer.Scalar_ptr;
   const std::size_t saved_bulk_cursor = buffer.Current;
