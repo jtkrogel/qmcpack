@@ -3182,6 +3182,20 @@ void WFTrainBatched::process(xmlNodePtr node)
             "AE/ordinary-VP PP energy Adam or explicit-policy KFAC, nonempty crowds/step1 and PBYP or supported all-electron/no drift; "
             "extended rank/crowd/PP profiles require finite retained cap and line_search=off on every rank");
     }
+    // A request receipt precedes population allocation. Admission below can still
+    // reject it; do not present requested crowds as concurrent derivative lanes.
+    if (selected_provider_->usesAcceleratorParameterProducts())
+      app_log() << "WFTrain execution request: schema=" << selected_provider_->parameterSchema().fingerprint()
+                << " scalar=" << (complex_training_component_ ? "paired_complex" : "real")
+                << " geometry=" << (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN
+                    ? "open" : "periodic")
+                << " physical_ecp=" << population_.get_golden_hamiltonian().hasPhysicalNLPP()
+                << " score_only=" << wftrain::usesEnergyScoreEstimator(training_input_, bool(complex_training_component_))
+                << " ranks=" << myComm->size() << " global_walkers=" << walker_counts.global_walkers
+                << " nominal_crowds=" << walker_counts.walkers_per_crowd.size()
+                << " nonempty_crowds=" << std::count_if(walker_counts.walkers_per_crowd.begin(),
+                    walker_counts.walkers_per_crowd.end(), [](auto n) { return n > 0; })
+                << " precision=fp64 admission=pending" << std::endl;
     initPopulationAndCrowds(walker_counts);
     // Independent score selection must retain the qualified scalar ECP topology.
     int invalid_score_ecp = 0;
@@ -3251,6 +3265,13 @@ void WFTrainBatched::process(xmlNodePtr node)
     if (complex_gpu_provider_ && population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
         qmcdriver_input_.get_max_blocks() != 1)
       throw UniformCommunicateError("WFTrainBatched: paired ECP requires one block before sampling");
+    if (selected_provider_->usesAcceleratorParameterProducts() &&
+        wftrain::usesEnergyScoreEstimator(training_input_, bool(complex_training_component_)))
+      app_log() << "WFTrain effective score execution: derivative_lanes=1 derivative_dispatch=serialized"
+                << " retained_crowds=" << crowds_.size()
+                << " statistics=rank_global_then_mpi updates_per_iteration=1"
+                << " local_energy=native parameter_authority=host"
+                << " residency=host_mediated fallback_reason=shared_derivative_lane" << std::endl;
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     if (resident_adam_budget_ &&
