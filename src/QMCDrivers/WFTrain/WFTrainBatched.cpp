@@ -4299,6 +4299,7 @@ void WFTrainBatched::run()
               << " iteration_warmupsteps " << training_input_.getWarmupSteps() << std::endl;
 
   if (myComm->rank() == 0 && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
+  {
     app_log() << "WFTrain KFAC controls: defaults="
               << (training_input_.getKFACDefaults() == WFTrainDriverInput::KFACDefaults::LEGACY ? "legacy" :
                   training_input_.getKFACDefaults() == WFTrainDriverInput::KFACDefaults::SOFT_COVARIANCE ? "deepqmc" :
@@ -4334,8 +4335,13 @@ void WFTrainBatched::run()
               << " schedule_arithmetic="
               << (training_input_.getKFACScheduleArithmetic() == WFTrainDriverInput::KFACScheduleArithmetic::MULTIPLY_RECIPROCAL
                     ? "multiply_reciprocal" : "divide_rate")
-              << " exclude_width=" << training_input_.getKFACExcludeWidth()
-              << " curvature="
+              << " exclude_width=";
+    // Keep the unbounded policy out of a finite-math scalar logging argument.
+    if (wftrain::isPositiveInfinityTrainingReal(training_input_.getKFACExcludeWidth()))
+      app_log() << "inf";
+    else
+      app_log() << training_input_.getKFACExcludeWidth();
+    app_log() << " curvature="
               << (training_input_.getKFACCurvature() == WFTrainDriverInput::KFACCurvature::NATIVE_SCORE
                       ? "native_score" : "registered_gaussian")
               << " damping_policy="
@@ -4356,6 +4362,7 @@ void WFTrainBatched::run()
               << " constraint_units=LR^2*g_dot_preconditioned_g"
               << " euclidean_update_cap=" << training_input_.getMaximumUpdateNorm()
               << " registered_curvature_reference_devices=1" << std::endl;
+  }
   if (myComm->rank() == 0 && kfac_optimizer)
     app_log() << "WFTrain persistent KFAC: step=" << kfac_optimizer->step()
               << " data_seen=" << kfac_optimizer->dataSeen()
