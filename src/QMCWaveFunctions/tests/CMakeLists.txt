@@ -975,6 +975,8 @@ add_executable(test_psiformer_streaming_derivative
 target_link_libraries(
   test_psiformer_streaming_derivative
   catch_main
+  qmcdriver
+  qmcham
   qmcwfs
   platform_LA
   platform_runtime
