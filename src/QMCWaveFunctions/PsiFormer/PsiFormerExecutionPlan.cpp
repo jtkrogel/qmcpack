@@ -114,6 +114,11 @@ ClassifiedParameter classifyParameter(const ParameterLayoutInput& layout)
     if (layout.name == "coefficients_down")
       return {ParameterRole::FOURIER_COEFFICIENT_DOWN, NO_ATTENTION_BLOCK};
   }
+  if (endsWith(layout.module, "/residual_pair_v1"))
+  {
+    if (layout.name == "same_log_length") return {ParameterRole::CUSP_SAME_ALPHA, NO_ATTENTION_BLOCK};
+    if (layout.name == "opposite_log_length") return {ParameterRole::CUSP_OPPOSITE_ALPHA, NO_ATTENTION_BLOCK};
+  }
   if (endsWith(layout.module, "/electronic_cusp_asymptotic"))
   {
     if (layout.name == "same_alpha")

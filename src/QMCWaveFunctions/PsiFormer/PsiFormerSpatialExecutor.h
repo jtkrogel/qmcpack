@@ -1624,6 +1624,26 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
     const double alpha      = same_spin ? same_alpha : opposite_alpha;
     const double factor     = same_spin ? 0.25 : 0.5;
     const double radius     = distances[pair_index];
+    if (layout_->residual_pair_)
+    {
+      const auto& positions = workspace.geometry_.electrons();
+      const auto displacement = layout_->residual_pair_->displacement(positions[pair.first], positions[pair.second]);
+      const auto jet = layout_->residual_pair_->evaluate(displacement, alpha, same_spin);
+      cusp_value += jet.value;
+      for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+      {
+        const auto electron = laneElectron(workspace, lane);
+        if (electron == pair.first || electron == pair.second)
+          workspace.scalar_gradient_scratch_[lane] += (electron == pair.first ? 1 : -1) *
+              jet.radial_first_over_r * displacement[laneDimension(workspace, lane)];
+      }
+      for (const std::size_t electron : {pair.first, pair.second})
+        if (electron >= workspace.target_begin_ &&
+            electron - workspace.target_begin_ < workspace.laplacian_lanes_)
+          workspace.scalar_laplacian_scratch_[electron - workspace.target_begin_] +=
+              jet.radial_second + 2 * jet.radial_first_over_r;
+      continue;
+    }
     if (radius == 0)
       throw std::runtime_error("PsiFormer spatial derivatives are undefined at an electron-electron coalescence");
     const double denominator = alpha + radius;

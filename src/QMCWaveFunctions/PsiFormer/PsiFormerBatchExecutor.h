@@ -2873,7 +2873,14 @@ private:
           (pair.first < layout.spinUpCount()) == (pair.second < layout.spinUpCount());
       const double alpha = same_spin ? same_alpha : anti_alpha;
       const double factor = same_spin ? 0.25 : 0.5;
-      cusp -= factor * alpha * alpha / (alpha + distances[pair_index]);
+      if (layout.residualPair())
+      {
+        const auto& positions = geometry.electrons();
+        const auto displacement = layout.residualPair()->displacement(positions[pair.first], positions[pair.second]);
+        cusp += layout.residualPair()->evaluate(displacement, alpha, same_spin).value;
+      }
+      else
+        cusp -= factor * alpha * alpha / (alpha + distances[pair_index]);
     }
     return cusp;
   }

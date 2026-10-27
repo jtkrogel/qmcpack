@@ -215,6 +215,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
   std::string parameter_checkpoint;
+  std::string neural_jastrow;
+  double neural_jastrow_cutoff = 0, neural_jastrow_same_reference = 1, neural_jastrow_opposite_reference = 1;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices, gpu = "no";
   std::string precision_text = "fp64_reference";
   ParticleSet::PosType reduced_twist(0.0);
@@ -223,6 +225,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   // Optimization remains off unless explicitly requested, preserving existing
   // inference inputs exactly.
   OhmmsAttributeSet attributes;
+  attributes.add(neural_jastrow, "neural_jastrow");
+  attributes.add(neural_jastrow_cutoff, "neural_jastrow_cutoff");
+  attributes.add(neural_jastrow_same_reference, "neural_jastrow_same_reference");
+  attributes.add(neural_jastrow_opposite_reference, "neural_jastrow_opposite_reference");
   attributes.add(name, "name");
   attributes.add(parameters, "parameters");
   attributes.add(configuration, "configuration");
@@ -249,6 +255,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::optional<psiformer::PsiFormerModelFile> imported_model;
   if (direct_model)
     imported_model.emplace(psiformer::readPsiFormerModelFile(parameters));
+  const bool jastrow_profile = initialization == psiformer::PSIFORMER_PERIODIC_JASTROW_V1 ||
+      (imported_model && imported_model->parameters.environment.residual_pair);
+  if ((!jastrow_profile && (!neural_jastrow.empty() || neural_jastrow_cutoff != 0 ||
+                           neural_jastrow_same_reference != 1 || neural_jastrow_opposite_reference != 1)) ||
+      (jastrow_profile && !direct_model && neural_jastrow != "zero_residual_pair_v1") ||
+      (jastrow_profile && direct_model && (!neural_jastrow.empty() || neural_jastrow_cutoff != 0 ||
+                           neural_jastrow_same_reference != 1 || neural_jastrow_opposite_reference != 1)))
+    throw std::invalid_argument("Neural Jastrow policy requires fresh matching initialization; imports preserve stored metadata");
   const bool pair_profile = initialization == psiformer::PSIFORMER_PERIODIC_PAIR_V1 ||
       (imported_model && imported_model->parameters.environment.periodic_profile);
   auto* profile_node = psiformer::periodicProfileChild(cur);
@@ -298,6 +312,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 #elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
   selected_pair_gpu = pair_profile && complex_profile && system == "all_electron" &&
       (pair_request == "cuda" || pair_request == "hip");
+#endif
+  if (jastrow_profile && (!periodic || system != "pseudopotential" ||
+      (pair_request != "no" && pair_request != "cpu") ||
+      precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE))
+    throw std::invalid_argument("Jastrow profile requires CPU real Gamma periodic pseudopotential FP64");
+#if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
+  if (jastrow_profile)
+    throw std::invalid_argument("Jastrow profile requires a real full-precision CPU build");
 #endif
   if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
       (pair_request != "no" && pair_request != "cpu" && !selected_pair_gpu) ||
@@ -383,12 +405,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (!internal_initialization && has_initialization_seed)
     throw std::invalid_argument(
         "PsiFormer initialization_seed requires internal initialization");
-  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1 && !complex_profile && !pair_profile)
+  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1 && !complex_profile && !pair_profile && !jastrow_profile)
     throw std::invalid_argument("Unsupported PsiFormer initialization profile: " + initialization);
   const std::uint64_t initialization_seed = parseInitializationSeed(initialization_seed_text);
 
   if (targetPtcl.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
+  if (jastrow_profile && std::any_of(reduced_twist.begin(), reduced_twist.end(), [](double x) { return x != 0; }))
+    throw std::invalid_argument("Jastrow profile requires Gamma twist");
   const auto& particle_twist = targetPtcl.getTwist();
   bool particle_twist_is_zero = true;
   for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
@@ -526,6 +550,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       for (std::size_t axis = 0; axis < 3; ++axis)
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           environment.lattice_vectors[axis][dimension] = targetPtcl.getLattice().R(axis, dimension);
+    }
+    if (jastrow_profile && !direct_model)
+    {
+      psiformer::ResidualPairMetadata metadata;
+      metadata.same_reference = neural_jastrow_same_reference;
+      metadata.opposite_reference = neural_jastrow_opposite_reference;
+      metadata.cutoff = neural_jastrow_cutoff;
+      environment.residual_pair = std::make_shared<const psiformer::ResidualPairGeometry>(metadata, environment.lattice_vectors);
     }
     if (pair_profile && !direct_model)
     {

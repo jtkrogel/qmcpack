@@ -237,14 +237,16 @@ std::vector<TensorSpecification> makeTensorSpecifications(
   tensors.reserve(8 + static_cast<std::size_t>(has_same_spin_pair) + 8 * model.attention_blocks +
                   (paired_head ? 2 : 0));
 
-  appendSpecification(tensors, prefix + "electronic_cusp_asymptotic", "anti_alpha", {},
-                      ParameterRole::CUSP_OPPOSITE_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+  const std::string correlation_module = environment.residual_pair ? "residual_pair_v1" : "electronic_cusp_asymptotic";
+  const double correlation_initial = environment.residual_pair ? 0 : 1;
+  appendSpecification(tensors, prefix + correlation_module, environment.residual_pair ? "opposite_log_length" : "anti_alpha", {},
+                      ParameterRole::CUSP_OPPOSITE_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, correlation_initial, 0, 0);
   // Haiku materializes this trainable scalar only when the system contains a
   // same-spin electron pair.  Preserving that conditional leaf is necessary
   // for canonical round trips with two-electron pseudopotential calculations.
   if (has_same_spin_pair)
-    appendSpecification(tensors, prefix + "electronic_cusp_asymptotic", "same_alpha", {},
-                        ParameterRole::CUSP_SAME_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
+    appendSpecification(tensors, prefix + correlation_module, environment.residual_pair ? "same_log_length" : "same_alpha", {},
+                        ParameterRole::CUSP_SAME_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, correlation_initial, 0, 0);
   if (fourier)
   {
     const std::vector<std::size_t> shape{environment.periodic_profile->fourier_modes.size(), model.determinants, electrons};
@@ -381,11 +383,19 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
                                                              ExecutionEnvironment environment)
 {
   if (profile != DEEPQMC_PSIFORMER_V1 && profile != PSIFORMER_COMPLEX_PERIODIC_V1)
-    if (profile != PSIFORMER_PERIODIC_PAIR_V1)
+    if (profile != PSIFORMER_PERIODIC_PAIR_V1 && profile != PSIFORMER_PERIODIC_JASTROW_V1)
       throw std::invalid_argument("Unknown PsiFormer initialization profile: " + profile);
   const bool pair_profile = profile == PSIFORMER_PERIODIC_PAIR_V1;
   if (pair_profile != static_cast<bool>(environment.periodic_profile))
     throw std::invalid_argument("Versioned periodic metadata requires the explicit periodic pair initialization profile");
+  if ((profile == PSIFORMER_PERIODIC_JASTROW_V1) != static_cast<bool>(environment.residual_pair))
+    throw std::invalid_argument("Residual pair metadata requires its explicit Jastrow initialization profile");
+  if (environment.residual_pair && (environment.boundary != BoundaryCondition::PERIODIC ||
+      environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+      environment.head_representation != HeadRepresentation::REAL ||
+      !std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool x) { return x; })))
+    throw std::invalid_argument("Residual pair profile requires real fully periodic torus metadata");
   validatePeriodicProfileMetadata(model_shape, environment);
   const bool paired_profile = profile == PSIFORMER_COMPLEX_PERIODIC_V1 ||
       (pair_profile && environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX);

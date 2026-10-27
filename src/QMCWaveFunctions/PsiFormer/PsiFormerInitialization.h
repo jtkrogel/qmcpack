@@ -37,6 +37,9 @@ inline constexpr char PSIFORMER_COMPLEX_PERIODIC_V1[] = "psiformer_complex_perio
 /// Opt-in two-cell features, pair bias and occupied full real-Gamma or paired-complex heads.
 inline constexpr char PSIFORMER_PERIODIC_PAIR_V1[] = "psiformer_periodic_pair_v1";
 
+/// CPU real Gamma orbital trunk with an exact-zero trainable pair residual.
+inline constexpr char PSIFORMER_PERIODIC_JASTROW_V1[] = "psiformer_periodic_jastrow_v1";
+
 /// Stable name of the integer generator and Gaussian transform used by v1.
 inline constexpr char PSIFORMER_INITIALIZATION_RNG_V1[] = "splitmix64_box_muller_v1";
 

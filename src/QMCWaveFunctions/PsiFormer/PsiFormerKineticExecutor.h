@@ -1738,6 +1738,8 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
 inline double DirectKineticExecutor::buildCusp(const double* parameters,
                                                DirectKineticTrunkWorkspace& workspace) const
 {
+  if (plan_.environment().residual_pair)
+    throw std::invalid_argument("Residual pair profile uses score energy products; kinetic parameter response is unsupported");
   std::fill(workspace.cusp_gradient_.begin(), workspace.cusp_gradient_.end(), 0.0);
   std::fill(workspace.cusp_laplacian_.begin(), workspace.cusp_laplacian_.end(), 0.0);
   if (plan_.environment().periodic_profile && !plan_.environment().periodic_profile->electron_electron_cusp)
