@@ -4290,13 +4290,13 @@ TEST_CASE("PsiFormer complex C2 score lanes preserve weighted partition sums",
   const auto r0 = gpu.gpuDerivativeRequirements(1, 1, 1, 7, scope);
   const auto r1 = gpu1.gpuDerivativeRequirements(2, 2, 1, 7, scope);
   auto first = gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 0, 0, 1, 1, 7,
-      r0.device_bytes, r0.host_bytes, r0.matrix_work, scope);
+      r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work), scope);
   auto second = gpu1.makeBudgetedGpuDerivativeOperator(trials1, particles1, 1, 1, 2, 1, 7,
-      r1.device_bytes, r1.host_bytes, r1.matrix_work, scope);
+      r1.device_bytes, r1.host_bytes, std::max(std::size_t{1}, r1.matrix_work), scope);
   CHECK(first->storageDiagnostics().shared_workspace_identity != second->storageDiagnostics().shared_workspace_identity);
   CHECK_THROWS(gpu.gpuDerivativeRequirements(1, 1, 1, 7));
   CHECK_THROWS(gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 2, 2, 1, 1, 7,
-      r0.device_bytes, r0.host_bytes, r0.matrix_work, scope));
+      r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work), scope));
   PsiFormerComplexWF cpu("score_crowds", initialized, p0, source, clone_cap, twist);
   auto cpu1 = cpu.makeClone(p1), cpu2 = cpu.makeClone(p2);
   RefVectorWithLeader<WaveFunctionComponent> components(cpu, {cpu, *cpu1, *cpu2});
