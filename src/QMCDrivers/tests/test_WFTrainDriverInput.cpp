@@ -210,7 +210,34 @@ TEST_CASE("Training no-exclusion sentinel is exact under finite-math compilation
     double value;
     std::memcpy(&value, &patterns[i], sizeof(value));
     CHECK(wftrain::isPositiveInfinityTrainingReal(value) == (i == 0));
+    CHECK(wftrain::isFiniteTrainingReal(value) == (i >= 4));
   }
+}
+
+TEST_CASE("KFAC reader preserves unbounded exclusion under finite math",
+          "[drivers][wf_train][kfac_reader][positive_infinity_policy]")
+{
+  const auto parse = [](const std::string& controls) {
+    return parseTrainingInput("<qmc><training optimizer='kfac'>" + controls + "</training></qmc>");
+  };
+  const WFTrainDriverInput initial;
+  CHECK(wftrain::isPositiveInfinityTrainingReal(initial.getKFACExcludeWidth()));
+  const auto defaults = parse("");
+  CHECK(wftrain::isPositiveInfinityTrainingReal(defaults.getKFACExcludeWidth()));
+  const std::string clipping = "<parameter name='kfac_objective'>clipped_covariance</parameter>"
+      "<parameter name='kfac_clip_mode'>soft_median</parameter>"
+      "<parameter name='kfac_clip_width'>1</parameter>"
+      "<parameter name='kfac_clip_quantile'>0.95</parameter>";
+  for (const auto& exclusion : {std::string{}, std::string{"<parameter name='kfac_exclude_width'>none</parameter>"}})
+  {
+    const auto input = parse(clipping + exclusion);
+    CHECK(input.getKFACClipWidth() == Catch::Approx(1));
+    CHECK(input.getKFACClipQuantile() == Catch::Approx(.95));
+    CHECK(wftrain::isPositiveInfinityTrainingReal(input.getKFACExcludeWidth()));
+  }
+  CHECK(parse(clipping + "<parameter name='kfac_exclude_width'>2</parameter>").getKFACExcludeWidth() == 2);
+  for (const auto* invalid : {"0", "-2", "nan", "inf"})
+    CHECK_THROWS(parse(clipping + "<parameter name='kfac_exclude_width'>" + invalid + "</parameter>"));
 }
 
 TEST_CASE("KFAC parity controls are explicit and optimizer specific", "[drivers][wf_train][kfac]")

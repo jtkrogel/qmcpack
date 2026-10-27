@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -66,10 +67,16 @@ enum class ScoreObjectiveClipMode { SOFT_MEDIAN, HARD_MEDIAN, HARD_MEAN };
 
 struct ClippedScoreObjectiveControl
 {
+  ClippedScoreObjectiveControl() noexcept
+  {
+    constexpr std::uint64_t bits = UINT64_C(0x7ff0000000000000);
+    std::memcpy(&exclude_width, &bits, sizeof(bits));
+  }
+
   ScoreObjectiveClipMode mode = ScoreObjectiveClipMode::SOFT_MEDIAN;
   DerivativeReal width = 1.0;
   DerivativeReal quantile = 0.95;
-  DerivativeReal exclude_width = std::numeric_limits<DerivativeReal>::infinity();
+  DerivativeReal exclude_width{};
 };
 
 struct ClippedScoreObjectiveResult

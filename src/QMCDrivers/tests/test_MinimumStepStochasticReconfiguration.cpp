@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "io/hdf/hdf_archive.h"
 
 #include <array>
@@ -329,6 +330,28 @@ TEST_CASE("Weighted score factor agrees with a dense centered oracle",
   CHECK(storage.complex_parameter_vectors == 2);
   CHECK(storage.local_sample_vector_size == 3);
   CHECK(storage.retained_numeric_bytes > 0);
+}
+
+TEST_CASE("Unbounded score exclusion preserves every finite sample under finite math",
+          "[wftrain][objective_residual][positive_infinity_policy]")
+{
+  const std::array<DerivativeReal, 4> energies{0, 1, 3, 10}, weights{1, 2, 1, 2};
+  for (const auto mode : {ScoreObjectiveClipMode::SOFT_MEDIAN, ScoreObjectiveClipMode::HARD_MEDIAN,
+                          ScoreObjectiveClipMode::HARD_MEAN})
+  {
+    ClippedScoreObjectiveControl control;
+    control.mode = mode;
+    CHECK(isPositiveInfinityTrainingReal(control.exclude_width));
+    const auto unbounded = prepareClippedScoreObjective({energies.data(), energies.size()},
+        {weights.data(), weights.size()}, control);
+    CHECK(unbounded.unmasked_samples == energies.size());
+    control.exclude_width = 1e20;
+    const auto finite = prepareClippedScoreObjective({energies.data(), energies.size()},
+        {weights.data(), weights.size()}, control);
+    CHECK(finite.unmasked_samples == energies.size());
+    for (std::size_t i = 0; i < energies.size(); ++i)
+      CHECK(unbounded.coefficients[i] == finite.coefficients[i]);
+  }
 }
 
 TEST_CASE("Clipped score objective centers before masking and preserves weight units",

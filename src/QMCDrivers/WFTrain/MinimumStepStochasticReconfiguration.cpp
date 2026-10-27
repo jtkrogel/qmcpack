@@ -348,12 +348,13 @@ ClippedScoreObjectiveResult prepareClippedScoreObjective(
     DerivativeArrayView<const DerivativeReal> weights,
     ClippedScoreObjectiveControl control)
 {
+  const bool unbounded_exclusion = isPositiveInfinityTrainingReal(control.exclude_width);
+
   if (energies.empty() || energies.size() != weights.size() || !energies.data() || !weights.data() ||
       !isFiniteTrainingReal(control.width) || control.width <= 0.0 ||
       !isFiniteTrainingReal(control.quantile) || control.quantile <= 0.0 || control.quantile > 1.0 ||
-      control.exclude_width <= 0.0 ||
-      (!isFiniteTrainingReal(control.exclude_width) &&
-       !isPositiveInfinityTrainingReal(control.exclude_width)))
+      (!unbounded_exclusion &&
+       (!isFiniteTrainingReal(control.exclude_width) || control.exclude_width <= 0.0)))
     throw std::invalid_argument("Clipped score objective has invalid inputs or controls");
   if (control.mode != ScoreObjectiveClipMode::SOFT_MEDIAN &&
       control.mode != ScoreObjectiveClipMode::HARD_MEDIAN &&
@@ -407,12 +408,16 @@ ClippedScoreObjectiveResult prepareClippedScoreObjective(
       const DerivativeReal squeezed = std::copysign(
           std::log1p((a + a * a / 2.0 + a * a * a) / (1.0 + a * a)), z);
       transformed = result.center + 2.0 * half_width * squeezed;
-      mask[i] = std::abs(delta) / result.scale < control.exclude_width;
+      mask[i] = true;
+      if (!unbounded_exclusion)
+        mask[i] = std::abs(delta) / result.scale < control.exclude_width;
     }
     else
     {
       transformed = std::clamp(energies[i], result.center - half_width, result.center + half_width);
-      mask[i] = std::abs(delta) < control.exclude_width;
+      mask[i] = true;
+      if (!unbounded_exclusion)
+        mask[i] = std::abs(delta) < control.exclude_width;
     }
     if (!isFiniteTrainingReal(transformed))
       throw std::invalid_argument("Clipped score objective produced a nonfinite transformed energy");

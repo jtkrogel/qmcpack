@@ -22,8 +22,8 @@
 namespace qmcplusplus::wftrain
 {
 
-/// Test an IEEE-754 binary64 value without a fast-math-sensitive comparison.
-inline bool isFiniteTrainingReal(double value) noexcept
+/// Borrow bits without a finite-math scalar-argument promise or FP comparison.
+inline bool isFiniteTrainingReal(const double& value) noexcept
 {
   static_assert(sizeof(double) == sizeof(std::uint64_t));
   static_assert(std::numeric_limits<double>::is_iec559);
@@ -33,7 +33,7 @@ inline bool isFiniteTrainingReal(double value) noexcept
 }
 
 /// Recognize the explicit no-exclusion sentinel even under finite-math assumptions.
-inline bool isPositiveInfinityTrainingReal(double value) noexcept
+inline bool isPositiveInfinityTrainingReal(const double& value) noexcept
 {
   static_assert(sizeof(double) == sizeof(std::uint64_t));
   static_assert(std::numeric_limits<double>::is_iec559);

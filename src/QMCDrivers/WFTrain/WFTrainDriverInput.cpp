@@ -6,6 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include "WFTrainDriverInput.h"
+#include "TrainingNumerics.h"
 
 #include "Message/UniformCommunicateError.h"
 #include "OhmmsData/XMLParsingString.h"
@@ -105,6 +106,21 @@ std::size_t parseNonnegativeSize(const std::string& text, const std::string& att
   return value;
 }
 
+// XML conversion must materialize even nonfinite values so the integer-bit
+// validator can reject them. Keep that scalar ABI boundary out of finite-math
+// assumptions; numerical kernels and their compilation policy are unchanged.
+#if defined(__clang__)
+#pragma float_control(precise, on, push)
+__attribute__((noinline))
+#endif
+void parseRealInto(const char* text, char** end, double& value) noexcept
+{
+  value = std::strtod(text, end);
+}
+#if defined(__clang__)
+#pragma float_control(pop)
+#endif
+
 /** Parse one finite floating-point value and reject trailing text. */
 double parseFiniteReal(const std::string& text, const std::string& attribute)
 {
@@ -113,7 +129,8 @@ double parseFiniteReal(const std::string& text, const std::string& attribute)
 
   errno             = 0;
   char* parse_end    = nullptr;
-  const double value = std::strtod(text.c_str(), &parse_end);
+  double value;
+  parseRealInto(text.c_str(), &parse_end, value);
   static_assert(sizeof(double) == sizeof(std::uint64_t));
   static_assert(std::numeric_limits<double>::is_iec559);
   std::uint64_t value_bits;
@@ -211,7 +228,19 @@ void readParameterChildren(xmlNodePtr training_node,
   }
 }
 
+/// Construct policy metadata without a nonfinite floating-point function return.
+void setUnboundedExclusion(double& value) noexcept
+{
+  constexpr std::uint64_t bits = UINT64_C(0x7ff0000000000000);
+  std::memcpy(&value, &bits, sizeof(bits));
+}
+
 } // namespace
+
+WFTrainDriverInput::WFTrainDriverInput()
+{
+  setUnboundedExclusion(kfac_exclude_width_);
+}
 
 void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
 {
@@ -281,7 +310,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   kfac_clip_width_ = 1.0;
   kfac_complex_clip_width_ = 5.0;
   kfac_clip_quantile_ = 0.95;
-  kfac_exclude_width_ = std::numeric_limits<double>::infinity();
+  setUnboundedExclusion(kfac_exclude_width_);
   kfac_norm_constraint_ = 0.0;
   kfac_persist_state_ = false;
   kfac_ema_decay_ = 0.0;
@@ -968,8 +997,13 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       kfac_exclude_width_ = parseNonnegativeReal(readControl("kfac_exclude_width"), "kfac_exclude_width");
     if (seen_controls.count("kfac_norm_constraint"))
       kfac_norm_constraint_ = parseNonnegativeReal(readControl("kfac_norm_constraint"), "kfac_norm_constraint");
+    // The no-exclusion sentinel is an intentional nonfinite policy value.
+    // Classify its bits before any ordered floating-point comparison so finite-
+    // math assumptions cannot reject the default or explicit "none" spelling.
+    const bool valid_exclusion = wftrain::isPositiveInfinityTrainingReal(kfac_exclude_width_) ||
+        (wftrain::isFiniteTrainingReal(kfac_exclude_width_) && kfac_exclude_width_ > 0.0);
     if (kfac_clip_width_ <= 0.0 || kfac_clip_quantile_ <= 0.0 || kfac_clip_quantile_ > 1.0 ||
-        kfac_exclude_width_ <= 0.0)
+        !valid_exclusion)
       throw UniformCommunicateError("WFTrainDriverInput: invalid KFAC clipping width or quantile");
     if (kfac_objective_ == KFACObjective::COMPONENTWISE_MEAN_RESIDUAL &&
         kfac_gradient_ != KFACGradient::REAL_CENTERED_RESIDUAL)

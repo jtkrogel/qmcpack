@@ -22,6 +22,8 @@ namespace qmcplusplus
 class WFTrainDriverInput
 {
 public:
+  WFTrainDriverInput();
+
   enum class KFACObjective { RAW_COVARIANCE, CLIPPED_COVARIANCE, COMPONENTWISE_MAD_COVARIANCE, COMPONENTWISE_MEAN_RESIDUAL };
 
   enum class KFACDefaults { LEGACY, SOFT_COVARIANCE, MEAN_RESIDUAL, MEDIAN_COVARIANCE };
@@ -167,7 +169,8 @@ public:
   double getKFACClipWidth() const noexcept { return kfac_clip_width_; }
   double getKFACComplexClipWidth() const noexcept { return kfac_complex_clip_width_; }
   double getKFACClipQuantile() const noexcept { return kfac_clip_quantile_; }
-  double getKFACExcludeWidth() const noexcept { return kfac_exclude_width_; }
+  /// Preserve the no-exclusion sentinel across finite-math scalar return assumptions.
+  const double& getKFACExcludeWidth() const noexcept { return kfac_exclude_width_; }
   double getKFACNormConstraint() const noexcept { return kfac_norm_constraint_; }
   bool getKFACPersistState() const noexcept { return kfac_persist_state_; }
   double getKFACEMADecay() const noexcept { return kfac_ema_decay_; }
@@ -270,7 +273,7 @@ private:
   double kfac_clip_width_{1.0};
   double kfac_complex_clip_width_{5.0};
   double kfac_clip_quantile_{0.95};
-  double kfac_exclude_width_{std::numeric_limits<double>::infinity()};
+  double kfac_exclude_width_{};
   double kfac_norm_constraint_{0.0};
   bool kfac_persist_state_{false};
   double kfac_ema_decay_{0.0};
