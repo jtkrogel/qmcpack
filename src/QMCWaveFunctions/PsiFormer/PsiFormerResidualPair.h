@@ -24,6 +24,15 @@ inline bool residualPairFinite(double value) noexcept
   return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
+/// Inspect publication storage without passing its value through a finite-math scalar ABI.
+inline bool residualPairFiniteReference(const double& value) noexcept
+{
+  std::uint64_t bits;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+
 /// Immutable contract for the exact-zero, cusp-free pair correction.
 struct ResidualPairMetadata
 {

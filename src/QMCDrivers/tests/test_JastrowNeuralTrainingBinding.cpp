@@ -20,12 +20,15 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "io/hdf/hdf_archive.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerResidualPair.h"
 #include "QMCWaveFunctions/Jastrow/J1OrbitalSoA.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "SimulationCell.h"
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 
 namespace qmcplusplus::wftrain
@@ -138,6 +141,21 @@ private:
   std::size_t ordinal_;
 };
 } // namespace
+
+TEST_CASE("Product finite guard inspects stored IEEE values", "[wftrain][jastrow_neural_product][product_finite_guard]")
+{
+  // Runtime storage covers finite-math policies without constructing infinity in a scalar ABI.
+  volatile std::uint64_t stored[] = {UINT64_C(0), UINT64_C(0x8000000000000000),
+      UINT64_C(0x7fefffffffffffff), UINT64_C(1), UINT64_C(0x7ff0000000000000),
+      UINT64_C(0xfff0000000000000), UINT64_C(0x7ff8000000000001)};
+  for (std::size_t i = 0; i < sizeof(stored)/sizeof(stored[0]); ++i)
+  {
+    const std::uint64_t bits = stored[i];
+    double value;
+    std::memcpy(&value, &bits, sizeof(value));
+    CHECK(psiformer::residualPairFiniteReference(value) == (i < 4));
+  }
+}
 
 TEST_CASE("Joint Jastrow product scores and kinetic cross terms match finite differences",
           "[wftrain][jastrow_neural_product]")

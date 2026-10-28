@@ -8,7 +8,7 @@
 #include "TrainingCheckpoint.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "io/hdf/hdf_archive.h"
-#include "Message/Communicate.h"
+#include "Message/CommOperators.h"
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -369,8 +369,8 @@ void JastrowNeuralTrainingBinding::validateCandidate(const StructuredParameterSn
   if (candidate.schema_fingerprint != schema_->fingerprint() || candidate.values.size() != schema_->parameterCount() ||
       candidate.version != version_ || expected_version != version_ || version_ == std::numeric_limits<std::size_t>::max())
     throw std::invalid_argument("Invalid or stale joint Jastrow product candidate");
-  for (double value : candidate.values)
-    if (!psiformer::residualPairFinite(value)) throw std::invalid_argument("Nonfinite joint Jastrow product candidate");
+  for (const double& value : candidate.values)
+    if (!psiformer::residualPairFiniteReference(value)) throw std::invalid_argument("Nonfinite joint Jastrow product candidate");
 }
 
 void JastrowNeuralTrainingBinding::resetJastrows(TrialWaveFunction& wavefunction,
@@ -443,11 +443,11 @@ std::size_t JastrowNeuralTrainingBinding::publishParameters(const StructuredPara
         validation_particles.update();
         auto validation = replacement->makeClone(validation_particles);
         validation->evaluateLog(validation_particles);
-        if (!psiformer::residualPairFinite(validation->getLogPsi())) throw std::runtime_error("Nonfinite product candidate value");
+        if (!psiformer::residualPairFiniteReference(validation->getLogPsi())) throw std::runtime_error("Nonfinite product candidate value");
         if (live.hamiltonian)
         {
           auto hamiltonian = live.hamiltonian->makeClone(validation_particles, *validation);
-          if (!psiformer::residualPairFinite(hamiltonian->evaluateDeterministic(*validation, validation_particles)))
+          if (!psiformer::residualPairFiniteReference(hamiltonian->evaluateDeterministic(*validation, validation_particles)))
             throw std::runtime_error("Nonfinite product candidate local energy");
         }
       }
