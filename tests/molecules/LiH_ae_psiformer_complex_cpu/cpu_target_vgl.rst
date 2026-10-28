@@ -97,7 +97,7 @@ publication/isolation, all/n-electron proposals, occupied phases, Fourier
 envelopes, unchanged score conventions and failure invalidation.
 
 Native periodic Li/H valence1 ECP qualification used N20/W8/C1, nonzero twist,
-all-particle moves and one score-only Adam update. FULL and target8 produced
+all-particle moves and one score-only Adam update. FULL and target 8 produced
 bitwise-identical numeric model, optimizer and sampler state. These N20 native
 observations have locally preserved input, execution, comparison and memory
 receipts.
@@ -109,13 +109,21 @@ The historical qualification wording at commit 6b4bc6bec stated::
   only their reported memory inventory; no large-system determinants or
   derivatives were evaluated.
 
-Receipt reconciliation on 2026-10-28 distinguishes this historical summary from
-recovered execution evidence. The preserved component launcher selects operation
-plan for N200, which does not allocate either derivative owner. Until a separate
-actual allocation receipt is recovered, N200 is PLAN_ONLY/ALLOCATION_UNVERIFIED.
-N20/N50 component and N100/N300 allocation receipts must be reconciled with their
-remote execution records before extending the locally verified qualification
-boundary. No larger-system convergence or universal performance claim follows.
+Receipt reconciliation on 2026-10-28 initially marked N200 as
+PLAN_ONLY/ALLOCATION_UNVERIFIED: the primary component launcher selects operation
+plan, which does not allocate either derivative owner. The subsequently recovered
+N200_actual_memory/probe.jsonl and time.log establish a separate completed
+allocation run with exit status zero: FULL owner 25,676,996,616 bytes and streamed
+owner 1,109,577,352 bytes. That run has no separate execution.json; its raw
+allocation events and timed executable command are preserved explicitly.
+
+Recovered N20/N50 comparison receipts show zero absolute/scaled error in complete
+VGL products, using target 8 with nondividing tails. N100 and N300 receipts, plus
+the separate N200 run, verify actual FULL/streamed owner allocation only; none
+evaluated large-system determinants or derivatives. Process peak RSS includes
+the FULL run and cannot be labelled a streamed-only process peak. The final
+registered shared/streamed CPU test also passed. No larger-system convergence
+or universal performance claim follows.
 
 CPU mixed precision, GPU changes, forces, Hessian outputs, spinors, T-moves and
 new optimizer methods are outside this CPU execution slice.
