@@ -98,10 +98,24 @@ envelopes, unchanged score conventions and failure invalidation.
 
 Native periodic Li/H valence1 ECP qualification used N20/W8/C1, nonzero twist,
 all-particle moves and one score-only Adam update. FULL and target8 produced
-bitwise-identical numeric model, optimizer and sampler state. Single-core N20
-and N50 component controls additionally compared complete VGL exactly. Sparse
-N100, N200 and N300 actual owner-allocation checks establish only their reported
-memory inventory; no large-system determinants or derivatives were evaluated. No larger-system convergence or universal performance claim follows.
+bitwise-identical numeric model, optimizer and sampler state. These N20 native
+observations have locally preserved input, execution, comparison and memory
+receipts.
+
+The historical qualification wording at commit 6b4bc6bec stated::
+
+  Single-core N20 and N50 component controls additionally compared complete VGL
+  exactly. Sparse N100, N200 and N300 actual owner-allocation checks establish
+  only their reported memory inventory; no large-system determinants or
+  derivatives were evaluated.
+
+Receipt reconciliation on 2026-10-28 distinguishes this historical summary from
+recovered execution evidence. The preserved component launcher selects operation
+plan for N200, which does not allocate either derivative owner. Until a separate
+actual allocation receipt is recovered, N200 is PLAN_ONLY/ALLOCATION_UNVERIFIED.
+N20/N50 component and N100/N300 allocation receipts must be reconciled with their
+remote execution records before extending the locally verified qualification
+boundary. No larger-system convergence or universal performance claim follows.
 
 CPU mixed precision, GPU changes, forces, Hessian outputs, spinors, T-moves and
 new optimizer methods are outside this CPU execution slice.
