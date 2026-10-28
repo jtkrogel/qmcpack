@@ -586,7 +586,7 @@ inline void validateComplexTargetCuspStateOwner(std::shared_ptr<const PreparedDe
 } // namespace qmcplusplus::psiformer::device
 
 /// Compare ordered trace schedules, including a target-slab tail and failed partial terms.
-void validateComplexSpatialTraceSplit()
+void validateComplexSpatialTraceSplit(std::size_t n = 7, std::size_t determinants = 3)
 {
   const char* configured = std::getenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT");
   // Restore the caller's selector even when a validation check throws.
@@ -602,8 +602,8 @@ void validateComplexSpatialTraceSplit()
         ::unsetenv("PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT");
     }
   } restore{configured != nullptr, configured ? configured : ""};
-  constexpr std::size_t batch = 2, determinants = 3, n = 7, targets = 5, capacity = 3;
-  constexpr std::size_t matrix_span = batch * determinants * n * n;
+  constexpr std::size_t batch = 2, targets = 5, capacity = 3;
+  const std::size_t matrix_span = batch * determinants * n * n;
   const auto plan = planComplexSpatialTraceWorkspace(batch, determinants, n, targets, capacity);
   std::vector<cuDoubleComplex> inverse(matrix_span), head((1 + 4 * targets) * matrix_span);
   for (std::size_t i = 0; i < inverse.size(); ++i)
@@ -671,13 +671,18 @@ void validateComplexSpatialTraceSplit()
   catch (const std::invalid_argument& error)
   { rejected = std::string(error.what()) == "PSIFORMER_GPU_COMPLEX_SPATIAL_TRACE_SPLIT must be 0 or 1"; }
   if (!rejected) throw std::runtime_error("Ordered trace split admitted an invalid selector");
-  std::cout << "PASS ordered complex trace split B2/D3/N7/K5/T3 finite/NaN partial terms, status, outputs and tails exact; invalid selector rejected\n";
+  std::cout << "PASS ordered complex trace split B2/D" << determinants << "/N" << n
+            << "/K5/T3 finite/NaN partial terms, status, outputs and tails exact; invalid selector rejected\n";
 }
 
 /// Target forward-only oracle/legacy parity, physical outputs, generations and budgets.
 void validateComplexSpatialTargets(std::size_t concurrent_targets = 0)
 {
-  if (concurrent_targets == 8) validateComplexSpatialTraceSplit();
+  if (concurrent_targets == 8)
+  {
+    validateComplexSpatialTraceSplit();
+    validateComplexSpatialTraceSplit(100, 16);
+  }
   using namespace qmcplusplus::psiformer;
   using namespace qmcplusplus::psiformer::device;
   using C = std::complex<double>;
