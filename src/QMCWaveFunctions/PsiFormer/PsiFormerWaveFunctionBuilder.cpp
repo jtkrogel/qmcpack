@@ -151,19 +151,20 @@ std::size_t parseCloneNumericLimit(const std::string& text, const char* name = "
 }
 
 /// Distinguish true atomic charges from explicit PP effective-valence metadata.
-void validateComplexCoulombSource(const ParticleSet& ions, bool pseudopotential = false)
+void validateCoulombSource(const ParticleSet& ions, bool pseudopotential, const char* scalar)
 {
+  const std::string prefix = std::string(scalar) + " PsiFormer ";
   const auto& species = ions.getSpeciesSet();
   const int charge = species.findAttribute("charge");
   if (charge < 0)
-    throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP source requires ionic charges"
-                                             : "Complex PsiFormer all-electron source requires ionic charges");
+    throw std::invalid_argument(prefix + (pseudopotential ? "PP source requires ionic charges"
+                                                        : "all-electron source requires ionic charges"));
   for (int group = 0; group < species.size(); ++group)
   {
     const double z = species(charge, group);
     if (!psiformer::determinant::isFiniteReal(z) || z <= 0 || z != std::floor(z))
-      throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP charges must be positive integers"
-                                               : "Complex PsiFormer all-electron charges must be positive atomic numbers");
+      throw std::invalid_argument(prefix + (pseudopotential ? "PP charges must be positive integers"
+                                                          : "all-electron charges must be positive atomic numbers"));
     for (const char* name : {"atomicnumber", "valence"})
     {
       const int attribute = species.findAttribute(name);
@@ -171,8 +172,8 @@ void validateComplexCoulombSource(const ParticleSet& ions, bool pseudopotential 
       if (attribute >= 0 && (!psiformer::determinant::isFiniteReal(species(attribute, group)) ||
           (pseudopotential && atomic ? species(attribute, group) < z ||
               species(attribute, group) != std::floor(species(attribute, group)) : species(attribute, group) != z)))
-        throw std::invalid_argument(pseudopotential ? "Complex PsiFormer PP charge/atomicnumber/valence mismatch"
-                                                 : "Complex PsiFormer all-electron charge/atomicnumber/valence mismatch");
+        throw std::invalid_argument(prefix + (pseudopotential ? "PP charge/atomicnumber/valence mismatch"
+                                                            : "all-electron charge/atomicnumber/valence mismatch"));
     }
   }
 }
@@ -310,6 +311,13 @@ try
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
   const auto pair_request = normalizedAcceleratorRequest(gpu);
+  const bool cpu_real_pair_ecp = pair_profile && !complex_profile && system == "pseudopotential" &&
+      (pair_request == "no" || pair_request == "cpu") &&
+      precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE;
+#ifdef MIXED_PRECISION
+  if (cpu_real_pair_ecp)
+    throw std::invalid_argument("Versioned real CPU ECP requires a full-precision build");
+#endif
   bool selected_pair_gpu = false;
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
   selected_pair_gpu = pair_profile && !complex_profile && system == "all_electron" &&
@@ -326,7 +334,8 @@ try
   if (jastrow_profile)
     throw std::invalid_argument("Jastrow profile requires a real full-precision CPU build");
 #endif
-  if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential")) ||
+  if (pair_profile && (!periodic || (system != "all_electron" && !(complex_profile && system == "pseudopotential") &&
+                                   !cpu_real_pair_ecp) ||
       (pair_request != "no" && pair_request != "cpu" && !selected_pair_gpu) ||
       precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE))
     throw std::invalid_argument("Versioned periodic profiles require CPU or the selected real GPU AE FP64 profile");
@@ -558,8 +567,8 @@ try
       throw std::invalid_argument("PsiFormer source particle set not found: " + source);
     source_particles = source_particle_set->second.get();
   }
-  if (complex_profile)
-    validateComplexCoulombSource(*source_particles, system == "pseudopotential");
+  if (complex_profile || cpu_real_pair_ecp)
+    validateCoulombSource(*source_particles, system == "pseudopotential", complex_profile ? "Complex" : "Real");
 
   std::unique_ptr<PsiFormerWF> component;
   const std::array<double, 3> twist_array{
@@ -609,6 +618,17 @@ try
     if (direct_model)
       psiformer::validatePsiFormerModelFile(*imported_model, parameters, targetPtcl, *source_particles,
                                             system, twist_array);
+    if (cpu_real_pair_ecp)
+    {
+      const auto& admitted_environment = direct_model ? imported_model->parameters.environment : environment;
+      const auto& profile = admitted_environment.periodic_profile;
+      // The electron-electron Coulomb cusp is independent of the ionic effective core charge.
+      if (!profile || profile->feature_transform != psiformer::PeriodicFeatureTransform::LOG_COMPLEMENT_V1 ||
+          profile->envelope_policy != psiformer::PeriodicEnvelopePolicy::ATOM_CENTERED ||
+          !profile->electron_electron_cusp)
+        throw std::invalid_argument("Versioned real CPU ECP requires log_complement_v1, atom_centered and "
+                                    "electron_electron_cusp=yes");
+    }
     if (selected_pair_gpu)
     {
       const auto& selected_environment = direct_model ? imported_model->parameters.environment : environment;
