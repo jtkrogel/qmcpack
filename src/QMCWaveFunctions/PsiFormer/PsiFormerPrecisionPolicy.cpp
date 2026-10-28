@@ -155,12 +155,14 @@ PsiFormerPrecisionRule psiFormerPrecisionRule(PsiFormerPrecisionPolicy policy,
   if (policy == PsiFormerPrecisionPolicy::FP64_REFERENCE)
     return {};
 
-  // This narrower experimental route lowers only explicit affine projections.
-  // Attention contractions, nonlinearities, orbital construction and every
-  // derivative/reduction stay binary64; do not inherit the broader FP32 policy.
+  // Explicit affine primal and algorithmic affine adjoints use strict FP32.
+  // Attention contractions, nonlinearities, physical heads and all response,
+  // metric/optimizer reductions remain binary64. Mixed training was previously
+  // rejected; its newly admitted restart identity carries the affine AD revision.
   if (policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
   {
-    if (operation != PsiFormerArithmeticOperation::DENSE_PROJECTION)
+    if (operation != PsiFormerArithmeticOperation::DENSE_PROJECTION &&
+        operation != PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE)
       return {};
     return {PsiFormerArithmeticPrecision::BINARY32, PsiFormerArithmeticPrecision::BINARY32,
             PsiFormerArithmeticPrecision::BINARY32, false, false};

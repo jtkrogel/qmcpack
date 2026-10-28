@@ -35,6 +35,13 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
   FP32_DENSE_FP64_ISLANDS
 };
 
+/** Frozen arithmetic identity for newly supported mixed score training/restart.
+ * Earlier mixed inference had no admitted training/restart route. Native mixed
+ * training fingerprints must include this revision; the public label is stable.
+ */
+inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1 =
+    "fp32_dense_fp64_islands_affine_ad_v1";
+
 /// Explicit numerical-owner authority; the existing REAL attachment stays the default.
 enum class MixedTrunkHeadPolicy : std::uint8_t
 {
@@ -136,7 +143,8 @@ struct PsiFormerPrecisionTraits
 {
   static constexpr bool lower_value =
       Policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
-      ? Operation == PsiFormerArithmeticOperation::DENSE_PROJECTION
+      ? (Operation == PsiFormerArithmeticOperation::DENSE_PROJECTION ||
+         Operation == PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE)
       : Policy != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (detail::lower_precision_value_operation_v<Operation> ||
        Operation == PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION);
@@ -205,7 +213,7 @@ static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
 static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
                                  PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS,
                                  PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE>::storage_type,
-                             double>);
+                             float>);
 
 /// Record storage, multiply, and reduction precision for one operation class.
 struct PsiFormerPrecisionRule

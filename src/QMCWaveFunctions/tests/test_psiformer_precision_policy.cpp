@@ -39,7 +39,7 @@ TEST_CASE("PsiFormer precision policy names are strict and stable",
   CHECK_THROWS_AS(parsePsiFormerPrecisionPolicy("tf32"), std::invalid_argument);
 }
 
-TEST_CASE("PsiFormer dense-only mixed policy preserves every FP64 island",
+TEST_CASE("PsiFormer affine mixed policy preserves every FP64 island",
           "[wavefunction][psiformer][precision]")
 {
   constexpr auto policy = PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
@@ -49,13 +49,23 @@ TEST_CASE("PsiFormer dense-only mixed policy preserves every FP64 island",
   {
     const auto operation = static_cast<PsiFormerArithmeticOperation>(value);
     const auto rule = psiFormerPrecisionRule(policy, operation);
-    const auto precision = operation == PsiFormerArithmeticOperation::DENSE_PROJECTION
+    const auto precision = operation == PsiFormerArithmeticOperation::DENSE_PROJECTION ||
+        operation == PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE
         ? PsiFormerArithmeticPrecision::BINARY32 : PsiFormerArithmeticPrecision::BINARY64;
     CHECK(rule.storage == precision);
     CHECK(rule.compute == precision);
     CHECK(rule.accumulation == precision);
     CHECK_FALSE(rule.allow_fast_math);
   }
+  CHECK(std::string(PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1) ==
+        "fp32_dense_fp64_islands_affine_ad_v1");
+  CHECK(psiFormerPrecisionPolicyFingerprint(policy) != UINT64_C(3524009065336389029));
+  // Extending the explicit affine policy must preserve unrelated/FP64 identities.
+  CHECK(psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy::FP64_REFERENCE) == UINT64_C(8375592183835889190));
+  CHECK(psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE) == UINT64_C(17935884788340388935));
+  CHECK(psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE) == UINT64_C(5586706325018456420));
+  CHECK((std::is_same_v<typename PsiFormerPrecisionTraits<policy,
+      PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE>::storage_type, float>));
   CHECK_NOTHROW(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::CUDA));
   CHECK_NOTHROW(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::HIP));
   CHECK_THROWS_AS(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::CPU), std::invalid_argument);
