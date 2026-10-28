@@ -688,6 +688,14 @@ public:
   /// Retain a SCORE_ONLY lane and ordered C2 contractions; physical EL/sampling remain HOST.
   std::size_t prepareResidentScoreAdam(std::size_t budget) const;
 
+  /// Optional real OPEN physical-final capture for the C1 HOST-authority score bridge.
+  std::size_t prepareResidentECPObservation(std::size_t samples, const std::string& physical_source) const;
+  bool residentECPObservationEnabled() const;
+  void bindResidentECPObservation(const RefVectorWithLeader<WaveFunctionComponent>& components,
+      wftrain::StreamingDerivativeOperator& derivative, std::uint64_t grid,
+      const std::string& physical_source, const std::vector<double>& energies,
+      const std::vector<double>& kinetic) const;
+
   /// Scalar-only accepted DEVICE observations; the owner pins the derivative session.
   class ResidentOpenObservationBatch
   {

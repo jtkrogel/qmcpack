@@ -1611,6 +1611,9 @@ public:
   /// Optimizer workspace dies BEFORE its anchored Session; source diagnostics exclude it.
   std::shared_ptr<psiformer::device::PreparedDevicePcg> resident_energy_sr_workspace;
 #endif
+  /// Independently bounds two simultaneous generations in each numeric domain.
+  std::size_t resident_ecp_observation_budget = 0;
+  std::string resident_ecp_physical_source;
   bool resident_energy_sr_reuse = false;
   bool resident_energy_sr_workspace_started = false;
 };
@@ -2517,6 +2520,26 @@ public:
     initializeStorageDiagnostics();
   }
 
+#ifdef ENABLE_CUDA
+  void bindECPObservation(std::shared_ptr<const psiformer::device::PreparedDeviceECPObservation> observation)
+  {
+    if (!score_only_ || !hasDeviceProducts() || !observation || ecp_observation_ || retained_coordinates_ ||
+        has_evaluated_.load(std::memory_order_acquire) || observation->sampleCount() != sample_count_)
+      throw std::invalid_argument("ECP physical observation requires an unused sole score batch");
+    observation->validate(parameter_version_, observation->gridFingerprint(),
+        model_state_->resident_ecp_physical_source, observation->coordinateGeneration());
+    ecp_observation_ = std::move(observation);
+    initializeStorageDiagnostics();
+  }
+
+  psiformer::device::PackedDeviceCoordinatesView retainedScoreCoordinates(std::size_t begin, std::size_t count) const
+  {
+    if (ecp_observation_)
+      return ecp_observation_->view(begin, count, parameter_version_);
+    return retained_coordinates_->view(begin, count);
+  }
+#endif
+
   /// Advertise the conservative full-channel fallback O(P) bound.
   wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
   {
@@ -2790,7 +2813,7 @@ protected:
               (device_authority_terminal && terminal && sample_count_ > 0 && model_state_->resident_device_authority_enabled));
       const bool resident_products = resident_scores || resident_kinetic;
       // Mixed kinetic/ECP requests retain their existing host coordinate boundary.
-      const bool retained_score_input = retained_coordinates_ && !needs_kinetic && !needs_ecp;
+      const bool retained_score_input = (retained_coordinates_ || ecp_observation_) && !needs_kinetic && !needs_ecp;
       const auto& contracted_channels = resident_kinetic ? device_channels : score_channels;
       const auto contracted_count = resident_kinetic ? device_channel_count : score_channel_count;
       if (terminal && !resident_kinetic && !(score_covariance_terminal && resident_scores))
@@ -2835,7 +2858,7 @@ protected:
             weights[sample] = channels[0].coefficients.values[offset + sample].real();
           auto& session = *shared_scratch_->device_products;
           if (retained_score_input)
-            session.accumulateWeightedScoreTileDeviceCoordinates(retained_coordinates_->view(offset, count),
+            session.accumulateWeightedScoreTileDeviceCoordinates(retainedScoreCoordinates(offset, count),
                 weights.data(), parameter_version_);
           else
             session.accumulateWeightedScoreTile(positions_.data() + offset * 3 * electron_count_,
@@ -2942,7 +2965,7 @@ protected:
               coefficients[score_channel] = channels[score_channels[score_channel]].coefficients.values[sample];
             auto& session = *shared_scratch_->device_products;
             if (retained_score_input)
-              session.accumulateScoreContractionDeviceCoordinates(retained_coordinates_->view(sample, 1),
+              session.accumulateScoreContractionDeviceCoordinates(retainedScoreCoordinates(sample, 1),
                   coefficients.data(), score_channel_count, parameter_version_);
             else
               session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
@@ -3109,8 +3132,8 @@ protected:
           {
             const auto count = std::min(capacity, sample_count_ - offset);
             auto& session = *shared_scratch_->device_products;
-            const auto& products = retained_coordinates_
-                ? session.scoreJvpPreparedTileDeviceCoordinates(retained_coordinates_->view(offset, count), parameter_version_)
+            const auto& products = (retained_coordinates_ || ecp_observation_)
+                ? session.scoreJvpPreparedTileDeviceCoordinates(retainedScoreCoordinates(offset, count), parameter_version_)
                 : session.scoreJvpPreparedTile(positions_.data() + offset * 3 * electron_count_, count, parameter_version_);
             for (std::size_t sample = 0; sample < count; ++sample)
               sample_products_[offset + sample] += factor * products[sample];
@@ -3125,7 +3148,7 @@ protected:
           app_log() << "  PsiFormer device score JVP tiles: configurations=" << sample_count_
                     << ", prepared_capacity=" << capacity << ", completed_tiles=" << completed_tiles
                     << ", final_tile_count=" << final_count << ", direction_uploads=" << components
-                    << ", retained_coordinate_input=" << (retained_coordinates_ ? "device" : "host")
+                    << ", retained_coordinate_input=" << ((retained_coordinates_ || ecp_observation_) ? "device" : "host")
                     << ", parameter_version=" << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
           shared_scratch_->reported_device_jvp_tiles = true;
         }
@@ -3345,7 +3368,7 @@ private:
   {
     NativeTimerScope host_timer(phase_timers_.gpu_call);
     const auto& response = shared_scratch_->device_products->scoreDeviceCoordinates(
-        retained_coordinates_->view(sample, 1), parameter_version_);
+        retainedScoreCoordinates(sample, 1), parameter_version_);
     reportDeviceProducts();
     pf::DirectScoreResult result;
     result.parameter_score = {response.data(), response.size()};
@@ -3909,9 +3932,16 @@ private:
         positions_.capacity(), sizeof(double),
         "PsiFormer streaming position capacity");
     std::size_t device_position_bytes = 0;
+    std::size_t observation_host_bytes = 0, observation_final_bytes = 0;
 #ifdef ENABLE_CUDA
     if (retained_coordinates_)
       device_position_bytes = retained_coordinates_->deviceWorkspaceBytes();
+    if (ecp_observation_)
+    {
+      device_position_bytes = ecp_observation_->coordinateBytes();
+      observation_final_bytes = ecp_observation_->deviceBytes() - device_position_bytes;
+      observation_host_bytes = ecp_observation_->hostBytes();
+    }
 #endif
     const std::size_t gradient_bytes = checkedBatchMemoryMultiply(
         total_log_gradients_real_.capacity(), sizeof(double),
@@ -3925,7 +3955,8 @@ private:
     const std::size_t auxiliary_bytes = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(gradient_bytes, imaginary_gradient_bytes,
                               "PsiFormer streaming complex drift storage"),
-        inverse_mass_bytes,
+        checkedBatchMemoryAdd(inverse_mass_bytes, observation_host_bytes,
+            "ECP observation HOST numeric owner"),
         "PsiFormer streaming sample auxiliary storage");
     const std::size_t sample_product_elements = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(sample_products_.capacity(),
@@ -3967,6 +3998,8 @@ private:
 #endif
       workspace_bytes = checkedBatchMemoryAdd(score_workspace_->vectorStorageBytes(),
           kinetic_workspace_->vectorStorageBytes(), "PsiFormer streaming evaluator workspaces");
+    workspace_bytes = checkedBatchMemoryAdd(workspace_bytes, observation_final_bytes,
+        "ECP observation DEVICE final products");
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(score_bytes, kinetic_parameter_bytes,
                               "PsiFormer streaming real parameter scratch"),
@@ -3993,6 +4026,12 @@ private:
 #ifdef ENABLE_CUDA
     if (retained_coordinates_)
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(retained_coordinates_->view(0, sample_count_).sourceIdentity()));
+    if (ecp_observation_)
+    {
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(ecp_observation_.get()));
+      mixFingerprint(fingerprint, ecp_observation_->coordinateGeneration());
+      mixFingerprint(fingerprint, ecp_observation_->gridFingerprint());
+    }
 #endif
     if (kinetic_workspace_)
       mixFingerprint(fingerprint, kinetic_workspace_->storageFingerprint());
@@ -4053,7 +4092,7 @@ private:
           resource, batch_ordinal_, parameter_version_);
       trace_sample_capacity_[2].snapshotAt(__FILE__, __LINE__, "StreamingDerivative::sample_products", sample_product_bytes,
           resource, batch_ordinal_, parameter_version_);
-      auto shared_host_bytes = workspace_bytes + channel_bytes;
+      auto shared_host_bytes = workspace_bytes - observation_final_bytes + channel_bytes;
       bool shared_capacity_valid = true;
 #ifdef ENABLE_CUDA
       if (hasDeviceProducts())
@@ -4083,7 +4122,7 @@ private:
             1 + deviceScoreContractionGeneration(),
             fingerprint,
             reinterpret_cast<std::uintptr_t>(shared_scratch_.get()),
-            checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
+            checkedBatchMemoryAdd(workspace_bytes - observation_final_bytes, channel_bytes,
                                   "PsiFormer shared scratch retained bytes"),
             device_position_bytes,
             fallback_allowance > channel_bytes ? fallback_allowance - channel_bytes : 0};
@@ -4099,6 +4138,7 @@ private:
   std::vector<double> positions_;
 #ifdef ENABLE_CUDA
   std::unique_ptr<psiformer::device::PreparedDeviceCoordinates> retained_coordinates_;
+  std::shared_ptr<const psiformer::device::PreparedDeviceECPObservation> ecp_observation_;
 #endif
   std::vector<double> total_log_gradients_real_;
   std::vector<double> total_log_gradients_imaginary_;
@@ -5075,6 +5115,9 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   bool acquired_from_prepared_collection            = false;
 
   std::unique_ptr<pf::DirectBatchWorkspace> batch_workspace;
+#ifdef ENABLE_CUDA
+  std::shared_ptr<psiformer::device::PreparedDeviceECPObservation> ecp_observation;
+#endif
   /// ECP-only VALUE context; never upgrades the ordinary sampler/FULL capacity.
   std::unique_ptr<pf::DirectBatchWorkspace> ecp_value_workspace;
   bool ecp_value_reported = false;
@@ -14256,6 +14299,80 @@ std::size_t PsiFormerWF::prepareResidentScoreAdam(std::size_t budget) const
 #endif
 }
 
+bool PsiFormerWF::residentECPObservationEnabled() const
+{
+  return model_state_->resident_ecp_observation_budget != 0;
+}
+
+std::size_t PsiFormerWF::prepareResidentECPObservation(std::size_t samples, const std::string& physical_source) const
+{
+  const char* value = std::getenv("PSIFORMER_GPU_RESIDENT_ECP_OBSERVATION_BYTES");
+  if (!value) return 0;
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  std::size_t bytes = 0;
+  for (const char* digit = value; *digit; ++digit)
+  {
+    if (*digit < '0' || *digit > '9' || bytes > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+      throw std::invalid_argument("ECP observation cap must be a positive finite decimal byte count");
+    bytes = bytes * 10 + (*digit - '0');
+  }
+  if (!bytes || bytes == std::numeric_limits<std::size_t>::max() || physical_source.empty() ||
+      system_kind_ != "pseudopotential" || batch_execution_plan_ || !model_state_->resident_score_adam_scratch ||
+      model_state_->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
+      model_state_->resident_device_authority_enabled ||
+      model_state_->resident_score_adam_scratch->device_products->retainedCoordinateBudget())
+    throw std::invalid_argument("ECP observation requires real OPEN C1 HOST-authority score Adam and explicit finite cap");
+  const auto cost = psiformer::device::PreparedDeviceECPObservation::estimate(samples,
+      model_state_->execution_plan.modelShape().electrons());
+  if (cost.device_bytes > bytes / 2 || cost.host_bytes > bytes / 2)
+    throw std::length_error("ECP observation per-domain cap excludes required two-generation transition peak");
+  model_state_->resident_ecp_physical_source = physical_source;
+  model_state_->resident_ecp_observation_budget = bytes;
+  app_log() << "Resident ECP physical finals admitted: DEVICE_owner_bytes=" << cost.device_bytes
+            << " HOST_owner_bytes=" << cost.host_bytes << " transition_generations=2 per_domain_transition_cap_bytes=" << bytes
+            << "; model/tapes/vendor/metadata excluded; native ECP HOST R/G/L adapter remains" << std::endl;
+  // Retained admission charges the combined HOST+DEVICE transition separately.
+  return checkedBatchMemoryMultiply(2, checkedBatchMemoryAdd(cost.device_bytes, cost.host_bytes,
+      "ECP observation owner bytes"), "ECP observation transition bytes");
+#else
+  throw std::invalid_argument("ECP observation requires a real GPU build");
+#endif
+}
+
+void PsiFormerWF::bindResidentECPObservation(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    wftrain::StreamingDerivativeOperator& derivative, std::uint64_t grid,
+    const std::string& physical_source, const std::vector<double>& energies, const std::vector<double>& kinetic) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  auto* source = dynamic_cast<PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (!residentECPObservationEnabled() || !source || source->model_state_ != model_state_)
+    throw std::invalid_argument("ECP observation requires this provider's prepared score batch");
+  PsiFormerDerivativeLease lease(*source->shared_scratch_);
+  PsiFormerReadTransaction read(*model_state_);
+  if (read.parameterVersion() != derivative.parameterVersion())
+    throw std::invalid_argument("ECP observation parameter version changed before binding");
+  auto& resource = requireMultiWalkerResource(components);
+  if (!resource.ecp_observation)
+    throw std::invalid_argument("ECP observation has no completed native FULL capture");
+  const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(*model_state_->numerical_tile_backend);
+  const auto before = source->shared_scratch_->device_products->transferSnapshot();
+  backend.sealECPObservation(resource.batch_workspace->numericalSamplingWorkspace(), *resource.ecp_observation,
+      grid, physical_source, source->positions_, energies, kinetic);
+  source->bindECPObservation(resource.ecp_observation);
+  const auto after = source->shared_scratch_->device_products->transferSnapshot();
+  app_log() << "Resident ECP observation sealed: version=" << derivative.parameterVersion() << " grid=" << grid
+            << " coordinate_generation=" << resource.ecp_observation->coordinateGeneration()
+            << " samples=" << derivative.sampleCount() << " DEVICE_owner_bytes=" << resource.ecp_observation->deviceBytes()
+            << " HOST_owner_bytes=" << resource.ecp_observation->hostBytes()
+            << " seal_uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+            << " seal_downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
+            << " source_coordinate_ingress=HOST_NATIVE_FULL final_capture=D2D score_coordinate_ingress=DEVICE"
+            << " ECP_adapter=HOST_NATIVE parameter_authority=HOST counter_scope=device_wide" << std::endl;
+#else
+  throw std::invalid_argument("ECP observation requires a real GPU build");
+#endif
+}
+
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
 namespace
 {
@@ -15309,8 +15426,32 @@ void PsiFormerWF::mw_evaluateLog(
       packBatchConfiguration(batch, walker, p_list[walker]);
     }
 
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    const auto* observation_backend = transaction.state().resident_ecp_observation_budget
+        ? dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(transaction.state().numerical_tile_backend.get())
+        : nullptr;
+    if (observation_backend)
+    {
+      std::vector<double> masses(electrons);
+      for (std::size_t e = 0; e < electrons; ++e)
+        masses[e] = 1.0 / p_list[0].get_mass_by_group()[p_list[0].getGroupID(e)];
+      resource.ecp_observation.reset();
+      observation_backend->beginECPObservation(batch.numericalSamplingWorkspace(), wfc_list.size(), masses,
+          transaction.state().resident_ecp_physical_source, transaction.state().resident_ecp_observation_budget);
+    }
+    struct ObservationCaptureGuard
+    {
+      const psiformer::device::PreparedDeviceBatchBackend* backend;
+      pf::DirectBatchWorkspace& batch;
+      ~ObservationCaptureGuard() { if (backend) backend->cancelECPObservation(batch.numericalSamplingWorkspace()); }
+    } observation_guard{observation_backend, batch};
+#endif
     const pf::DirectBatchSpatialResultView result =
         transaction.state().direct_batch_executor.evaluateFull(batch);
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    if (observation_backend)
+      resource.ecp_observation = observation_backend->finishECPObservation(batch.numericalSamplingWorkspace());
+#endif
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
       if (result.parameter_version[walker] != parameter_version)
         throw std::logic_error("PsiFormer full-spatial batch observed inconsistent parameters");

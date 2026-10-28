@@ -91,6 +91,7 @@ public:
 
 private:
   friend class PreparedDeviceCoordinates;
+  friend class PreparedDeviceECPObservation;
   friend class PreparedDeviceInference;
 
   /// Snapshot immutable extent/identity fields while the owner holds its lock.

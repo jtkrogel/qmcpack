@@ -16,6 +16,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_BATCH_BACKEND_H
 
 #include "PsiFormerDeviceCrowdHooks.h"
+#include "PsiFormerDeviceECPObservation.h"
 #include "PsiFormerDeviceProductSession.h"
 #include "PsiFormerDeviceMetropolis.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
@@ -433,6 +434,9 @@ private:
         context->executor.release(owner_, context->crowd, context->hooks);
       throw;
     }
+    if (spatial && context->observation_capture)
+      context->observation_capture->append(context->hooks.spatial_->completedSpatialFinals(),
+          context->hooks.queue_, context->positions, size, generation);
     if (preparation_.active_inference_crowds > 1)
       lock.unlock();
 
@@ -665,6 +669,51 @@ public:
               << " requested_device_bytes=" << extra << " future_FULL_numeric_bound=" << future_full
               << " HOST_scope=numeric_not_aggregate_fit\n";
     return true;
+  }
+
+  /// Capture all FULL microtiles of one explicitly admitted native real OPEN call.
+  void beginECPObservation(pf::DirectBatchTileBackendWorkspace& workspace, std::size_t samples,
+      const std::vector<double>& inverse_masses, const std::string& physical_source, std::size_t numeric_cap) const
+  {
+    std::lock_guard lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (!context || context->owner != this || context->observation_capture ||
+        preparation_.active_inference_crowds != 1 || context->hooks.target_preparation_.max_targets)
+      throw std::invalid_argument("ECP observation capture requires one exclusive untargeted FULL crowd");
+    // Two immutable generations can overlap at the parameter-publication fence.
+    context->observation_capture = std::make_shared<PreparedDeviceECPObservation>(image_, samples,
+        inverse_masses, context->observation_source, physical_source, numeric_cap / 2, numeric_cap / 2);
+  }
+
+  std::shared_ptr<PreparedDeviceECPObservation> finishECPObservation(
+      pf::DirectBatchTileBackendWorkspace& workspace) const
+  {
+    std::lock_guard lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (!context || context->owner != this || !context->observation_capture)
+      throw std::invalid_argument("ECP observation capture is absent or foreign");
+    context->observation_capture->finishCapture(image_->version());
+    return std::move(context->observation_capture);
+  }
+
+  void cancelECPObservation(pf::DirectBatchTileBackendWorkspace& workspace) const noexcept
+  {
+    std::lock_guard lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (context && context->owner == this) context->observation_capture.reset();
+  }
+
+  void sealECPObservation(pf::DirectBatchTileBackendWorkspace& workspace,
+      PreparedDeviceECPObservation& observation, std::uint64_t grid, const std::string& physical_source,
+      const std::vector<double>& positions, const std::vector<double>& energy,
+      const std::vector<double>& native_kinetic) const
+  {
+    std::lock_guard lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    if (!context || context->owner != this || observation.source_.get() != context->observation_source.get())
+      throw std::invalid_argument("ECP observation belongs to another native crowd source");
+    observation.seal(context->hooks.queue_, image_->version(), grid, physical_source,
+        positions, energy, native_kinetic);
   }
 
   /// Host permit evidence only, not a claim of simultaneous kernel execution.
@@ -1082,6 +1131,8 @@ private:
     PsiFormerAcceleratorCrowdState crowd;
     PreparedDeviceCrowdHooks hooks;
     // Declared after hooks: sampler must die before its borrowed graph/queue.
+    std::shared_ptr<const std::size_t> observation_source = std::make_shared<const std::size_t>(0);
+    std::shared_ptr<PreparedDeviceECPObservation> observation_capture;
     std::unique_ptr<PreparedDeviceMetropolis> sampler;
     std::vector<double> sampler_positions, sampler_gaussian, sampler_uniforms, sampler_masses;
     std::vector<std::size_t> sampler_indices;

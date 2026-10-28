@@ -29,6 +29,30 @@ Error peekAtLastError()
 #endif
 }
 
+__global__ void residentFinalKinetic(SpatialJetLayout layout, const double* roots,
+    const double* masses, double* kinetic, std::uint64_t* status)
+{
+  const std::size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+  if (sample >= layout.configuration_count) return;
+  status[sample] = 1;
+  double total = 0;
+  for (std::size_t e = 0; e < layout.electron_count; ++e)
+  {
+    double lap = roots[layout.uncheckedLaplacianOffset(sample, e, 0)];
+    if (!open_kinetic_reverse::finite(lap) || !open_kinetic_reverse::finite(masses[e]) || masses[e] <= 0) return;
+    for (std::size_t d = 0; d < 3; ++d)
+    {
+      const double g = roots[layout.uncheckedGradientOffset(sample, 3 * e + d, 0)];
+      if (!open_kinetic_reverse::finite(g)) return;
+      lap += g * g;
+    }
+    total -= .5 * masses[e] * lap;
+  }
+  if (!open_kinetic_reverse::finite(total)) return;
+  kinetic[sample] = total;
+  status[sample] = 0;
+}
+
 /// Small molecular counterpart: deterministic scalar sums, no additional arena.
 __global__ void residentOpenEnergy(SpatialJetLayout layout, const double* root,
     const double* positions, const double* nuclei, std::size_t ions,
@@ -450,6 +474,19 @@ Error launchOpenCuspKineticReverse(
   else
     openCuspKineticReverseKernel<false><<<1, 1, 0, stream>>>(
         layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response, status, {});
+  return peekAtLastError();
+}
+
+Error launchResidentFinalKinetic(Stream stream, const SpatialJetLayout& layout,
+    const double* roots, const double* inverse_masses, double* kinetic, std::uint64_t* status)
+{
+  validateSpatialJetLayout(layout);
+  if (layout.mode != SpatialJetMode::FULL_VGL || !layout.configuration_count || layout.element_count != 1 ||
+      layout.gradient_lanes != 3 * layout.electron_count || layout.laplacian_lanes != layout.electron_count ||
+      layout.target_electron_begin != 0 || !roots || !inverse_masses || !kinetic || !status)
+    throw std::invalid_argument("Resident final kinetic requires complete real FULL roots");
+  residentFinalKinetic<<<(layout.configuration_count + 63) / 64, 64, 0, stream>>>(
+      layout, roots, inverse_masses, kinetic, status);
   return peekAtLastError();
 }
 

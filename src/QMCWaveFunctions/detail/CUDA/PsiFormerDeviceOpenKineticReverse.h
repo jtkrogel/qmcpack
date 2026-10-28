@@ -18,6 +18,10 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Observe kinetic scalars from an owning complete-final batch, without a neural tape.
+Error launchResidentFinalKinetic(Stream stream, const SpatialJetLayout& layout,
+    const double* roots, const double* inverse_masses, double* kinetic, std::uint64_t* status);
+
 /// Observe one open real FULL root and straight-Coulomb geometry without HOST R/G/L.
 Error launchResidentOpenEnergy(Stream stream, const SpatialJetLayout& root_layout,
     const double* root, const double* positions, const double* nuclei, std::size_t ions,

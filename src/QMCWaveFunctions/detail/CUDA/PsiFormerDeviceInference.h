@@ -2210,6 +2210,25 @@ public:
     return *value_tape_.at(layer);
   }
 
+  struct SpatialFinalView
+  {
+    SpatialJetLayout root_layout;
+    const double* positions;
+    const double* root;
+    const PreparedDeviceModel* image;
+    std::size_t evaluation_generation;
+  };
+
+  /// Final outputs need no reverse block tapes. Borrow only until the next evaluation/rebind.
+  SpatialFinalView completedSpatialFinals() const
+  {
+    if (!result_valid_ || mode_ != SpatialJetMode::FULL_VGL ||
+        result_layout_.target_electron_begin != 0 || result_layout_.laplacian_lanes != ne_)
+      throw std::logic_error("Device physical finals require a completed complete FULL result");
+    return {result_layout_, positions_.data(),
+            (target_preparation_.max_targets ? full_output_ : output_).data(), model_.get(), evaluation_generation_};
+  }
+
   /// Borrow completed full-spatial head/root data while retaining the model lease.
   SpatialHeadTape spatialHeadTape() const
   {

@@ -1271,6 +1271,20 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
         throw std::logic_error("GPU score-only ECP differs from the actual native nonlocal energy");
       batch.local_energies.emplace_back(result.local_energies[sample], 0);
     }
+    if (real->residentECPObservationEnabled())
+    {
+      RefVectorWithLeader<WaveFunctionComponent> components(*twfs[0].get().getOrbitals()[0]);
+      for (const auto& wf : twfs) components.push_back(*wf.get().getOrbitals()[0]);
+      const auto physical = wftrain::realECPPhysicalIdentity(const_cast<PsiFormerWF&>(*real),
+          electrons[0].get(), hamiltonians[0].get());
+      std::vector<double> kinetic(samples);
+      for (std::size_t sample = 0; sample < samples; ++sample)
+        kinetic[sample] = hamiltonians[sample].get().getKineticEnergy();
+      real->bindResidentECPObservation(components, *batch.derivative_operator, result.grid_fingerprint,
+          physical.fingerprint, result.local_energies, kinetic);
+      if (scoreOnlyECPCaptureNamedBytes(*batch.derivative_operator, samples) > scalar_ecp_budget)
+        throw std::length_error("GPU ECP physical observation plus score owners exceed retained numeric budget");
+    }
     // Physical EL includes ECP; this owner intentionally advertises no ECP dEL.
     app_log() << "WFTrain GPU score-only accepted-grid ECP: grid=" << result.grid_fingerprint
               << " version=" << version << " samples=" << samples
@@ -3360,6 +3374,8 @@ void WFTrainBatched::process(xmlNodePtr node)
         training_input_.getGradientEstimator() == WFTrainDriverInput::GradientEstimator::SCORE_COVARIANCE;
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
     resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
+    if (std::getenv("PSIFORMER_GPU_RESIDENT_ECP_OBSERVATION_BYTES") && !resident_score_adam_)
+      throw UniformCommunicateError("Resident ECP physical observation requires explicit score Adam C2 bridge before sampling");
     if (resident_score_adam_ && resident_device_authority_)
       throw UniformCommunicateError("Score Adam C2 bridge requires HOST parameter authority until physical PP DEVICE observations are implemented");
     if (const auto* optin = std::getenv("PSIFORMER_GPU_RESIDENT_OPEN_OBSERVATION"))
@@ -3430,6 +3446,14 @@ void WFTrainBatched::process(xmlNodePtr node)
             : device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
       else
         resident_sr_incremental_bytes_ = device_provider->prepareResidentEnergySR(crowds_.front()->size(), resident_sr_budget_);
+      if (resident_score_adam_)
+      {
+        auto& provider = *dynamic_cast<PsiFormerWF*>(selected_provider_);
+        const auto physical = wftrain::realECPPhysicalIdentity(provider,
+            population_.get_golden_electrons(), population_.get_golden_hamiltonian());
+        const auto observation_bytes = provider.prepareResidentECPObservation(crowds_.front()->size(), physical.fingerprint);
+        enforceMemoryBudget(*myComm, observation_bytes, training_input_.getMaximumRetainedBytes());
+      }
       // Authority activation borrows the admitted C3 lane; it allocates no new image.
       if (resident_device_authority_)
       {
