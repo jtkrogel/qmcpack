@@ -52,6 +52,8 @@ struct PsiFormerComplexWF::Impl
     const std::size_t limit;
     std::mutex mutex;
     std::size_t retained = 0, owners = 0, fingerprint = 0;
+    /// Physical lazy VALUE/FULL/ACTIVE/STREAMED banks, excluding collective proposal products.
+    std::array<std::size_t, 4> mode_retained{};
   };
 
   /** Exclusive lazy CPU VALUE/FULL/ACTIVE scratch with no accepted walker state.
@@ -59,7 +61,7 @@ struct PsiFormerComplexWF::Impl
    */
   struct CpuLane
   {
-    enum class Mode { VALUE, FULL_VGL, ACTIVE_ELECTRON_GRADIENT };
+    enum class Mode { VALUE, FULL_VGL, ACTIVE_ELECTRON_GRADIENT, STREAMED_FULL_VGL };
 
     explicit CpuLane(std::shared_ptr<CpuScratchBudget> authority) : budget(std::move(authority))
     {
@@ -73,8 +75,11 @@ struct PsiFormerComplexWF::Impl
       value.reset();
       full.reset();
       active.reset();
+      streamed.reset();
       std::lock_guard lock(budget->mutex);
       budget->retained -= charged;
+      for (std::size_t mode = 0; mode < charged_modes.size(); ++mode)
+        budget->mode_retained[mode] -= charged_modes[mode];
       --budget->owners;
       budget->fingerprint ^= fingerprint;
     }
@@ -95,6 +100,8 @@ struct PsiFormerComplexWF::Impl
           std::lock_guard lock(budget->mutex);
           destination = std::move(candidate);
           charged += bytes;
+          charged_modes[static_cast<std::size_t>(mode)] += bytes;
+          budget->mode_retained[static_cast<std::size_t>(mode)] += bytes;
           fingerprint ^= next;
           budget->fingerprint ^= next;
         }
@@ -114,12 +121,14 @@ struct PsiFormerComplexWF::Impl
 
     std::shared_ptr<CpuScratchBudget> budget;
     std::mutex mutex;
-    static constexpr std::array<const char*, 3> trace_names{
+    static constexpr std::array<const char*, 4> trace_names{
         "ComplexWF::shared_cpu_VALUE", "ComplexWF::shared_cpu_FULL_VGL",
-        "ComplexWF::shared_cpu_ACTIVE_ELECTRON_GRADIENT"};
-    std::array<psiformer::memory::HostCapacity, 3> trace_capacity;
+        "ComplexWF::shared_cpu_ACTIVE_ELECTRON_GRADIENT", "ComplexWF::shared_cpu_STREAMED_FULL_VGL"};
+    std::array<psiformer::memory::HostCapacity, 4> trace_capacity;
     std::unique_ptr<pf::DirectComplexValueWorkspace> value;
     std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
+    std::unique_ptr<pf::DirectComplexStreamedSpatialWorkspace> streamed;
+    std::array<std::size_t, 4> charged_modes{};
     std::size_t charged = 0, fingerprint = 0;
   };
 
@@ -632,7 +641,7 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
           , std::shared_ptr<GpuLane> prepared = {}
 #endif
-          )
+          , std::size_t cpu_targets = 0)
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           system_kind(kind), environment(environmentFor(electrons, initialized.environment)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -652,11 +661,13 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
               prepared ? 1 :
 #endif
-              requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS"))
+              requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS")), cpu_targets(cpu_targets)
 #ifdef ENABLE_CUDA
           , inference_concurrency(gpu_crowds)
 #endif
     {
+      if (cpu_targets && (!cpu_limit || gpu_limit || cpu_targets > model.ne))
+        throw std::invalid_argument("Complex CPU target VGL requires shared CPU admission and targets1..Ne");
       if (cpu_limit)
       {
         if (gpu_limit)
@@ -670,7 +681,10 @@ struct PsiFormerComplexWF::Impl
             fourierModeCount(plan)};
         cpu_requirements = {pf::DirectComplexValueWorkspace::storageRequirement(shape),
             pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::FULL_VGL),
-            pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)};
+            pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT),
+            cpu_targets ? pf::DirectComplexStreamedSpatialWorkspace::storageRequirement(shape, cpu_targets) : 0};
+        if (cpu_targets && cpu_requirements[3] > cpu_limit)
+          throw std::length_error("Complex streamed CPU owner exceeds the shared family cap before allocation");
       }
       if (gpu_limit)
       {
@@ -751,9 +765,10 @@ struct PsiFormerComplexWF::Impl
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     const std::size_t gpu_limit;
     const std::size_t gpu_capacity, gpu_crowds;
+    const std::size_t cpu_targets;
     std::shared_ptr<CpuScratchBudget> cpu_budget;
     std::shared_ptr<CpuLane> cpu;
-    std::array<std::size_t, 3> cpu_requirements{};
+    std::array<std::size_t, 4> cpu_requirements{};
     std::atomic<std::size_t> acquired_teams{0};
 #ifdef ENABLE_CUDA
     psiformer::PsiFormerInferenceConcurrency inference_concurrency;
@@ -2679,11 +2694,14 @@ struct PsiFormerComplexWF::Impl
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
        const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
        std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
-       std::size_t cpu_limit)
+       std::size_t cpu_limit, std::size_t cpu_targets)
       : Impl(std::make_shared<Model>(component_name,
                                    materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint, system_kind),
-                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind, cpu_limit),
-             electrons, limit)
+                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind, cpu_limit
+#ifdef ENABLE_CUDA
+                                   , std::shared_ptr<GpuLane>{}
+#endif
+                                   , cpu_targets), electrons, limit)
   {}
 
   /// Check the full requirement before allocation; shared clones enter under their caller's read lease.
@@ -2767,6 +2785,11 @@ struct PsiFormerComplexWF::Impl
       result.shared_cpu_value_bytes = state->cpu_requirements[0];
       result.shared_cpu_full_bytes = state->cpu_requirements[1];
       result.shared_cpu_active_bytes = state->cpu_requirements[2];
+      result.shared_cpu_streamed_bytes = state->cpu_requirements[3];
+      result.cpu_vgl_targets = state->cpu_targets;
+      result.shared_cpu_retained_mode_bytes = state->cpu_budget->mode_retained;
+      result.shared_cpu_collective_bytes = result.shared_cpu_bytes;
+      for (auto retained : result.shared_cpu_retained_mode_bytes) result.shared_cpu_collective_bytes -= retained;
     }
 #ifdef ENABLE_CUDA
     if (state->gpu)
@@ -3277,14 +3300,25 @@ struct PsiFormerComplexWF::Impl
     {
       NativeTimerScope numerical_timer(phase_timers.cpu_spatial);
       const auto mode = electron < 0 ? pf::DirectSpatialMode::FULL_VGL : pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT;
-      auto& workspace = result.cpu_owner
-          ? result.cpu_owner->prepare(electron < 0 ? result.cpu_owner->full : result.cpu_owner->active,
-              state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); },
-              electron < 0 ? CpuLane::Mode::FULL_VGL : CpuLane::Mode::ACTIVE_ELECTRON_GRADIENT)
-          : (electron < 0 ? *full : *active);
-      positions(workspace, p, replacement, absolute, collective);
-      static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
-          ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
+      if (electron < 0 && state->cpu_targets)
+      {
+        auto& workspace = result.cpu_owner->prepare(result.cpu_owner->streamed, state->cpu_requirements[3],
+            [&] { return state->spatial.makeStreamedWorkspace(state->cpu_targets, state->cpu_requirements[3]); },
+            CpuLane::Mode::STREAMED_FULL_VGL);
+        positions(workspace, p, replacement, absolute, collective);
+        static_cast<pf::DirectComplexSpatialResult&>(result) = state->spatial.evaluateFull(workspace);
+      }
+      else
+      {
+        auto& workspace = result.cpu_owner
+            ? result.cpu_owner->prepare(electron < 0 ? result.cpu_owner->full : result.cpu_owner->active,
+                state->cpu_requirements[electron < 0 ? 1 : 2], [&] { return state->spatial.makeWorkspace(mode); },
+                electron < 0 ? CpuLane::Mode::FULL_VGL : CpuLane::Mode::ACTIVE_ELECTRON_GRADIENT)
+            : (electron < 0 ? *full : *active);
+        positions(workspace, p, replacement, absolute, collective);
+        static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
+            ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
+      }
     }
     else
     {
@@ -3547,10 +3581,10 @@ class PsiFormerComplexWF::FixedGridEnergyReference
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
     std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
-    std::size_t cpu_limit)
+    std::size_t cpu_limit, std::size_t cpu_targets)
     : WaveFunctionComponent(name),
       impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced,
-                                 gpu_limit, parameter_checkpoint, system_kind, cpu_limit))
+                                 gpu_limit, parameter_checkpoint, system_kind, cpu_limit, cpu_targets))
 {
   if (!parameter_checkpoint.empty())
     app_log() << "Complex PsiFormer imported model identity=" << impl_->state->identity << std::endl;
@@ -4753,7 +4787,11 @@ void PsiFormerComplexWF::isolateParameterState()
     auto state = std::make_shared<Impl::Model>(getName(),
         InitializedNativeModel{std::move(detached), original->profile, original->seed, original->environment},
         *impl_->particles, *original->source, original->reduced_twist, 0, original->system_kind,
-        original->cpu_budget ? original->cpu_budget->limit : 0);
+        original->cpu_budget ? original->cpu_budget->limit : 0
+#ifdef ENABLE_CUDA
+        , std::shared_ptr<Impl::GpuLane>{}
+#endif
+        , original->cpu_targets);
     independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   }
   // Fresh executors/workspaces bind only detached leaves; accepted state and weak

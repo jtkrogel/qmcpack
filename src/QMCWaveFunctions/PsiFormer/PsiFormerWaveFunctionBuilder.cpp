@@ -291,7 +291,7 @@ try
   }
   [[maybe_unused]] std::size_t clone_numeric_limit = 0;
   [[maybe_unused]] std::size_t gpu_numeric_limit = 0;
-  [[maybe_unused]] std::size_t cpu_shared_numeric_limit = 0;
+  [[maybe_unused]] std::size_t cpu_shared_numeric_limit = 0, cpu_vgl_targets = 0;
 #ifndef QMC_COMPLEX
   if (complex_profile)
     throw std::invalid_argument("psiformer_complex_periodic_v1 requires a complex QMCPACK build");
@@ -369,13 +369,19 @@ try
       cpu_shared_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_cpu_shared_numeric_bytes"),
                                                        "max_cpu_shared_numeric_bytes");
     }
+    if (xmlHasProp(cur, BAD_CAST "cpu_vgl_targets"))
+    {
+      if (explicit_gpu || !cpu_shared_numeric_limit)
+        throw std::invalid_argument("cpu_vgl_targets requires explicit complex shared CPU scratch");
+      cpu_vgl_targets = parseCloneNumericLimit(getXMLAttributeValue(cur, "cpu_vgl_targets"), "cpu_vgl_targets");
+    }
     if (explicit_gpu)
       gpu_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_gpu_numeric_bytes"), "max_gpu_numeric_bytes");
     else if (xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
       throw std::invalid_argument("max_gpu_numeric_bytes requires the explicit complex GPU profile");
   }
   else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes") || xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes") ||
-           xmlHasProp(cur, BAD_CAST "max_cpu_shared_numeric_bytes"))
+           xmlHasProp(cur, BAD_CAST "max_cpu_shared_numeric_bytes") || xmlHasProp(cur, BAD_CAST "cpu_vgl_targets"))
     throw std::invalid_argument("Complex numeric caps belong only to psiformer_complex_periodic_v1");
   // Selected pair requests must validate their resolved metadata before consulting a device runtime.
   psiformer::PsiFormerAcceleratorResolution accelerator_resolution = selected_pair_gpu
@@ -653,7 +659,7 @@ try
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
                                                          *source_particles, clone_numeric_limit, twist_array,
                                                          gpu_numeric_limit, parameter_checkpoint, system,
-                                                         cpu_shared_numeric_limit);
+                                                         cpu_shared_numeric_limit, cpu_vgl_targets);
       const auto storage = complex->numericStorage();
       app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
                                      : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes
@@ -672,6 +678,14 @@ try
                   << " per_lane_value_bytes=" << storage.shared_cpu_value_bytes
                   << " per_lane_full_bytes=" << storage.shared_cpu_full_bytes
                   << " per_lane_active_bytes=" << storage.shared_cpu_active_bytes
+                  << " cpu_vgl_mode=" << (storage.cpu_vgl_targets ? "target_streamed" : "full")
+                  << " cpu_vgl_targets=" << storage.cpu_vgl_targets
+                  << " per_lane_streamed_bytes=" << storage.shared_cpu_streamed_bytes
+                  << " retained_value_bytes=" << storage.shared_cpu_retained_mode_bytes[0]
+                  << " retained_full_bytes=" << storage.shared_cpu_retained_mode_bytes[1]
+                  << " retained_active_bytes=" << storage.shared_cpu_retained_mode_bytes[2]
+                  << " retained_streamed_bytes=" << storage.shared_cpu_retained_mode_bytes[3]
+                  << " retained_collective_bytes=" << storage.shared_cpu_collective_bytes
                   << "; lazy=yes; one_lane_per_crowd_plus_scalar_fallback; dormant_owners_remain_charged=yes; "
                   << "excludes clone G/L, model, derivatives and nonnumerical/native HOST owners" << std::endl;
       if (adopt_explicit_twist)

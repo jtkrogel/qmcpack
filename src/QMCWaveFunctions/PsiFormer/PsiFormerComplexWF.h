@@ -39,7 +39,7 @@ public:
                      std::size_t maximum_clone_numeric_bytes,
                      std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0,
                      const std::string& parameter_checkpoint = {}, const std::string& system_kind = "all_electron",
-                     std::size_t maximum_cpu_shared_numeric_bytes = 0);
+                     std::size_t maximum_cpu_shared_numeric_bytes = 0, std::size_t cpu_vgl_targets = 0);
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
   ~PsiFormerComplexWF() override;
@@ -322,6 +322,9 @@ public:
     const void* shared_image_identity = nullptr;
     std::size_t shared_cpu_bytes = 0, shared_cpu_limit_bytes = 0, shared_cpu_owners = 0, shared_cpu_fingerprint = 0;
     std::size_t shared_cpu_value_bytes = 0, shared_cpu_full_bytes = 0, shared_cpu_active_bytes = 0;
+    /// Streamed complete outputs are included; retained mode bytes include dormant owners.
+    std::size_t shared_cpu_streamed_bytes = 0, cpu_vgl_targets = 0, shared_cpu_collective_bytes = 0;
+    std::array<std::size_t, 4> shared_cpu_retained_mode_bytes{};
     const void* shared_cpu_identity = nullptr;
   };
 

@@ -1059,7 +1059,7 @@ TEST_CASE("Complex CPU shared scratch is lazy, capped and independent of walker 
 }
 
 TEST_CASE("Complex shared CPU collective proposals retain atomic complete products",
-          "[wavefunction][psiformer][complex_wf][complex_cpu_collective]")
+          "[wavefunction][psiformer][complex_wf][complex_cpu_collective][complex_cpu_streamed]")
 {
   const SimulationCell simulation_cell(cell());
   auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
@@ -1068,8 +1068,9 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   auto source = ions(simulation_cell);
   const auto twist = GENERATE(std::array<double, 3>{}, (std::array<double, 3>{.17, -.11, .07}));
   const auto selected = GENERATE(1, 2, 3, 4);
+  const auto vgl_targets = GENERATE(std::size_t{0}, std::size_t{3});
   CAPTURE(selected);
-  PsiFormerComplexWF family("collective", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  PsiFormerComplexWF family("collective", parameters(), p0, source, clone_cap, twist, 0, {}, "all_electron", clone_cap, vgl_targets);
   auto other = family.makeClone(p1);
   auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
   PsiFormerComplexWF private_cpu("private", parameters(), p0, source, clone_cap, twist);
@@ -1133,7 +1134,8 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
     CHECK_THROWS(family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, alias, laplacians));
     family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians);
     const auto warm = family.numericStorage();
-    CHECK(warm.shared_cpu_bytes > before.shared_cpu_bytes + before.shared_cpu_full_bytes);
+    const auto lane_bytes = vgl_targets ? before.shared_cpu_streamed_bytes : before.shared_cpu_full_bytes;
+    CHECK(warm.shared_cpu_bytes > before.shared_cpu_bytes + lane_bytes);
     for (std::size_t i = 0; i < 2; ++i)
     {
       close(ratios[i], oracle_logs[i] - old_logs[i], 2e-12);
@@ -2655,7 +2657,7 @@ TEST_CASE("Paired DEVICE affine factors match independent CPU two-channel rows",
 #endif
 
 TEST_CASE("Complex provider affine rows preserve canonical phase scores and bounded factors",
-          "[wavefunction][psiformer][complex_wf][complex_affine_provider]")
+          "[wavefunction][psiformer][complex_wf][complex_affine_provider][complex_cpu_streamed]")
 {
   using namespace wftrain;
   bool pair_profile = false;
@@ -2794,6 +2796,19 @@ TEST_CASE("Complex provider affine rows preserve canonical phase scores and boun
     CHECK_THROWS(PsiFormerComplexWF("bad_origin", invalid, p, source, clone_cap, {.17, -.11, .07}));
   }
   PsiFormerComplexWF component("affine", initialized, p, source, clone_cap, {.17, -.11, .07});
+  // One non-divisor target lane must preserve occupied phases and Fourier envelopes.
+  PsiFormerComplexWF streamed("streamed_profile", initialized, p, source, clone_cap,
+      {.17, -.11, .07}, 0, {}, "all_electron", clone_cap, 3);
+  const auto full_log = evaluate(component, p);
+  const auto full_g = p.G;
+  const auto full_l = p.L;
+  close(evaluate(streamed, p), full_log, 2e-12);
+  for (int e = 0; e < p.getTotalNum(); ++e)
+  {
+    close(p.L[e], full_l[e], 2e-12);
+    for (int d = 0; d < 3; ++d) close(p.G[e][d], full_g[e][d], 2e-12);
+  }
+
   const auto& schema = component.parameterSchema();
   const auto affine = component.affineParameterBlocks();
   REQUIRE_FALSE(affine.empty());
@@ -7982,5 +7997,94 @@ TEST_CASE("CPU paired energies preserve accepted ordinary nonlocal quadrature",
     CHECK(std::abs(independent[0].imag()) + std::abs(independent[1].imag()) > 1e-7);
     CHECK(cpu.snapshotParameters().values == snapshot.values);
   }
+}
+
+TEST_CASE("Complex CPU target owner preserves unequal-spin VGL and physical family accounting",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_streamed]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell, 3, 2), q = electrons(simulation_cell, 3, 2);
+  p.R[4] = q.R[4] = ParticleSet::PosType{.7, -.6, 1.3};
+  p.update();
+  q.update();
+  auto source = ions(simulation_cell);
+  auto initialized = parameters(true, false, 7, 5);
+  initialized.model_shape.spin_up_electrons = 3;
+  initialized.model_shape.spin_down_electrons = 2;
+  const std::array<double, 3> twist{.17, -.11, .07};
+  PsiFormerComplexWF full("full", initialized, p, source, clone_cap, twist, 0, {}, "all_electron", clone_cap);
+  // Target[2,4) crosses the 3/2 spin boundary; target4 is a smaller final tail.
+  PsiFormerComplexWF stream("stream", initialized, q, source, clone_cap, twist, 0, {}, "all_electron", clone_cap, 2);
+  const auto cold = stream.numericStorage();
+  CHECK(cold.cpu_vgl_targets == 2);
+  CHECK(cold.shared_cpu_bytes == 0);
+  CHECK(cold.shared_cpu_streamed_bytes < cold.shared_cpu_full_bytes);
+  CHECK(cold.allocated_bytes == 5*(sizeof(WaveFunctionComponent::GradType)+sizeof(WaveFunctionComponent::ValueType)));
+  const auto compare = [&] {
+    const auto reference = evaluate(full, p);
+    close(evaluate(stream, q), reference, 2e-12);
+    for (int e = 0; e < 5; ++e)
+    {
+      close(q.L[e], p.L[e], 2e-12);
+      for (int d = 0; d < 3; ++d) close(q.G[e][d], p.G[e][d], 2e-12);
+    }
+    const auto expected = full.observeCoulombEnergy(p, -2.7);
+    const auto actual = stream.observeCoulombEnergy(q, -2.7);
+    close(actual.kinetic, expected.kinetic, 2e-12);
+    close(actual.local_energy, expected.local_energy, 2e-12);
+  };
+  compare();
+  auto warm = stream.numericStorage();
+  CHECK(warm.shared_cpu_bytes == cold.shared_cpu_streamed_bytes);
+  CHECK(warm.shared_cpu_retained_mode_bytes[1] == 0);
+  CHECK(warm.shared_cpu_retained_mode_bytes[3] == cold.shared_cpu_streamed_bytes);
+  CHECK(warm.shared_cpu_collective_bytes == 0);
+  std::vector<std::unique_ptr<WaveFunctionComponent>> clones;
+  for (int i = 0; i < 16; ++i) clones.push_back(stream.makeClone(q));
+  CHECK(stream.numericStorage().shared_cpu_bytes == warm.shared_cpu_bytes);
+  CHECK(stream.numericStorage().shared_cpu_owners == warm.shared_cpu_owners);
+  CHECK(dynamic_cast<PsiFormerComplexWF&>(*clones.back()).numericStorage().cpu_vgl_targets == 2);
+
+  struct Ignore final : wftrain::AffineScoreObserver
+  { void observe(const wftrain::AffineScoreObservation&) override {} } ignore;
+  std::vector<double> full_real, full_imag, stream_real, stream_imag;
+  for (auto* component : {&full, &stream}) component->prepareAffineScores(component->affineScoreStorage().required_bytes);
+  full.observeComplexAffineScores(p, ignore, full_real, full_imag);
+  stream.observeComplexAffineScores(q, ignore, stream_real, stream_imag);
+  CHECK((stream_real == full_real));
+  CHECK((stream_imag == full_imag));
+
+  q.makeMove(0, ParticleSet::PosType{.01, -.02, .03});
+  WaveFunctionComponent::GradType proposed_gradient{};
+  CHECK_NOTHROW(stream.ratioGrad(q, 0, proposed_gradient));
+  stream.restore(0);
+  q.rejectMove(0);
+  warm = stream.numericStorage();
+  CHECK(warm.shared_cpu_bytes == cold.shared_cpu_streamed_bytes+cold.shared_cpu_active_bytes);
+  CHECK(warm.shared_cpu_retained_mode_bytes[2] == cold.shared_cpu_active_bytes);
+  CHECK(warm.shared_cpu_retained_mode_bytes[1] == 0);
+  for (int repeat = 0; repeat < 2; ++repeat) compare();
+  CHECK(stream.numericStorage().shared_cpu_fingerprint == warm.shared_cpu_fingerprint);
+
+  for (auto* component : {&full, &stream})
+  {
+    auto candidate = component->snapshotParameters();
+    candidate.values[0] += .0001;
+    component->publishParameters(candidate, candidate.version);
+  }
+  compare();
+  stream.isolateParameterState();
+  CHECK(stream.numericStorage().shared_cpu_identity != cold.shared_cpu_identity);
+  CHECK(stream.numericStorage().cpu_vgl_targets == 2);
+  CHECK(stream.numericStorage().shared_cpu_bytes == 0);
+  compare();
+  CHECK(stream.numericStorage().shared_cpu_retained_mode_bytes[1] == 0);
+
+  CHECK_THROWS_AS(PsiFormerComplexWF("no_shared", initialized, q, source, clone_cap, twist, 0, {}, "all_electron", 0, 2),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(PsiFormerComplexWF("too_many", initialized, q, source, clone_cap, twist, 0, {}, "all_electron", clone_cap, 6),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(PsiFormerComplexWF("short", initialized, q, source, clone_cap, twist, 0, {}, "all_electron",
+      cold.shared_cpu_streamed_bytes-1, 2), std::length_error);
 }
 } // namespace qmcplusplus
