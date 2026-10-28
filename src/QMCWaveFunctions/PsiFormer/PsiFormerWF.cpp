@@ -608,6 +608,37 @@ bool walkerBufferScalarIsFinite(const T& value) noexcept
                static_cast<double>(std::imag(value)));
 }
 
+/// Inspect cache-proof storage before any finite-math floating-point conversion.
+template<class T>
+bool immediateReplayEncodingIsFinite(const T& value) noexcept
+{
+  if constexpr (std::is_floating_point_v<T>)
+  {
+    static_assert(sizeof(T) == sizeof(std::uint64_t) || sizeof(T) == sizeof(std::uint32_t));
+    if constexpr (sizeof(T) == sizeof(std::uint64_t))
+    {
+      std::uint64_t bits;
+      std::memcpy(&bits, &value, sizeof(bits));
+      return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+    }
+    else
+    {
+      std::uint32_t bits;
+      std::memcpy(&bits, &value, sizeof(bits));
+      return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+    }
+  }
+  else
+  {
+    // std::complex guarantees adjacent real/imaginary storage; avoid value-returning accessors.
+    using Real = typename T::value_type;
+    static_assert(sizeof(T) == 2 * sizeof(Real));
+    std::array<Real, 2> components;
+    std::memcpy(components.data(), &value, sizeof(value));
+    return immediateReplayEncodingIsFinite(components[0]) && immediateReplayEncodingIsFinite(components[1]);
+  }
+}
+
 /// Return true only for the binary64 encoding of negative zero.
 bool isNegativeZero(double value) noexcept
 {
@@ -10976,8 +11007,8 @@ bool PsiFormerWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live,
                                                     const std::vector<ValueType>& fresh_laplacian,
                                                     const ParticleSet* expected_source,
                                                     std::size_t expected_version,
-                                                    double expected_log,
-                                                    double expected_phase) const
+                                                    const double& expected_log,
+                                                    const double& expected_phase) const
 {
 #if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
   return false;
@@ -10989,24 +11020,51 @@ bool PsiFormerWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live,
   if (!expected_source || expected_source != validated_source_ || bound_particle_set_ != &live ||
       live.getActivePtcl() != -1 || state.resident_device_authority_enabled || system_kind_ != "pseudopotential" ||
       state.precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE || environment.periodic_profile ||
-      environment.boundary != psiformer::BoundaryCondition::PERIODIC ||
-      environment.geometry_feature_policy != psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
       state.twist_phase.active() || fresh_gradient.size() != 3 * count || fresh_laplacian.size() != count)
+    return false;
+  if (!immediateReplayEncodingIsFinite(expected_log) || !immediateReplayEncodingIsFinite(expected_phase) ||
+      !immediateReplayEncodingIsFinite(log_value_))
+    return false;
+  const auto finite_range = [](const auto& values) {
+    return std::all_of(values.begin(), values.end(), [](const auto& value) {
+      return immediateReplayEncodingIsFinite(value);
+    });
+  };
+  if (!finite_range(fresh_gradient) || !finite_range(fresh_laplacian) ||
+      !finite_range(live.L) || !finite_range(accepted_laplacian_))
+    return false;
+  for (const auto& gradient : live.G)
+    if (!finite_range(gradient)) return false;
+  for (const auto& gradient : accepted_gradient_)
+    if (!finite_range(gradient)) return false;
+  for (const auto* particles : {&live, &saved})
+  {
+    if (!finite_range(particles->spins) || !finite_range(particles->Z) ||
+        !finite_range(particles->get_mass_by_group()))
+      return false;
+    for (const auto& position : particles->R)
+      if (!finite_range(position)) return false;
+  }
+  const bool periodic = environment.boundary == psiformer::BoundaryCondition::PERIODIC;
+  if (environment.geometry_feature_policy != (periodic
+          ? psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1
+          : psiformer::GeometryFeaturePolicy::OPEN_EUCLIDEAN_V1))
     return false;
   const auto& source = *expected_source;
   for (const auto* particles : {&live, &source})
   {
-    if (particles->getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+    if (particles->getLattice().getSuperCellEnum() != (periodic ? SUPERCELL_BULK : SUPERCELL_OPEN))
       return false;
     for (int axis = 0; axis < 3; ++axis)
     {
-      if (!walkerBufferScalarIsFinite(particles->getTwist()[axis]) || particles->getTwist()[axis] != 0)
+      if (!immediateReplayEncodingIsFinite(particles->getTwist()[axis]) || particles->getTwist()[axis] != 0)
         return false;
       for (int dimension = 0; dimension < 3; ++dimension)
       {
-        const auto actual = particles->getLattice().R(axis, dimension);
-        const auto expected = environment.lattice_vectors[axis][dimension];
-        if (!walkerBufferScalarIsFinite(actual) || !walkerBufferScalarIsFinite(expected) || actual != expected)
+        const auto& actual = particles->getLattice().R(axis, dimension);
+        const auto& expected = environment.lattice_vectors[axis][dimension];
+        if (!immediateReplayEncodingIsFinite(actual) || !immediateReplayEncodingIsFinite(expected) ||
+            (periodic && actual != expected))
           return false;
       }
     }
@@ -11023,11 +11081,11 @@ bool PsiFormerWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live,
   for (std::size_t ion = 0; ion < ions; ++ion)
   {
     const auto group = source.GroupID[ion];
-    if (group < 0 || group >= species.getTotalNum() || !walkerBufferScalarIsFinite(species(charge, group)) ||
+    if (group < 0 || group >= species.getTotalNum() || !immediateReplayEncodingIsFinite(species(charge, group)) ||
         species(charge, group) != state.model.cfg.charges.x[ion])
       return false;
     for (int dimension = 0; dimension < 3; ++dimension)
-      if (!walkerBufferScalarIsFinite(source.R[ion][dimension]) ||
+      if (!immediateReplayEncodingIsFinite(source.R[ion][dimension]) ||
           source.R[ion][dimension] != state.model.cfg.nuclei.x[3 * ion + dimension])
         return false;
   }

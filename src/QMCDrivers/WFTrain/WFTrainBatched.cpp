@@ -947,14 +947,15 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(crowd.getSharedResource().ham_res, hamiltonian_batch);
     ParticleSet::mw_update(electron_batch);
     const bool reuse_full = full_handoff && gpu_training && score_only && has_nonlocal_ecp &&
-        !capture_ecp_jvp_replay && !capture_inline_ecp_vjp && batch_ordinal == 0 && sample_offset == 0 &&
+        !capture_ecp_jvp_replay && !capture_inline_ecp_vjp &&
         consumeImmediateFullReplay(crowd, *full_handoff);
     if (!reuse_full)
       TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
     if (full_handoff)
-      app_log() << "Paired KFAC immediate ECP FULL handoff: full_elided=" << reuse_full
-                << " full_evaluations=" << !reuse_full << " host_capacity_bytes=" << full_handoff->retainedBytes()
-                << "; first replay, physical accepted grid and Hamiltonian unchanged" << std::endl;
+      app_log() << "Paired immediate ECP FULL handoff: full_elided=" << reuse_full
+                << " full_evaluations=" << !reuse_full << " batch=" << batch_ordinal << " offset=" << sample_offset
+                << " host_capacity_bytes=" << full_handoff->retainedBytes()
+                << "; physical accepted grid and Hamiltonian unchanged" << std::endl;
     // Resolve actual replay batch leaders/clones; the primary prototype cannot stand in for them.
     auto componentAt = [&](std::size_t sample) -> PsiFormerComplexWF& {
       const auto& components = twfs[sample].get().getOrbitals();
@@ -1197,7 +1198,7 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   ParticleSet::mw_update(electron_batch);
   bool reuse_immediate_full = false;
 #ifndef QMC_COMPLEX
-  if (full_handoff && score_only && !capture_ecp_jvp_replay && batch_ordinal == 0 && sample_offset == 0)
+  if (full_handoff && score_only && !capture_ecp_jvp_replay)
   {
     const auto& components = twfs[0].get().getOrbitals();
     const auto* real = components.size() == 1 ? dynamic_cast<const PsiFormerWF*>(components[0].get()) : nullptr;
@@ -1212,8 +1213,9 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
   }
   if (full_handoff)
-    app_log() << "KFAC immediate ECP FULL handoff: full_elided=" << reuse_immediate_full
+    app_log() << "Immediate ECP FULL handoff: full_elided=" << reuse_immediate_full
               << " full_evaluations=" << !reuse_immediate_full
+              << " batch=" << batch_ordinal << " offset=" << sample_offset
               << " host_capacity_bytes=" << full_handoff->retainedBytes()
               << "; accepted ECP grid traversal and RNG unchanged" << std::endl;
 
@@ -4087,6 +4089,28 @@ void WFTrainBatched::run()
       crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
 #endif
   const bool kfac_ecp_full_handoff = real_kfac_ecp_full_handoff || paired_kfac_ecp_full_handoff;
+  const char* score_handoff_optin = std::getenv("PSIFORMER_GPU_SCORE_ECP_FULL_HANDOFF");
+  if (score_handoff_optin && std::string(score_handoff_optin) != "0" && std::string(score_handoff_optin) != "1")
+    throw UniformCommunicateError("PSIFORMER_GPU_SCORE_ECP_FULL_HANDOFF must be 0 or 1");
+  // Every receipt is captured immediately after its own replay. It owns copied
+  // derivative evidence, never mutable FULL tapes or a previous accepted grid.
+  const bool score_ecp_full_handoff = score_handoff_optin && std::string(score_handoff_optin) == "1" &&
+      score_training && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      !resident_device_authority_ && !jastrow_binding_ && crowds_.size() == 1 &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+      ((!complex_training && immediate_real_fp64_build && device_provider &&
+        device_provider->usesAcceleratorParameterProducts() &&
+        (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN ||
+         device_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons())))
+#ifdef QMC_COMPLEX
+       || (complex_training && complex_gpu_provider_ && complex_training_component_ &&
+           complex_training_component_->gpuInferenceEnabled() &&
+           complex_training_component_->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()))
+#endif
+      );
+  if (score_handoff_optin && std::string(score_handoff_optin) == "1")
+    app_log() << "Score Adam ECP FULL handoff: eligible=" << score_ecp_full_handoff
+              << "; per-replay proof, native Hamiltonian/grid/RNG unchanged" << std::endl;
   if (immediate_optin && std::string(immediate_optin) == "1")
     app_log() << "KFAC immediate ECP FULL handoff: eligible=" << kfac_ecp_full_handoff
               << "; only the second synchronous FULL may be elided" << std::endl;
@@ -5102,10 +5126,10 @@ void WFTrainBatched::run()
             }
             std::optional<ImmediateFullReplayReceipt> full_handoff;
             std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score;
-            if (kfac_ecp_full_handoff && fresh_full && retained_samples.size() == 1 &&
+            if ((kfac_ecp_full_handoff || score_ecp_full_handoff) && fresh_full &&
                 score_training && has_nonlocal_ecp && !capture_ecp_jvp_replay)
             {
-              if (paired_kfac_ecp_full_handoff)
+              if (complex_training)
               {
                 auto live = checkedMemoryAdd(retained_configuration_bytes,
                     kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0);

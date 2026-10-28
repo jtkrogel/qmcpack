@@ -3346,13 +3346,17 @@ TEST_CASE("PsiFormer retained ENERGY replay requires exact current FULL cache ev
 }
 
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
-TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixed context",
+TEST_CASE("PsiFormer immediate replay proves fresh derivatives and fixed context",
           "[wavefunction][psiformer][immediate_full_replay]")
 {
+  const bool periodic = GENERATE(false, true);
   Lattice lattice;
-  lattice.R = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
-  lattice.BoxBConds = {true, true, true};
-  lattice.reset();
+  if (periodic)
+  {
+    lattice.R = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+    lattice.BoxBConds = {true, true, true};
+    lattice.reset();
+  }
   SimulationCell cell(lattice);
   auto live = makeLiHElectrons(cell, "lih_pp");
   WaveFunctionComponentBuilder::PSetMap sources;
@@ -3361,7 +3365,7 @@ TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixe
   sources.emplace(ions->getName(), std::move(ions));
   PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, live, sources);
   auto component = buildInternalPsiFormer(builder, "pf_immediate", 23, "pseudopotential", "0 257",
-                                         "periodic_torus_v1");
+                                         periodic ? "periodic_torus_v1" : "open_euclidean_v1");
   live.G = ValueType(0);
   live.L = ValueType(0);
   const auto log = component->evaluateLog(live, live.G, live.L);
@@ -3377,7 +3381,9 @@ TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixe
   REQUIRE(component->validatedReplaySource() == source);
   REQUIRE(component->canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian, source, version,
                                                         std::real(log), std::imag(log)));
+  const auto put_bits = [](double& value, std::uint64_t bits) { std::memcpy(&value, &bits, sizeof(bits)); };
   bool positive = false;
+  auto expected_log = std::real(log), expected_phase = std::imag(log);
   const ParticleSet* expected_source = source;
   auto expected_version = version;
   SECTION("retained derivative payload can be old while the copied fresh views prove replay")
@@ -3393,7 +3399,17 @@ TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixe
   SECTION("fresh gradient changed") { gradient[0] += .125; }
   SECTION("fresh Laplacian changed") { laplacian[0] += .125; }
   SECTION("fresh view extent changed") { gradient.pop_back(); }
-  SECTION("nonfinite fresh derivative") { laplacian[0] = std::numeric_limits<double>::infinity(); }
+  SECTION("nonfinite fresh derivative") { put_bits(laplacian[0], UINT64_C(0x7ff0000000000000)); }
+  SECTION("nonfinite expected log") { put_bits(expected_log, UINT64_C(0x7ff0000000000000)); }
+  SECTION("nonfinite expected phase") { put_bits(expected_phase, UINT64_C(0x7ff8000000000001)); }
+  SECTION("nonfinite live gradient") { put_bits(live.G[0][0], UINT64_C(0x7ff8000000000001)); }
+  SECTION("nonfinite saved coordinate") { put_bits(saved.R[0][0], UINT64_C(0x7ff0000000000000)); }
+  SECTION("nonfinite fixed source position") { put_bits(source->R[0][0], UINT64_C(0x7ff8000000000001)); }
+  SECTION("nonfinite fixed effective charge")
+  {
+    auto& species = source->getSpeciesSet();
+    put_bits(species(species.findAttribute("charge"), 0), UINT64_C(0xfff0000000000000));
+  }
   SECTION("fixed source positions changed") { source->R[0][0] += .125; }
   SECTION("fixed effective charge changed")
   {
@@ -3407,12 +3423,14 @@ TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixe
     // Both ParticleSets see the mutation: copying a ParticleSet was not a CELL snapshot.
     CHECK(saved.getLattice().R(0, 0) == live.getLattice().R(0, 0));
     CHECK(component->canReuseFullSpatialReplay(live, saved, version, std::real(log), std::imag(log)));
+    // OPEN arithmetic has no lattice metric; the driver receipt separately snapshots CELL metadata.
+    positive = !periodic;
   }
   SECTION("active ParticleSet move without a component proposal")
   {
     live.makeMove(0, ParticleSet::PosType{.01, 0, 0});
   }
-  SECTION("nonfinite CELL") { cell.getLattice().R(0, 0) = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("nonfinite CELL") { put_bits(cell.getLattice().R(0, 0), UINT64_C(0x7ff8000000000001)); }
   SECTION("spin metadata changed") { saved.spins[0] += .125; }
   SECTION("proposal pending") { testing::TestPsiFormerWF::markScalarProposalPending(*component, 0); }
   SECTION("restore pending") { testing::TestPsiFormerWF::makeReplayCacheIneligible(*component, true); }
@@ -3433,7 +3451,7 @@ TEST_CASE("PsiFormer immediate periodic replay proves fresh derivatives and fixe
   const auto workspace = testing::TestPsiFormerWF::directWorkspaceDiagnostics(*component);
   for (int repeat = 0; repeat < 2; ++repeat)
     CHECK(component->canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian, expected_source,
-                                                       expected_version, std::real(log), std::imag(log)) == positive);
+                                                       expected_version, expected_log, expected_phase) == positive);
   CHECK(testing::TestPsiFormerWF::scalarStateMatches(*component, state));
   checkScalarWorkspaceStorage(testing::TestPsiFormerWF::directWorkspaceDiagnostics(*component), workspace);
 }

@@ -404,8 +404,8 @@ public:
                                          const std::vector<ValueType>& fresh_laplacian,
                                          const ParticleSet* expected_source,
                                          std::size_t expected_version,
-                                         double expected_log,
-                                         double expected_phase) const;
+                                         const double& expected_log,
+                                         const double& expected_phase) const;
 
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
