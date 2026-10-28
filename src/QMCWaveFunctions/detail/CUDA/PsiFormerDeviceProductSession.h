@@ -23,6 +23,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
 #include <exception>
+#include "Platforms/Host/OutputManager.h"
 #include <array>
 #include <atomic>
 #include <functional>
@@ -1179,6 +1180,10 @@ private:
       return;
     invalidateScoreContraction();
     image_->validateSuccessor(active_image_);
+    if (profile_ == ProductSessionProfile::SCORE_ONLY && outputManager.isDebugActive())
+      app_debug_stream() << "PsiFormer score lane image rebind: session=" << this << " source_image=" << image_.get()
+                << " successor_image=" << active_image_.get() << " parameter_version=" << active_image_->version()
+                << "; idle fixed-shape arenas retained; process_local_identity\n";
     values_.rebindModel(active_image_);
     score_.rebindModel(active_image_);
     jvp_.rebindModel(active_image_);

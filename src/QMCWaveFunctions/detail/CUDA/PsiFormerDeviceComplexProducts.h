@@ -138,6 +138,22 @@ public:
     LocalTerms terms;
   };
 
+  /// Reuse only the idle score arena; all borrowed results become stale before rebinding.
+  void rebindScoreModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    requireNoStreamingNonlocal();
+    if (cost_.scope != ComplexProductsScope::SCORE_ECP_ONLY)
+      throw std::logic_error("Only score-only complex products support idle image rebind");
+    if (successor == image_) return;
+    image_->validateSuccessor(successor);
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex products generation exhausted");
+    ready_ = jvp_ready_ = false;
+    ++generation_;
+    score_->rebindModel(successor);
+    image_ = std::move(successor);
+  }
+
   /// Reject checked combined device/host/work caps before either numerical owner allocates.
   static std::unique_ptr<PreparedDeviceComplexProducts> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
@@ -993,7 +1009,7 @@ private:
       throw std::logic_error("Complex products actual inventory differs from checked admission");
   }
 
-  const std::shared_ptr<const PreparedDeviceModel> image_;
+  std::shared_ptr<const PreparedDeviceModel> image_;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
   const ComplexProductsCost cost_;

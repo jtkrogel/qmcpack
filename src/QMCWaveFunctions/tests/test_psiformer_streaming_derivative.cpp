@@ -1538,6 +1538,8 @@ TEST_CASE("PsiFormer real GPU score-only profiles preserve complete-product lane
     ScopedEnvironmentVariable crowds("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "2");
     PsiFormerWF gpu("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
     RefVectorWithLeader<WaveFunctionComponent> components(gpu, {gpu});
+    auto anchor0 = gpu.retainGpuScoreLane(0), anchor1 = gpu.retainGpuScoreLane(1);
+    CHECK_THROWS(gpu.retainGpuScoreLane(2));
     auto first = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
     auto second = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 1, 1, 7);
     CHECK(first->storageDiagnostics().shared_workspace_identity != second->storageDiagnostics().shared_workspace_identity);
@@ -1564,6 +1566,28 @@ TEST_CASE("PsiFormer real GPU score-only profiles preserve complete-product lane
     auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
     gpu.publishParameters(candidate, candidate.version);
     CHECK_THROWS(run(*first)); CHECK_THROWS(run(*second));
+    const auto id0 = first->storageDiagnostics().shared_workspace_identity;
+    const auto id1 = second->storageDiagnostics().shared_workspace_identity;
+    first.reset(); second.reset();
+    const auto before_recreate = metrics.snapshot();
+    first = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 7);
+    second = gpu.makeGpuScoreStreamingDerivativeOperator(components, particles, 1, 1, 7);
+    CHECK(first->storageDiagnostics().shared_workspace_identity == id0);
+    CHECK(second->storageDiagnostics().shared_workspace_identity == id1);
+    auto candidate_cpu = cpu.snapshotParameters(); candidate_cpu.values[0] += .001;
+    cpu.publishParameters(candidate_cpu, candidate_cpu.version);
+    auto updated_reference = cpu.makeStreamingDerivativeOperator(cpu_components, particles, 0, 0, 7);
+    const wftrain::StructuredParameterVectorConstView updated_tangent(gpu.parameterSchema(), first->parameterVersion(),
+        {direction.data(), direction.size()});
+    RecordingSampleSink actual0, actual1, expected_updated;
+    first->applyScoreJVP(updated_tangent, actual0); second->applyScoreJVP(updated_tangent, actual1);
+    updated_reference->applyScoreJVP(updated_tangent, expected_updated);
+    checkClose(actual0.results()[0], expected_updated.results()[0]);
+    checkClose(actual1.results()[0], expected_updated.results()[0]);
+    const auto after_recreate = metrics.snapshot();
+    CHECK(after_recreate.allocation_calls == before_recreate.allocation_calls);
+    // Both fixed arenas survive; their last shared old canonical image retires after both rebinds.
+    CHECK(before_recreate.live_bytes - after_recreate.live_bytes == p * sizeof(double));
   }
   else
     WARN("NOT_RUN: C2 score-lane qualification requires PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES");

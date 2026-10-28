@@ -3573,6 +3573,9 @@ void WFTrainBatched::run()
   if (selected_provider_ == nullptr)
     throw UniformCommunicateError("WFTrainBatched: process() must select a provider before run()");
 
+  // Declare before every iteration owner: snapshots and callbacks die before these driver-phase anchors.
+  std::vector<std::shared_ptr<PsiFormerGpuScoreLaneAnchor>> score_lane_anchors;
+  std::vector<std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor>> complex_score_lane_anchors;
   auto* device_provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
   const bool resident_score_adam = resident_score_adam_;
@@ -4393,6 +4396,29 @@ void WFTrainBatched::run()
   myComm->bcast(history_failed);
   if (history_failed)
     throw UniformCommunicateError("WFTrainBatched: conflicting output family or inaccessible training history");
+
+  if (score_training && training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP())
+  {
+    if (device_provider && device_provider->usesAcceleratorParameterProducts())
+      for (std::size_t ordinal = 0; ordinal < crowds_.size(); ++ordinal)
+        score_lane_anchors.push_back(device_provider->retainGpuScoreLane(ordinal));
+
+#ifdef QMC_COMPLEX
+    else if (complex_gpu_provider_)
+    {
+      const auto* complex = complex_training_component_;
+      if (!complex || !complex->gpuInferenceEnabled())
+        throw UniformCommunicateError("Complex score anchors require the admitted GPU component behind the provider");
+      const auto& limits = training_input_.getComplexGpuTraining();
+      for (std::size_t ordinal = 0; ordinal < crowds_.size(); ++ordinal)
+        complex_score_lane_anchors.push_back(complex->retainGpuScoreLane(ordinal, crowds_[ordinal]->size(),
+            limits.kinetic_targets, std::min(selected_provider_->parameterSchema().parameterCount(),
+                training_input_.getParameterChunkSize()), limits.device_bytes, limits.host_bytes,
+            limits.maximum_matrix_work));
+    }
+#endif
+  }
 
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);

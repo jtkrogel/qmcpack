@@ -1010,7 +1010,7 @@ struct PsiFormerComplexWF::Impl
     /// Declare before Products: borrowers die before their exact queue/BLAS/image generation.
     const std::shared_ptr<GpuLane> generation;
     // Pin the immutable image separately: publication rebinds inference lanes.
-    const std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+    std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
     const std::size_t maximum_samples, targets, chunk;
     const GpuDerivativeScope scope;
     compute::Queue<PlatformKind::CUDA> queue;
@@ -1019,8 +1019,73 @@ struct PsiFormerComplexWF::Impl
     std::mutex device_mutex;
     const std::vector<C> zeros;
     std::vector<Products::Channel> channels;
-    std::mutex execution_mutex;
+    std::recursive_mutex execution_mutex;
+    bool active = false;
   };
+
+  /// Reject callback re-entry while retaining the lane through the complete sink traversal.
+  struct GpuDerivativeLease
+  {
+    explicit GpuDerivativeLease(GpuDerivativeLane& lane) : lock(lane.execution_mutex), lane(lane)
+    {
+      if (lane.active) throw std::logic_error("Complex GPU derivative lane cannot be re-entered");
+      lane.active = true;
+    }
+    GpuDerivativeLease(GpuDerivativeLease&& other) noexcept : lock(std::move(other.lock)), lane(other.lane) {}
+    GpuDerivativeLease(const GpuDerivativeLease&) = delete;
+    GpuDerivativeLease& operator=(const GpuDerivativeLease&) = delete;
+    ~GpuDerivativeLease() { unlock(); }
+    bool owns_lock() const noexcept { return lock.owns_lock(); }
+    void unlock() noexcept
+    {
+      if (lock.owns_lock())
+      {
+        lane.active = false;
+        lock.unlock();
+      }
+    }
+    std::unique_lock<std::recursive_mutex> lock;
+    GpuDerivativeLane& lane;
+  };
+
+  /// Called under Model read, current inference-generation lock and derivative-factory lock.
+  static std::shared_ptr<GpuDerivativeLane> acquireGpuDerivativeLane(const std::shared_ptr<Model>& state,
+      std::size_t ordinal, std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
+      const PsiFormerComplexWF::GpuDerivativeRequirements& budget, GpuDerivativeScope scope)
+  {
+    auto& selected = scope == GpuDerivativeScope::SCORE_ECP_ONLY
+        ? state->gpu_score_crowd_lanes[state->gpu_crowds == 1 ? 0 : ordinal] : state->gpu_derivative_lane;
+    auto lane = selected.lock();
+    // COMPLETE retains its original replacement contract: an obsolete profile does not constrain its successor.
+    if (lane && scope != GpuDerivativeScope::SCORE_ECP_ONLY &&
+        (lane->generation != state->gpu || lane->image != state->gpu->image))
+      lane.reset();
+    if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets ||
+        lane->chunk != chunk || lane->scope != scope))
+      throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
+    if (lane && (lane->generation != state->gpu || lane->image != state->gpu->image))
+    {
+      if (scope != GpuDerivativeScope::SCORE_ECP_ONLY) lane.reset();
+      else
+      {
+        std::unique_lock idle(lane->execution_mutex, std::try_to_lock);
+        if (!idle.owns_lock() || lane->active || lane->generation != state->gpu)
+          throw std::logic_error("Complex score image rebind requires its idle original generation");
+        const auto previous = lane->image;
+        lane->products->rebindScoreModel(state->gpu->image);
+        lane->image = state->gpu->image;
+        if (outputManager.isDebugActive())
+          app_debug_stream() << "Complex score lane image rebind: lane=" << lane.get()
+                  << " source_image=" << previous.get() << " successor_image=" << lane->image.get()
+                  << " parameter_version=" << lane->image->version()
+                  << "; idle fixed-shape arenas retained; process_local_identity" << std::endl;
+      }
+    }
+    if (!lane) lane = std::make_shared<GpuDerivativeLane>(state, maximum_samples, targets, chunk, budget, scope);
+    selected = lane;
+    if (ordinal == 0) state->gpu_derivative_lane = lane;
+    return lane;
+  }
 
   /// Immutable HOST samples with no CPU tapes; numerical output remains leased through sink callbacks.
   struct GpuDerivativeStream final : wftrain::StreamingDerivativeOperator
@@ -1121,7 +1186,7 @@ struct PsiFormerComplexWF::Impl
     /// Validate captured VALUE provenance and complete admission before adopting any replay storage.
     void bindNonLocalECPJVPReplay(std::unique_ptr<wftrain::NonLocalECPJVPReplay> incoming) override
     {
-      std::unique_lock execution(lane->execution_mutex);
+      GpuDerivativeLease execution(*lane);
       std::shared_lock read(lane->state->mutex);
       requireCurrent();
       if (!incoming || replay || has_evaluated)
@@ -1254,7 +1319,7 @@ struct PsiFormerComplexWF::Impl
         wftrain::SampleProductSink& sink) const override
     {
       NativeTimerScope timer(phase_timers.score_jvp);
-      std::unique_lock execution(lane->execution_mutex);
+      GpuDerivativeLease execution(*lane);
       has_evaluated = true;
       const C* output;
       {
@@ -1297,7 +1362,7 @@ struct PsiFormerComplexWF::Impl
     void evaluateLocalEnergyJVP(const wftrain::StructuredParameterVectorConstView& direction,
         std::uint32_t mask, wftrain::SampleProductSink& sink) const override
     {
-      std::unique_lock execution(lane->execution_mutex);
+      GpuDerivativeLease execution(*lane);
       has_evaluated = true;
       const C* output;
       {
@@ -1324,7 +1389,7 @@ struct PsiFormerComplexWF::Impl
     {
       NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
-      std::unique_lock execution(lane->execution_mutex);
+      GpuDerivativeLease execution(*lane);
       has_evaluated = true;
       GpuDerivativeLane::Products::CompletedResult result;
       {
@@ -1494,7 +1559,7 @@ struct PsiFormerComplexWF::Impl
   struct GpuNonLocalCapture final : wftrain::NonLocalECPDerivativeConsumer
   {
     const std::shared_ptr<GpuDerivativeLane> lane;
-    std::unique_lock<std::mutex> execution;
+    GpuDerivativeLease execution;
     std::unique_ptr<GpuNonLocalReplay> record;
     std::vector<const ParticleSet*> particles;
     std::size_t expected = 0;
@@ -1530,7 +1595,7 @@ struct PsiFormerComplexWF::Impl
 
     /// Allocate only preadmitted capture capacities before the Hamiltonian traversal.
     GpuNonLocalCapture(const GpuDerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
-        std::unique_lock<std::mutex>&& lease, std::size_t cap)
+        GpuDerivativeLease&& lease, std::size_t cap)
         : lane(s.lane), execution(std::move(lease)), record(std::make_unique<GpuNonLocalReplay>(s))
     {
       const auto q = lane->maximum_samples - s.samples;
@@ -2284,10 +2349,11 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
     /// Reuse the accepted GPU stream's immutable image and device accumulator without a Q owner.
     NonLocalVJPCapture(const GpuDerivativeStream& s, const RefVectorWithLeader<ParticleSet>& targets,
-        std::unique_lock<std::mutex>&& lease)
-        : NonLocalVJPCapture(s.lane->state, s, s.positions, targets, std::move(lease), true)
+        GpuDerivativeLease&& lease)
+        : NonLocalVJPCapture(s.lane->state, s, s.positions, targets, std::unique_lock<std::mutex>{}, true)
     {
       gpu_lane = s.lane;
+      gpu_execution.emplace(std::move(lease));
     }
 #endif
 
@@ -2516,7 +2582,10 @@ struct PsiFormerComplexWF::Impl
         }
         sink->end();
         state = State::COMPLETE;
-        execution.unlock();
+#ifdef ENABLE_CUDA
+        gpu_execution.reset();
+#endif
+        if (execution.owns_lock()) execution.unlock();
       }
       catch (...) { abort(); throw; }
     }
@@ -2525,12 +2594,15 @@ struct PsiFormerComplexWF::Impl
     void abort() noexcept override
     {
 #ifdef ENABLE_CUDA
-      if (gpu_lane && execution.owns_lock())
+      if (gpu_lane && gpu_execution && gpu_execution->owns_lock())
         gpu_lane->products->abortStreamingNonlocalVJP();
 #endif
       if (sink)
         sink->abort();
       state = State::POISONED;
+#ifdef ENABLE_CUDA
+      gpu_execution.reset();
+#endif
       if (execution.owns_lock())
         execution.unlock();
     }
@@ -2573,6 +2645,7 @@ struct PsiFormerComplexWF::Impl
     std::shared_ptr<DerivativeLane> cpu_lane;
 #ifdef ENABLE_CUDA
     std::shared_ptr<GpuDerivativeLane> gpu_lane;
+    std::optional<GpuDerivativeLease> gpu_execution;
 #endif
     std::vector<C> coefficients, energies;
     std::vector<double> moved_positions;
@@ -3426,6 +3499,17 @@ struct PsiFormerComplexWF::Impl
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
 };
 
+/// Driver-phase ownership avoids a strong Model-to-lane cycle.
+class PsiFormerComplexGpuScoreLaneAnchor
+{
+  friend class PsiFormerComplexWF;
+#ifdef ENABLE_CUDA
+  explicit PsiFormerComplexGpuScoreLaneAnchor(std::shared_ptr<PsiFormerComplexWF::Impl::GpuDerivativeLane> lane)
+      : lane_(std::move(lane)) {}
+  const std::shared_ptr<PsiFormerComplexWF::Impl::GpuDerivativeLane> lane_;
+#endif
+};
+
 /// Keep the accepted traversal and both provenance owners alive without copying virtual configurations.
 class PsiFormerComplexWF::FixedGridEnergyReference
 {
@@ -4015,7 +4099,10 @@ std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::make
   const bool device = gpu != nullptr;
   if ((cpu && cpu->state != impl_->state) || (gpu && gpu->lane->state != impl_->state) || (!cpu && !gpu))
     throw std::invalid_argument("Complex inline ECP requires its own accepted derivative stream");
-  std::unique_lock execution(device ? gpu->lane->execution_mutex : cpu->lane->execution_mutex);
+  std::unique_lock<std::mutex> execution;
+  std::optional<Impl::GpuDerivativeLease> gpu_execution;
+  if (device) gpu_execution.emplace(*gpu->lane);
+  else execution = std::unique_lock(cpu->lane->execution_mutex);
 #else
   const bool device = false;
   if (!cpu || cpu->state != impl_->state)
@@ -4060,7 +4147,7 @@ std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::make
   }
   std::unique_ptr<Impl::NonLocalVJPCapture> capture;
 #ifdef ENABLE_CUDA
-  if (gpu) capture = std::make_unique<Impl::NonLocalVJPCapture>(*gpu, particles, std::move(execution));
+  if (gpu) capture = std::make_unique<Impl::NonLocalVJPCapture>(*gpu, particles, std::move(*gpu_execution));
   else
 #endif
     capture = std::make_unique<Impl::NonLocalVJPCapture>(*cpu, particles, std::move(execution));
@@ -4100,7 +4187,7 @@ std::size_t PsiFormerComplexWF::gpuNonLocalReplayRequiredBytes(const wftrain::St
 #ifdef ENABLE_CUDA
   const auto* s = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
   if (!s || s->lane->state != impl_->state) throw std::invalid_argument("Complex ECP capture requires its own GPU operator");
-  std::unique_lock execution(s->lane->execution_mutex);
+  Impl::GpuDerivativeLease execution(*s->lane);
   std::shared_lock read(impl_->state->mutex);
   s->requireCurrent();
   if (s->replay || s->has_evaluated) throw std::logic_error("Complex ECP capture requires an unused unbound operator");
@@ -4119,7 +4206,7 @@ std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::make
   const auto* s = dynamic_cast<const Impl::GpuDerivativeStream*>(&op);
   if (!s || s->lane->state != impl_->state || !host_cap || host_cap == std::numeric_limits<std::size_t>::max())
     throw std::invalid_argument("Complex ECP capture requires its own operator and finite HOST cap");
-  std::unique_lock execution(s->lane->execution_mutex);
+  Impl::GpuDerivativeLease execution(*s->lane);
   std::shared_lock read(impl_->state->mutex);
   s->requireCurrent();
   if (s->replay || s->has_evaluated) throw std::logic_error("Complex ECP capture requires an unused unbound operator");
@@ -4169,6 +4256,38 @@ PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeR
   }
 #endif
   throw std::logic_error("Explicit GPU derivatives require an immutable GPU inference profile");
+}
+
+std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor> PsiFormerComplexWF::retainGpuScoreLane(
+    std::size_t ordinal, std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
+    std::size_t device_cap, std::size_t host_cap, std::size_t work_cap) const
+{
+#ifdef ENABLE_CUDA
+  const auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  if (!state->gpu || !maximum_samples || ordinal >= state->gpu_crowds || state->gpu_crowds > 2)
+    throw std::invalid_argument("Complex score anchor requires the admitted GPU C1/C2 profile");
+  std::unique_lock gpu(state->gpu->mutex);
+  if (state->pending_proposals.load(std::memory_order_relaxed))
+    throw std::logic_error("Complex score anchor requires an idle model family");
+  Impl::validateDerivativeSource(*state);
+  constexpr auto scope = GpuDerivativeScope::SCORE_ECP_ONLY;
+  const auto budget = Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk, scope);
+  for (const auto cap : {device_cap, host_cap, work_cap})
+    if (!cap || cap == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Complex score anchor requires positive finite domain/work caps");
+  if (budget.device_bytes > device_cap || budget.host_bytes > host_cap || budget.matrix_work > work_cap)
+    throw std::length_error("Complex score anchor exceeds domain/work admission");
+  std::lock_guard preparation(state->derivative_factory_mutex);
+  auto lane = Impl::acquireGpuDerivativeLane(state, ordinal, maximum_samples, targets, chunk, budget, scope);
+  app_log() << "Complex score lane driver anchor: crowd=" << ordinal << " lane=" << lane.get()
+            << " active_image=" << lane->image.get() << " parameter_version=" << lane->image->version()
+            << " DEVICE_bytes=" << budget.device_bytes << " HOST_bytes=" << budget.host_bytes
+            << "; process_local_identity; caller snapshots/shared image excluded" << std::endl;
+  return std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor>(new PsiFormerComplexGpuScoreLaneAnchor(std::move(lane)));
+#else
+  throw std::invalid_argument("Complex score anchors require an immutable GPU profile");
+#endif
 }
 
 /// Admit the actual SOLE TrialWF batch before allocating any derivative numerical ownership.
@@ -4237,15 +4356,8 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
       }
     }
     std::lock_guard preparation(state->derivative_factory_mutex);
-    auto& selected = state->gpu_crowds == 2 ? state->gpu_score_crowd_lanes[ordinal] : state->gpu_derivative_lane;
-    auto lane = selected.lock();
-    if (lane && (lane->generation != state->gpu || lane->image != state->gpu->image))
-      lane.reset();
-    if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk || lane->scope != scope))
-      throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
-    if (!lane)
-      lane = std::make_shared<Impl::GpuDerivativeLane>(state, maximum_samples, targets, chunk,
-          Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk, scope), scope);
+    auto lane = Impl::acquireGpuDerivativeLane(state, ordinal, maximum_samples, targets, chunk,
+        Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk, scope), scope);
     auto result = std::make_unique<Impl::GpuDerivativeStream>(lane, ordinal, offset, samples, host_cap);
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
@@ -4259,7 +4371,6 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     }
     if (result->storageDiagnostics().retained_numeric_bytes != required.device_bytes + required.host_bytes)
       throw std::logic_error("Complex GPU derivative numeric capacity differs from exact admission");
-    selected = lane;
     // Affine collection is rank-global and sequential, using the first score
     // lane over all retained coordinates without creating another owner.
     if (ordinal == 0) state->gpu_derivative_lane = lane;
@@ -4376,7 +4487,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
     throw std::logic_error("Paired DEVICE affine collection requires an existing prepared score-products lane");
   // Match derivative streams: execution precedes model read and spans collection.
   // HOST sinks run outside the model and GPU locks.
-  std::unique_lock execution(lane->execution_mutex);
+  Impl::GpuDerivativeLease execution(*lane);
   const auto current = [&] {
     if (impl_->state != state || lane->generation != state->gpu ||
         expected_version != state->model.p.version() || lane->scope != GpuDerivativeScope::SCORE_ECP_ONLY ||

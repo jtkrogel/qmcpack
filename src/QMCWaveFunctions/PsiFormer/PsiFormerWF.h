@@ -75,6 +75,7 @@ struct DirectScoreResult;
 
 namespace qmcplusplus
 {
+class PsiFormerGpuScoreLaneAnchor;
 namespace psiformer
 {
 /// Dependency-light result of deterministic native PsiFormer initialization.
@@ -684,6 +685,9 @@ public:
 
   /// Retain one shared lane and admit C3; return separately charged norm bytes.
   std::size_t prepareResidentEnergyAdam(std::size_t budget) const;
+
+  /// Driver-phase ownership of one existing score lane; model registration remains weak.
+  std::shared_ptr<PsiFormerGpuScoreLaneAnchor> retainGpuScoreLane(std::size_t crowd_ordinal) const;
 
   /// Retain a SCORE_ONLY lane and ordered C2 contractions; physical EL/sampling remain HOST.
   std::size_t prepareResidentScoreAdam(std::size_t budget) const;

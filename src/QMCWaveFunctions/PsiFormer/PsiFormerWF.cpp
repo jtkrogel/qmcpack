@@ -2371,6 +2371,20 @@ struct PsiFormerDerivativeScratch
   psiformer::memory::HostCapacity trace_host_capacity;
 };
 
+/// Driver owns this handle; no strong link points back to the model state.
+class PsiFormerGpuScoreLaneAnchor
+{
+public:
+  ~PsiFormerGpuScoreLaneAnchor() = default;
+private:
+  friend class PsiFormerWF;
+  PsiFormerGpuScoreLaneAnchor(std::shared_ptr<const pf::DirectBatchTileBackend> backend,
+      std::shared_ptr<PsiFormerDerivativeScratch> lane) : backend_(std::move(backend)), lane_(std::move(lane)) {}
+  // The session borrows backend controls; destroy the lane before its backend.
+  const std::shared_ptr<const pf::DirectBatchTileBackend> backend_;
+  const std::shared_ptr<PsiFormerDerivativeScratch> lane_;
+};
+
 /** Serialize competing calls, but reject re-entry from a sink callback.
  * Recursive acquisition must fail rather than deadlock or overwrite the outer
  * operation's still-live channels/sample products.
@@ -14259,6 +14273,32 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
   return norm;
 #else
   throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
+#endif
+}
+
+/// Keep the fixed score arena alive for the driver phase without retaining the model state.
+std::shared_ptr<PsiFormerGpuScoreLaneAnchor> PsiFormerWF::retainGpuScoreLane(std::size_t crowd_ordinal) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  if (!backend || !usesAcceleratorParameterProducts() ||
+      crowd_ordinal >= backend->activeInferenceCrowdCapacity() || backend->activeInferenceCrowdCapacity() > 2)
+    throw std::invalid_argument("Score lane anchor requires the admitted GPU ECP C1/C2 profile");
+  auto lane = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount(), 4, true, crowd_ordinal);
+  std::unique_lock execution(lane->execution_mutex, std::try_to_lock);
+  if (!execution.owns_lock() || lane->active)
+    throw std::logic_error("Score lane anchor preparation requires an idle numerical lane");
+  const auto image = backend->currentImage();
+  app_log() << "PsiFormer score lane driver anchor: crowd=" << crowd_ordinal << " lane=" << lane.get()
+            << " session=" << lane->device_products.get() << " active_image=" << image.get() << " metadata_family=" << image->metadataFamily().get()
+            << " parameter_version=" << image->version() << " DEVICE_bytes=" << lane->device_products->deviceWorkspaceBytes()
+            << " HOST_bytes=" << lane->device_products->hostWorkspaceBytes()
+            << "; process_local_identity; caller snapshots/later HOST outputs/shared image excluded" << std::endl;
+  return std::shared_ptr<PsiFormerGpuScoreLaneAnchor>(new PsiFormerGpuScoreLaneAnchor(
+      model_state_->numerical_tile_backend, std::move(lane)));
+#else
+  throw std::invalid_argument("GPU score lane anchors require a real GPU profile");
 #endif
 }
 

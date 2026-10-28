@@ -22,6 +22,7 @@
 namespace qmcplusplus
 {
 class TrialWaveFunction;
+class PsiFormerComplexGpuScoreLaneAnchor;
 namespace wftrain { class NonLocalECPNativeCapture; class KFACBlockRegistry; }
 namespace psiformer
 {
@@ -210,6 +211,11 @@ public:
   GpuDerivativeRequirements gpuDerivativeRequirements(std::size_t sample_count,
       std::size_t maximum_batch_samples, std::size_t targets, std::size_t chunk,
       GpuDerivativeScope scope = GpuDerivativeScope::COMPLETE) const;
+
+  /// Driver-phase lifetime only; no Model-owned strong lane link.
+  std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor> retainGpuScoreLane(std::size_t crowd_ordinal,
+      std::size_t maximum_batch_samples, std::size_t targets, std::size_t chunk,
+      std::size_t maximum_device_bytes, std::size_t maximum_host_bytes, std::size_t maximum_matrix_work) const;
 
   /// Immutable sample products for explicit analysis/hybrid driver: sole TrialWF, TRANSPOSE SCORE/physical dK.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedGpuDerivativeOperator(
@@ -476,6 +482,7 @@ public:
   void evaluateDerivatives(ParticleSet&, const OptVariables&, Vector<ValueType>&, Vector<ValueType>&) override;
 
 private:
+  friend class PsiFormerComplexGpuScoreLaneAnchor;
   struct Impl;
   /// CPU and explicit hybrid entry points share one admitted HOST affine owner.
   void prepareAffineScoresImpl(std::size_t maximum_bytes, bool hybrid);

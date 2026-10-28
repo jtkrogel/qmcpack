@@ -4289,6 +4289,8 @@ TEST_CASE("PsiFormer complex C2 score lanes preserve weighted partition sums",
   constexpr auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
   const auto r0 = gpu.gpuDerivativeRequirements(1, 1, 1, 7, scope);
   const auto r1 = gpu1.gpuDerivativeRequirements(2, 2, 1, 7, scope);
+  auto anchor0 = gpu.retainGpuScoreLane(0, 1, 1, 7, r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work));
+  auto anchor1 = gpu1.retainGpuScoreLane(1, 2, 1, 7, r1.device_bytes, r1.host_bytes, std::max(std::size_t{1}, r1.matrix_work));
   auto first = gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 0, 0, 1, 1, 7,
       r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work), scope);
   auto second = gpu1.makeBudgetedGpuDerivativeOperator(trials1, particles1, 1, 1, 2, 1, 7,
@@ -4327,8 +4329,95 @@ TEST_CASE("PsiFormer complex C2 score lanes preserve weighted partition sums",
   for (std::size_t i = 0; i < a.size(); ++i) close(a[i] + b[i], expected[i], 3e-9);
   auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
   const auto q = gpu.gpuParameterPublicationRequirements();
-  gpu.publishBudgetedGpuParameters(candidate, candidate.version, q.device_bytes, q.host_bytes);
+  // A publication inside a sink callback must not rebind an arena still borrowed by that callback.
+  ComplexStreamingSink publication_sink;
+  bool published = false;
+  publication_sink.callback = [&] {
+    if (published) return;
+    published = true;
+    gpu.publishBudgetedGpuParameters(candidate, candidate.version, q.device_bytes, q.host_bytes);
+    CHECK_THROWS(gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 0, 0, 1, 1, 7,
+        r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work), scope));
+    CHECK_THROWS(contract(*first, 0, 0));
+  };
+  const CoefficientView publication_weights{first->parameterSchema().providerId(), first->parameterSchema().fingerprint(),
+      first->parameterVersion(), 0, 0, {coefficients.data(), 1}};
+  const VJPCoefficientChannel publication_channel{"score", DerivativeProduct::SCORE_VJP, publication_weights, 0};
+  first->applyVJPs({&publication_channel, 1}, DerivativeAdjoint::HERMITIAN, publication_sink);
+  REQUIRE(published);
   CHECK_THROWS(contract(*first, 0, 0)); CHECK_THROWS(contract(*second, 1, 1));
+  const auto id0 = first->storageDiagnostics().shared_workspace_identity;
+  const auto id1 = second->storageDiagnostics().shared_workspace_identity;
+  first.reset(); second.reset();
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto before_recreate = metrics.snapshot();
+  first = gpu.makeBudgetedGpuDerivativeOperator(trials0, particles0, 0, 0, 1, 1, 7,
+      r0.device_bytes, r0.host_bytes, std::max(std::size_t{1}, r0.matrix_work), scope);
+  second = gpu1.makeBudgetedGpuDerivativeOperator(trials1, particles1, 1, 1, 2, 1, 7,
+      r1.device_bytes, r1.host_bytes, std::max(std::size_t{1}, r1.matrix_work), scope);
+  CHECK(first->storageDiagnostics().shared_workspace_identity == id0);
+  CHECK(second->storageDiagnostics().shared_workspace_identity == id1);
+  const auto after_recreate = metrics.snapshot();
+  CHECK(after_recreate.allocation_calls == before_recreate.allocation_calls);
+  // Inference already adopted the successor; the two score arenas release the last shared old image.
+  CHECK(before_recreate.live_bytes - after_recreate.live_bytes == gpu.parameterSchema().parameterCount() * sizeof(double));
+  auto candidate_cpu = cpu.snapshotParameters(); candidate_cpu.values[0] += .001;
+  cpu.publishParameters(candidate_cpu, candidate_cpu.version);
+  oracle = cpu.makeBudgetedStreamingDerivativeOperator(components, all, 0, 0, 7,
+      cpu.streamingDerivativeRequiredBytes(3));
+  const auto updated_expected = contract(*oracle, 0, 0);
+  const auto updated_a = contract(*first, 0, 0), updated_b = contract(*second, 1, 1);
+  for (std::size_t i = 0; i < updated_a.size(); ++i)
+    close(updated_a[i] + updated_b[i], updated_expected[i], 3e-9);
+  const auto before_retire = metrics.snapshot();
+  anchor0.reset(); anchor1.reset();
+  CHECK(metrics.snapshot().live_bytes == before_retire.live_bytes); // Operators still borrow both lanes.
+  first.reset(); second.reset();
+  const auto retired = metrics.snapshot();
+  CHECK(before_retire.live_bytes - retired.live_bytes == r0.device_bytes + r1.device_bytes);
+}
+
+TEST_CASE("PsiFormer stale COMPLETE GPU owners permit a different successor capacity",
+          "[wavefunction][psiformer][complex_gpu_complete_replacement]")
+{
+  using namespace wftrain;
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+#endif
+  { WARN("NOT_RUN: COMPLETE owner replacement requires a GPU"); return; }
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS", "1");
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), source = ions(simulation_cell);
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("complete_replacement", parameters(), p, source,
+      clone_cap, std::array<double, 3>{.17, -.11, .07}, 64 * 1024 * 1024);
+  auto& gpu = *owner; trial.addComponent(std::move(owner));
+  RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial});
+  RefVectorWithLeader<ParticleSet> particles(p, {p});
+  const auto first_budget = gpu.gpuDerivativeRequirements(1, 1, 1, 7);
+  auto stale = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 0, 0, 1, 1, 7,
+      first_budget.device_bytes, first_budget.host_bytes, first_budget.matrix_work);
+  const auto first_identity = stale->storageDiagnostics().shared_workspace_identity;
+  auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
+  const auto publication = gpu.gpuParameterPublicationRequirements();
+  gpu.publishBudgetedGpuParameters(candidate, candidate.version, publication.device_bytes, publication.host_bytes);
+  const auto next_budget = gpu.gpuDerivativeRequirements(1, 2, 2, 11);
+  auto current = gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 0, 0, 2, 2, 11,
+      next_budget.device_bytes, next_budget.host_bytes, next_budget.matrix_work);
+  CHECK(current->parameterVersion() == candidate.version + 1);
+  CHECK(current->storageDiagnostics().shared_workspace_identity != first_identity);
+  // A live CURRENT profile still cannot be silently replaced by a different request.
+  CHECK_THROWS(gpu.makeBudgetedGpuDerivativeOperator(trials, particles, 0, 0, 1, 1, 7,
+      first_budget.device_bytes, first_budget.host_bytes, first_budget.matrix_work));
+  std::vector<C> direction(gpu.parameterSchema().parameterCount(), C{.001, 0});
+  ComplexSampleSink rejected;
+  CHECK_THROWS(stale->applyScoreJVP({gpu.parameterSchema(), candidate.version,
+      {direction.data(), direction.size()}}, rejected));
 }
 
 TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical products",
@@ -7315,6 +7404,9 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   const auto& schema = gpu.parameterSchema();
   std::vector<C> coefficients{{.7, -.2}, {-.4, .3}}, direction(schema.parameterCount());
   for (std::size_t i = 0; i < direction.size(); ++i) direction[i] = .003 * std::sin(double(i + 1));
+  // The factory's moved-from lease must not clear the capture's active fence.
+  ComplexSampleSink replay_borrowed;
+  CHECK_THROWS(op->applyScoreJVP({schema, 0, {direction.data(), direction.size()}}, replay_borrowed));
   VJPCoefficientChannel channel{"actual_nonlocal", DerivativeProduct::LOCAL_ENERGY_VJP,
       {schema.providerId(), schema.fingerprint(), 0, 19, 23, {coefficients.data(), 2}},
       localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
@@ -7362,6 +7454,8 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   CHECK_THROWS(gpu.nonLocalVJPCaptureRequiredBytes(0));
   CHECK_THROWS(gpu.makeBudgetedNonLocalVJPConsumer(trials, particles, *op, inline_bytes - 1));
   auto inline_consumer = gpu.makeBudgetedNonLocalVJPConsumer(trials, particles, *op, inline_bytes);
+  ComplexSampleSink inline_borrowed;
+  CHECK_THROWS(op->applyScoreJVP({schema, 0, {direction.data(), direction.size()}}, inline_borrowed));
   CHECK(inline_consumer->storageDiagnostics().retained_numeric_bytes <= inline_bytes);
   PreparedLocalEnergyVJPCapture inline_sink(schema, 0, channel.local_energy_term_mask);
   auto mismatched_channel = channel;
