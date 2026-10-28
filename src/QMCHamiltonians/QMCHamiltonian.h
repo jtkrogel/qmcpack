@@ -290,6 +290,8 @@ public:
    * Exactly one ordinary-locality scalar-relativistic NonLocalECPotential is
    * traversed.  Its accepted quadrature grid supplies both its energy and VJP;
    * every other physical Hamiltonian term follows its normal multiwalker path.
+   * keep_grid=true requires a validated/restored captured grid and consumes no rotation RNG.
+   * The default preserves ordinary stochastic rotations and RNG consumption.
    */
   static StreamingNonLocalECPResult mw_evaluateWithStreamingNonLocalECPDerivatives(
       const RefVectorWithLeader<QMCHamiltonian>& ham_list,
@@ -298,7 +300,7 @@ public:
       wftrain::NonLocalECPDerivativeConsumer& consumer,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       wftrain::ParameterReductionSink& sink,
-      std::size_t native_capture_host_cap = 0);
+      std::size_t native_capture_host_cap = 0, bool keep_grid = false);
 
   /** evaluate Local energy with Toperators updated.
    * @param P ParticleSEt

@@ -753,7 +753,7 @@ std::uint64_t NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
     const RefVectorWithLeader<ParticleSet>& p_list,
     wftrain::NonLocalECPDerivativeConsumer& consumer,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-    wftrain::ParameterReductionSink& sink) const
+    wftrain::ParameterReductionSink& sink, bool keep_grid) const
 {
   auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
   if (this != &leader)
@@ -803,7 +803,7 @@ std::uint64_t NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
             static_cast<std::size_t>(leader.IonConfig.getTotalNum()))
       throw std::invalid_argument(
           "NonLocalECPotential streaming-derivative crowd has incompatible particle shapes.");
-    if (potential.myRNG == nullptr)
+    if (!keep_grid && potential.myRNG == nullptr)
       throw std::logic_error(
           "NonLocalECPotential streaming-derivative grid rotation requires a random-number generator.");
   }
@@ -874,10 +874,13 @@ std::uint64_t NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
   {
     auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
     const ParticleSet& particles = p_list[walker];
-    for (const auto& component : potential.PPset)
-      if (component)
-        component->rotateQuadratureGrid(
-            generateRandomRotationMatrix(*potential.myRNG));
+    // A validated native replay receipt restores the complete grid before this call.
+    // Reusing it consumes no RNG and preserves the ordinary path's enumeration.
+    if (!keep_grid)
+      for (const auto& component : potential.PPset)
+        if (component)
+          component->rotateQuadratureGrid(
+              generateRandomRotationMatrix(*potential.myRNG));
 
     const auto& distance_table =
         particles.getDistTableAB(potential.myTableIndex);

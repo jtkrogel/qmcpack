@@ -204,6 +204,8 @@ public:
    * weights, complete wavefunction ratios, and value-evaluation stamps are live.
    * This is the strict O(P)+O(B)+O(Qtile) route: it neither constructs the
    * legacy walker-by-parameter result nor retains virtual-particle descriptors.
+   * keep_grid=true requires a validated/restored captured grid and consumes no rotation RNG.
+   * The default preserves ordinary stochastic rotations and RNG consumption.
    * @return Fingerprint of the accepted job traversal and rotated grid coordinates.
    */
   std::uint64_t mw_evaluateWithStreamingParameterDerivatives(
@@ -212,7 +214,7 @@ public:
       const RefVectorWithLeader<ParticleSet>& p_list,
       wftrain::NonLocalECPDerivativeConsumer& consumer,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-      wftrain::ParameterReductionSink& sink) const;
+      wftrain::ParameterReductionSink& sink, bool keep_grid = false) const;
 
   /// Report whether determinant-locality or T-move determinant localization is enabled.
   bool usesDLA() const noexcept { return use_DLA; }

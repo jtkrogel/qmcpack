@@ -677,7 +677,7 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     wftrain::NonLocalECPDerivativeConsumer& consumer,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
     wftrain::ParameterReductionSink& sink,
-    std::size_t native_capture_host_cap)
+    std::size_t native_capture_host_cap, bool keep_grid)
 {
   if (wf_list.size() != ham_list.size() || p_list.size() != ham_list.size())
     throw std::invalid_argument(
@@ -772,7 +772,7 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     {
       auto& nonlocal = component_list.getCastedLeader<NonLocalECPotential>();
       grid_fingerprint = nonlocal.mw_evaluateWithStreamingParameterDerivatives(
-          component_list, wf_list, p_list, consumer, channels, sink);
+          component_list, wf_list, p_list, consumer, channels, sink, keep_grid);
     }
     else
       leader.H[operator_index]->mw_evaluate(component_list, wf_list, p_list);

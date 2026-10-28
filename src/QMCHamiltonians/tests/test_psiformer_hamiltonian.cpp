@@ -9,6 +9,7 @@
  * @brief End-to-end Hamiltonian tests for the public PsiFormer interface.
  */
 
+#include <cstring>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
@@ -614,6 +615,26 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
   CHECK(replay_storage.tile_count == ecp_replay->tiles().size());
   CHECK(replay_storage.retained_numeric_bytes > 0);
   CHECK(replay_storage.storage_fingerprint != 0);
+
+  // Recompute the whole physical ECP traversal on its accepted grid without a new draw.
+  // This is a fresh transaction, not reuse of already accumulated parameter responses.
+  ecp_consumer.reset();
+  {
+    auto fixed_consumer = psiformer_leader.makeNonLocalECPDerivativeConsumer(
+        psiformer_components, particles, 257, true);
+    SelectedParameterSink fixed_capture(canonical_parameters);
+    const auto calls_before_fixed = grid_rng1.calls() + grid_rng2.calls();
+    const auto fixed_result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+        hamiltonians, wavefunctions, particles, *fixed_consumer,
+        {&ecp_channel, 1}, fixed_capture, 0, true);
+    CHECK(grid_rng1.calls() + grid_rng2.calls() == calls_before_fixed);
+    CHECK(fixed_result.grid_fingerprint == streaming_result.grid_fingerprint);
+    REQUIRE(fixed_result.local_energies.size() == streaming_result.local_energies.size());
+    CHECK(std::memcmp(fixed_result.local_energies.data(), streaming_result.local_energies.data(),
+        streaming_result.local_energies.size() * sizeof(streaming_result.local_energies[0])) == 0);
+    CHECK(std::memcmp(fixed_capture.result().data(), ecp_capture.result().data(),
+        sizeof(ecp_capture.result())) == 0);
+  }
 
   auto kinetic_derivative = psiformer_leader.makeStreamingDerivativeOperator(
       psiformer_components, particles, 0, 0, 257);
