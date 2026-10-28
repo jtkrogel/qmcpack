@@ -1344,6 +1344,21 @@ private:
         ? score(workspace, ParameterRole::CUSP_SAME_ALPHA)
         : nullptr;
     double& anti_score      = score(workspace, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
+    if (const auto& residual = plan_.environment().residual_pair)
+    {
+      double value = 0;
+      const auto& positions = workspace.geometry_.electrons();
+      for (const auto pair : workspace.geometry_.electronPairs())
+      {
+        const bool same = (pair.first < spin_up_electrons_) == (pair.second < spin_up_electrons_);
+        const auto displacement = residual->displacement(positions[pair.first], positions[pair.second]);
+        const auto jet = residual->evaluate(displacement, same ? same_alpha : anti_alpha, same);
+        value += jet.value;
+        if (same) *same_score += reverse_seed * jet.score;
+        else anti_score += reverse_seed * jet.score;
+      }
+      return value;
+    }
     return realCuspValueAndReverse(workspace.geometry_, spin_up_electrons_, same_alpha,
         anti_alpha, same_score, anti_score, reverse_seed);
   }

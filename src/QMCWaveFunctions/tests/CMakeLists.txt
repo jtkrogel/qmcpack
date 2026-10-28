@@ -1012,3 +1012,19 @@ set_property(
 
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")
+
+add_executable(test_psiformer_residual_pair test_psiformer_residual_pair.cpp)
+target_include_directories(test_psiformer_residual_pair PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_residual_pair
+              1 1 $<TARGET_FILE:test_psiformer_residual_pair>)
+set_tests_properties(deterministic-unit_test_psiformer_residual_pair PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_residual_pair_executor
+               test_psiformer_residual_pair_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_residual_pair_executor catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_residual_pair_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_residual_pair_executor
+              1 1 $<TARGET_FILE:test_psiformer_residual_pair_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_residual_pair_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})

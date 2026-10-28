@@ -123,6 +123,7 @@ public:
         head_width_(feature_width_ / head_count_),
         input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
         periodic_profile_(plan.environment().periodic_profile),
+        residual_pair_(plan.environment().residual_pair),
         layers_(plan.modelShape().attention_blocks)
   {
     if (electron_count_ == 0 || spin_up_count_ + spin_down_count_ != electron_count_ ||
@@ -207,6 +208,7 @@ public:
   std::size_t headWidth() const noexcept { return head_width_; }
   std::size_t inputWidth() const noexcept { return input_width_; }
   const auto& periodicProfile() const noexcept { return periodic_profile_; }
+  const auto& residualPair() const noexcept { return residual_pair_; }
 
 private:
   friend class DirectValueExecutor;
@@ -247,6 +249,7 @@ private:
   std::size_t head_width_;
   std::size_t input_width_;
   std::shared_ptr<const qmcplusplus::psiformer::PeriodicProfileMetadata> periodic_profile_;
+  std::shared_ptr<const qmcplusplus::psiformer::ResidualPairGeometry> residual_pair_;
 
   DirectParameterTensor anti_alpha_;
   DirectParameterTensor same_alpha_;
@@ -907,7 +910,14 @@ private:
       const bool same_spin    = first_up == second_up;
       const double alpha      = same_spin ? same_alpha : anti_alpha;
       const double factor     = same_spin ? 0.25 : 0.5;
-      cusp -= factor * alpha * alpha / (alpha + distances[pair_index]);
+      if (layout_->residual_pair_)
+      {
+        const auto& positions = workspace.geometry_.electrons();
+        const auto displacement = layout_->residual_pair_->displacement(positions[pair.first], positions[pair.second]);
+        cusp += layout_->residual_pair_->evaluate(displacement, alpha, same_spin).value;
+      }
+      else
+        cusp -= factor * alpha * alpha / (alpha + distances[pair_index]);
     }
     return cusp;
   }

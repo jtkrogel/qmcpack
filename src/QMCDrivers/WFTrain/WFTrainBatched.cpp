@@ -18,6 +18,7 @@
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/JastrowNeuralTrainingBinding.h"
 #include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
 #include "QMCDrivers/WFTrain/SampledLinearMethod.h"
@@ -2934,6 +2935,46 @@ void WFTrainBatched::process(xmlNodePtr node)
       validateHamiltonianForTraining();
 
     auto providers = student_prototype_.extractStructuredParameterProviders();
+    for (auto& provider : providers)
+      if (auto* neural = dynamic_cast<PsiFormerWF*>(&provider.get()); neural && neural->isJastrowAugmented())
+      {
+        using I = WFTrainDriverInput;
+        const bool pretrain = training_input_.getObjective() == I::Objective::ORBITAL_MSE;
+        const bool energy = training_input_.getObjective() == I::Objective::ENERGY;
+        if (providers.size() != 1 || vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
+            training_input_.getLineSearch() != I::LineSearch::OFF ||
+            (pretrain && (training_input_.getOptimizer() != I::Optimizer::ADAM || !training_input_.samplesOrbitalStudent())) ||
+            (energy && ((training_input_.getOptimizer() != I::Optimizer::ADAM && training_input_.getOptimizer() != I::Optimizer::KFAC) ||
+                         !wftrain::usesEnergyScoreEstimator(training_input_, false))) || (!pretrain && !energy) ||
+            !training_input_.getMaximumRetainedBytes() ||
+            training_input_.getMaximumRetainedBytes() == std::numeric_limits<std::size_t>::max())
+          throw UniformCommunicateError("Jastrow product training requires CPU PBYP, finite retained cap, line_search=off, "
+              "student-measure orbital_mse Adam or score-covariance ENERGY Adam/KFAC");
+        jastrow_binding_ = std::make_unique<wftrain::JastrowNeuralTrainingBinding>(student_prototype_,
+            population_.get_golden_electrons(), *myComm, pretrain);
+        std::size_t pair_parameters = 0;
+        for (const auto& block : jastrow_binding_->parameterSchema().blocks())
+          if (block.update_group == "neural_pair_residual") pair_parameters += block.count;
+        const auto traditional_selected = jastrow_binding_->jastrowParameterCount();
+        const auto traditional_total = jastrow_binding_->jastrowTotalParameterCount();
+        const auto determinant_parameters = jastrow_binding_->parameterSchema().parameterCount()-pair_parameters-traditional_selected;
+        app_log() << "WFTrain Jastrow product counts: determinant=" << determinant_parameters << " neural_pair=" << pair_parameters
+                  << " traditional_total=" << traditional_total
+                  << " objective_active=" << determinant_parameters+(pretrain ? 0 : pair_parameters+traditional_selected)
+                  << " objective_frozen=" << (pretrain ? pair_parameters+traditional_total : traditional_total-traditional_selected)
+                  << std::endl;
+        app_log() << "WFTrain Jastrow product masks: determinant=active neural_pair=" << (pretrain ? "frozen_zero" : "active")
+                  << " traditional_selected=" << jastrow_binding_->jastrowParameterCount()
+                  << " traditional_objective=" << (pretrain ? "frozen" : "coefficient_optimize_flags")
+                  << " max_coefficients=" << wftrain::JastrowNeuralTrainingBinding::MAXIMUM_JASTROW_PARAMETERS
+                  << " dense_metric_bytes=" << jastrow_binding_->jastrowParameterCount()*jastrow_binding_->jastrowParameterCount()*sizeof(double)
+                  << "; KFAC uses complete-configuration coefficient scores; cross-block curvature omitted" << std::endl;
+      }
+    if (jastrow_binding_)
+    {
+      providers.clear();
+      providers.emplace_back(*jastrow_binding_);
+    }
     if (providers.empty() && !complex_training_component_)
     {
       using O = WFTrainDriverInput::Optimizer;
@@ -3126,7 +3167,7 @@ void WFTrainBatched::process(xmlNodePtr node)
 #endif
     int policy_failure = (selected_pair_accelerator && !hybrid_score_kfac) ||
         (explicit_kfac_policy && ((selected_provider_->usesAcceleratorParameterProducts() && !hybrid_score_kfac) ||
-        (!dynamic_cast<PsiFormerWF*>(selected_provider_) &&
+        (!dynamic_cast<PsiFormerWF*>(selected_provider_) && !jastrow_binding_ &&
          !dynamic_cast<FrozenReferenceResidualWF*>(selected_provider_) && !complex_training_component_) ||
         training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF));
     int hybrid_ranks = hybrid_score_kfac ? 1 : 0;
@@ -3440,6 +3481,14 @@ void WFTrainBatched::process(xmlNodePtr node)
                                           population_.get_hamiltonians()[i].get());
       }
     }
+    if (jastrow_binding_)
+    {
+      jastrow_binding_->attachLive(population_.get_golden_twf(), population_.get_golden_electrons(),
+          &population_.get_golden_hamiltonian());
+      for (std::size_t i = 0; i < population_.get_twfs().size(); ++i)
+        jastrow_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i],
+            population_.get_hamiltonians()[i].get());
+    }
     initializeDeterminantOverlap();
     // Target construction clones SPOs and may allocate differently on each rank.
     // Agree on failure before any participant enters the training collectives.
@@ -3449,7 +3498,7 @@ void WFTrainBatched::process(xmlNodePtr node)
       initializeOrbitalPretraining();
       if (inference_input_.enabled && training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
       {
-        bool admitted = orbital_target_ && dynamic_cast<PsiFormerWF*>(selected_provider_);
+        bool admitted = orbital_target_ && (dynamic_cast<PsiFormerWF*>(selected_provider_) || jastrow_binding_);
 #ifdef QMC_COMPLEX
         admitted = admitted || (complex_orbital_target_ && complex_training_component_ &&
                                  !complex_training_component_->gpuInferenceEnabled());
@@ -3874,6 +3923,23 @@ void WFTrainBatched::run()
       complex_physical_identity = identity.str();
       physical_agreement_identity = complex_physical_identity;
     }
+    if (jastrow_binding_)
+    {
+      std::ostringstream identity;
+      identity << jastrow_binding_->modelIdentity();
+      const auto& hamiltonian = population_.get_golden_hamiltonian();
+      if (const auto& provenance = hamiltonian.ecpModelProvenance())
+        identity << ";ordinary_ecp=" << provenance->ordinary_locality_vp << ";ecp=" << provenance->scientific_definition;
+      for (int i = 0; i < hamiltonian.size(); ++i)
+      {
+        const auto* term = hamiltonian.getComponent(i);
+        identity << ';' << term->getClassName() << ':' << term->getName();
+        if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(term)) identity << ':' << aa->ewaldModelDefinition();
+        if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(term)) identity << ':' << ab->ewaldModelDefinition();
+      }
+      complex_physical_identity = identity.str();
+      physical_agreement_identity = complex_physical_identity;
+    }
     if (physical_agreement_identity.empty())
       physical_agreement_identity = complex_physical_identity;
     if (!physical_agreement_identity.empty())
@@ -4268,6 +4334,10 @@ void WFTrainBatched::run()
         {
           const auto name = entry.path().filename().string();
           if (name.rfind(prefix, 0) != 0)
+            continue;
+          // Ordinary containers such as .inference share the .i prefix. Only
+          // a digit starts a numbered artifact; malformed numbered names still fail below.
+          if (name.size() > prefix.size() && (name[prefix.size()] < '0' || name[prefix.size()] > '9'))
             continue;
           const auto end = name.find('.', prefix.size());
           const auto digits = name.substr(prefix.size(), end - prefix.size());
@@ -4737,12 +4807,22 @@ void WFTrainBatched::run()
 #endif
           {
             auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-            if (!student)
-              throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
-            auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerWF,
-                psiformer::OrbitalTargetEvaluator>>(*student, *orbital_target_, retained_samples);
-            producer_retained_bytes = typed->retainedBytes();
-            producer = std::move(typed);
+            if (jastrow_binding_)
+            {
+              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<wftrain::JastrowNeuralTrainingBinding,
+                  psiformer::OrbitalTargetEvaluator>>(*jastrow_binding_, *orbital_target_, retained_samples);
+              producer_retained_bytes = typed->retainedBytes();
+              producer = std::move(typed);
+            }
+            else
+            {
+              if (!student)
+                throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerWF,
+                  psiformer::OrbitalTargetEvaluator>>(*student, *orbital_target_, retained_samples);
+              producer_retained_bytes = typed->retainedBytes();
+              producer = std::move(typed);
+            }
           }
           coordinator = std::make_unique<wftrain::OrbitalPretrainingCoordinator>(
               orbital_target_fingerprint_, reduction);
@@ -4904,6 +4984,20 @@ void WFTrainBatched::run()
           // energies and responses are paired on their accepted replay grids.
           for (auto& samples : retained_samples)
           {
+            if (jastrow_binding_)
+            {
+              wftrain::PreparedEnergyGradientBatch batch;
+              batch.weights.assign(samples.particles.size(), 1.0);
+              for (double energy : samples.local_energies) batch.local_energies.emplace_back(energy);
+              batch.local_energy_term_mask = 0;
+              RefVector<ParticleSet> positions;
+              for (auto& particles : samples.particles) positions.push_back(*particles);
+              batch.derivative_operator = jastrow_binding_->makeScoreOperator(positions, batch_ordinal++, sample_offset,
+                  training_input_.getParameterChunkSize());
+              sample_offset += samples.particles.size();
+              batches.push_back(std::move(batch));
+              continue;
+            }
             if (conventional_binding_)
             {
               if (has_nonlocal_ecp)
@@ -6192,7 +6286,7 @@ bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_v
       const auto& descriptor = orbital_target_->descriptor();
       moments = std::make_unique<wftrain::OrbitalInferenceMoments>(descriptor.spinUpElectrons(),
           descriptor.spinDownElectrons(), descriptor.terms().size(), inference_input_.evaluate_energy);
-      auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+      auto* student = jastrow_binding_ ? &jastrow_binding_->neural() : dynamic_cast<PsiFormerWF*>(selected_provider_);
       observer = [&, student](Crowd& crowd) {
         for (std::size_t i = 0; i < crowd.size(); ++i)
         {
@@ -6327,7 +6421,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
   auto* complex = complex_training_component_;
   paired = complex != nullptr;
 #endif
-  if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_))
+  if (!paired && !dynamic_cast<PsiFormerWF*>(selected_provider_) && !jastrow_binding_)
     throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
   if (training_input_.getOrbitalNormalization() != wftrain::OrbitalLossNormalization::SPIN_SECTOR_SUM)
   {
@@ -6341,7 +6435,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
   }
   if (training_input_.samplesOrbitalStudent())
   {
-    const auto* real_student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+    const auto* real_student = jastrow_binding_ ? &jastrow_binding_->neural() : dynamic_cast<PsiFormerWF*>(selected_provider_);
     bool supported_student = real_student && !real_student->usesAcceleratorParameterProducts();
 #ifdef QMC_COMPLEX
     supported_student = supported_student || complex != nullptr;
@@ -6367,7 +6461,7 @@ void WFTrainBatched::initializeOrbitalPretraining()
     RefVectorWithLeader<ParticleSet> particles(electrons);
     particles.push_back(electrons);
     count = TrialWaveFunction::makeStructuredDeterminantChannelBatch(
-        wavefunctions, particles, selected_provider_id_)->channelCount();
+        wavefunctions, particles, jastrow_binding_ ? jastrow_binding_->neural().parameterSchema().providerId() : selected_provider_id_)->channelCount();
   }
 
   const SlaterDet* single = nullptr;

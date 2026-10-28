@@ -28,6 +28,7 @@ namespace qmcplusplus::wftrain
 class DeterminantOverlapObjective;
 class StructuredParameterProvider;
 class TrainingWaveFunctionBinding;
+class JastrowNeuralTrainingBinding;
 }
 
 namespace qmcplusplus
@@ -104,6 +105,7 @@ private:
   std::string selected_provider_id_;
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
   std::unique_ptr<wftrain::TrainingWaveFunctionBinding> conventional_binding_;
+  std::unique_ptr<wftrain::JastrowNeuralTrainingBinding> jastrow_binding_;
   /// Driver-only opt-in authority; generic GPU component discovery/publication remains closed.
   std::unique_ptr<wftrain::StructuredParameterProvider> complex_gpu_provider_;
   /// Actual numerical component remains distinct from its driver-owned provider adapter.

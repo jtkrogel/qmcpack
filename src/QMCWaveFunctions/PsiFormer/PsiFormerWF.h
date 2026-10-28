@@ -79,6 +79,7 @@ namespace psiformer
 {
 /// Dependency-light result of deterministic native PsiFormer initialization.
 struct InitializedPsiFormerParameters;
+struct ExecutionEnvironment;
 
 /// Pure input used to estimate this component family's planned batch storage.
 struct PsiFormerMemoryPolicyInput;
@@ -459,6 +460,23 @@ public:
 
   /// Fingerprint immutable physical model semantics, excluding learned parameters and Hamiltonian settings.
   std::string trainingConfigurationFingerprint() const;
+
+  /// Identify the CPU exact-zero residual policy without exposing native storage.
+  bool isJastrowAugmented() const noexcept;
+  /// Check an imported residual policy and fixed cell against this immutable model.
+  bool matchesJastrowCorrelation(const psiformer::ExecutionEnvironment&) const;
+  /// Adopt a privately prepared matching model after collective publication readiness.
+  void adoptPreparedParameterState(const PsiFormerWF&) noexcept;
+
+  /// Exclusive same-thread CPU publication; discard leaves live parameters unchanged.
+  class PreparedCpuParameterPublication
+  {
+  public:
+    virtual ~PreparedCpuParameterPublication() = default;
+    virtual std::size_t commit() noexcept = 0;
+  };
+  std::unique_ptr<PreparedCpuParameterPublication> prepareCpuParameterPublication(
+      const wftrain::StructuredParameterSnapshot&, std::size_t expected_version);
 
   /// Stream one configuration's affine score rows through transient native scratch.
   void observeAffineScores(const ParticleSet& particles,
@@ -1785,6 +1803,8 @@ private:
   /// Clone-owned native handles are registered before any evaluation.
   psiformer::PsiFormerTimers phase_timers_;
 
+  struct CpuParameterPublication;
+
   /// Versioned native model protected against evaluation/reset overlap.
   std::shared_ptr<PsiFormerSharedState> model_state_;
   /// Clone-family optimizer names, global indices, and canonical flat-index mapping.
@@ -1822,10 +1842,10 @@ private:
   /// Layout evidence for externally owned persistent walker-record regions.
   pf::WalkerBufferLayout prepared_walker_buffer_layout_;
   /// Fixed allocation identities published immediately before the preparation marker.
-  const GradType* prepared_accepted_gradient_data_ = nullptr;
-  const ValueType* prepared_accepted_laplacian_data_ = nullptr;
-  const GradType* prepared_proposed_gradient_data_ = nullptr;
-  const ValueType* prepared_proposed_laplacian_data_ = nullptr;
+  const ParticleSet::ParticleGradient::value_type* prepared_accepted_gradient_data_ = nullptr;
+  const ParticleSet::ParticleLaplacian::value_type* prepared_accepted_laplacian_data_ = nullptr;
+  const ParticleSet::ParticleGradient::value_type* prepared_proposed_gradient_data_ = nullptr;
+  const ParticleSet::ParticleLaplacian::value_type* prepared_proposed_laplacian_data_ = nullptr;
   /// Exact admitted capacities paired with the retained allocation identities.
   std::size_t prepared_accepted_gradient_capacity_ = 0;
   std::size_t prepared_accepted_laplacian_capacity_ = 0;

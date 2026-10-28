@@ -22,6 +22,7 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_EXECUTION_PLAN_H
 #define QMCPLUSPLUS_PSIFORMER_EXECUTION_PLAN_H
 
+#include "QMCWaveFunctions/PsiFormer/PsiFormerResidualPair.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -196,6 +197,7 @@ struct ExecutionEnvironment
   // to the explicit periodic profile; the common outer twist is separate.
   HeadRepresentation head_representation = HeadRepresentation::REAL;
   std::shared_ptr<const PeriodicProfileMetadata> periodic_profile;
+  std::shared_ptr<const ResidualPairGeometry> residual_pair;
 };
 
 /// Validate opt-in metadata independently before initializer/workspace allocations.

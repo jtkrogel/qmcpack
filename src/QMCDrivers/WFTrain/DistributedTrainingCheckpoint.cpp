@@ -11,6 +11,7 @@
 
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
+#include "QMCDrivers/WFTrain/JastrowNeuralTrainingBinding.h"
 
 #include "Message/CommOperators.h"
 #include "io/hdf/hdf_archive.h"
@@ -371,6 +372,8 @@ void DistributedTrainingCheckpoint::saveIterationBundle(
         parent->exportModel(temporary_parameters.string());
       else if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
         conventional->exportModel(temporary_parameters);
+      else if (const auto* product = dynamic_cast<const JastrowNeuralTrainingBinding*>(&provider))
+        product->exportModel(temporary_parameters, parameters.filename().string());
       else
         throw std::runtime_error("Training bundle model export requires a supported training binding");
       const auto saved = TrainingCheckpoint::readModelParameters(staging / (root + ".state.h5"),
@@ -380,6 +383,8 @@ void DistributedTrainingCheckpoint::saveIterationBundle(
           return parent->readModel(temporary_parameters.string()).values;
         if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
           return conventional->readModel(temporary_parameters).values;
+        if (const auto* product = dynamic_cast<const JastrowNeuralTrainingBinding*>(&provider))
+          return product->readModel(temporary_parameters).values;
         return psiformer::readPsiFormerModelFile(temporary_parameters.string()).parameters.values;
       }();
       if (saved.values != exported || provider.snapshotParameters().version != saved.version)
