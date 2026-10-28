@@ -8,6 +8,7 @@
 #include "Message/Communicate.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCDrivers/WFTrain/JastrowNeuralTrainingBinding.h"
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
@@ -441,6 +442,186 @@ TEST_CASE("Physical BFD accepted-grid ratios include the entire Jastrow product"
   CHECK(oracle.points > 0);
   CHECK(oracle.oracle_energy == Catch::Approx(std::real(oracle.energy.energies()[0])).epsilon(2e-8).margin(2e-8));
   CHECK(result.local_energies[0] == Catch::Approx(oracle.oracle_energy).epsilon(2e-8).margin(2e-8));
+}
+
+TEST_CASE("CPU product collective proposals preserve accepted caches and subsequent PBYP ratios",
+          "[wftrain][jastrow_neural_product][product_collective]")
+{
+  bool frozen = false;
+  SECTION("active conventional banks") {}
+  SECTION("frozen conventional banks") { frozen = true; }
+  ProductFixture fixture(frozen);
+  auto& p0 = fixture.electrons;
+  auto& wf0 = fixture.wavefunction;
+  JastrowNeuralTrainingBinding binding(wf0,p0,*OHMMS::Controller,false);
+  auto parameters = binding.snapshotParameters();
+  for (const auto& block : binding.parameterSchema().blocks())
+    if (block.update_group == "neural_pair_residual") parameters.values[block.offset] = .12;
+  binding.publishParameters(parameters,parameters.version);
+  wf0.evaluateLog(p0);
+  ParticleSet p1(p0);
+  p1.R[1][1] += .017;
+  p1.update();
+  auto follower = wf0.makeClone(p1);
+  follower->evaluateLog(p1);
+  auto& wf1 = *follower;
+  ParticleSet reference_seed_particles(p0); reference_seed_particles.update();
+  auto reference_seed = wf0.makeClone(reference_seed_particles);
+  REQUIRE(wf0.supportsMultiParticleMoves());
+  RefVectorWithLeader<ParticleSet> particles(p0,{p0,p1});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wf0,{wf0,wf1});
+  ResourceCollection particle_resources("product_collective_particles"), wf_resources("product_collective_wf");
+  p0.createResource(particle_resources); wf0.createResource(wf_resources);
+  const auto compare_products = [](const auto& g, const auto& l, const ParticleSet& reference) {
+    double kinetic = 0, expected_kinetic = 0;
+    for (int e = 0; e < reference.getTotalNum(); ++e)
+    {
+      double square = 0, expected_square = 0;
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        CHECK(std::real(g[e][axis]) == Catch::Approx(std::real(reference.G[e][axis])).epsilon(2e-9).margin(2e-9));
+        square += std::real(g[e][axis]*g[e][axis]);
+        expected_square += std::real(reference.G[e][axis]*reference.G[e][axis]);
+      }
+      CHECK(std::real(l[e]) == Catch::Approx(std::real(reference.L[e])).epsilon(2e-9).margin(2e-9));
+      kinetic -= .5*(std::real(l[e])+square);
+      expected_kinetic -= .5*(std::real(reference.L[e])+expected_square);
+    }
+    CHECK(kinetic == Catch::Approx(expected_kinetic).epsilon(3e-9).margin(3e-9));
+  };
+  {
+    ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources,particles);
+    ResourceCollectionTeamLock<TrialWaveFunction> wf_lock(wf_resources,wavefunctions);
+    for (int round = 0; round < 3; ++round)
+    {
+      const auto old_r0 = p0.R, old_r1 = p1.R;
+      const auto old_g0 = p0.G, old_g1 = p1.G;
+      const auto old_l0 = p0.L, old_l1 = p1.L;
+      const double old_log[2]{wf0.getLogPsi(),wf1.getLogPsi()};
+      const double old_phase[2]{wf0.getPhase(),wf1.getPhase()};
+      std::vector<std::size_t> offsets{0};
+      std::vector<ParticleSet::IndexType> indices;
+      std::vector<ParticleSet::PosType> positions;
+      std::vector<std::unique_ptr<ParticleSet>> reference_particles;
+      std::vector<std::unique_ptr<TrialWaveFunction>> reference_wfs;
+      for (int walker = 0; walker < 2; ++walker)
+      {
+        auto reference = std::make_unique<ParticleSet>(particles[walker]);
+        for (int e = 0; e < p0.getTotalNum(); ++e)
+        {
+          auto position = particles[walker].R[e] + ParticleSet::PosType{.011*(e+1),-.007*(walker+1),.005*(round+1)};
+          if (round == 0 && walker == 0 && e == 0) position[0] += 8;
+          indices.push_back(e); positions.push_back(position); reference->R[e] = position;
+        }
+        offsets.push_back(indices.size());
+        reference->update();
+        auto reference_wf = reference_seed->makeClone(*reference);
+        reference_wf->evaluateLog(*reference);
+        reference_particles.push_back(std::move(reference));
+        reference_wfs.push_back(std::move(reference_wf));
+      }
+      const MCMultiParticleMoves<CoordsType::POS> moves(offsets,indices,positions);
+      std::vector<TrialWaveFunction::LogValue> ratios(2);
+      TrialWaveFunction::mw_evaluateMultiParticleMove(wavefunctions,particles,moves,ratios);
+      CHECK_THROWS(TrialWaveFunction::mw_evaluateMultiParticleMove(wavefunctions,particles,moves,ratios));
+      for (int walker = 0; walker < 2; ++walker)
+      {
+        CHECK(std::real(ratios[walker]) == Catch::Approx(reference_wfs[walker]->getLogPsi()-old_log[walker]).epsilon(2e-10).margin(2e-10));
+        CHECK(std::abs(std::polar(1.,std::imag(ratios[walker]))-
+            std::polar(1.,reference_wfs[walker]->getPhase()-old_phase[walker])) < 2e-10);
+        const auto& proposed_g = wavefunctions[walker].multiParticleProposalGradient();
+        for (int e = 0; e < p0.getTotalNum(); ++e)
+          for (int axis = 0; axis < 3; ++axis)
+            CHECK(std::real(proposed_g[e][axis]) == Catch::Approx(std::real(reference_particles[walker]->G[e][axis])).epsilon(2e-9).margin(2e-9));
+        CHECK(wavefunctions[walker].getLogPsi() == old_log[walker]);
+      }
+      for (int e = 0; e < p0.getTotalNum(); ++e)
+      {
+        CHECK(p0.R[e] == old_r0[e]); CHECK(p1.R[e] == old_r1[e]);
+        CHECK(p0.G[e] == old_g0[e]); CHECK(p1.G[e] == old_g1[e]);
+        CHECK(p0.L[e] == old_l0[e]); CHECK(p1.L[e] == old_l1[e]);
+      }
+      auto altered = positions; altered.back()[2] += .001;
+      const MCMultiParticleMoves<CoordsType::POS> mismatch(offsets,indices,altered);
+      CHECK_THROWS(TrialWaveFunction::mw_accept_rejectMultiParticleMove(wavefunctions,particles,mismatch,{false,false}));
+      std::vector<bool> valid;
+      ParticleSet::mw_makeMoveSelectedParticles(particles,moves,valid);
+      const std::vector<bool> accepted = round == 0 ? std::vector<bool>{false,true} :
+          round == 1 ? std::vector<bool>{true,false} : std::vector<bool>{true,true};
+      for (int walker = 0; walker < 2; ++walker)
+        if (accepted[walker])
+          for (std::size_t entry = offsets[walker]; entry < offsets[walker+1]; ++entry) REQUIRE(valid[entry]);
+      TrialWaveFunction::mw_accept_rejectMultiParticleMove(wavefunctions,particles,moves,accepted);
+      ParticleSet::mw_accept_rejectMoveSelectedParticles(particles,accepted);
+      CHECK_THROWS(TrialWaveFunction::mw_accept_rejectMultiParticleMove(wavefunctions,particles,moves,accepted));
+      for (int walker = 0; walker < 2; ++walker)
+      {
+        ParticleSet reference(particles[walker]); reference.update();
+        auto fresh = reference_seed->makeClone(reference); fresh->evaluateLog(reference);
+        CHECK(wavefunctions[walker].getLogPsi() == Catch::Approx(fresh->getLogPsi()).epsilon(2e-10).margin(2e-10));
+        compare_products(particles[walker].G,particles[walker].L,reference);
+      }
+    }
+    // Accepted collective caches must remain valid through the ordinary single-electron API.
+    const ParticleSet::PosType displacement{.019,-.013,.007};
+    ParticleSet moved(p0); moved.R[0] += displacement; moved.update();
+    auto reference = reference_seed->makeClone(moved); reference->evaluateLog(moved);
+    const double expected_ratio = std::cos(reference->getPhase()-wf0.getPhase())*
+        std::exp(reference->getLogPsi()-wf0.getLogPsi());
+    p0.makeMove(0,displacement);
+    CHECK(std::real(wf0.calcRatio(p0,0)) == Catch::Approx(expected_ratio).epsilon(3e-9).margin(3e-9));
+    wf0.acceptMove(p0,0); p0.acceptMove(0); wf0.completeUpdates(); p0.donePbyP();
+    wf0.evaluateGL(p0,false);
+    compare_products(p0.G,p0.L,moved);
+    VirtualParticleSet virtuals(p0);
+    const std::vector<ParticleSet::PosType> virtual_moves{{.027,-.013,.009},{-.021,.014,.032}};
+    virtuals.makeMoves(p0,0,virtual_moves);
+    std::vector<QMCTraits::ValueType> virtual_ratios(virtual_moves.size()); wf0.evaluateRatios(virtuals,virtual_ratios);
+    for (std::size_t i = 0; i < virtual_moves.size(); ++i)
+    {
+      ParticleSet vp(p0); vp.R[0] += virtual_moves[i]; vp.update();
+      auto fresh = reference_seed->makeClone(vp); fresh->evaluateLog(vp);
+      const double expected = std::cos(fresh->getPhase()-wf0.getPhase())*std::exp(fresh->getLogPsi()-wf0.getLogPsi());
+      CHECK(std::real(virtual_ratios[i]) == Catch::Approx(expected).epsilon(3e-9).margin(3e-9));
+    }
+  }
+  // Joint publication swaps coefficient banks; reacquire resources and propose from refreshed caches.
+  auto successor = binding.snapshotParameters();
+  for (const auto& block : binding.parameterSchema().blocks())
+    if (block.update_group == "neural_pair_residual" || block.update_group == "traditional_jastrow")
+      for (std::size_t i = 0; i < block.count; ++i)
+        successor.values[block.offset+i] += .003*(i+1)/block.count;
+  binding.publishParameters(successor,successor.version);
+  wf0.evaluateLog(p0);
+  reference_seed_particles.R = p0.R; reference_seed_particles.update();
+  reference_seed = wf0.makeClone(reference_seed_particles);
+  RefVectorWithLeader<ParticleSet> one_p(p0,{p0});
+  RefVectorWithLeader<TrialWaveFunction> one_wf(wf0,{wf0});
+  ResourceCollection after_p("product_after_publication_particles"), after_wf("product_after_publication_wf");
+  p0.createResource(after_p); wf0.createResource(after_wf);
+  ResourceCollectionTeamLock<ParticleSet> after_p_lock(after_p,one_p);
+  ResourceCollectionTeamLock<TrialWaveFunction> after_wf_lock(after_wf,one_wf);
+  std::vector<ParticleSet::IndexType> indices;
+  std::vector<ParticleSet::PosType> positions;
+  ParticleSet proposed(p0);
+  for (int e = 0; e < p0.getTotalNum(); ++e)
+  { indices.push_back(e); positions.push_back(p0.R[e]+ParticleSet::PosType{-.006,.004,.008}); proposed.R[e]=positions.back(); }
+  proposed.update(); auto fresh = reference_seed->makeClone(proposed); fresh->evaluateLog(proposed);
+  const MCMultiParticleMoves<CoordsType::POS> moves({0,indices.size()},indices,positions);
+  std::vector<TrialWaveFunction::LogValue> ratios(1);
+  const double old_log = wf0.getLogPsi();
+  TrialWaveFunction::mw_evaluateMultiParticleMove(one_wf,one_p,moves,ratios);
+  CHECK(std::real(ratios[0]) == Catch::Approx(fresh->getLogPsi()-old_log).epsilon(2e-10).margin(2e-10));
+  for (int e = 0; e < p0.getTotalNum(); ++e)
+    for (int axis = 0; axis < 3; ++axis)
+      CHECK(std::real(wf0.multiParticleProposalGradient()[e][axis]) == Catch::Approx(std::real(proposed.G[e][axis])).epsilon(2e-9).margin(2e-9));
+  std::vector<bool> valid;
+  ParticleSet::mw_makeMoveSelectedParticles(one_p,moves,valid);
+  for (bool position_valid : valid) REQUIRE(position_valid);
+  TrialWaveFunction::mw_accept_rejectMultiParticleMove(one_wf,one_p,moves,{true});
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(one_p,{true});
+  CHECK(wf0.getLogPsi() == Catch::Approx(fresh->getLogPsi()).epsilon(2e-10).margin(2e-10));
+  compare_products(p0.G,p0.L,proposed);
 }
 
 } // namespace qmcplusplus::wftrain

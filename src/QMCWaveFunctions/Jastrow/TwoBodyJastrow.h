@@ -19,6 +19,7 @@
 #include "Configuration.h"
 #if !defined(QMC_BUILD_SANDBOX_ONLY)
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "Particle/MCMultiParticleMoves.h"
 #endif
 #include <ResourceHandle.h>
 #include "Particle/DistanceTable.h"
@@ -80,6 +81,16 @@ protected:
   const valT lapfac;
 
 private:
+#if !defined(QMC_BUILD_SANDBOX_ONLY)
+  // One bounded J-only staging bank per active component/walker, never per sample.
+  std::unique_ptr<ParticleSet> multi_particle_particles_;
+  std::unique_ptr<WaveFunctionComponent> multi_particle_component_;
+  ParticleSet::ParticleGradient multi_particle_gradient_;
+  ParticleSet::ParticleLaplacian multi_particle_laplacian_;
+  std::uint64_t multi_particle_fingerprint_ = 0;
+  bool multi_particle_pending_ = false;
+
+#endif
   /// if true use offload
   const bool use_offload_;
 
@@ -191,6 +202,25 @@ public:
 
   void evaluateHessian(ParticleSet& P, HessVector& grad_grad_psi) override;
 
+#if !defined(QMC_BUILD_SANDBOX_ONLY)
+  /// CPU real full-configuration proposals stage native J-only products privately.
+  bool supportsMultiParticleMoves() const noexcept override
+  {
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    return !use_offload_;
+#else
+    return false;
+#endif
+  }
+  void mw_evaluateMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios, const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const override;
+  void mw_accept_rejectMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+      const std::vector<bool>& accepted) const override;
+
+#endif
   /** recompute internal data assuming distance table is fully ready */
   void recompute(const ParticleSet& P) override;
   void mw_recompute(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

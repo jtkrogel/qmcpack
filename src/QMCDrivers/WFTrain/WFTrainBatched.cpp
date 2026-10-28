@@ -3014,14 +3014,17 @@ void WFTrainBatched::process(xmlNodePtr node)
         using I = WFTrainDriverInput;
         const bool pretrain = training_input_.getObjective() == I::Objective::ORBITAL_MSE;
         const bool energy = training_input_.getObjective() == I::Objective::ENERGY;
-        if (providers.size() != 1 || vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
+        const bool product_move = vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP ||
+            (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
+             !neural->usesAcceleratorParameterProducts() && student_prototype_.supportsMultiParticleMoves());
+        if (providers.size() != 1 || !product_move ||
             training_input_.getLineSearch() != I::LineSearch::OFF ||
             (pretrain && (training_input_.getOptimizer() != I::Optimizer::ADAM || !training_input_.samplesOrbitalStudent())) ||
             (energy && ((training_input_.getOptimizer() != I::Optimizer::ADAM && training_input_.getOptimizer() != I::Optimizer::KFAC) ||
                          !wftrain::usesEnergyScoreEstimator(training_input_, false))) || (!pretrain && !energy) ||
             !training_input_.getMaximumRetainedBytes() ||
             training_input_.getMaximumRetainedBytes() == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("Jastrow product training requires CPU PBYP, finite retained cap, line_search=off, "
+          throw UniformCommunicateError("Jastrow product training requires CPU PBYP or supported all-particle moves, finite retained cap, line_search=off, "
               "student-measure orbital_mse Adam or score-covariance ENERGY Adam/KFAC");
         jastrow_binding_ = std::make_unique<wftrain::JastrowNeuralTrainingBinding>(student_prototype_,
             population_.get_golden_electrons(), *myComm, pretrain);

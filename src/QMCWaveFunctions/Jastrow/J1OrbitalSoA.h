@@ -20,6 +20,7 @@
 #include "Configuration.h"
 #include <ResourceHandle.h>
 #include "Particle/DistanceTable.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "CPU/VectorOps.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "Utilities/qmc_common.h"
@@ -57,6 +58,14 @@ class J1OrbitalSoA : public WaveFunctionComponent
 
   using GradDerivVec  = Vector<QTFull::GradType>;
   using ValueDerivVec = Vector<QTFull::ValueType>;
+
+  // One bounded J-only staging bank per active component/walker, never per sample.
+  std::unique_ptr<ParticleSet> multi_particle_particles_;
+  std::unique_ptr<WaveFunctionComponent> multi_particle_component_;
+  ParticleSet::ParticleGradient multi_particle_gradient_;
+  ParticleSet::ParticleLaplacian multi_particle_laplacian_;
+  std::uint64_t multi_particle_fingerprint_ = 0;
+  bool multi_particle_pending_ = false;
 
   /// if true use offload
   const bool use_offload_;
@@ -234,6 +243,23 @@ public:
 
   void releaseResource(ResourceCollection& collection,
                        const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override;
+
+  /// CPU real full-configuration proposals stage native J-only products privately.
+  bool supportsMultiParticleMoves() const noexcept override
+  {
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    return !use_offload_;
+#else
+    return false;
+#endif
+  }
+  void mw_evaluateMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios, const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const override;
+  void mw_accept_rejectMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+      const std::vector<bool>& accepted) const override;
 
   void recompute(const ParticleSet& P) override
   {
@@ -693,5 +719,111 @@ extern template class J1OrbitalSoA<UserFunctor<QMCTraits::RealType>>;
 extern template class J1OrbitalSoA<ShortRangeCuspFunctor<QMCTraits::RealType>>;
 extern template class J1OrbitalSoA<PadeFunctor<QMCTraits::RealType>>;
 extern template class J1OrbitalSoA<Pade2ndOrderFunctor<QMCTraits::RealType>>;
+template<class FT>
+void J1OrbitalSoA<FT>::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios, const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+    const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
+{
+  const auto count = wfc_list.size();
+  if (!supportsMultiParticleMoves() || p_list.size() != count || moves.walkerCount() != count ||
+      log_ratios.size() != count || proposed_gradient_list.size() != count || proposed_laplacian_list.size() != count)
+    throw std::invalid_argument("J1OrbitalSoA CPU collective proposal has incompatible shapes or backend");
+  moves.validateFor(p_list);
+  for (std::size_t walker = 0; walker < count; ++walker)
+  {
+    const auto& component = wfc_list.getCastedElement<J1OrbitalSoA<FT>>(walker);
+    if (!component.supportsMultiParticleMoves() || component.multi_particle_pending_ ||
+        p_list[walker].getTotalNum() != component.Nelec ||
+        proposed_gradient_list[walker].get().size() != component.Nelec ||
+        proposed_laplacian_list[walker].get().size() != component.Nelec)
+      throw std::logic_error("J1OrbitalSoA CPU collective proposal requires resolved matching components");
+    for (const ParticleSet& accepted : p_list)
+      if (proposed_gradient_list[walker].get().data() == accepted.G.data() ||
+          proposed_laplacian_list[walker].get().data() == accepted.L.data())
+        throw std::invalid_argument("J1OrbitalSoA collective outputs alias accepted particle products");
+  }
+  try
+  {
+    for (std::size_t walker = 0; walker < count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<J1OrbitalSoA<FT>>(walker);
+      if (!component.multi_particle_particles_)
+        component.multi_particle_particles_ = std::make_unique<ParticleSet>(p_list[walker]);
+      auto& proposed = *component.multi_particle_particles_;
+      proposed.R = p_list[walker].R;
+      const auto slice = moves.slice(walker);
+      for (std::size_t entry = 0; entry < slice.size(); ++entry)
+        proposed.R[slice.particleIndex(entry)] = slice.proposedPosition(entry);
+      proposed.update(true); // Only short-range J distances are consumed, never its structure factor.
+      // Refresh small conventional functors so coefficient publications/resets cannot leave stale staging.
+      component.multi_particle_component_ = component.makeClone(proposed);
+      component.multi_particle_gradient_.resize(component.Nelec);
+      component.multi_particle_laplacian_.resize(component.Nelec);
+      component.multi_particle_gradient_ = ValueType(0);
+      component.multi_particle_laplacian_ = ValueType(0);
+      component.multi_particle_component_->evaluateLog(proposed, component.multi_particle_gradient_,
+          component.multi_particle_laplacian_);
+      component.multi_particle_fingerprint_ = moves.fingerprint();
+      component.multi_particle_pending_ = true;
+    }
+    for (std::size_t walker = 0; walker < count; ++walker)
+    {
+      const auto& component = wfc_list.getCastedElement<J1OrbitalSoA<FT>>(walker);
+      log_ratios[walker] = component.multi_particle_component_->get_log_value() - component.log_value_;
+      for (int electron = 0; electron < component.Nelec; ++electron)
+      {
+        proposed_gradient_list[walker].get()[electron] += component.multi_particle_gradient_[electron];
+        proposed_laplacian_list[walker].get()[electron] += component.multi_particle_laplacian_[electron];
+      }
+    }
+  }
+  catch (...)
+  {
+    for (WaveFunctionComponent& base : wfc_list)
+    {
+      auto& component = static_cast<J1OrbitalSoA<FT>&>(base);
+      component.multi_particle_pending_ = false;
+      component.multi_particle_fingerprint_ = 0;
+    }
+    throw;
+  }
+}
+
+template<class FT>
+void J1OrbitalSoA<FT>::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+    const std::vector<bool>& accepted) const
+{
+  if (!supportsMultiParticleMoves() || wfc_list.size() != p_list.size() ||
+      moves.walkerCount() != wfc_list.size() || accepted.size() != wfc_list.size())
+    throw std::invalid_argument("J1OrbitalSoA CPU collective resolution has incompatible shapes or backend");
+  moves.validateFor(p_list);
+  const auto fingerprint = moves.fingerprint();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    const auto& component = wfc_list.getCastedElement<J1OrbitalSoA<FT>>(walker);
+    if (!component.multi_particle_pending_ || component.multi_particle_fingerprint_ != fingerprint ||
+        !component.multi_particle_component_)
+      throw std::logic_error("J1OrbitalSoA collective resolution has no matching pending proposal");
+  }
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<J1OrbitalSoA<FT>>(walker);
+    if (accepted[walker])
+    {
+      const auto& next = static_cast<const J1OrbitalSoA<FT>&>(*component.multi_particle_component_);
+      std::copy_n(next.Vat.data(), component.Nelec, component.Vat.data());
+      std::copy_n(next.Grad.data(), component.Nelec, component.Grad.data());
+      std::copy_n(next.Lap.data(), component.Nelec, component.Lap.data());
+      component.log_value_ = next.log_value_;
+    }
+    component.multi_particle_pending_ = false;
+    component.multi_particle_fingerprint_ = 0;
+  }
+}
+
 } // namespace qmcplusplus
 #endif

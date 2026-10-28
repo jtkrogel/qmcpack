@@ -736,6 +736,116 @@ typename TwoBodyJastrow<FT>::LogValue TwoBodyJastrow<FT>::evaluateLog(const Part
   return log_value_ = computeGL(G, L);
 }
 
+#if !defined(QMC_BUILD_SANDBOX_ONLY)
+template<class FT>
+void TwoBodyJastrow<FT>::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios, const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+    const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
+{
+  const auto count = wfc_list.size();
+  if (!supportsMultiParticleMoves() || p_list.size() != count || moves.walkerCount() != count ||
+      log_ratios.size() != count || proposed_gradient_list.size() != count || proposed_laplacian_list.size() != count)
+    throw std::invalid_argument("TwoBodyJastrow CPU collective proposal has incompatible shapes or backend");
+  moves.validateFor(p_list);
+  for (std::size_t walker = 0; walker < count; ++walker)
+  {
+    const auto& component = wfc_list.getCastedElement<TwoBodyJastrow<FT>>(walker);
+    if (!component.supportsMultiParticleMoves() || component.multi_particle_pending_ ||
+        p_list[walker].getTotalNum() != component.N ||
+        proposed_gradient_list[walker].get().size() != component.N ||
+        proposed_laplacian_list[walker].get().size() != component.N)
+      throw std::logic_error("TwoBodyJastrow CPU collective proposal requires resolved matching components");
+    for (const ParticleSet& accepted : p_list)
+      if (proposed_gradient_list[walker].get().data() == accepted.G.data() ||
+          proposed_laplacian_list[walker].get().data() == accepted.L.data())
+        throw std::invalid_argument("TwoBodyJastrow collective outputs alias accepted particle products");
+  }
+  try
+  {
+    for (std::size_t walker = 0; walker < count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<TwoBodyJastrow<FT>>(walker);
+      if (!component.multi_particle_particles_)
+        component.multi_particle_particles_ = std::make_unique<ParticleSet>(p_list[walker]);
+      auto& proposed = *component.multi_particle_particles_;
+      proposed.R = p_list[walker].R;
+      const auto slice = moves.slice(walker);
+      for (std::size_t entry = 0; entry < slice.size(); ++entry)
+        proposed.R[slice.particleIndex(entry)] = slice.proposedPosition(entry);
+      proposed.update(true); // Only short-range J distances are consumed, never its structure factor.
+      // Refresh small conventional functors so coefficient publications/resets cannot leave stale staging.
+      component.multi_particle_component_ = component.makeClone(proposed);
+      component.multi_particle_gradient_.resize(component.N);
+      component.multi_particle_laplacian_.resize(component.N);
+      component.multi_particle_gradient_ = ValueType(0);
+      component.multi_particle_laplacian_ = ValueType(0);
+      component.multi_particle_component_->evaluateLog(proposed, component.multi_particle_gradient_,
+          component.multi_particle_laplacian_);
+      component.multi_particle_fingerprint_ = moves.fingerprint();
+      component.multi_particle_pending_ = true;
+    }
+    for (std::size_t walker = 0; walker < count; ++walker)
+    {
+      const auto& component = wfc_list.getCastedElement<TwoBodyJastrow<FT>>(walker);
+      log_ratios[walker] = component.multi_particle_component_->get_log_value() - component.log_value_;
+      for (int electron = 0; electron < component.N; ++electron)
+      {
+        proposed_gradient_list[walker].get()[electron] += component.multi_particle_gradient_[electron];
+        proposed_laplacian_list[walker].get()[electron] += component.multi_particle_laplacian_[electron];
+      }
+    }
+  }
+  catch (...)
+  {
+    for (WaveFunctionComponent& base : wfc_list)
+    {
+      auto& component = static_cast<TwoBodyJastrow<FT>&>(base);
+      component.multi_particle_pending_ = false;
+      component.multi_particle_fingerprint_ = 0;
+    }
+    throw;
+  }
+}
+
+template<class FT>
+void TwoBodyJastrow<FT>::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list, const MCMultiParticleMoves<CoordsType::POS>& moves,
+    const std::vector<bool>& accepted) const
+{
+  if (!supportsMultiParticleMoves() || wfc_list.size() != p_list.size() ||
+      moves.walkerCount() != wfc_list.size() || accepted.size() != wfc_list.size())
+    throw std::invalid_argument("TwoBodyJastrow CPU collective resolution has incompatible shapes or backend");
+  moves.validateFor(p_list);
+  const auto fingerprint = moves.fingerprint();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    const auto& component = wfc_list.getCastedElement<TwoBodyJastrow<FT>>(walker);
+    if (!component.multi_particle_pending_ || component.multi_particle_fingerprint_ != fingerprint ||
+        !component.multi_particle_component_)
+      throw std::logic_error("TwoBodyJastrow collective resolution has no matching pending proposal");
+  }
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<TwoBodyJastrow<FT>>(walker);
+    if (accepted[walker])
+    {
+      const auto& next = static_cast<const TwoBodyJastrow<FT>&>(*component.multi_particle_component_);
+      std::copy_n(next.Uat.data(), component.N, component.Uat.data());
+      std::copy_n(next.d2Uat.data(), component.N, component.d2Uat.data());
+      for (int axis = 0; axis < DIM; ++axis)
+        std::copy_n(next.dUat.data(axis), component.N, component.dUat.data(axis));
+      component.log_value_ = next.log_value_;
+    }
+    component.multi_particle_pending_ = false;
+    component.multi_particle_fingerprint_ = 0;
+  }
+}
+
+#endif
+
 template<typename FT>
 void TwoBodyJastrow<FT>::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                                         const RefVectorWithLeader<ParticleSet>& p_list,

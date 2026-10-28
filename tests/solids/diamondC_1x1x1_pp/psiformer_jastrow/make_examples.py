@@ -57,8 +57,8 @@ def sampling(node, acceptance, inference=False):
         parameter(node, name, value)
 
 
-def training(root, objective, optimizer, acceptance):
-    qmc = ET.SubElement(root, 'qmc', method='wf_train', move='pbyp', checkpoint='-1')
+def training(root, objective, optimizer, acceptance, move='pbyp'):
+    qmc = ET.SubElement(root, 'qmc', method='wf_train', move=move, checkpoint='-1')
     ET.SubElement(qmc, 'qmcsystem', wavefunction='student', hamiltonian='h0')
     controls = ET.SubElement(qmc, 'training', objective=objective, optimizer=optimizer)
     values = dict(iterations=3 if acceptance else 10, learning_rate=1e-6 if acceptance else 1e-5,
@@ -75,7 +75,7 @@ def training(root, objective, optimizer, acceptance):
     for name, value in values.items():
         parameter(controls, name, value)
     sampling(qmc, acceptance)
-    inference = ET.SubElement(qmc, 'inference', interval='1', last='yes', move='pbyp', evaluate_energy='yes')
+    inference = ET.SubElement(qmc, 'inference', interval='1', last='yes', move=move, evaluate_energy='yes')
     sampling(inference, acceptance, inference=True)
     return qmc
 
@@ -91,6 +91,8 @@ def main():
     parser.add_argument('--asset-dir', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--acceptance', action='store_true', help='Use the bounded few-update functional cases.')
+    parser.add_argument('--move', choices=('pbyp', 'alle'), default='pbyp',
+                        help='Student move scheme; the conventional SJ reference retains PBYP.')
     args = parser.parse_args()
     assets = args.asset_dir.resolve()
     for name in ('det_qmc.in.xml', 'pwscf.pwscf.h5', 'C.BFD.xml'):
@@ -102,13 +104,13 @@ def main():
         hashes.append(f'{hashlib.sha256((assets/name).read_bytes()).hexdigest()}  {assets/name}')
     (args.output_dir / 'reference_assets.sha256').write_text('\n'.join(hashes)+'\n')
     root = make_document(assets, 'orbital_pretrain', frozen=False)
-    training(root, 'orbital_mse', 'adam', args.acceptance)
+    training(root, 'orbital_mse', 'adam', args.acceptance, args.move)
     write(root, args.output_dir / 'orbital_pretrain.xml')
     for optimizer in ('adam', 'kfac'):
         for frozen in (True, False):
             name = f'energy_{optimizer}_j_{"frozen" if frozen else "active"}'
             root = make_document(assets, name, frozen)
-            training(root, 'energy', optimizer, args.acceptance)
+            training(root, 'energy', optimizer, args.acceptance, args.move)
             write(root, args.output_dir / f'{name}.xml')
     for reference in (False, True):
         name = 'sj_reference_vmc' if reference else 'initial_product_vmc'
@@ -116,7 +118,7 @@ def main():
         if reference:
             pseudo = root.find(".//pairpot[@type='pseudo']")
             pseudo.set('wavefunction', 'sj_reference')
-        qmc = ET.SubElement(root, 'qmc', method='vmc', move='pbyp', checkpoint='-1')
+        qmc = ET.SubElement(root, 'qmc', method='vmc', move='pbyp' if reference else args.move, checkpoint='-1')
         ET.SubElement(qmc, 'qmcsystem', wavefunction='sj_reference' if reference else 'student', hamiltonian='h0')
         sampling(qmc, args.acceptance)
         write(root, args.output_dir / f'{name}.xml')

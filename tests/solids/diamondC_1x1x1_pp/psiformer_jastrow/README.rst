@@ -45,18 +45,25 @@ each objective creates fresh optimizer history. Both stages retain their stated
 warmup/steps/substeps controls. Running two separate processes without a checkpoint
 or model association instead starts a new sampler.
 
-All examples use PBYP and line_search=off. Conventional J1/J2 do not advertise
-all-particle proposals in this slice. The checked-in examples use 16 walkers,
-64 warmup sweeps and 10 updates per stage. To reproduce the bounded functional
-qualification rather than run that preset::
+The checked-in examples use PBYP and line_search=off, with 16 walkers,
+64 warmup sweeps and 10 updates per stage. Generate CPU real FP64 all-particle
+student moves with ``--move alle``. This uses the complete neural/J1/J2 product
+for VMC, orbital pretraining and ENERGY Adam/KFAC. The separate conventional
+Slater-Jastrow reference input retains PBYP. The physical BFD Hamiltonian and
+eight valence electrons are unchanged. To generate short all-particle controls::
 
-  python3 make_examples.py --asset-dir .. --output-dir short_cases --acceptance
+  python3 make_examples.py --asset-dir .. --output-dir short_cases --acceptance --move alle
   python3 product_workflow.py handoff short_cases/orbital_pretrain.xml \
     short_cases/energy_kfac_j_active.xml --output short_cases/pipeline.xml
 
 The acceptance preset uses 3 updates per stage, 4 walkers, 4 warmup steps and
 2 sampled steps per update. It measures finite complete-product observations,
 mask enforcement, publications and persistence; it establishes no convergence.
+Omit ``--move alle`` to reproduce the PBYP controls. All-particle proposals
+stage only conventional Jastrow components in private particle banks; acceptance
+copies their native caches, while rejection preserves accepted values. J1/J2
+coefficient publications are reflected in the next proposal. Accelerator and
+complex/mixed-precision conventional Jastrow proposals remain outside this route.
 
 Optimizer and memory conventions
 --------------------------------
