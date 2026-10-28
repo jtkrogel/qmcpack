@@ -188,3 +188,104 @@ TEST_CASE("PsiFormer split real feature views preserve padded packed and partial
                   std::invalid_argument);
   CHECK_THROWS(split.data());
 }
+
+TEST_CASE("Complex target streaming preserves complete products with bounded physical storage",
+          "[wavefunction][psiformer][complex_spatial][complex_cpu_streamed]")
+{
+  auto model = tinyModel(true, true);
+  const auto execution_plan = plan(model, true, true);
+  pf::DirectComplexSpatialExecutor spatial(model, execution_plan);
+  auto full = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  const auto positions = model.cfg.configuration(0);
+  const auto view = pf::GeometryPositionView::interleaved(positions.x.data(), model.ne);
+  const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+      model.heads, execution_plan.parameter(ps::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
+      model.blocks, model.p.size()};
+  CHECK(full->vectorStorageBytes() ==
+        pf::DirectComplexSpatialWorkspace::storageRequirement(shape, pf::DirectSpatialMode::FULL_VGL));
+
+  for (const std::size_t targets : {std::size_t{1}, std::size_t{3}, model.ne})
+  {
+    const auto bytes = pf::DirectComplexStreamedSpatialWorkspace::storageRequirement(shape, targets);
+    CHECK_THROWS_AS(spatial.makeStreamedWorkspace(targets, bytes-1), std::length_error);
+    auto stream = spatial.makeStreamedWorkspace(targets, bytes);
+    CHECK(stream->vectorStorageBytes() == bytes);
+    CHECK(stream->targetCapacity() == targets);
+    if (targets < model.ne) CHECK(bytes < full->vectorStorageBytes());
+    const auto fingerprint = stream->storageFingerprint();
+    const auto compare = [&] {
+      const auto reference = spatial.evaluateFull(*full);
+      const auto result = spatial.evaluateFull(*stream);
+      CHECK(result.gradient_count == 3*model.ne);
+      CHECK(result.laplacian_count == model.ne);
+      CHECK(result.parameter_version == model.p.version());
+      CHECK(result.amplitude.log_abs == Catch::Approx(reference.amplitude.log_abs).margin(2e-11));
+      close(result.amplitude.phase, reference.amplitude.phase);
+      C kinetic{}, reference_kinetic{};
+      for (std::size_t lane = 0; lane < 3*model.ne; ++lane)
+        close(result.gradient[lane], reference.gradient[lane]);
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+      {
+        close(result.laplacian_log[electron], reference.laplacian_log[electron]);
+        close(result.laplacian_ratio[electron], reference.laplacian_ratio[electron]);
+        kinetic -= .5*result.laplacian_ratio[electron];
+        reference_kinetic -= .5*reference.laplacian_ratio[electron];
+      }
+      close(kinetic, reference_kinetic);
+      CHECK(stream->storageFingerprint() == fingerprint);
+      CHECK(stream->vectorStorageBytes() == bytes);
+    };
+    full->setPositions(view);
+    stream->setPositions(view);
+    compare();
+    const auto generation = stream->evaluationGeneration();
+    stream->setPosition(1, 2, positions.x[5]+.013);
+    full->setPosition(1, 2, positions.x[5]+.013);
+    CHECK_THROWS(stream->result());
+    compare();
+    CHECK(stream->evaluationGeneration() > generation);
+    const auto old_version = stream->observedParameterVersion();
+    auto values = model.p.flat_values();
+    values[execution_plan.parameter(ps::ParameterRole::BACKFLOW_UP_WEIGHT,
+        ps::NO_ATTENTION_BLOCK, ps::HeadTensorComponent::IMAG).begin] += .003;
+    model.p.set_flat_values(values);
+    CHECK(old_version != model.p.version());
+    compare();
+    pf::DirectComplexSpatialExecutor foreign(model, execution_plan);
+    CHECK_THROWS_AS(foreign.evaluateFull(*stream), std::invalid_argument);
+    CHECK_THROWS(stream->result());
+    stream->setPosition(0, 0, std::numeric_limits<double>::quiet_NaN());
+    CHECK_THROWS(spatial.evaluateFull(*stream));
+    CHECK_THROWS(stream->result());
+    CHECK(stream->observedParameterVersion() == std::numeric_limits<std::size_t>::max());
+  }
+  CHECK_THROWS_AS(spatial.makeStreamedWorkspace(0, 1000000), std::invalid_argument);
+  CHECK_THROWS_AS(spatial.makeStreamedWorkspace(model.ne+1, 1000000), std::invalid_argument);
+  CHECK_THROWS_AS(spatial.makeStreamedWorkspace(1, 0), std::invalid_argument);
+  CHECK_THROWS_AS(spatial.makeStreamedWorkspace(1, std::numeric_limits<std::size_t>::max()), std::invalid_argument);
+}
+
+TEST_CASE("Complex target lane rejects invalid ranges without retaining a published result",
+          "[wavefunction][psiformer][complex_spatial][complex_cpu_streamed]")
+{
+  auto model = tinyModel(true, true);
+  const auto execution_plan = plan(model, true, true);
+  pf::DirectComplexSpatialExecutor spatial(model, execution_plan);
+  auto target = spatial.makeTargetWorkspace(3, 100000000);
+  const auto positions = model.cfg.configuration(0);
+  target->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+  const auto bytes = target->vectorStorageBytes(), fingerprint = target->storageFingerprint();
+  for (const auto range : {std::array<std::size_t,2>{0,3}, {3,1}, {1,2}, {0,3}})
+  {
+    const auto result = spatial.evaluateTarget(*target, range[0], range[1]);
+    CHECK(result.gradient_count == 3*range[1]);
+    CHECK(result.laplacian_count == range[1]);
+    CHECK(target->vectorStorageBytes() == bytes);
+    CHECK(target->storageFingerprint() == fingerprint);
+  }
+  for (const auto range : {std::array<std::size_t,2>{0,0}, {0,4}, {4,1}, {3,2}})
+  {
+    CHECK_THROWS(spatial.evaluateTarget(*target, range[0], range[1]));
+    CHECK_THROWS(target->result());
+  }
+}

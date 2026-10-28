@@ -49,11 +49,11 @@ inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
         const double first = -decay * weighted;
         output[element] += weighted;
         for (std::size_t lane = 0; lane < orbitals.gradient_lanes; ++lane)
-          if ((orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL ? lane / 3 : active) == row)
+          if ((orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL ? orbitals.physicalTargetElectron(lane / 3) : active) == row)
             output[orbitals.uncheckedPlaneOffset(0, 1 + lane, element)] +=
                 first * selected.gradient[lane % 3];
-        if (orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL)
-          output[orbitals.uncheckedPlaneOffset(0, 1 + orbitals.gradient_lanes + row, element)] +=
+        if (orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL && orbitals.containsTargetElectron(row))
+          output[orbitals.uncheckedPlaneOffset(0, 1 + orbitals.gradient_lanes + row-orbitals.target_electron_begin, element)] +=
               decay * decay * weighted * selected.gradient_norm_squared + first * selected.laplacian;
       }
     }
@@ -93,32 +93,20 @@ class DirectComplexSpatialWorkspace
 {
   using C = qmcplusplus::psiformer::determinant::Complex;
 public:
-  /// Replace omitted real output/algebra by exact mixed-domain requirements before allocation.
-  static std::size_t storageRequirement(const PsiFormerStorageShape& shape,
-                                       DirectSpatialMode mode)
+  /// Count the exact existing FULL/ACTIVE owner before any numeric allocation.
+  static std::size_t storageRequirement(const PsiFormerStorageShape& shape, DirectSpatialMode mode)
   {
-    using namespace qmcplusplus::psiformer;
     if (mode != DirectSpatialMode::FULL_VGL && mode != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
       throw std::invalid_argument("invalid complex spatial storage mode");
-    const auto orbitals = checkedStorageProduct(shape.determinants,
-        checkedStorageProduct(shape.electrons, shape.electrons, "complex matrix extent overflow"),
-        "complex orbital extent overflow");
-    const auto jets = layout(orbitals, shape.electrons, mode);
-    const auto outputs = checkedStorageSum(jets.gradient_lanes,
-        checkedStorageProduct(2, jets.laplacian_lanes, "complex output extent overflow"),
-        "complex output extent overflow");
-    std::size_t bytes = spatialWorkspaceStorageRequirement(shape, mode == DirectSpatialMode::FULL_VGL) -
-        determinantStorageRequirement(shape.determinants, shape.electrons,
-            jets.gradient_lanes, jets.laplacian_lanes) -
-        checkedStorageBytes<double>(outputs, "real output bytes overflow");
-    // The omitted real orbital jets and the explicit real envelope jets have identical extents.
-    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets, shape.occupied_momentum_count, shape.fourier_mode_count),
-                    "complex spatial bytes overflow");
-    addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(shape.determinants,
-        shape.electrons, 0, jets.gradient_lanes, jets.laplacian_lanes), "complex spatial bytes overflow");
-    addStorageBytes(bytes, checkedStorageBytes<C>(outputs, "complex output bytes overflow"),
-                    "complex spatial bytes overflow");
-    return bytes;
+    return storageRequirementImpl(shape, mode, 0);
+  }
+
+  /// Count a compact target owner while preserving complete physical matrices/geometry.
+  static std::size_t targetStorageRequirement(const PsiFormerStorageShape& shape, std::size_t targets)
+  {
+    if (!targets || targets > shape.electrons)
+      throw std::invalid_argument("complex target capacity must be positive and at most Ne");
+    return storageRequirementImpl(shape, DirectSpatialMode::TARGET_VGL, targets);
   }
 
   /// Mutable prepared clones cannot share ownership by copying.
@@ -197,13 +185,14 @@ private:
   /// Prepare one derivative mode without a legacy real head or packed feature copy.
   DirectComplexSpatialWorkspace(const DirectComplexSpatialExecutor* owner,
       std::unique_ptr<DirectSpatialTrunkWorkspace> trunk,
-      const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor& descriptor, DirectSpatialMode mode)
+      const qmcplusplus::psiformer::ComplexOrbitalHeadDescriptor& descriptor, DirectSpatialMode mode,
+      std::size_t targets = 0)
       : owner_(owner), trunk_(std::move(trunk)), mode_(mode),
         features_(layout(checkedStorageProduct(descriptor.electrons, descriptor.feature_width,
-            "complex feature extent overflow"), descriptor.electrons, mode)),
+            "complex feature extent overflow"), descriptor.electrons, mode, targets)),
         orbitals_(layout(checkedStorageProduct(descriptor.determinants,
             checkedStorageProduct(descriptor.electrons, descriptor.electrons, "complex matrix extent overflow"),
-            "complex orbital extent overflow"), descriptor.electrons, mode)),
+            "complex orbital extent overflow"), descriptor.electrons, mode, targets)),
         envelopes_(qmcplusplus::psiformer::spatialJetSpanElements(orbitals_)),
         head_(descriptor, features_, orbitals_), determinant_(descriptor.determinants, descriptor.electrons,
             0, features_.gradient_lanes, features_.laplacian_lanes),
@@ -212,11 +201,47 @@ private:
 
   /// Map the existing physical differentiation modes to compact numerical jet layouts.
   static qmcplusplus::psiformer::SpatialJetLayout layout(std::size_t elements, std::size_t electrons,
-                                                        DirectSpatialMode mode)
+                                                        DirectSpatialMode mode, std::size_t targets = 0)
   {
+    if (mode == DirectSpatialMode::TARGET_VGL)
+      return qmcplusplus::psiformer::makeSpatialTargetJetLayout(1, elements, electrons, 0, targets);
     return qmcplusplus::psiformer::makeSpatialJetLayout(1, elements, electrons,
         mode == DirectSpatialMode::FULL_VGL ? qmcplusplus::psiformer::SpatialJetMode::FULL_VGL :
                                              qmcplusplus::psiformer::SpatialJetMode::ACTIVE);
+  }
+
+  /// Share the same inclusive accounting for complete and compact target owners.
+  static std::size_t storageRequirementImpl(const PsiFormerStorageShape& shape, DirectSpatialMode mode,
+                                             std::size_t targets)
+  {
+    using namespace qmcplusplus::psiformer;
+    const auto orbitals = checkedStorageProduct(shape.determinants,
+        checkedStorageProduct(shape.electrons, shape.electrons, "complex matrix extent overflow"),
+        "complex orbital extent overflow");
+    const auto jets = layout(orbitals, shape.electrons, mode, targets);
+    const auto outputs = checkedStorageSum(jets.gradient_lanes,
+        checkedStorageProduct(2, jets.laplacian_lanes, "complex output extent overflow"),
+        "complex output extent overflow");
+    auto bytes = spatialTrunkStorageRequirement(shape, jets.gradient_lanes, jets.laplacian_lanes);
+    addStorageBytes(bytes, checkedStorageBytes<double>(spatialJetSpanElements(jets), "complex envelope bytes overflow"),
+                    "complex spatial bytes overflow");
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets,
+        shape.occupied_momentum_count, shape.fourier_mode_count), "complex spatial bytes overflow");
+    addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(shape.determinants,
+        shape.electrons, 0, jets.gradient_lanes, jets.laplacian_lanes), "complex spatial bytes overflow");
+    addStorageBytes(bytes, checkedStorageBytes<C>(outputs, "complex output bytes overflow"),
+                    "complex spatial bytes overflow");
+    return bytes;
+  }
+
+  /// Retarget only live layouts; all reserved numeric buffers retain their original capacities.
+  void setTargetRange(std::size_t begin, std::size_t count)
+  {
+    const auto features = qmcplusplus::psiformer::withSpatialTargetRange(features_, begin, count);
+    const auto orbitals = qmcplusplus::psiformer::withSpatialTargetRange(orbitals_, begin, count);
+    head_.setTargetRange(begin, count);
+    features_ = features;
+    orbitals_ = orbitals;
   }
 
   /// Invalidate before every mutation or attempted evaluation, including failures.
@@ -235,6 +260,81 @@ private:
   std::vector<double> envelopes_;
   qmcplusplus::psiformer::ComplexOrbitalHeadWorkspace head_;
   qmcplusplus::psiformer::determinant::ComplexDeterminantWorkspace determinant_;
+  std::vector<C> gradient_, lap_log_, lap_ratio_;
+  DirectComplexSpatialResult result_;
+  std::size_t generation_ = 0;
+  bool valid_ = false;
+};
+
+/// One reusable target lane plus complete O(Ne) outputs, with no full derivative graph.
+class DirectComplexStreamedSpatialWorkspace
+{
+  using C = qmcplusplus::psiformer::determinant::Complex;
+public:
+  /// Count every owned numeric allocation, including the complete result assembly.
+  static std::size_t storageRequirement(const PsiFormerStorageShape& shape, std::size_t targets)
+  {
+    const char* message = "complex streamed spatial storage overflow";
+    return checkedStorageSum(DirectComplexSpatialWorkspace::targetStorageRequirement(shape, targets),
+        checkedStorageBytes<C>(checkedStorageProduct(5, shape.electrons, message), message), message);
+  }
+
+  DirectComplexStreamedSpatialWorkspace(const DirectComplexStreamedSpatialWorkspace&) = delete;
+  DirectComplexStreamedSpatialWorkspace& operator=(const DirectComplexStreamedSpatialWorkspace&) = delete;
+
+  /// Coordinate edits invalidate complete output before changing the private target lane.
+  void setPositions(GeometryPositionView positions) { invalidate(); tile_->setPositions(positions); }
+  void setPosition(std::size_t electron, std::size_t dimension, double value)
+  { invalidate(); tile_->setPosition(electron, dimension, value); }
+
+  /// Borrow only complete successful products and their request/model stamps.
+  const DirectComplexSpatialResult& result() const
+  {
+    if (!valid_) throw std::logic_error("complex streamed spatial result unavailable");
+    return result_;
+  }
+  std::size_t evaluationGeneration() const noexcept { return generation_; }
+  std::size_t observedParameterVersion() const noexcept
+  { return valid_ ? result_.parameter_version : std::numeric_limits<std::size_t>::max(); }
+  std::size_t targetCapacity() const noexcept { return targets_; }
+
+  /// Physical bytes include the tile and all complete result vectors; borrowed views add none.
+  std::size_t vectorStorageBytes() const
+  {
+    const char* message = "complex streamed spatial storage overflow";
+    auto bytes = tile_->vectorStorageBytes();
+    for (const auto* output : {&gradient_, &lap_log_, &lap_ratio_})
+      addStorageBytes(bytes, checkedStorageBytes<C>(output->capacity(), message), message);
+    return bytes;
+  }
+  std::size_t storageFingerprint() const noexcept
+  {
+    auto hash = tile_->storageFingerprint();
+    for (const auto* output : {&gradient_, &lap_log_, &lap_ratio_})
+      qmcplusplus::psiformer::determinant::detail::mixStorage(hash, *output);
+    return hash;
+  }
+
+private:
+  friend class DirectComplexSpatialExecutor;
+  DirectComplexStreamedSpatialWorkspace(const DirectComplexSpatialExecutor* owner,
+      std::unique_ptr<DirectComplexSpatialWorkspace> tile, std::size_t electrons, std::size_t targets)
+      : owner_(owner), tile_(std::move(tile)), targets_(targets),
+        gradient_(checkedStorageProduct(3, electrons, "complex complete gradient extent overflow")),
+        lap_log_(electrons), lap_ratio_(electrons)
+  {}
+
+  /// Failed evaluations and edits cannot expose a partly assembled previous result.
+  void invalidate()
+  {
+    valid_ = false;
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("complex streamed spatial generation exhausted");
+    ++generation_;
+  }
+  const DirectComplexSpatialExecutor* owner_;
+  std::unique_ptr<DirectComplexSpatialWorkspace> tile_;
+  const std::size_t targets_;
   std::vector<C> gradient_, lap_log_, lap_ratio_;
   DirectComplexSpatialResult result_;
   std::size_t generation_ = 0;
@@ -287,6 +387,61 @@ public:
         this, trunk_.makeTrunkWorkspace(mode), descriptor_, mode));
   }
 
+  /// Admit the whole compact complex owner before preparing its real trunk.
+  std::unique_ptr<DirectComplexSpatialWorkspace> makeTargetWorkspace(std::size_t targets,
+                                                                   std::size_t byte_budget) const
+  {
+    if (!byte_budget || byte_budget == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("complex target workspace requires a positive finite byte cap");
+    if (DirectComplexSpatialWorkspace::targetStorageRequirement(storageShape(), targets) > byte_budget)
+      throw std::length_error("complex target workspace exceeds its byte cap before allocation");
+    return std::unique_ptr<DirectComplexSpatialWorkspace>(new DirectComplexSpatialWorkspace(this,
+        trunk_.makeTargetTrunkWorkspace(targets, byte_budget), descriptor_, DirectSpatialMode::TARGET_VGL, targets));
+  }
+
+  /// Prepare a single bounded lane and complete result assembly under one exact cap.
+  std::unique_ptr<DirectComplexStreamedSpatialWorkspace> makeStreamedWorkspace(std::size_t targets,
+                                                                            std::size_t byte_budget) const
+  {
+    if (!byte_budget || byte_budget == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("complex streamed workspace requires a positive finite byte cap");
+    if (DirectComplexStreamedSpatialWorkspace::storageRequirement(storageShape(), targets) > byte_budget)
+      throw std::length_error("complex streamed workspace exceeds its byte cap before allocation");
+    return std::unique_ptr<DirectComplexStreamedSpatialWorkspace>(new DirectComplexStreamedSpatialWorkspace(
+        this, makeTargetWorkspace(targets, byte_budget), descriptor_.electrons, targets));
+  }
+
+  /// Evaluate only the specified physical target interval, including a smaller tail.
+  DirectComplexSpatialResult evaluateTarget(DirectComplexSpatialWorkspace& workspace,
+                                           std::size_t begin, std::size_t count) const
+  { return evaluate(workspace, DirectSpatialMode::TARGET_VGL, begin, count); }
+
+  /// Assemble one complete complex VGL result using the same bounded target lane repeatedly.
+  DirectComplexSpatialResult evaluateFull(DirectComplexStreamedSpatialWorkspace& workspace) const
+  {
+    workspace.invalidate();
+    if (workspace.owner_ != this)
+      throw std::invalid_argument("complex streamed spatial owner mismatch");
+    const auto version = parameters_.version();
+    qmcplusplus::psiformer::determinant::ComplexLogAmplitude amplitude;
+    for (std::size_t begin = 0; begin < descriptor_.electrons; begin += workspace.targets_)
+    {
+      const auto count = std::min(workspace.targets_, descriptor_.electrons-begin);
+      const auto tile = evaluateTarget(*workspace.tile_, begin, count);
+      if (tile.parameter_version != version || parameters_.version() != version ||
+          tile.gradient_count != 3*count || tile.laplacian_count != count)
+        throw std::logic_error("complex streamed spatial tile version or extent changed");
+      if (begin == 0) amplitude = tile.amplitude;
+      std::copy_n(tile.gradient, 3*count, workspace.gradient_.data()+3*begin);
+      std::copy_n(tile.laplacian_log, count, workspace.lap_log_.data()+begin);
+      std::copy_n(tile.laplacian_ratio, count, workspace.lap_ratio_.data()+begin);
+    }
+    workspace.result_ = {amplitude, workspace.gradient_.data(), workspace.lap_log_.data(), workspace.lap_ratio_.data(),
+        workspace.gradient_.size(), workspace.lap_log_.size(), DirectSpatialMode::FULL_VGL, 0, version, workspace.generation_};
+    workspace.valid_ = true;
+    return workspace.result_;
+  }
+
   /// Evaluate all physical gradient and Laplacian lanes.
   DirectComplexSpatialResult evaluateFull(DirectComplexSpatialWorkspace& workspace) const
   {
@@ -300,6 +455,17 @@ public:
   }
 
 private:
+  /// Recover exact physical shape/counts from immutable prepared metadata.
+  PsiFormerStorageShape storageShape() const
+  {
+    const auto& layout = *metadata_.trunkLayout();
+    PsiFormerStorageShape shape{descriptor_.electrons, layout.nucleusCount(), descriptor_.determinants,
+        descriptor_.feature_width, layout.headCount(), layout.inputWidth(), 0, 0};
+    shape.occupied_momentum_count = descriptor_.reciprocal_momenta.size();
+    shape.fourier_mode_count = descriptor_.fourier_modes ? descriptor_.fourier_modes->momenta().size() : 0;
+    return shape;
+  }
+
   /// Enforce the full paired periodic schema before resolving real metadata.
   static const qmcplusplus::psiformer::PsiFormerExecutionPlan& admit(const PsiFormer& model,
       const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
@@ -323,14 +489,16 @@ private:
 
   /// Compose shared real trunk, split-feature complex head and strict analytic reduction.
   DirectComplexSpatialResult evaluate(DirectComplexSpatialWorkspace& w, DirectSpatialMode mode,
-                                      std::size_t active) const
+                                      std::size_t active, std::size_t targets = 0) const
   {
     using namespace qmcplusplus::psiformer;
     w.invalidate();
     if (w.owner_ != this || w.mode_ != mode)
       throw std::invalid_argument("PsiFormer complex spatial workspace owner or mode mismatch");
+    if (mode == DirectSpatialMode::TARGET_VGL) w.setTargetRange(active, targets);
     const auto t = mode == DirectSpatialMode::FULL_VGL ? trunk_.evaluateTrunkFull(*w.trunk_) :
-                                                      trunk_.evaluateTrunkActive(*w.trunk_, active);
+        mode == DirectSpatialMode::TARGET_VGL ? trunk_.evaluateTrunkTarget(*w.trunk_, active, targets) :
+                                              trunk_.evaluateTrunkActive(*w.trunk_, active);
     const double* p = parameters_.flat_values().data();
     fillRealOrbitalEnvelopeJets(*t.geometry, w.orbitals_, descriptor_.spin_up,
         metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data(),
@@ -351,9 +519,9 @@ private:
         w.features_.laplacian_lanes, w.gradient_.data(), w.lap_log_.data(), w.lap_ratio_.data());
     auto amplitude = det.amplitude;
     amplitude.log_abs += t.cusp;
-    for (std::size_t lane = 0; lane < w.gradient_.size(); ++lane)
+    for (std::size_t lane = 0; lane < w.features_.gradient_lanes; ++lane)
       w.gradient_[lane] += t.cusp_gradient[lane];
-    for (std::size_t electron = 0; electron < w.lap_log_.size(); ++electron)
+    for (std::size_t electron = 0; electron < w.features_.laplacian_lanes; ++electron)
     {
       w.lap_log_[electron] += t.cusp_laplacian[electron];
       auto ratio = w.lap_log_[electron];
@@ -368,7 +536,7 @@ private:
         if (!determinant::isFiniteReal(value.real()) || !determinant::isFiniteReal(value.imag()))
           throw std::overflow_error("PsiFormer complex spatial derivative overflow");
     w.result_ = {amplitude, w.gradient_.data(), w.lap_log_.data(), w.lap_ratio_.data(),
-                 w.gradient_.size(), w.lap_log_.size(), mode, active, t.parameter_version, w.generation_};
+                 w.features_.gradient_lanes, w.features_.laplacian_lanes, mode, active, t.parameter_version, w.generation_};
     w.valid_ = true;
     return w.result_;
   }

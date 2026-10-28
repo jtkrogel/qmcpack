@@ -660,6 +660,38 @@ public:
         GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), mode, boundary_);
   }
 
+  /// Admit and allocate only compact target trunk jets, retaining all physical rows.
+  std::unique_ptr<DirectSpatialTrunkWorkspace> makeTargetTrunkWorkspace(std::size_t max_targets,
+                                                                     std::size_t byte_budget) const
+  {
+    if (!max_targets || max_targets > layout_->electronCount() || !byte_budget ||
+        byte_budget == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("PsiFormer target trunk requires valid targets and a finite byte cap");
+    const PsiFormerStorageShape shape{layout_->electronCount(), layout_->nucleusCount(), layout_->determinantCount(),
+        layout_->featureWidth(), layout_->headCount(), layout_->inputWidth(), 0, 0};
+    if (spatialTrunkStorageRequirement(shape, checkedStorageProduct(3, max_targets,
+            "PsiFormer target trunk gradient overflow"), max_targets) > byte_budget)
+      throw std::length_error("PsiFormer target trunk exceeds its byte cap before allocation");
+    return std::unique_ptr<DirectSpatialTrunkWorkspace>(new DirectSpatialTrunkWorkspace(*layout_,
+        GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()),
+        DirectSpatialMode::TARGET_VGL, boundary_, max_targets));
+  }
+
+  /// Retarget one fixed trunk bank without changing any numeric allocation.
+  DirectSpatialTrunkResultView evaluateTrunkTarget(DirectSpatialTrunkWorkspace& workspace,
+                                                   std::size_t begin, std::size_t count) const
+  {
+    workspace.invalidateResult();
+    if (workspace.mode_ != DirectSpatialMode::TARGET_VGL || !count || count > workspace.target_capacity_ ||
+        begin >= layout_->electronCount() || count > layout_->electronCount()-begin)
+      throw std::invalid_argument("PsiFormer target trunk interval exceeds its prepared capacity");
+    workspace.target_begin_ = begin;
+    workspace.target_count_ = count;
+    workspace.gradient_lanes_ = 3*count;
+    workspace.laplacian_lanes_ = count;
+    return evaluateTrunkImpl(workspace);
+  }
+
   /// Publish all physical-electron feature/cusp jets after complete real trunk success.
   DirectSpatialTrunkResultView evaluateTrunkFull(DirectSpatialTrunkWorkspace& workspace) const
   {
