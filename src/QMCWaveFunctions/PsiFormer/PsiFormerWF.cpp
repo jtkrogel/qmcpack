@@ -14297,8 +14297,20 @@ double PsiFormerWF::consumeResidentScoreAdam(const wftrain::StreamingDerivativeO
   double norm = 0;
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
     auto& session = *source->shared_scratch_->device_products;
+    const auto before = session.transferSnapshot();
     norm = session.consumeScoreAdam(adam, derivative.parameterVersion(), generation,
         parameters, weight, transformed_mean, beta1, beta2, correction1, correction2, epsilon, candidate);
+    const auto after = session.transferSnapshot();
+    app_log() << "Resident score Adam terminal consumer: channels=2 parameter_response_mask=0 P=" << parameters.size()
+              << " parameter_version=" << derivative.parameterVersion()
+              << " uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+              << " downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
+              << " allocation_calls=" << after.allocation_calls - before.allocation_calls
+              << " free_calls=" << after.free_calls - before.free_calls
+              << " expected_uploaded_bytes=" << 8 * parameters.size()
+              << " expected_downloaded_bytes=" << 8 * parameters.size() + adam.energyGradientDeviceBytes() + 16
+              << " counter_scope=device_wide producer_seed_checkpoint_excluded=yes"
+              << " sampling=host local_energy=host parameter_publication=host" << std::endl;
   }, false, true);
   return norm;
 #else
