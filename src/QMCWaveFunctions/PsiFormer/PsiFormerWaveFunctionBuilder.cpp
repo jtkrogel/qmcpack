@@ -349,8 +349,6 @@ try
     const bool gpu_ecp = explicit_gpu && system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((initialization == "psiformer_complex_periodic_v1" && parameters.empty()) || direct_model);
     const bool cpu_ecp = !explicit_gpu && (request == "no" || request == "cpu") &&
-        (optimization_enabled || direct_model || (!pair_profile && parameters.empty() &&
-         initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1)) &&
         system == "pseudopotential" && parameter_checkpoint.empty() &&
         ((parameters.empty() && (initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 || pair_profile)) || direct_model);
     const bool cpu_training = !explicit_gpu && (request == "no" || request == "cpu") &&

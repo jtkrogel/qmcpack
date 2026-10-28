@@ -1779,6 +1779,100 @@ TEST_CASE("Legacy paired CPU pseudopotential inference initializes without optim
   CHECK(readiness.calls == 0);
 }
 
+
+TEST_CASE("Versioned paired CPU ECP fresh inference matches training and standalone import",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_pp_inference][cpu_ecp_profile]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  p.create({1, 1});
+  p.R[0] = {.2, .1, .3}; p.R[1] = {1.1, .5, 1.4};
+  p.resetGroups(); p.update();
+  auto training_p = ParticleSet(p);
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  auto source = std::make_unique<ParticleSet>(ions(simulation_cell));
+  auto& species = source->getSpeciesSet();
+  species(species.findAttribute("charge"), 0) = 1;
+  species(species.findAttribute("valence"), 0) = 1;
+  source->resetGroups(); source->update();
+  pool.emplace("ion0", std::move(source));
+  AdmissionReadiness readiness;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, pool, &readiness);
+  PsiFormerWaveFunctionBuilder training_builder(OHMMS::Controller, training_p, pool, &readiness);
+  const auto xml = [&](const std::string& controls, const std::string& twist,
+                       const std::string& model = "", const std::string& gpu = "cpu") {
+    std::ostringstream text;
+    text << std::setprecision(17) << "<psiformer source='ion0' system='pseudopotential' "
+         << "feature_policy='periodic_two_cell_v1' gpu='" << gpu << "' "
+         << "max_clone_numeric_bytes='67108864' twist='" << twist << "' " << controls;
+    if (!model.empty()) text << " parameters='" << model << "'/>";
+    else
+    {
+      text << " initialization='psiformer_periodic_pair_v1' initialization_seed='17'>"
+           << "<periodic_profile version='1' head='paired_complex' feature_transform='log_complement_v1' "
+           << "electron_electron_cusp='yes' envelope_policy='atom_centered'>"
+           << "<parameter name='primitive_lattice'>";
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) text << p.getLattice().R(i, j) << ' ';
+      text << "</parameter><parameter name='tiling'>1 0 0 0 1 0 0 0 1</parameter>"
+           << "<parameter name='primitive_motif'>";
+      for (int ion = 0; ion < 2; ++ion)
+        for (int d = 0; d < 3; ++d) text << pool.at("ion0")->R[ion][d] << ' ';
+      text << "</parameter><parameter name='motif_species'>Li H</parameter>"
+           << "<parameter name='occupied_columns'>0 0 0 0 0 1 0 0 0 0 1 1</parameter>"
+           << "</periodic_profile></psiformer>";
+    }
+    return text.str();
+  };
+  const auto build = [](PsiFormerWaveFunctionBuilder& selected, const std::string& text) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(text));
+    return selected.buildComponent(document.getRoot());
+  };
+  for (const std::string twist : {"0 0 0", ".125 -.0625 .03125"})
+  {
+    p.setTwist({}); training_p.setTwist({});
+    auto cold_base = build(builder, xml("optimize='no'", twist));
+    auto training_base = build(training_builder, xml("optimize='yes' optimize_scope='all'", twist));
+    auto* cold = dynamic_cast<PsiFormerComplexWF*>(cold_base.get());
+    auto* training = dynamic_cast<PsiFormerComplexWF*>(training_base.get());
+    REQUIRE(cold != nullptr); REQUIRE(training != nullptr);
+    CHECK_FALSE(cold->gpuInferenceEnabled()); CHECK(cold->isPseudopotentialSystem());
+    CHECK(cold->snapshotParameters().version == 0);
+    CHECK(cold->snapshotParameters().values == training->snapshotParameters().values);
+    const auto center = evaluate(*cold, p);
+    close(center, evaluate(*training, training_p), 2e-12);
+    for (int e = 0; e < p.getTotalNum(); ++e)
+    {
+      close(p.L[e], training_p.L[e], 2e-12);
+      for (int d = 0; d < 3; ++d) close(p.G[e][d], training_p.G[e][d], 2e-12);
+    }
+    const auto saved = p.R[0];
+    for (int d = 0; d < 3; ++d) p.R[0][d] += p.getLattice().R(0, d);
+    p.update();
+    const double angle = twist == "0 0 0" ? 0 : 2 * std::acos(-1.) * .125;
+    close(std::exp(evaluate(*cold, p) - center), std::polar(1., angle), 2e-11);
+    p.R[0] = saved; p.update();
+    const auto path = "psiformer_cpu_pair_ecp_fresh." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+    REQUIRE_FALSE(std::filesystem::exists(path));
+    cold->exportModel(path);
+    auto imported_base = build(builder, xml("optimize='no'", twist, path));
+    auto* imported = dynamic_cast<PsiFormerComplexWF*>(imported_base.get());
+    REQUIRE(imported != nullptr);
+    CHECK(imported->isPseudopotentialSystem());
+    CHECK(imported->snapshotParameters().values == cold->snapshotParameters().values);
+    close(evaluate(*imported, p), center, 2e-12);
+    CHECK(std::filesystem::remove(path));
+  }
+  p.setTwist({});
+  CHECK_THROWS_AS(build(builder, xml("optimize='no' optimize_scope='all'", "0 0 0")), std::invalid_argument);
+  CHECK_THROWS_AS(build(builder, xml("optimize='no' precision='fp32_dense_fp64_islands'", "0 0 0")),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(build(builder, xml("optimize='no'", "0 0 0", "", "cuda")), std::invalid_argument);
+  CHECK_THROWS_AS(build(builder, xml("optimize='no'", "0 0 0", "", "auto")), std::invalid_argument);
+  CHECK(readiness.calls == 0);
+}
+
 TEST_CASE("PsiFormer paired XML observes the same production Coulomb Hamiltonian sample",
           "[wavefunction][psiformer][complex_wf][complex_admission]")
 {
