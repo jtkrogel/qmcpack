@@ -216,6 +216,18 @@ if(Python3_EXECUTABLE)
     PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()
 
+add_executable(test_psiformer_capability_report test_psiformer_capability_report.cpp)
+target_include_directories(test_psiformer_capability_report PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_psiformer_capability_report PRIVATE Threads::Threads)
+add_test(NAME deterministic-unit_test_psiformer_capability_report COMMAND test_psiformer_capability_report)
+if(Python3_EXECUTABLE)
+  add_test(NAME deterministic-unit_test_psiformer_capability_report_json
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_psiformer_capability_report.py
+      $<TARGET_FILE:test_psiformer_capability_report>)
+  set_tests_properties(deterministic-unit_test_psiformer_capability_report_json
+    PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+endif()
+
 set(CATEGORY_MPI sposet)
 
 foreach(CATEGORY common trialwf sposet jastrow determinant)

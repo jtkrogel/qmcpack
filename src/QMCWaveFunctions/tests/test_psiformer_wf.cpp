@@ -14,6 +14,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Message/Communicate.h"
+#include "OutputManager.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
 #include "Particle/MCMultiParticleMoves.h"
@@ -2181,6 +2182,12 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
 TEST_CASE("PsiFormer builder resolves accelerator policy before model construction",
           "[wavefunction][psiformer][accelerator][builder]")
 {
+  struct CaptureLog
+  {
+    std::ostringstream text;
+    std::streambuf* original = app_log().rdbuf(text.rdbuf());
+    ~CaptureLog() { app_log().rdbuf(original); }
+  } capture;
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
@@ -2296,6 +2303,23 @@ TEST_CASE("PsiFormer builder resolves accelerator policy before model constructi
   require_early_failure("mystery", "gpu must be");
   require_early_failure("sycl", "no production executor");
   CHECK(provider.inspection_count == before_invalid);
+
+  automatic->evaluateLog(electrons, electrons.G, electrons.L);
+  clone->evaluateLog(electrons, electrons.G, electrons.L);
+  automatic.reset();
+  // A shared family emits its completed summary when its final clone owner dies.
+  clone_storage.reset();
+  const auto report = capture.text.str();
+  CHECK(report.find("\"phase\":\"selection\"") != std::string::npos);
+  CHECK(report.find("\"requested_backend\":\"auto\"") != std::string::npos);
+  CHECK(report.find("\"selected_backend\":\"cpu\"") != std::string::npos);
+  CHECK(report.find("\"active_crowds\":\"not_started\"") != std::string::npos);
+  CHECK(report.find("\"device_resident_owner\":\"none\"") != std::string::npos);
+  CHECK(report.find("\"readiness_provenance\":\"injected_test_provider\"") != std::string::npos);
+  CHECK(report.find("\"failure_category\":\"unsupported_operation\"") != std::string::npos);
+  CHECK(report.find("\"failure_category\":\"invalid_input\"") != std::string::npos);
+  CHECK(report.find("\"phase\":\"dispatch_summary\"") != std::string::npos);
+  CHECK(report.find("\"scalar_full\":\"2\"") != std::string::npos);
 }
 
 TEST_CASE("PsiFormer direct constructors default to CPU and reject forged accelerator routes",

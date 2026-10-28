@@ -9,6 +9,7 @@
  * @brief QMCPACK integration for the native PsiFormer evaluator.
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCapabilityReport.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
@@ -1421,6 +1422,34 @@ public:
           "Periodic PsiFormer requires direct value/spatial/score/kinetic backends; "
           "the molecular native oracle is not periodic");
   }
+
+  ~PsiFormerSharedState()
+  {
+    // Resource teardown cannot turn a completed run into a logging exception.
+    try
+    {
+#ifdef ENABLE_CUDA
+      if (const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(numerical_tile_backend.get()))
+        psiformer::writeCapabilityReceipt(app_log(), "inference_admission_summary", {
+            {"model_identity", std::to_string(persistent_model_identity)},
+            {"prepared_crowd_capacity", std::to_string(backend->activeInferenceCrowdCapacity())},
+            {"peak_admitted_calls", std::to_string(backend->peakAdmittedInferenceCalls())},
+            {"scope", "host_permits_not_gpu_overlap"}});
+#endif
+
+      capability_dispatch.report(app_log(), persistent_model_identity);
+      if (numerical_tile_backend)
+      {
+        psiformer::writeCapabilityReceipt(app_log(), "device_dispatch_summary", {
+            {"model_identity", std::to_string(persistent_model_identity)},
+            {"completed_numerical_tiles", std::to_string(numerical_tile_backend->numericalTileCount())},
+            {"gpu_overlap", "not_measured"}});
+      }
+    }
+    catch (...) {}
+  }
+
+  psiformer::CapabilityDispatchCounters capability_dispatch;
 
   /// Publish under the caller's exclusive model lock, including restart/rollback.
   /// Device upload and native validation precede the shared version transition.
@@ -4870,6 +4899,7 @@ private:
  * against the same immutable/versioned model state without copying buffers. */
 struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
 {
+  bool capability_reported = false;
   /// Identify which of the two statically typed ratio vectors owns the arena.
   enum class RatioArenaKind : std::uint8_t
   {
@@ -6835,6 +6865,23 @@ PsiFormerWF::PsiFormerWF(std::string name,
       throw std::invalid_argument("PsiFormer optimize_indices contains a duplicate flat index");
   }
 
+  psiformer::writeCapabilityReceipt(app_log(), "effective_component", {
+      {"source", "PsiFormerWF.cpp"},
+      {"selected_backend", psiformer::psiFormerAcceleratorBackendName(model_state_->accelerator_resolution.backend)},
+      {"precision", psiformer::psiFormerPrecisionPolicyName(model_state_->precision)},
+      {"model_identity", std::to_string(model_state_->persistent_model_identity)},
+      {"parameter_version", std::to_string(parameters_ref.version())},
+      {"value_kernel", directBackendModeName(model_state_->direct_value_mode)},
+      {"spatial_kernel", directBackendModeName(model_state_->direct_spatial_mode)},
+      {"score_kernel", directBackendModeName(model_state_->direct_score_mode)},
+      {"kinetic_kernel", directBackendModeName(model_state_->direct_kinetic_mode)},
+      {"device_resident_owner", model_state_->numerical_tile_backend ? "prepared_numerical_tile_backend" : "none"},
+      {"device_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(model_state_->numerical_tile_backend.get()))},
+      {"cpu_vgl_target_capacity", std::to_string(model_state_->cpu_target_vgl.targets)},
+      {"cpu_kinetic_target_capacity", std::to_string(model_state_->cpu_target_kinetic.targets)},
+      {"active_crowds", "driver_resource_deferred"}, {"active_lanes", "driver_resource_deferred"},
+      {"sampling_hamiltonian", "native_driver_owned"}});
+
   observed_parameter_version_ = parameters_ref.version();
   accepted_parameter_version_ = observed_parameter_version_;
   resizeAcceptedSpatialStorage(model_state_->model.ne);
@@ -8714,6 +8761,23 @@ void PsiFormerWF::acquireResource(
   leader.mw_resource_handle_ = std::move(candidate_handle);
   auto& acquired_resource = leader.mw_resource_handle_.getResource();
   acquired_resource.scalar_value_acquisition_thread = std::this_thread::get_id();
+  if (!acquired_resource.capability_reported)
+  {
+    psiformer::writeCapabilityReceipt(app_log(), "effective_crowd", {
+        {"model_identity", std::to_string(leader.model_state_->persistent_model_identity)},
+        {"resource_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(&acquired_resource))},
+        {"scope", "first_acquisition_of_this_crowd_resource"}, {"active_crowds", "1"},
+        {"active_walker_lanes", std::to_string(wfc_list.size())},
+        {"prepared_walker_tile_capacity", std::to_string(acquired_resource.batch_workspace->tileCapacity())},
+        {"prepared_virtual_tile_capacity", std::to_string(acquired_resource.ecp_value_workspace
+            ? acquired_resource.ecp_value_workspace->tileCapacity()
+            : acquired_resource.batch_workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY))},
+        {"capacity_interpretation", "zero_means_lazy_not_prepared"},
+        {"nominal_driver_crowds", collection.hasSingleDriverCrowd() ? "1" : "not_exposed"},
+        {"gpu_overlap", "not_measured"}});
+    acquired_resource.capability_reported = true;
+  }
+
   if (leader.batch_execution_plan_)
   {
     acquired_resource.acquired_plan_identity            = collection_provenance.plan.get();
@@ -14134,6 +14198,7 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
                                                ParticleSet::ParticleGradient& g,
                                                ParticleSet::ParticleLaplacian& l)
 {
+  psiformer::CompletedCapabilityDispatch dispatch(model_state_->capability_dispatch, 1, false);
   requireUnplannedScalarEvaluation("evaluateLog");
   requireNoSelectedParticleProposal("evaluateLog");
   if (model_state_->cpu_target_vgl.targets && has_proposal_)
@@ -15285,6 +15350,7 @@ void PsiFormerWF::mw_evaluateLog(
     const RefVector<ParticleSet::ParticleGradient>& gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list) const
 {
+  psiformer::CompletedCapabilityDispatch dispatch(model_state_->capability_dispatch, wfc_list.size(), true);
   NativeTimerScope timer(phase_timers_.batch_vgl);
   // Preserve the historical lazy/oracle implementation byte-for-byte behind
   // an explicit no-policy branch.

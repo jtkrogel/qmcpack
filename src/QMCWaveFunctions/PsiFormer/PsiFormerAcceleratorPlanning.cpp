@@ -10,6 +10,7 @@
  */
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCapabilityReport.h"
 
 #include <config.h>
 
@@ -47,7 +48,7 @@ std::string normalizedToken(std::string_view input)
 /// Reject an unavailable strict request with a stable diagnostic.
 [[noreturn]] void throwUnavailable(PsiFormerAcceleratorBackend backend)
 {
-  throw std::runtime_error(std::string("PsiFormer accelerator backend '") +
+  throw CapabilityError(CapabilityFailure::UNSUPPORTED_OPERATION, std::string("PsiFormer accelerator backend '") +
                            psiFormerAcceleratorBackendName(backend) +
                            "' is not compiled into this executable");
 }
@@ -86,7 +87,11 @@ PsiFormerAcceleratorResolutionReason readinessReason(
 [[noreturn]] void throwNotReady(PsiFormerAcceleratorBackend backend,
                                 PsiFormerAcceleratorResolutionReason reason)
 {
-  throw std::runtime_error(std::string("PsiFormer accelerator backend '") +
+  const auto category = reason == PsiFormerAcceleratorResolutionReason::NOT_COMPILED ||
+          reason == PsiFormerAcceleratorResolutionReason::INCOMPLETE_OPERATION_COVERAGE ||
+          reason == PsiFormerAcceleratorResolutionReason::NO_PRODUCTION_EXECUTOR
+      ? CapabilityFailure::UNSUPPORTED_OPERATION : CapabilityFailure::UNQUALIFIED_HARDWARE;
+  throw CapabilityError(category, std::string("PsiFormer accelerator backend '") +
                            psiFormerAcceleratorBackendName(backend) +
                            "' is not production-ready: " +
                            psiFormerAcceleratorResolutionReasonName(reason));
@@ -225,7 +230,8 @@ PsiFormerAcceleratorResolution resolvePsiFormerAcceleratorRequest(
 {
   const std::string value = normalizedToken(request);
   if (value == "omptarget" || value == "sycl")
-    throw std::runtime_error(std::string("PsiFormer accelerator backend '") + value +
+    throw CapabilityError(CapabilityFailure::UNSUPPORTED_OPERATION,
+                          std::string("PsiFormer accelerator backend '") + value +
                              "' has no production executor");
   const bool cpu_requested = value.empty() || value == "no" || value == "cpu";
   if (!cpu_requested && value != "auto" && value != "yes" && value != "cuda" && value != "hip")

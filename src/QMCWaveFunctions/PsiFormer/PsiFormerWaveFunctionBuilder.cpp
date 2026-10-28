@@ -10,6 +10,8 @@
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "DeviceManager.h"
+#include "qmcpack_version.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCapabilityReport.h"
 #include "Message/CommOperators.h"
 #include "OhmmsData/AttributeSet.h"
 #include "OhmmsData/XMLParsingString.h"
@@ -211,6 +213,7 @@ std::array<double, 3> parseReducedTwist(const std::string& value)
 
 // Select HDF5 import or deterministic internal construction and validate optimizer controls.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildComponent(xmlNodePtr cur)
+try
 {
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
@@ -384,6 +387,37 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       psiformer::PsiFormerAcceleratorBackend::CPU)
     throw std::runtime_error(
         "PsiFormer numerical dispatch cannot be enabled by an injected test readiness provider");
+
+  // Selection receipt precedes component/workspace allocation. Runtime crowd and
+  // owner activation belongs to later driver resource preparation, not XML intent.
+  const auto report_selection = [&]() {
+#ifdef QMCPACK_GIT_HASH
+    const std::string source_revision = QMCPACK_GIT_HASH;
+#else
+    const std::string source_revision = "unavailable_non_git_build";
+#endif
+    const auto compiled = psiformer::compiledPsiFormerAcceleratorSupport();
+    psiformer::writeCapabilityReceipt(app_log(), "selection", {
+      {"requested_backend", gpu}, {"source_revision", source_revision},
+      {"compiler", __VERSION__}, {"compiled_cuda", compiled.cuda ? "yes" : "no"},
+      {"compiled_hip", compiled.hip ? "yes" : "no"},
+      {"selected_backend", psiformer::psiFormerAcceleratorBackendName(accelerator_resolution.backend)},
+      {"fallback_reason", psiformer::psiFormerAcceleratorResolutionReasonName(accelerator_resolution.reason)},
+      {"fallback_count", std::to_string(accelerator_resolution.fallback_count)},
+      {"operation", optimization_enabled ? "score_kinetic_nonlocal" : "inference"},
+      {"scalar_domain", complex_profile ? "paired_real_complex" : "real"},
+      {"geometry", periodic ? "periodic" : "open"}, {"profile", feature_policy},
+      {"system", system}, {"precision", psiformer::psiFormerPrecisionPolicyName(precision)},
+      {"ranks", std::to_string(myComm->size())},
+      {"nominal_crowds", "driver_deferred"}, {"active_crowds", "not_started"},
+      {"active_lanes", "not_started"}, {"walker_capacity", "driver_deferred"},
+      {"target_capacity", "component_preparation_deferred"}, {"virtual_capacity", "component_preparation_deferred"},
+      {"resident_owners", "component_preparation_deferred"},
+      {"model_identity", "component_preparation_deferred"},
+      {"readiness_provenance", accelerator_readiness_provider_ ? "injected_test_provider" : "compiled_support_and_device_manager"},
+      {"qualification", "existing_admission_policy_no_new_runtime_validation"}});
+  };
+  if (!selected_pair_gpu) report_selection();
 
   const bool internal_initialization = !initialization.empty();
   const bool has_parameter_path      = !parameters.empty();
@@ -585,6 +619,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
           accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU)
         throw std::runtime_error("PsiFormer numerical dispatch cannot be enabled by an injected test readiness provider");
     }
+    if (selected_pair_gpu) report_selection();
     psiformer::InitializedPsiFormerParameters initialized = direct_model
         ? std::move(imported_model->parameters)
         : psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization, environment);
@@ -667,6 +702,18 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (adopt_explicit_twist)
     targetPtcl.setTwist(reduced_twist);
   return component;
+}
+catch (const std::exception& error)
+{
+  // Diagnostic failures must preserve the original strict rejection and message.
+  try
+  {
+    psiformer::writeCapabilityReceipt(app_log(), "rejection", {
+        {"failure_category", psiformer::capabilityFailureName(psiformer::capabilityFailure(error))},
+        {"reason", error.what()}, {"constraint_kind", "implementation_or_qualification"}});
+  }
+  catch (...) {}
+  throw;
 }
 
 } // namespace qmcplusplus

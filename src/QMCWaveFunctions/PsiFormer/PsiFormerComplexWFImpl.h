@@ -683,7 +683,57 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Complex GPU inference is not compiled");
 #endif
       }
+#ifdef ENABLE_CUDA
+      if (gpu)
+        psiformer::writeCapabilityReceipt(app_log(), "prepared_device_owner", {
+            {"model_identity", std::to_string(identity)},
+            {"lane_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(gpu.get()))},
+            {"image_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(gpu->image.get()))},
+            {"walker_capacity", std::to_string(gpu->capacity)},
+            {"virtual_capacity", std::to_string(gpu->virtual_capacity)},
+            {"target_capacity", std::to_string(gpu->trace_targets)},
+            {"device_bytes", std::to_string(gpu->device_bytes)},
+            {"lane_policy", "per_operation_mutex"}});
+#endif
+      psiformer::writeCapabilityReceipt(app_log(), "effective_component", {
+          {"source", "PsiFormerComplexWFImpl.h"}, {"model_identity", std::to_string(identity)},
+          {"parameter_version", std::to_string(model.p.version())}, {"scalar_domain", "paired_real_complex"},
+          {"precision", "fp64_reference"},
+          {"spatial_kernel", gpu_limit ? "prepared_gpu" : "cpu_direct_complex_spatial"},
+          {"scratch_owner", gpu_limit ? "model_shared_gpu_lane" : (cpu_limit ? "explicit_shared_cpu_scratch" : "per_clone_cpu_scratch")},
+          {"device_resident_owner", gpu_limit ? "shared_model_image_and_lane" : "none"},
+          {"cpu_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(cpu_budget.get()))},
+          {"gpu_walker_capacity", std::to_string(gpu_capacity)},
+          {"gpu_inference_crowd_capacity", std::to_string(gpu_crowds)},
+          {"active_crowds", "driver_resource_deferred"}, {"active_lanes", "driver_resource_deferred"},
+          {"sampling_hamiltonian", "cpu"}});
     }
+
+    ~Model()
+    {
+      try
+      {
+        capability_dispatch.report(app_log(), identity);
+#ifdef ENABLE_CUDA
+        if (gpu_limit)
+          psiformer::writeCapabilityReceipt(app_log(), "inference_admission_summary", {
+              {"model_identity", std::to_string(identity)}, {"prepared_crowd_capacity", std::to_string(gpu_crowds)},
+              {"peak_admitted_calls", std::to_string(inference_concurrency.peakAdmittedCalls())},
+              {"scope", "host_permits_per_lane_mutex_not_gpu_overlap"}});
+#endif
+
+        psiformer::writeCapabilityReceipt(app_log(), "component_dispatch_summary", {
+            {"model_identity", std::to_string(identity)},
+            {"scope", "complex_core_and_dense_inference_only_excludes_derivatives_and_stream_virtual"},
+            {"gpu_scalar_core_calls", std::to_string(gpu_scalar_core_calls.load())},
+            {"cpu_core_calls", std::to_string(cpu_core_calls.load())},
+            {"gpu_dense_tiles", std::to_string(gpu_dense_tiles.load())},
+            {"gpu_overlap", "not_measured"}});
+      }
+      catch (...) {}
+    }
+    psiformer::CapabilityDispatchCounters capability_dispatch;
+    std::atomic<std::size_t> gpu_scalar_core_calls{0}, cpu_core_calls{0}, gpu_dense_tiles{0};
 
     pf::PsiFormer model;
     const std::string profile;
@@ -926,6 +976,7 @@ struct PsiFormerComplexWF::Impl
     std::vector<std::uint64_t> keys;
     std::vector<GradType> gradient;
     std::vector<ValueType> laplacian;
+    bool capability_reported = false;
     std::size_t reported_host_bytes = 0;
     std::size_t cpu_collective_bytes = 0, cpu_collective_fingerprint = 0;
     psiformer::memory::HostCapacity trace_cpu_collective;
@@ -3132,6 +3183,7 @@ struct PsiFormerComplexWF::Impl
             resource.laplacian[walker * n + e] = converted;
           }
       }
+      state->gpu_dense_tiles.fetch_add(1, std::memory_order_relaxed);
       dense_tiles += count > 1;
       tail = count;
       begin += count;
@@ -3212,6 +3264,7 @@ struct PsiFormerComplexWF::Impl
       }
       result.amplitude = {{lane.amplitude[0].phase.x, lane.amplitude[0].phase.y}, lane.amplitude[0].log_abs};
       result.parameter_version = lane.image->version();
+      state->gpu_scalar_core_calls.fetch_add(1, std::memory_order_relaxed);
       return result;
     }
 #endif
@@ -3243,6 +3296,7 @@ struct PsiFormerComplexWF::Impl
       result.amplitude = evaluated.amplitude;
       result.parameter_version = evaluated.parameter_version;
     }
+    state->cpu_core_calls.fetch_add(1, std::memory_order_relaxed);
     return result;
   }
 
@@ -4981,6 +5035,17 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
                 << "; exact_shared_image=yes; original_scalar_lane_retained=yes; dormant_bytes_remain_charged=yes" << std::endl;
     }
 #endif
+    if (!resource.capability_reported)
+    {
+      psiformer::writeCapabilityReceipt(app_log(), "effective_crowd", {
+          {"model_identity", std::to_string(impl_->state->identity)},
+          {"resource_owner_id", std::to_string(reinterpret_cast<std::uintptr_t>(&resource))},
+          {"scope", "first_acquisition_of_this_crowd_resource"}, {"active_crowds", "1"},
+          {"active_walker_lanes", std::to_string(components.size())},
+          {"nominal_driver_crowds", collection.hasSingleDriverCrowd() ? "1" : "not_exposed"},
+          {"lane_policy", "per_operation_mutex"}, {"gpu_overlap", "not_measured"}});
+      resource.capability_reported = true;
+    }
     const auto host_bytes = resource.hostNumericBytes();
     if (resource.reported_host_bytes != host_bytes)
     {
@@ -5195,6 +5260,7 @@ void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionCo
     const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
 {
+  psiformer::CompletedCapabilityDispatch dispatch(impl_->state->capability_dispatch, components.size(), true);
   if (!impl_->denseEnabled())
   {
     WaveFunctionComponent::mw_evaluateLog(components, targets, gradients, laplacians);
@@ -5432,6 +5498,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateGL(const ParticleSet& p
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& p,
     ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
 {
+  psiformer::CompletedCapabilityDispatch dispatch(impl_->state->capability_dispatch, 1, false);
   std::shared_lock read(impl_->state->mutex);
   return evaluateLogLocked(p, g, l);
 }
