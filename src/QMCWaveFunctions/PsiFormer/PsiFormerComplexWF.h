@@ -188,15 +188,19 @@ public:
   std::size_t publishBudgetedGpuParameters(const wftrain::StructuredParameterSnapshot& candidate,
       std::size_t expected_version, std::size_t additional_device_cap, std::size_t additional_host_cap);
 
-  /// Exact two-tape lane plus immutable samples/JVP output, not the inference clone budget.
-  std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count) const;
+  /// Prepared CPU ownership; the complete default retains kinetic parameter response.
+  enum class CpuDerivativeScope { COMPLETE, SCORE_ONLY };
+
+  /// Exact selected lane plus immutable samples/JVP output, not the inference clone budget.
+  std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count,
+      CpuDerivativeScope scope = CpuDerivativeScope::COMPLETE) const;
 
   /// Explicit capped numerical binding; the unbudgeted factory remains closed.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedStreamingDerivativeOperator(
       const RefVectorWithLeader<WaveFunctionComponent>& components,
       const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal,
       std::size_t sample_offset, std::size_t maximum_parameter_chunk_size,
-      std::size_t maximum_numeric_bytes) const;
+      std::size_t maximum_numeric_bytes, CpuDerivativeScope scope = CpuDerivativeScope::COMPLETE) const;
 
   /// Additional derivative ownership only; excludes admitted inference/image/vendor and caller coefficients.
   struct GpuDerivativeRequirements

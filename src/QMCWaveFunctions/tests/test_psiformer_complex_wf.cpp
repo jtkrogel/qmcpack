@@ -3530,7 +3530,7 @@ TEST_CASE("PsiFormer paired CPU trial isolation preserves the shared source fami
 }
 
 TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic contractions",
-          "[wavefunction][psiformer][complex_wf][complex_streaming]")
+          "[wavefunction][psiformer][complex_wf][complex_streaming][complex_cpu_score_scope]")
 {
   using namespace wftrain;
   const SimulationCell simulation_cell(cell());
@@ -3580,6 +3580,59 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
         {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 7, 11,
           {coefficients[c].data(), 2}}, c == 1 ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0};
   }
+  // SCORE is a separate fully prepared owner, never a lazy mutation of the FULL lane.
+  using Scope = PsiFormerComplexWF::CpuDerivativeScope;
+  const auto score_bytes = component.streamingDerivativeRequiredBytes(2, Scope::SCORE_ONLY);
+  REQUIRE(score_bytes < bytes);
+  CHECK_THROWS(component.streamingDerivativeRequiredBytes(2, static_cast<Scope>(-1)));
+  CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 7, 11, 5, score_bytes - 1, Scope::SCORE_ONLY));
+  auto score_stream = component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 7, 11, 5, score_bytes, Scope::SCORE_ONLY);
+  auto score_peer = component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 7, 11, 5, score_bytes, Scope::SCORE_ONLY);
+  const auto score_storage = score_stream->storageDiagnostics();
+  CHECK(score_storage.retained_numeric_bytes == score_bytes);
+  CHECK(score_storage.shared_workspace_identity != diagnostic.shared_workspace_identity);
+  CHECK(score_storage.shared_workspace_identity == score_peer->storageDiagnostics().shared_workspace_identity);
+  CHECK(score_storage.real_parameter_vectors == 1);
+  CHECK(score_storage.complex_parameter_vectors == 4);
+  CHECK_FALSE(score_stream->capabilities().supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  ComplexStreamingSink score_output;
+  CHECK_THROWS(score_stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, score_output));
+  CHECK(score_output.state() == DerivativeSinkState::IDLE);
+  CHECK(score_stream->storageDiagnostics().storage_fingerprint == score_storage.storage_fingerprint);
+  std::vector<C> direction(schema.parameterCount());
+  for (std::size_t i = 0; i < direction.size(); ++i) direction[i] = .003 * std::sin(double(i + 1));
+  ComplexSampleSink full_jvp, score_jvp;
+  stream->applyScoreJVP({schema, stream->parameterVersion(), {direction.data(), direction.size()}}, full_jvp);
+  score_stream->applyScoreJVP({schema, score_stream->parameterVersion(), {direction.data(), direction.size()}}, score_jvp);
+  REQUIRE(full_jvp.values.size() == score_jvp.values.size());
+  for (std::size_t i = 0; i < full_jvp.values.size(); ++i) close(full_jvp.values[i], score_jvp.values[i], 2e-11);
+  // A score estimator advertises no local-energy parameter response on its batch.
+  // Keeping the old KINETIC mask must fail even though the estimator requests only scores.
+  const auto produced_gradient = [&](Scope scope, std::uint32_t term_mask) {
+    PreparedEnergyGradientBatch batch;
+    batch.weights = {.4, 1.3};
+    batch.local_energies = {{-1.2, .2}, {-.4, -.1}};
+    batch.local_energy_term_mask = term_mask;
+    batch.derivative_operator = component.makeBudgetedStreamingDerivativeOperator(
+        components, particles, 7, 11, 5, component.streamingDerivativeRequiredBytes(2, scope), scope);
+    std::vector<PreparedEnergyGradientBatch> batches;
+    batches.push_back(std::move(batch));
+    PreparedEnergyGradientProducer producer(std::move(batches), std::nullopt, true);
+    EnergyGradientAccumulator accumulator(schema, component.snapshotParameters().version,
+        EnergyGradientEstimator::HALF_SCORE_COVARIANCE);
+    producer.accumulate(component.snapshotParameters(), accumulator);
+    DistributedParameterReduction reduction(*OHMMS::Controller);
+    reduction.reduce(accumulator);
+    return accumulator.finalize().gradient;
+  };
+  CHECK_THROWS(produced_gradient(Scope::SCORE_ONLY, localEnergyTermBit(LocalEnergyTerm::KINETIC)));
+  const auto full_gradient = produced_gradient(Scope::COMPLETE, localEnergyTermBit(LocalEnergyTerm::KINETIC));
+  const auto score_gradient = produced_gradient(Scope::SCORE_ONLY, 0);
+  REQUIRE(full_gradient.size() == score_gradient.size());
+  for (std::size_t i = 0; i < full_gradient.size(); ++i) close(full_gradient[i], score_gradient[i], 2e-11);
   // Explicit complete rows are test-only; the fused owner never materializes these B-by-P matrices.
   std::array<std::vector<C>, 2> score, kinetic;
   const C one{1};
@@ -3612,6 +3665,16 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
     for (std::size_t parameter = 0; parameter < schema.parameterCount(); ++parameter)
       close(sink.values[c][parameter], coefficients[c][0] * (c == 1 ? kinetic[0] : score[0])[parameter] +
           coefficients[c][1] * (c == 1 ? kinetic[1] : score[1])[parameter], 2e-11);
+  for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+  {
+    ComplexStreamingSink full_score, prepared_score;
+    stream->applyVJPs({channels.data(), 1}, adjoint, full_score);
+    score_stream->applyVJPs({channels.data(), 1}, adjoint, prepared_score);
+    for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+      close(full_score.values[0][i], prepared_score.values[0][i], 2e-11);
+  }
+  CHECK(score_stream->storageDiagnostics().storage_fingerprint == score_storage.storage_fingerprint);
+  CHECK(score_stream->storageDiagnostics().allocation_generation == score_storage.allocation_generation);
   sink.reset();
   sink.fail_next = true;
   CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
@@ -3625,14 +3688,61 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
   sink.reset();
   CHECK_THROWS(stream->applyVJPs({unsupported.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
   CHECK(sink.state() == DerivativeSinkState::IDLE);
-  const auto snapshot = component.snapshotParameters();
+  auto snapshot = component.snapshotParameters();
+  snapshot.values[0] += 1e-4;
   component.publishParameters(snapshot, snapshot.version);
   CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
   CHECK(sink.state() == DerivativeSinkState::POISONED);
+  score_output.reset();
+  CHECK_THROWS(score_stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::TRANSPOSE, score_output));
+  auto fresh_score = component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 7, 11, 5, score_bytes, Scope::SCORE_ONLY);
+  CHECK(fresh_score->storageDiagnostics().shared_workspace_identity == score_storage.shared_workspace_identity);
+  auto fresh_full = component.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 5, bytes);
+  auto fresh_channel = channels[0];
+  fresh_channel.coefficients.parameter_version = fresh_score->parameterVersion();
+  score_output.reset();
+  CHECK_NOTHROW(fresh_score->applyVJPs({&fresh_channel, 1}, DerivativeAdjoint::TRANSPOSE, score_output));
+
+  ComplexStreamingSink fresh_full_output;
+  fresh_full->applyVJPs({&fresh_channel, 1}, DerivativeAdjoint::TRANSPOSE, fresh_full_output);
+  for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+    close(fresh_full_output.values[0][i], score_output.values[0][i], 2e-11);
+  // Restart restores the model, not a retained numerical lane; compare the new sample binding.
+  const auto restart_path = "psiformer_score_scope." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  REQUIRE_FALSE(std::filesystem::exists(restart_path));
+  component.exportModel(restart_path);
+  const auto restarted_model = psiformer::readPsiFormerModelFile(restart_path);
+  PsiFormerComplexWF restarted("stream", restarted_model.parameters, p, source, clone_cap, {.17, -.11, .07});
+  RefVectorWithLeader<WaveFunctionComponent> restarted_components(restarted, {restarted});
+  RefVectorWithLeader<ParticleSet> restarted_particles(p, {p});
+  auto restarted_score = restarted.makeBudgetedStreamingDerivativeOperator(restarted_components, restarted_particles,
+      7, 11, 5, restarted.streamingDerivativeRequiredBytes(1, Scope::SCORE_ONLY), Scope::SCORE_ONLY);
+  RefVectorWithLeader<WaveFunctionComponent> fresh_components(component, {component});
+  RefVectorWithLeader<ParticleSet> fresh_particles(p, {p});
+  auto current_score = component.makeBudgetedStreamingDerivativeOperator(fresh_components, fresh_particles,
+      7, 11, 5, component.streamingDerivativeRequiredBytes(1, Scope::SCORE_ONLY), Scope::SCORE_ONLY);
+  const C restart_one{1};
+  const auto score_at_restart = [&](StreamingDerivativeOperator& prepared) {
+    const auto& identity = prepared.parameterSchema();
+    VJPCoefficientChannel channel{"score", DerivativeProduct::SCORE_VJP,
+        {identity.providerId(), identity.fingerprint(), prepared.parameterVersion(), 7, 11, {&restart_one, 1}}, 0};
+    ComplexStreamingSink output;
+    prepared.applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, output);
+    return output.values[0];
+  };
+  const auto restarted_values = score_at_restart(*restarted_score);
+  const auto current_values = score_at_restart(*current_score);
+  REQUIRE(restarted_values.size() == current_values.size());
+  for (std::size_t i = 0; i < current_values.size(); ++i) close(restarted_values[i], current_values[i], 2e-12);
+  CHECK(restarted.snapshotParameters().values == component.snapshotParameters().values);
+  CHECK(restarted_score->storageDiagnostics().shared_workspace_identity != score_storage.shared_workspace_identity);
+  CHECK(std::filesystem::remove(restart_path));
+
 }
 
 TEST_CASE("PsiFormer complex stream physical finite differences and concrete factory rejection",
-          "[wavefunction][psiformer][complex_wf][complex_streaming]")
+          "[wavefunction][psiformer][complex_wf][complex_streaming][complex_cpu_score_scope]")
 {
   using namespace wftrain;
   const SimulationCell simulation_cell(cell());
@@ -3694,6 +3804,14 @@ TEST_CASE("PsiFormer complex stream physical finite differences and concrete fac
     close(sink.values[0][schema.blocks()[block].offset], score[block], 3e-6);
     close(sink.values[1][schema.blocks()[block].offset], kinetic[block], 3e-5);
   }
+  using Scope = PsiFormerComplexWF::CpuDerivativeScope;
+  const auto score_cap = component.streamingDerivativeRequiredBytes(1, Scope::SCORE_ONLY);
+  auto score_stream = component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 0, 0, 3, score_cap, Scope::SCORE_ONLY);
+  ComplexStreamingSink score_sink;
+  score_stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::TRANSPOSE, score_sink);
+  for (std::size_t block = 0; block < schema.blocks().size(); ++block)
+    close(score_sink.values[0][schema.blocks()[block].offset], score[block], 3e-6);
   RefVectorWithLeader<WaveFunctionComponent> wrong(component);
   wrong.push_back(foreign);
   CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(wrong, particles, 0, 0, 3, cap));
@@ -3712,10 +3830,16 @@ TEST_CASE("PsiFormer complex stream physical finite differences and concrete fac
   CHECK_THROWS(prepare()); // another clone's unresolved proposal blocks the whole family
   sink.reset();
   CHECK_THROWS(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
+  score_sink.reset();
+  CHECK_THROWS(score_stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::TRANSPOSE, score_sink));
+  CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(
+      components, particles, 0, 0, 3, score_cap, Scope::SCORE_ONLY));
   clone.restore(0);
   clone_p.rejectMove(0);
   sink.reset();
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
+  score_sink.reset();
+  CHECK_NOTHROW(score_stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::TRANSPOSE, score_sink));
   CHECK(component.structuredParameterProvider() == &component);
 }
 

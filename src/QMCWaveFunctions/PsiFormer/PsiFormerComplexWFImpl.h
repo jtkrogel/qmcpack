@@ -782,6 +782,7 @@ struct PsiFormerComplexWF::Impl
     std::atomic<std::size_t> pending_proposals{0};
     std::mutex derivative_factory_mutex;
     std::weak_ptr<DerivativeLane> derivative_lane;
+    std::weak_ptr<DerivativeLane> score_derivative_lane;
 #ifdef ENABLE_CUDA
     std::weak_ptr<GpuDerivativeLane> gpu_derivative_lane;
     /// Only active retained score batches hold these two numerical owners alive.
@@ -1832,7 +1833,7 @@ struct PsiFormerComplexWF::Impl
   };
 #endif
 
-  /// One leased score tape, one complete kinetic tape, and three fixed complex contractions.
+  /// Prepared score tape, optional complete kinetic tape, and three fixed complex contractions.
   struct DerivativeLane
   {
     /// Derive the same checked shape consumed by both qualified numerical owners.
@@ -1846,12 +1847,15 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Include both executor ion copies and all channel buffers before any numerical allocation.
-    static std::size_t required(const Model& s, std::size_t samples)
+    static std::size_t required(const Model& s, std::size_t samples, CpuDerivativeScope scope)
     {
+      if (scope != CpuDerivativeScope::COMPLETE && scope != CpuDerivativeScope::SCORE_ONLY)
+        throw std::invalid_argument("Unknown complex CPU derivative scope");
       const auto dimensions = shape(s);
       const char* message = "Complex PsiFormer derivative bytes overflow";
       std::size_t bytes = pf::DirectComplexScoreWorkspace::storageRequirement(dimensions);
-      pf::addStorageBytes(bytes, pf::DirectComplexKineticWorkspace::storageRequirement(dimensions), message);
+      if (scope == CpuDerivativeScope::COMPLETE)
+        pf::addStorageBytes(bytes, pf::DirectComplexKineticWorkspace::storageRequirement(dimensions), message);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(
           pf::checkedStorageProduct(3, dimensions.parameter_count, message), message), message);
       std::size_t doubles = pf::checkedStorageProduct(6, dimensions.nuclei, message);
@@ -1865,9 +1869,10 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Only the already-admitted factory may allocate the lane; there is no probe preparation.
-    explicit DerivativeLane(const Model& s)
-        : score(s.model, s.plan), kinetic(s.model, s.plan, s.cartesian_twist),
-          score_work(score.makeWorkspace()), kinetic_work(kinetic.makeWorkspace(kinetic.requiredStorageBytes()))
+    explicit DerivativeLane(const Model& s, CpuDerivativeScope scope)
+        : scope(scope), score(s.model, s.plan), kinetic(s.model, s.plan, s.cartesian_twist),
+          score_work(score.makeWorkspace()),
+          kinetic_work(scope == CpuDerivativeScope::COMPLETE ? kinetic.makeWorkspace(kinetic.requiredStorageBytes()) : nullptr)
     {
       for (auto& channel : channels)
         channel.resize(s.model.p.size());
@@ -1882,7 +1887,8 @@ struct PsiFormerComplexWF::Impl
     std::size_t bytes() const
     {
       std::size_t result = score_work->vectorStorageBytes();
-      pf::addStorageBytes(result, kinetic_work->vectorStorageBytes(), "derivative lane bytes overflow");
+      if (kinetic_work)
+        pf::addStorageBytes(result, kinetic_work->vectorStorageBytes(), "derivative lane bytes overflow");
       for (const auto bytes : {score.numericMetadataStorageBytes(), kinetic.numericMetadataStorageBytes()})
         pf::addStorageBytes(result, bytes, "derivative lane bytes overflow");
       for (const auto& channel : channels)
@@ -1894,13 +1900,14 @@ struct PsiFormerComplexWF::Impl
     /// Track all persistent numerical allocations, not evaluation generations.
     std::size_t fingerprint() const noexcept
     {
-      std::size_t result = score_work->storageFingerprint() ^ kinetic_work->storageFingerprint();
+      std::size_t result = score_work->storageFingerprint() ^ (kinetic_work ? kinetic_work->storageFingerprint() : 0);
       result ^= score.numericMetadataStorageFingerprint() ^ kinetic.numericMetadataStorageFingerprint();
       for (const auto& channel : channels)
         psiformer::determinant::detail::mixStorage(result, channel);
       return result;
     }
 
+    const CpuDerivativeScope scope;
     const pf::DirectComplexScoreExecutor score;
     const pf::DirectComplexKineticExecutor kinetic;
     std::unique_ptr<pf::DirectComplexScoreWorkspace> score_work;
@@ -2232,15 +2239,16 @@ struct PsiFormerComplexWF::Impl
     {
       using namespace wftrain;
       StreamingDerivativeCapabilities c;
-      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
-          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
+      const bool complete = lane->scope == CpuDerivativeScope::COMPLETE;
+      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
+      if (complete) c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
       c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) |
           derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
-      c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      c.local_energy_term_mask = complete ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0;
       c.maximum_vjp_channels = 3;
       c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
       c.maximum_sample_tile_size = 1;
-      c.fixed_parameter_scratch_vectors = 7;
+      c.fixed_parameter_scratch_vectors = complete ? 7 : 5;
       c.block_streaming = true;
       return c;
     }
@@ -2269,9 +2277,11 @@ struct PsiFormerComplexWF::Impl
       wftrain::StreamingDerivativeStorageDiagnostics d;
       d.parameter_count = state->schema->parameterCount();
       d.sample_count = samples;
-      d.real_parameter_vectors = 2;
-      d.complex_parameter_vectors = 5;
-      d.parameter_scratch_bytes = d.parameter_count * (2 * sizeof(double) + 5 * sizeof(C));
+      const bool complete = lane->scope == CpuDerivativeScope::COMPLETE;
+      d.real_parameter_vectors = complete ? 2 : 1;
+      d.complex_parameter_vectors = complete ? 5 : 4;
+      d.parameter_scratch_bytes = d.parameter_count *
+          (d.real_parameter_vectors * sizeof(double) + d.complex_parameter_vectors * sizeof(C));
       d.shared_workspace_bytes = lane->bytes();
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
@@ -2306,6 +2316,8 @@ struct PsiFormerComplexWF::Impl
           need_score |= requested[channel].product == DerivativeProduct::SCORE_VJP;
           need_kinetic |= requested[channel].product == DerivativeProduct::LOCAL_ENERGY_VJP;
         }
+        if (need_kinetic && !lane->kinetic_work)
+          throw std::logic_error("CPU score-only lane cannot serve kinetic parameter response");
         const auto n = state->model.ne, p = state->model.p.size();
         for (std::size_t sample = 0; sample < samples; ++sample)
         {
@@ -4095,19 +4107,19 @@ std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 }
 
 /// Preflight an independent derivative budget without constructing either retained tape.
-std::size_t PsiFormerComplexWF::streamingDerivativeRequiredBytes(std::size_t samples) const
+std::size_t PsiFormerComplexWF::streamingDerivativeRequiredBytes(std::size_t samples, CpuDerivativeScope scope) const
 {
   if (gpuInferenceEnabled())
     throw std::logic_error("Complex GPU inference does not expose CPU derivative storage");
   std::shared_lock read(impl_->state->mutex);
-  return Impl::DerivativeLane::required(*impl_->state, samples);
+  return Impl::DerivativeLane::required(*impl_->state, samples, scope);
 }
 
 /// Validate every concrete binding before allocation; unbudgeted discovery remains deliberately closed.
 std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBudgetedStreamingDerivativeOperator(
     const RefVectorWithLeader<WaveFunctionComponent>& components,
     const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
-    std::size_t chunk, std::size_t maximum_bytes) const
+    std::size_t chunk, std::size_t maximum_bytes, CpuDerivativeScope scope) const
 {
   NativeTimerScope timer(impl_->phase_timers.preparation);
   if (gpuInferenceEnabled())
@@ -4115,7 +4127,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   const auto state = impl_->state;
   std::shared_lock read(state->mutex);
   const auto samples = particles.size(), n = state->model.ne;
-  const auto required = Impl::DerivativeLane::required(*state, samples);
+  const auto required = Impl::DerivativeLane::required(*state, samples, scope);
   if (!maximum_bytes || maximum_bytes == std::numeric_limits<std::size_t>::max() || required > maximum_bytes)
     throw std::length_error("Complex PsiFormer derivative numeric budget exceeded before preparation");
   if (&components.getLeader() != this || &particles.getLeader() != impl_->particles ||
@@ -4148,9 +4160,10 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   }
   // Factory serialization never waits on a lane execution lease while holding the model read lock.
   std::lock_guard preparation(state->derivative_factory_mutex);
-  auto lane = state->derivative_lane.lock();
+  auto& selected = scope == CpuDerivativeScope::SCORE_ONLY ? state->score_derivative_lane : state->derivative_lane;
+  auto lane = selected.lock();
   if (!lane)
-    lane = std::make_shared<Impl::DerivativeLane>(*state);
+    lane = std::make_shared<Impl::DerivativeLane>(*state, scope);
   auto result = std::make_unique<Impl::DerivativeStream>(state, lane, ordinal, offset, samples, chunk);
   for (std::size_t sample = 0; sample < samples; ++sample)
   {
@@ -4165,7 +4178,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   }
   if (result->storageDiagnostics().retained_numeric_bytes != required)
     throw std::logic_error("Complex PsiFormer derivative numeric capacity differs from exact admission");
-  state->derivative_lane = lane;
+  selected = lane;
   return result;
 }
 

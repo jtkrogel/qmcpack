@@ -1049,9 +1049,12 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       }
       else
       {
-        const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+        if (score_only) batch.local_energy_term_mask = 0;
+        const auto cpu_scope = score_only ? PsiFormerComplexWF::CpuDerivativeScope::SCORE_ONLY
+                                         : PsiFormerComplexWF::CpuDerivativeScope::COMPLETE;
+        const auto required = leader.streamingDerivativeRequiredBytes(walkers.size(), cpu_scope);
         batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
-            component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+            component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required, cpu_scope);
       }
       const auto& schema = batch.derivative_operator->parameterSchema();
       const auto version = batch.derivative_operator->parameterVersion();
@@ -1143,9 +1146,12 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     }
     else
     {
-      const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+      if (score_only) batch.local_energy_term_mask = 0;
+      const auto cpu_scope = score_only ? PsiFormerComplexWF::CpuDerivativeScope::SCORE_ONLY
+                                       : PsiFormerComplexWF::CpuDerivativeScope::COMPLETE;
+      const auto required = leader.streamingDerivativeRequiredBytes(walkers.size(), cpu_scope);
       batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
-          component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+          component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required, cpu_scope);
     }
     return batch;
   }
@@ -3730,7 +3736,9 @@ void WFTrainBatched::run()
                      "native/image model HOST and vendor storage" << std::endl;
       }
       else
-        derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
+        derivative_bytes = complex->streamingDerivativeRequiredBytes(samples,
+            wftrain::usesEnergyScoreEstimator(training_input_, true) ? PsiFormerComplexWF::CpuDerivativeScope::SCORE_ONLY
+                                                                   : PsiFormerComplexWF::CpuDerivativeScope::COMPLETE);
       derivative_bytes = checkedMemoryAdd(derivative_bytes, additive_bytes);
       std::size_t complex_kfac_allowance = 0;
       if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC)
