@@ -8087,4 +8087,49 @@ TEST_CASE("Complex CPU target owner preserves unequal-spin VGL and physical fami
   CHECK_THROWS_AS(PsiFormerComplexWF("short", initialized, q, source, clone_cap, twist, 0, {}, "all_electron",
       cold.shared_cpu_streamed_bytes-1, 2), std::length_error);
 }
+
+TEST_CASE("Complex CPU target XML admits exact shared budgets before numerical owners",
+          "[wavefunction][psiformer][complex_wf][complex_cpu_streamed][complex_cpu_xml]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::make_unique<ParticleSet>(ions(simulation_cell)));
+  AdmissionReadiness readiness;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, sources, &readiness);
+  const auto build = [&](const std::string& extra) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(complexXml(extra)));
+    return builder.buildComponent(document.getRoot());
+  };
+  const std::string shared = "max_cpu_shared_numeric_bytes='16777216' ";
+  auto full_base = build(shared);
+  auto stream_base = build(shared+"cpu_vgl_targets='3'");
+  auto* full = dynamic_cast<PsiFormerComplexWF*>(full_base.get());
+  auto* stream = dynamic_cast<PsiFormerComplexWF*>(stream_base.get());
+  REQUIRE(full != nullptr);
+  REQUIRE(stream != nullptr);
+  CHECK(full->numericStorage().cpu_vgl_targets == 0);
+  CHECK(stream->numericStorage().cpu_vgl_targets == 3);
+  CHECK(full->numericStorage().shared_cpu_bytes == 0);
+  CHECK(stream->numericStorage().shared_cpu_bytes == 0);
+  CHECK(stream->numericStorage().shared_cpu_streamed_bytes < full->numericStorage().shared_cpu_full_bytes);
+  CHECK((stream->snapshotParameters().values == full->snapshotParameters().values));
+  const auto reference = evaluate(*full, p);
+  const auto gradient = p.G;
+  const auto laplacian = p.L;
+  close(evaluate(*stream, p), reference, 2e-12);
+  for (int electron = 0; electron < p.getTotalNum(); ++electron)
+  {
+    close(p.L[electron], laplacian[electron], 2e-12);
+    for (int d = 0; d < 3; ++d) close(p.G[electron][d], gradient[electron][d], 2e-12);
+  }
+  for (const std::string value : {"0", "-1", "nan", "2x", "18446744073709551616", "18446744073709551615"})
+    CHECK_THROWS_AS(build(shared+"cpu_vgl_targets='"+value+"'"), std::invalid_argument);
+  CHECK_THROWS_AS(build("cpu_vgl_targets='2'"), std::invalid_argument);
+  CHECK_THROWS_AS(build(shared+"cpu_vgl_targets='5'"), std::invalid_argument);
+  CHECK_THROWS_AS(build("max_cpu_shared_numeric_bytes='1' cpu_vgl_targets='3'"), std::length_error);
+  CHECK_THROWS_AS(build(shared+"gpu='cuda' cpu_vgl_targets='2'"), std::invalid_argument);
+  CHECK(readiness.calls == 0);
+}
 } // namespace qmcplusplus
