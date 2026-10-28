@@ -2358,7 +2358,8 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
 
 /// Validate the native periodic PP operator partition, without touching quadrature RNGs.
 std::string periodicScoreECPIdentity(ParticleSet& electrons, const ParticleSet& ions,
-    QMCHamiltonian& hamiltonian, const std::string& model_identity)
+    QMCHamiltonian& hamiltonian, const std::string& model_identity,
+    const char* identity_prefix = "legacy-torus-score-ecp-v1/")
 {
   const auto& provenance = hamiltonian.ecpModelProvenance();
   if (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())
@@ -2448,7 +2449,7 @@ std::string periodicScoreECPIdentity(ParticleSet& electrons, const ParticleSet& 
     }
   }
   std::ostringstream identity;
-  identity << "legacy-torus-score-ecp-v1/" << std::hex << hash;
+  identity << identity_prefix << std::hex << hash;
   return identity.str();
 }
 
@@ -2473,9 +2474,12 @@ std::string realScoreECPIdentity(PsiFormerWF& component, ParticleSet& electrons,
   component.validateSystem(electrons, ions, "pseudopotential");
   if (electrons.getLattice().SuperCellEnum != SUPERCELL_OPEN)
   {
-    if (!component.matchesLegacyTorusPseudopotentialTarget(electrons))
-      throw std::invalid_argument("Periodic real score ECP requires legacy torus Gamma metadata");
-    return periodicScoreECPIdentity(electrons, ions, hamiltonian, component.trainingConfigurationFingerprint());
+    const bool cpu_pair = !component.usesAcceleratorParameterProducts() &&
+        component.matchesRealDevicePairTarget(electrons);
+    if (!component.matchesLegacyTorusPseudopotentialTarget(electrons) && !cpu_pair)
+      throw std::invalid_argument("Periodic real score ECP requires legacy torus Gamma or qualified CPU pair metadata");
+    return periodicScoreECPIdentity(electrons, ions, hamiltonian, component.trainingConfigurationFingerprint(),
+        cpu_pair ? "real-cpu-pair-score-ecp-v1/" : "legacy-torus-score-ecp-v1/");
   }
   const auto& species = ions.getSpeciesSet();
   const int charge = species.findAttribute("charge");
@@ -3909,8 +3913,10 @@ void WFTrainBatched::run()
       real_ecp_identity = wftrain::realECPPhysicalIdentity(*device_provider,
           population_.get_golden_electrons(), population_.get_golden_hamiltonian());
       physical_agreement_identity = real_ecp_identity->fingerprint;
-      // Only the newly complete mixed-source row changes its persisted identity.
-      if (real_ecp_identity->mixed_open_sources)
+      // Preserve historical rows; bind the new CPU pair row to actual PP content too.
+      if (real_ecp_identity->mixed_open_sources ||
+          (!device_provider->usesAcceleratorParameterProducts() &&
+           device_provider->matchesRealDevicePairTarget(population_.get_golden_electrons())))
         complex_physical_identity = physical_agreement_identity;
     }
     if (device_provider && device_provider->usesAcceleratorParameterProducts() &&

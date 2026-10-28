@@ -672,6 +672,57 @@ TEST_CASE("Selected real pair physics identity binds actual native Ewald sources
   CHECK(realPairCoulombIdentity(component, electrons, *physical) == identity);
   physical->addOperator(std::make_unique<HarmonicExternalPotential>(electrons), "extra");
   CHECK_THROWS(realPairCoulombIdentity(component, electrons, *physical));
+  // Direct constructors use the same CPU profile gate and physical PP identity as XML.
+  // Li effective charge one supplies an actual nonlocal PP channel, unlike the H local-only file.
+  ions.getSpeciesSet().speciesName[0] = "Li";
+  const int atomic_number = ions.getSpeciesSet().addAttribute("atomicnumber");
+  ions.getSpeciesSet()(atomic_number, 0) = 3;
+  PsiFormerWF pp_component("pair_ecp_physics", parameters, electrons, ions, true, {}, true);
+  pp_component.validateSystem(electrons, ions, "pseudopotential");
+  REQUIRE_FALSE(pp_component.usesAcceleratorParameterProducts());
+  REQUIRE(pp_component.matchesRealDevicePairTarget(electrons));
+  const auto pp_directory = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/molecules/LiH_pp";
+  const auto makePPHamiltonian = [&]() {
+    auto result = std::make_unique<QMCHamiltonian>();
+    result->addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+    result->addOperator(std::make_unique<CoulombPBCAA>(electrons, true, false, false), "ee");
+    result->addOperator(std::make_unique<CoulombPBCAA>(ions, false, false, false), "ii");
+    Libxml2Document document;
+    REQUIRE(document.parseFromString("<pairpot type='pseudo' format='xml' algorithm='batched' DLA='no'>"
+        "<pseudo elementType='Li' href='" + (pp_directory / "Li.BFD.xml").string() + "'/></pairpot>"));
+    ECPotentialBuilder builder(*result, ions, electrons, OHMMS::Controller);
+    REQUIRE(builder.put(document.getRoot()));
+    return result;
+  };
+  auto pp = makePPHamiltonian();
+  const auto pp_identity = realECPPhysicalIdentity(pp_component, electrons, *pp).fingerprint;
+  CHECK(pp_identity.find("real-cpu-pair-score-ecp-v1/") == 0);
+  const auto original_provenance = pp->ecpModelProvenance();
+  REQUIRE(original_provenance);
+  auto altered_provenance = std::make_shared<QMCHamiltonian::ECPModelProvenance>(*original_provenance);
+  altered_provenance->scientific_definition += "/different-pp-content";
+  pp->setECPModelProvenance(altered_provenance);
+  CHECK(realECPPhysicalIdentity(pp_component, electrons, *pp).fingerprint != pp_identity);
+  altered_provenance->ordinary_locality_vp = false;
+  CHECK_THROWS(realECPPhysicalIdentity(pp_component, electrons, *pp));
+  pp->setECPModelProvenance(nullptr);
+  CHECK_THROWS(realECPPhysicalIdentity(pp_component, electrons, *pp));
+  pp->setECPModelProvenance(original_provenance);
+  CHECK(realECPPhysicalIdentity(pp_component, electrons, *pp).fingerprint == pp_identity);
+  auto wrong_parameters = parameters;
+  auto wrong_profile = std::make_shared<ps::PeriodicProfileMetadata>(*profile);
+  wrong_profile->feature_transform = ps::PeriodicFeatureTransform::RAW_TRIGONOMETRIC_V1;
+  wrong_parameters.environment.periodic_profile = wrong_profile;
+  PsiFormerWF wrong_component("wrong_pair_ecp", wrong_parameters, electrons, ions, true, {}, true);
+  wrong_component.validateSystem(electrons, ions, "pseudopotential");
+  CHECK_THROWS(realECPPhysicalIdentity(wrong_component, electrons, *pp));
+  electrons.setTwist({.125, 0, 0});
+  CHECK_THROWS(realECPPhysicalIdentity(pp_component, electrons, *pp));
+  electrons.setTwist({0, 0, 0});
+  CHECK(realECPPhysicalIdentity(pp_component, electrons, *pp).fingerprint == pp_identity);
+  ions.getSpeciesSet().speciesName[0] = "H";
+  ions.getSpeciesSet()(atomic_number, 0) = 1;
 #ifdef QMC_COMPLEX
   // The paired descriptor keeps the same neutral physical source and adds independent imaginary heads.
   auto paired = parameters;
