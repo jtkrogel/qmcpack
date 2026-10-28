@@ -216,6 +216,18 @@ if(Python3_EXECUTABLE)
     PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()
 
+add_executable(test_psiformer_capability_report test_psiformer_capability_report.cpp)
+target_include_directories(test_psiformer_capability_report PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_psiformer_capability_report PRIVATE Threads::Threads)
+add_test(NAME deterministic-unit_test_psiformer_capability_report COMMAND test_psiformer_capability_report)
+if(Python3_EXECUTABLE)
+  add_test(NAME deterministic-unit_test_psiformer_capability_report_json
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_psiformer_capability_report.py
+      $<TARGET_FILE:test_psiformer_capability_report>)
+  set_tests_properties(deterministic-unit_test_psiformer_capability_report_json
+    PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+endif()
+
 set(CATEGORY_MPI sposet)
 
 foreach(CATEGORY common trialwf sposet jastrow determinant)
@@ -784,6 +796,15 @@ add_unit_test(deterministic-unit_test_psiformer_complex_spatial
 set_tests_properties(deterministic-unit_test_psiformer_complex_spatial
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# Manual component probe: no statistical trajectory and no automatic timing test.
+add_executable(psiformer_complex_cpu_probe
+               psiformer_complex_cpu_probe.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp
+               ../PsiFormer/PsiFormerInitialization.cpp)
+target_link_libraries(psiformer_complex_cpu_probe IO::HDF5 platform_LA)
+target_include_directories(psiformer_complex_cpu_probe PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
 add_executable(test_psiformer_complex_score
                test_psiformer_complex_score.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp
@@ -815,6 +836,13 @@ if(QMC_COMPLEX)
                 1 1 $<TARGET_FILE:test_psiformer_complex_wf>)
   set_tests_properties(deterministic-unit_test_psiformer_complex_wf
                        PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+  if(NOT MIXED_PRECISION)
+    add_unit_test(deterministic-unit_test_psiformer_complex_cpu_streamed
+                  1 1 $<TARGET_FILE:test_psiformer_complex_wf>
+                  "[complex_cpu_streamed],[complex_cpu_shared]")
+    set_tests_properties(deterministic-unit_test_psiformer_complex_cpu_streamed
+                         PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+  endif()
 endif()
 
 add_executable(test_psiformer_batch_executor

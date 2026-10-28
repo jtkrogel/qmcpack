@@ -14,6 +14,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Message/Communicate.h"
+#include "OutputManager.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
 #include "Particle/MCMultiParticleMoves.h"
@@ -2181,6 +2182,12 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
 TEST_CASE("PsiFormer builder resolves accelerator policy before model construction",
           "[wavefunction][psiformer][accelerator][builder]")
 {
+  struct CaptureLog
+  {
+    std::ostringstream text;
+    std::streambuf* original = app_log().rdbuf(text.rdbuf());
+    ~CaptureLog() { app_log().rdbuf(original); }
+  } capture;
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
@@ -2296,6 +2303,23 @@ TEST_CASE("PsiFormer builder resolves accelerator policy before model constructi
   require_early_failure("mystery", "gpu must be");
   require_early_failure("sycl", "no production executor");
   CHECK(provider.inspection_count == before_invalid);
+
+  automatic->evaluateLog(electrons, electrons.G, electrons.L);
+  clone->evaluateLog(electrons, electrons.G, electrons.L);
+  automatic.reset();
+  // A shared family emits its completed summary when its final clone owner dies.
+  clone_storage.reset();
+  const auto report = capture.text.str();
+  CHECK(report.find("\"phase\":\"selection\"") != std::string::npos);
+  CHECK(report.find("\"requested_backend\":\"auto\"") != std::string::npos);
+  CHECK(report.find("\"selected_backend\":\"cpu\"") != std::string::npos);
+  CHECK(report.find("\"active_crowds\":\"not_started\"") != std::string::npos);
+  CHECK(report.find("\"device_resident_owner\":\"none\"") != std::string::npos);
+  CHECK(report.find("\"readiness_provenance\":\"injected_test_provider\"") != std::string::npos);
+  CHECK(report.find("\"failure_category\":\"unsupported_operation\"") != std::string::npos);
+  CHECK(report.find("\"failure_category\":\"invalid_input\"") != std::string::npos);
+  CHECK(report.find("\"phase\":\"dispatch_summary\"") != std::string::npos);
+  CHECK(report.find("\"scalar_full\":\"2\"") != std::string::npos);
 }
 
 TEST_CASE("PsiFormer direct constructors default to CPU and reject forged accelerator routes",
@@ -8582,6 +8606,243 @@ TEST_CASE("PsiFormer GPU scalar ECP reuses one acquired crowd owner",
               << " live_DEVICE=" << warm.live_bytes << " peak_DEVICE=" << warm.peak_bytes
               << " warm_allocations=" << warm.allocation_calls << "\n";
   }
+}
+#endif
+
+
+#ifndef MIXED_PRECISION
+namespace
+{
+/// Four physical effective-core ions share two feature centers in a skew simulation cell.
+struct VersionedCpuEcpFixture
+{
+  static Lattice makeLattice()
+  {
+    Lattice lattice;
+    lattice.R = {8, 0, 0, .6, 7.4, 0, -.3, .5, 8.5};
+    lattice.BoxBConds = {true, true, true};
+    lattice.reset();
+    return lattice;
+  }
+
+  VersionedCpuEcpFixture() : lattice(makeLattice()), cell(lattice), particles(makeLiHElectrons(cell))
+  {
+    auto ions = std::make_unique<ParticleSet>(cell);
+    ions->setName("ion0");
+    ions->create({4});
+    auto& species = ions->getSpeciesSet();
+    const int group = species.addSpecies("Li");
+    species(species.addAttribute("charge"), group) = 1;
+    species(species.addAttribute("valence"), group) = 1;
+    species(species.addAttribute("atomicnumber"), group) = 3;
+    ions->R[0] = {0, 0, 0}; ions->R[1] = {1, 1, 1};
+    ions->R[2] = {4, 0, 0}; ions->R[3] = {5, 1, 1};
+    ions->resetGroups(); ions->update();
+    sources.emplace("ion0", std::move(ions));
+    for (int e = 0; e < particles.getTotalNum(); ++e)
+      particles.R[e] = {.21 + .17 * e, -.31 + .13 * e, .51 - .11 * e};
+    particles.update();
+  }
+
+  std::unique_ptr<PsiFormerWF> build(const std::string& gpu = "cpu",
+      const std::string& transform = "log_complement_v1", const std::string& cusp = "yes",
+      const std::string& extra = "", const std::string& model = "", const std::string& system = "pseudopotential")
+  {
+    std::ostringstream xml;
+    xml << std::setprecision(17) << "<psiformer name='cpu_pair_ecp' source='ion0' system='" << system
+        << "' gpu='" << gpu << "' feature_policy='periodic_two_cell_v1' optimize='yes' "
+        << "optimize_scope='indices' optimize_indices='0 257' " << extra;
+    if (!model.empty()) xml << " parameters='" << model << "'/>";
+    else
+    {
+      xml << " initialization='psiformer_periodic_pair_v1' initialization_seed='17'>"
+          << "<periodic_profile version='1' head='real' feature_transform='" << transform
+          << "' electron_electron_cusp='" << cusp << "' envelope_policy='atom_centered'>"
+          << "<parameter name='primitive_lattice'>";
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) xml << lattice.R(i, j) / (i == 0 ? 2 : 1) << ' ';
+      xml << "</parameter><parameter name='tiling'>2 0 0 0 1 0 0 0 1</parameter>"
+          << "<parameter name='primitive_motif'>0 0 0 1 1 1</parameter>"
+          << "<parameter name='motif_species'>Li Li</parameter>"
+          << "<parameter name='occupied_columns'>0 0 0 0 0 1 0 0 0 1 0 1 "
+          << "0 0 0 0 1 1 0 0 0 1 1 1</parameter></periodic_profile></psiformer>";
+    }
+    Libxml2Document document;
+    if (!document.parseFromString(xml.str())) throw std::runtime_error("Invalid CPU ECP profile fixture XML");
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources, &readiness);
+    auto base = builder.buildComponent(document.getRoot());
+    auto* component = dynamic_cast<PsiFormerWF*>(base.get());
+    if (!component) throw std::runtime_error("CPU ECP profile did not construct a real head");
+    base.release();
+    return std::unique_ptr<PsiFormerWF>(component);
+  }
+
+  ParticleSet& source() { return *sources.at("ion0"); }
+  Lattice lattice;
+  SimulationCell cell;
+  ParticleSet particles;
+  WaveFunctionComponentBuilder::PSetMap sources;
+  CountingAcceleratorReadinessProvider readiness;
+};
+
+PsiFormerWF::LogValue evaluateCpuEcpProfile(PsiFormerWF& component, ParticleSet& particles)
+{
+  particles.G = ValueType{}; particles.L = ValueType{};
+  return component.evaluateLog(particles, particles.G, particles.L);
+}
+} // namespace
+
+TEST_CASE("Versioned real CPU ECP admission preserves effective charges and qualified policies",
+          "[wavefunction][psiformer][cpu_ecp_profile][builder]")
+{
+  VersionedCpuEcpFixture fixture;
+  auto component = fixture.build();
+  CHECK(component->isPseudopotentialSystem());
+  CHECK(fixture.readiness.inspection_count == 0);
+  CHECK_THROWS_AS(fixture.build("cuda"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("hip"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("auto"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("cpu", "log_complement_v1", "yes", "twist='.1 0 0'"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("cpu", "log_complement_v1", "no"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("cpu", "raw_trigonometric_v1"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("cpu", "polynomial_v1", "no"), std::invalid_argument);
+  CHECK_THROWS_AS(fixture.build("cpu", "log_complement_v1", "yes", "precision='fp32_dense_fp64_islands'"),
+                  std::invalid_argument);
+  auto& species = fixture.source().getSpeciesSet();
+  const int charge = species.findAttribute("charge"), valence = species.findAttribute("valence");
+  const int atomic = species.findAttribute("atomicnumber");
+  for (double bad : {0., -1., .5, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+  {
+    species(charge, 0) = bad;
+    CHECK_THROWS_AS(fixture.build(), std::invalid_argument);
+  }
+  species(charge, 0) = 1;
+  species(valence, 0) = 3;
+  CHECK_THROWS_AS(fixture.build(), std::invalid_argument);
+  species(valence, 0) = 1;
+  for (double bad : {0., 2.5, std::numeric_limits<double>::quiet_NaN()})
+  {
+    species(atomic, 0) = bad;
+    CHECK_THROWS_AS(fixture.build(), std::invalid_argument);
+  }
+  species(atomic, 0) = 3;
+  CHECK_NOTHROW(fixture.build());
+  CHECK(fixture.readiness.inspection_count == 0);
+  for (int d = 0; d < 3; ++d) CHECK(fixture.particles.getTwist()[d] == 0.0);
+}
+
+TEST_CASE("Versioned real CPU ECP products preserve translations and virtual cell crossings",
+          "[wavefunction][psiformer][cpu_ecp_profile][derivatives]")
+{
+  VersionedCpuEcpFixture fixture;
+  auto component = fixture.build();
+  auto& p = fixture.particles;
+  const auto reference = evaluateCpuEcpProfile(*component, p);
+  const auto gradient = p.G;
+  const auto laplacian = p.L;
+  const auto original = p.R;
+  for (int d = 0; d < 3; ++d) p.R[0][d] += fixture.lattice.R(0, d) + fixture.lattice.R(1, d);
+  p.update();
+  CHECK(std::abs(evaluateCpuEcpProfile(*component, p) - reference) < 2e-10);
+  for (int e = 0; e < p.getTotalNum(); ++e)
+  {
+    CHECK(std::abs(p.L[e] - laplacian[e]) < 2e-9);
+    for (int d = 0; d < 3; ++d) CHECK(std::abs(p.G[e][d] - gradient[e][d]) < 2e-9);
+  }
+  p.R = original; p.update();
+  constexpr double step = 2e-4;
+  double lap_finite_difference = 0;
+  for (int d = 0; d < 3; ++d)
+  {
+    p.R[0][d] += step; p.update();
+    const auto plus = evaluateCpuEcpProfile(*component, p);
+    p.R[0][d] -= 2 * step; p.update();
+    const auto minus = evaluateCpuEcpProfile(*component, p);
+    CHECK(std::real((plus - minus) / (2 * step)) ==
+          Catch::Approx(std::real(gradient[0][d])).epsilon(2e-5).margin(2e-6));
+    lap_finite_difference += std::real(plus + minus - 2. * reference) / (step * step);
+    p.R = original; p.update();
+  }
+  CHECK(lap_finite_difference == Catch::Approx(std::real(laplacian[0])).epsilon(2e-4).margin(2e-5));
+  evaluateCpuEcpProfile(*component, p);
+  auto active = registerSelectedParameters(*component);
+  Vector<ValueType> score(active.size()); score = ValueType{};
+  component->evaluateDerivativesWF(p, active, score);
+  const auto saved = component->snapshotParameters();
+  constexpr double parameter_step = 1e-5;
+  for (std::size_t ordinal = 0; ordinal < 2; ++ordinal)
+  {
+    const auto index = ordinal ? 257u : 0u;
+    auto candidate = component->snapshotParameters();
+    candidate.values[index] = saved.values[index] + parameter_step;
+    component->publishParameters(candidate, candidate.version);
+    const auto plus = evaluateCpuEcpProfile(*component, p);
+    candidate = component->snapshotParameters(); candidate.values[index] = saved.values[index] - parameter_step;
+    component->publishParameters(candidate, candidate.version);
+    const auto minus = evaluateCpuEcpProfile(*component, p);
+    CHECK(std::real((plus - minus) / (2 * parameter_step)) ==
+          Catch::Approx(std::real(score[ordinal])).epsilon(2e-5).margin(2e-6));
+    candidate = component->snapshotParameters(); candidate.values[index] = saved.values[index];
+    component->publishParameters(candidate, candidate.version);
+  }
+  evaluateCpuEcpProfile(*component, p);
+  ParticleSet::SingleParticlePos displacement{.37, -.22, .11};
+  auto image = displacement;
+  for (int d = 0; d < 3; ++d) image[d] += fixture.lattice.R(0, d);
+  VirtualParticleSet virtual_particles(p);
+  virtual_particles.makeMoves(p, 0, {displacement, image});
+  std::vector<ValueType> ratios(2);
+  component->evaluateRatios(virtual_particles, ratios);
+  CHECK(std::abs(ratios[0] - ratios[1]) < 2e-10);
+  p.R[0] += displacement; p.update();
+  CHECK(std::abs(ratios[0] - std::exp(evaluateCpuEcpProfile(*component, p) - reference)) < 2e-9);
+}
+
+TEST_CASE("Versioned real CPU ECP standalone files preserve physical source identity",
+          "[wavefunction][psiformer][cpu_ecp_profile][model_file]")
+{
+  VersionedCpuEcpFixture fixture;
+  auto component = fixture.build();
+  const auto value = evaluateCpuEcpProfile(*component, fixture.particles);
+  const auto gradient = fixture.particles.G;
+  const auto laplacian = fixture.particles.L;
+  ScopedTestDirectory directory("cpu_ecp_profile_model");
+  const auto path = (directory.path / "model.h5").string();
+  component->exportModel(path);
+  const auto model = psiformer::readPsiFormerModelFile(path);
+  CHECK(model.system == "pseudopotential");
+  CHECK(model.parameters.model_shape.nuclei == 2);
+  REQUIRE(model.parameters.environment.periodic_profile);
+  CHECK(model.parameters.environment.periodic_profile->electron_electron_cusp);
+  {
+    hdf_archive input;
+    REQUIRE(input.open(path, H5F_ACC_RDONLY)); input.push("psiformer_model", false);
+    std::vector<double> charges, physical;
+    input.read(charges, "nuclear_charges"); input.read(physical, "physical_source");
+    CHECK((charges == std::vector<double>{1, 1}));
+    REQUIRE(physical.size() == 20);
+    for (std::size_t ion = 0; ion < 4; ++ion) CHECK(physical[5 * ion + 3] == 1);
+  }
+  auto loaded = fixture.build("cpu", "log_complement_v1", "yes", "", path);
+  CHECK((loaded->snapshotParameters().values == component->snapshotParameters().values));
+  CHECK(std::abs(evaluateCpuEcpProfile(*loaded, fixture.particles) - value) < 2e-11);
+  for (int e = 0; e < fixture.particles.getTotalNum(); ++e)
+  {
+    CHECK(std::abs(fixture.particles.L[e] - laplacian[e]) < 2e-10);
+    for (int d = 0; d < 3; ++d) CHECK(std::abs(fixture.particles.G[e][d] - gradient[e][d]) < 2e-10);
+  }
+  auto original_active = registerSelectedParameters(*component);
+  auto loaded_active = registerSelectedParameters(*loaded);
+  Vector<ValueType> original_score(original_active.size()), loaded_score(loaded_active.size());
+  original_score = ValueType{}; loaded_score = ValueType{};
+  component->evaluateDerivativesWF(fixture.particles, original_active, original_score);
+  loaded->evaluateDerivativesWF(fixture.particles, loaded_active, loaded_score);
+  REQUIRE(original_score.size() == loaded_score.size());
+  for (int parameter = 0; parameter < original_score.size(); ++parameter)
+    CHECK(std::abs(original_score[parameter] - loaded_score[parameter]) < 2e-10);
+  CHECK_THROWS_AS(fixture.build("cpu", "log_complement_v1", "yes", "", path, "all_electron"), std::invalid_argument);
+  fixture.source().R[3][0] += .1;
+  CHECK_THROWS_AS(fixture.build("cpu", "log_complement_v1", "yes", "", path), std::invalid_argument);
 }
 #endif
 

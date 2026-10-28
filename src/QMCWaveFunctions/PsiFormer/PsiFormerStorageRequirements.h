@@ -784,6 +784,20 @@ inline std::size_t spatialWorkspaceStorageRequirement(const PsiFormerStorageShap
   return bytes;
 }
 
+/// Count only physical geometry, real trunk jets and scalar cusp derivative scratch.
+inline std::size_t spatialTrunkStorageRequirement(const PsiFormerStorageShape& shape,
+    std::size_t gradient_lanes, std::size_t laplacian_lanes)
+{
+  const char* message = "PsiFormer trunk-only storage overflow";
+  const auto orbitals = checkedStorageProduct(shape.determinants,
+      checkedStorageProduct(shape.electrons, shape.electrons, message), message);
+  const auto planes = checkedStorageSum(1, checkedStorageSum(gradient_lanes, laplacian_lanes, message), message);
+  const auto outputs = checkedStorageSum(gradient_lanes, checkedStorageProduct(2, laplacian_lanes, message), message);
+  return spatialWorkspaceStorageRequirement(shape, gradient_lanes, laplacian_lanes) -
+      determinantStorageRequirement(shape.determinants, shape.electrons, gradient_lanes, laplacian_lanes) -
+      checkedStorageBytes<double>(checkedStorageSum(checkedStorageProduct(orbitals, planes, message), outputs, message), message);
+}
+
 /// Preserve the legacy FULL/ACTIVE inclusive storage requirements.
 inline std::size_t spatialWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
                                                       bool full_vgl)

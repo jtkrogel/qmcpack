@@ -10,6 +10,7 @@
  */
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCapabilityReport.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -84,6 +85,32 @@ PsiFormerExecutionPlan makePlan()
 }
 
 } // namespace
+
+TEST_CASE("PsiFormer capability failures preserve strict admission categories",
+          "[wavefunction][psiformer][accelerator][capability]")
+{
+  const auto category = [](const std::string& request, const PsiFormerAcceleratorReadiness& readiness) {
+    try { resolvePsiFormerAcceleratorRequest(request, readiness); }
+    catch (const std::exception& error) { return capabilityFailure(error); }
+    return CapabilityFailure::UNCLASSIFIED;
+  };
+  PsiFormerAcceleratorReadiness readiness;
+  CHECK(category("typo", readiness) == CapabilityFailure::INVALID_INPUT);
+  CHECK(category("sycl", readiness) == CapabilityFailure::UNSUPPORTED_OPERATION);
+  CHECK(category("cuda", readiness) == CapabilityFailure::UNSUPPORTED_OPERATION);
+  readiness.cuda = {true, false, allPsiFormerAcceleratorOperations(), PsiFormerRuntimeValidation::PASSED};
+  CHECK(category("cuda", readiness) == CapabilityFailure::UNQUALIFIED_HARDWARE);
+  readiness.cuda.usable_device = true;
+  readiness.cuda.runtime_validation = PsiFormerRuntimeValidation::NOT_RUN;
+  CHECK(category("cuda", readiness) == CapabilityFailure::UNQUALIFIED_HARDWARE);
+  readiness.cuda.runtime_validation = PsiFormerRuntimeValidation::FAILED;
+  CHECK(category("cuda", readiness) == CapabilityFailure::UNQUALIFIED_HARDWARE);
+  readiness.cuda.operation_coverage = 0;
+  CHECK(category("cuda", readiness) == CapabilityFailure::UNSUPPORTED_OPERATION);
+  const auto automatic = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(automatic.backend == PsiFormerAcceleratorBackend::CPU);
+  CHECK(automatic.fallback_count == 1);
+}
 
 TEST_CASE("Real two-cell device metadata matching never implies backend readiness",
           "[wavefunction][psiformer][accelerator][pair_metadata]")

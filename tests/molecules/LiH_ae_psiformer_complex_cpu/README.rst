@@ -1,5 +1,5 @@
 Explicit CPU periodic complex inference smoke
-============================================
+=============================================
 
 These three inputs retain fixed starting electron coordinates, physical Li3/H1
 all-electron metadata and the actual periodic Coulomb operators. They exercise
@@ -21,7 +21,7 @@ bare kinetic energy. Both explicitly select the complex wavefunction/H pair in
 the driver and must fail its stateless selected-system check before sampling.
 
 CPU learned-phase first-order gate
----------------------------------
+----------------------------------
 
 The separate training checker generates short actual XML from these fixed-position
 inputs: Gamma Adam and nonzero-twist plainSGD, with scalar optimize=no unchanged.
@@ -47,3 +47,12 @@ It runs two tiny updates with bounded PCG and checks actual imaginary-head chang
 Early admission additionally charges exact covariance arrays plus the existing
 conservative SR solve allowance. No minimum/sample-space SR, trust-norm selection,
 local-energy JVP, new optimizer or GPU training capability is implied.
+
+Shared CPU target VGL
+---------------------
+
+The optional shared CPU spatial execution route is described in
+`cpu_target_vgl.rst <cpu_target_vgl.rst>`_. It preserves the FULL default and MC
+move grouping, with explicit target/cap admission and separate physical owner,
+retained-sample and process-memory accounting. Its periodic ECP qualification is
+separate from the three all-electron smoke inputs above.

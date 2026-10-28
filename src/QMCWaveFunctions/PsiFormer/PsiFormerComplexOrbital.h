@@ -98,7 +98,7 @@ public:
   ComplexOrbitalHeadWorkspace(ComplexOrbitalHeadDescriptor descriptor,
       SpatialJetLayout feature_layout, SpatialJetLayout envelope_layout)
       : descriptor_(std::move(descriptor)), features_(feature_layout), envelopes_(envelope_layout),
-        output_(makeOutputLayout()), projected_(spatialJetSpanElements(output_)),
+        output_(makeOutputLayout()), target_capacity_(output_.laplacian_lanes), projected_(spatialJetSpanElements(output_)),
         result_(projected_.size())
   {}
 
@@ -117,8 +117,22 @@ public:
   /// Return the immutable numerical descriptor, including copied reciprocal momenta.
   const ComplexOrbitalHeadDescriptor& descriptor() const noexcept { return descriptor_; }
 
-  /// Return the compact output planes suitable for complex determinant value/VGL.
+  /// Return the current compact output planes suitable for complex determinant value/VGL.
   const SpatialJetLayout& layout() const noexcept { return output_; }
+
+  /// Retarget compact FULL_VGL metadata inside the original numeric capacity.
+  void setTargetRange(std::size_t begin, std::size_t count)
+  {
+    valid_ = false;
+    if (output_.mode != SpatialJetMode::FULL_VGL || !count || count > target_capacity_)
+      throw std::invalid_argument("Complex orbital target range exceeds prepared capacity");
+    const auto features = withSpatialTargetRange(features_, begin, count);
+    const auto envelopes = withSpatialTargetRange(envelopes_, begin, count);
+    const auto output = withSpatialTargetRange(output_, begin, count);
+    features_ = features;
+    envelopes_ = envelopes;
+    output_ = output;
+  }
 
   /** Project and compose one prepared batch, with checked input spans.
    * Positions are packed [configuration,physical electron,Cartesian dimension].
@@ -188,7 +202,7 @@ private:
           descriptor_.spin_up, positions, position_count,
           {parameters.up.fourier_coefficients, parameters.down.fourier_coefficients},
           {parameters.up.fourier_coefficient_count, parameters.down.fourier_coefficient_count},
-          result_.data(), result_.size(), false, active_electron);
+          result_.data(), spatialJetSpanElements(output_), false, active_electron);
       for (const auto value : result_)
         if (!determinant::isFiniteComplex(value))
           throw std::overflow_error("complex orbital product output overflow");
@@ -464,7 +478,8 @@ private:
   }
 
   const ComplexOrbitalHeadDescriptor descriptor_;
-  const SpatialJetLayout features_, envelopes_, output_;
+  SpatialJetLayout features_, envelopes_, output_;
+  const std::size_t target_capacity_;
   std::vector<C> projected_, result_;
   bool valid_ = false;
 };
