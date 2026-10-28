@@ -34,6 +34,7 @@
 #include "PsiFormerDevicePeriodicValueTilingValidation.h"
 #include "PsiFormerDeviceMixedPeriodicGeometryValidation.h"
 #include "PsiFormerDeviceRealEnvelopeValidation.h"
+#include "PsiFormerDeviceForwardPhaseBankValidation.h"
 #include "PsiFormerDeviceLargeScoreTileValidation.h"
 #include "PsiFormerDeviceOrbitalProjectionValidation.h"
 #include "PsiFormerDeviceComplexInverseValidation.h"
@@ -654,6 +655,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--complex-kinetic-concurrent-traces-only" &&
         std::string_view(argv[1]) != "--complex-kinetic-head-owner-k1-only" &&
         std::string_view(argv[1]) != "--complex-kinetic-head-owner-k3-diagnostic-only" &&
+        std::string_view(argv[1]) != "--forward-phase-bank-only" &&
         std::string_view(argv[1]) != "--real-virtual-envelope-only" &&
         std::string_view(argv[1]) != "--mixed-periodic-geometry-only" &&
         std::string_view(argv[1]) != "--periodic-feature-jets-only" &&
@@ -666,7 +668,7 @@ int main(int argc, char** argv)
         std::string_view(argv[1]) != "--paired-two-cell-only" && std::string_view(argv[1]) != "--complex-orbital-vjp-only" && std::string_view(argv[1]) != "--complex-lu-only" && std::string_view(argv[1]) != "--complex-lu-growth-only" &&
         std::string_view(argv[1]) != "--complex-roots-only" && std::string_view(argv[1]) != "--complex-roots-large-only"))
       throw std::invalid_argument("Usage: periodic_validation [--complex-score-weighted-grid-only|"
-          "--complex-score-pair-events-only|--complex-score-cooperative-lu-only|--complex-score-periodic-geometry-only|--complex-score-inverse-columns-only|--complex-score-weighted-inverses-only|--large-real-score-tile-only|--complex-kinetic-head-owner-k3-diagnostic-only|--complex-kinetic-head-owner-k1-only|--complex-kinetic-head-parallel-only|--complex-target-factor-reuse-only|--complex-inverse-columns-only|--complex-mixed-value-only|--complex-mixed-full-only|--head-determinant-batch-only|--real-virtual-envelope-only|--mixed-periodic-geometry-only|--periodic-feature-jets-only|--complex-roots-only|--complex-roots-large-only|"
+          "--complex-score-pair-events-only|--complex-score-cooperative-lu-only|--complex-score-periodic-geometry-only|--complex-score-inverse-columns-only|--complex-score-weighted-inverses-only|--large-real-score-tile-only|--complex-kinetic-head-owner-k3-diagnostic-only|--complex-kinetic-head-owner-k1-only|--complex-kinetic-head-parallel-only|--complex-target-factor-reuse-only|--complex-inverse-columns-only|--complex-mixed-value-only|--complex-mixed-full-only|--head-determinant-batch-only|--forward-phase-bank-only|--real-virtual-envelope-only|--mixed-periodic-geometry-only|--periodic-feature-jets-only|--complex-roots-only|--complex-roots-large-only|"
           "--complex-kinetic-concurrent-traces-only|--complex-kinetic-channel-roots-only|--complex-kinetic-cooperative-lu-only|--periodic-value-tiling-only|--complex-value-only|--complex-spatial-only|--complex-score-only|--complex-orbital-vjp-only|--complex-lu-only|--complex-lu-growth-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-concurrent-only|--complex-spatial-target-cost-check|--complex-products-only|--periodic-pair-only|--two-cell-model-only|--paired-two-cell-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
@@ -754,6 +756,11 @@ int main(int argc, char** argv)
       validateMixedComplexValueNumerical(
           [](const ExecutionEnvironment& e) { return smallParameters(e); },
           [](const ExecutionEnvironment& e) { return configurations(e); });
+    else if (argc == 2 && std::string_view(argv[1]) == "--forward-phase-bank-only")
+    {
+      qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+      qmcplusplus::psiformer::device::ForwardPhaseBankValidationAccess::run(queue);
+    }
     else if (argc == 2 && std::string_view(argv[1]) == "--real-virtual-envelope-only")
     {
       qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;

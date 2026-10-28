@@ -63,6 +63,15 @@ inline bool configuredCuspStateReuse()
   throw std::invalid_argument("PSIFORMER_GPU_CUSP_STATE_REUSE requires 0 or 1");
 }
 
+/// Freeze the optional non-retained FULL scratch overlap before any reserve.
+inline bool configuredForwardPhaseBank()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_FORWARD_PHASE_BANK");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_FORWARD_PHASE_BANK requires 0 or 1");
+}
+
 /// Only ordinary paired compact-target prefixes may share the canonical cusp state.
 inline bool supportsHeadFreeTargetCuspReuse(const PsiFormerExecutionPlan& plan, std::size_t targets)
 {
@@ -98,6 +107,18 @@ struct TargetVglCost
   std::size_t charged_scalar_work_units = 0;
   std::size_t tile_count = 0;
 };
+
+/// Only ordinary legacy periodic REAL FULL can discard raw features before its head.
+inline bool supportsForwardPhaseBank(const PsiFormerExecutionPlan& plan)
+{
+  const auto& e = plan.environment();
+  return plan.modelShape().electrons() >= 100 && e.fixed_nuclei &&
+      e.boundary == BoundaryCondition::PERIODIC && !e.periodic_profile &&
+      e.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+      e.periodic_axes[0] && e.periodic_axes[1] && e.periodic_axes[2] &&
+      e.parameter_scalar_domain == ScalarDomain::REAL && e.compute_scalar_domain == ScalarDomain::REAL &&
+      e.head_representation == HeadRepresentation::REAL && e.amplitude_scalar_domain == ScalarDomain::REAL;
+}
 
 /// Count the bounded batch max-K real prefix: no real head, retained tapes or responseP.
 inline TargetVglCost estimateHeadFreeTargetPrefixCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
@@ -179,6 +200,37 @@ inline TargetVglCost estimateTargetVglCost(const PsiFormerExecutionPlan& plan, s
   const auto cube = mul(ne, mul(ne, ne)), bd = mul(batch, dets);
   cost.charged_scalar_work_units = add(mul(3, mul(bd, mul(ne, cube))),
       mul(4, mul(bd, mul(cost.tile_count, cube))));
+  return cost;
+}
+
+/** Exact ordinary non-retained REAL FULL owner, without target assembly buffers.
+ * Optional phase overlap changes capacity only, never the arithmetic/work proxy.
+ */
+inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
+                                               bool phase_bank = false)
+{
+  const auto& shape = plan.modelShape();
+  const auto n = shape.electrons();
+  if (phase_bank && !supportsForwardPhaseBank(plan))
+    throw std::invalid_argument("Forward phase bank requires an ordinary large legacy periodic REAL profile");
+  auto cost = estimateTargetVglCost(plan, batch, n);
+  const auto mul = [](auto a, auto b) {
+    return spatial_detail::checkedProduct(a, b, "Ordinary FULL extent overflow");
+  };
+  const auto add = [](auto a, auto b) {
+    return spatial_detail::checkedAdd(a, b, "Ordinary FULL extent overflow");
+  };
+  const auto planes = add(1, mul(4, n));
+  // Explicit targets additionally assemble complete phase/root/Laplacian outputs.
+  cost.device_workspace_bytes -= checkedDeviceBytes<double>(mul(batch, add(add(1, planes), n)));
+  cost.host_workspace_bytes -= add(checkedDeviceBytes<double>(mul(4, batch)),
+      checkedDeviceBytes<device_determinant::CombinationMetadata>(batch));
+  if (phase_bank)
+  {
+    const auto raw = mul(mul(batch, planes), mul(n, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]));
+    const auto orbital = mul(mul(batch, planes), mul(shape.determinants, mul(n, n)));
+    cost.device_workspace_bytes -= checkedDeviceBytes<double>(std::min(raw, orbital));
+  }
   return cost;
 }
 
@@ -1005,6 +1057,7 @@ private:
   friend struct RetainedValueCuspValidationAccess;
   friend struct PeriodicFeatureJetsValidationAccess;
   friend struct RealEnvelopeValidationAccess;
+  friend struct ForwardPhaseBankValidationAccess;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -1018,6 +1071,7 @@ private:
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets),
+        forward_phase_bank_requested_(configuredForwardPhaseBank()),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
         periodic_value_geometry_requested_(configuredPeriodicValueGeometryCooperative()),
@@ -1136,11 +1190,23 @@ private:
     if (target_preparation_.max_targets)
       setTargetRange(0, target_preparation_.max_targets);
 
+    // The embedding is the last raw-feature consumer. The head first writes
+    // orbitals after the complete trunk has been admitted on this same stream.
+    // Reverse/target/paired graphs keep their independently live storage.
+    forward_phase_bank_ = forward_phase_bank_requested_ && supportsForwardPhaseBank(plan_) &&
+        mode_ == SpatialJetMode::FULL_VGL && !retain_score_tape && !retain_spatial_tape &&
+        !real_trunk_only && !kinetic_trunk_only && !retained_targets_ && !target_preparation_.max_targets;
+    const auto raw_elements = spatialJetSpanElements(features_.output);
+    const auto orbital_elements = real_trunk_only ? 0 : spatialJetSpanElements(orbitals_.orbitals);
+    phase_bank_saved_bytes_ = forward_phase_bank_
+        ? checkedDeviceBytes<double>(std::min(raw_elements, orbital_elements)) : 0;
+
     positions_.reserveNamed(product(batch_, product(ne_, 3)), "Inference::positions_", __FILE__, __LINE__);
     active_.reserveNamed(batch_, "Inference::active_", __FILE__, __LINE__);
     const std::vector<std::size_t> zero_active(batch_, 0);
     active_.upload(zero_active.data(), batch_);
-    raw_.reserveNamed(spatialJetSpanElements(features_.output), "Inference::raw_", __FILE__, __LINE__);
+    raw_.reserveNamed(forward_phase_bank_ ? std::max(raw_elements, orbital_elements) : raw_elements,
+        forward_phase_bank_ ? "Inference::forward_phase_bank" : "Inference::raw_", __FILE__, __LINE__);
     const auto feature_elements = spatialJetSpanElements(dense_.source);
     a_.reserveNamed(feature_elements, "Inference::a_", __FILE__, __LINE__);
     b_.reserveNamed(feature_elements, "Inference::b_", __FILE__, __LINE__);
@@ -1157,9 +1223,9 @@ private:
     traceJet(weights_, attention_.attention, "Inference::weights_");
     if (!real_trunk_only)
     {
-      orbital_jets_.reserveNamed(spatialJetSpanElements(orbitals_.orbitals),
-          "Inference::orbital_jets_", __FILE__, __LINE__);
-      traceJet(orbital_jets_, orbitals_.orbitals, "Inference::orbital_jets_");
+      if (!forward_phase_bank_)
+        orbital_jets_.reserveNamed(orbital_elements, "Inference::orbital_jets_", __FILE__, __LINE__);
+      traceJet(orbitalStorage(), orbitals_.orbitals, "Inference::orbital_jets_");
       matrices_.reserveNamed(product(batch_, matrices_per_configuration_), "Inference::matrices_", __FILE__, __LINE__);
       lu_.reserveNamed(matrices_.capacity(), "Inference::lu_", __FILE__, __LINE__);
       if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
@@ -1287,6 +1353,12 @@ private:
       std::clog << "PsiFormer retained VALUE cusp preparation: selected="
                 << (!value_tape_.empty() && usesCooperativeValueCusp() ? "cooperative" : "scalar")
                 << " Ne=" << ne_ << " static_shared_payload_bytes=4100; no extra global owner\n";
+    if (forward_phase_bank_)
+    {
+      const auto cost = estimateOrdinaryFullVglCost(plan_, batch_capacity_, true);
+      if (deviceWorkspaceBytes() != cost.device_workspace_bytes || hostWorkspaceBytes() != cost.host_workspace_bytes)
+        throw std::logic_error("Forward phase bank prepared bytes differ from pre-allocation cost");
+    }
     if (memory::enabled())
     {
       const auto resource = reinterpret_cast<std::uintptr_t>(this);
@@ -1483,7 +1555,7 @@ private:
         evaluatePreparedTile();
         admitTileBase(begin == 0);
         const SpatialHeadTape head{orbitals_, cusp_, final_.output, positions_.data(), raw_.data(), a_.data(),
-            orbital_jets_.data(), retained_backflow_.data(), retained_envelope_.data(),
+            orbitalStorage().data(), retained_backflow_.data(), retained_envelope_.data(),
             det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data(), inverse_.data(),
             normalized_.data(), factors_.data(), combinations_.data()};
         target_tape_valid_ = true;
@@ -1622,7 +1694,7 @@ private:
           parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
           parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
-          active_.data(), orbital_jets_.data(), open_status_.data(), periodic_value_pairs_->radii.data(),
+          active_.data(), orbitalStorage().data(), open_status_.data(), periodic_value_pairs_->radii.data(),
           periodic_value_pairs_->valid.data(), periodic_value_pairs_->radii.capacity(),
           sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}),
           "model periodic VALUE pair geometry");
@@ -1631,7 +1703,7 @@ private:
           parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
           parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
-          active_.data(), orbital_jets_.data(), open_status_.data(),
+          active_.data(), orbitalStorage().data(), open_status_.data(),
           value_tape_.empty() ? nullptr : retained_backflow_.data(),
           value_tape_.empty() ? nullptr : retained_envelope_.data(), nullptr,
           sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}), "model periodic orbital VGL");
@@ -1640,13 +1712,13 @@ private:
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
-        active_.data(), orbital_jets_.data(), open_status_.data()), "model tiled OPEN orbital VALUE");
+        active_.data(), orbitalStorage().data(), open_status_.data()), "model tiled OPEN orbital VALUE");
     else
       checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
-        active_.data(), orbital_jets_.data(), open_status_.data(),
+        active_.data(), orbitalStorage().data(), open_status_.data(),
         value_tape_.empty() ? nullptr : retained_backflow_.data(),
           value_tape_.empty() ? nullptr : retained_envelope_.data()), "model open orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
@@ -1667,7 +1739,7 @@ private:
     {
       // Only later tiles of this request may reuse successful bitwise-equal bases.
       // Every public/direct tile call and every new coordinate attempt starts fresh.
-      checkRuntime(launchDeterminantTargetFactorization(stream, orbital_jets_.data(), batch_,
+      checkRuntime(launchDeterminantTargetFactorization(stream, orbitalStorage().data(), batch_,
           shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base,
           matrices_.data(), lu_.data(), inverse_.data(), permutations_.data(), solve_.data(),
           factors_.data()), "model target determinants");
@@ -1677,7 +1749,7 @@ private:
       for (std::size_t configuration = 0; configuration < batch_; ++configuration)
       {
         const auto origin = configuration * orbitals_.orbitals.configuration_stride;
-        copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
+        copy(orbitalStorage(), origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
       }
       if (usesCooperativeValueLu())
         checkRuntime(launchDeterminantValueFactorizationCooperative(stream, matrices_.data(), batch_,
@@ -1717,8 +1789,8 @@ private:
     {
       const auto result = parallel_traces_->evaluate(determinant_layout,
           {factors_.data(), combinations_.data(), normalized_.data(), inverse_.data(),
-           orbital_jets_.data() + orbitals_.orbitals.plane_stride,
-           orbital_jets_.data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride});
+           orbitalStorage().data() + orbitals_.orbitals.plane_stride,
+           orbitalStorage().data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride});
       trace_status = result.status;
       trace_gradient = result.log_gradient;
       trace_lap_log = result.lap_log;
@@ -1746,8 +1818,8 @@ private:
     }
     else
       checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
-        normalized_.data(), inverse_.data(), orbital_jets_.data() + orbitals_.orbitals.plane_stride,
-        orbital_jets_.data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
+        normalized_.data(), inverse_.data(), orbitalStorage().data() + orbitals_.orbitals.plane_stride,
+        orbitalStorage().data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
     evaluateCusp();
     checkOpen(batch_);
@@ -1818,6 +1890,8 @@ public:
       throw std::invalid_argument("Target VGL does not admit mixed affine arithmetic");
     if (adapter && (!value_tape_.empty() || !supportsMixedRealInferenceEnvironment(plan_.environment())))
       throw std::invalid_argument("Mixed affine inference requires a supported real geometry without reverse tapes");
+    if (adapter && forward_phase_bank_)
+      throw std::invalid_argument("Forward phase bank requires an FP64 graph without mixed affine attachment");
     if (adapter && adapter->modelImage().get() != model_.get())
       throw std::invalid_argument("Mixed affine adapter has a stale or foreign parameter image");
     if (adapter && adapter->maximumRows() < product(product(batch_capacity_, ne_), dense_.source.plane_count))
@@ -1852,6 +1926,11 @@ public:
     (target_preparation_.max_targets ? full_output_ : output_).downloadOnStream(jets.data(), jets.size(), queue_.getNative());
     (target_preparation_.max_targets ? full_lap_ratio_ : lap_ratio_).downloadOnStream(ratios.data(), ratios.size(), queue_.getNative());
   }
+
+  /// Actual cold-selected overlap; views never add another allocation charge.
+  bool usesForwardPhaseBank() const noexcept { return forward_phase_bank_; }
+
+  std::size_t forwardPhaseBankSavedBytes() const noexcept { return phase_bank_saved_bytes_; }
 
   /// Expose the fixed output layout for result comparison, not internal scratch.
   const SpatialJetLayout& resultLayout() const noexcept { return result_layout_; }
@@ -2234,7 +2313,7 @@ public:
   {
     (void)spatialBlockTape(0);
     return {orbitals_, cusp_, final_.output, positions_.data(), raw_.data(), a_.data(),
-            orbital_jets_.data(), retained_backflow_.data(), retained_envelope_.data(),
+            orbitalStorage().data(), retained_backflow_.data(), retained_envelope_.data(),
             det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data(), inverse_.data(),
             normalized_.data(), factors_.data(), combinations_.data()};
   }
@@ -2259,7 +2338,7 @@ public:
       throw std::invalid_argument("Spatial orbital tape destination extent mismatch");
     retained_backflow_.download(backflow.data(), count);
     retained_envelope_.download(envelope.data(), count);
-    orbital_jets_.download(orbitals.data(), count);
+    orbitalStorage().download(orbitals.data(), count);
   }
 
   /// Report the live configuration prefix belonging to the completed tape.
@@ -2740,6 +2819,11 @@ private:
     checkRuntime(launchDerivativeCopy(queue_.getNative(), layout, source.data(), target.data()), "model jet packing");
   }
 
+  /// The raw and orbital intervals are disjoint only in the selected ordinary FULL graph.
+  DeviceBuffer<double>& orbitalStorage() noexcept { return forward_phase_bank_ ? raw_ : orbital_jets_; }
+
+  const DeviceBuffer<double>& orbitalStorage() const noexcept { return forward_phase_bank_ ? raw_ : orbital_jets_; }
+
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   const PsiFormerExecutionPlan& plan_;
@@ -2752,6 +2836,9 @@ private:
   const SpatialJetMode mode_;
   const TargetVglPreparation target_preparation_;
   const bool retained_targets_;
+  const bool forward_phase_bank_requested_;
+  bool forward_phase_bank_ = false;
+  std::size_t phase_bank_saved_bytes_ = 0;
   const bool cooperative_value_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
   const bool cooperative_open_features_requested_;
