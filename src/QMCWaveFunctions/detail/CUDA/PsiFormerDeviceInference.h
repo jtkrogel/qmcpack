@@ -234,6 +234,13 @@ inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& p
   return cost;
 }
 
+/// Bound one logical selected-K request by its mixed attempt plus complete canonical retry.
+inline std::size_t mixedTargetRequestScalarWork(std::size_t single_attempt_work, bool allow_fp64_retry = true)
+{
+  return spatial_detail::checkedProduct(allow_fp64_retry ? std::size_t(2) : std::size_t(1),
+      single_attempt_work, "Mixed target complete-request work overflow");
+}
+
 /// Charge the optional bounded trace leaf before any composite graph allocation.
 inline TargetVglCost estimatePreparedTargetVglCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
                                                   const TargetVglPreparation& preparation)
@@ -330,17 +337,21 @@ inline std::size_t estimateRetainedValueIncrementBytes(const PsiFormerExecutionP
  * be assembled into one physical root; callers may retry an admitted full graph.
  */
 inline void admitTargetVglBase(double phase, double logabs, double reference_phase, double reference_logabs,
-                              const device_determinant::CombinationMetadata& combination)
+                              const device_determinant::CombinationMetadata& combination, bool mixed_request = false)
 {
+  const auto reject = [mixed_request](const char* reason) {
+    if (mixed_request) throw MixedPrecisionRetryRequired(reason);
+    throw std::runtime_error(reason);
+  };
   if (!device_math::isFiniteBinary64(phase) || !device_math::isFiniteBinary64(logabs) ||
       !device_math::isFiniteBinary64(reference_phase) || !device_math::isFiniteBinary64(reference_logabs) ||
       (phase != 1.0 && phase != -1.0) || phase != reference_phase || combination.severe_cancellation ||
       combination.status != device_determinant::CombinationStatus::REGULAR)
-    throw std::runtime_error("Target VGL tiles have an unavailable or inconsistent base value/phase");
+    reject("Target VGL tiles have an unavailable or inconsistent base value/phase");
   const double bound = 256 * std::numeric_limits<double>::epsilon() *
       (1 + std::max(std::abs(logabs), std::abs(reference_logabs)));
   if (std::abs(logabs - reference_logabs) > bound)
-    throw std::runtime_error("Target VGL tiles disagree on the rounded log amplitude");
+    reject("Target VGL tiles disagree on the rounded log amplitude");
 }
 
 /// Identify the numerical enum domain stored in a compact first-failure record.
@@ -1744,7 +1755,7 @@ private:
       // Only later tiles of this request may reuse successful bitwise-equal bases.
       // Every public/direct tile call and every new coordinate attempt starts fresh.
       checkRuntime(launchDeterminantTargetFactorization(stream, orbitalStorage().data(), batch_,
-          shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base,
+          shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base && !mixed_dense_,
           matrices_.data(), lu_.data(), inverse_.data(), permutations_.data(), solve_.data(),
           factors_.data()), "model target determinants");
     }
@@ -1899,21 +1910,33 @@ public:
     evaluate(positions);
   }
 
+  /// Bound folded affine rows by the prepared capacity and selected K, never the full result layout.
+  std::size_t mixedDenseRowCapacity() const
+  {
+    const auto targets = target_preparation_.max_targets ? target_preparation_.max_targets : ne_;
+    const auto planes = mode_ == SpatialJetMode::VALUE_ONLY ? std::size_t(1) :
+        spatial_detail::checkedAdd(std::size_t(1), product(std::size_t(4), targets),
+            "Mixed target plane count overflow");
+    return product(product(batch_capacity_, ne_), planes);
+  }
+
   /** Opt into matched approximate affine value/VGL planes; reverse tapes remain rejected.
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
   {
     if (mixed_retained_attachment_)
       throw std::invalid_argument("A retained mixed arithmetic binding cannot be replaced by ordinary attachment");
-    if (adapter && target_preparation_.max_targets)
-      throw std::invalid_argument("Target VGL does not admit mixed affine arithmetic");
+    if (adapter && (retained_targets_ || kinetic_trunk_only_ ||
+        (target_preparation_.max_targets && (target_preparation_.reuse_cusp_state ||
+            target_preparation_.parallel_trace_workspace_budget_bytes))))
+      throw std::invalid_argument("Mixed target VGL requires ordinary unretained graphs without cusp reuse");
     if (adapter && (!value_tape_.empty() || !supportsMixedRealInferenceEnvironment(plan_.environment())))
       throw std::invalid_argument("Mixed affine inference requires a supported real geometry without reverse tapes");
     if (adapter && forward_phase_bank_)
       throw std::invalid_argument("Forward phase bank requires an FP64 graph without mixed affine attachment");
     if (adapter && adapter->modelImage().get() != model_.get())
       throw std::invalid_argument("Mixed affine adapter has a stale or foreign parameter image");
-    if (adapter && adapter->maximumRows() < product(product(batch_capacity_, ne_), dense_.source.plane_count))
+    if (adapter && adapter->maximumRows() < mixedDenseRowCapacity())
       throw std::invalid_argument("Mixed affine adapter cannot hold every requested spatial plane");
     mixed_dense_ = std::move(adapter);
     if (mixed_dense_)
@@ -2551,12 +2574,14 @@ private:
                                  SpatialJetMode requested_mode = SpatialJetMode::VALUE_ONLY)
   {
     if (adapter && ((requested_mode != SpatialJetMode::VALUE_ONLY && requested_mode != SpatialJetMode::FULL_VGL) ||
-        mode_ != requested_mode || target_preparation_.max_targets ||
+        mode_ != requested_mode ||
+        (target_preparation_.max_targets && (target_preparation_.reuse_cusp_state ||
+            target_preparation_.parallel_trace_workspace_budget_bytes)) ||
         !value_tape_.empty() || retained_targets_ || kinetic_trunk_only_ ||
         !supportsMixedPairedTrunkEnvironment(plan_.environment())))
-      throw std::invalid_argument("Mixed paired trunk requires ordinary legacy-torus VALUE/FULL without retained state");
+      throw std::invalid_argument("Mixed paired trunk requires legacy-torus VALUE/FULL without retained state or cusp reuse");
     if (adapter && (adapter->modelImage().get() != model_.get() ||
-        adapter->maximumRows() < product(product(batch_capacity_, ne_), features_.output.plane_count)))
+        adapter->maximumRows() < mixedDenseRowCapacity()))
       throw std::invalid_argument("Mixed paired trunk adapter has a foreign image or insufficient row capacity");
     mixed_dense_ = std::move(adapter);
     value_tape_valid_ = result_valid_ = false;
@@ -2632,7 +2657,8 @@ private:
         canonical_log_[configuration] = tile_log_[configuration];
       }
       admitTargetVglBase(tile_phase_[configuration], tile_log_[configuration],
-          canonical_phase_[configuration], canonical_log_[configuration], host_combinations_[configuration]);
+          canonical_phase_[configuration], canonical_log_[configuration], host_combinations_[configuration],
+          bool(mixed_dense_));
     }
   }
 
@@ -3015,12 +3041,39 @@ class PreparedDeviceMixedInference
 {
   friend struct MixedPeriodicGeometryValidationAccess;
 public:
+  /// Charge both selected-K graphs and one cache/cast owner, including cold conversion peak.
+  static std::size_t estimateTargetDeviceWorkspaceBytes(const PsiFormerExecutionPlan& plan,
+      std::size_t capacity, TargetVglPreparation preparation)
+  {
+    if (!supportsMixedRealInferenceEnvironment(plan.environment()) ||
+        !preparation.max_targets || preparation.reuse_cusp_state ||
+        preparation.parallel_trace_workspace_budget_bytes)
+      throw std::invalid_argument("Mixed REAL targets require ordinary selected-K preparation");
+    const auto graph = estimatePreparedTargetVglCost(plan, capacity, preparation);
+    const auto add = [](std::size_t a, std::size_t b) {
+      return spatial_detail::checkedAdd(a, b, "Mixed REAL target owner bytes overflow");
+    };
+    const auto mul = [](std::size_t a, std::size_t b) {
+      return spatial_detail::checkedProduct(a, b, "Mixed REAL target owner extent overflow");
+    };
+    const auto planes = add(std::size_t(1), mul(std::size_t(4), preparation.max_targets));
+    const auto rows = mul(mul(capacity, plan.modelShape().electrons()), planes);
+    const auto cache = checkedDeviceBytes<float>(plan.parameterCount());
+    const auto live = add(add(mul(std::size_t(2), graph.device_workspace_bytes), cache),
+        PreparedDeviceMixedValueDense::estimateDeviceWorkspaceBytes(plan, rows));
+    const auto cold = add(add(graph.device_workspace_bytes, cache),
+        sizeof(PsiFormerParameterConversionDiagnostics));
+    return std::max(live, cold);
+  }
+
   /// Prepare both routes up front; parameter conversion hazards may select FP64-only operation.
   PreparedDeviceMixedInference(std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
                                     compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
                                     SpatialJetMode mode = SpatialJetMode::VALUE_ONLY,
-                                    bool allow_fp64_retry = true)
-      : reference_(model, capacity, queue, blas, mode), allow_retry_(allow_fp64_retry)
+                                    bool allow_fp64_retry = true, TargetVglPreparation preparation = {})
+      : reference_(model, capacity, queue, blas, mode, false, false,
+            configuredInferenceStatusPolicy(), checkedTargetPreparation(model, capacity, mode, allow_fp64_retry, preparation)),
+        allow_retry_(allow_fp64_retry)
   {
     // Exclude the reference before conversion can fail and select FP64-only recovery.
     reference_.excludeCooperativeValueLuForMixedRequest();
@@ -3029,11 +3082,10 @@ public:
     {
       parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model, queue);
       adapter_ = std::make_shared<PreparedDeviceMixedValueDense>(parameters_,
-          spatial_detail::checkedProduct(spatial_detail::checkedProduct(capacity,
-              model->plan().modelShape().electrons(), "Mixed row overflow"),
-              reference_.resultLayout().plane_count, "Mixed spatial row overflow"),
+          reference_.mixedDenseRowCapacity(),
           queue, blas);
-      approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode);
+      approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode,
+          false, false, configuredInferenceStatusPolicy(), preparation);
       approximate_->excludeCooperativeValueLuForMixedRequest();
       approximate_->excludeCooperativeOpenFeaturesForMixedRequest();
       approximate_->setMixedDense(adapter_);
@@ -3158,6 +3210,31 @@ public:
   }
 
 private:
+  /// Reject invalid target mode or insufficient complete-owner caps before the first graph allocation.
+  static TargetVglPreparation checkedTargetPreparation(const std::shared_ptr<const PreparedDeviceModel>& model,
+      std::size_t capacity, SpatialJetMode mode, bool allow_retry, TargetVglPreparation preparation)
+  {
+    if (!preparation.max_targets)
+    {
+      if (preparation.reuse_cusp_state || preparation.parallel_trace_workspace_budget_bytes ||
+          preparation.device_workspace_budget_bytes || preparation.scalar_work_budget)
+        throw std::invalid_argument("Mixed REAL FULL does not admit stray target preparation controls");
+      return preparation;
+    }
+    if (!model || mode != SpatialJetMode::FULL_VGL)
+      throw std::invalid_argument("Mixed REAL selected targets require a canonical FULL_VGL image");
+    const auto bytes = estimateTargetDeviceWorkspaceBytes(model->plan(), capacity, preparation);
+    const auto graph = estimatePreparedTargetVglCost(model->plan(), capacity, preparation);
+    const auto request_work = mixedTargetRequestScalarWork(graph.charged_scalar_work_units, allow_retry);
+    if (!preparation.device_workspace_budget_bytes || !preparation.scalar_work_budget ||
+        preparation.device_workspace_budget_bytes == std::numeric_limits<std::size_t>::max() ||
+        preparation.scalar_work_budget == std::numeric_limits<std::size_t>::max() ||
+        bytes > preparation.device_workspace_budget_bytes ||
+        request_work > preparation.scalar_work_budget)
+      throw std::length_error("Mixed REAL targets exceed complete-owner byte/whole-request work caps");
+    return preparation;
+  }
+
   PreparedDeviceInference reference_;
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters_;
   std::shared_ptr<PreparedDeviceMixedValueDense> adapter_;

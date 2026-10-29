@@ -250,9 +250,11 @@ private:
       throw std::logic_error("Mixed FULL diagnostic pivots require an attached typed adapter");
     if (canonical_)
     {
-      if (minimum_scaled_pivots || trunk_->mixed_dense_)
-        throw std::invalid_argument("Mixed paired FULL does not admit target/retained execution");
-      evaluateTargets(positions);
+      if (trunk_->mixed_dense_ && (factor_reuse_ || cold_cooperative_lu_ || inverse_columns_ ||
+          projection_banks_[0] || trunk_->target_preparation_.reuse_cusp_state ||
+          trunk_->target_preparation_.parallel_trace_workspace_budget_bytes))
+        throw std::invalid_argument("Mixed paired targets exclude factor/head/inverse/cusp experiments");
+      evaluateTargets(positions, minimum_scaled_pivots);
       return;
     }
     auto& t = *trunk_;
@@ -279,12 +281,7 @@ private:
     finishHead(minimum_scaled_pivots);
     if (minimum_scaled_pivots)
     {
-      t.mixed_dense_->checkComplexValueConditioning(minimum_scaled_pivots, channels_.data(), amplitude_.data(),
-          t.batch_, t.shape_.determinants);
-      t.mixed_dense_->checkComplexSpatialConditioning(envelope_.data(), projections_.data(),
-          projections_.data() + cost_.head_elements, t.orbitals_.orbitals.configuration_stride, inverse_.data(),
-          channels_.data(), amplitude_.data(), t.cusp_jets_.data(), t.cusp_.output.configuration_stride,
-          t.batch_, t.shape_.determinants, t.ne_);
+      checkMixedSpatialConditioning(minimum_scaled_pivots);
     }
     if (concurrent_targets_)
       checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
@@ -353,17 +350,40 @@ public:
 private:
   friend struct ComplexSpatialTargetValidationAccess;
 
+  /// Screen the completed selected head using the same resident FULL sensitivity leaves.
+  void checkMixedSpatialConditioning(double* minimum_scaled_pivots)
+  {
+    auto& t = *trunk_;
+    t.mixed_dense_->checkComplexValueConditioning(minimum_scaled_pivots, channels_.data(), amplitude_.data(),
+        t.batch_, t.shape_.determinants);
+    t.mixed_dense_->checkComplexSpatialConditioning(envelope_.data(), projections_.data(),
+        projections_.data() + cost_.head_elements, t.orbitals_.orbitals.configuration_stride, inverse_.data(),
+        channels_.data(), amplitude_.data(), t.cusp_jets_.data(), t.cusp_.output.configuration_stride,
+        t.batch_, t.shape_.determinants, t.ne_);
+  }
+
   /// One mapped prefix/cusp plus paired head; no reverse ticket or retained tape.
   void prepareTarget(std::size_t begin, std::size_t count, bool reuse_previous = false,
-      std::uint8_t* test_decisions = nullptr)
+      std::uint8_t* test_decisions = nullptr, double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
     t.setTargetRange(begin, count);
     t.resetStatusAdmission();
-    t.evaluatePreparedTrunk();
+    try
+    {
+      t.evaluatePreparedTrunk();
+    }
+    catch (const InferenceStatusError& error)
+    {
+      if (!t.mixed_dense_ || error.stage() == 0) throw;
+      throw MixedComplexValueFailure(ComplexValueFailureStage::AFFINE_TRUNK, error.what());
+    }
+    if (t.mixed_dense_) t.mixed_dense_->admitAffinePrefix();
     t.evaluateCusp();
     t.checkOpen(t.batch_);
-    finishHead(nullptr, reuse_previous, test_decisions);
+    finishHead(minimum_scaled_pivots, reuse_previous && !t.mixed_dense_, test_decisions);
+    if (minimum_scaled_pivots)
+      checkMixedSpatialConditioning(minimum_scaled_pivots);
   }
 
   /// Write live K lanes directly into final physical output ranges, without scatter.
@@ -385,7 +405,7 @@ private:
   }
 
   /// Upload once; only complete consistent targets can publish the full physical root.
-  void evaluateTargets(const std::vector<double>& positions)
+  void evaluateTargets(const std::vector<double>& positions, double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
     t.beginCoordinateEvaluation();
@@ -398,7 +418,8 @@ private:
     for (std::size_t begin = 0; begin < t.ne_;)
     {
       const auto count = std::min(t.target_preparation_.max_targets, t.ne_ - begin);
-      prepareTarget(begin, count, reuse_previous);
+      PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
+      prepareTarget(begin, count, reuse_previous, nullptr, minimum_scaled_pivots);
       ComplexValueResult single;
       auto* current = target_current_.empty() ? &single : target_current_.data();
       amplitude_.downloadOnStream(current, t.batch_, t.queue_.getNative());
@@ -408,8 +429,14 @@ private:
         else if (std::abs(current[b].log_abs - canonical_[b].log_abs) > 2e-11 ||
             std::hypot(cuCreal(current[b].phase) - cuCreal(canonical_[b].phase),
                        cuCimag(current[b].phase) - cuCimag(canonical_[b].phase)) > 2e-11)
+        {
+          if (t.mixed_dense_)
+            throw MixedComplexValueFailure(ComplexValueFailureStage::COMBINATION,
+                "Complex target VGL base changed within one request");
           throw std::runtime_error("Complex target VGL base changed within one request");
+        }
       finishTarget(begin);
+      mixed_attempt.finish();
       reuse_previous = true;
       begin += count;
     }

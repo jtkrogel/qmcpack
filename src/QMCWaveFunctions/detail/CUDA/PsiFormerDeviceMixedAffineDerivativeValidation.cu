@@ -7,6 +7,7 @@
  */
 #define PSIFORMER_LIBRARY
 #include "PsiFormerDeviceMixedAffineDerivativeValidation.h"
+#include "PsiFormerDeviceMixedTargetValidation.h"
 
 /// Execute the generated oracle only when an actual GPU is visible.
 int main()
@@ -26,6 +27,8 @@ int main()
       throw std::runtime_error("Mixed affine numerical oracle requires a visible GPU");
     std::cout << "Actual-device mixed affine validation backend=" << backend
               << " visible_devices=" << devices << '\n';
+    validateMixedSpatialConditioningScreen();
+    validateMixedTargetStreaming();
     validateMixedAffineDerivatives();
     return 0;
   }
