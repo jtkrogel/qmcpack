@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_COMPLEX_INFERENCE_H
 #include "PsiFormerDeviceMixedComplexValue.h"
 #include "PsiFormerDeviceMixedComplexSpatial.h"
+#include <algorithm>
 #include <map>
 
 namespace qmcplusplus::psiformer::device
@@ -50,7 +51,8 @@ public:
     const auto shared_cache = owns_parameters ? checkedDeviceBytes<float>(plan.parameterCount()) : 0;
     const auto pending = owns_parameters ? add(checkedDeviceBytes<float>(plan.parameterCount()),
         sizeof(PsiFormerParameterConversionDiagnostics)) : 0;
-    return {value, full, add(add(value, full), shared_cache), add(host, diagnostics), pending};
+    const auto scalar_host = checkedDeviceBytes<ComplexValueResult>(capacity);
+    return {value, full, add(add(value, full), shared_cache), add(add(host, diagnostics), scalar_host), pending};
   }
 
   /// Retain inference/profile restrictions; explicit targets are checked against the typed plan and caps.
@@ -82,7 +84,8 @@ public:
       : image_(std::move(image)),
         cost_(admittedCost(checkedPlan(image_), capacity, owner_budget, concurrent_targets,
             !shared_parameters, preparation)),
-        owns_parameters_(!shared_parameters)
+        owns_parameters_(!shared_parameters),
+        value_staging_(capacity)
   {
     if (shared_parameters && (shared_parameters->modelImage().get() != image_.get() ||
         shared_parameters->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD))
@@ -98,7 +101,8 @@ public:
     if (value_->parameterCache().get() != parameters_.get() || full_->parameterCache().get() != parameters_.get() ||
         value_->deviceWorkspaceBytes() + full_->deviceWorkspaceBytes() +
             (owns_parameters_ ? parameters_->deviceStorageBytes() : 0) != cost_.device_bytes ||
-        value_->hostNumericBytes() + full_->hostNumericBytes() +
+        checkedDeviceBytes<ComplexValueResult>(value_staging_.capacity()) +
+            value_->hostNumericBytes() + full_->hostNumericBytes() +
             (owns_parameters_ ? sizeof(PsiFormerParameterConversionDiagnostics) : 0) != cost_.host_bytes)
       throw std::logic_error("Paired mixed inference actual owner inventory differs from cold admission");
   }
@@ -129,6 +133,8 @@ public:
   void adoptPreparedRebind(const std::shared_ptr<const PreparedDeviceModel>& successor,
       const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& prepared) noexcept
   {
+    value_valid_ = false;
+    value_count_ = 0;
     value_->adoptPreparedRebind(successor, prepared);
     full_->adoptPreparedRebind(successor, prepared);
     parameters_ = prepared;
@@ -139,6 +145,8 @@ public:
   void evaluateValue(const std::vector<double>& positions,
       PsiFormerGpuTrainingEpochMode mode = PsiFormerGpuTrainingEpochMode::INFERENCE)
   {
+    value_valid_ = false;
+    value_count_ = 0;
     validateEpochMode(mode);
     ++counters_.value_attempts;
     value_canonical_ = false;
@@ -149,6 +157,15 @@ public:
       full_->evaluateCanonicalValue(positions);
       value_canonical_ = true;
     }
+    // Retain an independent publication before a FULL request revokes the producer scalar.
+    const auto count = positions.size() / (3 * image_->plan().modelShape().electrons());
+    if (!count || count > value_staging_.capacity())
+      throw std::logic_error("Paired mixed inference VALUE exceeds cold scalar capacity");
+    value_staging_.resize(count);
+    if (value_canonical_) full_->downloadCanonicalValue(value_staging_);
+    else value_->download(value_->resultView(), value_staging_);
+    value_count_ = count;
+    value_valid_ = true;
     ++counters_.value_requests;
     if (mode == PsiFormerGpuTrainingEpochMode::FP64_REPLAY) ++counters_.value_epoch_replays;
     if (value_canonical_) ++counters_.value_canonical_fp64;
@@ -158,8 +175,12 @@ public:
   /// Copy only the complete admitted VALUE output into native staging.
   void downloadValue(std::vector<ComplexValueResult>& amplitude) const
   {
-    if (value_canonical_) full_->downloadCanonicalValue(amplitude);
-    else value_->download(value_->resultView(), amplitude);
+    image_->validateCurrentDevice();
+    if (!value_valid_)
+      throw std::logic_error("Paired mixed inference VALUE has no completed publication");
+    if (amplitude.size() != value_count_)
+      throw std::invalid_argument("Paired mixed inference VALUE output has another extent");
+    std::copy_n(value_staging_.begin(), value_count_, amplitude.begin());
   }
 
   /// Consume all fields from one admitted mixed or complete same-image FP64 FULL attempt.
@@ -209,7 +230,7 @@ public:
   }
 
 private:
-  /// Reject unknown epoch policy before any request counter or numeric state changes.
+  /// Reject unknown epoch policy before any request counter or producer work changes.
   static void validateEpochMode(PsiFormerGpuTrainingEpochMode mode)
   {
     switch (mode)
@@ -243,6 +264,9 @@ private:
   const Cost cost_;
   const bool owns_parameters_;
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters_;
+  std::vector<ComplexValueResult> value_staging_;
+  std::size_t value_count_ = 0;
+  bool value_valid_ = false;
   bool value_canonical_ = false;
   const std::string canonical_value_reason_;
   std::unique_ptr<PreparedDeviceMixedComplexValue> value_;
