@@ -58,6 +58,11 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
     cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
     cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
+/// Use canonical scalar LU without inverse work or ambient cooperative dispatch.
+/// This shares the inverse producer's LU primal while admitting valid nodal VALUE results.
+Error launchComplexCanonicalScalarFactor(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status);
+
 /// Reuse only an accepted bit-identical raw channel within one target request.
 /// Current matrices occupy dead trace scratch; canonical raw matrices survive in head VALUE.
 /// Optional per-channel decisions are test-only (0=cold,1=reuse,2=current fallback).

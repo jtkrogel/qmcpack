@@ -21,6 +21,7 @@
 
 #include "PsiFormerDeviceResources.h"
 #include "PsiFormerDeviceCoordinates.h"
+#include "PsiFormerDeviceCanonicalHead.h"
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceSpatialTraces.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
@@ -40,6 +41,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -235,6 +237,15 @@ inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& p
 }
 
 /// Bound one logical selected-K request by its mixed attempt plus complete canonical retry.
+/// Charge one additional full-FP64 VALUE factor/inverse pass; this existing scalar proxy is not FLOPs.
+inline std::size_t canonicalHeadScalarWork(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  if (!batch) throw std::invalid_argument("Canonical head scalar work requires a nonempty population");
+  const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Canonical head scalar work overflow"); };
+  const auto n = plan.modelShape().electrons();
+  return mul(std::size_t(4), mul(batch, mul(plan.modelShape().determinants, mul(n, mul(n, n)))));
+}
+
 inline std::size_t mixedTargetRequestScalarWork(std::size_t single_attempt_work, bool allow_fp64_retry = true)
 {
   return spatial_detail::checkedProduct(allow_fp64_retry ? std::size_t(2) : std::size_t(1),
@@ -1051,6 +1062,7 @@ public:
   {}
 
 private:
+  friend class PreparedDeviceCanonicalRealHead;
   friend class PreparedDeviceTargetKinetic;
   friend class PreparedDeviceMetropolis;
   friend class PreparedDeviceKineticReverse;
@@ -1397,19 +1409,65 @@ public:
     evaluateOwnedCoordinates();
   }
 
-  /// Consume a checked device population without a coordinate host upload.
-  void evaluateDeviceCoordinates(const PackedDeviceCoordinatesView& positions)
+  /// Invalidate and stage checked device coordinates without admitting a partial numerical result.
+  void stageDeviceCoordinates(const PackedDeviceCoordinatesView& positions)
   {
     beginCoordinateEvaluation();
     positions.copyTo(positions_, queue_, model_->metadataFamily(), ne_);
     setBatchCount(positions.batchCount());
+    evaluation_coordinates_ = positions;
+  }
+
+  /// Consume a checked device population without a coordinate host upload.
+  void evaluateDeviceCoordinates(const PackedDeviceCoordinatesView& positions)
+  {
+    stageDeviceCoordinates(positions);
     evaluateOwnedCoordinates();
   }
 
+  /// Contract spatial jets at a same-request full-FP64 primal head, without using a mixed inverse.
+  void evaluateCanonicalHead(const RealCanonicalHeadView& head)
+  { evaluateCanonicalRequest(head, false); }
+
+  /// Retain mixed VALUE activations while sourcing every physical determinant coefficient from FP64.
+  void evaluateRetainedCanonicalHead(const RealCanonicalHeadView& head)
+  { evaluateCanonicalRequest(head, true); }
+
 private:
+  /// Keep the head borrow request-local and invalidate all output/tape authority on every failed attempt.
+  void evaluateCanonicalRequest(const RealCanonicalHeadView& head, bool retained_value)
+  {
+    beginCoordinateEvaluation();
+    head.validate(model_, model_->version(), &queue_, head.coordinates().batchCount(), ne_, shape_.determinants);
+    if ((retained_value ? (mode_ != SpatialJetMode::VALUE_ONLY || value_tape_.empty() || target_preparation_.max_targets)
+                        : (mode_ != SpatialJetMode::FULL_VGL || !value_tape_.empty())) ||
+        real_trunk_only_ || retained_targets_ || kinetic_trunk_only_ || target_preparation_.reuse_cusp_state ||
+        target_preparation_.parallel_trace_workspace_budget_bytes)
+      throw std::invalid_argument("Canonical REAL head has incompatible FULL/retained VALUE preparation");
+    head.coordinates().copyTo(positions_, queue_, model_->metadataFamily(), ne_);
+    setBatchCount(head.coordinates().batchCount());
+    evaluation_coordinates_ = head.coordinates();
+    const auto borrow = head;
+    canonical_head_ = &borrow;
+    try
+    {
+      evaluateOwnedCoordinates();
+      canonical_retained_head_ = retained_value;
+      canonical_head_ = nullptr;
+    }
+    catch (...)
+    {
+      canonical_head_ = nullptr;
+      result_valid_ = value_tape_valid_ = canonical_retained_head_ = false;
+      throw;
+    }
+  }
+
   /// Revoke every previous output before validating or copying replacement input.
   void beginCoordinateEvaluation()
   {
+    evaluation_coordinates_ = {};
+    canonical_retained_head_ = false;
     cusp_state_valid_ = false;
     cusp_state_canonical_replay_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
@@ -1745,48 +1803,58 @@ private:
     // Only values need compact packing for factorization and the score-head ABI.
     // Spatial traces borrow the existing orbital planes with a configuration stride,
     // avoiding a second B*4Ne*D*Ne^2 derivative tensor and two copies per configuration.
-    const char* reuse_flag = std::getenv("PSIFORMER_GPU_TARGET_FACTOR_REUSE");
-    const bool request_local_factor_reuse = reuse_flag && reuse_flag[0] == '1' && reuse_flag[1] == '\0' &&
-        target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
-        !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
-        !mixed_value_lu_excluded_ && plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
-    if ((parallel_traces_ && !retained_targets_) || request_local_factor_reuse)
+    if (canonical_head_)
+      canonical_head_->validate(model_, model_->version(), &queue_, batch_, ne_, shape_.determinants);
+    const auto* head_factors = canonical_head_ ? canonical_head_->factorizations() : factors_.data();
+    const auto* head_combinations = canonical_head_ ? canonical_head_->combinations() : combinations_.data();
+    const auto* head_weights = canonical_head_ ? canonical_head_->normalizedWeights() : normalized_.data();
+    const auto* head_inverse = canonical_head_ ? canonical_head_->inverses() : inverse_.data();
+    if (!canonical_head_)
     {
-      // Only later tiles of this request may reuse successful bitwise-equal bases.
-      // Every public/direct tile call and every new coordinate attempt starts fresh.
-      checkRuntime(launchDeterminantTargetFactorization(stream, orbitalStorage().data(), batch_,
-          shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base && !mixed_dense_,
-          matrices_.data(), lu_.data(), inverse_.data(), permutations_.data(), solve_.data(),
-          factors_.data()), "model target determinants");
-    }
-    else
-    {
-      for (std::size_t configuration = 0; configuration < batch_; ++configuration)
+      const char* reuse_flag = std::getenv("PSIFORMER_GPU_TARGET_FACTOR_REUSE");
+      const bool request_local_factor_reuse = reuse_flag && reuse_flag[0] == '1' && reuse_flag[1] == '\0' &&
+          target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
+          !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
+          !mixed_value_lu_excluded_ && plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
+      if ((parallel_traces_ && !retained_targets_) || request_local_factor_reuse)
       {
-        const auto origin = configuration * orbitals_.orbitals.configuration_stride;
-        copy(orbitalStorage(), origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
+        // Only later tiles of this request may reuse successful bitwise-equal bases.
+        // Every public/direct tile call and every new coordinate attempt starts fresh.
+        checkRuntime(launchDeterminantTargetFactorization(stream, orbitalStorage().data(), batch_,
+            shape_.determinants, ne_, orbitals_.orbitals.configuration_stride, reuse_target_base && !mixed_dense_,
+            matrices_.data(), lu_.data(), inverse_.data(), permutations_.data(), solve_.data(),
+            factors_.data()), "model target determinants");
       }
-      if (usesCooperativeValueLu())
-        checkRuntime(launchDeterminantValueFactorizationCooperative(stream, matrices_.data(), batch_,
-            shape_.determinants, ne_, lu_.data(), permutations_.data(), factors_.data()), "model cooperative VALUE determinants");
       else
-        checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
-            mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
-            permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+      {
+        for (std::size_t configuration = 0; configuration < batch_; ++configuration)
+        {
+          const auto origin = configuration * orbitals_.orbitals.configuration_stride;
+          copy(orbitalStorage(), origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
+        }
+        if (usesCooperativeValueLu())
+          checkRuntime(launchDeterminantValueFactorizationCooperative(stream, matrices_.data(), batch_,
+              shape_.determinants, ne_, lu_.data(), permutations_.data(), factors_.data()), "model cooperative VALUE determinants");
+        else
+          checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
+              mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
+              permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+      }
+      checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
+          term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
     }
-    checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
-        term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
     // Value-only evaluation deliberately avoids inverse/traces and all spatial
     // output planes; nodal values remain defined even when log derivatives are not.
     if (mode_ == SpatialJetMode::VALUE_ONLY)
     {
       evaluateCusp();
       checkOpen(batch_);
-      checkRuntime(launchFinalValueCombination(stream, batch_, combinations_.data(), cusp_jets_.data(),
+      checkRuntime(launchFinalValueCombination(stream, batch_, head_combinations, cusp_jets_.data(),
           phase_.data(), output_.data(), open_status_.data()), "model final values");
       checkOpen(batch_);
       if (mixed_dense_)
-        mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
+        mixed_dense_->checkValueConditioning(head_factors, head_combinations, batch_, shape_.determinants);
+      if (canonical_head_) copyCanonicalPrimal();
       mixed_attempt.finish();
       return;
     }
@@ -1803,7 +1871,7 @@ private:
     if (parallel_traces_)
     {
       const auto result = parallel_traces_->evaluate(determinant_layout,
-          {factors_.data(), combinations_.data(), normalized_.data(), inverse_.data(),
+          {head_factors, head_combinations, head_weights, head_inverse,
            orbitalStorage().data() + orbitals_.orbitals.plane_stride,
            orbitalStorage().data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride});
       trace_status = result.status;
@@ -1832,22 +1900,24 @@ private:
       }
     }
     else
-      checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
-        normalized_.data(), inverse_.data(), orbitalStorage().data() + orbitals_.orbitals.plane_stride,
+      checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, head_factors, head_combinations,
+        head_weights, head_inverse, orbitalStorage().data() + orbitals_.orbitals.plane_stride,
         orbitalStorage().data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
     evaluateCusp();
     checkOpen(batch_);
-    checkRuntime(launchFinalSpatialCombination(stream, final_, combinations_.data(), trace_status,
+    checkRuntime(launchFinalSpatialCombination(stream, final_, head_combinations, trace_status,
         trace_gradient, trace_lap_log, cusp_jets_.data(), phase_.data(), output_.data(),
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
     if (mixed_dense_)
     {
-      mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
-      mixed_dense_->checkSpatialConditioning(matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(),
+      mixed_dense_->checkValueConditioning(head_factors, head_combinations, batch_, shape_.determinants);
+      if (!canonical_head_)
+        mixed_dense_->checkSpatialConditioning(matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(),
           batch_, shape_.determinants, ne_);
     }
+    if (canonical_head_) copyCanonicalPrimal();
     mixed_attempt.finish();
   }
 
@@ -2014,6 +2084,17 @@ public:
         supportsCooperativeRealValueLuEnvironment(environment);
   }
 
+  /// Freeze physical scalar VALUE to the same arithmetic as the canonical inverse producer.
+  void configureCanonicalScalarValue()
+  {
+    if (mode_ != SpatialJetMode::VALUE_ONLY || mixed_dense_ || evaluation_generation_ || forward_phase_bank_ ||
+        periodic_value_tiling_ || periodic_value_pairs_ || sparse_envelope_ || retained_targets_ || kinetic_trunk_only_)
+      throw std::invalid_argument("Canonical scalar VALUE must be frozen before ordinary unmixed preparation is used");
+    canonical_scalar_value_ = true;
+    excludeCooperativeValueLuForMixedRequest();
+    excludeCooperativeOpenFeaturesForMixedRequest();
+  }
+
   /// Permanently exclude cooperative VALUE LU and target factor reuse throughout mixed request/replay.
   void excludeCooperativeValueLuForMixedRequest()
   {
@@ -2087,7 +2168,7 @@ public:
                        environment.amplitude_scalar_domain == ScalarDomain::REAL) ||
         (environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
-    return ((periodic_value_geometry_requested_ && value_tape_.empty()) || retained_score_periodic_geometry_) &&
+    return !canonical_scalar_value_ && ((periodic_value_geometry_requested_ && value_tape_.empty()) || retained_score_periodic_geometry_) &&
         ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY && !retained_targets_ && !kinetic_trunk_only_ &&
         environment.fixed_nuclei &&
         environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
@@ -2205,6 +2286,9 @@ private:
     value_tape_mixed_parameters_.reset();
     result_valid_ = false;
     target_tape_valid_ = false;
+    canonical_retained_head_ = false;
+    canonical_head_ = nullptr;
+    evaluation_coordinates_ = {};
     if (parallel_traces_) parallel_traces_->invalidate();
   }
 
@@ -2443,6 +2527,13 @@ public:
     return batch_;
   }
 
+  /// Report the exact device source consumed by a completed retained tape; HOST submissions have no such identity.
+  const PackedDeviceCoordinatesView& evaluationCoordinates() const
+  {
+    (void)valueTapeBatchCount();
+    return evaluation_coordinates_;
+  }
+
   /// Completed primal identity, not the currently attached retry policy; null means FP64.
   const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& valueTapeMixedParameters() const
   {
@@ -2461,9 +2552,25 @@ public:
   ValueHeadTape valueHeadTape() const
   {
     (void)valueTapeBatchCount();
+    if (canonical_retained_head_)
+      throw std::logic_error("Canonical retained VALUE requires its explicit current FP64 head view");
     return {positions_.data(), retained_backflow_.data(), retained_envelope_.data(),
             matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(), combinations_.data()};
   }
+
+  /// Borrow the admitted canonical head together with this tape's own mixed orbital factors.
+  ValueHeadTape valueHeadTape(const RealCanonicalHeadView& head) const
+  {
+    const auto count = valueTapeBatchCount();
+    head.validate(model_, model_->version(), &queue_, count, ne_, shape_.determinants);
+    if (!evaluation_coordinates_.sameSourceRange(head.coordinates()))
+      throw std::invalid_argument("Canonical head and retained VALUE tape have different coordinate generations");
+    return {positions_.data(), retained_backflow_.data(), retained_envelope_.data(),
+        head.matrices(), head.inverses(), head.normalizedWeights(), head.factorizations(), head.combinations()};
+  }
+
+  /// Identify tapes that cannot safely expose unused ordinary determinant buffers.
+  bool requiresCanonicalHead() const noexcept { return canonical_retained_head_; }
 
   /// Download the common cusp without subtracting possibly nodal log amplitudes.
   void downloadValueCusp(std::vector<double>& destination) const
@@ -2478,6 +2585,8 @@ public:
   void downloadValueFactorizations(std::vector<device_determinant::FactorizationMetadata>& destination) const
   {
     const auto count = product(valueTapeBatchCount(), shape_.determinants);
+    if (canonical_retained_head_)
+      throw std::logic_error("Canonical retained VALUE has no ordinary factorization metadata");
     if (destination.size() < count)
       throw std::invalid_argument("Factorization metadata destination is too small");
     factors_.download(destination.data(), count);
@@ -2615,6 +2724,28 @@ private:
         adapter->finishEvaluation();
     }
   };
+
+  /// Preserve exact canonical scalar output and target-base metadata without copying head matrices.
+  void copyCanonicalPrimal()
+  {
+    const auto transfer = [&](auto* destination, const auto* source, std::size_t count) {
+      const auto bytes = checkedDeviceBytes<std::remove_cv_t<std::remove_pointer_t<decltype(destination)>>>(count);
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice, queue_.getNative()),
+          "canonical primal scalar D2D copy");
+#else
+      checkRuntime(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, queue_.getNative()),
+          "canonical primal scalar D2D copy");
+#endif
+      deviceMemoryMetrics(phase_.deviceOrdinal()).copied(bytes);
+    };
+    transfer(phase_.data(), canonical_head_->phases(), batch_);
+    for (std::size_t c = 0; c < batch_; ++c)
+      transfer(output_.data() + final_.output.uncheckedValueOffset(c, 0),
+          canonical_head_->logValues() + c * canonical_head_->logStride(), 1);
+    if (target_preparation_.max_targets)
+      transfer(combinations_.data(), canonical_head_->combinations(), batch_);
+  }
 
   /// Restrict all launches to a compact live prefix without resizing any buffers.
   void setBatchCount(std::size_t count)
@@ -2943,6 +3074,10 @@ private:
   AcceleratorBlasHandle& blas_;
   const SpatialJetMode mode_;
   const TargetVglPreparation target_preparation_;
+  PackedDeviceCoordinatesView evaluation_coordinates_;
+  bool canonical_scalar_value_ = false;
+  bool canonical_retained_head_ = false;
+  const RealCanonicalHeadView* canonical_head_ = nullptr;
   const bool retained_targets_;
   const bool real_trunk_only_;
   const bool forward_phase_bank_requested_;
@@ -3037,6 +3172,243 @@ private:
 
 /** Explicit matched approximate value/VGL with whole-request FP64 replay.
  * Spatial planes follow the standard mixed-AD convention; reverse tapes remain unavailable. */
+/** Exact resident VALUE/inverse owner inventory, excluding immutable model/vendor bytes. */
+struct CanonicalRealHeadCost
+{
+  std::size_t device_bytes = 0, host_bytes = 0;
+};
+
+/// Count the existing retained VALUE root plus its separately owned packed-coordinate source.
+inline CanonicalRealHeadCost estimateCanonicalRealHeadCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  if (!batch || plan.environment().periodic_profile ||
+      plan.environment().head_representation != HeadRepresentation::REAL ||
+      plan.environment().amplitude_scalar_domain != ScalarDomain::REAL)
+    throw std::invalid_argument("Canonical REAL head requires a finite ordinary REAL population");
+  const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Canonical REAL head byte overflow"); };
+  const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Canonical REAL head extent overflow"); };
+  const auto& shape = plan.modelShape();
+  const auto n = shape.electrons(), nf = mul(mul(batch, n), shape.feature_dimension);
+  const auto attention = mul(mul(mul(batch, shape.attention_heads), n), n);
+  const auto matrices = mul(mul(mul(batch, shape.determinants), n), n);
+  const auto factors = mul(batch, shape.determinants);
+  const auto features = plan.environment().boundary == BoundaryCondition::PERIODIC
+      ? makePeriodicFeatureJetLayout(batch, n, shape.nuclei, shape.spin_up_electrons, SpatialJetMode::VALUE_ONLY)
+      : makeOpenFeatureJetLayout(batch, n, shape.nuclei, shape.spin_up_electrons, SpatialJetMode::VALUE_ONLY);
+  const auto final = makeFinalSpatialJetLayout(batch, n, SpatialJetMode::VALUE_ONLY).output;
+  const auto cusp = makeOpenCuspJetLayout(batch, n, shape.spin_up_electrons, SpatialJetMode::VALUE_ONLY).output;
+  std::size_t doubles = 0;
+  for (auto count : {mul(3, mul(batch, n)), spatialJetSpanElements(features.output), mul(8, nf), attention,
+      mul(6, matrices), mul(factors, n), mul(4, factors), spatialJetSpanElements(cusp), batch,
+      spatialJetSpanElements(final), mul(batch, final.laplacian_lanes),
+      mul(shape.attention_blocks, add(mul(8, nf), attention)), mul(3, mul(batch, n))})
+    doubles = add(doubles, count);
+  CanonicalRealHeadCost cost{checkedDeviceBytes<double>(doubles), 0};
+  const auto status = std::max(nf, matrices), jets = mul(mul(batch, shape.attention_heads), n);
+  for (auto bytes : {checkedDeviceBytes<std::size_t>(add(batch, mul(factors, n))),
+      checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors),
+      checkedDeviceBytes<device_determinant::CombinationMetadata>(batch), checkedDeviceBytes<OpenSpatialStatus>(status),
+      checkedDeviceBytes<device_math::JetMathStatus>(jets), checkedDeviceBytes<InferenceStatusWord>(1)})
+    cost.device_bytes = add(cost.device_bytes, bytes);
+  for (auto bytes : {checkedDeviceBytes<OpenSpatialStatus>(status), checkedDeviceBytes<device_math::JetMathStatus>(jets),
+      checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors),
+      checkedDeviceBytes<device_determinant::CombinationMetadata>(batch)})
+    cost.host_bytes = add(cost.host_bytes, bytes);
+  return cost;
+}
+
+/** Produce current FP64 primal coefficients using one resident VALUE graph, never a shadow FULL root. */
+class PreparedDeviceCanonicalRealHead
+{
+public:
+  using Cost = CanonicalRealHeadCost;
+
+  /// Expose pure checked admission to native owners before any allocation or RNG work.
+  static Cost required(const PsiFormerExecutionPlan& plan, std::size_t capacity)
+  { return estimateCanonicalRealHeadCost(plan, capacity); }
+
+  /// Check the complete coordinate/graph/guard inventory before constructing numeric owners.
+  static std::unique_ptr<PreparedDeviceCanonicalRealHead> prepare(std::shared_ptr<const PreparedDeviceModel> image,
+      std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget)
+  {
+    if (!image) throw std::invalid_argument("Canonical REAL head image is absent");
+    const auto cost = required(image->plan(), capacity);
+    if (!budget || budget == std::numeric_limits<std::size_t>::max() || cost.device_bytes > budget)
+      throw std::length_error("Canonical REAL head exceeds its explicit resident owner admission");
+    return std::unique_ptr<PreparedDeviceCanonicalRealHead>(
+        new PreparedDeviceCanonicalRealHead(std::move(image), capacity, queue, blas, cost));
+  }
+
+  /// Revoke publication while stale borrows retain numeric storage until their own retirement.
+  ~PreparedDeviceCanonicalRealHead()
+  {
+    state_->ready = false;
+    state_->alive = false;
+  }
+
+  /// Upload one current population once; every consumer receives the producer's exact device R.
+  RealCanonicalHeadView evaluate(const std::vector<double>& positions)
+  {
+    invalidate();
+    storage_->coordinates->upload(positions);
+    return evaluateCurrent(storage_->coordinates->view(0, positions.size() / (3 * state_->electrons)));
+  }
+
+  /// Import one admitted device population without any HOST coordinate readback.
+  RealCanonicalHeadView evaluateDeviceCoordinates(const PackedDeviceCoordinatesView& positions)
+  {
+    invalidate();
+    storage_->coordinates->copyFrom(positions, queue_);
+    return evaluateCurrent(storage_->coordinates->view(0, positions.batchCount()));
+  }
+
+  /// Return only the most recently completed canonical head and its exact coordinate generation.
+  RealCanonicalHeadView view() const
+  {
+    RealCanonicalHeadView result;
+    result.identity_ = CanonicalHeadIdentity(state_);
+    result.matrices_ = storage_->graph->matrices_.data(); result.inverse_ = storage_->graph->inverse_.data();
+    result.weights_ = storage_->graph->normalized_.data(); result.factors_ = storage_->graph->factors_.data();
+    result.combinations_ = storage_->graph->combinations_.data(); result.phase_ = storage_->graph->phase_.data();
+    result.log_ = storage_->graph->output_.data(); result.log_stride_ = storage_->graph->final_.output.configuration_stride;
+    result.validate(state_->image, state_->model_version, &queue_, state_->count, state_->electrons, state_->determinants);
+    return result;
+  }
+
+  /// Consume canonical physical scalar VALUE into caller-owned cold staging, without a matrix export.
+  void downloadValue(double* phase, double* log, std::size_t count) const
+  {
+    const auto current = view();
+    if (!phase || !log || count != state_->count)
+      throw std::invalid_argument("Canonical REAL scalar destination has the wrong live extent");
+    storage_->graph->phase_.downloadOnStream(phase, count, queue_.getNative());
+    for (std::size_t c = 0; c < count; ++c)
+      storage_->graph->output_.downloadOnStream(log + c, 1, queue_.getNative(),
+          storage_->graph->final_.output.uncheckedValueOffset(c, 0));
+  }
+
+  /// Validate every fixed-shape successor before a native transaction adopts any owner.
+  void validateModelRebind(const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
+    if (state_.use_count() != 1)
+      throw std::logic_error("Canonical REAL head cannot rebind while an issued borrow remains live");
+    if (state_->generation == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Canonical REAL head generation exhausted");
+    storage_->graph->validateModelRebind(successor);
+  }
+
+  /// Caller has prevalidated all owners and retains the old immutable image through adoption.
+  void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& successor) noexcept
+  {
+    state_->ready = false; ++state_->generation;
+    storage_->graph->adoptPreparedModel(successor);
+    state_->image = successor; state_->model_version = successor->version(); state_->count = 0;
+  }
+
+  /// Preserve the ordinary single-owner convenience operation with the same preflight.
+  void rebindModel(const std::shared_ptr<const PreparedDeviceModel>& successor)
+  { validateModelRebind(successor); adoptPreparedModel(successor); }
+
+  /// Report actual numeric inventory, excluding shared model and opaque vendor storage.
+  std::size_t deviceWorkspaceBytes() const
+  { return storage_->graph->deviceWorkspaceBytes() + storage_->coordinates->deviceWorkspaceBytes(); }
+
+  /// Report tracked numeric HOST arrays separately from aggregate RSS.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return storage_->graph->hostWorkspaceBytes() + checkedDeviceBytes<device_determinant::FactorizationMetadata>(
+        storage_->factors.capacity()) + checkedDeviceBytes<device_determinant::CombinationMetadata>(storage_->sums.capacity());
+  }
+
+  /// Retain the exact current immutable model identity for cache/publication preflights.
+  const std::shared_ptr<const PreparedDeviceModel>& modelImage() const noexcept { return state_->image; }
+
+  /// Report frozen capacity without extending the live population.
+  std::size_t capacity() const noexcept { return capacity_; }
+
+private:
+  /// Keep all numeric allocations in one cold owner retained by issued identity borrows.
+  struct Storage
+  {
+    std::unique_ptr<PreparedDeviceInference> graph;
+    std::unique_ptr<PreparedDeviceCoordinates> coordinates;
+    std::vector<device_determinant::FactorizationMetadata> factors;
+    std::vector<device_determinant::CombinationMetadata> sums;
+  };
+
+  /// Construct the exact admitted inventory with no reverse/JVP or per-request numeric allocation.
+  PreparedDeviceCanonicalRealHead(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, Cost cost)
+      : queue_(queue), capacity_(capacity), storage_(std::make_shared<Storage>()),
+        state_(std::shared_ptr<CanonicalHeadState>(new CanonicalHeadState))
+  {
+    const auto& shape = image->plan().modelShape();
+    storage_->coordinates = image->prepareCoordinates(capacity, checkedDeviceBytes<double>(3 * shape.electrons() * capacity));
+    storage_->graph = std::make_unique<PreparedDeviceInference>(image, capacity, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+    storage_->graph->configureCanonicalScalarValue();
+    storage_->factors.resize(capacity * shape.determinants); storage_->sums.resize(capacity);
+    state_->image = std::move(image); state_->storage = storage_; state_->queue = &queue;
+    state_->model_version = state_->image->version(); state_->electrons = shape.electrons();
+    state_->determinants = shape.determinants;
+    const auto actual_device = deviceWorkspaceBytes(), actual_host = hostWorkspaceBytes();
+    if (actual_device != cost.device_bytes || actual_host != cost.host_bytes)
+    {
+      std::ostringstream reason;
+      reason << "Canonical REAL head inventory differs: DEVICE=" << actual_device << '/' << cost.device_bytes
+             << " HOST=" << actual_host << '/' << cost.host_bytes;
+      throw std::logic_error(reason.str());
+    }
+  }
+
+  /// Revoke the prior head before every coordinate replacement, including failed attempts.
+  void invalidate()
+  {
+    state_->ready = false; state_->count = 0;
+    if (state_->generation == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Canonical REAL head generation exhausted");
+    ++state_->generation;
+  }
+
+  /// Admit used canonical factors with the unchanged minimum-pivot/cancellation safeguards.
+  RealCanonicalHeadView evaluateCurrent(const PackedDeviceCoordinatesView& coordinates)
+  {
+    storage_->graph->evaluateDeviceCoordinates(coordinates);
+    const auto count = coordinates.batchCount(), determinants = state_->determinants;
+    storage_->graph->factors_.download(storage_->factors.data(), count * determinants);
+    storage_->graph->combinations_.download(storage_->sums.data(), count);
+    std::size_t bad_pivots = 0, bad_sums = 0;
+    for (std::size_t i = 0; i < count * determinants; ++i)
+    {
+      const auto& factor = storage_->factors[i];
+      if (factor.status != device_determinant::FactorizationStatus::REGULAR || !factor.inverse_available ||
+          !device_math::isFiniteBinary64(factor.minimum_scaled_pivot) || factor.minimum_scaled_pivot < 1.0e-3)
+        ++bad_pivots;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      const auto& sum = storage_->sums[i];
+      if (sum.status != device_determinant::CombinationStatus::REGULAR || sum.severe_cancellation ||
+          !device_math::isFiniteBinary64(sum.sum_abs_scaled) || !device_math::isFiniteBinary64(sum.abs_sum_scaled) ||
+          sum.abs_sum_scaled < 1.0e-3 * sum.sum_abs_scaled)
+        ++bad_sums;
+    }
+    if (bad_pivots || bad_sums)
+    {
+      std::ostringstream reason;
+      reason << "Canonical FP64 head requires a complete physical FP64 retry; small_determinant_pivot="
+             << bad_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
+      throw MixedPrecisionRetryRequired(reason.str().c_str());
+    }
+    state_->coordinates = coordinates; state_->count = count; state_->ready = true;
+    return view();
+  }
+
+  compute::Queue<PlatformKind::CUDA>& queue_;
+  const std::size_t capacity_;
+  std::shared_ptr<Storage> storage_;
+  std::shared_ptr<CanonicalHeadState> state_;
+};
+
 class PreparedDeviceMixedInference
 {
   friend struct MixedPeriodicGeometryValidationAccess;

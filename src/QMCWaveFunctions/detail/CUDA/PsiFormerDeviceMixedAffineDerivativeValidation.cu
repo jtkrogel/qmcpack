@@ -8,6 +8,8 @@
 #define PSIFORMER_LIBRARY
 #include "PsiFormerDeviceMixedAffineDerivativeValidation.h"
 #include "PsiFormerDeviceMixedTargetValidation.h"
+#include "PsiFormerDeviceCanonicalHeadValidation.h"
+#include "PsiFormerDeviceComplexCanonicalHeadValidation.h"
 
 /// Execute the generated oracle only when an actual GPU is visible.
 int main()
@@ -29,6 +31,8 @@ int main()
               << " visible_devices=" << devices << '\n';
     validateMixedSpatialConditioningScreen();
     validateMixedTargetStreaming();
+    validateRealCanonicalHeads();
+    validateComplexCanonicalHeads();
     validateMixedAffineDerivatives();
     return 0;
   }

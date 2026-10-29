@@ -367,6 +367,10 @@ inline void realNativeBinding(const std::shared_ptr<const PreparedDeviceModel>& 
   const auto n = plan.modelShape().electrons();
   DeviceExecutionPreparation preparation{};
   preparation.vgl = realPreparation(plan, 1, 1);
+  preparation.vgl.scalar_work_budget = spatial_detail::checkedAdd(preparation.vgl.scalar_work_budget,
+      canonicalHeadScalarWork(plan, 1), "Native canonical target work overflow");
+  preparation.vgl.device_workspace_budget_bytes = std::size_t(2) * 1024 * 1024 * 1024;
+  preparation.vgl.device_workspace_budget_bytes = PreparedDeviceCrowdHooks::mixedTargetDeviceBytes(plan, 1, preparation.vgl);
   PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, preparation, false);
   auto workspace = backend.prepare(1);
   const auto copy = [&](const pf::DirectBatchTileResultView& view, std::size_t version) {

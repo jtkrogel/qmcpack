@@ -74,6 +74,13 @@ public:
     return reverseSeeded(forward, weights, nullptr, nullptr, nullptr);
   }
 
+  /// Reverse a retained tape using the same-request FP64 determinant linearization and ordinary physical cusp.
+  const double* reverseCanonicalHead(const PreparedDeviceInference& forward, const RealCanonicalHeadView& head,
+      const std::vector<double>& weights)
+  {
+    return reverseSeeded(forward, weights, nullptr, nullptr, nullptr, nullptr, &head);
+  }
+
   /// Curvature observes one unweighted real/open sample before scratch reuse.
   const double* observeAffine(const PreparedDeviceInference& forward, DeviceAffineObservationSink& affine)
   {
@@ -84,6 +91,19 @@ public:
     unit_weights_.resize(1);
     unit_weights_[0] = 1.0;
     return reverseSeeded(forward, unit_weights_, nullptr, nullptr, nullptr, &affine);
+  }
+
+  /// Feed KFAC affine observations from the same canonical-head score seeds as the gradient.
+  const double* observeAffineCanonicalHead(const PreparedDeviceInference& forward, const RealCanonicalHeadView& head,
+      DeviceAffineObservationSink& affine)
+  {
+    ready_ = false;
+    if (forward.valueTapeBatchCount() != 1 || model_->plan().environment().periodic_profile ||
+        model_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL)
+      throw std::invalid_argument("Canonical-head affine observations require one ordinary REAL sample");
+    unit_weights_.resize(1);
+    unit_weights_[0] = 1.0;
+    return reverseSeeded(forward, unit_weights_, nullptr, nullptr, nullptr, &affine, &head);
   }
 
   /// Reverse independent determinant log amplitudes, rather than log of their sum.
@@ -134,7 +154,8 @@ private:
   /// Share the head/trunk reverse while preserving each objective's seed rules.
   const double* reverseSeeded(const PreparedDeviceInference& forward, const std::vector<double>& weights,
       const std::vector<double>* channels, const std::vector<double>* raw_seeds,
-      const std::vector<double>* cusp_weights, DeviceAffineObservationSink* affine = nullptr)
+      const std::vector<double>* cusp_weights, DeviceAffineObservationSink* affine = nullptr,
+      const RealCanonicalHeadView* canonical_head = nullptr)
   {
     ready_ = false;
     model_->validateCurrentDevice();
@@ -147,16 +168,22 @@ private:
       if (!device_math::isFiniteBinary64(weight))
         throw std::invalid_argument("Score reverse weight is nonfinite");
 
+    if (canonical_head)
+    {
+      canonical_head->validate(model_, model_->version(), &queue_, count, ne, determinants);
+      if (!forward.evaluationCoordinates().sameSourceRange(canonical_head->coordinates()))
+        throw std::invalid_argument("Canonical score head and retained tape consumed different coordinate intervals");
+    }
     // Inverse seeds cannot represent singular-channel cofactor derivatives even
     // when the determinant sum is nonzero. Reject rather than silently drop them.
-    if (!raw_seeds)
+    if (!raw_seeds && !canonical_head)
     {
       forward.downloadValueFactorizations(host_factors_);
       for (std::size_t channel = 0; channel < count * determinants; ++channel)
         if ((!channels || (*channels)[channel] != 0.0) && !host_factors_[channel].inverse_available)
           throw std::runtime_error("GPU score requires regular selected determinant channels; cofactor fallback unavailable");
     }
-    const auto head = forward.valueHeadTape();
+    const auto head = canonical_head ? forward.valueHeadTape(*canonical_head) : forward.valueHeadTape();
     const auto stream = queue_.getNative();
     const OrbitalProductReverseLayout orbital{count, determinants, ne, ne, ne * ne, determinants * ne * ne};
     if (raw_seeds)
@@ -165,12 +192,15 @@ private:
     {
       channel_weights_.upload(channels->data(), channels->size());
       checkRuntime(launchIndependentChannelSeeds(stream, orbital, channel_weights_.data(),
-          head.inverses, seeds_.data()), "independent determinant seeds");
+          canonical_head ? canonical_head->inverses() : head.inverses, seeds_.data()), "independent determinant seeds");
     }
     else
     {
-      checkRuntime(launchDeterminantMatrixReverseSeeds(stream, head.factorizations, head.combinations,
-          head.normalized_weights, head.inverses, count, determinants, ne, seeds_.data(), status_.data()),
+      checkRuntime(launchDeterminantMatrixReverseSeeds(stream,
+          canonical_head ? canonical_head->factorizations() : head.factorizations,
+          canonical_head ? canonical_head->combinations() : head.combinations,
+          canonical_head ? canonical_head->normalizedWeights() : head.normalized_weights,
+          canonical_head ? canonical_head->inverses() : head.inverses, count, determinants, ne, seeds_.data(), status_.data()),
           "score determinant seeds");
       queue_.sync();
       status_.download(host_status_.data(), count);

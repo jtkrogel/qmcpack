@@ -4,7 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_H
-#include "PsiFormerDeviceComplexValue.h"
+#include "PsiFormerDeviceComplexCanonicalHead.h"
 #include "PsiFormerDeviceComplexSpatialKernels.h"
 #include "PsiFormerDeviceComplexSpatialConcurrent.h"
 #include <cstdlib>
@@ -239,13 +239,28 @@ public:
   void evaluate(const std::vector<double>& positions)
   { evaluateCoordinates(positions, nullptr); }
 
+  /// Consume only the producer-owned R and its complete same-image canonical head.
+  void evaluateCanonicalHead(const ComplexCanonicalHeadView& head, double* minimum_scaled_pivots)
+  {
+    invalidate();
+    auto& t = *trunk_;
+    head.validate(t.model_, t.model_->version(), &t.queue_, head.identity().batchCount(), t.ne_, t.shape_.determinants);
+    if (!t.mixed_dense_ || factor_reuse_ || cold_cooperative_lu_ || inverse_columns_ || projection_banks_[0])
+      throw std::invalid_argument("Canonical paired spatial head requires the ordinary mixed derivative graph");
+    canonical_head_ = &head;
+    try { evaluateCoordinates({}, minimum_scaled_pivots, true); }
+    catch (...) { canonical_head_ = nullptr; throw; }
+    canonical_head_ = nullptr;
+  }
+
 private:
   friend class PreparedDeviceMixedComplexSpatial;
 
   /// Ordinary mixed composition supplies only private pivots; default FULL is unchanged.
-  void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots)
+  void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots,
+      bool already_invalidated = false)
   {
-    invalidate();
+    if (!already_invalidated) invalidate();
     if (minimum_scaled_pivots && !trunk_->mixed_dense_)
       throw std::logic_error("Mixed FULL diagnostic pivots require an attached typed adapter");
     if (canonical_)
@@ -258,11 +273,16 @@ private:
       return;
     }
     auto& t = *trunk_;
-    t.beginCoordinateEvaluation();
-    if (positions.empty() || positions.size() % (3 * t.ne_) || positions.size() > t.positions_.capacity())
-      throw std::invalid_argument("Complex FULL packed coordinates exceed capacity");
-    t.setBatchCount(positions.size() / (3 * t.ne_));
-    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    if (canonical_head_)
+      t.stageDeviceCoordinates(canonical_head_->coordinates());
+    else
+    {
+      t.beginCoordinateEvaluation();
+      if (positions.empty() || positions.size() % (3 * t.ne_) || positions.size() > t.positions_.capacity())
+        throw std::invalid_argument("Complex FULL packed coordinates exceed capacity");
+      t.setBatchCount(positions.size() / (3 * t.ne_));
+      t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    }
     t.resetStatusAdmission();
     PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
     try
@@ -279,19 +299,19 @@ private:
     t.checkOpen(t.batch_);
 
     finishHead(minimum_scaled_pivots);
-    if (minimum_scaled_pivots)
+    if (minimum_scaled_pivots && !canonical_head_)
     {
       checkMixedSpatialConditioning(minimum_scaled_pivots);
     }
     if (concurrent_targets_)
       checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
-          t.ne_, t.ne_, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),
+          t.ne_, t.ne_, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(), traceInverse(), head_.data(),
           t.cusp_jets_.data(), product_.data(), channel_terms_.data(), outputs_.data(),
           outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()),
           "concurrent complex FULL traces");
     else
       checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.batch_, t.shape_.determinants, t.ne_, channels_.data(),
-          amplitude_.data(), inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data(),
+          amplitude_.data(), traceInverse(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data(),
           outputs_.data() + 3 * capacity_electrons_, outputs_.data() + 4 * capacity_electrons_, status_.data()), "complex FULL traces");
     admitStatus(ComplexValueFailureStage::COMBINATION);
     mixed_attempt.finish();
@@ -350,6 +370,9 @@ public:
 private:
   friend struct ComplexSpatialTargetValidationAccess;
 
+  const cuDoubleComplex* traceInverse() const noexcept
+  { return canonical_head_ ? canonical_head_->inverses() : inverse_.data(); }
+
   /// Screen the completed selected head using the same resident FULL sensitivity leaves.
   void checkMixedSpatialConditioning(double* minimum_scaled_pivots)
   {
@@ -382,7 +405,7 @@ private:
     t.evaluateCusp();
     t.checkOpen(t.batch_);
     finishHead(minimum_scaled_pivots, reuse_previous && !t.mixed_dense_, test_decisions);
-    if (minimum_scaled_pivots)
+    if (minimum_scaled_pivots && !canonical_head_)
       checkMixedSpatialConditioning(minimum_scaled_pivots);
   }
 
@@ -393,7 +416,7 @@ private:
     if (concurrent_targets_)
       checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
           t.ne_, t.orbitals_.orbitals.laplacian_lanes, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(),
-          inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), channel_terms_.data(),
+          traceInverse(), head_.data(), t.cusp_jets_.data(), product_.data(), channel_terms_.data(),
           outputs_.data() + 3 * begin, outputs_.data() + 3 * capacity_electrons_ + begin,
           outputs_.data() + 4 * capacity_electrons_ + begin, status_.data()), "concurrent complex target traces");
     else
@@ -408,12 +431,17 @@ private:
   void evaluateTargets(const std::vector<double>& positions, double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
-    t.beginCoordinateEvaluation();
-    const auto stride = 3 * t.ne_;
-    if (positions.empty() || positions.size() % stride || positions.size() > t.positions_.capacity())
-      throw std::invalid_argument("Complex target VGL requires complete configurations within capacity");
-    t.setBatchCount(positions.size() / stride);
-    t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    if (canonical_head_)
+      t.stageDeviceCoordinates(canonical_head_->coordinates());
+    else
+    {
+      t.beginCoordinateEvaluation();
+      const auto stride = 3 * t.ne_;
+      if (positions.empty() || positions.size() % stride || positions.size() > t.positions_.capacity())
+        throw std::invalid_argument("Complex target VGL requires complete configurations within capacity");
+      t.setBatchCount(positions.size() / stride);
+      t.positions_.uploadOnStream(positions.data(), positions.size(), t.queue_.getNative());
+    }
     bool reuse_previous = false;
     for (std::size_t begin = 0; begin < t.ne_;)
     {
@@ -481,6 +509,24 @@ private:
       checkRuntime(launchComplexSpatialHead(t.queue_.getNative(), t.orbitals_, envelope_.data(), projections_.data(),
           projections_.data() + cost_.head_elements, head_.data(), status_.data()), "complex FULL product-rule head");
     admitStatus(ComplexValueFailureStage::PACKED_HEAD);
+
+    if (canonical_head_)
+    {
+      // Mixed derivative jets survive; only the used head comes from full-FP64 VALUE.
+      canonical_head_->validate(t.model_, t.model_->version(), &t.queue_, t.batch_, t.ne_, t.shape_.determinants);
+      const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
+#ifdef QMC_CUDA2HIP
+        checkRuntime(hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice, t.queue_.getNative()),
+            "canonical paired spatial coefficient copy");
+#else
+        checkRuntime(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, t.queue_.getNative()),
+            "canonical paired spatial coefficient copy");
+#endif
+      };
+      copy(channels_.data(), canonical_head_->channels(), checkedDeviceBytes<ComplexValueChannel>(t.batch_ * t.shape_.determinants));
+      copy(amplitude_.data(), canonical_head_->amplitudes(), checkedDeviceBytes<ComplexValueResult>(t.batch_));
+      return;
+    }
 
     // Only the contiguous VALUE plane becomes LU; all derivative planes survive.
     if (minimum_scaled_pivots)
@@ -614,6 +660,7 @@ private:
   DeviceBuffer<std::uint64_t> status_;
   std::unique_ptr<ComplexValueResult[]> canonical_;
   std::vector<ComplexValueResult> target_current_;
+  const ComplexCanonicalHeadView* canonical_head_ = nullptr;
   std::size_t generation_ = 0;
   bool valid_ = false;
   bool inverse_columns_reported_ = false;

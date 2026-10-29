@@ -152,6 +152,20 @@ inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& p
   return cost;
 }
 
+/// Full-FP64 paired VALUE with inverse ownership, without a retained reverse tape.
+inline ComplexValueCost estimateComplexCanonicalValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  auto cost = estimateComplexValueCost(plan, batch, false);
+  const auto solve = spatial_detail::checkedProduct(batch, spatial_detail::checkedProduct(
+      plan.modelShape().determinants, plan.modelShape().electrons(), "Canonical paired solve overflow"),
+      "Canonical paired solve overflow");
+  const auto extra = spatial_detail::checkedAdd(checkedDeviceBytes<cuDoubleComplex>(cost.matrices),
+      spatial_detail::checkedAdd(checkedDeviceBytes<cuDoubleComplex>(solve), checkedDeviceBytes<std::size_t>(solve),
+          "Canonical paired inverse bytes overflow"), "Canonical paired inverse bytes overflow");
+  cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, extra, "Canonical paired VALUE bytes overflow");
+  return cost;
+}
+
 /** Complete numerical-only complex VALUE over ONE real trunk and canonical image.
  * Caller queue/BLAS and its exclusive execution lease outlive this noncopyable
  * owner. No public GPU XML/score/VGL/inner-G/outer-twist capability is implied.
@@ -259,6 +273,7 @@ public:
   }
 
 private:
+  friend class PreparedDeviceCanonicalComplexHead;
   friend class PreparedDeviceMixedComplexValue;
   friend struct PeriodicValueTilingValidationAccess;
   /// The private mixed composition supplies a separately admitted pivot bank.
@@ -515,21 +530,66 @@ private:
     admitStatus(ComplexValueFailureStage::PACKED_HEAD);
   }
 
+  /// Retain mixed neural primals but use only a validated canonical head for log-score seeds.
+  void evaluateRetainedCanonicalCoordinates(const PackedDeviceCoordinatesView& positions,
+      const cuDoubleComplex* inverse, const ComplexValueChannel* channels, const ComplexValueResult* amplitudes)
+  {
+    invalidate();
+    auto& t = *trunk_;
+    if (!t.mixed_retained_attachment_ || t.value_tape_.empty() || !inverse || !channels || !amplitudes)
+      throw std::logic_error("Canonical paired score requires a retained mixed primal and complete head");
+    t.stageDeviceCoordinates(positions);
+    PreparedDeviceInference::MixedValueAttempt attempt(t.mixed_dense_.get(), t.model_);
+    evaluateHeadOwnedCoordinates(true);
+    const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice, t.queue_.getNative()),
+          "canonical paired score coefficient copy");
+#else
+      checkRuntime(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, t.queue_.getNative()),
+          "canonical paired score coefficient copy");
+#endif
+    };
+    copy(inverse_.data(), inverse, checkedDeviceBytes<cuDoubleComplex>(t.batch_ * t.matrices_per_configuration_));
+    copy(channels_.data(), channels, checkedDeviceBytes<ComplexValueChannel>(t.batch_ * t.shape_.determinants));
+    copy(results_.data(), amplitudes, checkedDeviceBytes<ComplexValueResult>(t.batch_));
+    attempt.finish();
+    t.value_tape_valid_ = true;
+    valid_ = true;
+  }
+
+  /// Stage the producer's exact device snapshot before the paired head is evaluated.
+  void evaluateCanonicalDeviceCoordinates(const PackedDeviceCoordinatesView& positions, double* minima,
+      bool scalar_only = false)
+  {
+    invalidate();
+    trunk_->stageDeviceCoordinates(positions);
+    evaluateOwnedCoordinates(false, scalar_only ? nullptr : minima, scalar_only);
+  }
+
   /// All coordinate loading paths share exactly the same trunk, head and determinant algebra.
-  void evaluateOwnedCoordinates(bool virtual_envelope = false, double* minimum_scaled_pivots = nullptr)
+  void evaluateOwnedCoordinates(bool virtual_envelope = false, double* minimum_scaled_pivots = nullptr,
+      bool canonical_scalar_only = false)
   {
     auto& t = *trunk_;
     const bool retained_diagnostics = t.mixed_retained_attachment_ &&
         t.mode_ == SpatialJetMode::VALUE_ONLY && !t.value_tape_.empty() &&
         inverse_.capacity() && permutation_.capacity() && solve_.capacity();
-    if ((minimum_scaled_pivots && inverse_.capacity() && !retained_diagnostics) ||
+    if ((minimum_scaled_pivots && inverse_.capacity() && !retained_diagnostics && !canonical_inverse_) ||
         (t.mixed_dense_ && (!minimum_scaled_pivots || virtual_envelope)))
       throw std::logic_error("Mixed paired VALUE requires ordinary inverse-null or explicit retained conditioning storage");
     PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
     evaluateHeadOwnedCoordinates(true, virtual_envelope);
 
     // The private head epoch ends here: matrix storage now becomes LU IN PLACE.
-    if (minimum_scaled_pivots && retained_diagnostics)
+    if (canonical_scalar_only)
+    {
+      if (!canonical_inverse_ || t.mixed_dense_)
+        throw std::logic_error("Canonical scalar factorization requires its prepared full-FP64 physical owner");
+      checkRuntime(launchComplexCanonicalScalarFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, matrix_.data(), channels_.data(), status_.data()), "canonical scalar VALUE factorization");
+    }
+    else if (minimum_scaled_pivots && (retained_diagnostics || canonical_inverse_))
       checkRuntime(launchComplexSpatialFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
           t.ne_, matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data(),
           minimum_scaled_pivots), "complex retained VALUE inverse diagnostics");
@@ -670,8 +730,9 @@ private:
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost,
       bool retain_score = false, bool retain_inverse = true, bool score_inverse_columns = false,
-      bool score_periodic_geometry = false, bool score_cooperative_lu = false, bool score_pair_check = false)
-      : cost_(cost), score_inverse_columns_(score_inverse_columns), score_cooperative_lu_(score_cooperative_lu),
+      bool score_periodic_geometry = false, bool score_cooperative_lu = false, bool score_pair_check = false,
+      bool canonical_inverse = false)
+      : cost_(cost), canonical_inverse_(canonical_inverse), score_inverse_columns_(score_inverse_columns), score_cooperative_lu_(score_cooperative_lu),
         score_pair_check_(score_pair_check),
         trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
           SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true,
@@ -682,8 +743,8 @@ private:
         channels_(capacity * trunk_->shape_.determinants, "ComplexValue::channels_", __FILE__, __LINE__),
         results_(capacity, "ComplexValue::results_", __FILE__, __LINE__),
         status_(1, "ComplexValue::status_", __FILE__, __LINE__),
-        inverse_(retain_score && retain_inverse ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
-        solve_(retain_score && retain_inverse ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
+        inverse_((retain_score || canonical_inverse) && retain_inverse ? cost.matrices : 0, "ComplexValue::inverse_", __FILE__, __LINE__),
+        solve_((retain_score || canonical_inverse) && retain_inverse ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
         permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__),
         pair_events_(cost.pair_event_bytes / sizeof(std::uint64_t), "ComplexValue::pair_events_", __FILE__, __LINE__),
         envelope_base_(cost.envelope_anchor_bytes ? 3 * trunk_->ne_ : 0),
@@ -761,6 +822,7 @@ private:
   }
 
   const ComplexValueCost cost_;
+  const bool canonical_inverse_;
   // Immutable selectors only; inverse/permutation/solve remain the existing retained banks.
   const bool score_inverse_columns_;
   const bool score_cooperative_lu_;

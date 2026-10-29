@@ -57,9 +57,11 @@ public:
     const auto input = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
     const auto casts = add(checkedDeviceBytes<float>(mul(rows, add(std::max(input, width), width))),
         sizeof(PsiFormerDeviceNumericalDiagnostics));
-    const auto bytes = add(cost.device_workspace_bytes, casts);
+    const auto bytes = add(add(cost.device_workspace_bytes, casts),
+        PreparedDeviceCanonicalRealHead::required(plan, capacity).device_bytes);
     if (bytes > preparation.device_workspace_budget_bytes ||
-        mixedTargetRequestScalarWork(cost.charged_scalar_work_units) > preparation.scalar_work_budget)
+        add(mixedTargetRequestScalarWork(cost.charged_scalar_work_units), canonicalHeadScalarWork(plan, capacity)) >
+            preparation.scalar_work_budget)
       throw std::length_error("Mixed real target graph and private casts exceed byte/work caps");
     return bytes;
   }
@@ -110,13 +112,15 @@ public:
     if (mixed_dense_ && (!mixed_parameters || mixed_parameters->modelImage().get() != image.get()))
       throw std::logic_error("Numerical crowd successor has no matching mixed parameter image");
     // Preflight both shared-cache leaves before either graph revokes its current products.
+    if (canonical_head_) canonical_head_->validateModelRebind(image);
     if (values_)
-      values_->validateModelRebindWithMixedParameters(image, mixed_parameters);
+      values_->validateModelRebindWithMixedParameters(image, {});
     if (spatial_)
       spatial_->validateModelRebindWithMixedParameters(image, mixed_parameters);
     // Old image/cache members retain lifetime through both no-throw adoptions.
+    if (canonical_head_) canonical_head_->adoptPreparedModel(image);
     if (values_)
-      values_->adoptPreparedModelWithMixedParameters(image, mixed_parameters);
+      values_->adoptPreparedModelWithMixedParameters(image, {});
     if (spatial_)
       spatial_->adoptPreparedModelWithMixedParameters(image, mixed_parameters);
     image_ = std::move(image);
@@ -303,6 +307,7 @@ public:
   /// Count actual approximate successes separately from complete FP64 numerical retries.
   std::size_t mixedBatches() const noexcept { return mixed_batches_; }
   std::size_t mixedRetries() const noexcept { return mixed_retries_; }
+  std::size_t canonicalValueBatches() const noexcept { return canonical_value_batches_; }
   const std::string& mixedRetryReason() const noexcept { return mixed_retry_reason_; }
 
   /// Freeze one native epoch policy only while this physical crowd is released.
@@ -349,7 +354,33 @@ private:
       graph.evaluateFp64(positions_);
       return; // Explicit native replay is separate from inference's automatic retry counter.
     }
-    if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::STRICT_MIXED)
+    if (mixed_dense_ && &graph == values_.get())
+    {
+      // Scalar MC/ECP calls define the same full-FP64 primal as the sensitive head.
+      graph.evaluate(positions_);
+      ++canonical_value_batches_;
+      return;
+    }
+    if (canonical_head_)
+    {
+      try
+      {
+        const auto head = canonical_head_->evaluate(positions_);
+        graph.evaluateCanonicalHead(head);
+      }
+      catch (const MixedPrecisionRetryRequired& error)
+      {
+        if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::STRICT_MIXED) throw;
+        mixed_retry_reason_ = error.what(); retried = true;
+      }
+      catch (const InferenceStatusError& error)
+      {
+        if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::STRICT_MIXED || error.stage() == 0) throw;
+        mixed_retry_reason_ = error.what(); retried = true;
+      }
+      if (retried) graph.evaluateFp64(positions_);
+    }
+    else if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::STRICT_MIXED)
       graph.evaluate(positions_);
     else
       retried = graph.evaluateWithFp64Retry(positions_, mixed_retry_reason_);
@@ -402,7 +433,7 @@ private:
     {
       mixed_dense = std::make_shared<PreparedDeviceMixedValueDense>(mixed_parameters_,
           spatial->mixedDenseRowCapacity(), queue_, blas_);
-      values->setMixedDense(mixed_dense);
+      values->configureCanonicalScalarValue();
       spatial->setMixedDense(mixed_dense);
     }
     std::vector<double> positions, phases, jets, ratios;
@@ -416,6 +447,9 @@ private:
     values_ = std::move(values);
     spatial_ = std::move(spatial);
     mixed_dense_ = std::move(mixed_dense);
+    if (mixed_parameters_)
+      canonical_head_ = PreparedDeviceCanonicalRealHead::prepare(image_, capacity, queue_, blas_,
+          PreparedDeviceCanonicalRealHead::required(image_->plan(), capacity).device_bytes);
     positions_.swap(positions);
     phases_.swap(phases);
     jets_.swap(jets);
@@ -462,8 +496,9 @@ private:
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   const TargetVglPreparation target_preparation_;
   const bool lazy_spatial_;
+  std::unique_ptr<PreparedDeviceCanonicalRealHead> canonical_head_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
-  std::size_t mixed_batches_ = 0, mixed_retries_ = 0;
+  std::size_t mixed_batches_ = 0, mixed_retries_ = 0, canonical_value_batches_ = 0;
   std::string mixed_retry_reason_;
   PsiFormerGpuTrainingEpochMode training_epoch_mode_ = PsiFormerGpuTrainingEpochMode::INFERENCE;
   const PsiFormerAcceleratorSharedModel& owner_;

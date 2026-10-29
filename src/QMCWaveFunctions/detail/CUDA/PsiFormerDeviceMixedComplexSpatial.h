@@ -61,7 +61,7 @@ public:
 
   /// Admit one complete graph plus the cache/casts/pivots/diagnostics, including cold peak.
   static std::size_t estimateDeviceBytes(const PsiFormerExecutionPlan& plan, std::size_t capacity,
-      std::size_t concurrent_targets = 0, TargetVglPreparation preparation = {})
+      std::size_t concurrent_targets = 0, TargetVglPreparation preparation = {}, bool canonical_physical_head = false)
   {
     if (!supportsMixedPairedTrunkEnvironment(plan.environment()))
       throw std::invalid_argument("Mixed paired FULL requires a fixed legacy periodic real trunk");
@@ -76,6 +76,14 @@ public:
     const auto graph = spatialCost(plan, capacity, concurrent_targets, preparation).device_bytes;
     const auto cache = checkedDeviceBytes<float>(plan.parameterCount());
     auto bytes = add(graph, cache);
+    if (canonical_physical_head)
+    {
+      bytes = add(bytes, PreparedDeviceCanonicalComplexHead::required(plan, capacity).device_bytes);
+      if (preparation.max_targets && add(mixedTargetRequestScalarWork(
+              estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity).charged_scalar_work_units),
+              canonicalHeadScalarWork(plan, capacity)) > preparation.scalar_work_budget)
+        throw std::length_error("Canonical paired physical request exceeds its complete work cap");
+    }
     bytes = add(bytes, checkedDeviceBytes<float>(mul(maximumRows(plan, capacity, preparation), add(std::max(input, width), width))));
     bytes = add(bytes, checkedDeviceBytes<double>(mul(capacity, plan.modelShape().determinants)));
     bytes = add(bytes, sizeof(PsiFormerDeviceNumericalDiagnostics));
@@ -88,9 +96,9 @@ public:
 
   /// A composing owner charges its one shared immutable FP32 cache separately.
   static std::size_t estimatePrivateDeviceBytes(const PsiFormerExecutionPlan& plan, std::size_t capacity,
-      std::size_t concurrent_targets = 0, TargetVglPreparation preparation = {})
+      std::size_t concurrent_targets = 0, TargetVglPreparation preparation = {}, bool canonical_physical_head = false)
   {
-    return estimateDeviceBytes(plan, capacity, concurrent_targets, preparation) -
+    return estimateDeviceBytes(plan, capacity, concurrent_targets, preparation, canonical_physical_head) -
         checkedDeviceBytes<float>(plan.parameterCount());
   }
 
@@ -99,20 +107,23 @@ public:
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget,
       bool allow_fp64_retry = true, std::size_t concurrent_targets = 0,
       std::shared_ptr<const PreparedDeviceMixedDenseParameters> shared_parameters = {},
-      TargetVglPreparation preparation = {})
+      TargetVglPreparation preparation = {}, bool canonical_physical_head = false)
       : model_(std::move(image)), queue_(queue), owns_parameters_(!shared_parameters), allow_retry_(allow_fp64_retry)
   {
     if (!model_) throw std::invalid_argument("Mixed paired FULL requires a canonical image");
     validateSharedParameters(model_, shared_parameters);
     const auto bytes = owns_parameters_
-        ? estimateDeviceBytes(model_->plan(), capacity, concurrent_targets, preparation)
-        : estimatePrivateDeviceBytes(model_->plan(), capacity, concurrent_targets, preparation);
+        ? estimateDeviceBytes(model_->plan(), capacity, concurrent_targets, preparation, canonical_physical_head)
+        : estimatePrivateDeviceBytes(model_->plan(), capacity, concurrent_targets, preparation, canonical_physical_head);
     if (bytes > budget) throw std::length_error("Mixed paired FULL exceeds its combined owner budget");
     model_->validateCurrentDevice();
     // One immutable trace slab belongs to this same graph on mixed and FP64 attempts.
     graph_ = preparation.max_targets
         ? PreparedDeviceComplexSpatial::prepare(model_, queue, blas, preparation, capacity, concurrent_targets)
         : PreparedDeviceComplexSpatial::prepare(model_, capacity, queue, blas, budget, concurrent_targets);
+    if (canonical_physical_head)
+      canonical_head_ = PreparedDeviceCanonicalComplexHead::prepare(model_, capacity, queue, blas,
+          PreparedDeviceCanonicalComplexHead::required(model_->plan(), capacity).device_bytes);
     parameters_ = std::move(shared_parameters);
     if (owns_parameters_)
       parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model_, queue_,
@@ -139,7 +150,13 @@ public:
     retry_reason_.clear();
     try
     {
-      graph_->evaluateCoordinates(positions, pivots_.data());
+      if (canonical_head_)
+      {
+        const auto head = canonical_head_->evaluate(positions);
+        graph_->evaluateCanonicalHead(head, pivots_.data());
+      }
+      else
+        graph_->evaluateCoordinates(positions, pivots_.data());
       valid_ = true;
       return;
     }
@@ -154,6 +171,21 @@ public:
       retry_reason_ = error.what();
     }
     evaluateFp64Graph(positions);
+  }
+
+  /// Scalar native proposals share the physical FP64 VALUE producer, without claiming mixed work or inverse admission.
+  void evaluateCanonicalValue(const std::vector<double>& positions)
+  {
+    if (!canonical_head_) throw std::logic_error("Canonical scalar VALUE requires the prepared native physical role");
+    advanceGeneration();
+    valid_ = used_retry_ = false;
+    retry_reason_.clear();
+    canonical_head_->evaluateScalar(positions);
+  }
+  void downloadCanonicalValue(std::vector<ComplexValueResult>& amplitudes) const
+  {
+    if (!canonical_head_) throw std::logic_error("Canonical scalar VALUE has no physical producer");
+    canonical_head_->downloadScalar(amplitudes);
   }
 
   /// Select FP64 for the complete native epoch without allocating a second FULL graph.
@@ -215,6 +247,7 @@ public:
     validateSharedParameters(successor, prepared);
     if (!allow_retry_ && !prepared->usable())
       throw MixedPrecisionRetryRequired("Shared paired successor cache requires FP64 replay");
+    if (canonical_head_) canonical_head_->validateModelRebind(successor);
     adapter_->validateParameterRebind(prepared);
     graph_->trunk_->validateModelRebindWithMixedParameters(successor, prepared);
   }
@@ -223,6 +256,7 @@ public:
   void adoptPreparedRebind(const std::shared_ptr<const PreparedDeviceModel>& successor,
       const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& prepared) noexcept
   {
+    if (canonical_head_) canonical_head_->adoptPreparedModel(successor);
     adapter_->adoptPreparedParameters(prepared);
     graph_->adoptPreparedModel(successor);
     parameters_ = prepared;
@@ -251,7 +285,8 @@ public:
   /// Keep HOST numeric staging separate from shared model/vendor and object storage.
   std::size_t hostNumericBytes() const
   {
-    return spatial_detail::checkedAdd(graph_->cost().host_bytes,
+    return spatial_detail::checkedAdd(spatial_detail::checkedAdd(graph_->cost().host_bytes,
+        canonical_head_ ? canonical_head_->hostWorkspaceBytes() : 0, "Canonical paired HOST bytes overflow"),
         sizeof(PsiFormerDeviceNumericalDiagnostics) +
             (owns_parameters_ ? sizeof(PsiFormerParameterConversionDiagnostics) : 0),
         "Mixed paired FULL HOST bytes overflow");
@@ -260,7 +295,8 @@ public:
   /// Count exactly one complete graph plus its private cache, casts and diagnostics.
   std::size_t deviceWorkspaceBytes() const
   {
-    auto bytes = spatial_detail::checkedAdd(graph_->cost().device_bytes,
+    auto bytes = spatial_detail::checkedAdd(spatial_detail::checkedAdd(graph_->cost().device_bytes,
+        canonical_head_ ? canonical_head_->deviceWorkspaceBytes() : 0, "Canonical paired device bytes overflow"),
         owns_parameters_ ? parameters_->deviceStorageBytes() : 0,
         "Mixed paired FULL live bytes overflow");
     bytes = spatial_detail::checkedAdd(bytes, adapter_->deviceWorkspaceBytes(), "Mixed paired FULL live bytes overflow");
@@ -306,6 +342,7 @@ private:
       throw std::overflow_error("Mixed paired FULL generation exhausted");
     ++generation_;
   }
+  std::unique_ptr<PreparedDeviceCanonicalComplexHead> canonical_head_;
   std::shared_ptr<const PreparedDeviceModel> model_;
   compute::Queue<PlatformKind::CUDA>& queue_;
   const bool owns_parameters_;

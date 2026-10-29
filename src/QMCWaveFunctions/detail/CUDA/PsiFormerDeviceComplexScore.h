@@ -4,7 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_H
-#include "PsiFormerDeviceComplexValue.h"
+#include "PsiFormerDeviceComplexCanonicalHead.h"
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceComplexScoreKernels.h"
 
@@ -174,6 +174,11 @@ inline ComplexScoreCost estimateMixedComplexScoreCost(const PsiFormerExecutionPl
   cost.mixed_pivot_bytes = checkedDeviceBytes<double>(plan.modelShape().determinants);
   for (const auto bytes : {cost.mixed_forward_bytes, cost.mixed_derivative_bytes, cost.mixed_pivot_bytes})
     cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, bytes, "Mixed complex score bytes overflow");
+  const auto canonical = PreparedDeviceCanonicalComplexHead::required(plan, 1);
+  cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, canonical.device_bytes,
+      "Mixed paired canonical score bytes overflow");
+  cost.host_bytes = spatial_detail::checkedAdd(cost.host_bytes, canonical.host_bytes,
+      "Mixed paired canonical score HOST bytes overflow");
   cost.host_bytes = spatial_detail::checkedAdd(cost.host_bytes, 2 * sizeof(PsiFormerDeviceNumericalDiagnostics),
       "Mixed complex score host diagnostics overflow");
   return cost;
@@ -437,6 +442,7 @@ public:
         forward_->generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Mixed complex score generation exhausted");
     const auto& image = incoming->modelImage();
+    canonical_head_->validateModelRebind(image);
     forward_->trunk_->validateModelRebindWithMixedParameters(image, incoming);
     network_->validateModelRebindWithMixedParameters(image, incoming);
   }
@@ -446,6 +452,7 @@ public:
       const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
   {
     const auto& image = incoming->modelImage();
+    canonical_head_->adoptPreparedModel(image);
     mixed_forward_->adoptPreparedParameters(incoming);
     forward_->adoptPreparedModel(image);
     network_->adoptPreparedModelWithMixedParameters(image, incoming);
@@ -525,6 +532,8 @@ private:
       if (orbital_only_ || !network_->mixed_ ||
           network_->mixed_->parameters().get() != mixed_forward_->parameterCache().get())
         throw std::invalid_argument("Mixed complex score primal and derivative caches differ");
+      canonical_head_ = PreparedDeviceCanonicalComplexHead::prepare(forward_->trunk_->model_, 1, queue, blas,
+          PreparedDeviceCanonicalComplexHead::required(forward_->trunk_->plan_, 1).device_bytes);
       forward_->trunk_->setMixedRetainedValueDense(mixed_forward_);
     }
     if ((cost.weighted_grid_bytes != 0 && cost.weighted_grid_bytes != sizeof(ComplexScoreWeightedGridState)) ||
@@ -532,13 +541,17 @@ private:
       throw std::logic_error("Complex score grid differs from its frozen admission");
     const double one = 1;
     unit_.upload(&one, 1);
-    const auto actual = forward_->cost().device_bytes + network_->deviceWorkspaceBytes() +
+    const auto ordinary_actual = forward_->cost().device_bytes + network_->deviceWorkspaceBytes() +
         (mixed_forward_ ? mixed_forward_->deviceWorkspaceBytes() : 0) + checkedDeviceBytes<double>(mixed_pivots_.capacity()) +
         8 * (seed_.capacity() + feature_.capacity() + ion_.capacity() + pair_.capacity() + unit_.capacity()) +
         same_.capacity() + 16 * (score_.capacity() + orbital_cotangents_.capacity()) +
         sizeof(ComplexScoreWeightedGridState) * weighted_grid_.capacity();
-    if (actual != cost.device_bytes || forward_->cost().host_bytes + network_->hostWorkspaceBytes() +
-        (mixed_forward_ ? mixed_forward_->hostWorkspaceBytes() : 0) != cost.host_bytes ||
+    const auto actual = spatial_detail::checkedAdd(ordinary_actual,
+        canonical_head_ ? canonical_head_->deviceWorkspaceBytes() : 0, "Canonical paired score bytes overflow");
+    const auto host = spatial_detail::checkedAdd(forward_->cost().host_bytes + network_->hostWorkspaceBytes() +
+        (mixed_forward_ ? mixed_forward_->hostWorkspaceBytes() : 0),
+        canonical_head_ ? canonical_head_->hostWorkspaceBytes() : 0, "Canonical paired score HOST bytes overflow");
+    if (actual != cost.device_bytes || host != cost.host_bytes ||
         8 * network_->response_.capacity() + 16 * score_.capacity() != cost.canonical_bytes)
       throw std::logic_error("Complex score inventory differs from exact preflight/24P");
   }
@@ -567,7 +580,13 @@ private:
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex score generation exhausted");
     ++generation_;
-    if (mixed_forward_) forward_->evaluateRetainedMixedCoordinates(positions, mixed_pivots_);
+    if (mixed_forward_)
+    {
+      const auto head = canonical_head_->evaluate(positions);
+      auto& t = *forward_->trunk_;
+      head.validate(t.model_, t.model_->version(), &t.queue_, 1, t.ne_, t.shape_.determinants);
+      forward_->evaluateRetainedCanonicalCoordinates(head.coordinates(), head.inverses(), head.channels(), head.amplitudes());
+    }
     else forward_->evaluate(positions);
     auto& t = *forward_->trunk_;
     const auto weighted_inverse = cooperative_weighted_inverses_ ? launchComplexScoreWeightedInversesCooperative :
@@ -685,6 +704,7 @@ private:
   const bool cooperative_lu_;
   const bool cooperative_pair_check_;
   const bool cooperative_weighted_inverses_;
+  std::unique_ptr<PreparedDeviceCanonicalComplexHead> canonical_head_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_forward_;
   DeviceBuffer<double> mixed_pivots_;
   std::unique_ptr<PreparedDeviceComplexValue> forward_;

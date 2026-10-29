@@ -86,6 +86,13 @@ public:
   /// Identify the source replacement epoch independently of model versions.
   std::size_t sourceGeneration() const noexcept { return generation_; }
 
+  /// Compare the exact issued source interval, including its coordinate replacement generation.
+  bool sameSourceRange(const PackedDeviceCoordinatesView& other) const noexcept
+  {
+    return identity_ && identity_ == other.identity_ && generation_ == other.generation_ &&
+        begin_ == other.begin_ && count_ == other.count_ && electrons_ == other.electrons_ && device_ == other.device_;
+  }
+
   /// Identify one source lifetime for diagnostics, not permission to dereference it.
   const void* sourceIdentity() const noexcept { return identity_; }
 
@@ -109,6 +116,14 @@ private:
     if (!state)
       throw std::invalid_argument("Device coordinate source lifetime expired");
     std::lock_guard lock(state->mutex);
+    copyToLocked(state, destination, queue, family, electrons);
+  }
+
+  /// Share the validated transfer while a coordinate importer holds both source locks.
+  void copyToLocked(const std::shared_ptr<coordinate_detail::SourceState>& state,
+      DeviceBuffer<double>& destination, compute::Queue<PlatformKind::CUDA>& queue,
+      const std::shared_ptr<const PreparedDeviceModelMetadata>& family, std::size_t electrons) const
+  {
     if (!state->ready || state.get() != identity_ || state->generation != generation_ ||
         state->family.get() != family.get() || electrons_ != electrons || state->electrons != electrons ||
         count_ == 0 || begin_ > state->live || count_ > state->live - begin_ ||
@@ -191,6 +206,23 @@ public:
     state_->ready = true;
   }
 
+  /// Import a live device population without a HOST readback; replacement revokes old views even on failure.
+  void copyFrom(const PackedDeviceCoordinatesView& source, compute::Queue<PlatformKind::CUDA>& queue)
+  {
+    const auto incoming = source.state_.lock();
+    if (!incoming || incoming.get() == state_.get())
+    {
+      std::lock_guard lock(state_->mutex);
+      revokeLocked();
+      throw std::invalid_argument("Device coordinate import has an expired or identical source");
+    }
+    std::scoped_lock lock(state_->mutex, incoming->mutex);
+    revokeLocked();
+    source.copyToLocked(incoming, state_->positions, queue, state_->family, state_->electrons);
+    state_->live = source.batchCount();
+    state_->ready = true;
+  }
+
   /// Borrow a checked contiguous subpopulation without allocation or transfer.
   PackedDeviceCoordinatesView view(std::size_t begin, std::size_t count) const
   {
@@ -206,6 +238,16 @@ public:
 private:
   friend class PreparedDeviceModel;
   friend class PreparedDeviceMetropolis;
+
+  /// Revoke a destination generation while its mutation lock is held.
+  void revokeLocked()
+  {
+    state_->ready = false;
+    state_->live = 0;
+    if (state_->generation == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device coordinate source generation exhausted");
+    ++state_->generation;
+  }
 
   /// Bind trusted physical/layout metadata through the model's named preparation.
   PreparedDeviceCoordinates(std::shared_ptr<const PreparedDeviceModelMetadata> family,

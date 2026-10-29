@@ -105,11 +105,12 @@ class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
         std::clog << "PsiFormer explicit mixed inference summary: scope=all_destroyed_contexts"
                   << ", contexts=" << contexts.load(std::memory_order_relaxed)
                   << ", mixed_batches=" << successes.load(std::memory_order_relaxed)
+                  << ", canonical_fp64_value_batches=" << canonical_values.load(std::memory_order_relaxed)
                   << ", whole_fp64_retries=" << retries.load(std::memory_order_relaxed) << std::endl;
       }
       catch (...) {} // Diagnostics must not throw during resource destruction.
     }
-    std::atomic<std::size_t> contexts{0}, successes{0}, retries{0};
+    std::atomic<std::size_t> contexts{0}, successes{0}, retries{0}, canonical_values{0};
   };
 
 public:
@@ -543,6 +544,7 @@ private:
     if (mixed_parameters_ && (!mixed_reported_.exchange(true, std::memory_order_relaxed) ||
                              context->hooks.mixedRetries() != previous_mixed_retries))
       std::clog << "PsiFormer explicit mixed inference completed: mixed_batches=" << context->hooks.mixedBatches()
+                << ", canonical_fp64_value_batches=" << context->hooks.canonicalValueBatches()
                 << ", whole_fp64_retries=" << context->hooks.mixedRetries()
                 << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
     if (valid_hint && hint->live_cookie->load(std::memory_order_acquire) != hint->request_generation)
@@ -1193,6 +1195,7 @@ private:
       if (mixed_statistics)
       {
         mixed_statistics->successes.fetch_add(hooks.mixedBatches(), std::memory_order_relaxed);
+        mixed_statistics->canonical_values.fetch_add(hooks.canonicalValueBatches(), std::memory_order_relaxed);
         mixed_statistics->retries.fetch_add(hooks.mixedRetries(), std::memory_order_relaxed);
         mixed_statistics->contexts.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1229,12 +1232,17 @@ private:
       cost.device_workspace_bytes =
           PreparedDeviceCrowdHooks::mixedTargetDeviceBytes(image_->plan(), capacity, preparation);
       cost.host_workspace_bytes = spatial_detail::checkedAdd(cost.host_workspace_bytes,
-          sizeof(PsiFormerDeviceNumericalDiagnostics), "Mixed target HOST diagnostic bytes overflow");
-      cost.charged_scalar_work_units = mixedTargetRequestScalarWork(cost.charged_scalar_work_units);
+          spatial_detail::checkedAdd(sizeof(PsiFormerDeviceNumericalDiagnostics),
+              PreparedDeviceCanonicalRealHead::required(image_->plan(), capacity).host_bytes,
+              "Canonical target HOST bytes overflow"),
+          "Mixed target HOST diagnostic bytes overflow");
+      cost.charged_scalar_work_units = spatial_detail::checkedAdd(
+          mixedTargetRequestScalarWork(cost.charged_scalar_work_units), canonicalHeadScalarWork(image_->plan(), capacity),
+          "Canonical mixed target request work overflow");
       reportDeviceTargetSelection(std::cout, "MIXED_VGL_profile", image_->plan(), capacity,
           preparation.max_targets, cost, preparation.device_workspace_budget_bytes, preparation.scalar_work_budget);
-      std::cout << "  Mixed target request work includes one approximate sweep and one complete same-K FP64 retry;"
-                   " shared canonical/FP32 images and separate VALUE graph excluded; descriptor_only=yes; not iteration work or FLOPs\n";
+      std::cout << "  Mixed target request work includes one canonical FP64 VALUE head, one approximate sweep and one complete same-K FP64 retry;"
+                   " shared canonical/FP32 parameter images and separate scalar VALUE graph excluded; canonical head graph included; descriptor_only=yes; not iteration work or FLOPs\n";
     }
     if (preparation.parallel_trace_workspace_budget_bytes)
       reportDeviceTargetSelection(std::cout, "VGL_parallel_actual_owner", image_->plan(), capacity,

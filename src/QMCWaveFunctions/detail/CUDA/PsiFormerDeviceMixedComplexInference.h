@@ -26,6 +26,7 @@ public:
   struct Counters
   {
     std::size_t value_attempts = 0, value_requests = 0, value_mixed = 0, value_replays = 0;
+    std::size_t value_canonical_fp64 = 0;
     std::size_t full_attempts = 0, full_requests = 0, full_mixed = 0, full_replays = 0;
     std::size_t value_epoch_replays = 0, full_epoch_replays = 0;
   };
@@ -39,10 +40,11 @@ public:
     };
     const auto value = PreparedDeviceMixedComplexValue::estimatePrivateDeviceBytes(plan, capacity);
     const auto full = PreparedDeviceMixedComplexSpatial::estimatePrivateDeviceBytes(
-        plan, capacity, concurrent_targets, preparation);
-    const auto host = add(add(estimateComplexValueCost(plan, capacity, true, false).host_bytes,
-                              estimateComplexValueCost(plan, capacity, true, false).host_bytes),
-                          PreparedDeviceMixedComplexSpatial::spatialCost(plan, capacity, concurrent_targets, preparation).host_bytes);
+        plan, capacity, concurrent_targets, preparation, true);
+    const auto value_host = estimateComplexValueCost(plan, capacity, true, false).host_bytes;
+    const auto host = add(PreparedDeviceCanonicalComplexHead::required(plan, capacity).host_bytes,
+        add(add(value_host, value_host), PreparedDeviceMixedComplexSpatial::spatialCost(
+            plan, capacity, concurrent_targets, preparation).host_bytes));
     const auto diagnostics = add(2 * sizeof(PsiFormerDeviceNumericalDiagnostics),
         owns_parameters ? sizeof(PsiFormerParameterConversionDiagnostics) : 0);
     const auto shared_cache = owns_parameters ? checkedDeviceBytes<float>(plan.parameterCount()) : 0;
@@ -92,7 +94,7 @@ public:
     value_ = std::make_unique<PreparedDeviceMixedComplexValue>(image_, capacity, queue, blas,
         cost_.value_device_bytes, true, parameters_);
     full_ = std::make_unique<PreparedDeviceMixedComplexSpatial>(image_, capacity, queue, blas,
-        cost_.full_device_bytes, true, concurrent_targets, parameters_, preparation);
+        cost_.full_device_bytes, true, concurrent_targets, parameters_, preparation, true);
     if (value_->parameterCache().get() != parameters_.get() || full_->parameterCache().get() != parameters_.get() ||
         value_->deviceWorkspaceBytes() + full_->deviceWorkspaceBytes() +
             (owns_parameters_ ? parameters_->deviceStorageBytes() : 0) != cost_.device_bytes ||
@@ -139,19 +141,26 @@ public:
   {
     validateEpochMode(mode);
     ++counters_.value_attempts;
+    value_canonical_ = false;
     if (mode == PsiFormerGpuTrainingEpochMode::FP64_REPLAY)
       value_->evaluateFp64(positions);
     else
-      value_->evaluate(positions, mode == PsiFormerGpuTrainingEpochMode::STRICT_MIXED);
+    {
+      full_->evaluateCanonicalValue(positions);
+      value_canonical_ = true;
+    }
     ++counters_.value_requests;
     if (mode == PsiFormerGpuTrainingEpochMode::FP64_REPLAY) ++counters_.value_epoch_replays;
-    if (value_->usedFp64Retry()) { ++counters_.value_replays; recordReason(value_reasons_, value_->retryReason()); }
-    else ++counters_.value_mixed;
+    if (value_canonical_) ++counters_.value_canonical_fp64;
+    else if (value_->usedFp64Retry()) { ++counters_.value_replays; recordReason(value_reasons_, value_->retryReason()); }
   }
 
   /// Copy only the complete admitted VALUE output into native staging.
   void downloadValue(std::vector<ComplexValueResult>& amplitude) const
-  { value_->download(value_->resultView(), amplitude); }
+  {
+    if (value_canonical_) full_->downloadCanonicalValue(amplitude);
+    else value_->download(value_->resultView(), amplitude);
+  }
 
   /// Consume all fields from one admitted mixed or complete same-image FP64 FULL attempt.
   void evaluateFull(const std::vector<double>& positions,
@@ -181,7 +190,8 @@ public:
   const Counters& counters() const noexcept { return counters_; }
 
   /// Explain the most recent VALUE precision selection.
-  const std::string& valueRetryReason() const noexcept { return value_->retryReason(); }
+  const std::string& valueRetryReason() const noexcept
+  { return value_canonical_ ? canonical_value_reason_ : value_->retryReason(); }
 
   /// Explain the most recent FULL precision selection.
   const std::string& fullRetryReason() const noexcept { return full_->retryReason(); }
@@ -233,6 +243,8 @@ private:
   const Cost cost_;
   const bool owns_parameters_;
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters_;
+  bool value_canonical_ = false;
+  const std::string canonical_value_reason_;
   std::unique_ptr<PreparedDeviceMixedComplexValue> value_;
   std::unique_ptr<PreparedDeviceMixedComplexSpatial> full_;
   Counters counters_;

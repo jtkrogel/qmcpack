@@ -644,7 +644,8 @@ struct PsiFormerComplexWF::Impl
       if (!mixed) return;
       const auto& c = mixed->counters();
       app_log() << "  Paired mixed inference completed contexts: VALUE_requests=" << c.value_requests
-                << " VALUE_mixed=" << c.value_mixed << " VALUE_FP64_replays=" << c.value_replays
+                << " VALUE_mixed=" << c.value_mixed << " VALUE_canonical_FP64=" << c.value_canonical_fp64
+                << " VALUE_FP64_replays=" << c.value_replays
                 << " FULL_requests=" << c.full_requests << " FULL_mixed=" << c.full_mixed
                 << " FULL_FP64_replays=" << c.full_replays << "; CPU_fallback=no" << std::endl;
       for (const auto& entry : mixed->valueReasons())

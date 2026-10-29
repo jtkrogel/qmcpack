@@ -129,6 +129,11 @@ inline ScoreTileStorage estimateMixedScoreTileStorage(const PsiFormerExecutionPl
        PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(plan, rows),
        PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(plan, rows)})
     cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, bytes, "Mixed score inventory overflow");
+  const auto canonical = PreparedDeviceCanonicalRealHead::required(plan, batch);
+  cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, canonical.device_bytes,
+      "Mixed canonical score inventory overflow");
+  cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes, canonical.host_bytes,
+      "Mixed canonical score HOST inventory overflow");
   cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes,
       3 * sizeof(PsiFormerDeviceNumericalDiagnostics), "Mixed score HOST diagnostics overflow");
   return cost;
@@ -275,8 +280,7 @@ public:
             throw std::invalid_argument("Resident kinetic coefficient is nonfinite");
       // copyTo checks source lifetime/epoch before either score or dK can be folded.
       kinetic_->spatial.evaluateDeviceCoordinates(observation.coordinates);
-      values_.evaluateDeviceCoordinates(observation.coordinates);
-      score_contraction_->accumulate(score_.reverse(values_, weights_), score_coefficients, channels);
+      score_contraction_->accumulate(reversePhysicalScoreDevice(observation.coordinates, weights_), score_coefficients, channels);
       score_contraction_->accumulate(kinetic_->reverse.evaluate(kinetic_->spatial, weights_,
           resident_open_->masses, {}), kinetic_coefficients, channels);
     }, 1, &observation.coordinates);
@@ -340,7 +344,11 @@ public:
     if (independent_score_lane && profile_ != ProductSessionProfile::SCORE_ONLY)
       throw std::invalid_argument("Independent product lanes require score-only preparation");
     if (mixed_forward_)
+    {
+      canonical_head_ = PreparedDeviceCanonicalRealHead::prepare(image_, score_capacity_, queue_, blas_,
+          PreparedDeviceCanonicalRealHead::required(image_->plan(), score_capacity_).device_bytes);
       values_.setMixedRetainedValueDense(mixed_forward_);
+    }
     // Logical single-root sizes stay 3Ne even when position capacity admits tiles.
     positions_.reserve(spatial_detail::checkedProduct(positions_.size(), score_capacity_,
         "Device score tile position extent overflow"));
@@ -350,7 +358,9 @@ public:
     {
       const auto expected = mixed_forward_ ? estimateMixedScoreTileStorage(image_->plan(), score_capacity_)
                                            : estimateScoreTileStorage(image_->plan(), score_capacity_);
-      const auto actual = spatial_detail::checkedAdd(values_.deviceWorkspaceBytes(),
+      const auto actual = spatial_detail::checkedAdd(
+          spatial_detail::checkedAdd(values_.deviceWorkspaceBytes(),
+              canonical_head_ ? canonical_head_->deviceWorkspaceBytes() : 0, "Canonical score graph bytes overflow"),
           spatial_detail::checkedAdd(score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes(),
               "Score graph storage overflow"), "Score graph storage overflow");
       if (spatial_detail::checkedAdd(actual, mixed_forward_ ? mixed_forward_->deviceWorkspaceBytes() : 0,
@@ -467,8 +477,7 @@ public:
       statistics.beginSample(version);
       try
       {
-        values_.evaluate(positions_);
-        score_.observeAffine(values_, statistics);
+        observePhysicalAffine(statistics);
         for (const auto& range : fallback_ranges)
           score_.downloadResponseChunk(range.first, score_response_.data() + range.first, range.second);
       }
@@ -485,8 +494,7 @@ public:
   const std::vector<double>& score(const double* positions, std::size_t version)
   {
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
-      values_.evaluate(positions_);
-      score_.reverse(values_, weights_);
+      reversePhysicalScore(weights_);
       score_.downloadResponse(score_response_);
     });
     return score_response_;
@@ -497,8 +505,7 @@ public:
                                                    std::size_t version)
   {
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
-      values_.evaluateDeviceCoordinates(positions);
-      score_.reverse(values_, weights_);
+      reversePhysicalScoreDevice(positions, weights_);
       score_.downloadResponse(score_response_);
     }, 1, &positions);
     return score_response_;
@@ -634,8 +641,7 @@ public:
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
       if (!score_contraction_)
         throw std::logic_error("Device score contraction was not prepared");
-      values_.evaluate(positions_);
-      const double* response = score_.reverse(values_, weights_);
+      const double* response = reversePhysicalScore(weights_);
       score_contraction_->accumulate(response, coefficients, channels);
     });
   }
@@ -647,8 +653,7 @@ public:
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
       if (!score_contraction_)
         throw std::logic_error("Device score contraction was not prepared");
-      values_.evaluateDeviceCoordinates(positions);
-      score_contraction_->accumulate(score_.reverse(values_, weights_), coefficients, channels);
+      score_contraction_->accumulate(reversePhysicalScoreDevice(positions, weights_), coefficients, channels);
     }, 1, &positions);
   }
 
@@ -667,8 +672,7 @@ public:
       std::copy_n(weights, count, tile_weights_.begin());
       // reverse() validates every finite signed weight and every determinant,
       // including configurations with zero weight. It returns a weighted sum.
-      values_.evaluate(positions_);
-      const double* response = score_.reverse(values_, tile_weights_);
+      const double* response = reversePhysicalScore(tile_weights_);
       const std::complex<double> unit(1, 0);
       score_contraction_->accumulate(response, channels ? channels : &unit, channel_count);
     }, count);
@@ -686,8 +690,7 @@ public:
         throw std::invalid_argument("Weighted score tile requires weights and a prepared contraction");
       tile_weights_.resize(count);
       std::copy_n(weights, count, tile_weights_.begin());
-      values_.evaluateDeviceCoordinates(positions);
-      const double* response = score_.reverse(values_, tile_weights_);
+      const double* response = reversePhysicalScoreDevice(positions, tile_weights_);
       const std::complex<double> unit(1, 0);
       score_contraction_->accumulate(response, &unit, 1);
     }, count, &positions);
@@ -722,8 +725,7 @@ public:
       std::copy_n(inverse_masses, masses_.size(), masses_.begin());
 
       // Ordinary score is evaluated once, independently of kinetic target tiles.
-      values_.evaluate(positions_);
-      const double* response = score_.reverse(values_, weights_);
+      const double* response = reversePhysicalScore(weights_);
       score_contraction_->accumulate(response, score_coefficients, channels);
       if (target_kinetic_)
         response = target_kinetic_->evaluate(positions_, weights_, masses_, drift_);
@@ -1088,6 +1090,8 @@ public:
     std::size_t bytes = 0;
     for (auto amount : {values_.deviceWorkspaceBytes(), score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product session byte overflow");
+    if (canonical_head_)
+      bytes = spatial_detail::checkedAdd(bytes, canonical_head_->deviceWorkspaceBytes(), "Canonical score head bytes overflow");
     if (mixed_forward_)
       bytes = spatial_detail::checkedAdd(bytes, mixed_forward_->deviceWorkspaceBytes(), "Mixed primal cast bytes overflow");
     if (kinetic_)
@@ -1123,6 +1127,8 @@ public:
                                          "Device product host staging overflow");
     for (auto amount : {values_.hostWorkspaceBytes(), score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product host status overflow");
+    if (canonical_head_)
+      bytes = spatial_detail::checkedAdd(bytes, canonical_head_->hostWorkspaceBytes(), "Canonical score HOST bytes overflow");
     if (mixed_forward_)
       bytes = spatial_detail::checkedAdd(bytes, mixed_forward_->hostWorkspaceBytes(), "Mixed primal HOST diagnostics overflow");
     if (kinetic_)
@@ -1241,6 +1247,45 @@ private:
         acceleratorOperationBit(PsiFormerAcceleratorOperation::KINETIC_RESPONSE);
   }
 
+  /// Keep canonical-head borrows request-local, so publication never retains stale coefficients.
+  const double* reversePhysicalScore(const std::vector<double>& weights)
+  {
+    if (!canonical_head_)
+    {
+      values_.evaluate(positions_);
+      return score_.reverse(values_, weights);
+    }
+    const auto head = canonical_head_->evaluate(positions_);
+    values_.evaluateRetainedCanonicalHead(head);
+    return score_.reverseCanonicalHead(values_, head, weights);
+  }
+
+  const double* reversePhysicalScoreDevice(const PackedDeviceCoordinatesView& positions,
+      const std::vector<double>& weights)
+  {
+    if (!canonical_head_)
+    {
+      values_.evaluateDeviceCoordinates(positions);
+      return score_.reverse(values_, weights);
+    }
+    const auto head = canonical_head_->evaluateDeviceCoordinates(positions);
+    values_.evaluateRetainedCanonicalHead(head);
+    return score_.reverseCanonicalHead(values_, head, weights);
+  }
+
+  void observePhysicalAffine(PreparedDeviceAffineStatistics& statistics)
+  {
+    if (!canonical_head_)
+    {
+      values_.evaluate(positions_);
+      score_.observeAffine(values_, statistics);
+      return;
+    }
+    const auto head = canonical_head_->evaluate(positions_);
+    values_.evaluateRetainedCanonicalHead(head);
+    score_.observeAffineCanonicalHead(values_, head, statistics);
+  }
+
   /// Catch up released fixed-shape resources after an accepted publication.
   void rebind()
   {
@@ -1255,9 +1300,11 @@ private:
     if (active_mixed_parameters_)
     {
       const auto& successor = *active_mixed_parameters_;
+      canonical_head_->validateModelRebind(active_image_);
       values_.validateModelRebindWithMixedParameters(active_image_, successor);
       score_.validateModelRebindWithMixedParameters(active_image_, successor);
       jvp_.validateModelRebindWithMixedParameters(active_image_, successor);
+      canonical_head_->adoptPreparedModel(active_image_);
       values_.adoptPreparedModelWithMixedParameters(active_image_, successor);
       score_.adoptPreparedModelWithMixedParameters(active_image_, successor);
       jvp_.adoptPreparedModelWithMixedParameters(active_image_, successor);
@@ -1444,6 +1491,7 @@ private:
   AcceleratorBlasHandle blas_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_forward_;
   std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_reverse_, mixed_jvp_;
+  std::unique_ptr<PreparedDeviceCanonicalRealHead> canonical_head_;
   PreparedDeviceInference values_;
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;

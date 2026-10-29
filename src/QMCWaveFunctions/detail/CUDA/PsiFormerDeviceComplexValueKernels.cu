@@ -785,6 +785,17 @@ Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t 
   return launched();
 }
 
+/// Native canonical VALUE requires the same scalar LU primal, without an unused inverse solve.
+Error launchComplexCanonicalScalarFactor(Stream stream, std::size_t channels, std::size_t n,
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status)
+{
+  if (!n || !matrix || !metadata || !status)
+    throw std::invalid_argument("Canonical scalar factor storage/size is invalid");
+  factor<false><<<blocks(channels), 128, 0, stream>>>(channels, n, matrix, metadata, status,
+      nullptr, nullptr, nullptr, nullptr);
+  return launched();
+}
+
 /// Exact raw-matrix fallback shares the unchanged scalar factor/inverse body.
 Error launchComplexTargetFactorReuse(Stream stream, std::size_t channels, std::size_t n,
     cuDoubleComplex* current, cuDoubleComplex* canonical_raw, bool reuse_previous,
