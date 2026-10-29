@@ -24,6 +24,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceComplexScoreKernels.cu
     PsiFormerDeviceComplexKineticKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceInverseCertificate.cu
     PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceSpatialTraces.cu
     PsiFormerDevicePrecision.cu
@@ -46,6 +47,7 @@ add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
 # not reassociation or fused coordinate updates.
 # Keep this leaf strict even when a parent Release policy enables fast math.
 set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceInverseCertificate.cu
     PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceMetropolisKernels.cu PsiFormerDeviceAdamKernels.cu
     PsiFormerDeviceComplexValueKernels.cu PsiFormerDeviceComplexSpatialKernels.cu
@@ -55,6 +57,10 @@ set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceDeterminantKe
     $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>)
+# Directed bound arithmetic must preserve binary64 normal/subnormal semantics.
+set_property(SOURCE PsiFormerDeviceInverseCertificate.cu APPEND PROPERTY COMPILE_OPTIONS
+    $<$<COMPILE_LANGUAGE:CUDA>:--ftz=false>
+    $<$<COMPILE_LANGUAGE:CUDA>:--prec-div=true>)
 if(QMC_CUDA2HIP)
   set_source_files_properties(${PSIFORMER_DEVICE_SRCS} PROPERTIES LANGUAGE HIP)
 else()
