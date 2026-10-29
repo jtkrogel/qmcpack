@@ -16,6 +16,8 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_VALUE_DENSE_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_VALUE_DENSE_H
 
+#include <complex>
+
 #include "PsiFormerDeviceDense.h"
 #include "Platforms/CUDA/CUDATypeMapping.hpp"
 #include "PsiFormerDeviceResources.h"
