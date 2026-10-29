@@ -3309,6 +3309,13 @@ void WFTrainBatched::process(xmlNodePtr node)
     // A request receipt precedes population allocation. Admission below can still
     // reject it; do not present requested crowds as concurrent derivative lanes.
     if (selected_provider_->usesAcceleratorParameterProducts())
+    {
+      const auto* real_request = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+      bool mixed_request = real_request && real_request->usesMixedAffineTraining();
+#ifdef QMC_COMPLEX
+      mixed_request = mixed_request ||
+          (complex_training_component_ && complex_training_component_->usesMixedAffineTraining());
+#endif
       app_log() << "WFTrain execution request: schema=" << selected_provider_->parameterSchema().fingerprint()
                 << " scalar=" << (complex_training_component_ ? "paired_complex" : "real")
                 << " geometry=" << (population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN
@@ -3319,7 +3326,11 @@ void WFTrainBatched::process(xmlNodePtr node)
                 << " nominal_crowds=" << walker_counts.walkers_per_crowd.size()
                 << " nonempty_crowds=" << std::count_if(walker_counts.walkers_per_crowd.begin(),
                     walker_counts.walkers_per_crowd.end(), [](auto n) { return n > 0; })
-                << " precision=fp64 admission=pending" << std::endl;
+                << " precision=" << psiformer::psiFormerPrecisionPolicyName(mixed_request
+                    ? psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
+                    : psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+                << " admission=pending" << std::endl;
+    }
     initPopulationAndCrowds(walker_counts);
     // Only physical ECP score Adam/KFAC may use the new independent C2 owners.
     // All other operations retain their original topology restrictions.

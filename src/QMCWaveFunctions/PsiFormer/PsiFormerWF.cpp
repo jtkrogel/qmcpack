@@ -14633,9 +14633,9 @@ std::shared_ptr<PsiFormerGpuScoreLaneAnchor> PsiFormerWF::retainGpuScoreLane(std
   const auto image = backend->currentImage();
   app_log() << "PsiFormer score lane driver anchor: crowd=" << crowd_ordinal << " lane=" << lane.get()
             << " session=" << lane->deviceProducts() << " active_image=" << image.get() << " metadata_family=" << image->metadataFamily().get()
-            << " parameter_version=" << image->version() << " DEVICE_bytes=" << lane->deviceProducts()->deviceWorkspaceBytes()
-            << " HOST_bytes=" << lane->deviceProducts()->hostWorkspaceBytes()
-            << "; process_local_identity; caller snapshots/later HOST outputs/shared image excluded" << std::endl;
+            << " parameter_version=" << image->version() << " selected_recipe_DEVICE_bytes=" << lane->deviceProducts()->deviceWorkspaceBytes()
+            << " selected_recipe_HOST_bytes=" << lane->deviceProducts()->hostWorkspaceBytes()
+            << "; process_local_identity; selected_recipe_only; other_precision_recipe/caller_snapshots/later_HOST_outputs/shared_image_excluded" << std::endl;
   return std::shared_ptr<PsiFormerGpuScoreLaneAnchor>(new PsiFormerGpuScoreLaneAnchor(
       model_state_->numerical_tile_backend, std::move(lane)));
 #else

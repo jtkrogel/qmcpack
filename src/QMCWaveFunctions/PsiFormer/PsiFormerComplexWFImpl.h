@@ -535,7 +535,7 @@ struct PsiFormerComplexWF::Impl
                   << " device_bytes=" << mixed->cost().device_bytes << " host_numeric_bytes=" << mixed->cost().host_bytes
                   << " pending_device_bytes=" << mixed->cost().pending_device_bytes
                   << "; current_owner_estimates=yes retained_generations=aggregate_DEVICE_allocation_lifetime"
-                     " same_FP64_image=yes inference_only=yes CPU_fallback=no" << std::endl;
+                     " same_FP64_image=yes scope=physical_inference_owner CPU_fallback=no" << std::endl;
     }
 
     /// Catch an idle resource up under model read and its exclusive execution lock.
@@ -844,7 +844,7 @@ struct PsiFormerComplexWF::Impl
       psiformer::writeCapabilityReceipt(app_log(), "effective_component", {
           {"source", "PsiFormerComplexWFImpl.h"}, {"model_identity", std::to_string(identity)},
           {"parameter_version", std::to_string(model.p.version())}, {"scalar_domain", "paired_real_complex"},
-          {"precision", "fp64_reference"},
+          {"precision", psiformer::psiFormerPrecisionPolicyName(precision_policy)},
           {"spatial_kernel", gpu_limit ? "prepared_gpu" : "cpu_direct_complex_spatial"},
           {"scratch_owner", gpu_limit ? "model_shared_gpu_lane" : (cpu_limit ? "explicit_shared_cpu_scratch" : "per_clone_cpu_scratch")},
           {"device_resident_owner", gpu_limit ? "shared_model_image_and_lane" : "none"},
