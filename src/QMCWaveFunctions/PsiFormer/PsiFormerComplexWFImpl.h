@@ -4388,7 +4388,7 @@ std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
   if (s.precision_policy == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
   {
-    mixPersistentString(hash, psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1);
+    mixPersistentString(hash, psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2);
     mixPersistentString(hash, "score_induced_fp64_dot_v1");
   }
 #ifdef ENABLE_CUDA

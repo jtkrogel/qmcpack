@@ -59,6 +59,10 @@ TEST_CASE("PsiFormer affine mixed policy preserves every FP64 island",
   }
   CHECK(std::string(PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1) ==
         "fp32_dense_fp64_islands_affine_ad_v1");
+  CHECK(std::string(PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2) ==
+        "fp32_dense_fp64_islands_canonical_head_affine_ad_v2");
+  CHECK(std::string(PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2) !=
+        PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1);
   CHECK(psiFormerPrecisionPolicyFingerprint(policy) != UINT64_C(3524009065336389029));
   // Extending the explicit affine policy must preserve unrelated/FP64 identities.
   CHECK(psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy::FP64_REFERENCE) == UINT64_C(8375592183835889190));

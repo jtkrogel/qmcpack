@@ -42,6 +42,10 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
 inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1 =
     "fp32_dense_fp64_islands_affine_ad_v1";
 
+/// Distinguish canonical FP64 scalar/head training from the legacy mixed-head arithmetic.
+inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2 =
+    "fp32_dense_fp64_islands_canonical_head_affine_ad_v2";
+
 /** Scope one native mixed training epoch without changing the public precision label.
  * Ordinary inference retains its existing local replay policy. Training either
  * propagates mixed rejection or selects complete same-image FP64 replay.
