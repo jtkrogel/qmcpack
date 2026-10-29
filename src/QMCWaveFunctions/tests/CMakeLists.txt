@@ -663,6 +663,17 @@ add_unit_test(deterministic-unit_test_psiformer_ecp_contraction
 set_tests_properties(deterministic-unit_test_psiformer_ecp_contraction
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# CPU algebra/negative guards for the shared canonical inverse certificate.
+add_executable(test_psiformer_inverse_certificate_math test_psiformer_inverse_certificate_math.cpp)
+target_link_libraries(test_psiformer_inverse_certificate_math qmc_external_catch2)
+target_include_directories(test_psiformer_inverse_certificate_math PRIVATE "${qmcpack_SOURCE_DIR}/src")
+target_compile_options(test_psiformer_inverse_certificate_math PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,IntelLLVM>:-fno-fast-math>)
+add_unit_test(deterministic-unit_test_psiformer_inverse_certificate_math
+              1 1 $<TARGET_FILE:test_psiformer_inverse_certificate_math>)
+set_tests_properties(deterministic-unit_test_psiformer_inverse_certificate_math
+                    PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_device_determinant_math
                test_psiformer_device_determinant_math.cpp)
 target_link_libraries(test_psiformer_device_determinant_math qmc_external_catch2)

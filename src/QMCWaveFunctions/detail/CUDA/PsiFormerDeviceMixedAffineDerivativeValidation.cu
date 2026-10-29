@@ -10,6 +10,7 @@
 #include "PsiFormerDeviceMixedTargetValidation.h"
 #include "PsiFormerDeviceCanonicalHeadValidation.h"
 #include "PsiFormerDeviceComplexCanonicalHeadValidation.h"
+#include "PsiFormerDeviceInverseCertificateValidation.h"
 
 /// Execute the generated oracle only when an actual GPU is visible.
 int main()
@@ -29,6 +30,7 @@ int main()
       throw std::runtime_error("Mixed affine numerical oracle requires a visible GPU");
     std::cout << "Actual-device mixed affine validation backend=" << backend
               << " visible_devices=" << devices << '\n';
+    validateCanonicalInverseCertificates();
     validateMixedSpatialConditioningScreen();
     validateMixedTargetStreaming();
     validateRealCanonicalHeads();

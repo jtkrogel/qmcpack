@@ -238,19 +238,40 @@ inline void validate()
         for (std::size_t d = 0; d < shape.determinants; ++d)
           unsafe_values[parameter.begin + row * shape.determinants * 4 + d * 4] *= 1e-6;
     }
-    auto unsafe_image = successor->makeUpdatedImage(unsafe_values, 2);
+    // A column scaling can make a pivot small without corrupting its FP64 inverse.
+    auto low_pivot_image = successor->makeUpdatedImage(unsafe_values, 2);
+    producer->rebindModel(low_pivot_image);
+    head = producer->evaluate(first);
+    const auto low_factors = hostCopy(head.factorizations(), shape.determinants, queue);
+    require(std::any_of(low_factors.begin(), low_factors.end(), [](const auto& f) {
+      return f.minimum_scaled_pivot < 1e-3;
+    }), "Canonical low-pivot positive did not exercise a small pivot");
+    std::cout << "PASS REAL canonical accurate_low_pivot inverse_certificate=valid mixed_jet_accuracy_claim=0\n";
+    head = {};
+    // A zero orbital column has no inverse and must never mint a head borrow.
+    for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+    {
+      const auto& parameter = plan.parameter(role);
+      for (std::size_t row = 0; row < shape.feature_dimension; ++row)
+        for (std::size_t d = 0; d < shape.determinants; ++d)
+          unsafe_values[parameter.begin + row * shape.determinants * 4 + d * 4] = 0;
+    }
+    auto unsafe_image = low_pivot_image->makeUpdatedImage(unsafe_values, 3);
     producer->rebindModel(unsafe_image);
     rejected = false;
     try { (void)producer->evaluate(first); }
     catch (const MixedPrecisionRetryRequired& error)
     {
-      rejected = mixed_target_validation::diagnosticCount(error.what(), "small_determinant_pivot") != 0;
+      rejected = mixed_target_validation::diagnosticCount(error.what(), "invalid_factor") != 0 ||
+          mixed_target_validation::diagnosticCount(error.what(), "uncertified_fp64_inverse") != 0;
     }
-    require(rejected, "Canonical actual-used-head pivot safeguard did not reject an unsafe column");
+    catch (const InferenceStatusError& error) { rejected = error.stage() != 0; }
+    require(rejected, "Canonical actual-used-head inverse safeguard did not reject a noninvertible column");
     rejected = false;
     try { (void)producer->view(); } catch (const std::invalid_argument&) { rejected = true; }
     require(rejected, "Failed canonical head guard minted a usable view");
-    std::cout << "PASS REAL canonical actual_head_guard typed_pivot_rejection=1 no_head_publication=1\n";
+    std::cout << "PASS REAL canonical actual_head_guard typed_inverse_rejection=1 no_head_publication=1\n";
+
   }
   {
     const auto start = metrics.snapshot();
