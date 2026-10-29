@@ -530,6 +530,22 @@ private:
     admitStatus(ComplexValueFailureStage::PACKED_HEAD);
   }
 
+  /// Canonical heads expose inverse/channels/amplitude only; their private LU has no issued borrow.
+  /// Factorization, solves and reduction have completed on this queue before reconstructing A in place.
+  const cuDoubleComplex* repackCanonicalMatrixForCertificate()
+  {
+    auto& t = *trunk_;
+    if (!valid_ || !canonical_inverse_ || t.mode_ != SpatialJetMode::VALUE_ONLY ||
+        !t.value_tape_.empty() || t.mixed_dense_ || score_inverse_columns_ || score_cooperative_lu_)
+      throw std::logic_error("Inverse certification cannot replace live retained/borrowed paired LU storage");
+    resetStatus();
+    checkRuntime(launchComplexValuePack(t.queue_.getNative(), t.product(t.batch_, t.matrices_per_configuration_),
+        envelope_.data(), projections_.data(), projections_.data() + cost_.matrices, matrix_.data(), status_.data()),
+        "canonical paired original matrix reconstruction");
+    admitStatus(ComplexValueFailureStage::PACKED_HEAD);
+    return matrix_.data();
+  }
+
   /// Retain mixed neural primals but use only a validated canonical head for log-score seeds.
   void evaluateRetainedCanonicalCoordinates(const PackedDeviceCoordinatesView& positions,
       const cuDoubleComplex* inverse, const ComplexValueChannel* channels, const ComplexValueResult* amplitudes)

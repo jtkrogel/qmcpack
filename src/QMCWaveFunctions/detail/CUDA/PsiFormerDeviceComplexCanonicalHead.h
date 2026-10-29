@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_CANONICAL_HEAD_H
 #include "PsiFormerDeviceCanonicalHead.h"
 #include "PsiFormerDeviceComplexValue.h"
+#include "PsiFormerDeviceInverseCertificate.h"
 
 namespace qmcplusplus::psiformer::device
 {
@@ -67,10 +68,14 @@ public:
       return spatial_detail::checkedAdd(a, b, "Canonical paired head bytes overflow");
     };
     const auto channels = mul(capacity, plan.modelShape().determinants);
-    return {add(graph.device_bytes, add(checkedDeviceBytes<double>(channels),
-                checkedDeviceBytes<double>(mul(mul(3, capacity), plan.modelShape().electrons())))),
-        add(graph.host_bytes, add(checkedDeviceBytes<ComplexValueChannel>(channels),
-            add(checkedDeviceBytes<double>(channels), checkedDeviceBytes<ComplexValueResult>(capacity))))};
+    auto device = add(graph.device_bytes, checkedDeviceBytes<double>(channels));
+    device = add(device, checkedDeviceBytes<double>(mul(mul(3, capacity), plan.modelShape().electrons())));
+    device = add(device, checkedDeviceBytes<inverse_certificate::Result>(channels));
+    auto host = graph.host_bytes;
+    for (auto bytes : {checkedDeviceBytes<ComplexValueChannel>(channels), checkedDeviceBytes<double>(channels),
+         checkedDeviceBytes<ComplexValueResult>(capacity), checkedDeviceBytes<inverse_certificate::Result>(channels)})
+      host = add(host, bytes);
+    return {device, host};
   }
 
   /// Reject malformed extents and insufficient finite budgets before preparing numeric storage.
@@ -174,7 +179,9 @@ public:
   {
     return spatial_detail::checkedAdd(graph_cost_.device_bytes,
         spatial_detail::checkedAdd(storage_->coordinates->deviceWorkspaceBytes(),
-            checkedDeviceBytes<double>(storage_->pivots.capacity()), "Canonical paired device bytes overflow"),
+            spatial_detail::checkedAdd(checkedDeviceBytes<double>(storage_->pivots.capacity()),
+                checkedDeviceBytes<inverse_certificate::Result>(storage_->inverse_quality.capacity()),
+                "Canonical paired certificate bytes overflow"), "Canonical paired device bytes overflow"),
         "Canonical paired device bytes overflow");
   }
 
@@ -184,7 +191,8 @@ public:
     auto bytes = graph_cost_.host_bytes;
     for (const auto amount : {checkedDeviceBytes<double>(storage_->host_pivots.capacity()),
          checkedDeviceBytes<ComplexValueResult>(storage_->amplitudes.capacity()),
-         checkedDeviceBytes<ComplexValueChannel>(storage_->channels.capacity())})
+         checkedDeviceBytes<ComplexValueChannel>(storage_->channels.capacity()),
+         checkedDeviceBytes<inverse_certificate::Result>(storage_->host_inverse_quality.capacity())})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Canonical paired HOST bytes overflow");
     return bytes;
   }
@@ -204,6 +212,8 @@ private:
     std::vector<double> host_pivots;
     std::vector<ComplexValueResult> amplitudes;
     std::vector<ComplexValueChannel> channels;
+    DeviceBuffer<inverse_certificate::Result> inverse_quality;
+    std::vector<inverse_certificate::Result> host_inverse_quality;
   };
 
   /// Construct exactly the complete admitted owner, with no retained neural reverse tape.
@@ -216,10 +226,14 @@ private:
     storage_->coordinates = image->prepareCoordinates(capacity, checkedDeviceBytes<double>(3 * shape.electrons() * capacity));
     storage_->graph.reset(new PreparedDeviceComplexValue(image, capacity, queue, blas, graph_cost_,
         false, true, false, false, false, false, true));
-    storage_->pivots.reserveNamed(capacity * shape.determinants, "CanonicalComplexHead::pivots", __FILE__, __LINE__);
-    storage_->host_pivots.resize(capacity * shape.determinants);
+    const auto channels = spatial_detail::checkedProduct(capacity, shape.determinants,
+        "Canonical paired certificate extent overflow");
+    storage_->pivots.reserveNamed(channels, "CanonicalComplexHead::pivots", __FILE__, __LINE__);
+    storage_->host_pivots.resize(channels);
     storage_->amplitudes.resize(capacity);
-    storage_->channels.resize(capacity * shape.determinants);
+    storage_->channels.resize(channels);
+    storage_->inverse_quality.reserveNamed(channels, "CanonicalComplexHead::inverse_quality", __FILE__, __LINE__);
+    storage_->host_inverse_quality.resize(channels);
     state_->image = std::move(image);
     state_->storage = storage_;
     state_->queue = &queue;
@@ -240,23 +254,26 @@ private:
     ++state_->generation;
   }
 
-  /// Preserve all existing paired finite, pivot and cancellation safeguards on the used head.
+  /// Certify the reconstructed FP64 A/inverse while retaining finite factors and the unchanged cancellation gate.
   ComplexCanonicalHeadView evaluateCurrent(const PackedDeviceCoordinatesView& coordinates)
   {
     storage_->graph->evaluateCanonicalDeviceCoordinates(coordinates, storage_->pivots.data());
     const auto count = coordinates.batchCount();
-    storage_->pivots.download(storage_->host_pivots.data(), count * state_->determinants);
+    const auto channels = spatial_detail::checkedProduct(count, state_->determinants,
+        "Canonical paired live certificate extent overflow");
+    storage_->pivots.download(storage_->host_pivots.data(), channels);
     storage_->graph->results_.download(storage_->amplitudes.data(), count);
-    storage_->graph->channels_.download(storage_->channels.data(), count * state_->determinants);
-    std::size_t bad_pivots = 0, bad_sums = 0;
-    for (std::size_t i = 0; i < count * state_->determinants; ++i)
+    storage_->graph->channels_.download(storage_->channels.data(), channels);
+    std::size_t bad_factors = 0, bad_inverse = 0, small_pivots = 0, bad_sums = 0;
+    for (std::size_t i = 0; i < channels; ++i)
     {
       const auto& channel = storage_->channels[i];
       if (channel.status || !device_math::isFiniteBinary64(channel.log_abs) ||
           !device_math::isFiniteBinary64(cuCreal(channel.phase)) ||
           !device_math::isFiniteBinary64(cuCimag(channel.phase)) ||
-          !device_math::isFiniteBinary64(storage_->host_pivots[i]) || storage_->host_pivots[i] < 1.0e-3)
-        ++bad_pivots;
+          !device_math::isFiniteBinary64(storage_->host_pivots[i]))
+        ++bad_factors;
+      if (storage_->host_pivots[i] < 1.0e-3) ++small_pivots; // Diagnostic only for this full-FP64 producer.
     }
     for (std::size_t i = 0; i < count; ++i)
     {
@@ -266,13 +283,25 @@ private:
           !device_math::isFiniteBinary64(a.cancellation_ratio) || a.cancellation_ratio < 1.0e-3)
         ++bad_sums;
     }
-    if (bad_pivots || bad_sums)
-    {
-      std::ostringstream reason;
-      reason << "Canonical paired FP64 head requires a complete physical FP64 retry; small_determinant_pivot="
-             << bad_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
-      throw MixedPrecisionRetryRequired(reason.str().c_str());
-    }
+    const auto require_admitted = [&] {
+      if (bad_factors || bad_inverse || bad_sums)
+      {
+        std::ostringstream reason;
+        reason << "Canonical paired FP64 head requires a complete physical FP64 retry; invalid_factor=" << bad_factors
+               << " uncertified_fp64_inverse=" << bad_inverse << " small_determinant_pivot_diagnostic="
+               << small_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
+        throw MixedPrecisionRetryRequired(reason.str().c_str());
+      }
+    };
+    // Invalid factors may leave inverse storage unwritten; never read B on that path.
+    require_admitted();
+    const auto* matrix = storage_->graph->repackCanonicalMatrixForCertificate();
+    checkRuntime(inverse_certificate::launchComplex(queue_.getNative(), matrix, storage_->graph->inverse_.data(),
+        channels, state_->electrons, storage_->inverse_quality.data()), "canonical paired inverse certificate");
+    storage_->inverse_quality.downloadOnStream(storage_->host_inverse_quality.data(), channels, queue_.getNative());
+    for (std::size_t i = 0; i < channels; ++i)
+      if (!inverse_certificate::isCertified(storage_->host_inverse_quality[i])) ++bad_inverse;
+    require_admitted();
     state_->coordinates = coordinates;
     state_->count = count;
     state_->ready = true;

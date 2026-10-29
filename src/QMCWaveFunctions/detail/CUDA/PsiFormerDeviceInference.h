@@ -22,6 +22,7 @@
 #include "PsiFormerDeviceResources.h"
 #include "PsiFormerDeviceCoordinates.h"
 #include "PsiFormerDeviceCanonicalHead.h"
+#include "PsiFormerDeviceInverseCertificate.h"
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceSpatialTraces.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
@@ -237,13 +238,20 @@ inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& p
 }
 
 /// Bound one logical selected-K request by its mixed attempt plus complete canonical retry.
-/// Charge one additional full-FP64 VALUE factor/inverse pass; this existing scalar proxy is not FLOPs.
+/// Charge the FP64 factor/inverse pass and its fixed-AB certificate; this scalar proxy is not FLOPs.
 inline std::size_t canonicalHeadScalarWork(const PsiFormerExecutionPlan& plan, std::size_t batch)
 {
   if (!batch) throw std::invalid_argument("Canonical head scalar work requires a nonempty population");
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Canonical head scalar work overflow"); };
   const auto n = plan.modelShape().electrons();
-  return mul(std::size_t(4), mul(batch, mul(plan.modelShape().determinants, mul(n, mul(n, n)))));
+  const auto count = mul(batch, plan.modelShape().determinants);
+  const auto factor = mul(std::size_t(4), mul(count, mul(n, mul(n, n))));
+  const bool complex = plan.environment().head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX;
+  const auto certificate = inverse_certificate::requiredScalarWork(count, n, complex);
+  // Paired factorization overwrites A with LU; reconstruct A from its unchanged FP64 planes.
+  const auto repack = complex ? mul(std::size_t(8), mul(count, mul(n, n))) : 0;
+  return spatial_detail::checkedAdd(spatial_detail::checkedAdd(factor, certificate,
+      "Canonical head certificate work overflow"), repack, "Canonical head repack work overflow");
 }
 
 inline std::size_t mixedTargetRequestScalarWork(std::size_t single_attempt_work, bool allow_fp64_retry = true)
@@ -3214,6 +3222,8 @@ inline CanonicalRealHeadCost estimateCanonicalRealHeadCost(const PsiFormerExecut
       checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors),
       checkedDeviceBytes<device_determinant::CombinationMetadata>(batch)})
     cost.host_bytes = add(cost.host_bytes, bytes);
+  cost.device_bytes = add(cost.device_bytes, checkedDeviceBytes<inverse_certificate::Result>(factors));
+  cost.host_bytes = add(cost.host_bytes, checkedDeviceBytes<inverse_certificate::Result>(factors));
   return cost;
 }
 
@@ -3311,13 +3321,22 @@ public:
 
   /// Report actual numeric inventory, excluding shared model and opaque vendor storage.
   std::size_t deviceWorkspaceBytes() const
-  { return storage_->graph->deviceWorkspaceBytes() + storage_->coordinates->deviceWorkspaceBytes(); }
+  {
+    return spatial_detail::checkedAdd(spatial_detail::checkedAdd(storage_->graph->deviceWorkspaceBytes(),
+        storage_->coordinates->deviceWorkspaceBytes(), "Canonical REAL device inventory overflow"),
+        checkedDeviceBytes<inverse_certificate::Result>(storage_->inverse_quality.capacity()),
+        "Canonical REAL certificate inventory overflow");
+  }
 
   /// Report tracked numeric HOST arrays separately from aggregate RSS.
   std::size_t hostWorkspaceBytes() const
   {
-    return storage_->graph->hostWorkspaceBytes() + checkedDeviceBytes<device_determinant::FactorizationMetadata>(
-        storage_->factors.capacity()) + checkedDeviceBytes<device_determinant::CombinationMetadata>(storage_->sums.capacity());
+    auto bytes = storage_->graph->hostWorkspaceBytes();
+    for (auto amount : {checkedDeviceBytes<device_determinant::FactorizationMetadata>(storage_->factors.capacity()),
+        checkedDeviceBytes<device_determinant::CombinationMetadata>(storage_->sums.capacity()),
+        checkedDeviceBytes<inverse_certificate::Result>(storage_->host_inverse_quality.capacity())})
+      bytes = spatial_detail::checkedAdd(bytes, amount, "Canonical REAL HOST inventory overflow");
+    return bytes;
   }
 
   /// Retain the exact current immutable model identity for cache/publication preflights.
@@ -3334,6 +3353,8 @@ private:
     std::unique_ptr<PreparedDeviceCoordinates> coordinates;
     std::vector<device_determinant::FactorizationMetadata> factors;
     std::vector<device_determinant::CombinationMetadata> sums;
+    DeviceBuffer<inverse_certificate::Result> inverse_quality;
+    std::vector<inverse_certificate::Result> host_inverse_quality;
   };
 
   /// Construct the exact admitted inventory with no reverse/JVP or per-request numeric allocation.
@@ -3346,7 +3367,11 @@ private:
     storage_->coordinates = image->prepareCoordinates(capacity, checkedDeviceBytes<double>(3 * shape.electrons() * capacity));
     storage_->graph = std::make_unique<PreparedDeviceInference>(image, capacity, queue, blas, SpatialJetMode::VALUE_ONLY, true);
     storage_->graph->configureCanonicalScalarValue();
-    storage_->factors.resize(capacity * shape.determinants); storage_->sums.resize(capacity);
+    const auto channels = spatial_detail::checkedProduct(capacity, shape.determinants,
+        "Canonical REAL certificate extent overflow");
+    storage_->factors.resize(channels); storage_->sums.resize(capacity);
+    storage_->inverse_quality.reserveNamed(channels, "CanonicalRealHead::inverse_quality", __FILE__, __LINE__);
+    storage_->host_inverse_quality.resize(channels);
     state_->image = std::move(image); state_->storage = storage_; state_->queue = &queue;
     state_->model_version = state_->image->version(); state_->electrons = shape.electrons();
     state_->determinants = shape.determinants;
@@ -3369,20 +3394,25 @@ private:
     ++state_->generation;
   }
 
-  /// Admit used canonical factors with the unchanged minimum-pivot/cancellation safeguards.
+  /// Certify the actual FP64 inverse; retain regularity, finiteness and the unchanged cancellation gate.
   RealCanonicalHeadView evaluateCurrent(const PackedDeviceCoordinatesView& coordinates)
   {
     storage_->graph->evaluateDeviceCoordinates(coordinates);
     const auto count = coordinates.batchCount(), determinants = state_->determinants;
-    storage_->graph->factors_.download(storage_->factors.data(), count * determinants);
+    const auto channels = spatial_detail::checkedProduct(count, determinants, "Canonical REAL live extent overflow");
+    storage_->graph->factors_.download(storage_->factors.data(), channels);
     storage_->graph->combinations_.download(storage_->sums.data(), count);
-    std::size_t bad_pivots = 0, bad_sums = 0;
-    for (std::size_t i = 0; i < count * determinants; ++i)
+    std::size_t bad_factors = 0, bad_inverse = 0, small_pivots = 0, bad_sums = 0;
+    for (std::size_t i = 0; i < channels; ++i)
     {
       const auto& factor = storage_->factors[i];
       if (factor.status != device_determinant::FactorizationStatus::REGULAR || !factor.inverse_available ||
-          !device_math::isFiniteBinary64(factor.minimum_scaled_pivot) || factor.minimum_scaled_pivot < 1.0e-3)
-        ++bad_pivots;
+          !device_math::isFiniteBinary64(factor.phase) || !device_math::isFiniteBinary64(factor.log_abs) ||
+          !device_math::isFiniteBinary64(factor.matrix_scale) ||
+          !device_math::isFiniteBinary64(factor.minimum_scaled_pivot) ||
+          !device_math::isFiniteBinary64(factor.maximum_scaled_pivot))
+        ++bad_factors;
+      if (factor.minimum_scaled_pivot < 1.0e-3) ++small_pivots; // Report only: A is FP64, not an FP32 proposal.
     }
     for (std::size_t i = 0; i < count; ++i)
     {
@@ -3392,13 +3422,25 @@ private:
           sum.abs_sum_scaled < 1.0e-3 * sum.sum_abs_scaled)
         ++bad_sums;
     }
-    if (bad_pivots || bad_sums)
-    {
-      std::ostringstream reason;
-      reason << "Canonical FP64 head requires a complete physical FP64 retry; small_determinant_pivot="
-             << bad_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
-      throw MixedPrecisionRetryRequired(reason.str().c_str());
-    }
+    const auto require_admitted = [&] {
+      if (bad_factors || bad_inverse || bad_sums)
+      {
+        std::ostringstream reason;
+        reason << "Canonical FP64 head requires a complete physical FP64 retry; invalid_factor=" << bad_factors
+               << " uncertified_fp64_inverse=" << bad_inverse << " small_determinant_pivot_diagnostic="
+               << small_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
+        throw MixedPrecisionRetryRequired(reason.str().c_str());
+      }
+    };
+    // Invalid factors may leave inverse storage unwritten; never read B on that path.
+    require_admitted();
+    checkRuntime(inverse_certificate::launchReal(queue_.getNative(), storage_->graph->matrices_.data(),
+        storage_->graph->inverse_.data(), channels, state_->electrons, storage_->inverse_quality.data()),
+        "canonical REAL inverse certificate");
+    storage_->inverse_quality.downloadOnStream(storage_->host_inverse_quality.data(), channels, queue_.getNative());
+    for (std::size_t i = 0; i < channels; ++i)
+      if (!inverse_certificate::isCertified(storage_->host_inverse_quality[i])) ++bad_inverse;
+    require_admitted();
     state_->coordinates = coordinates; state_->count = count; state_->ready = true;
     return view();
   }
