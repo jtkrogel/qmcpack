@@ -1192,9 +1192,9 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     throw std::invalid_argument("Parallel kinetic traces require kinetic targets/selection and one inference crowd");
   if ((vgl || kinetic || select_vgl || select_kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
-  if ((vgl || kinetic || select_vgl || select_kinetic || retained_coordinates || metropolis || adam) &&
+  if ((kinetic || select_vgl || select_kinetic || retained_coordinates || metropolis || adam) &&
       precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
-    throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
+    throw std::invalid_argument("GPU kinetic/selection/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
   preparation.active_inference_crowds = active_inference_crowds ? active_inference_crowds : 1;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
@@ -1213,6 +1213,8 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     preparation.kinetic = {kinetic, bytes, work, lifted, kinetic_trace_bytes};
   preparation = psiformer::device::resolveDeviceTargetSelection(plan, preparation);
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
+  if (precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS && preparation.vgl.max_targets)
+    psiformer::device::PreparedDeviceCrowdHooks::mixedTargetDeviceBytes(plan, 1, preparation.vgl);
   if (parallel_trace_bytes)
     app_log() << "  PsiFormer parallel VGL B1 preallocation: trace_workspace_limit_bytes=" << parallel_trace_bytes
               << ", composite_owner_device_bytes="

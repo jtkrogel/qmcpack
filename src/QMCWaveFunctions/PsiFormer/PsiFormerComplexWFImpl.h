@@ -315,9 +315,11 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
       if (!capacity || capacity == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU tile capacity must be positive and finite");
-      if (mixed_inference && (preparation.max_targets || virtual_capacity || virtual_envelope_reuse ||
-          head_determinant_batch || full_inverse_columns || target_factor_reuse))
-        throw std::invalid_argument("Paired mixed inference requires ordinary FULL without virtual/cache/head/inverse tuning");
+      if (mixed_inference && (virtual_capacity || virtual_envelope_reuse || head_determinant_batch ||
+          full_inverse_columns || target_factor_reuse || target_cold_cooperative_lu ||
+          (preparation.max_targets && (preparation.reuse_cusp_state ||
+                                      preparation.parallel_trace_workspace_budget_bytes))))
+        throw std::invalid_argument("Paired mixed inference excludes virtual/cache/head/inverse/reuse tuning");
       if (virtual_envelope_reuse && !virtual_capacity)
         throw std::invalid_argument("Virtual envelope reuse requires the separate complex virtual tile owner");
       if (target_factor_reuse && !preparation.max_targets)
@@ -345,20 +347,21 @@ struct PsiFormerComplexWF::Impl
                 head_determinant_batch, target_factor_reuse, preparation.reuse_cusp_state, target_cold_cooperative_lu)
           : estimateComplexSpatialCost(plan, capacity, trace_targets, head_determinant_batch);
       const auto work = preparation.max_targets
-          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity,
-                preparation.reuse_cusp_state).charged_scalar_work_units : 0;
+          ? mixedTargetRequestScalarWork(estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets, capacity,
+                preparation.reuse_cusp_state).charged_scalar_work_units, mixed_inference) : 0;
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
                                      work > preparation.scalar_work_budget))
         throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
       auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
                                                              "Complex GPU lane bytes overflow");
-      const auto mixed_cost = mixed_inference ? PreparedDeviceMixedComplexInference::required(plan, capacity, trace_targets, !shared_mixed_parameters) :
+      const auto mixed_cost = mixed_inference ? PreparedDeviceMixedComplexInference::required(
+          plan, capacity, trace_targets, !shared_mixed_parameters, preparation) :
           PreparedDeviceMixedComplexInference::Cost{};
       if (mixed_inference)
       {
         PreparedDeviceMixedComplexInference::validateConfiguration(plan.environment(), false, preparation.max_targets);
         bytes = PreparedDeviceMixedComplexInference::admittedCost(plan, capacity, limit, trace_targets,
-            !shared_mixed_parameters).device_bytes;
+            !shared_mixed_parameters, preparation).device_bytes;
       }
       if (bytes > limit)
       {
@@ -477,8 +480,8 @@ struct PsiFormerComplexWF::Impl
           mixed(mixed_inference ? std::make_unique<psiformer::device::PreparedDeviceMixedComplexInference>(
               image, capacity, queue, blas, psiformer::spatial_detail::checkedAdd(bytes,
                   psiformer::device::PreparedDeviceMixedComplexInference::required(plan, capacity, trace_targets,
-                      !shared_mixed_parameters).pending_device_bytes,
-                  "Paired mixed construction pending ownership overflow"), trace_targets, shared_mixed_parameters) : nullptr),
+                      !shared_mixed_parameters, preparation).pending_device_bytes,
+                  "Paired mixed construction pending ownership overflow"), trace_targets, shared_mixed_parameters, preparation) : nullptr),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
           laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),
           virtual_positions(3 * electrons * virtual_capacity), virtual_amplitude(virtual_capacity),
@@ -532,6 +535,10 @@ struct PsiFormerComplexWF::Impl
                 << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
       if (mixed)
         app_log() << "  Paired mixed inference owner admission: VALUE_graphs=2 FULL_graphs=1"
+                  << " selected_K=" << preparation.max_targets
+                  << " folded_mixed_rows=" << psiformer::device::PreparedDeviceMixedComplexSpatial::maximumRows(
+                      plan, capacity, preparation)
+                  << " spatial_private_device_bytes=" << mixed->cost().full_device_bytes
                   << " device_bytes=" << mixed->cost().device_bytes << " host_numeric_bytes=" << mixed->cost().host_bytes
                   << " pending_device_bytes=" << mixed->cost().pending_device_bytes
                   << "; current_owner_estimates=yes retained_generations=aggregate_DEVICE_allocation_lifetime"

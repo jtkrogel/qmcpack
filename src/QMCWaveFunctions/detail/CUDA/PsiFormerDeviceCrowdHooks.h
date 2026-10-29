@@ -18,7 +18,9 @@
 #include "PsiFormerDeviceExecutionPreparation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
+#include <algorithm>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -32,6 +34,36 @@ namespace qmcplusplus::psiformer::device
 class PreparedDeviceCrowdHooks final : public PsiFormerAcceleratorHooks
 {
 public:
+  /// Charge the selected spatial graph and shared VALUE/spatial casts/diagnostics before allocation.
+  /// Excludes the separate VALUE graph, canonical image and immutable FP32 cache admitted by the backend.
+  static std::size_t mixedTargetDeviceBytes(const PsiFormerExecutionPlan& plan, std::size_t capacity,
+      TargetVglPreparation preparation)
+  {
+    if (!preparation.max_targets || preparation.max_targets > plan.modelShape().electrons() || !capacity ||
+        !preparation.device_workspace_budget_bytes ||
+        preparation.device_workspace_budget_bytes == std::numeric_limits<std::size_t>::max() ||
+        !preparation.scalar_work_budget || preparation.scalar_work_budget == std::numeric_limits<std::size_t>::max() ||
+        preparation.parallel_trace_workspace_budget_bytes || preparation.reuse_cusp_state)
+      throw std::invalid_argument("Mixed real targets require finite caps without optional trace or cusp owners");
+    const auto add = [](std::size_t a, std::size_t b) {
+      return spatial_detail::checkedAdd(a, b, "Mixed real target owner bytes overflow");
+    };
+    const auto mul = [](std::size_t a, std::size_t b) {
+      return spatial_detail::checkedProduct(a, b, "Mixed real target owner extent overflow");
+    };
+    const auto cost = estimatePreparedTargetVglCost(plan, capacity, preparation);
+    const auto rows = mul(mul(capacity, plan.modelShape().electrons()), add(1, mul(4, preparation.max_targets)));
+    const auto width = plan.modelShape().feature_dimension;
+    const auto input = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
+    const auto casts = add(checkedDeviceBytes<float>(mul(rows, add(std::max(input, width), width))),
+        sizeof(PsiFormerDeviceNumericalDiagnostics));
+    const auto bytes = add(cost.device_workspace_bytes, casts);
+    if (bytes > preparation.device_workspace_budget_bytes ||
+        mixedTargetRequestScalarWork(cost.charged_scalar_work_units) > preparation.scalar_work_budget)
+      throw std::length_error("Mixed real target graph and private casts exceed byte/work caps");
+    return bytes;
+  }
+
   /// Construct vendor handles without allocating per-walker model images.
   PreparedDeviceCrowdHooks(std::shared_ptr<const PreparedDeviceModel> image,
                           const PsiFormerAcceleratorSharedModel& owner,
@@ -47,7 +79,7 @@ public:
     image_->validateCurrentDevice();
     validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}});
     if (mixed_parameters_ && target_preparation_.max_targets)
-      throw std::invalid_argument("Mixed precision does not support target VGL preparation");
+      mixedTargetDeviceBytes(image_->plan(), 1, target_preparation_);
     if (lazy_spatial_ && mixed_parameters_)
       throw std::invalid_argument("Lazy VGL preparation requires FP64 crowd resources");
     const auto provenance = owner_.activeProvenance();
@@ -75,20 +107,18 @@ public:
         provenance.layout_fingerprint != model_provenance_.layout_fingerprint)
       throw std::logic_error("Numerical crowd successor does not match its published owner");
 
-    if (mixed_dense_)
-    {
-      if (!mixed_parameters || mixed_parameters->modelImage().get() != image.get())
-        throw std::logic_error("Numerical crowd successor has no matching mixed parameter image");
-      mixed_dense_->rebindParameters(mixed_parameters);
-    }
-    // Both graphs belong to the same metadata family. These host-only rebinds
-    // invalidate old products without reallocating any prepared device storage.
-    // A failed retained-VALUE upgrade may leave values_ absent; a sampler retry
-    // rebuilds it using the newly rebound image before attempting acquisition.
+    if (mixed_dense_ && (!mixed_parameters || mixed_parameters->modelImage().get() != image.get()))
+      throw std::logic_error("Numerical crowd successor has no matching mixed parameter image");
+    // Preflight both shared-cache leaves before either graph revokes its current products.
     if (values_)
-      values_->rebindModel(image);
+      values_->validateModelRebindWithMixedParameters(image, mixed_parameters);
     if (spatial_)
-      spatial_->rebindModel(image);
+      spatial_->validateModelRebindWithMixedParameters(image, mixed_parameters);
+    // Old image/cache members retain lifetime through both no-throw adoptions.
+    if (values_)
+      values_->adoptPreparedModelWithMixedParameters(image, mixed_parameters);
+    if (spatial_)
+      spatial_->adoptPreparedModelWithMixedParameters(image, mixed_parameters);
     image_ = std::move(image);
     mixed_parameters_ = std::move(mixed_parameters);
     model_provenance_ = provenance;
@@ -358,6 +388,8 @@ private:
     if (acquired_ || capacity == 0)
       throw std::logic_error("Numerical crowd preparation requires released positive capacity");
     validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}}, capacity);
+    if (mixed_parameters_ && target_preparation_.max_targets)
+      mixedTargetDeviceBytes(image_->plan(), capacity, target_preparation_);
     const auto status_policy = configuredInferenceStatusPolicy();
     auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY,
         retain_values_, false, status_policy);
@@ -365,15 +397,13 @@ private:
     if (!lazy_spatial_ || spatial_)
       spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
           SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_);
+    std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense;
     if (mixed_parameters_)
     {
-      const auto rows = spatial_detail::checkedProduct(
-          spatial_detail::checkedProduct(capacity, image_->plan().modelShape().electrons(),
-                                         "Mixed crowd electron rows overflow"),
-          spatial->resultLayout().plane_count, "Mixed crowd spatial rows overflow");
-      mixed_dense_ = std::make_shared<PreparedDeviceMixedValueDense>(mixed_parameters_, rows, queue_, blas_);
-      values->setMixedDense(mixed_dense_);
-      spatial->setMixedDense(mixed_dense_);
+      mixed_dense = std::make_shared<PreparedDeviceMixedValueDense>(mixed_parameters_,
+          spatial->mixedDenseRowCapacity(), queue_, blas_);
+      values->setMixedDense(mixed_dense);
+      spatial->setMixedDense(mixed_dense);
     }
     std::vector<double> positions, phases, jets, ratios;
     positions.reserve(spatial_detail::checkedProduct(capacity, coordinatesPerConfiguration(),
@@ -385,6 +415,7 @@ private:
                                                    "Numerical ratio staging overflow"));
     values_ = std::move(values);
     spatial_ = std::move(spatial);
+    mixed_dense_ = std::move(mixed_dense);
     positions_.swap(positions);
     phases_.swap(phases);
     jets_.swap(jets);

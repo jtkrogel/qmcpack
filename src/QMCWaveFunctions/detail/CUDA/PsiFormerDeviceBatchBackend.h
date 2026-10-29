@@ -1223,6 +1223,19 @@ private:
   /// Report the exact capacity authority only when a FULL graph is actually prepared.
   void reportSpatialPreparation(const TargetVglPreparation& preparation, std::size_t capacity) const
   {
+    if (mixed_parameters_ && preparation.max_targets)
+    {
+      auto cost = estimatePreparedTargetVglCost(image_->plan(), capacity, preparation);
+      cost.device_workspace_bytes =
+          PreparedDeviceCrowdHooks::mixedTargetDeviceBytes(image_->plan(), capacity, preparation);
+      cost.host_workspace_bytes = spatial_detail::checkedAdd(cost.host_workspace_bytes,
+          sizeof(PsiFormerDeviceNumericalDiagnostics), "Mixed target HOST diagnostic bytes overflow");
+      cost.charged_scalar_work_units = mixedTargetRequestScalarWork(cost.charged_scalar_work_units);
+      reportDeviceTargetSelection(std::cout, "MIXED_VGL_profile", image_->plan(), capacity,
+          preparation.max_targets, cost, preparation.device_workspace_budget_bytes, preparation.scalar_work_budget);
+      std::cout << "  Mixed target request work includes one approximate sweep and one complete same-K FP64 retry;"
+                   " shared canonical/FP32 images and separate VALUE graph excluded; descriptor_only=yes; not iteration work or FLOPs\n";
+    }
     if (preparation.parallel_trace_workspace_budget_bytes)
       reportDeviceTargetSelection(std::cout, "VGL_parallel_actual_owner", image_->plan(), capacity,
           preparation.max_targets, estimatePreparedTargetVglCost(image_->plan(), capacity, preparation),
@@ -1241,7 +1254,7 @@ private:
     return image;
   }
 
-  /// Reject mixed targets and incomplete/over-budget profiles before graph reserve.
+  /// Admit only the selected mixed VGL seam and reject incomplete or over-budget profiles.
   static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
       PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
   {
@@ -1268,11 +1281,13 @@ private:
          (preparation.metropolis_drift_budget_bytes && plan.environment().boundary != BoundaryCondition::OPEN)))
       throw std::invalid_argument("Explicit device sampling requires real FP64; periodic sampling excludes drift");
     if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
-        (preparation.vgl.max_targets || preparation.kinetic.max_targets ||
-         preparation.select_vgl_targets || preparation.select_kinetic_targets))
-      throw std::invalid_argument("Mixed precision does not support explicit GPU target preparation");
+        (preparation.kinetic.max_targets || preparation.select_vgl_targets || preparation.select_kinetic_targets ||
+         preparation.retained_coordinate_workspace_budget_bytes))
+      throw std::invalid_argument("Mixed precision admits explicit VGL targets without kinetic/selection/retained preparation");
     preparation = resolveDeviceTargetSelection(plan, preparation);
     validateDeviceExecutionPreparation(plan, preparation);
+    if (precision == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS && preparation.vgl.max_targets)
+      PreparedDeviceCrowdHooks::mixedTargetDeviceBytes(plan, 1, preparation.vgl);
     return preparation;
   }
 

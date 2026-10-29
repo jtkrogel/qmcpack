@@ -10,12 +10,13 @@
 
 namespace qmcplusplus::psiformer::device
 {
-/// Explicit inference-only composition: two VALUE graphs and ONE complete FULL graph.
+/// Explicit inference-only composition: two VALUE graphs and one FULL or selected-K spatial graph.
 /// The immutable FP64 image, queue and vendor resources are shared and charged outside.
 class PreparedDeviceMixedComplexInference
 {
 public:
   /// Separate live DEVICE/HOST owners from temporary pending conversion admission.
+  /// full_device_bytes covers the complete physical result, using FULL or selected-K storage.
   struct Cost
   {
     std::size_t value_device_bytes, full_device_bytes, device_bytes, host_bytes, pending_device_bytes;
@@ -31,16 +32,17 @@ public:
 
   /// Sum private graphs and ONE shared FP32 cache, plus one pending successor conversion.
   static Cost required(const PsiFormerExecutionPlan& plan, std::size_t capacity,
-      std::size_t concurrent_targets = 0, bool owns_parameters = true)
+      std::size_t concurrent_targets = 0, bool owns_parameters = true, TargetVglPreparation preparation = {})
   {
     const auto add = [](auto a, auto b) {
       return spatial_detail::checkedAdd(a, b, "Paired mixed inference ownership overflow");
     };
     const auto value = PreparedDeviceMixedComplexValue::estimatePrivateDeviceBytes(plan, capacity);
-    const auto full = PreparedDeviceMixedComplexSpatial::estimatePrivateDeviceBytes(plan, capacity, concurrent_targets);
+    const auto full = PreparedDeviceMixedComplexSpatial::estimatePrivateDeviceBytes(
+        plan, capacity, concurrent_targets, preparation);
     const auto host = add(add(estimateComplexValueCost(plan, capacity, true, false).host_bytes,
                               estimateComplexValueCost(plan, capacity, true, false).host_bytes),
-                          estimateComplexSpatialCost(plan, capacity, concurrent_targets).host_bytes);
+                          PreparedDeviceMixedComplexSpatial::spatialCost(plan, capacity, concurrent_targets, preparation).host_bytes);
     const auto diagnostics = add(2 * sizeof(PsiFormerDeviceNumericalDiagnostics),
         owns_parameters ? sizeof(PsiFormerParameterConversionDiagnostics) : 0);
     const auto shared_cache = owns_parameters ? checkedDeviceBytes<float>(plan.parameterCount()) : 0;
@@ -49,19 +51,20 @@ public:
     return {value, full, add(add(value, full), shared_cache), add(host, diagnostics), pending};
   }
 
-  /// Reject training, targets and nonlegacy profiles before any numeric owner exists.
+  /// Retain inference/profile restrictions; explicit targets are checked against the typed plan and caps.
   static void validateConfiguration(const ExecutionEnvironment& environment, bool optimizing, std::size_t targets)
   {
-    if (optimizing || targets || !supportsMixedPairedTrunkEnvironment(environment))
-      throw std::invalid_argument("Paired mixed capability is legacy ordinary FULL inference only");
+    if (optimizing || targets == std::numeric_limits<std::size_t>::max() ||
+        !supportsMixedPairedTrunkEnvironment(environment))
+      throw std::invalid_argument("Paired mixed capability requires a fixed legacy periodic inference profile");
   }
 
   /// Pure cold admission is testable at exact-minus-one without allocating a graph.
   static Cost admittedCost(const PsiFormerExecutionPlan& plan, std::size_t capacity, std::size_t owner_budget,
-      std::size_t concurrent_targets = 0, bool owns_parameters = true)
+      std::size_t concurrent_targets = 0, bool owns_parameters = true, TargetVglPreparation preparation = {})
   {
-    validateConfiguration(plan.environment(), false, 0);
-    const auto cost = required(plan, capacity, concurrent_targets, owns_parameters);
+    validateConfiguration(plan.environment(), false, preparation.max_targets);
+    const auto cost = required(plan, capacity, concurrent_targets, owns_parameters, preparation);
     if (spatial_detail::checkedAdd(cost.device_bytes, cost.pending_device_bytes,
           "Paired mixed inference pending ownership overflow") > owner_budget)
       throw std::length_error("Paired mixed inference owners and pending caches exceed admission");
@@ -72,9 +75,11 @@ public:
   PreparedDeviceMixedComplexInference(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
       std::size_t owner_budget, std::size_t concurrent_targets = 0,
-      std::shared_ptr<const PreparedDeviceMixedDenseParameters> shared_parameters = {})
+      std::shared_ptr<const PreparedDeviceMixedDenseParameters> shared_parameters = {},
+      TargetVglPreparation preparation = {})
       : image_(std::move(image)),
-        cost_(admittedCost(checkedPlan(image_), capacity, owner_budget, concurrent_targets, !shared_parameters)),
+        cost_(admittedCost(checkedPlan(image_), capacity, owner_budget, concurrent_targets,
+            !shared_parameters, preparation)),
         owns_parameters_(!shared_parameters)
   {
     if (shared_parameters && (shared_parameters->modelImage().get() != image_.get() ||
@@ -87,7 +92,7 @@ public:
     value_ = std::make_unique<PreparedDeviceMixedComplexValue>(image_, capacity, queue, blas,
         cost_.value_device_bytes, true, parameters_);
     full_ = std::make_unique<PreparedDeviceMixedComplexSpatial>(image_, capacity, queue, blas,
-        cost_.full_device_bytes, true, concurrent_targets, parameters_);
+        cost_.full_device_bytes, true, concurrent_targets, parameters_, preparation);
     if (value_->parameterCache().get() != parameters_.get() || full_->parameterCache().get() != parameters_.get() ||
         value_->deviceWorkspaceBytes() + full_->deviceWorkspaceBytes() +
             (owns_parameters_ ? parameters_->deviceStorageBytes() : 0) != cost_.device_bytes ||
