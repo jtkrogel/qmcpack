@@ -30,9 +30,10 @@ public:
   PreparedDeviceScoreReverse(std::shared_ptr<const PreparedDeviceModel> model,
                              std::size_t capacity,
                              compute::Queue<PlatformKind::CUDA>& queue,
-                             AcceleratorBlasHandle& blas)
+                             AcceleratorBlasHandle& blas,
+                             std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed = {})
       : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas),
-        network_(model_, capacity, queue, blas)
+        network_(model_, capacity, queue, blas, NetworkReverseOutput::PARAMETER_SCORE, std::move(mixed))
   {
     const auto& shape = model_->plan().modelShape();
     const auto ne = shape.electrons();
@@ -277,6 +278,23 @@ public:
     model_->validateSuccessor(successor);
     network_.rebindModel(successor);
     model_ = std::move(successor);
+    ready_ = false;
+  }
+
+  /// Preflight the head and trunk while retaining their accepted predecessor image.
+  void validateModelRebindWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) const
+  {
+    model_->validateSuccessor(successor);
+    network_.validateModelRebindWithMixedParameters(successor, incoming);
+  }
+
+  /// All validation and predecessor lifetime authority remain with the native transaction.
+  void adoptPreparedModelWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
+  {
+    network_.adoptPreparedModelWithMixedParameters(successor, incoming);
+    model_ = successor;
     ready_ = false;
   }
 

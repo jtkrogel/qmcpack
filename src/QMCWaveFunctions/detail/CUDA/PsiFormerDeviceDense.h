@@ -104,6 +104,16 @@ void denseForwardFp32(AcceleratorBlasHandle& handle,
                       const float* weight,
                       float* target);
 
+/** Form an FP32 input VJP in private storage (beta=0), preserving row strides. */
+void denseInputAdjointFp32(AcceleratorBlasHandle& handle,
+    const PsiFormerBlasMathModePlan& math_mode, const DenseForwardLayout& layout,
+    const float* target_adjoint, const float* weight, float* source_adjoint);
+
+/** Form an FP32 weight VJP in private storage (beta=0), preserving row strides. */
+void denseWeightAdjointFp32(AcceleratorBlasHandle& handle,
+    const PsiFormerBlasMathModePlan& math_mode, const DenseForwardLayout& layout,
+    const float* source, const float* target_adjoint, float* weight_adjoint);
+
 /// Apply three independent FP32 projections into Q, K, and V buffers.
 void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
                            const PsiFormerBlasMathModePlan& math_mode,

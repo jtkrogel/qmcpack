@@ -152,6 +152,22 @@ else()
 endif()
 target_link_libraries(psiformer_device_periodic_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
 
+# Focused mixed affine primal/derivative oracle, independent of unrelated fixture parsers.
+add_executable(psiformer_device_mixed_affine_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceMixedAffineDerivativeValidation.cu
+               # The standalone native batch adapter needs its control-plane implementations.
+               ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
+               ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
+               ../../PsiFormer/PsiFormerInitialization.cpp
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../../PsiFormer/PsiFormerGeometry.cpp)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceMixedAffineDerivativeValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_mixed_affine_validation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_mixed_affine_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
+
 # Opt-in warm timing/copy evidence; deliberately not a hardware-independent CTest.
 add_executable(psiformer_device_benchmark EXCLUDE_FROM_ALL
                PsiFormerDeviceBenchmark.cu
@@ -162,6 +178,25 @@ else()
   set_target_properties(psiformer_device_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 target_link_libraries(psiformer_device_benchmark PRIVATE psiformer_device IO::HDF5 platform_LA)
+
+# Focused mixed native-owner oracle, independent of unrelated large validation fixtures.
+add_executable(psiformer_device_mixed_owner_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceMixedOwnerValidation.cu
+               ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
+               ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
+               ../../PsiFormer/PsiFormerInitialization.cpp
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../../PsiFormer/PsiFormerGeometry.cpp)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceMixedOwnerValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_mixed_owner_validation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_mixed_owner_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
+target_compile_options(psiformer_device_mixed_owner_validation PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
+  $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>)
 
 # Standalone bounded trace algebra/performance check, independent of full VGL.
 add_executable(psiformer_device_spatial_trace_validation EXCLUDE_FROM_ALL
@@ -196,7 +231,7 @@ endforeach()
 
 # Correctness oracles must retain IEEE NaN/infinity semantics even when the
 # application's Release flags use fast-math. Library kernel policy is unchanged.
-foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation psiformer_device_concurrency_validation)
+foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_mixed_affine_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation psiformer_device_concurrency_validation)
   target_compile_options(${validation_target} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>

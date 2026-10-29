@@ -40,6 +40,7 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDevicePcg.h"
 #ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMixedComplexInference.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexProducts.h"
 #endif
@@ -1953,8 +1954,12 @@ public:
           model_state_->numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer independent channels require the numerical device backend");
+      device_backend_ = backend;
+      training_epoch_generation_ = backend->trainingEpochGeneration();
       device_products_ = backend->prepareProductSession(
-          psiformer::device::ProductSessionProfile::SCORE_ONLY);
+          psiformer::device::ProductSessionProfile::SCORE_ONLY, 1,
+          backend->usesMixedAffineProducts() && backend->trainingEpochMode() ==
+              psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
       device_positions_.resize(3 * electron_count_);
       workspace_bytes = checkedBatchMemoryAdd(device_products_->deviceWorkspaceBytes(),
           device_products_->hostWorkspaceBytes(), "PsiFormer overlap device scratch");
@@ -2087,6 +2092,13 @@ private:
 
   void requireBoundVersion() const
   {
+#ifdef ENABLE_CUDA
+    if (device_backend_ && device_backend_->usesMixedAffineProducts() &&
+        device_backend_->trainingEpochMode() == psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+      throw std::logic_error("Mixed real parameter products require an explicit native arithmetic epoch");
+    if (device_backend_ && training_epoch_generation_ != device_backend_->trainingEpochGeneration())
+      throw std::runtime_error("PsiFormer determinant-channel arithmetic epoch is stale");
+#endif
     if (model_state_->model.p.version() != parameter_version_)
       throw std::runtime_error(
           "PsiFormer determinant-channel batch parameter version is stale");
@@ -2103,6 +2115,8 @@ private:
   mutable std::vector<double> log_abs_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> workspace_;
 #ifdef ENABLE_CUDA
+  const psiformer::device::PreparedDeviceBatchBackend* device_backend_ = nullptr;
+  std::size_t training_epoch_generation_ = 0;
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products_;
   mutable std::vector<double> device_positions_;
   mutable bool reported_device_channels_ = false;
@@ -2378,13 +2392,24 @@ struct PsiFormerDerivativeScratch
           state.numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer device products require the prepared numerical backend");
-      device_products = backend->prepareProductSession(
-          score_only ? psiformer::device::ProductSessionProfile::SCORE_ONLY
-                     : psiformer::device::ProductSessionProfile::SCORE_AND_KINETIC, score_capacity);
+      device_backend = backend;
+      if (backend->usesMixedAffineProducts())
+      {
+        if (!score_only)
+          throw std::invalid_argument("Mixed native products require the explicit SCORE-only profile");
+        auto prepared = backend->prepareMixedTrainingProductSessions(score_capacity);
+        device_products = std::move(prepared.first);
+        device_products_fp64 = std::move(prepared.second);
+      }
+      else
+        device_products = backend->prepareProductSession(
+            score_only ? psiformer::device::ProductSessionProfile::SCORE_ONLY
+                       : psiformer::device::ProductSessionProfile::SCORE_AND_KINETIC, score_capacity);
       if (score_only)
         app_log() << "  PsiFormer GPU score-only product lane prepared: capacity=" << device_products->scoreCapacity()
-                  << ", DEVICE_bytes=" << device_products->deviceWorkspaceBytes()
-                  << ", HOST_bytes=" << device_products->hostWorkspaceBytes()
+                  << ", DEVICE_bytes=" << deviceProductDeviceBytes()
+                  << ", HOST_bytes=" << deviceProductHostBytes()
+                  << ", prepared_FP64_replay=" << bool(device_products_fp64)
                   << ", kinetic_owners=0; ordinary physical sampling VGL is unchanged" << std::endl;
       device_positions.resize(3 * state.execution_plan.modelShape().electrons());
       device_direction.resize(parameters);
@@ -2417,12 +2442,39 @@ struct PsiFormerDerivativeScratch
   std::unique_ptr<pf::DirectKineticWorkspace> kinetic;
   bool reported_cpu_target_products = false;
 #ifdef ENABLE_CUDA
+  /// Select the complete prepared arithmetic recipe for this explicit epoch.
+  psiformer::device::PreparedDeviceProductSession* deviceProducts() const noexcept
+  {
+    return device_products_fp64 && device_backend->trainingEpochMode() ==
+        psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY
+        ? device_products_fp64.get() : device_products.get();
+  }
+
+  /// Charge both recipes even while only one is selected for execution.
+  std::size_t deviceProductDeviceBytes() const
+  {
+    return checkedBatchMemoryAdd(device_products ? device_products->deviceWorkspaceBytes() : 0,
+        device_products_fp64 ? device_products_fp64->deviceWorkspaceBytes() : 0,
+        "PsiFormer mixed and replay DEVICE products");
+  }
+
+  /// Keep private HOST diagnostics and staging in the same owner inventory.
+  std::size_t deviceProductHostBytes() const
+  {
+    return checkedBatchMemoryAdd(device_products ? device_products->hostWorkspaceBytes() : 0,
+        device_products_fp64 ? device_products_fp64->hostWorkspaceBytes() : 0,
+        "PsiFormer mixed and replay HOST products");
+  }
+
+  const psiformer::device::PreparedDeviceBatchBackend* device_backend = nullptr;
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products;
+  std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products_fp64;
   std::vector<double> device_positions;
   std::vector<double> device_direction;
   std::vector<wftrain::DerivativeValue> device_ecp_chunk;
   std::vector<double> device_ecp_positions, device_ecp_weights;
   bool reported_device_products = false;
+  bool reported_mixed_products = false, reported_fp64_replay_products = false;
   bool reported_device_score_contraction = false;
   bool reported_device_score_tiles = false;
   bool reported_device_jvp_tiles = false;
@@ -2540,6 +2592,10 @@ public:
         reference_score_products_(makeSampleProductVector(sample_count_)),
         replay_weight_sums_(makeSampleProductVector(sample_count_))
   {
+#ifdef ENABLE_CUDA
+    if (shared_scratch_->device_backend)
+      training_epoch_generation_ = shared_scratch_->device_backend->trainingEpochGeneration();
+#endif
     const std::size_t expected_positions = checkedPositionCount(sample_count_, electron_count_);
     if (positions_.size() != expected_positions)
       throw std::invalid_argument("PsiFormer streaming derivative received the wrong position extent");
@@ -2574,10 +2630,10 @@ public:
     // Immutable samples belong to this operator, not its shared derivative lane.
     // Empty operators need no allocation/upload. Enabled admission failures throw;
     // they must not silently return to coordinate host uploads.
-    if (hasDeviceProducts() && shared_scratch_->device_products->retainedCoordinateBudget() && sample_count_ != 0)
+    if (hasDeviceProducts() && shared_scratch_->deviceProducts()->retainedCoordinateBudget() && sample_count_ != 0)
     {
       std::lock_guard scratch_lock(shared_scratch_->execution_mutex);
-      auto& session = *shared_scratch_->device_products;
+      auto& session = *shared_scratch_->deviceProducts();
       const auto before = session.transferSnapshot();
       retained_coordinates_ = session.prepareSampleCoordinates(positions_, parameter_version_);
       const auto after = session.transferSnapshot();
@@ -2775,7 +2831,7 @@ public:
                 << ", HOST_chunk_bytes=" << chunk * sizeof(wftrain::DerivativeValue)
                 << ", HOST_virtual_tile_bytes=" << tile_bytes << ", virtual_tile_capacity=" << capacity
                 << "; native aggregate DEVICE admission applies; metadata/vendor excluded" << std::endl;
-      shared_scratch_->device_products->prepareScoreContractions(MAXIMUM_VJP_CHANNELS, parameter_version_, bytes);
+      shared_scratch_->deviceProducts()->prepareScoreContractions(MAXIMUM_VJP_CHANNELS, parameter_version_, bytes);
       if (shared_scratch_->device_ecp_chunk.size() < chunk)
         shared_scratch_->device_ecp_chunk.resize(chunk);
       if (shared_scratch_->device_ecp_positions.size() < coordinates)
@@ -2906,7 +2962,7 @@ protected:
       std::size_t weighted_configurations = 0;
       if (resident_products)
       {
-        auto& session = *shared_scratch_->device_products;
+        auto& session = *shared_scratch_->deviceProducts();
         transfer_before = session.transferSnapshot();
         // Explicit cold preparation may grow capacity. Repeated requests with
         // the same admitted channel count reuse it without allocation.
@@ -2923,14 +2979,14 @@ protected:
       {
         std::array<double, 4> weights{};
         const auto capacity = deviceScoreCapacity();
-        const auto before_tiles = shared_scratch_->device_products->weightedScoreTiles();
-        const auto before_configurations = shared_scratch_->device_products->weightedScoreConfigurations();
+        const auto before_tiles = shared_scratch_->deviceProducts()->weightedScoreTiles();
+        const auto before_configurations = shared_scratch_->deviceProducts()->weightedScoreConfigurations();
         for (std::size_t offset = 0; offset < sample_count_; offset += capacity)
         {
           const auto count = std::min(capacity, sample_count_ - offset);
           for (std::size_t sample = 0; sample < count; ++sample)
             weights[sample] = channels[0].coefficients.values[offset + sample].real();
-          auto& session = *shared_scratch_->device_products;
+          auto& session = *shared_scratch_->deviceProducts();
           if (retained_score_input)
             session.accumulateWeightedScoreTileDeviceCoordinates(retainedScoreCoordinates(offset, count),
                 weights.data(), parameter_version_);
@@ -2939,8 +2995,8 @@ protected:
                 weights.data(), count, parameter_version_);
           final_score_tile_count = count;
         }
-        completed_score_tiles = shared_scratch_->device_products->weightedScoreTiles() - before_tiles;
-        weighted_configurations = shared_scratch_->device_products->weightedScoreConfigurations() - before_configurations;
+        completed_score_tiles = shared_scratch_->deviceProducts()->weightedScoreTiles() - before_tiles;
+        weighted_configurations = shared_scratch_->deviceProducts()->weightedScoreConfigurations() - before_configurations;
         reportDeviceProducts();
       }
       else
@@ -2976,7 +3032,7 @@ protected:
                 imaginary_coefficients[slot] = coefficient * imaginary_unit;
               }
             }
-            shared_scratch_->device_products->accumulateKineticContraction(
+            shared_scratch_->deviceProducts()->accumulateKineticContraction(
                 shared_scratch_->device_positions.data(), total_drift, imaginary_drift, inverse_mass,
                 score_coefficients.data(), kinetic_coefficients.data(), imaginary_coefficients.data(),
                 contracted_count, parameter_version_);
@@ -3037,7 +3093,7 @@ protected:
             std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
             for (std::size_t score_channel = 0; score_channel < score_channel_count; ++score_channel)
               coefficients[score_channel] = channels[score_channels[score_channel]].coefficients.values[sample];
-            auto& session = *shared_scratch_->device_products;
+            auto& session = *shared_scratch_->deviceProducts();
             if (retained_score_input)
               session.accumulateScoreContractionDeviceCoordinates(retainedScoreCoordinates(sample, 1),
                   coefficients.data(), score_channel_count, parameter_version_);
@@ -3067,7 +3123,7 @@ protected:
 #ifdef ENABLE_CUDA
       if (resident_products)
       {
-        auto& session = *shared_scratch_->device_products;
+        auto& session = *shared_scratch_->deviceProducts();
         // Append physical ECP to the tagged ENERGY sum before its single finite admission.
         // Native DEVICE-authority ECP admission remains independently controlled by the driver.
         try
@@ -3154,7 +3210,7 @@ protected:
             if (completed_slots[channel] == MAXIMUM_VJP_CHANNELS)
               std::fill_n(output.data(), chunk.count, wftrain::DerivativeValue{});
             else
-              shared_scratch_->device_products->downloadScoreContractionChunk(*completed,
+              shared_scratch_->deviceProducts()->downloadScoreContractionChunk(*completed,
                   completed_slots[channel], chunk.parameter_offset, output.data(), chunk.count);
             sink->add(channel, {chunk, {output.data(), chunk.count}});
             continue;
@@ -3167,12 +3223,12 @@ protected:
     catch (...)
     {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
-      if (completed) shared_scratch_->device_products->abortScoreContraction();
+      if (completed) shared_scratch_->deviceProducts()->abortScoreContraction();
 #endif
       throw;
     }
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
-    if (completed) shared_scratch_->device_products->abortScoreContraction();
+    if (completed) shared_scratch_->deviceProducts()->abortScoreContraction();
 #endif
   }
 
@@ -3205,7 +3261,7 @@ protected:
           for (std::size_t offset = 0; offset < sample_count_; offset += capacity)
           {
             const auto count = std::min(capacity, sample_count_ - offset);
-            auto& session = *shared_scratch_->device_products;
+            auto& session = *shared_scratch_->deviceProducts();
             const auto& products = (retained_coordinates_ || ecp_observation_)
                 ? session.scoreJvpPreparedTileDeviceCoordinates(retainedScoreCoordinates(offset, count), parameter_version_)
                 : session.scoreJvpPreparedTile(positions_.data() + offset * 3 * electron_count_, count, parameter_version_);
@@ -3375,7 +3431,7 @@ private:
   bool hasDeviceProducts() const noexcept
   {
 #ifdef ENABLE_CUDA
-    return shared_scratch_->device_products != nullptr;
+    return shared_scratch_->deviceProducts() != nullptr;
 #else
     return false;
 #endif
@@ -3385,7 +3441,7 @@ private:
   std::size_t deviceScoreContractionCapacity() const noexcept
   {
 #ifdef ENABLE_CUDA
-    return hasDeviceProducts() ? shared_scratch_->device_products->scoreContractionCapacity() : 0;
+    return hasDeviceProducts() ? shared_scratch_->deviceProducts()->scoreContractionCapacity() : 0;
 #else
     return 0;
 #endif
@@ -3394,7 +3450,7 @@ private:
   std::size_t deviceScoreCapacity() const noexcept
   {
 #ifdef ENABLE_CUDA
-    return hasDeviceProducts() ? shared_scratch_->device_products->scoreCapacity() : 1;
+    return hasDeviceProducts() ? shared_scratch_->deviceProducts()->scoreCapacity() : 1;
 #else
     return 1;
 #endif
@@ -3403,7 +3459,7 @@ private:
   std::size_t deviceScoreContractionGeneration() const noexcept
   {
 #ifdef ENABLE_CUDA
-    return hasDeviceProducts() ? shared_scratch_->device_products->scoreContractionGeneration() : 0;
+    return hasDeviceProducts() ? shared_scratch_->deviceProducts()->scoreContractionGeneration() : 0;
 #else
     return 0;
 #endif
@@ -3424,14 +3480,14 @@ private:
     }
     if (component != 0 && !nonzero)
       return false;
-    shared_scratch_->device_products->prepareScoreDirection(values, parameter_version_);
+    shared_scratch_->deviceProducts()->prepareScoreDirection(values, parameter_version_);
     return true;
   }
 
   /// Return only the scalar contraction, keeping the P-vector response off the host.
   double evaluatePreparedDeviceJVP() const
   {
-    const double result = shared_scratch_->device_products->scoreJvpPrepared(
+    const double result = shared_scratch_->deviceProducts()->scoreJvpPrepared(
         shared_scratch_->device_positions.data(), parameter_version_);
     reportDeviceProducts();
     return result;
@@ -3441,7 +3497,7 @@ private:
   pf::DirectScoreResult evaluateRetainedScoreResponse(std::size_t sample) const
   {
     NativeTimerScope host_timer(phase_timers_.gpu_call);
-    const auto& response = shared_scratch_->device_products->scoreDeviceCoordinates(
+    const auto& response = shared_scratch_->deviceProducts()->scoreDeviceCoordinates(
         retainedScoreCoordinates(sample, 1), parameter_version_);
     reportDeviceProducts();
     pf::DirectScoreResult result;
@@ -3458,7 +3514,7 @@ private:
     if (hasDeviceProducts())
     {
       NativeTimerScope host_timer(phase_timers_.gpu_call);
-      const auto& response = shared_scratch_->device_products->score(
+      const auto& response = shared_scratch_->deviceProducts()->score(
           shared_scratch_->device_positions.data(), parameter_version_);
       reportDeviceProducts();
       pf::DirectScoreResult result;
@@ -3478,7 +3534,7 @@ private:
     if (hasDeviceProducts())
     {
       NativeTimerScope host_timer(phase_timers_.gpu_call);
-      auto& session = *shared_scratch_->device_products;
+      auto& session = *shared_scratch_->deviceProducts();
       const auto* positions = shared_scratch_->device_positions.data();
       const auto& response = session.kinetic(positions, drift, masses, parameter_version_);
       const auto& score = session.score(positions, parameter_version_);
@@ -3516,7 +3572,7 @@ private:
     if (hasDeviceProducts())
     {
       NativeTimerScope host_timer(phase_timers_.gpu_call);
-      const auto& response = shared_scratch_->device_products->gradientResponse(
+      const auto& response = shared_scratch_->deviceProducts()->gradientResponse(
           shared_scratch_->device_positions.data(), drift, masses, parameter_version_);
       reportDeviceProducts();
       return {response.data(), response.size()};
@@ -3534,12 +3590,32 @@ private:
   void reportDeviceProducts() const
   {
 #ifdef ENABLE_CUDA
-    if (!shared_scratch_->reported_device_products)
+    auto& scratch = *shared_scratch_;
+    const auto& session = *scratch.deviceProducts();
+    if (scratch.device_products_fp64)
+    {
+      const bool mixed = session.usesMixedAffineProducts();
+      auto& reported = mixed ? scratch.reported_mixed_products : scratch.reported_fp64_replay_products;
+      if (!reported)
+      {
+        app_log() << "  PsiFormer numerical device parameter product completed: parameter_version="
+                  << parameter_version_ << ", arithmetic=" << (mixed ? "strict_mixed_affine" : "explicit_FP64_replay")
+                  << ", epoch_generation=" << training_epoch_generation_;
+        if (const auto* reverse = session.mixedReverseStatistics())
+          app_log() << ", reverse_completed=" << reverse->completed << ", reverse_FP32_GEMMs=" << reverse->fp32_gemms
+                    << ", reverse_logical_cast_bytes=" << reverse->logicalTransferBytes();
+        if (const auto* jvp = session.mixedJvpStatistics())
+          app_log() << ", JVP_completed=" << jvp->completed << ", JVP_FP32_GEMMs=" << jvp->fp32_gemms;
+        app_log() << "; private numeric completion, whole-epoch admission remains pending" << std::endl;
+        reported = true;
+      }
+    }
+    else if (!scratch.reported_device_products)
     {
       app_log() << "  PsiFormer numerical device parameter product completed: parameter_version="
-                << parameter_version_ << ", kinetic_targets=" << shared_scratch_->device_products->kineticTargetCapacity()
+                << parameter_version_ << ", kinetic_targets=" << session.kineticTargetCapacity()
                 << ", CPU derivative fallback=no" << std::endl;
-      shared_scratch_->reported_device_products = true;
+      scratch.reported_device_products = true;
     }
 #endif
   }
@@ -3642,7 +3718,7 @@ private:
               std::copy_n(positions_.data() + point.sample * elements, elements, destination);
               std::copy_n(point.replacement_position.data(), 3, destination + 3 * point.electron);
             }
-            const auto& products = shared_scratch_->device_products->scoreJvpPreparedTile(
+            const auto& products = shared_scratch_->deviceProducts()->scoreJvpPreparedTile(
                 shared_scratch_->device_ecp_positions.data(), count, parameter_version_);
             // Consume the borrowed O(B) scalars before any subsequent session action.
             for (std::size_t local = 0; local < count; ++local)
@@ -3739,7 +3815,7 @@ private:
         return;
       if (append_energy && (count != 1 || active[0] != 0 || channels.size() != 3))
         throw std::invalid_argument("Resident ECP append requires the first ordered ENERGY C3 channel");
-      auto& session = *shared_scratch_->device_products;
+      auto& session = *shared_scratch_->deviceProducts();
       const auto transfer_before = session.transferSnapshot();
       const auto before_tiles = session.weightedScoreTiles();
       const auto before_configurations = session.weightedScoreConfigurations();
@@ -3943,6 +4019,14 @@ private:
     if (model_state_->model.p.version() != parameter_version_)
       throw std::runtime_error(
           "PsiFormer streaming derivative parameter version is stale");
+#ifdef ENABLE_CUDA
+    if (shared_scratch_->device_backend && shared_scratch_->device_backend->usesMixedAffineProducts() &&
+        shared_scratch_->device_backend->trainingEpochMode() == psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+      throw std::logic_error("Mixed real parameter products require an explicit native arithmetic epoch");
+    if (shared_scratch_->device_backend && training_epoch_generation_ !=
+        shared_scratch_->device_backend->trainingEpochGeneration())
+      throw std::runtime_error("PsiFormer streaming derivative arithmetic epoch is stale");
+#endif
   }
 
   /// Reject a direct result that was not produced from the bound read transaction.
@@ -4049,9 +4133,9 @@ private:
 #ifdef ENABLE_CUDA
     if (hasDeviceProducts())
     {
-      const auto& session = *shared_scratch_->device_products;
-      workspace_bytes = checkedBatchMemoryAdd(session.deviceWorkspaceBytes(), session.hostWorkspaceBytes(),
-                                               "PsiFormer device product host/device storage");
+      const auto& session = *shared_scratch_->deviceProducts();
+      workspace_bytes = checkedBatchMemoryAdd(shared_scratch_->deviceProductDeviceBytes(),
+          shared_scratch_->deviceProductHostBytes(), "PsiFormer device product host/device storage");
       workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
           checkedBatchMemoryMultiply(shared_scratch_->device_positions.capacity(), sizeof(double),
                                       "PsiFormer device provider coordinate staging"),
@@ -4113,6 +4197,11 @@ private:
     if (hasDeviceProducts())
     {
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_products.get()));
+      if (shared_scratch_->device_products_fp64)
+      {
+        mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_products_fp64.get()));
+        mixFingerprint(fingerprint, training_epoch_generation_);
+      }
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_positions.data()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_direction.data()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_ecp_chunk.data()));
@@ -4172,7 +4261,7 @@ private:
       if (hasDeviceProducts())
       {
         // Both values are current owned capacities of this exact session, not peaks or forecasts.
-        const auto device_bytes = shared_scratch_->device_products->deviceWorkspaceBytes();
+        const auto device_bytes = shared_scratch_->deviceProductDeviceBytes();
         shared_capacity_valid = device_bytes <= shared_host_bytes;
         if (shared_capacity_valid) shared_host_bytes -= device_bytes;
         else psiformer::memory::emit({"snapshot_failed", 0, "StreamingDerivative::shared_host_lane"});
@@ -4205,6 +4294,7 @@ private:
   std::shared_ptr<PsiFormerSharedState> model_state_;
   std::shared_ptr<const wftrain::StructuredParameterSchema> schema_;
   std::size_t parameter_version_ = 0;
+  std::size_t training_epoch_generation_ = 0;
   std::size_t batch_ordinal_     = 0;
   std::size_t sample_offset_     = 0;
   std::size_t sample_count_      = 0;
@@ -4292,8 +4382,12 @@ public:
           model_state_->numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer ECP products require the numerical device backend");
+      device_backend_ = backend;
+      training_epoch_generation_ = backend->trainingEpochGeneration();
       device_products_ = backend->prepareProductSession(
-          psiformer::device::ProductSessionProfile::SCORE_ONLY);
+          psiformer::device::ProductSessionProfile::SCORE_ONLY, 1,
+          backend->usesMixedAffineProducts() && backend->trainingEpochMode() ==
+              psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
       device_positions_.resize(3 * electron_count_);
     }
 #endif
@@ -4703,6 +4797,13 @@ private:
   /// Reject parameter publication after the consumer was prepared.
   void requireBoundVersion() const
   {
+#ifdef ENABLE_CUDA
+    if (device_backend_ && device_backend_->usesMixedAffineProducts() &&
+        device_backend_->trainingEpochMode() == psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+      throw std::logic_error("Mixed real parameter products require an explicit native arithmetic epoch");
+    if (device_backend_ && training_epoch_generation_ != device_backend_->trainingEpochGeneration())
+      throw std::runtime_error("PsiFormer ECP derivative arithmetic epoch is stale");
+#endif
     if (model_state_->model.p.version() != parameter_version_)
       throw std::runtime_error(
           "PsiFormer ECP consumer parameter version is stale");
@@ -4916,6 +5017,8 @@ private:
   wftrain::ParameterChunkPlan chunk_plan_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> score_workspace_;
 #ifdef ENABLE_CUDA
+  const psiformer::device::PreparedDeviceBatchBackend* device_backend_ = nullptr;
+  std::size_t training_epoch_generation_ = 0;
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products_;
   mutable std::vector<double> device_positions_;
 #endif
@@ -6876,8 +6979,9 @@ PsiFormerWF::PsiFormerWF(std::string name,
       throw std::invalid_argument("PsiFormer CPU target VGL training requires REAL FP64 OPEN or legacy torus Gamma metadata");
 #endif
   }
-  if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && enable_optimization)
-    throw std::invalid_argument("Mixed PsiFormer precision is inference-only; optimize=yes is unsupported");
+  if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      enable_optimization && !usesMixedAffineTraining())
+    throw std::invalid_argument("Mixed PsiFormer optimization requires the prepared GPU affine training route");
   if (!enable_optimization && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
   if (enable_optimization && model_state_->numerical_tile_backend &&
@@ -6929,6 +7033,7 @@ PsiFormerWF::PsiFormerWF(std::string name,
 
   observed_parameter_version_ = parameters_ref.version();
   accepted_parameter_version_ = observed_parameter_version_;
+  accepted_epoch_generation_ = currentArithmeticEpochGeneration();
   resizeAcceptedSpatialStorage(model_state_->model.ne);
   const std::size_t name_width = std::to_string(parameters_ref.size() - 1).size();
   std::vector<OptVariables::pair_type> selected_parameters;
@@ -7033,6 +7138,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       accepted_laplacian_(other.accepted_laplacian_),
       accepted_configuration_identity_(other.accepted_configuration_identity_),
       accepted_parameter_version_(other.accepted_parameter_version_),
+      accepted_epoch_generation_(other.accepted_epoch_generation_),
       accepted_state_requirement_(other.accepted_state_requirement_),
       current_sign_(other.current_sign_)
 {
@@ -7655,6 +7761,86 @@ bool PsiFormerWF::usesAcceleratorParameterProducts() const noexcept
   return model_state_->numerical_tile_backend != nullptr;
 }
 
+/// Identify the immutable mixed policy without consulting mutable epoch state.
+bool PsiFormerWF::usesMixedAffineTraining() const noexcept
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  return backend && backend->usesMixedAffineProducts();
+#else
+  return false;
+#endif
+}
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+namespace
+{
+/// Fence arithmetic selection while retaining both prepared product recipes.
+class PsiFormerNativeGpuTrainingEpoch final : public PsiFormerWF::GpuTrainingEpoch
+{
+public:
+  PsiFormerNativeGpuTrainingEpoch(std::shared_ptr<PsiFormerSharedState> state,
+      std::size_t expected_version, psiformer::PsiFormerGpuTrainingEpochMode mode)
+      : state_(std::move(state))
+  {
+    std::unique_lock model_lock(state_->mutex, std::try_to_lock);
+    if (!model_lock.owns_lock())
+      throw std::logic_error("Mixed real epoch requires an idle native model");
+    std::lock_guard factory_lock(state_->derivative_scratch_factory_mutex);
+    backend_ = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+        state_->numerical_tile_backend.get());
+    if (!backend_ || !backend_->usesMixedAffineProducts() || state_->model.p.version() != expected_version ||
+        state_->resident_device_authority_enabled || state_->planned_single_transaction_count.load() ||
+        state_->planned_selected_transaction_count.load())
+      throw std::logic_error("Mixed real epoch requires an exact-version idle C1 native family");
+
+    // Escaped inactive operators may retain their lanes; generation fencing makes
+    // them unusable after this boundary without retiring their borrowed outputs.
+    std::array<std::shared_ptr<PsiFormerDerivativeScratch>, 4> lanes{
+        state_->derivative_scratch.lock(), state_->score_derivative_scratch.lock(),
+        state_->score_crowd_scratch[0].lock(), state_->score_crowd_scratch[1].lock()};
+    std::array<std::unique_lock<std::recursive_mutex>, 4> lane_locks;
+    for (std::size_t i = 0; i < lanes.size(); ++i)
+    {
+      if (!lanes[i]) continue;
+      bool duplicate = false;
+      for (std::size_t j = 0; j < i; ++j) duplicate |= lanes[j] == lanes[i];
+      if (duplicate) continue;
+      lane_locks[i] = std::unique_lock<std::recursive_mutex>(lanes[i]->execution_mutex, std::try_to_lock);
+      if (!lane_locks[i].owns_lock() || lanes[i]->active)
+        throw std::logic_error("Mixed real epoch cannot replace a leased product recipe");
+    }
+    generation_ = backend_->enterTrainingEpoch(expected_version, mode);
+  }
+
+  /// Restore only arithmetic selection; all mutable owners retain their capacity.
+  ~PsiFormerNativeGpuTrainingEpoch() override
+  {
+    std::unique_lock model_lock(state_->mutex);
+    std::lock_guard factory_lock(state_->derivative_scratch_factory_mutex);
+    backend_->leaveTrainingEpoch(generation_);
+  }
+
+private:
+  std::shared_ptr<PsiFormerSharedState> state_;
+  const psiformer::device::PreparedDeviceBatchBackend* backend_ = nullptr;
+  std::size_t generation_ = 0;
+};
+} // namespace
+#endif
+
+/// Enter one explicit training recipe before physical and derivative preparation.
+std::unique_ptr<PsiFormerWF::GpuTrainingEpoch> PsiFormerWF::enterGpuTrainingEpoch(
+    std::size_t expected_version, psiformer::PsiFormerGpuTrainingEpochMode mode)
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  return std::make_unique<PsiFormerNativeGpuTrainingEpoch>(model_state_, expected_version, mode);
+#else
+  throw std::invalid_argument("Mixed real GPU training epochs require a REAL accelerator build");
+#endif
+}
+
 /// Read the prepared GPU limit without consuming HOST leaves or mutable configuration.
 std::size_t PsiFormerWF::activeAcceleratorInferenceCrowdCapacity() const
 {
@@ -8264,6 +8450,8 @@ bool PsiFormerWF::usesDeviceAffineStatistics() const noexcept
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   const char* enabled = std::getenv("PSIFORMER_GPU_KFAC_AFFINE");
+  if (usesMixedAffineTraining())
+    return !enabled || std::strcmp(enabled, "1") == 0;
   return enabled && std::strcmp(enabled, "1") == 0 && usesAcceleratorParameterProducts() &&
       !model_state_->execution_plan.environment().periodic_profile;
 #else
@@ -8337,12 +8525,15 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
     throw std::invalid_argument("Device affine collection requires enabled statistics and samples");
   // C2 already retains score lane0. Reuse it over the complete rank population
   // rather than creating a third complete-product owner just for affine sums.
-  const bool independent_score = activeAcceleratorInferenceCrowdCapacity() == 2;
+  const bool independent_score = usesMixedAffineTraining() || activeAcceleratorInferenceCrowdCapacity() == 2;
   auto scratch = acquireDerivativeScratch(*model_state_, parameterSchema().parameterCount(), 1, independent_score);
   PsiFormerDerivativeLease scratch_lease(*scratch);
   PsiFormerReadTransaction transaction(*model_state_);
   const auto& state = transaction.state();
-  if (!scratch->device_products || expected_version != transaction.parameterVersion() ||
+  if (usesMixedAffineTraining() && scratch->device_backend->trainingEpochMode() ==
+      psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+    throw std::logic_error("Mixed affine statistics require an explicit native arithmetic epoch");
+  if (!scratch->deviceProducts() || expected_version != transaction.parameterVersion() ||
       registry.parameterSchema().fingerprint() != parameterSchema().fingerprint())
     throw std::invalid_argument("Device affine collection has an incompatible model generation");
   const auto descriptors = deviceAffineDescriptors(state.execution_plan, registry);
@@ -8350,7 +8541,7 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
   if (!maximum_numeric_bytes || required > maximum_numeric_bytes)
     throw std::length_error("Device affine collection exceeds its remaining numeric budget");
   using Owner = psiformer::device::PreparedDeviceAffineStatistics;
-  auto factors = scratch->device_products->prepareAffineStatistics(descriptors,
+  auto factors = scratch->deviceProducts()->prepareAffineStatistics(descriptors,
       gaussian_curvature,
       Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), transaction.parameterVersion());
   std::vector<std::pair<std::size_t, std::size_t>> fallback_ranges;
@@ -8385,7 +8576,7 @@ void PsiFormerWF::accumulateDeviceAffineStatistics(const std::vector<const Parti
     sink.beginSample();
     try
     {
-      const auto& score = scratch->device_products->affineFallbackScore(scratch->device_positions.data(),
+      const auto& score = scratch->deviceProducts()->affineFallbackScore(scratch->device_positions.data(),
           *factors, fallback_ranges, transaction.parameterVersion());
       sink.addFallbackScore(score);
       auto prepared = factors->prepareSampleCommit();
@@ -8499,7 +8690,10 @@ std::string PsiFormerWF::trainingConfigurationFingerprint() const
   return "real-training-model-v1/" + system_kind_ + "/" + parameterSchema().fingerprint() + "/" +
       modelFingerprint(state.model, state.model_origin, state.initialization_profile, state.initialization_seed,
                        state.execution_plan.environment(), state.twist_phase.reduced, state.twist_phase.cartesian,
-                       state.physical_source, state.physical_species);
+                       state.physical_source, state.physical_species) +
+      (state.precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
+          ? "/arithmetic/" + std::string(psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1) +
+              "/jvp/fp32_affine_directional_v1" : "");
 }
 
 /// Bind composite models to neural physics without binding an import pathname or random seed.
@@ -8515,6 +8709,8 @@ void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
                                      wftrain::AffineScoreObserver& observer,
                                      std::vector<double>& score) const
 {
+  if (usesMixedAffineTraining())
+    throw std::invalid_argument("Mixed native affine observations require admitted DEVICE statistics");
   PsiFormerReadTransaction transaction(*model_state_);
   const auto& state = transaction.state();
   if (state.direct_score_mode != DirectBackendMode::DIRECT)
@@ -8593,7 +8789,7 @@ void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
       if (!psiformer::determinant::isFiniteReal(coordinate))
         throw std::invalid_argument("PsiFormer orbital forward coordinates must be finite");
 #ifdef ENABLE_CUDA
-      if (scratch->device_products)
+      if (scratch->deviceProducts())
       {
         scratch->device_positions[3 * electron + dimension] = coordinate;
         continue;
@@ -8603,12 +8799,12 @@ void PsiFormerWF::evaluateOrbitalValues(const ParticleSet& particles,
     }
   }
 #ifdef ENABLE_CUDA
-  if (scratch->device_products)
+  if (scratch->deviceProducts())
   {
     const auto count = checkedBatchMemoryMultiply(shape.determinants,
         checkedBatchMemoryMultiply(ne, ne, "PsiFormer orbital forward matrix"), "PsiFormer orbital forward extent");
     orbitals.resize(count);
-    scratch->device_products->rawOrbitalValues(scratch->device_positions.data(), orbitals.data(), count,
+    scratch->deviceProducts()->rawOrbitalValues(scratch->device_positions.data(), orbitals.data(), count,
                                                expected_version);
     return;
   }
@@ -8650,7 +8846,7 @@ double PsiFormerWF::evaluateOrbitalMSE(const ParticleSet& particles,
       if (!psiformer::determinant::isFiniteReal(coordinate))
         throw std::invalid_argument("PsiFormer orbital-MSE coordinates must be finite");
 #ifdef ENABLE_CUDA
-      if (scratch->device_products)
+      if (scratch->deviceProducts())
       {
         scratch->device_positions[3 * electron + dimension] = coordinate;
         continue;
@@ -8661,9 +8857,9 @@ double PsiFormerWF::evaluateOrbitalMSE(const ParticleSet& particles,
   }
 
 #ifdef ENABLE_CUDA
-  if (scratch->device_products)
+  if (scratch->deviceProducts())
   {
-    const double loss = scratch->device_products->orbitalMse(scratch->device_positions.data(),
+    const double loss = scratch->deviceProducts()->orbitalMse(scratch->device_positions.data(),
         target.data(), target.size(), gradient.data(), gradient.size(), expected_version);
     if (!scratch->reported_device_products)
     {
@@ -10797,6 +10993,7 @@ void PsiFormerWF::invalidateParameterCaches(std::size_t parameter_version)
   accepted_value_valid_             = false;
   accepted_configuration_identity_ = 0;
   accepted_parameter_version_      = parameter_version;
+  accepted_epoch_generation_ = currentArithmeticEpochGeneration();
   accepted_state_requirement_      = AcceptedStateRequirement::INVALID;
   accepted_gradient_               = ValueType(0);
   accepted_laplacian_              = ValueType(0);
@@ -10807,7 +11004,8 @@ void PsiFormerWF::invalidateParameterCaches(std::size_t parameter_version)
 // Lazily invalidate clone-local caches after another clone updates the model.
 void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
 {
-  if (observed_parameter_version_ != parameter_version)
+  if (observed_parameter_version_ != parameter_version ||
+      accepted_epoch_generation_ != currentArithmeticEpochGeneration())
   {
     // Legacy multiwalker proposals use the same origins but do not carry a
     // hard-plan binding.  Only a plan-bound proposal participates in the
@@ -10916,12 +11114,25 @@ void PsiFormerWF::resizeAcceptedSpatialStorage(std::size_t electron_count)
   accepted_state_requirement_ = AcceptedStateRequirement::INVALID;
 }
 
+// Read immutable backend identity and the atomic arithmetic generation only.
+std::size_t PsiFormerWF::currentArithmeticEpochGeneration() const noexcept
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  return backend ? backend->trainingEpochGeneration() : 0;
+#else
+  return 0;
+#endif
+}
+
 // Check every mutable part of the accepted-state key before cache reuse.
 bool PsiFormerWF::acceptedStateMatches(const ParticleSet& particles,
                                        std::size_t parameter_version,
                                        AcceptedStateRequirement requirement) const
 {
   return accepted_value_valid_ && accepted_parameter_version_ == parameter_version &&
+      accepted_epoch_generation_ == currentArithmeticEpochGeneration() &&
       accepted_configuration_identity_ == configurationIdentity(particles) &&
       static_cast<std::uint64_t>(accepted_state_requirement_) >= static_cast<std::uint64_t>(requirement);
 }
@@ -11010,6 +11221,8 @@ bool PsiFormerWF::canReuseImmediateFullSpatialReplay(const ParticleSet& live,
                                                     const double& expected_log,
                                                     const double& expected_phase) const
 {
+  if (usesMixedAffineTraining())
+    return false;
 #if defined(QMC_COMPLEX) || defined(MIXED_PRECISION)
   return false;
 #else
@@ -12272,7 +12485,9 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
   }
 
   const auto decoded_requirement = static_cast<AcceptedStateRequirement>(requirement);
-  if (decoded_requirement != AcceptedStateRequirement::FULL_SPATIAL ||
+  // The persistent schema has no arithmetic stamp; mixed readers must refresh.
+  if (usesMixedAffineTraining() ||
+      decoded_requirement != AcceptedStateRequirement::FULL_SPATIAL ||
       version != static_cast<std::uint64_t>(parameter_version) ||
       configuration != configurationIdentity(particles))
   {
@@ -12284,6 +12499,7 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
   log_value_                      = LogValue(logabs, phase);
   accepted_configuration_identity_ = configuration;
   accepted_parameter_version_      = static_cast<std::size_t>(version);
+  accepted_epoch_generation_ = currentArithmeticEpochGeneration();
   accepted_state_requirement_      = decoded_requirement;
   accepted_value_valid_            = true;
   clearProposalState();
@@ -13738,6 +13954,7 @@ void PsiFormerWF::publishCpuTargetFullVGL(ParticleSet::ParticleGradient& gradien
   log_value_ = proposed_log_value_;
   accepted_configuration_identity_ = proposed_configuration_identity_;
   accepted_parameter_version_ = proposed_parameter_version_;
+  accepted_epoch_generation_ = currentArithmeticEpochGeneration();
   accepted_state_requirement_ = AcceptedStateRequirement::FULL_SPATIAL;
   accepted_value_valid_ = true;
   clearProposalState();
@@ -14319,6 +14536,7 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
     }
     accepted_configuration_identity_ = configurationIdentity(p);
     accepted_parameter_version_      = transaction.parameterVersion();
+    accepted_epoch_generation_ = currentArithmeticEpochGeneration();
     accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
     accepted_value_valid_            = true;
     clearProposalState();
@@ -14387,7 +14605,7 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
   // Match evaluation lock order: never wait for the lane while holding a model read.
   PsiFormerDerivativeLease lease(*scratch);
   PsiFormerReadTransaction state_lock(*model_state_);
-  scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
+  scratch->deviceProducts()->prepareScoreContractions(3, model_state_->model.p.version(), c3);
   app_log() << "Resident ENERGY bridge admitted: C3 device bytes=" << c3 << ", norm device bytes=" << norm
             << ", C3 status host bytes=" << c3 - 48 * p << ", norm host bytes=" << norm
             << "; cap covers C3+norm device payload ONLY; existing Adam, model/tapes, host compatibility/canonical/coefficients, sampling, vendor and checkpoints excluded" << std::endl;
@@ -14414,9 +14632,9 @@ std::shared_ptr<PsiFormerGpuScoreLaneAnchor> PsiFormerWF::retainGpuScoreLane(std
     throw std::logic_error("Score lane anchor preparation requires an idle numerical lane");
   const auto image = backend->currentImage();
   app_log() << "PsiFormer score lane driver anchor: crowd=" << crowd_ordinal << " lane=" << lane.get()
-            << " session=" << lane->device_products.get() << " active_image=" << image.get() << " metadata_family=" << image->metadataFamily().get()
-            << " parameter_version=" << image->version() << " DEVICE_bytes=" << lane->device_products->deviceWorkspaceBytes()
-            << " HOST_bytes=" << lane->device_products->hostWorkspaceBytes()
+            << " session=" << lane->deviceProducts() << " active_image=" << image.get() << " metadata_family=" << image->metadataFamily().get()
+            << " parameter_version=" << image->version() << " DEVICE_bytes=" << lane->deviceProducts()->deviceWorkspaceBytes()
+            << " HOST_bytes=" << lane->deviceProducts()->hostWorkspaceBytes()
             << "; process_local_identity; caller snapshots/later HOST outputs/shared image excluded" << std::endl;
   return std::shared_ptr<PsiFormerGpuScoreLaneAnchor>(new PsiFormerGpuScoreLaneAnchor(
       model_state_->numerical_tile_backend, std::move(lane)));
@@ -14449,7 +14667,7 @@ std::size_t PsiFormerWF::prepareResidentScoreAdam(std::size_t budget) const
   }
   PsiFormerDerivativeLease lease(*scratch);
   PsiFormerReadTransaction read(*model_state_);
-  scratch->device_products->prepareScoreContractions(2, model_state_->model.p.version(), c2);
+  scratch->deviceProducts()->prepareScoreContractions(2, model_state_->model.p.version(), c2);
   app_log() << "Resident score Adam bridge admitted: C2_device_bytes=" << c2
             << " norm_device_bytes=" << norm << " derivative_response_mask=0"
             << " sampling=host local_energy=host parameter_publication=host"
@@ -14483,7 +14701,7 @@ std::size_t PsiFormerWF::prepareResidentECPObservation(std::size_t samples, cons
       system_kind_ != "pseudopotential" || batch_execution_plan_ || !model_state_->resident_score_adam_scratch ||
       model_state_->execution_plan.environment().boundary != psiformer::BoundaryCondition::OPEN ||
       model_state_->resident_device_authority_enabled ||
-      model_state_->resident_score_adam_scratch->device_products->retainedCoordinateBudget())
+      model_state_->resident_score_adam_scratch->deviceProducts()->retainedCoordinateBudget())
     throw std::invalid_argument("ECP observation requires real OPEN C1 HOST-authority score Adam and explicit finite cap");
   const auto cost = psiformer::device::PreparedDeviceECPObservation::estimate(samples,
       model_state_->execution_plan.modelShape().electrons());
@@ -14518,11 +14736,11 @@ void PsiFormerWF::bindResidentECPObservation(const RefVectorWithLeader<WaveFunct
   if (!resource.ecp_observation)
     throw std::invalid_argument("ECP observation has no completed native FULL capture");
   const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(*model_state_->numerical_tile_backend);
-  const auto before = source->shared_scratch_->device_products->transferSnapshot();
+  const auto before = source->shared_scratch_->deviceProducts()->transferSnapshot();
   backend.sealECPObservation(resource.batch_workspace->numericalSamplingWorkspace(), *resource.ecp_observation,
       grid, physical_source, source->positions_, energies, kinetic);
   source->bindECPObservation(resource.ecp_observation);
-  const auto after = source->shared_scratch_->device_products->transferSnapshot();
+  const auto after = source->shared_scratch_->deviceProducts()->transferSnapshot();
   app_log() << "Resident ECP observation sealed: version=" << derivative.parameterVersion() << " grid=" << grid
             << " coordinate_generation=" << resource.ecp_observation->coordinateGeneration()
             << " samples=" << derivative.sampleCount() << " DEVICE_owner_bytes=" << resource.ecp_observation->deviceBytes()
@@ -14616,7 +14834,7 @@ void PsiFormerWF::prepareResidentOpenObservation(const ParticleSet& electrons, c
       "Resident temporary masses");
   if (host_cap <= temporary_bytes)
     throw std::length_error("Resident open cold HOST cap does not cover temporary mass staging");
-  scratch->device_products->prepareResidentOpenEnergy(inverse_masses,
+  scratch->deviceProducts()->prepareResidentOpenEnergy(inverse_masses,
       read.state().model.cfg.charges.x, device_cap, host_cap - temporary_bytes);
 #else
   throw std::invalid_argument("Resident open observation requires a real GPU build");
@@ -14651,7 +14869,7 @@ std::unique_ptr<PsiFormerWF::ResidentOpenObservationBatch> PsiFormerWF::observeR
       throw std::invalid_argument("Resident observation contains a foreign component");
     const auto coordinates = backend.residentAcceptedCoordinates(
         resource.batch_workspace->numericalSamplingWorkspace(), sample, result->version);
-    result->observations.push_back(scratch->device_products->observeResidentOpenEnergy(coordinates, result->version));
+    result->observations.push_back(scratch->deviceProducts()->observeResidentOpenEnergy(coordinates, result->version));
   }
   return result;
 #else
@@ -14707,7 +14925,7 @@ double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivative
     throw std::invalid_argument("Resident ENERGY requires this provider's current T/EO/O kinetic batch");
   double norm = 0;
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
-    auto& session = *source->shared_scratch_->device_products;
+    auto& session = *source->shared_scratch_->deviceProducts();
     const auto before = session.transferSnapshot(); // Seed/producer/finish/checkpoint traffic is OUTSIDE.
     norm = session.consumeEnergyAdam(adam, derivative.parameterVersion(), generation,
         parameters, weight, energy, beta1, beta2, correction1, correction2, epsilon, candidate);
@@ -14749,7 +14967,7 @@ double PsiFormerWF::consumeResidentScoreAdam(const wftrain::StreamingDerivativeO
     throw std::invalid_argument("Resident score Adam requires ordered energy-weighted-score/weighted-score C2 channels");
   double norm = 0;
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
-    auto& session = *source->shared_scratch_->device_products;
+    auto& session = *source->shared_scratch_->deviceProducts();
     const auto before = session.transferSnapshot();
     norm = session.consumeScoreAdam(adam, derivative.parameterVersion(), generation,
         parameters, weight, transformed_mean, beta1, beta2, correction1, correction2, epsilon, candidate);
@@ -14864,7 +15082,7 @@ void PsiFormerWF::residentDeviceAuthorityTransferWindow(const char* label, bool 
   const auto& scratch = model_state_->resident_energy_scratch;
   if (!model_state_->resident_device_authority_enabled || !scratch || !label)
     throw std::logic_error("Resident DEVICE transfer window requires active authority");
-  const auto now = scratch->device_products->transferSnapshot();
+  const auto now = scratch->deviceProducts()->transferSnapshot();
   if (begin)
   {
     if (model_state_->resident_transfer_window_active)
@@ -14936,7 +15154,7 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeRes
   proposal->adam = adam;
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr,
       [&](std::size_t generation) {
-        proposal->candidate = source->shared_scratch_->device_products->consumeEnergyAdamDeviceCandidate(
+        proposal->candidate = source->shared_scratch_->deviceProducts()->consumeEnergyAdamDeviceCandidate(
             *adam, derivative.parameterVersion(), generation, weight, energy, beta1, beta2,
             correction1, correction2, epsilon, snapshot_device_cap, true);
       }, true);
@@ -14966,7 +15184,7 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> PsiFormerWF::consumeRes
   auto proposal = std::make_unique<ResidentAuthorityProposal>();
   proposal->state = model_state_;
   proposal->adam = adam;
-  auto& session = *batch->scratch->device_products;
+  auto& session = *batch->scratch->deviceProducts();
   const auto generation = session.beginScoreContraction(3, batch->version,
       psiformer::device::ScoreContractionRole::ENERGY_T_EO_O);
   double energy = 0;
@@ -15069,7 +15287,7 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceSRProposal> PsiFormerWF::consumeResid
   if (!proposal->backend)
     throw std::invalid_argument("DEVICE SR authority requires the admitted GPU backend");
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
-    auto& session = *proposal->scratch->device_products;
+    auto& session = *proposal->scratch->deviceProducts();
     if (!model_state_->resident_energy_sr_workspace)
     {
       if (model_state_->resident_energy_sr_workspace_started)
@@ -15214,7 +15432,7 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
   model_state_->resident_energy_sr_reuse = reuse;
   if (reuse)
     app_log() << "Resident ENERGY SR reuse=on: persistent workspace overlaps successor image publication; aggregate peak may increase beyond named caps" << std::endl;
-  scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
+  scratch->deviceProducts()->prepareScoreContractions(3, model_state_->model.p.version(), c3);
   std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
   model_state_->resident_energy_scratch = std::move(scratch);
   return incremental;
@@ -15239,9 +15457,9 @@ void PsiFormerWF::releaseResidentEnergySRWorkspace() const noexcept
     std::lock_guard execution_lock(scratch->execution_mutex);
     if (!model_state_->resident_energy_sr_workspace)
       return;
-    const auto before = scratch->device_products->transferSnapshot();
+    const auto before = scratch->deviceProducts()->transferSnapshot();
     model_state_->resident_energy_sr_workspace.reset();
-    const auto after = scratch->device_products->transferSnapshot();
+    const auto after = scratch->deviceProducts()->transferSnapshot();
     app_log() << "Resident ENERGY SR workspace release cached_owner=1 free_calls=" << after.free_calls - before.free_calls
               << " allocation_calls=" << after.allocation_calls - before.allocation_calls << std::endl;
   }
@@ -15276,7 +15494,7 @@ wftrain::ResidentEnergySRDiagnostics PsiFormerWF::consumeResidentEnergySR(
       frozen.emplace_back(block.offset, block.count);
   wftrain::ResidentEnergySRDiagnostics diagnostics;
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
-    auto& session = *source->shared_scratch_->device_products;
+    auto& session = *source->shared_scratch_->deviceProducts();
     const auto cold = session.transferSnapshot();
     using Owner = psiformer::device::PreparedDevicePcg;
     const bool reuse = model_state_->resident_energy_sr_reuse;
@@ -15574,6 +15792,7 @@ void PsiFormerWF::mw_evaluateLog(
         }
         component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
         component.accepted_parameter_version_      = parameter_version;
+        component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
         component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
         component.accepted_value_valid_            = true;
         component.clearProposalState();
@@ -15643,6 +15862,7 @@ void PsiFormerWF::mw_evaluateLog(
       }
       component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
       component.accepted_parameter_version_      = parameter_version;
+      component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
       component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
       component.accepted_value_valid_            = true;
       component.clearProposalState();
@@ -15937,6 +16157,7 @@ void PsiFormerWF::mw_evaluateLog(
       component.accepted_configuration_identity_ =
           resource.configuration_identities[lane];
       component.accepted_parameter_version_ = parameter_version;
+      component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
       component.accepted_state_requirement_ =
           AcceptedStateRequirement::FULL_SPATIAL;
       component.observed_parameter_version_ = parameter_version;
@@ -17060,6 +17281,7 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
         component.log_value_                      = component.proposed_log_value_;
         component.accepted_configuration_identity_ = component.proposed_configuration_identity_;
         component.accepted_parameter_version_      = parameter_version;
+        component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
         component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
         component.accepted_value_valid_            = true;
       }
@@ -17236,6 +17458,7 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
         component.accepted_configuration_identity_ =
             component.proposed_configuration_identity_;
         component.accepted_parameter_version_ = parameter_version;
+        component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
         component.accepted_state_requirement_ =
             AcceptedStateRequirement::FULL_SPATIAL;
         component.observed_parameter_version_ = parameter_version;
@@ -17351,6 +17574,7 @@ void PsiFormerWF::mw_recompute(
           twistPhaseAngle(transaction.state(), p_list[walker]));
       component.accepted_configuration_identity_ = staged_configuration[selected];
       component.accepted_parameter_version_      = parameter_version;
+      component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
       component.accepted_state_requirement_ = preserve_spatial[selected]
           ? AcceptedStateRequirement::FULL_SPATIAL
           : AcceptedStateRequirement::VALUE_ONLY;
@@ -17546,6 +17770,7 @@ void PsiFormerWF::mw_recompute(
       component.accepted_configuration_identity_ =
           resource.configuration_identities[slot];
       component.accepted_parameter_version_ = parameter_version;
+      component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
       component.accepted_state_requirement_ =
           resource.preservation_flags[slot] != 0
           ? AcceptedStateRequirement::FULL_SPATIAL
@@ -19134,6 +19359,7 @@ void PsiFormerWF::acceptMove(ParticleSet& particles, int particle_index, bool)
     accepted_value_valid_ = true;
     accepted_configuration_identity_ = proposed_configuration_identity_;
     accepted_parameter_version_      = observed_parameter_version_;
+    accepted_epoch_generation_ = currentArithmeticEpochGeneration();
     accepted_state_requirement_      = AcceptedStateRequirement::VALUE_ONLY;
   }
   clearProposalState();
@@ -19212,6 +19438,7 @@ void PsiFormerWF::mw_accept_rejectMove(
         component.accepted_value_valid_ = true;
         component.accepted_configuration_identity_ = component.proposed_configuration_identity_;
         component.accepted_parameter_version_      = parameter_version;
+        component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
         component.accepted_state_requirement_      = AcceptedStateRequirement::VALUE_ONLY;
       }
     }
@@ -19408,6 +19635,7 @@ void PsiFormerWF::mw_accept_rejectMove(
         component.accepted_configuration_identity_ =
             component.proposed_configuration_identity_;
         component.accepted_parameter_version_ = proposal_version;
+        component.accepted_epoch_generation_ = component.currentArithmeticEpochGeneration();
         component.accepted_state_requirement_ =
             AcceptedStateRequirement::VALUE_ONLY;
       }
@@ -19516,7 +19744,8 @@ void PsiFormerWF::copyFromBufferPlanned(ParticleSet& particles,
   const auto publish = [&]() noexcept {
     // The live marker is withdrawn before any accepted payload changes.
     accepted_value_valid_ = false;
-    if (phase_b.classification ==
+    // A legacy buffer cannot establish which same-version arithmetic produced G/L.
+    if (!usesMixedAffineTraining() && phase_b.classification ==
         WalkerBufferRecordClassification::RESTORABLE)
     {
       static_assert(std::is_trivially_copyable_v<GradType>);
@@ -19529,6 +19758,7 @@ void PsiFormerWF::copyFromBufferPlanned(ParticleSet& particles,
       log_value_ = LogValue(phase_b.log_magnitude, phase_b.phase);
       accepted_configuration_identity_ = phase_b.configuration_identity;
       accepted_parameter_version_ = parameter_version;
+      accepted_epoch_generation_ = currentArithmeticEpochGeneration();
       accepted_state_requirement_ = AcceptedStateRequirement::FULL_SPATIAL;
       observed_parameter_version_ = parameter_version;
       // Publish validity only after the complete payload and key are live.
@@ -19542,6 +19772,7 @@ void PsiFormerWF::copyFromBufferPlanned(ParticleSet& particles,
       log_value_ = LogValue(0);
       accepted_configuration_identity_ = 0;
       accepted_parameter_version_ = parameter_version;
+      accepted_epoch_generation_ = currentArithmeticEpochGeneration();
       accepted_state_requirement_ = AcceptedStateRequirement::INVALID;
       observed_parameter_version_ = parameter_version;
     }

@@ -384,6 +384,20 @@ public:
   /// Report the prepared numerical backend used for this clone family's products.
   bool usesAcceleratorParameterProducts() const noexcept override;
 
+  /// Identify the immutable mixed affine training policy of this clone family.
+  bool usesMixedAffineTraining() const noexcept;
+
+  /// Own one explicit native arithmetic epoch without changing the model image.
+  class GpuTrainingEpoch
+  {
+  public:
+    virtual ~GpuTrainingEpoch() = default;
+  };
+
+  /// Select strict mixed execution or whole-epoch FP64 replay at an idle version.
+  std::unique_ptr<GpuTrainingEpoch> enterGpuTrainingEpoch(
+      std::size_t expected_version, psiformer::PsiFormerGpuTrainingEpochMode mode);
+
   /// Report the authoritative prepared GPU inference capacity; CPU reports zero.
   std::size_t activeAcceleratorInferenceCrowdCapacity() const;
 
@@ -1728,6 +1742,9 @@ private:
   /// Resize clone-local accepted G/L storage to one runtime electron configuration.
   void resizeAcceptedSpatialStorage(std::size_t electron_count);
 
+  /// Read the native arithmetic epoch without changing the model or owners.
+  std::size_t currentArithmeticEpochGeneration() const noexcept;
+
   /// Return whether accepted state satisfies an identity, version, and product requirement.
   bool acceptedStateMatches(const ParticleSet& particles,
                             std::size_t parameter_version,
@@ -1934,6 +1951,8 @@ private:
   std::uint64_t accepted_configuration_identity_ = 0;
   /// Parameter version under which the accepted products were evaluated.
   std::size_t accepted_parameter_version_ = 0;
+  /// Distinguish same-version accepted products from different arithmetic recipes.
+  std::size_t accepted_epoch_generation_ = 0;
   /// Strongest accepted product family currently available in clone-local storage.
   AcceptedStateRequirement accepted_state_requirement_ = AcceptedStateRequirement::INVALID;
   /// Accepted and proposed sign/log-value state used by particle-by-particle moves.

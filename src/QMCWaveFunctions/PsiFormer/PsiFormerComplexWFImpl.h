@@ -269,14 +269,14 @@ struct PsiFormerComplexWF::Impl
     /// Check the complete owner sum before allocating the image or either graph.
     static std::unique_ptr<GpuLane> prepare(const psiformer::PsiFormerExecutionPlan& plan,
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
-        std::size_t limit, std::size_t capacity)
+        std::size_t limit, std::size_t capacity, bool mixed_inference = false)
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
       return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
                            configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse(),
                            configuredHeadDeterminantBatch(), configuredFullInverseColumns(), configuredTargetFactorReuse(),
                            psiformer::device::configuredPeriodicValueGeometryTiled(),
-                           psiformer::device::configuredComplexTargetColdCooperativeLu());
+                           psiformer::device::configuredComplexTargetColdCooperativeLu(), mixed_inference);
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
@@ -286,13 +286,17 @@ struct PsiFormerComplexWF::Impl
         std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image = {},
         std::size_t virtual_capacity = 0, std::size_t trace_targets = 0, bool virtual_envelope_reuse = false,
         bool head_determinant_batch = false, bool full_inverse_columns = false, bool target_factor_reuse = false,
-        bool periodic_value_tiling = false, bool target_cold_cooperative_lu = false)
+        bool periodic_value_tiling = false, bool target_cold_cooperative_lu = false, bool mixed_inference = false,
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters = {})
     {
       using namespace psiformer::device;
       // Freeze one effective choice for every simultaneous ordinary VALUE owner.
+      if (shared_mixed_parameters && (!mixed_inference || !shared_image ||
+          shared_mixed_parameters->modelImage().get() != shared_image.get()))
+        throw std::invalid_argument("Shared paired affine cache requires its exact inference image");
       const bool tiled_requested = periodic_value_tiling;
       const auto& environment = plan.environment();
-      periodic_value_tiling = periodic_value_tiling &&
+      periodic_value_tiling = periodic_value_tiling && !mixed_inference &&
           plan.modelShape().electrons() >= 64 && environment.fixed_nuclei &&
           !environment.periodic_profile &&
           environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
@@ -305,12 +309,15 @@ struct PsiFormerComplexWF::Impl
                   << "; unchanged_baseline_owners=yes" << std::endl;
         return prepareFrozen(plan, parameters, nuclei, version, limit, preparation, capacity, shared_image,
             virtual_capacity, trace_targets, virtual_envelope_reuse, head_determinant_batch,
-            full_inverse_columns, target_factor_reuse, false, target_cold_cooperative_lu);
+            full_inverse_columns, target_factor_reuse, false, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters);
       };
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
       if (!capacity || capacity == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU tile capacity must be positive and finite");
+      if (mixed_inference && (preparation.max_targets || virtual_capacity || virtual_envelope_reuse ||
+          head_determinant_batch || full_inverse_columns || target_factor_reuse))
+        throw std::invalid_argument("Paired mixed inference requires ordinary FULL without virtual/cache/head/inverse tuning");
       if (virtual_envelope_reuse && !virtual_capacity)
         throw std::invalid_argument("Virtual envelope reuse requires the separate complex virtual tile owner");
       if (target_factor_reuse && !preparation.max_targets)
@@ -345,6 +352,14 @@ struct PsiFormerComplexWF::Impl
         throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
       auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
                                                              "Complex GPU lane bytes overflow");
+      const auto mixed_cost = mixed_inference ? PreparedDeviceMixedComplexInference::required(plan, capacity, trace_targets, !shared_mixed_parameters) :
+          PreparedDeviceMixedComplexInference::Cost{};
+      if (mixed_inference)
+      {
+        PreparedDeviceMixedComplexInference::validateConfiguration(plan.environment(), false, preparation.max_targets);
+        bytes = PreparedDeviceMixedComplexInference::admittedCost(plan, capacity, limit, trace_targets,
+            !shared_mixed_parameters).device_bytes;
+      }
       if (bytes > limit)
       {
         if (periodic_value_tiling)
@@ -360,6 +375,9 @@ struct PsiFormerComplexWF::Impl
                   psiformer::spatial_detail::checkedProduct(capacity, plan.modelShape().electrons(), "Complex GPU staging overflow"),
                   "Complex GPU staging overflow"),
               "Complex GPU staging overflow"), "Complex GPU host bytes overflow");
+      if (mixed_inference)
+        host = psiformer::spatial_detail::checkedAdd(host - value.host_bytes - spatial.host_bytes,
+            mixed_cost.host_bytes, "Paired mixed HOST numeric bytes overflow");
       if (virtual_capacity)
       {
         if (plan.environment().periodic_profile || !configuredDeviceMemoryAdmission().limit_bytes)
@@ -410,8 +428,8 @@ struct PsiFormerComplexWF::Impl
         }
         return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
             preparation, work, bytes, host, capacity, shared_image, virtual_capacity, trace_targets,
-            virtual_envelope_reuse, head_determinant_batch, full_inverse_columns,
-            target_factor_reuse, periodic_value_tiling, target_cold_cooperative_lu));
+            virtual_envelope_reuse, head_determinant_batch, full_inverse_columns, target_factor_reuse,
+            periodic_value_tiling, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters));
       }
       catch (const std::length_error&)
       {
@@ -437,23 +455,30 @@ struct PsiFormerComplexWF::Impl
         std::size_t capacity, std::shared_ptr<const psiformer::device::PreparedDeviceModel> shared_image,
         std::size_t virtual_capacity, std::size_t trace_targets, bool virtual_envelope_reuse,
         bool head_determinant_batch, bool full_inverse_columns, bool target_factor_reuse,
-        bool periodic_value_tiling, bool target_cold_cooperative_lu)
+        bool periodic_value_tiling, bool target_cold_cooperative_lu, bool mixed_inference,
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters)
         : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity),
           trace_targets(trace_targets), virtual_envelope_reuse(virtual_envelope_reuse),
           head_determinant_batch(head_determinant_batch), full_inverse_columns(full_inverse_columns),
-          target_factor_reuse(target_factor_reuse), target_cold_cooperative_lu(target_cold_cooperative_lu),
+          mixed_inference(mixed_inference), target_factor_reuse(target_factor_reuse),
+          target_cold_cooperative_lu(target_cold_cooperative_lu),
           periodic_value_tiling(periodic_value_tiling), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
                   ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
                   : psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version))),
-          value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas,
+          value(mixed_inference ? nullptr : psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas,
               value_cost.device_bytes, false, head_determinant_batch, periodic_value_tiling)),
-          full(preparation.max_targets
+          full(mixed_inference ? nullptr : preparation.max_targets
               ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity,
                     trace_targets, head_determinant_batch, target_factor_reuse, target_cold_cooperative_lu)
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas,
                     spatial_cost.device_bytes, trace_targets, head_determinant_batch, full_inverse_columns)),
+          mixed(mixed_inference ? std::make_unique<psiformer::device::PreparedDeviceMixedComplexInference>(
+              image, capacity, queue, blas, psiformer::spatial_detail::checkedAdd(bytes,
+                  psiformer::device::PreparedDeviceMixedComplexInference::required(plan, capacity, trace_targets,
+                      !shared_mixed_parameters).pending_device_bytes,
+                  "Paired mixed construction pending ownership overflow"), trace_targets, shared_mixed_parameters) : nullptr),
           positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
           laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),
           virtual_positions(3 * electrons * virtual_capacity), virtual_amplitude(virtual_capacity),
@@ -477,7 +502,7 @@ struct PsiFormerComplexWF::Impl
             image, virtual_capacity, queue, blas, extra.device_bytes, virtual_envelope_reuse,
             head_determinant_batch, periodic_value_tiling);
       }
-      const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
+      const auto actual_host = (mixed ? mixed->cost().host_bytes : value_cost.host_bytes + spatial_cost.host_bytes) +
               sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
               sizeof(cuDoubleComplex) * (gradient.capacity() + laplacian.capacity() + ratio.capacity()) +
               sizeof(C) * converted.capacity() +
@@ -487,7 +512,7 @@ struct PsiFormerComplexWF::Impl
               sizeof(std::array<std::size_t, 3>) * virtual_indices.capacity();
       if (actual_host != host_bytes)
         throw std::logic_error("Complex GPU host capacities differ from checked preparation");
-      if (value->cost().device_bytes + full->cost().device_bytes +
+      if ((mixed ? mixed->cost().device_bytes : value->cost().device_bytes + full->cost().device_bytes) +
           (virtual_value ? virtual_value->cost().device_bytes : 0) != device_bytes)
         throw std::logic_error("Complex GPU owner capacities differ from checked preparation");
       app_log() << "  Complex PsiFormer GPU inference prepared: mode="
@@ -497,19 +522,42 @@ struct PsiFormerComplexWF::Impl
                 << ", virtual_envelope_reuse=" << virtual_envelope_reuse
                 << ", head_determinant_batch=" << head_determinant_batch
                 << ", full_inverse_columns=" << full_inverse_columns
+                << ", mixed_inference=" << mixed_inference
                 << ", target_factor_reuse=" << target_factor_reuse
                 << ", target_cold_cooperative_lu=" << target_cold_cooperative_lu
-                << ", trace_storage_fingerprint=" << full->traceStorageFingerprint()
+                << ", trace_storage_fingerprint=" << (full ? full->traceStorageFingerprint() : 0)
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
                 << ", cusp_state_reuse=" << (full ? full->usesCuspStateReuse() : false)
                 << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
+      if (mixed)
+        app_log() << "  Paired mixed inference owner admission: VALUE_graphs=2 FULL_graphs=1"
+                  << " device_bytes=" << mixed->cost().device_bytes << " host_numeric_bytes=" << mixed->cost().host_bytes
+                  << " pending_device_bytes=" << mixed->cost().pending_device_bytes
+                  << "; current_owner_estimates=yes retained_generations=aggregate_DEVICE_allocation_lifetime"
+                     " same_FP64_image=yes inference_only=yes CPU_fallback=no" << std::endl;
     }
 
     /// Catch an idle resource up under model read and its exclusive execution lock.
-    void catchUp(const std::shared_ptr<const psiformer::device::PreparedDeviceModel>& current)
+    void catchUp(const std::shared_ptr<const psiformer::device::PreparedDeviceModel>& current,
+        const std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters>& current_mixed = {})
     {
       current->validateCurrentDevice();
+      if (mixed)
+      {
+        if (image == current)
+        {
+          mixed->validateImage(current);
+          return;
+        }
+        mixed->validatePreparedRebind(current, current_mixed);
+        queue.sync();
+        auto retired = image;
+        auto retired_cache = mixed->parameterCache();
+        mixed->adoptPreparedRebind(current, current_mixed);
+        image = current;
+        return;
+      }
       if (image == current)
         return;
       value->validateModelRebind(current);
@@ -523,6 +571,79 @@ struct PsiFormerComplexWF::Impl
       if (virtual_value)
         virtual_value->adoptPreparedModel(current);
       image = current;
+    }
+
+    /// Evaluate one complete VALUE request inside the existing native timer scope.
+    void evaluateValue(psiformer::PsiFormerGpuTrainingEpochMode mode =
+        psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+    {
+      if (mixed)
+      {
+        mixed->evaluateValue(positions, mode);
+        reportMixedProgress(false);
+      }
+      else
+        value->evaluate(positions);
+    }
+
+    /// Evaluate all FULL fields under the same selected numerical policy.
+    void evaluateFull(psiformer::PsiFormerGpuTrainingEpochMode mode =
+        psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+    {
+      if (mixed)
+      {
+        mixed->evaluateFull(positions, mode);
+        reportMixedProgress(true);
+      }
+      else
+        full->evaluate(positions);
+    }
+
+    /// Copy only the selected completed amplitude into native staging.
+    void downloadValue()
+    {
+      if (mixed)
+        mixed->downloadValue(amplitude);
+      else
+        value->download(value->resultView(), amplitude);
+    }
+
+    /// Copy all completed spatial fields without mixing results from separate attempts.
+    void downloadFull()
+    {
+      if (mixed)
+        mixed->downloadFull(amplitude, gradient, laplacian, ratio);
+      else
+        full->download(full->resultView(), amplitude, gradient, laplacian, ratio);
+    }
+
+    /// Emit bounded proof of first completed, first actual mixed and first replay work.
+    void reportMixedProgress(bool spatial) const
+    {
+      const auto& c = mixed->counters();
+      const auto requests = spatial ? c.full_requests : c.value_requests;
+      const auto actual = spatial ? c.full_mixed : c.value_mixed;
+      const auto replays = spatial ? c.full_replays : c.value_replays;
+      const auto& reason = spatial ? mixed->fullRetryReason() : mixed->valueRetryReason();
+      if (requests == 1 || (actual == 1 && reason.empty()) || (replays == 1 && !reason.empty()))
+        app_log() << "  Paired mixed inference numerical tile completed: mode=" << (spatial ? "FULL" : "VALUE")
+                  << " requests=" << requests << " actual_mixed=" << actual << " complete_FP64_replays=" << replays
+                  << " reason=" << (reason.empty() ? "none" : reason) << "; CPU_fallback=no" << std::endl;
+    }
+
+    /// Emit final successful graph/replay counts and exact reasons, not policy-only claims.
+    ~GpuLane()
+    {
+      if (!mixed) return;
+      const auto& c = mixed->counters();
+      app_log() << "  Paired mixed inference completed contexts: VALUE_requests=" << c.value_requests
+                << " VALUE_mixed=" << c.value_mixed << " VALUE_FP64_replays=" << c.value_replays
+                << " FULL_requests=" << c.full_requests << " FULL_mixed=" << c.full_mixed
+                << " FULL_FP64_replays=" << c.full_replays << "; CPU_fallback=no" << std::endl;
+      for (const auto& entry : mixed->valueReasons())
+        app_log() << "  Paired mixed VALUE replay reason: count=" << entry.second << " reason=" << entry.first << std::endl;
+      for (const auto& entry : mixed->fullReasons())
+        app_log() << "  Paired mixed FULL replay reason: count=" << entry.second << " reason=" << entry.first << std::endl;
     }
 
     /// Shrink only live prefixes; all capacities were admitted at the cold boundary.
@@ -542,6 +663,7 @@ struct PsiFormerComplexWF::Impl
     const bool virtual_envelope_reuse;
     const bool head_determinant_batch;
     const bool full_inverse_columns;
+    const bool mixed_inference;
     const bool target_factor_reuse;
     const bool target_cold_cooperative_lu;
     const bool periodic_value_tiling;
@@ -551,6 +673,7 @@ struct PsiFormerComplexWF::Impl
     std::unique_ptr<psiformer::device::PreparedDeviceComplexValue> value;
     std::unique_ptr<psiformer::device::PreparedDeviceComplexValue> virtual_value;
     std::unique_ptr<psiformer::device::PreparedDeviceComplexSpatial> full;
+    std::unique_ptr<psiformer::device::PreparedDeviceMixedComplexInference> mixed;
     std::vector<double> positions;
     std::vector<psiformer::device::ComplexValueResult> amplitude;
     std::vector<cuDoubleComplex> gradient, laplacian, ratio;
@@ -641,7 +764,8 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
           , std::shared_ptr<GpuLane> prepared = {}
 #endif
-          , std::size_t cpu_targets = 0)
+          , std::size_t cpu_targets = 0,
+          psiformer::PsiFormerPrecisionPolicy precision_policy = psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           system_kind(kind), environment(environmentFor(electrons, initialized.environment)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -661,11 +785,16 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
               prepared ? 1 :
 #endif
-              requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS")), cpu_targets(cpu_targets)
+              requestedCapacity(gpu_limit, "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS")), cpu_targets(cpu_targets),
+          precision_policy(precision_policy)
 #ifdef ENABLE_CUDA
           , inference_concurrency(gpu_crowds)
 #endif
     {
+      if (precision_policy != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+          (precision_policy != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
+           !gpu_limit || cpu_limit || cpu_targets))
+        throw std::invalid_argument("Paired mixed precision requires the explicitly capped GPU route");
       if (cpu_targets && (!cpu_limit || gpu_limit || cpu_targets > model.ne))
         throw std::invalid_argument("Complex CPU target VGL requires shared CPU admission and targets1..Ne");
       if (cpu_limit)
@@ -692,7 +821,10 @@ struct PsiFormerComplexWF::Impl
         if (gpu_crowds > 1 && !psiformer::device::configuredDeviceMemoryAdmission().limit_bytes)
           throw std::invalid_argument("Concurrent complex inference requires native aggregate device admission");
         gpu = prepared ? std::move(prepared) :
-            GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit, gpu_capacity);
+            GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit, gpu_capacity,
+                             precision_policy == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS);
+        if (gpu->mixed_inference != (precision_policy == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS))
+          throw std::invalid_argument("Prepared paired GPU owner has a conflicting precision policy");
 #else
         throw std::invalid_argument("Complex GPU inference is not compiled");
 #endif
@@ -766,6 +898,7 @@ struct PsiFormerComplexWF::Impl
     const std::size_t gpu_limit;
     const std::size_t gpu_capacity, gpu_crowds;
     const std::size_t cpu_targets;
+    const psiformer::PsiFormerPrecisionPolicy precision_policy;
     std::shared_ptr<CpuScratchBudget> cpu_budget;
     std::shared_ptr<CpuLane> cpu;
     std::array<std::size_t, 4> cpu_requirements{};
@@ -787,6 +920,9 @@ struct PsiFormerComplexWF::Impl
     std::weak_ptr<GpuDerivativeLane> gpu_derivative_lane;
     /// Only active retained score batches hold these two numerical owners alive.
     std::array<std::weak_ptr<GpuDerivativeLane>, 2> gpu_score_crowd_lanes;
+    std::atomic<psiformer::PsiFormerGpuTrainingEpochMode> gpu_training_epoch_mode{
+        psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE};
+    std::atomic<std::size_t> gpu_training_epoch_generation{0};
 #endif
   };
 
@@ -799,10 +935,13 @@ struct PsiFormerComplexWF::Impl
     /// Move fully resolved native leaves and final authority into one owning action.
     PreparedGpuPublication(std::shared_ptr<Model> model, std::shared_ptr<GpuLane> lane,
         std::shared_ptr<const psiformer::device::PreparedDeviceModel> next,
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> next_mixed,
         pf::Parameters::PreparedFlatValues native, std::unique_lock<std::shared_mutex> authority,
         std::unique_lock<std::mutex> execution)
         : state(std::move(model)), generation(std::move(lane)), successor(std::move(next)),
-          retired_image(generation->image), native_candidate(std::move(native)),
+          retired_image(generation->image), mixed_successor(std::move(next_mixed)),
+          retired_mixed(generation->mixed ? generation->mixed->parameterCache() : nullptr),
+          native_candidate(std::move(native)),
           write(std::move(authority)), gpu(std::move(execution)) {}
 
     /// Fixed native copies and pointer adoption only; retirement occurs after unlock.
@@ -811,8 +950,13 @@ struct PsiFormerComplexWF::Impl
       if (committed || !write.owns_lock() || !gpu.owns_lock())
         std::terminate();
       const auto version = native_candidate.commit();
-      generation->value->adoptPreparedModel(successor);
-      generation->full->adoptPreparedModel(successor);
+      if (generation->mixed)
+        generation->mixed->adoptPreparedRebind(successor, mixed_successor);
+      else
+      {
+        generation->value->adoptPreparedModel(successor);
+        generation->full->adoptPreparedModel(successor);
+      }
       if (generation->virtual_value)
         generation->virtual_value->adoptPreparedModel(successor);
       generation->image = successor;
@@ -826,6 +970,7 @@ struct PsiFormerComplexWF::Impl
     std::shared_ptr<Model> state;
     std::shared_ptr<GpuLane> generation;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> successor, retired_image;
+    std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> mixed_successor, retired_mixed;
     pf::Parameters::PreparedFlatValues native_candidate;
     std::weak_ptr<GpuDerivativeLane> retired_derivative;
     std::unique_lock<std::shared_mutex> write;
@@ -1027,6 +1172,15 @@ struct PsiFormerComplexWF::Impl
     }
   }
 
+  /// Keep canonical CPU/HOST and complete-response entry points outside mixed training.
+  static void requireTrainingPrecision(const Model& s)
+  {
+#ifdef ENABLE_CUDA
+    if (s.gpu && s.gpu->mixed_inference)
+      throw std::logic_error("Paired mixed training requires scoped GPU SCORE/ECP products and DEVICE affine statistics");
+#endif
+  }
+
 #ifdef ENABLE_CUDA
   /// One weakly shared immutable-image derivative lane; ownership keeps borrowed queue/BLAS alive.
   struct GpuDerivativeLane
@@ -1051,14 +1205,24 @@ struct PsiFormerComplexWF::Impl
     {
       const auto cost = psiformer::device::estimateComplexProductsCost(state.plan, targets, maximum_samples, 3, chunk,
           psiformer::device::ComplexProductsHostOutput::CHUNKED, numericalScope(scope));
+      const bool mixed = bool(state.gpu->mixed);
+      if (mixed && state.gpu_crowds != 1)
+        throw std::invalid_argument("Paired mixed training requires one GPU crowd");
+      if (mixed && scope != GpuDerivativeScope::SCORE_ECP_ONLY)
+        throw std::invalid_argument("Paired mixed training admits SCORE/ECP products, not full local-energy responses");
+      const auto mixed_cost = mixed ? psiformer::device::estimateMixedComplexProductsCost(state.plan, targets,
+          maximum_samples, 3, chunk, psiformer::device::ComplexProductsHostOutput::CHUNKED) :
+          psiformer::device::ComplexProductsCost{};
       const char* message = "Complex GPU derivative bytes overflow";
       std::size_t host = cost.host_bytes;
+      pf::addStorageBytes(host, mixed_cost.host_bytes, message);
+      const auto device = psiformer::spatial_detail::checkedAdd(cost.device_bytes, mixed_cost.device_bytes, message);
       pf::addStorageBytes(host, pf::checkedStorageBytes<C>(maximum_samples, message), message);
       pf::addStorageBytes(host, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(4,
           pf::checkedStorageProduct(samples, state.model.ne, message), message), message), message);
       auto total = host;
-      pf::addStorageBytes(total, cost.device_bytes, message); // Generic diagnostics sum both domains.
-      return {cost.device_bytes, host, cost.matrix_work};
+      pf::addStorageBytes(total, device, message); // Generic diagnostics sum both domains.
+      return {device, host, cost.matrix_work};
     }
 
     /// Allocate only after both domains and maximum request work have been admitted.
@@ -1066,12 +1230,50 @@ struct PsiFormerComplexWF::Impl
         std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget, GpuDerivativeScope scope)
         : state(std::move(model)), generation(state->gpu), image(generation->image),
           maximum_samples(maximum_samples), targets(targets), chunk(chunk), scope(scope), blas(queue),
-          products(Products::prepare(image, targets, maximum_samples, 3, chunk,
+          fp64_products(Products::prepare(image, targets, maximum_samples, 3, chunk,
               queue, blas, budget.device_bytes,
               budget.host_bytes - maximum_samples * sizeof(C), std::max(std::size_t{1}, budget.matrix_work),
               psiformer::device::ComplexProductsHostOutput::CHUNKED, numericalScope(scope))),
+          mixed_parameters(generation->mixed ? generation->mixed->parameterCache() : nullptr),
+          mixed_products(mixed_parameters ? Products::prepareMixed(mixed_parameters, targets,
+              maximum_samples, 3, chunk, queue, blas, budget.device_bytes, budget.host_bytes,
+              std::max(std::size_t{1}, budget.matrix_work), psiformer::device::ComplexProductsHostOutput::CHUNKED) : nullptr),
+          products(mixed_products ? mixed_products.get() : fp64_products.get()),
           zeros(maximum_samples), channels(3)
     {}
+
+    /// Select only while holding this lane's execution lease and the exact Model read authority.
+    void selectEpochProducts()
+    {
+      if (mixed_products && state->gpu_training_epoch_mode.load(std::memory_order_relaxed) ==
+          psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+        throw std::logic_error("Paired mixed products require an explicit native training epoch");
+      products = mixed_products && state->gpu_training_epoch_mode.load(std::memory_order_relaxed) !=
+          psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY
+          ? mixed_products.get() : fp64_products.get();
+    }
+
+    /// Count BOTH prepared precision paths; selecting FP64 never releases the mixed fallback authority.
+    std::size_t productDeviceBytes() const
+    {
+      return psiformer::spatial_detail::checkedAdd(fp64_products->cost().device_bytes,
+          mixed_products ? mixed_products->cost().device_bytes : 0, "Paired precision owner DEVICE bytes overflow");
+    }
+
+    /// Shared HOST inventories include both product paths but not caller coordinate snapshots.
+    std::size_t productHostBytes() const
+    {
+      return psiformer::spatial_detail::checkedAdd(fp64_products->cost().host_bytes,
+          mixed_products ? mixed_products->cost().host_bytes : 0, "Paired precision owner HOST bytes overflow");
+    }
+
+    /// Storage identity is independent of the selected epoch arithmetic and includes both owners.
+    std::size_t productStorageFingerprint() const
+    {
+      auto result = fp64_products->storageFingerprint();
+      if (mixed_products) result = (result ^ mixed_products->storageFingerprint()) * 1099511628211ULL;
+      return result;
+    }
 
     const std::shared_ptr<Model> state;
     /// Declare before Products: borrowers die before their exact queue/BLAS/image generation.
@@ -1082,7 +1284,10 @@ struct PsiFormerComplexWF::Impl
     const GpuDerivativeScope scope;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
-    const std::unique_ptr<Products> products;
+    const std::unique_ptr<Products> fp64_products;
+    std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> mixed_parameters;
+    const std::unique_ptr<Products> mixed_products;
+    Products* products; // Selected only while the complete native precision epoch is idle/bound.
     std::mutex device_mutex;
     const std::vector<C> zeros;
     std::vector<Products::Channel> channels;
@@ -1115,6 +1320,62 @@ struct PsiFormerComplexWF::Impl
     GpuDerivativeLane& lane;
   };
 
+  /// Change only native policy authority; no numerical buffers are detached or retired by this scope.
+  struct NativeGpuTrainingEpoch final : PsiFormerComplexWF::GpuTrainingEpoch
+  {
+    /// Freeze the exact image and quiesce all existing C1 scratch before changing epoch selection.
+    NativeGpuTrainingEpoch(std::shared_ptr<Model> model, std::size_t expected_version,
+        psiformer::PsiFormerGpuTrainingEpochMode mode) : state(std::move(model))
+    {
+      using Mode = psiformer::PsiFormerGpuTrainingEpochMode;
+      if (mode != Mode::STRICT_MIXED && mode != Mode::FP64_REPLAY)
+        throw std::invalid_argument("Paired native training epoch requires strict mixed or FP64 replay mode");
+      std::unique_lock write(state->mutex, std::try_to_lock);
+      if (!write.owns_lock())
+        throw std::logic_error("Paired native training epoch requires idle model authority");
+      std::lock_guard control(state->derivative_factory_mutex);
+      if (!state->gpu || !state->gpu->mixed || state->gpu_crowds != 1 ||
+          state->model.p.version() != expected_version || state->gpu->image->version() != expected_version ||
+          state->pending_proposals.load() || state->acquired_teams.load() ||
+          state->gpu_training_epoch_mode.load() != Mode::INFERENCE)
+        throw std::logic_error("Paired native training epoch requires its idle exact-version mixed C1 family");
+      if (state->gpu_training_epoch_generation.load() > std::numeric_limits<std::size_t>::max() - 3)
+        throw std::overflow_error("Paired native arithmetic epoch generation exhausted");
+      std::unique_lock inference(state->gpu->mutex, std::try_to_lock);
+      if (!inference.owns_lock()) throw std::logic_error("Paired native inference scratch is active");
+      state->gpu->queue.sync();
+      const std::array<std::shared_ptr<GpuDerivativeLane>, 3> lanes{
+          state->gpu_derivative_lane.lock(), state->gpu_score_crowd_lanes[0].lock(),
+          state->gpu_score_crowd_lanes[1].lock()};
+      for (std::size_t i = 0; i < lanes.size(); ++i)
+      {
+        const auto& lane = lanes[i];
+        if (!lane) continue;
+        bool duplicate = false;
+        for (std::size_t previous = 0; previous < i; ++previous) duplicate |= lanes[previous] == lane;
+        if (duplicate) continue;
+        std::unique_lock execution(lane->execution_mutex, std::try_to_lock);
+        std::unique_lock device(lane->device_mutex, std::try_to_lock);
+        if (!execution.owns_lock() || !device.owns_lock() || lane->active)
+          throw std::logic_error("Paired native derivative scratch is active");
+        lane->queue.sync();
+      }
+      state->gpu_training_epoch_mode.store(mode);
+      state->gpu_training_epoch_generation.fetch_add(1);
+    }
+
+    /// Revoke escaped operators and restore inference policy after all pending epoch work finishes.
+    ~NativeGpuTrainingEpoch() override
+    {
+      std::unique_lock write(state->mutex);
+      std::lock_guard control(state->derivative_factory_mutex);
+      state->gpu_training_epoch_mode.store(psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE);
+      state->gpu_training_epoch_generation.fetch_add(1);
+    }
+
+    const std::shared_ptr<Model> state;
+  };
+
   /// Called under Model read, current inference-generation lock and derivative-factory lock.
   static std::shared_ptr<GpuDerivativeLane> acquireGpuDerivativeLane(const std::shared_ptr<Model>& state,
       std::size_t ordinal, std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
@@ -1139,7 +1400,15 @@ struct PsiFormerComplexWF::Impl
         if (!idle.owns_lock() || lane->active || lane->generation != state->gpu)
           throw std::logic_error("Complex score image rebind requires its idle original generation");
         const auto previous = lane->image;
-        lane->products->rebindScoreModel(state->gpu->image);
+        const auto retired_cache = lane->mixed_parameters;
+        const auto incoming = state->gpu->mixed ? state->gpu->mixed->parameterCache() : nullptr;
+        lane->fp64_products->validateScoreModelRebind(state->gpu->image);
+        if (lane->mixed_products)
+          lane->mixed_products->validateScoreModelRebind(state->gpu->image, incoming);
+        lane->fp64_products->adoptPreparedScoreModel(state->gpu->image);
+        if (lane->mixed_products)
+          lane->mixed_products->adoptPreparedScoreModel(state->gpu->image, incoming);
+        lane->mixed_parameters = incoming;
         lane->image = state->gpu->image;
         if (outputManager.isDebugActive())
           app_debug_stream() << "Complex score lane image rebind: lane=" << lane.get()
@@ -1149,6 +1418,10 @@ struct PsiFormerComplexWF::Impl
       }
     }
     if (!lane) lane = std::make_shared<GpuDerivativeLane>(state, maximum_samples, targets, chunk, budget, scope);
+    lane->products = lane->mixed_products &&
+        state->gpu_training_epoch_mode.load(std::memory_order_relaxed) !=
+            psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY
+        ? lane->mixed_products.get() : lane->fp64_products.get();
     selected = lane;
     if (ordinal == 0) state->gpu_derivative_lane = lane;
     return lane;
@@ -1160,7 +1433,8 @@ struct PsiFormerComplexWF::Impl
     /// Preserve captured version/schema and bounded snapshot ownership.
     GpuDerivativeStream(std::shared_ptr<GpuDerivativeLane> scratch, std::size_t ordinal,
         std::size_t offset, std::size_t samples, std::size_t host_cap)
-        : lane(std::move(scratch)), version(lane->state->model.p.version()), ordinal(ordinal), offset(offset),
+        : lane(std::move(scratch)), version(lane->state->model.p.version()),
+          epoch_generation(lane->state->gpu_training_epoch_generation.load()), ordinal(ordinal), offset(offset),
           samples(samples), host_cap(host_cap), chunks(*lane->state->schema, version, lane->chunk),
           positions(3 * samples * lane->state->model.ne), inverse_masses(samples * lane->state->model.ne)
     {}
@@ -1220,10 +1494,12 @@ struct PsiFormerComplexWF::Impl
       d.parameter_count = cost.parameters;
       d.sample_count = samples;
       const bool complete = lane->scope == GpuDerivativeScope::COMPLETE;
-      d.real_parameter_vectors = complete ? 4 : 3;
-      d.complex_parameter_vectors = complete ? 5 : 4;
-      d.parameter_scratch_bytes = (complete ? 112 : 88) * cost.parameters + 32 * cost.chunk;
-      d.shared_workspace_bytes = cost.device_bytes + cost.host_bytes + lane->zeros.capacity() * sizeof(C);
+      const auto copies = lane->mixed_products ? 2 : 1;
+      d.real_parameter_vectors = copies * (complete ? 4 : 3);
+      d.complex_parameter_vectors = copies * (complete ? 5 : 4);
+      d.parameter_scratch_bytes = copies * ((complete ? 112 : 88) * cost.parameters + 32 * cost.chunk);
+      d.shared_workspace_bytes = lane->productDeviceBytes() + lane->productHostBytes() +
+          lane->zeros.capacity() * sizeof(C);
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
       d.sample_auxiliary_bytes = inverse_masses.capacity() * sizeof(double);
@@ -1236,7 +1512,7 @@ struct PsiFormerComplexWF::Impl
       d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes;
       d.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(lane.get());
       d.allocation_generation = bound ? 2 : 1;
-      d.storage_fingerprint = lane->products->storageFingerprint();
+      d.storage_fingerprint = lane->productStorageFingerprint();
       for (const auto* storage : {&positions, &inverse_masses})
         psiformer::determinant::detail::mixStorage(d.storage_fingerprint, *storage);
       psiformer::determinant::detail::mixStorage(d.storage_fingerprint, lane->zeros);
@@ -1279,7 +1555,7 @@ struct PsiFormerComplexWF::Impl
       std::size_t extra = diagnostics.retained_numeric_bytes;
       pf::addStorageBytes(extra, pf::checkedStorageBytes<std::size_t>(points.size(), message), message);
       pf::addStorageBytes(extra, pf::checkedStorageBytes<C>(samples + points.size(), message), message);
-      const auto current_host = storageDiagnostics().retained_numeric_bytes - lane->products->cost().device_bytes;
+      const auto current_host = storageDiagnostics().retained_numeric_bytes - lane->productDeviceBytes();
       if (extra > host_cap || current_host > host_cap - extra)
         throw std::length_error("Complex replay complete HOST storage exceeds factory admission");
       const auto finite = [](C x) { return psiformer::determinant::isFiniteReal(x.real()) &&
@@ -1376,6 +1652,7 @@ struct PsiFormerComplexWF::Impl
     void requireCurrent() const
     {
       if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+          epoch_generation != lane->state->gpu_training_epoch_generation.load() ||
           lane->state->pending_proposals.load(std::memory_order_relaxed))
         throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
       validateDerivativeSource(*lane->state);
@@ -1392,9 +1669,11 @@ struct PsiFormerComplexWF::Impl
       {
         std::shared_lock read(lane->state->mutex);
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+          epoch_generation != lane->state->gpu_training_epoch_generation.load() ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU score JVP snapshot is stale or family has a pending move");
         std::unique_lock gpu(lane->device_mutex);
+        lane->selectEpochProducts();
         validateDerivativeSource(*lane->state);
         {
           NativeTimerScope host_timer(phase_timers.gpu_call);
@@ -1438,6 +1717,7 @@ struct PsiFormerComplexWF::Impl
         if (!replay) throw std::invalid_argument("Complex local-energy JVP requires bound replay");
         const auto terms = localTerms(mask);
         std::unique_lock gpu(lane->device_mutex);
+        lane->selectEpochProducts();
         lane->products->evaluateLocalEnergyJVPReplacements(positions, replacementAccessor(), references, complete_weights,
             inverse_masses, lane->state->cartesian_twist, terms, direction.values().data(), direction.values().size());
         const auto result = lane->products->localEnergyJvpView(); lane->products->validate(result); output = result.data;
@@ -1478,9 +1758,11 @@ struct PsiFormerComplexWF::Impl
               throw std::invalid_argument("Complex bound replay requires energy/SCORE channels");
         }
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+          epoch_generation != lane->state->gpu_training_epoch_generation.load() ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
         std::unique_lock gpu(lane->device_mutex);
+        lane->selectEpochProducts();
         validateDerivativeSource(*lane->state);
         for (auto& channel : lane->channels)
           channel = {GpuDerivativeLane::Products::Role::SCORE, lane->zeros.data(), samples};
@@ -1521,7 +1803,7 @@ struct PsiFormerComplexWF::Impl
 
     psiformer::PsiFormerTimers phase_timers;
     const std::shared_ptr<GpuDerivativeLane> lane;
-    const std::size_t version, ordinal, offset, samples, host_cap;
+    const std::size_t version, epoch_generation, ordinal, offset, samples, host_cap;
     const wftrain::ParameterChunkPlan chunks;
     std::vector<double> positions, inverse_masses;
     std::shared_ptr<const wftrain::NonLocalECPJVPReplay> replay;
@@ -1654,7 +1936,7 @@ struct PsiFormerComplexWF::Impl
     static std::size_t required(const GpuDerivativeStream& s)
     {
       const auto r = requiredShape(s.samples, s.lane->state->model.ne, s.lane->maximum_samples - s.samples);
-      const auto current = s.storageDiagnostics().retained_numeric_bytes - s.lane->products->cost().device_bytes;
+      const auto current = s.storageDiagnostics().retained_numeric_bytes - s.lane->productDeviceBytes();
       if (r.bound_host_extra_bytes > s.host_cap || current > s.host_cap - r.bound_host_extra_bytes)
         throw std::length_error("Complex ECP capture plus eventual binding exceeds operator HOST admission");
       return r.capture_host_bytes;
@@ -2779,14 +3061,14 @@ struct PsiFormerComplexWF::Impl
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
        const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
        std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
-       std::size_t cpu_limit, std::size_t cpu_targets)
+       std::size_t cpu_limit, std::size_t cpu_targets, psiformer::PsiFormerPrecisionPolicy precision_policy)
       : Impl(std::make_shared<Model>(component_name,
                                    materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint, system_kind),
                                    electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit), system_kind, cpu_limit
 #ifdef ENABLE_CUDA
                                    , std::shared_ptr<GpuLane>{}
 #endif
-                                   , cpu_targets), electrons, limit)
+                                   , cpu_targets, precision_policy), electrons, limit)
   {}
 
   /// Check the full requirement before allocation; shared clones enter under their caller's read lease.
@@ -2921,11 +3203,21 @@ struct PsiFormerComplexWF::Impl
       throw std::logic_error("Complex PsiFormer persistence/observation requires no pending move");
   }
 
+  /// Ordinary FP64/CPU caches retain tag zero; mixed caches bind the exact native arithmetic epoch.
+  std::size_t nativeEpochGeneration() const noexcept
+  {
+#ifdef ENABLE_CUDA
+    if (state->gpu && state->gpu->mixed)
+      return state->gpu_training_epoch_generation.load(std::memory_order_relaxed);
+#endif
+    return 0;
+  }
+
   /// Own spatial products are usable only at the accepted configuration and parameter version.
   bool fullMatches(const ParticleSet& p) const
   {
     return accepted_valid && own_full_valid && accepted_key == configurationIdentity(p) &&
-        accepted_version == state->model.p.version();
+        accepted_version == state->model.p.version() && accepted_epoch_generation == nativeEpochGeneration();
   }
 
   /// Validate the entire additive observation before changing any caller product.
@@ -3015,7 +3307,7 @@ struct PsiFormerComplexWF::Impl
     requireRecordExtent(buffer);
     const auto start = buffer.current_scalar();
     for (auto integer : std::array<std::uint64_t, 8>{record_magic, 1, state->identity,
-        accepted_version, accepted_key, state->model.ne, recordScalars(), 1})
+        accepted_version, accepted_key, state->model.ne, recordScalars(), nativeEpochGeneration() + 1})
       putPersistentInteger(buffer, integer);
     auto put = [&buffer](double scalar) { buffer.put(scalar); };
     for (double scalar : {accepted.log_abs, accepted.phase.real(), accepted.phase.imag(),
@@ -3056,7 +3348,7 @@ struct PsiFormerComplexWF::Impl
       throw std::runtime_error("Complex PsiFormer walker record checksum mismatch");
     buffer.rewind(buffer.current(), start);
     for (auto expected : std::array<std::uint64_t, 8>{record_magic, 1, state->identity,
-        state->model.p.version(), configurationIdentity(p), state->model.ne, recordScalars(), 1})
+        state->model.p.version(), configurationIdentity(p), state->model.ne, recordScalars(), nativeEpochGeneration() + 1})
       if (getPersistentInteger(buffer, "complex provenance") != expected)
         throw std::runtime_error("Complex PsiFormer walker provenance or FULL extent mismatch");
     auto get = [&buffer]() { double scalar; buffer.get(scalar); return scalar; };
@@ -3163,12 +3455,14 @@ struct PsiFormerComplexWF::Impl
     const auto& current = state->gpu->image;
     if (current->version() != state->model.p.version())
       throw std::logic_error("Complex crowd current image/native parameter version differs");
-    lane.catchUp(current);
+    lane.catchUp(current, state->gpu->mixed ? state->gpu->mixed->parameterCache() :
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters>{});
   }
 
   /// The caller holds Model read; charge dynamic numeric copies, not shared image or descriptor metadata.
   PsiFormerComplexWF::GpuParameterPublicationRequirements candidateIsolationRequirements() const
   {
+    requireTrainingPrecision(*state);
     if (!state->gpu || state->gpu_crowds != 1)
       throw std::logic_error("Private complex GPU isolation requires a one-lane GPU family");
     requireNoCollective();
@@ -3254,16 +3548,16 @@ struct PsiFormerComplexWF::Impl
       {
         NativeTimerScope timer(phase_timers.gpu_evaluate);
         if (spatial)
-          lane.full->evaluate(lane.positions);
+          lane.evaluateFull(state->gpu_training_epoch_mode.load(std::memory_order_relaxed));
         else
-          lane.value->evaluate(lane.positions);
+          lane.evaluateValue(state->gpu_training_epoch_mode.load(std::memory_order_relaxed));
       }
       {
         NativeTimerScope timer(phase_timers.gpu_download);
         if (spatial)
-          lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+          lane.downloadFull();
         else
-          lane.value->download(lane.value->resultView(), lane.amplitude);
+          lane.downloadValue();
       }
       for (std::size_t local = 0; local < count; ++local)
       {
@@ -3346,11 +3640,11 @@ struct PsiFormerComplexWF::Impl
       {
         {
           NativeTimerScope host_timer(phase_timers.gpu_evaluate);
-          lane.full->evaluate(lane.positions);
+          lane.evaluateFull(state->gpu_training_epoch_mode.load(std::memory_order_relaxed));
         }
         {
           NativeTimerScope host_timer(phase_timers.gpu_download);
-          lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+          lane.downloadFull();
         }
         for (std::size_t i = 0; i < lane.gradient.size(); ++i)
           lane.converted[i] = {lane.gradient[i].x, lane.gradient[i].y};
@@ -3363,11 +3657,11 @@ struct PsiFormerComplexWF::Impl
       {
         {
           NativeTimerScope host_timer(phase_timers.gpu_evaluate);
-          lane.value->evaluate(lane.positions);
+          lane.evaluateValue(state->gpu_training_epoch_mode.load(std::memory_order_relaxed));
         }
         {
           NativeTimerScope host_timer(phase_timers.gpu_download);
-          lane.value->download(lane.value->resultView(), lane.amplitude);
+          lane.downloadValue();
         }
       }
       result.amplitude = {{lane.amplitude[0].phase.x, lane.amplitude[0].phase.y}, lane.amplitude[0].log_abs};
@@ -3425,7 +3719,7 @@ struct PsiFormerComplexWF::Impl
       std::vector<ValueType>& staged)
   {
 #ifdef ENABLE_CUDA
-    if (state->gpu && staged.size() > 1)
+    if (state->gpu && !state->gpu->mixed_inference && staged.size() > 1)
     {
       NativeTimerScope timer(phase_timers.value);
       auto permit = state->inference_concurrency.acquire();
@@ -3541,7 +3835,8 @@ struct PsiFormerComplexWF::Impl
       const ParticleSet::PosType* absolute = nullptr) const
   {
     if (!accepted_valid || accepted_key != configurationIdentity(p) ||
-        accepted_version != state->model.p.version() || accepted.isZero())
+        accepted_version != state->model.p.version() || accepted_epoch_generation != nativeEpochGeneration() ||
+        accepted.isZero())
       throw std::logic_error("Complex PsiFormer ratio requires a current accepted amplitude");
     C result{};
     if (!proposed.isZero())
@@ -3593,7 +3888,7 @@ struct PsiFormerComplexWF::Impl
   Amplitude accepted, proposed;
   LogValue proposed_log{};
   std::uint64_t accepted_key = 0, proposed_key = 0;
-  std::size_t accepted_version = 0, proposed_version = 0;
+  std::size_t accepted_version = 0, proposed_version = 0, accepted_epoch_generation = 0;
   int proposed_particle = -1;
   bool accepted_valid = false, pending = false, own_full_valid = false, collective_pending = false;
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
@@ -3677,10 +3972,10 @@ class PsiFormerComplexWF::FixedGridEnergyReference
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
     std::size_t gpu_limit, const std::string& parameter_checkpoint, const std::string& system_kind,
-    std::size_t cpu_limit, std::size_t cpu_targets)
+    std::size_t cpu_limit, std::size_t cpu_targets, psiformer::PsiFormerPrecisionPolicy precision_policy)
     : WaveFunctionComponent(name),
       impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced,
-                                 gpu_limit, parameter_checkpoint, system_kind, cpu_limit, cpu_targets))
+                                 gpu_limit, parameter_checkpoint, system_kind, cpu_limit, cpu_targets, precision_policy))
 {
   if (!parameter_checkpoint.empty())
     app_log() << "Complex PsiFormer imported model identity=" << impl_->state->identity << std::endl;
@@ -3726,6 +4021,7 @@ PsiFormerComplexWF::OrbitalMSEStorage PsiFormerComplexWF::orbitalMSEStorage() co
 /// Admit the exact score-only allocation before construction; repeat preparation is a no-op.
 void PsiFormerComplexWF::prepareOrbitalMSE(std::size_t maximum_bytes)
 {
+  Impl::requireTrainingPrecision(*impl_->state);
   auto state = impl_->state;
   std::shared_lock read(state->mutex);
   impl_->requireIdle(*impl_->particles);
@@ -3962,6 +4258,8 @@ bool PsiFormerComplexWF::canReuseImmediateFullSpatialReplay(const ParticleSet& l
   std::shared_lock read(impl_->state->mutex);
   const auto model = context.model.lock();
   const auto& state = *impl_->state;
+  if (usesMixedAffineTraining())
+    return false; // Its existing receipt does not seal a native precision epoch.
   if (!model || model.get() != impl_->state.get() || context.model.owner_before(impl_->state) ||
       impl_->state.owner_before(context.model) || context.source != state.source ||
       context.version != state.model.p.version() || impl_->pending || impl_->collective_pending ||
@@ -4056,12 +4354,35 @@ bool PsiFormerComplexWF::canReuseImmediateFullSpatialReplay(const ParticleSet& l
   return true;
 }
 
+/// Distinguish immutable mixed policy from the current scoped execution selection.
+bool PsiFormerComplexWF::usesMixedAffineTraining() const noexcept
+{
+  return impl_->state->precision_policy == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
+}
+
+/// Keep policy transitions local to this native component and its existing model authority.
+std::unique_ptr<PsiFormerComplexWF::GpuTrainingEpoch> PsiFormerComplexWF::enterGpuTrainingEpoch(
+    std::size_t expected_version, psiformer::PsiFormerGpuTrainingEpochMode mode)
+{
+#ifdef ENABLE_CUDA
+  impl_->requireIdle(*impl_->particles);
+  return std::make_unique<Impl::NativeGpuTrainingEpoch>(impl_->state, expected_version, mode);
+#else
+  throw std::logic_error("Native GPU training epoch is unavailable in a CPU build");
+#endif
+}
+
 /// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
 std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
 {
   std::shared_lock read(impl_->state->mutex);
   const auto& s = *impl_->state;
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  if (s.precision_policy == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
+  {
+    mixPersistentString(hash, psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1);
+    mixPersistentString(hash, "score_induced_fp64_dot_v1");
+  }
 #ifdef ENABLE_CUDA
   if (s.gpu)
   {
@@ -4536,9 +4857,13 @@ std::vector<wftrain::AffineParameterBlock> PsiFormerComplexWF::hybridAffineParam
 bool PsiFormerComplexWF::usesDeviceAffineStatistics() const
 {
   const char* value = std::getenv("PSIFORMER_GPU_KFAC_AFFINE");
-  if (!gpuInferenceEnabled() || !value || std::strcmp(value, "0") == 0)
+  if (!gpuInferenceEnabled())
     return false;
-  if (std::strcmp(value, "1") != 0)
+  if (usesMixedAffineTraining() && value && std::strcmp(value, "0") == 0)
+    throw std::invalid_argument("Paired mixed KFAC requires DEVICE affine statistics");
+  if (!usesMixedAffineTraining() && (!value || std::strcmp(value, "0") == 0))
+    return false;
+  if (value && std::strcmp(value, "1") != 0)
     throw std::invalid_argument("PSIFORMER_GPU_KFAC_AFFINE must be 0 or 1 for paired training");
 #ifdef ENABLE_CUDA
   const auto& e = impl_->state->environment;
@@ -4548,7 +4873,7 @@ bool PsiFormerComplexWF::usesDeviceAffineStatistics() const
       e.parameter_scalar_domain != psiformer::ScalarDomain::REAL ||
       e.compute_scalar_domain != psiformer::ScalarDomain::REAL ||
       e.amplitude_scalar_domain != psiformer::ScalarDomain::COMPLEX)
-    throw std::invalid_argument("Paired DEVICE affine statistics require legacy FP64 torus metadata");
+    throw std::invalid_argument("Paired DEVICE affine statistics require legacy torus metadata");
   return true;
 #else
   throw std::logic_error("Paired DEVICE affine statistics are unavailable in this build");
@@ -4611,6 +4936,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
         "Complex DEVICE affine combined bound overflow") > maximum_numeric_bytes)
       throw std::length_error("Paired DEVICE affine collection exceeds its combined numeric bound");
     std::unique_lock gpu(lane->device_mutex);
+    lane->selectEpochProducts();
     factors = lane->products->prepareAffineStatistics(descriptors, gaussian,
         Owner::requiredDeviceBytes(descriptors), Owner::requiredHostBytes(descriptors), expected_version);
   }
@@ -4639,6 +4965,7 @@ void PsiFormerComplexWF::accumulateDeviceAffineStatistics(const std::vector<cons
         std::shared_lock read(state->mutex);
         current();
         std::unique_lock gpu(lane->device_mutex);
+        lane->selectEpochProducts();
         factors->beginSample(expected_version);
         lane->products->affineFallbackComplexScore(positions, *factors, real, imaginary);
       }
@@ -4734,6 +5061,7 @@ void PsiFormerComplexWF::prepareHybridAffineScores(std::size_t maximum_bytes)
 /// Require the correct entry point before admitting a reusable HOST owner.
 void PsiFormerComplexWF::prepareAffineScoresImpl(std::size_t maximum_bytes, bool hybrid)
 {
+  Impl::requireTrainingPrecision(*impl_->state);
   NativeTimerScope timer(impl_->phase_timers.preparation);
   const auto state = impl_->state;
   std::shared_lock read(state->mutex);
@@ -4915,7 +5243,7 @@ void PsiFormerComplexWF::isolateParameterState()
 #ifdef ENABLE_CUDA
         , std::shared_ptr<Impl::GpuLane>{}
 #endif
-        , original->cpu_targets);
+        , original->cpu_targets, original->precision_policy);
     independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   }
   // Fresh executors/workspaces bind only detached leaves; accepted state and weak
@@ -4973,13 +5301,14 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
       parameters.flat_values(), configuration->nuclei.x, version, original->gpu_limit,
       source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets,
       source_lane->virtual_envelope_reuse, source_lane->head_determinant_batch, source_lane->full_inverse_columns,
-      source_lane->target_factor_reuse, source_lane->periodic_value_tiling, source_lane->target_cold_cooperative_lu));
+      source_lane->target_factor_reuse, source_lane->periodic_value_tiling,
+      source_lane->target_cold_cooperative_lu, source_lane->mixed_inference));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
       InitializedNativeModel{std::move(model), original->profile, original->seed, original->environment},
       *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind,
-      0, std::move(lane));
+      0, std::move(lane), 0, original->precision_policy);
   state->private_origin = original;
   state->private_origin_image = image;
   state->private_origin_version = version;
@@ -5037,6 +5366,16 @@ PsiFormerComplexWF::gpuParameterPublicationRequirements() const
     std::shared_lock read(impl_->state->mutex);
     const auto native_bytes = psiformer::spatial_detail::checkedProduct(
         sizeof(double), parameterSchema().parameterCount(), "Complex GPU native candidate bytes overflow");
+    if (impl_->state->gpu->mixed)
+    {
+      const auto cache_bytes = psiformer::device::checkedDeviceBytes<float>(parameterSchema().parameterCount());
+      return {psiformer::spatial_detail::checkedAdd(native_bytes,
+                  psiformer::spatial_detail::checkedAdd(cache_bytes, sizeof(psiformer::PsiFormerParameterConversionDiagnostics),
+                      "Complex mixed publication cache bytes overflow"),
+                  "Complex mixed publication DEVICE bytes overflow"),
+          psiformer::spatial_detail::checkedAdd(native_bytes, sizeof(psiformer::PsiFormerParameterConversionDiagnostics),
+              "Complex mixed publication HOST bytes overflow")};
+    }
     return {native_bytes, native_bytes};
   }
 #endif
@@ -5086,6 +5425,8 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
       std::shared_lock read(state->mutex);
       if (state->model.p.version() != expected_version)
         throw std::runtime_error("Complex GPU publication rejected a stale parameter version");
+      if (state->gpu_training_epoch_mode.load() != psiformer::PsiFormerGpuTrainingEpochMode::INFERENCE)
+        throw std::logic_error("Complex GPU publication requires completed native precision epoch work");
       if (state->pending_proposals.load(std::memory_order_relaxed))
         throw std::logic_error("Complex GPU publication requires no family pending proposals");
       Impl::validateDerivativeSource(*state);
@@ -5095,6 +5436,14 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
       if (source_image->version() != expected_version)
         throw std::logic_error("Complex GPU publication current image/native version mismatch");
       required = {native_bytes, native_bytes};
+      if (captured->mixed)
+      {
+        const auto pending = captured->mixed->cost().pending_device_bytes;
+        required.device_bytes = psiformer::spatial_detail::checkedAdd(native_bytes, pending,
+            "Complex mixed pending DEVICE bytes overflow");
+        required.host_bytes = psiformer::spatial_detail::checkedAdd(native_bytes,
+            sizeof(psiformer::PsiFormerParameterConversionDiagnostics), "Complex mixed pending HOST bytes overflow");
+      }
       if (required.device_bytes > additional_device_cap || required.host_bytes > additional_host_cap)
         throw std::length_error("Complex GPU publication exceeds new-generation caps before allocation");
     }
@@ -5107,6 +5456,10 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     // Independent canonical bytes share the immutable family, not an old P image.
     const auto next_version = expected_version + 1;
     auto successor = source_image->makeUpdatedImage(candidate.values, next_version);
+    std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> mixed_successor;
+    if (captured->mixed)
+      mixed_successor = std::make_shared<psiformer::device::PreparedDeviceMixedDenseParameters>(successor,
+          captured->queue, psiformer::MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, true);
 
     std::unique_lock write(state->mutex);
     if (state->model.p.version() != expected_version || state->gpu != captured || captured->image != source_image)
@@ -5117,14 +5470,19 @@ PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     std::unique_lock gpu(captured->mutex);
     captured->image->validateCurrentDevice();
     captured->queue.sync();
-    captured->value->validateModelRebind(successor);
-    captured->full->validateModelRebind(successor);
+    if (captured->mixed)
+      captured->mixed->validatePreparedRebind(successor, mixed_successor);
+    else
+    {
+      captured->value->validateModelRebind(successor);
+      captured->full->validateModelRebind(successor);
+    }
     if (captured->virtual_value)
       captured->virtual_value->validateModelRebind(successor);
     auto native = state->model.p.prepare_flat_values(candidate.values, expected_version);
     // All clones, including this publisher, reject old accepted caches by version.
     return std::make_unique<Impl::PreparedGpuPublication>(state, captured, std::move(successor),
-        std::move(native), std::move(write), std::move(gpu));
+        std::move(mixed_successor), std::move(native), std::move(write), std::move(gpu));
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
@@ -5190,7 +5548,10 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
           impl_->state->model.p.version(), impl_->state->gpu_limit,
           primary.preparation, primary.capacity, primary.image, primary.virtual_capacity, primary.trace_targets,
           primary.virtual_envelope_reuse, primary.head_determinant_batch, primary.full_inverse_columns,
-          primary.target_factor_reuse, primary.periodic_value_tiling, primary.target_cold_cooperative_lu);
+          primary.target_factor_reuse, primary.periodic_value_tiling,
+          primary.target_cold_cooperative_lu, primary.mixed_inference,
+          primary.mixed ? primary.mixed->parameterCache() :
+              std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters>{});
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes
@@ -5303,7 +5664,9 @@ void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
   {
     const auto& clone = *resource.components[i]->impl_;
     if (clone.pending || targets[i].getActivePtcl() >= 0 || !clone.accepted_valid || clone.accepted.isZero() ||
-        clone.accepted_version != impl_->state->model.p.version() || clone.accepted_key != configurationIdentity(targets[i]))
+        clone.accepted_version != impl_->state->model.p.version() ||
+        clone.accepted_epoch_generation != clone.nativeEpochGeneration() ||
+        clone.accepted_key != configurationIdentity(targets[i]))
       throw std::logic_error("Complex collective proposal requires current idle accepted amplitudes");
     if (gradients[i].get().size() != n || laplacians[i].get().size() != n)
       throw std::invalid_argument("Complex collective proposal spatial output extent differs");
@@ -5408,6 +5771,7 @@ void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
       clone.accepted = clone.proposed;
       clone.accepted_key = clone.proposed_key;
       clone.accepted_version = clone.proposed_version;
+      clone.accepted_epoch_generation = clone.nativeEpochGeneration();
       clone.accepted_valid = clone.own_full_valid = true;
       component.log_value_ = clone.proposed_log;
     }
@@ -5477,6 +5841,7 @@ void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionCo
     clone.accepted = resource.amplitude[i];
     clone.accepted_key = resource.keys[i];
     clone.accepted_version = impl_->state->model.p.version();
+    clone.accepted_epoch_generation = clone.nativeEpochGeneration();
     clone.accepted_valid = clone.own_full_valid = true;
     component.log_value_ = resource.logs[i];
   }
@@ -5703,6 +6068,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLogLocked(const Particl
   impl_->accepted = result.amplitude;
   impl_->accepted_key = configurationIdentity(p);
   impl_->accepted_version = result.parameter_version;
+  impl_->accepted_epoch_generation = impl_->nativeEpochGeneration();
   impl_->accepted_valid = true;
   impl_->own_full_valid = true;
   return log_value_ = physical;
@@ -5777,6 +6143,7 @@ void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
   impl_->own_full_valid = false; // VALUE/ACTIVE accepted state is never a FULL persistence/energy cache
   impl_->accepted_key = impl_->proposed_key;
   impl_->accepted_version = impl_->proposed_version;
+  impl_->accepted_epoch_generation = impl_->nativeEpochGeneration();
   impl_->accepted_valid = true;
   log_value_ = impl_->proposed_log;
 }
@@ -5870,6 +6237,7 @@ void PsiFormerComplexWF::copyFromBuffer(ParticleSet& p, WFBufferType& buffer)
   impl_->accepted = amplitude;
   impl_->accepted_key = configurationIdentity(p);
   impl_->accepted_version = impl_->state->model.p.version();
+  impl_->accepted_epoch_generation = impl_->nativeEpochGeneration();
   impl_->accepted_valid = impl_->own_full_valid = true;
   log_value_ = physical;
 }

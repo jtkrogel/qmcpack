@@ -311,6 +311,22 @@ __global__ void valueFp32ToFp64Kernel(BatchedValueLayout layout,
   target[offset] = static_cast<double>(value);
 }
 
+/// Promote one private FP32 derivative and accumulate only at the FP64 boundary.
+__global__ void mixedDerivativePromoteKernel(std::size_t count, const float* source,
+    double* target, bool accumulate, PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const double value = static_cast<double>(source[i]);
+  const double result = accumulate ? target[i] + value : value;
+  if (!finiteDouble(value) || !finiteDouble(result))
+  {
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.nonfinite_count), 1ULL);
+    target[i] = 0.0;
+  }
+  else target[i] = result;
+}
+
 inline int blasExtent(std::size_t extent) noexcept
 {
   return static_cast<int>(extent);
@@ -499,6 +515,40 @@ void denseForwardFp32(AcceleratorBlasHandle& handle,
   validateDenseForwardLayout(layout);
   executeWithDeviceBlasMathMode(handle, math_mode, [&] {
     denseForwardFp32Raw(handle, layout, source, weight, target);
+  });
+}
+
+/// Form the selected FP32 input VJP in private storage before FP64 accumulation.
+void denseInputAdjointFp32(AcceleratorBlasHandle& handle,
+    const PsiFormerBlasMathModePlan& math_mode, const DenseForwardLayout& layout,
+    const float* target_adjoint, const float* weight, float* source_adjoint)
+{
+  validateDenseForwardLayout(layout);
+  if (!target_adjoint || !weight || !source_adjoint)
+    throw std::invalid_argument("Mixed input VJP storage is null");
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    compute::BLAS::gemm(handle, 'T', 'N', blasExtent(layout.input_width),
+        blasExtent(layout.rows), blasExtent(layout.output_width), 1.0F,
+        weight, blasExtent(layout.weight_row_stride), target_adjoint,
+        blasExtent(layout.target_row_stride), 0.0F, source_adjoint,
+        blasExtent(layout.source_row_stride));
+  });
+}
+
+/// Form the selected FP32 shared-weight VJP without reading the response accumulator.
+void denseWeightAdjointFp32(AcceleratorBlasHandle& handle,
+    const PsiFormerBlasMathModePlan& math_mode, const DenseForwardLayout& layout,
+    const float* source, const float* target_adjoint, float* weight_adjoint)
+{
+  validateDenseForwardLayout(layout);
+  if (!source || !target_adjoint || !weight_adjoint)
+    throw std::invalid_argument("Mixed weight VJP storage is null");
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    compute::BLAS::gemm(handle, 'N', 'T', blasExtent(layout.output_width),
+        blasExtent(layout.input_width), blasExtent(layout.rows), 1.0F,
+        target_adjoint, blasExtent(layout.target_row_stride), source,
+        blasExtent(layout.source_row_stride), 0.0F, weight_adjoint,
+        blasExtent(layout.weight_row_stride));
   });
 }
 
@@ -893,6 +943,8 @@ PreparedDeviceMixedValueDense::PreparedDeviceMixedValueDense(
       "MixedValueDense::fp32_source", __FILE__, __LINE__);
   target_.reserveNamed(mixedCheckedMultiply(maximum_rows_, width), "MixedValueDense::fp32_target", __FILE__, __LINE__);
   device_diagnostics_.reserveNamed(1, "MixedValueDense::diagnostics", __FILE__, __LINE__);
+  if (estimateDeviceWorkspaceBytes(plan, maximum_rows_) != deviceWorkspaceBytes())
+    throw std::logic_error("Mixed affine planned and actual capacities differ");
 }
 
 void PreparedDeviceMixedValueDense::beginEvaluation(const std::shared_ptr<const PreparedDeviceModel>& image)
@@ -1050,8 +1102,9 @@ void PreparedDeviceMixedValueDense::checkComplexValueConditioning(const double* 
 #endif
 }
 
-void PreparedDeviceMixedValueDense::rebindParameters(
-    std::shared_ptr<const PreparedDeviceMixedDenseParameters> successor)
+/// Admit a successor cache while retaining the accepted affine image unchanged.
+void PreparedDeviceMixedValueDense::validateParameterRebind(
+    const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& successor) const
 {
   if (active_)
     throw std::logic_error("Cannot rebind mixed parameters during an open evaluation");
@@ -1060,9 +1113,23 @@ void PreparedDeviceMixedValueDense::rebindParameters(
   if (successor->trunkHeadPolicy() != parameters_->trunkHeadPolicy())
     throw std::invalid_argument("Mixed dense successor changes its admitted head family");
   modelImage()->validateSuccessor(successor->modelImage());
-  parameters_ = std::move(successor);
+}
+
+/// Swap only prevalidated cache metadata at the native no-throw boundary.
+void PreparedDeviceMixedValueDense::adoptPreparedParameters(
+    const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& successor) noexcept
+{
+  parameters_ = successor;
   diagnostics_ = {};
   statistics_ = {};
+}
+
+/// Preserve the single-owner API through the same preflight/adoption split.
+void PreparedDeviceMixedValueDense::rebindParameters(
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters> successor)
+{
+  validateParameterRebind(successor);
+  adoptPreparedParameters(successor);
 }
 
 const std::shared_ptr<const PreparedDeviceModel>& PreparedDeviceMixedValueDense::modelImage() const noexcept
@@ -1070,11 +1137,268 @@ const std::shared_ptr<const PreparedDeviceModel>& PreparedDeviceMixedValueDense:
   return parameters_->modelImage();
 }
 
+/// Count compact cast buffers and diagnostics before any affine-owner allocation.
+std::size_t PreparedDeviceMixedValueDense::estimateDeviceWorkspaceBytes(
+    const PsiFormerExecutionPlan& plan, std::size_t maximum_rows)
+{
+  if (!maximum_rows) throw std::invalid_argument("Mixed affine row capacity is zero");
+  const auto width = plan.modelShape().feature_dimension;
+  const auto input = std::max(width, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
+  const auto floats = mixedCheckedAdd(mixedCheckedMultiply(maximum_rows, input), mixedCheckedMultiply(maximum_rows, width));
+  return mixedCheckedAdd(checkedDeviceBytes<float>(floats), sizeof(PsiFormerDeviceNumericalDiagnostics));
+}
+
 std::size_t PreparedDeviceMixedValueDense::deviceWorkspaceBytes() const
 {
   return mixedCheckedAdd(mixedCheckedAdd(checkedDeviceBytes<float>(source_.capacity()),
       checkedDeviceBytes<float>(target_.capacity())),
       checkedDeviceBytes<PsiFormerDeviceNumericalDiagnostics>(device_diagnostics_.capacity()));
+}
+
+/// Count conversion traffic, excluding FP64 accumulator reads and vendor workspace traffic.
+std::size_t MixedAffineDerivativeStatistics::logicalTransferBytes() const
+{
+  return mixedCheckedMultiply(mixedCheckedAdd(cast_elements, promoted_elements), sizeof(double) + sizeof(float));
+}
+
+/// Derive every prepared cast, private product and observation capacity with checked arithmetic.
+std::size_t PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(
+    const PsiFormerExecutionPlan& plan, std::size_t maximum_rows)
+{
+  if (!maximum_rows)
+    throw std::invalid_argument("Mixed affine derivative row capacity is zero");
+  const auto width = plan.modelShape().feature_dimension;
+  const auto input = std::max(width, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
+  const auto sources = mixedCheckedMultiply(maximum_rows, input);
+  const auto adjoints = mixedCheckedMultiply(maximum_rows, width);
+  const auto weights = mixedCheckedMultiply(input, width);
+  std::size_t floats = mixedCheckedAdd(sources, adjoints);
+  floats = mixedCheckedAdd(floats, std::max(sources, weights));
+  floats = mixedCheckedAdd(floats, weights);
+  const auto numeric = mixedCheckedAdd(checkedDeviceBytes<float>(floats),
+      checkedDeviceBytes<double>(mixedCheckedAdd(sources, adjoints)));
+  return mixedCheckedAdd(numeric, sizeof(PsiFormerDeviceNumericalDiagnostics));
+}
+
+/// Allocate bounded mutable derivative scratch around one immutable compute image.
+PreparedDeviceMixedAffineDerivatives::PreparedDeviceMixedAffineDerivatives(
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters, std::size_t maximum_rows,
+    compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)
+    : parameters_(std::move(parameters)), maximum_rows_(maximum_rows), maximum_input_(0), width_(0),
+      queue_(queue), blas_(blas)
+{
+  if (!parameters_ || !maximum_rows_)
+    throw std::invalid_argument("Mixed affine derivatives require immutable parameters and positive capacity");
+  modelImage()->validateCurrentDevice();
+#ifdef QMC_CUDA2HIP
+  constexpr auto backend = PsiFormerAcceleratorBackend::HIP;
+#else
+  constexpr auto backend = PsiFormerAcceleratorBackend::CUDA;
+#endif
+  math_mode_ = makePsiFormerBlasMathModePlan(PsiFormerBackendMathMode::FP32_STRICT, backend);
+  const auto& plan = modelImage()->plan();
+  width_ = plan.modelShape().feature_dimension;
+  maximum_input_ = std::max(width_, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
+  const auto sources = mixedCheckedMultiply(maximum_rows_, maximum_input_);
+  const auto adjoints = mixedCheckedMultiply(maximum_rows_, width_);
+  const auto weights = mixedCheckedMultiply(maximum_input_, width_);
+  source_.reserveNamed(sources, "MixedAffineDerivatives::source", __FILE__, __LINE__);
+  adjoint_.reserveNamed(adjoints, "MixedAffineDerivatives::adjoint", __FILE__, __LINE__);
+  product_.reserveNamed(std::max(sources, weights), "MixedAffineDerivatives::product", __FILE__, __LINE__);
+  direction_.reserveNamed(weights, "MixedAffineDerivatives::weight_direction", __FILE__, __LINE__);
+  observation_source_.reserveNamed(sources, "MixedAffineDerivatives::observation_source", __FILE__, __LINE__);
+  observation_adjoint_.reserveNamed(adjoints, "MixedAffineDerivatives::observation_adjoint", __FILE__, __LINE__);
+  device_diagnostics_.reserveNamed(1, "MixedAffineDerivatives::diagnostics", __FILE__, __LINE__);
+  if (estimateDeviceWorkspaceBytes(plan, maximum_rows_) != deviceWorkspaceBytes())
+    throw std::logic_error("Mixed affine derivative planned and actual capacities differ");
+}
+
+/// Keep model authority attached to the exact shared FP32 compute image.
+const std::shared_ptr<const PreparedDeviceModel>& PreparedDeviceMixedAffineDerivatives::modelImage() const noexcept
+{ return parameters_->modelImage(); }
+
+/// Open one private arithmetic epoch and clear its sticky numerical diagnostics.
+void PreparedDeviceMixedAffineDerivatives::beginEvaluation(const std::shared_ptr<const PreparedDeviceModel>& image)
+{
+  if (active_)
+    throw std::logic_error("Mixed affine derivative evaluation is already open");
+  if (!image || image.get() != modelImage().get())
+    throw std::invalid_argument("Mixed affine derivatives have a stale or foreign image");
+  image->validateCurrentDevice();
+  statistics_.attempts = mixedCheckedAdd(statistics_.attempts, 1);
+  if (!parameters_->usable())
+  {
+    ++statistics_.rejected;
+    throw MixedPrecisionRetryRequired("Mixed affine derivative cache requires whole-sample FP64 replay");
+  }
+  diagnostics_ = {};
+  active_ = true;
+  try { clearMixedDeviceStorage(queue_.getNative(), device_diagnostics_.data(), sizeof(PsiFormerDeviceNumericalDiagnostics)); }
+  catch (...) { cancelEvaluation(); throw; }
+}
+
+/// Bind a typed canonical affine matrix and reject capacity or layout mismatches.
+const float* PreparedDeviceMixedAffineDerivatives::validateProjection(
+    const DenseForwardLayout& layout, const double* canonical_weight) const
+{
+  if (!active_)
+    throw std::logic_error("Mixed affine derivative projection has no open evaluation");
+  validateDenseForwardLayout(layout);
+  if (!layout.rows || layout.rows > maximum_rows_ || layout.input_width > maximum_input_ ||
+      layout.output_width != width_ || layout.source_row_stride != layout.input_width ||
+      layout.weight_row_stride != layout.output_width || layout.target_row_stride != layout.output_width)
+    throw std::invalid_argument("Mixed affine derivatives require compact matching rows within prepared capacity");
+  for (const auto& tensor : modelImage()->plan().parameterTensors())
+    if (isMixedValueDenseWeight(tensor.role) && tensor.shape.size() == 2 &&
+        canonical_weight == modelImage()->parameters() + tensor.begin &&
+        tensor.shape[0] == layout.input_width && tensor.shape[1] == layout.output_width)
+      return parameters_->parameters() + tensor.begin;
+  throw std::invalid_argument("Mixed affine derivative weight is not a matching canonical matrix");
+}
+
+/// Convert only the logical compact operands while recording cast hazards.
+void PreparedDeviceMixedAffineDerivatives::cast(
+    const double* source, float* target, std::size_t rows, std::size_t width)
+{
+  if (!source)
+    throw std::invalid_argument("Mixed affine derivative source is null");
+  statistics_.cast_elements = mixedCheckedAdd(statistics_.cast_elements, mixedCheckedMultiply(rows, width));
+  checkRuntime(launchValueFp64ToFp32(queue_.getNative(), makeBatchedValueLayout(1, rows, width),
+      source, target, device_diagnostics_.data()), "mixed affine derivative cast");
+}
+
+/// Promote a private product and optionally add it to the FP64 response island.
+void PreparedDeviceMixedAffineDerivatives::promote(
+    const float* source, double* target, std::size_t count, bool accumulate)
+{
+  if (!target)
+    throw std::invalid_argument("Mixed affine derivative destination is null");
+  statistics_.promoted_elements = mixedCheckedAdd(statistics_.promoted_elements, count);
+  mixedDerivativePromoteKernel<<<valueBlockCount(count), value_block_size, 0, queue_.getNative()>>>(
+      count, source, target, accumulate, device_diagnostics_.data());
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipPeekAtLastError(), "mixed affine derivative promotion");
+#else
+  checkRuntime(cudaPeekAtLastError(), "mixed affine derivative promotion");
+#endif
+}
+
+/// Match the input response to the same rounded weights consumed by the primal.
+void PreparedDeviceMixedAffineDerivatives::accumulateInputAdjoint(const DenseForwardLayout& layout,
+    const double* adjoint, const double* canonical_weight, double* input_response)
+{
+  try
+  {
+    const auto* weights = validateProjection(layout, canonical_weight);
+    cast(adjoint, adjoint_.data(), layout.rows, layout.output_width);
+    statistics_.fp32_gemms = mixedCheckedAdd(statistics_.fp32_gemms, 1);
+    denseInputAdjointFp32(blas_, math_mode_, layout, adjoint_.data(), weights, product_.data());
+    promote(product_.data(), input_response, layout.rows * layout.input_width, true);
+  }
+  catch (...) { cancelEvaluation(); throw; }
+}
+
+/// Accumulate the shared-weight response and materialize rows only for a pending sink.
+MixedAffineObservationView PreparedDeviceMixedAffineDerivatives::accumulateWeightAdjoint(
+    const DenseForwardLayout& layout, const double* source, const double* adjoint,
+    const double* canonical_weight, double* weight_response, bool materialize_observations)
+{
+  try
+  {
+    (void)validateProjection(layout, canonical_weight);
+    cast(source, source_.data(), layout.rows, layout.input_width);
+    cast(adjoint, adjoint_.data(), layout.rows, layout.output_width);
+    statistics_.fp32_gemms = mixedCheckedAdd(statistics_.fp32_gemms, 1);
+    denseWeightAdjointFp32(blas_, math_mode_, layout, source_.data(), adjoint_.data(), product_.data());
+    promote(product_.data(), weight_response, layout.input_width * layout.output_width, true);
+    if (materialize_observations)
+    {
+      promote(source_.data(), observation_source_.data(), layout.rows * layout.input_width, false);
+      promote(adjoint_.data(), observation_adjoint_.data(), layout.rows * layout.output_width, false);
+      return {observation_source_.data(), observation_adjoint_.data()};
+    }
+    return {nullptr, nullptr};
+  }
+  catch (...) { cancelEvaluation(); throw; }
+}
+
+/// Propagate dX W and X dW with separate FP32 products and an FP64 sum.
+void PreparedDeviceMixedAffineDerivatives::projectDirection(const DenseForwardLayout& layout,
+    const double* source, const double* source_direction, const double* canonical_weight,
+    const double* weight_direction, double* target)
+{
+  try
+  {
+    const auto* weights = validateProjection(layout, canonical_weight);
+    if (source_direction)
+    {
+      cast(source_direction, source_.data(), layout.rows, layout.input_width);
+      statistics_.fp32_gemms = mixedCheckedAdd(statistics_.fp32_gemms, 1);
+      denseForwardFp32(blas_, math_mode_, layout, source_.data(), weights, product_.data());
+      promote(product_.data(), target, layout.rows * layout.output_width, false);
+    }
+    cast(source, source_.data(), layout.rows, layout.input_width);
+    cast(weight_direction, direction_.data(), layout.input_width, layout.output_width);
+    statistics_.fp32_gemms = mixedCheckedAdd(statistics_.fp32_gemms, 1);
+    denseForwardFp32(blas_, math_mode_, layout, source_.data(), direction_.data(), product_.data());
+    promote(product_.data(), target, layout.rows * layout.output_width, source_direction != nullptr);
+  }
+  catch (...) { cancelEvaluation(); throw; }
+}
+
+/// Admit the complete arithmetic epoch before its owner can accept private outputs.
+void PreparedDeviceMixedAffineDerivatives::finishEvaluation()
+{
+  if (!active_)
+    throw std::logic_error("Mixed affine derivative admission has no open evaluation");
+  active_ = false;
+  try
+  {
+    queue_.sync();
+    device_diagnostics_.download(&diagnostics_, 1);
+    if (diagnostics_.execution.nonfinite_count || mixedConversionNeedsRetry(diagnostics_.conversion))
+      throw MixedPrecisionRetryRequired("Mixed affine derivative diagnostics require whole-sample FP64 replay");
+    statistics_.completed = mixedCheckedAdd(statistics_.completed, 1);
+  }
+  catch (...) { ++statistics_.rejected; throw; }
+}
+
+/// Validate the successor and idle epoch before any publication leaf mutates.
+void PreparedDeviceMixedAffineDerivatives::validateParameterRebind(
+    const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& successor) const
+{
+  if (active_)
+    throw std::logic_error("Cannot rebind an open mixed affine derivative evaluation");
+  if (!successor || successor->trunkHeadPolicy() != parameters_->trunkHeadPolicy())
+    throw std::invalid_argument("Mixed affine derivative successor changes the admitted head family");
+  modelImage()->validateSuccessor(successor->modelImage());
+}
+
+/// Adopt a prevalidated image without allocation, runtime work or a throwing check.
+void PreparedDeviceMixedAffineDerivatives::adoptPreparedParameters(
+    const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& successor) noexcept
+{
+  parameters_ = successor;
+  diagnostics_ = {};
+}
+
+/// Provide the ordinary single-owner rebind through the atomic-publication primitives.
+void PreparedDeviceMixedAffineDerivatives::rebindParameters(
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters> successor)
+{
+  validateParameterRebind(successor);
+  adoptPreparedParameters(successor);
+}
+
+/// Report actual prepared device capacities separately from the shared parameter cache.
+std::size_t PreparedDeviceMixedAffineDerivatives::deviceWorkspaceBytes() const
+{
+  std::size_t bytes = 0;
+  for (const auto count : {source_.capacity(), adjoint_.capacity(), product_.capacity(), direction_.capacity()})
+    bytes = mixedCheckedAdd(bytes, checkedDeviceBytes<float>(count));
+  for (const auto count : {observation_source_.capacity(), observation_adjoint_.capacity()})
+    bytes = mixedCheckedAdd(bytes, checkedDeviceBytes<double>(count));
+  return mixedCheckedAdd(bytes, checkedDeviceBytes<PsiFormerDeviceNumericalDiagnostics>(device_diagnostics_.capacity()));
 }
 
 } // namespace qmcplusplus::psiformer::device

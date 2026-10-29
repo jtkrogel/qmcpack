@@ -120,6 +120,20 @@ inline ScoreTileStorage estimateScoreTileStorage(const PsiFormerExecutionPlan& p
   return cost;
 }
 
+/// Extend the existing exact score inventory with one shared-cache affine arithmetic lane.
+inline ScoreTileStorage estimateMixedScoreTileStorage(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  auto cost = estimateScoreTileStorage(plan, batch);
+  const auto rows = spatial_detail::checkedProduct(batch, plan.modelShape().electrons(), "Mixed score rows overflow");
+  for (const auto bytes : {PreparedDeviceMixedValueDense::estimateDeviceWorkspaceBytes(plan, rows),
+       PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(plan, rows),
+       PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(plan, rows)})
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, bytes, "Mixed score inventory overflow");
+  cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes,
+      3 * sizeof(PsiFormerDeviceNumericalDiagnostics), "Mixed score HOST diagnostics overflow");
+  return cost;
+}
+
 /** Lease one prepared numerical derivative lane, sharing its backend's image.
  * The backend must outlive the session; the model owner and mutex are borrowed.
  * An outer provider scratch lease rejects callback re-entry and serializes use.
@@ -280,22 +294,34 @@ public:
   };
 
   /// Allocate scratch once while the owning backend's control mutex is held.
-  /// Product graphs are FP64: no mixed adapter is attached, and the backend rejects mixed preparation.
+  /// Fix one complete FP64 or matched mixed score policy before any product evaluation.
+  /// The backend's cache reference is stable and supplies privately prepared successors.
   PreparedDeviceProductSession(const std::shared_ptr<const PreparedDeviceModel>& active_image,
                                PsiFormerAcceleratorSharedModel& owner,
                                std::mutex& control_mutex, std::uint64_t identity,
                                ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
                                std::size_t score_capacity = 1,
                                DeviceExecutionPreparation preparation = {},
-                               bool admit_large_score = false, bool independent_score_lane = false)
-      : active_image_(active_image), image_(active_image), owner_(owner),
+                               bool admit_large_score = false, bool independent_score_lane = false,
+                               const std::shared_ptr<const PreparedDeviceMixedDenseParameters>* active_mixed_parameters = nullptr)
+      : active_image_(active_image), image_(active_image),
+        active_mixed_parameters_(validatedMixedParameters(active_image, profile,
+            independent_score_lane, active_mixed_parameters)), owner_(owner),
         mutex_(independent_score_lane ? lane_mutex_ : control_mutex),
         profile_(validatedProfile(profile)),
         score_capacity_(admit_large_score ? validatedScoreCapacity(score_capacity)
                                          : admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
         preparation_(validatedPreparation(image_->plan(), preparation)),
-        blas_(queue_), values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
-        score_(image_, score_capacity_, queue_, blas_), jvp_(image_, score_capacity_, queue_, blas_),
+        blas_(queue_),
+        mixed_forward_(active_mixed_parameters_ ? std::make_shared<PreparedDeviceMixedValueDense>(
+            *active_mixed_parameters_, mixedRows(), queue_, blas_) : nullptr),
+        mixed_reverse_(active_mixed_parameters_ ? std::make_shared<PreparedDeviceMixedAffineDerivatives>(
+            *active_mixed_parameters_, mixedRows(), queue_, blas_) : nullptr),
+        mixed_jvp_(active_mixed_parameters_ ? std::make_shared<PreparedDeviceMixedAffineDerivatives>(
+            *active_mixed_parameters_, mixedRows(), queue_, blas_) : nullptr),
+        values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
+        score_(image_, score_capacity_, queue_, blas_, mixed_reverse_),
+        jvp_(image_, score_capacity_, queue_, blas_, mixed_jvp_),
         kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets == 0
             ? std::make_unique<KineticWorkspace>(image_, queue_, blas_) : nullptr),
         target_kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets != 0
@@ -313,18 +339,22 @@ public:
   {
     if (independent_score_lane && profile_ != ProductSessionProfile::SCORE_ONLY)
       throw std::invalid_argument("Independent product lanes require score-only preparation");
+    if (mixed_forward_)
+      values_.setMixedRetainedValueDense(mixed_forward_);
     // Logical single-root sizes stay 3Ne even when position capacity admits tiles.
     positions_.reserve(spatial_detail::checkedProduct(positions_.size(), score_capacity_,
         "Device score tile position extent overflow"));
     tile_weights_.reserve(score_capacity_);
     products_.reserve(score_capacity_);
-    if (admit_large_score)
+    if (admit_large_score || mixed_forward_)
     {
-      const auto expected = estimateScoreTileStorage(image_->plan(), score_capacity_);
+      const auto expected = mixed_forward_ ? estimateMixedScoreTileStorage(image_->plan(), score_capacity_)
+                                           : estimateScoreTileStorage(image_->plan(), score_capacity_);
       const auto actual = spatial_detail::checkedAdd(values_.deviceWorkspaceBytes(),
           spatial_detail::checkedAdd(score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes(),
               "Score graph storage overflow"), "Score graph storage overflow");
-      if (actual != expected.device_bytes)
+      if (spatial_detail::checkedAdd(actual, mixed_forward_ ? mixed_forward_->deviceWorkspaceBytes() : 0,
+          "Mixed score graph inventory overflow") != expected.device_bytes)
         throw std::logic_error("Large REAL score graph differs from its cold storage descriptor");
     }
     executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
@@ -339,6 +369,21 @@ public:
 
   /// Immutable prepared capacity; capability reads need no lazy-owner access.
   std::size_t scoreCapacity() const noexcept { return score_capacity_; }
+
+  /// The numerical policy is immutable for this prepared session.
+  bool usesMixedAffineProducts() const noexcept { return bool(mixed_forward_); }
+
+  /// Borrow last primal cast counts under the caller's existing product lease.
+  const MixedValueDenseStatistics* mixedPrimalStatistics() const noexcept
+  { return mixed_forward_ ? &mixed_forward_->statistics() : nullptr; }
+
+  /// Borrow actual cumulative reverse arithmetic counts, excluding inference work.
+  const MixedAffineDerivativeStatistics* mixedReverseStatistics() const noexcept
+  { return mixed_reverse_ ? &mixed_reverse_->statistics() : nullptr; }
+
+  /// Keep independently rounded direct JVP arithmetic separate from reverse counts.
+  const MixedAffineDerivativeStatistics* mixedJvpStatistics() const noexcept
+  { return mixed_jvp_ ? &mixed_jvp_->statistics() : nullptr; }
 
   /// Return the explicit per-provider coordinate limit; zero retains host input.
   std::size_t retainedCoordinateBudget() const noexcept
@@ -1043,6 +1088,8 @@ public:
     std::size_t bytes = 0;
     for (auto amount : {values_.deviceWorkspaceBytes(), score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product session byte overflow");
+    if (mixed_forward_)
+      bytes = spatial_detail::checkedAdd(bytes, mixed_forward_->deviceWorkspaceBytes(), "Mixed primal cast bytes overflow");
     if (kinetic_)
     {
       bytes = spatial_detail::checkedAdd(bytes, kinetic_->spatial.deviceWorkspaceBytes(),
@@ -1076,6 +1123,8 @@ public:
                                          "Device product host staging overflow");
     for (auto amount : {values_.hostWorkspaceBytes(), score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product host status overflow");
+    if (mixed_forward_)
+      bytes = spatial_detail::checkedAdd(bytes, mixed_forward_->hostWorkspaceBytes(), "Mixed primal HOST diagnostics overflow");
     if (kinetic_)
     {
       bytes = spatial_detail::checkedAdd(bytes, kinetic_->spatial.hostWorkspaceBytes(),
@@ -1118,6 +1167,25 @@ private:
     if (capacity == 0 || capacity > 4)
       throw std::invalid_argument("Device score tile capacity must be between one and four");
     return capacity;
+  }
+
+  /// Validate the immutable mixed score profile before queue or graph allocation.
+  static const std::shared_ptr<const PreparedDeviceMixedDenseParameters>* validatedMixedParameters(
+      const std::shared_ptr<const PreparedDeviceModel>& image, ProductSessionProfile profile,
+      bool independent, const std::shared_ptr<const PreparedDeviceMixedDenseParameters>* parameters)
+  {
+    if (parameters && (profile != ProductSessionProfile::SCORE_ONLY || independent || !*parameters ||
+        (*parameters)->modelImage().get() != image.get() ||
+        (*parameters)->trunkHeadPolicy() != MixedTrunkHeadPolicy::REAL_AMPLITUDE))
+      throw std::invalid_argument("Mixed real products require one matching score-only affine cache lane");
+    return parameters;
+  }
+
+  /// Fold prepared configurations and physical electrons without introducing a padded shape.
+  std::size_t mixedRows() const
+  {
+    return spatial_detail::checkedProduct(score_capacity_, image_->plan().modelShape().electrons(),
+        "Mixed product folded-row capacity overflow");
   }
 
   /// Missing roots are a preparation contract error, before any product event.
@@ -1184,9 +1252,31 @@ private:
       app_debug_stream() << "PsiFormer score lane image rebind: session=" << this << " source_image=" << image_.get()
                 << " successor_image=" << active_image_.get() << " parameter_version=" << active_image_->version()
                 << "; idle fixed-shape arenas retained; process_local_identity\n";
-    values_.rebindModel(active_image_);
-    score_.rebindModel(active_image_);
-    jvp_.rebindModel(active_image_);
+    if (active_mixed_parameters_)
+    {
+      const auto& successor = *active_mixed_parameters_;
+      values_.validateModelRebindWithMixedParameters(active_image_, successor);
+      score_.validateModelRebindWithMixedParameters(active_image_, successor);
+      jvp_.validateModelRebindWithMixedParameters(active_image_, successor);
+      values_.adoptPreparedModelWithMixedParameters(active_image_, successor);
+      score_.adoptPreparedModelWithMixedParameters(active_image_, successor);
+      jvp_.adoptPreparedModelWithMixedParameters(active_image_, successor);
+    }
+    else if (profile_ == ProductSessionProfile::SCORE_ONLY)
+    {
+      values_.validateModelRebindWithMixedParameters(active_image_, {});
+      score_.validateModelRebindWithMixedParameters(active_image_, {});
+      jvp_.validateModelRebindWithMixedParameters(active_image_, {});
+      values_.adoptPreparedModelWithMixedParameters(active_image_, {});
+      score_.adoptPreparedModelWithMixedParameters(active_image_, {});
+      jvp_.adoptPreparedModelWithMixedParameters(active_image_, {});
+    }
+    else
+    {
+      values_.rebindModel(active_image_);
+      score_.rebindModel(active_image_);
+      jvp_.rebindModel(active_image_);
+    }
     if (kinetic_)
     {
       kinetic_->spatial.rebindModel(active_image_);
@@ -1340,6 +1430,7 @@ private:
 
   const std::shared_ptr<const PreparedDeviceModel>& active_image_;
   std::shared_ptr<const PreparedDeviceModel> image_;
+  const std::shared_ptr<const PreparedDeviceMixedDenseParameters>* const active_mixed_parameters_;
   PsiFormerAcceleratorSharedModel& owner_;
   // Independent score lanes execute under their provider's shared model read.
   // Publication holds model write authority; the backend control lock is not a
@@ -1351,6 +1442,8 @@ private:
   const DeviceExecutionPreparation preparation_;
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
+  std::shared_ptr<PreparedDeviceMixedValueDense> mixed_forward_;
+  std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_reverse_, mixed_jvp_;
   PreparedDeviceInference values_;
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;

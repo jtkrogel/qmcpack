@@ -225,15 +225,18 @@ public:
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
   std::unique_ptr<PreparedDeviceProductSession> prepareProductSession(
       ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
-      std::size_t score_capacity = 1) const
+      std::size_t score_capacity = 1, bool force_fp64 = false) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     const bool independent_score_lane = preparation_.active_inference_crowds == 2 &&
         profile == ProductSessionProfile::SCORE_ONLY;
     if (preparation_.active_inference_crowds != 1 && !independent_score_lane)
       throw std::invalid_argument("Concurrent GPU parameter products require two score-only lanes");
-    if (mixed_parameters_)
-      throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
+    if (mixed_parameters_ && (profile != ProductSessionProfile::SCORE_ONLY ||
+        preparation_.active_inference_crowds != 1))
+      throw std::invalid_argument("Mixed PsiFormer products require one score-only crowd");
+    if (force_fp64 && !mixed_parameters_)
+      throw std::invalid_argument("Explicit FP64 product replay requires a mixed policy owner");
     // The eager ordinary context is already live. Reserve the unchanged B1
     // kinetic root, future C3 sums and successor image before optional B growth.
     // The target-cost full-Ne bound may conservatively exceed the old FULL
@@ -306,7 +309,76 @@ public:
       std::clog << "PsiFormer large REAL score preparation: selected=1 reason=profile_topology_or_unbounded_admission\n";
     return std::make_unique<PreparedDeviceProductSession>(
         image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_, false,
-        independent_score_lane);
+        independent_score_lane, mixed_parameters_ && !force_fp64 ? &mixed_parameters_ : nullptr);
+  }
+
+  /// Immutable mixed parameter authority; the public inference label stays unchanged.
+  bool usesMixedAffineProducts() const noexcept { return bool(mixed_statistics_); }
+
+  /// Prepare both fixed-policy training owners under one cache/image admission boundary.
+  std::pair<std::unique_ptr<PreparedDeviceProductSession>, std::unique_ptr<PreparedDeviceProductSession>>
+  prepareMixedTrainingProductSessions(std::size_t requested_capacity = 1) const
+  {
+    std::lock_guard lock(control_mutex_);
+    if (!mixed_parameters_ || preparation_.active_inference_crowds != 1)
+      throw std::invalid_argument("Mixed real training requires one score-only crowd");
+    const auto capacity = PreparedDeviceProductSession::admittedScoreCapacity(image_->plan().modelShape(), requested_capacity);
+    const auto mixed = estimateMixedScoreTileStorage(image_->plan(), capacity);
+    const auto reference = estimateScoreTileStorage(image_->plan(), capacity);
+    const auto bytes = spatial_detail::checkedAdd(mixed.device_bytes, reference.device_bytes,
+        "Mixed and replay product inventory overflow");
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&ordinal), "Mixed product admission device");
+#else
+    checkRuntime(cudaGetDevice(&ordinal), "Mixed product admission device");
+#endif
+    { auto admission = deviceMemoryMetrics(ordinal).reserveAllocation(bytes); }
+    std::clog << "PsiFormer mixed score before allocation: capacity=" << capacity
+              << " mixed_DEVICE_graph_bytes=" << mixed.device_bytes
+              << " FP64_replay_DEVICE_graph_bytes=" << reference.device_bytes
+              << "; shared_master_and_compute_cache_excluded=yes\n";
+    auto approximate = std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity(),
+        ProductSessionProfile::SCORE_ONLY, capacity, preparation_, false, false, &mixed_parameters_);
+    auto fallback = std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity(),
+        ProductSessionProfile::SCORE_ONLY, capacity, preparation_);
+    return {std::move(approximate), std::move(fallback)};
+  }
+
+  /// Read the current native epoch policy without selecting a different parameter image.
+  PsiFormerGpuTrainingEpochMode trainingEpochMode() const noexcept
+  { return training_epoch_mode_.load(std::memory_order_acquire); }
+
+  /// Fence escaped derivative operators when either epoch boundary changes selection.
+  std::size_t trainingEpochGeneration() const noexcept
+  { return training_epoch_generation_.load(std::memory_order_acquire); }
+
+  /// Caller owns native ModelWrite; transition only released C1 numerical resources.
+  std::size_t enterTrainingEpoch(std::size_t version, PsiFormerGpuTrainingEpochMode mode) const
+  {
+    using Mode = PsiFormerGpuTrainingEpochMode;
+    if (mode != Mode::STRICT_MIXED && mode != Mode::FP64_REPLAY)
+      throw std::invalid_argument("Mixed real training requires strict mixed or FP64 replay mode");
+    auto boundary = inference_concurrency_.publicationBoundary();
+    std::lock_guard lock(control_mutex_);
+    if (!mixed_parameters_ || preparation_.active_inference_crowds != 1 || version != image_->version() ||
+        owner_.publicationPending() || trainingEpochMode() != Mode::INFERENCE)
+      throw std::logic_error("Mixed real epoch requires an idle exact-version C1 backend");
+    if (trainingEpochGeneration() > std::numeric_limits<std::size_t>::max() - 2)
+      throw std::overflow_error("Mixed real arithmetic epoch generation exhausted");
+    training_epoch_mode_.store(mode, std::memory_order_release);
+    return training_epoch_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  }
+
+  /// Caller retains native ModelWrite and ends the epoch before optimizer publication.
+  void leaveTrainingEpoch(std::size_t generation) const
+  {
+    auto boundary = inference_concurrency_.publicationBoundary();
+    std::lock_guard lock(control_mutex_);
+    if (generation != trainingEpochGeneration() || trainingEpochMode() == PsiFormerGpuTrainingEpochMode::INFERENCE)
+      throw std::logic_error("Mixed real arithmetic epoch owner is stale");
+    training_epoch_mode_.store(PsiFormerGpuTrainingEpochMode::INFERENCE, std::memory_order_release);
+    training_epoch_generation_.fetch_add(1, std::memory_order_acq_rel);
   }
 
   /// Return typed device products while leaving host publication to the caller.
@@ -351,6 +423,7 @@ private:
     std::unique_lock context_lock(context->evaluation_mutex, std::try_to_lock);
     if (!context_lock.owns_lock())
       throw std::logic_error("Device inference cannot re-enter the same native crowd resource");
+    context->hooks.setTrainingEpochMode(trainingEpochMode());
     // Recovery/capacity replacement must not silently drop a frozen admitted bank.
     if (context->pair_preparation_effective &&
         (!context->hooks.values_ || !context->hooks.values_->hasPeriodicValuePairs()))
@@ -1019,6 +1092,8 @@ public:
   {
     auto publication_boundary = inference_concurrency_.publicationBoundary();
     std::lock_guard<std::mutex> lock(control_mutex_);
+    if (trainingEpochMode() != PsiFormerGpuTrainingEpochMode::INFERENCE)
+      throw std::logic_error("End the native arithmetic epoch before parameter publication");
     if (!commit_native)
       throw std::invalid_argument("Device publication requires an authoritative native commit");
     auto candidate = image_->makeUpdatedImage(values, version);
@@ -1230,6 +1305,8 @@ private:
   const std::function<void()> first_dispatch_reporter_;
   mutable std::atomic<std::size_t> numerical_tiles_{0};
   mutable std::atomic<bool> mixed_reported_{false};
+  mutable std::atomic<PsiFormerGpuTrainingEpochMode> training_epoch_mode_{PsiFormerGpuTrainingEpochMode::INFERENCE};
+  mutable std::atomic<std::size_t> training_epoch_generation_{0};
   std::shared_ptr<MixedFinalStatistics> mixed_statistics_;
 };
 

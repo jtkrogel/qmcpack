@@ -72,6 +72,22 @@ inline ComplexProductsCost estimateComplexProductsCost(const PsiFormerExecutionP
       partials, mul(mul(2, p), samples), host_output, scope};
 }
 
+/// Count a mixed SCORE/ECP producer separately from its native FP64 fallback owner.
+inline ComplexProductsCost estimateMixedComplexProductsCost(const PsiFormerExecutionPlan& plan,
+    std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
+    ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
+{
+  auto cost = estimateComplexProductsCost(plan, targets, samples, channels, chunk, host_output,
+      ComplexProductsScope::SCORE_ECP_ONLY);
+  const auto mixed_score = estimateMixedComplexScoreCost(plan);
+  cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes - cost.score.device_bytes,
+      mixed_score.device_bytes, "Mixed complex products DEVICE bytes overflow");
+  cost.host_bytes = spatial_detail::checkedAdd(cost.host_bytes - cost.score.host_bytes,
+      mixed_score.host_bytes, "Mixed complex products HOST bytes overflow");
+  cost.score = mixed_score;
+  return cost; // Shared FP32/master images and the separate fallback remain caller-owned.
+}
+
 /** TRANSPOSE/HERMITIAN complex SCORE/physical dK and full-score/device-dot REAL JVP.
  * Caller owns queue/BLAS/exclusive image execution lease for this owner's lifetime.
  * Immutable packed batch inputs/coefficient views are borrowed only during evaluate.
@@ -138,20 +154,50 @@ public:
     LocalTerms terms;
   };
 
-  /// Reuse only the idle score arena; all borrowed results become stale before rebinding.
+  /// Preflight both arithmetic modes without revoking any accepted product receipt.
+  void validateScoreModelRebind(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming = {}) const
+  {
+    requireNoStreamingNonlocal();
+    if (cost_.scope != ComplexProductsScope::SCORE_ECP_ONLY)
+      throw std::logic_error("Only score-only complex products support idle image rebind");
+    image_->validateSuccessor(successor);
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex products generation exhausted");
+    if (score_->usesMixedAffine())
+    {
+      if (!incoming || incoming->modelImage().get() != successor.get())
+        throw std::invalid_argument("Mixed complex products successor cache/image differs");
+      score_->validateMixedParameterRebind(incoming);
+    }
+    else
+    {
+      if (incoming)
+        throw std::invalid_argument("FP64 complex products cannot adopt a mixed arithmetic cache");
+      score_->validateModelRebind(successor);
+    }
+  }
+
+  /// Adopt after every composing owner preflights and retains the old image/cache.
+  void adoptPreparedScoreModel(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming = {}) noexcept
+  {
+    ready_ = jvp_ready_ = nonlocal_jvp_ = local_jvp_ = false;
+    ++generation_;
+    if (score_->usesMixedAffine()) score_->adoptPreparedMixedParameters(incoming);
+    else score_->adoptPreparedModel(successor);
+    image_ = successor;
+  }
+
+  /// Preserve ordinary FP64 idle rebind; mixed callers must prepare a successor cache first.
   void rebindScoreModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
     requireNoStreamingNonlocal();
     if (cost_.scope != ComplexProductsScope::SCORE_ECP_ONLY)
       throw std::logic_error("Only score-only complex products support idle image rebind");
     if (successor == image_) return;
-    image_->validateSuccessor(successor);
-    if (generation_ == std::numeric_limits<std::size_t>::max())
-      throw std::overflow_error("Complex products generation exhausted");
-    ready_ = jvp_ready_ = false;
-    ++generation_;
-    score_->rebindModel(successor);
-    image_ = std::move(successor);
+    validateScoreModelRebind(successor);
+    adoptPreparedScoreModel(successor);
   }
 
   /// Reject checked combined device/host/work caps before either numerical owner allocates.
@@ -173,6 +219,28 @@ public:
       throw std::length_error("Complex products exceed combined device/host/request-work admission");
     return std::unique_ptr<PreparedDeviceComplexProducts>(
         new PreparedDeviceComplexProducts(std::move(image), targets, queue, blas, cost));
+  }
+
+  /// Bind one immutable mixed cache to a SCORE/ECP-only producer; native code owns whole-epoch retry.
+  static std::unique_ptr<PreparedDeviceComplexProducts> prepareMixed(
+      std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters,
+      std::size_t targets, std::size_t samples, std::size_t channels, std::size_t chunk,
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
+      std::size_t device_budget, std::size_t host_budget, std::size_t work_budget,
+      ComplexProductsHostOutput host_output = ComplexProductsHostOutput::RETAINED)
+  {
+    if (!parameters || parameters->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD)
+      throw std::invalid_argument("Mixed complex products require a paired affine cache");
+    const auto image = parameters->modelImage();
+    image->validateCurrentDevice();
+    const auto cost = estimateMixedComplexProductsCost(image->plan(), targets, samples, channels, chunk, host_output);
+    for (const auto cap : {device_budget, host_budget, work_budget})
+      if (!cap || cap == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Mixed complex products require positive finite numeric/work caps");
+    if (cost.device_bytes > device_budget || cost.host_bytes > host_budget || cost.matrix_work > work_budget)
+      throw std::length_error("Mixed complex products exceed combined numeric/work admission");
+    return std::unique_ptr<PreparedDeviceComplexProducts>(
+        new PreparedDeviceComplexProducts(image, targets, queue, blas, cost, std::move(parameters)));
   }
 
   /// Validate the WHOLE borrowed batch before any launch; publish only complete finite channels.
@@ -496,6 +564,8 @@ public:
    * Upload oneP direction per request, reuse across B1 numerical samples, and
    * download only complex scalar/status results. No B*P Jacobian or CPU tape.
    */
+  // The paired mixed recipe is the FP64 dot of its selected rounded reverse score.
+  // It does not dispatch the separately rounded affine forward-directional JVP.
   void evaluateScoreJVP(const std::vector<double>& positions, const Complex* direction, std::size_t count)
   {
     ready_ = jvp_ready_ = false;
@@ -980,9 +1050,11 @@ private:
 
   /// Materialize only checked capacities, including finite partials in BOTH memory domains.
   PreparedDeviceComplexProducts(std::shared_ptr<const PreparedDeviceModel> image, std::size_t targets,
-      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexProductsCost cost)
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexProductsCost cost,
+      std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters = {})
       : image_(std::move(image)), queue_(queue), blas_(blas), cost_(cost),
-        score_(PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
+        score_(parameters ? PreparedDeviceComplexScore::prepareMixed(std::move(parameters), queue, blas,
+            cost.score.device_bytes) : PreparedDeviceComplexScore::prepare(image_, queue, blas, cost.score.device_bytes)),
         kinetic_(cost.scope == ComplexProductsScope::COMPLETE ? PreparedDeviceComplexKinetic::prepare(
             image_, targets, queue, blas, cost.kinetic.device_bytes, cost.kinetic.matrix_work,
             cost.kinetic.parallel_head, cost.kinetic.cooperative_factor, cost.kinetic.channel_roots,

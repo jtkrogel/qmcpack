@@ -1070,7 +1070,7 @@ private:
                           bool kinetic_trunk_only = false, bool retained_score_periodic_geometry = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
-        target_preparation_(target_preparation), retained_targets_(retained_targets),
+        target_preparation_(target_preparation), retained_targets_(retained_targets), real_trunk_only_(real_trunk_only),
         forward_phase_bank_requested_(configuredForwardPhaseBank()),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
@@ -1403,6 +1403,7 @@ private:
     cusp_state_canonical_replay_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
     value_tape_valid_ = false;
+    value_tape_mixed_parameters_.reset();
     result_valid_ = false;
     target_tape_valid_ = false;
     admitted_target_tiles_ = 0;
@@ -1537,6 +1538,7 @@ private:
   void evaluateRetainedTargets(const std::vector<double>& positions, Consumer&& consume)
   {
     value_tape_valid_ = result_valid_ = target_tape_valid_ = false;
+    value_tape_mixed_parameters_.reset();
     if (parallel_traces_) parallel_traces_->invalidate();
     admitted_target_tiles_ = 0;
     if (!retained_targets_ || positions.size() != product(3, ne_))
@@ -1667,6 +1669,8 @@ private:
     // Every deferred neural result is initialized, but may be numerically invalid.
     // Admit the whole trunk before orbital construction or reverse-tape publication.
     admitStatus();
+    if (!value_tape_.empty())
+      value_tape_mixed_parameters_ = mixed_dense_ ? mixed_dense_->parameterCache() : nullptr;
   }
 
   /// Complete the unchanged real head after the shared neural prefix is admitted.
@@ -1866,26 +1870,37 @@ public:
         throw;
       retry_reason = error.what();
     }
-    // Private pointer detachment avoids the public setter's result invalidation
-    // after replay. The guard restores policy on both success and reference failure.
-    auto adapter = std::move(mixed_dense_);
-    try
-    {
-      evaluate(positions);
-    }
-    catch (...)
-    {
-      mixed_dense_ = std::move(adapter);
-      throw;
-    }
-    mixed_dense_ = std::move(adapter);
+    evaluateFp64(positions);
     return true;
+  }
+
+  /// Execute the same complete graph in explicit FP64 for a native epoch; retain a null-cache tape stamp.
+  void evaluateFp64(const std::vector<double>& positions)
+  {
+    // Private detachment preserves the completed replay result while restoring
+    // the prepared mixed policy for later epochs, even if this evaluation fails.
+    struct RestoreAdapter
+    {
+      std::shared_ptr<PreparedDeviceMixedValueDense>& slot;
+      std::shared_ptr<PreparedDeviceMixedValueDense> saved;
+
+      /// Retain the exact old arithmetic owner while the FP64 graph is active.
+      explicit RestoreAdapter(std::shared_ptr<PreparedDeviceMixedValueDense>& selected)
+          : slot(selected), saved(std::move(selected))
+      {}
+
+      /// Restore only policy ownership; do not invalidate the complete FP64 result.
+      ~RestoreAdapter() { slot = std::move(saved); }
+    } restore(mixed_dense_);
+    evaluate(positions);
   }
 
   /** Opt into matched approximate affine value/VGL planes; reverse tapes remain rejected.
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
   {
+    if (mixed_retained_attachment_)
+      throw std::invalid_argument("A retained mixed arithmetic binding cannot be replaced by ordinary attachment");
     if (adapter && target_preparation_.max_targets)
       throw std::invalid_argument("Target VGL does not admit mixed affine arithmetic");
     if (adapter && (!value_tape_.empty() || !supportsMixedRealInferenceEnvironment(plan_.environment())))
@@ -1903,7 +1918,35 @@ public:
       excludeCooperativeOpenFeaturesForMixedRequest();
     }
     value_tape_valid_ = false;
+    value_tape_mixed_parameters_.reset();
     result_valid_ = false;
+  }
+
+  /** Bind the declared mixed primal before the first retained VALUE evaluation.
+   * Reverse/JVP consumers must validate the completed tape's actual cache identity;
+   * a whole-request FP64 retry publishes a tape with no mixed cache authority.
+   */
+  void setMixedRetainedValueDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
+  {
+    if (!adapter || mixed_retained_attachment_ || evaluation_generation_ ||
+        mode_ != SpatialJetMode::VALUE_ONLY || value_tape_.empty() ||
+        target_preparation_.max_targets || retained_targets_ || kinetic_trunk_only_)
+      throw std::invalid_argument("Mixed retained attachment requires a cold prepared VALUE tape");
+    const bool paired = real_trunk_only_ && supportsMixedPairedTrunkEnvironment(plan_.environment());
+    if ((!paired && !supportsMixedRealInferenceEnvironment(plan_.environment())) ||
+        adapter->modelImage().get() != model_.get() ||
+        adapter->maximumRows() < product(batch_capacity_, ne_))
+      throw std::invalid_argument("Mixed retained adapter has a foreign image, profile or insufficient rows");
+    const auto& cache = adapter->parameterCache();
+    if (!cache || cache->modelImage().get() != model_.get() ||
+        (paired && cache->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD))
+      throw std::invalid_argument("Mixed retained adapter lacks its admitted immutable affine cache");
+    mixed_dense_ = std::move(adapter);
+    mixed_retained_attachment_ = true;
+    excludeCooperativeValueLuForMixedRequest();
+    excludeCooperativeOpenFeaturesForMixedRequest();
+    value_tape_valid_ = result_valid_ = false;
+    value_tape_mixed_parameters_.reset();
   }
 
   /// Retain strict value-only attachment for callers of the original experimental API.
@@ -2097,6 +2140,30 @@ public:
       throw std::invalid_argument("Rebind the prepared mixed affine cache before replacing its graph image");
   }
 
+  /// Preflight a prepared cache without replacing the currently accepted image or tape.
+  void validateModelRebindWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) const
+  {
+    model_->validateSuccessor(successor);
+    if (bool(mixed_dense_) != bool(incoming))
+      throw std::invalid_argument("Prepared graph rebind cannot change its frozen affine precision policy");
+    if (mixed_dense_)
+    {
+      if (mixed_dense_->modelImage().get() != model_.get() || incoming->modelImage().get() != successor.get())
+        throw std::invalid_argument("Prepared graph rebind has a foreign active or successor affine cache");
+      mixed_dense_->validateParameterRebind(incoming);
+    }
+  }
+
+  /// Caller prevalidates every leaf and retains the old image/cache through this no-throw boundary.
+  void adoptPreparedModelWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
+  {
+    if (mixed_dense_)
+      mixed_dense_->adoptPreparedParameters(incoming);
+    adoptPreparedModel(successor);
+  }
+
 private:
   /** Adopt only after validation, with exclusive owner authority and an external
    * strong old-image owner. No runtime call, allocation or resource retirement.
@@ -2108,6 +2175,7 @@ private:
     cusp_state_canonical_replay_ = false;
     model_ = successor;
     value_tape_valid_ = false;
+    value_tape_mixed_parameters_.reset();
     result_valid_ = false;
     target_tape_valid_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
@@ -2348,6 +2416,13 @@ public:
     return batch_;
   }
 
+  /// Completed primal identity, not the currently attached retry policy; null means FP64.
+  const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& valueTapeMixedParameters() const
+  {
+    (void)valueTapeBatchCount();
+    return value_tape_mixed_parameters_;
+  }
+
   /// Borrow geometry-derived feature values from the completed value-only tape.
   const double* valueRawFeatures() const
   {
@@ -2481,6 +2556,7 @@ private:
       throw std::invalid_argument("Mixed paired trunk adapter has a foreign image or insufficient row capacity");
     mixed_dense_ = std::move(adapter);
     value_tape_valid_ = result_valid_ = false;
+    value_tape_mixed_parameters_.reset();
   }
 
   /** Cancel adapter state on every graph exit, including an early physical failure. */
@@ -2826,6 +2902,8 @@ private:
 
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
+  std::shared_ptr<const PreparedDeviceMixedDenseParameters> value_tape_mixed_parameters_;
+  bool mixed_retained_attachment_ = false;
   const PsiFormerExecutionPlan& plan_;
   ModelShape shape_;
   std::size_t batch_;
@@ -2836,6 +2914,7 @@ private:
   const SpatialJetMode mode_;
   const TargetVglPreparation target_preparation_;
   const bool retained_targets_;
+  const bool real_trunk_only_;
   const bool forward_phase_bank_requested_;
   bool forward_phase_bank_ = false;
   std::size_t phase_bank_saved_bytes_ = 0;

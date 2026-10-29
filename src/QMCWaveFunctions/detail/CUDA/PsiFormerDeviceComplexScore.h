@@ -128,6 +128,7 @@ struct ComplexScoreCost
 {
   ComplexValueCost forward;
   std::size_t device_bytes, host_bytes, canonical_bytes, weighted_grid_bytes;
+  std::size_t mixed_forward_bytes = 0, mixed_derivative_bytes = 0, mixed_pivot_bytes = 0;
 };
 
 /// Count the head-free retained VALUE profile, one network lane and one complexP.
@@ -161,6 +162,21 @@ inline ComplexScoreCost estimateComplexScoreCost(const PsiFormerExecutionPlan& p
   const auto grid_bytes = weighted_grid && complexScoreWeightedGridEligible(plan) ? sizeof(ComplexScoreWeightedGridState) : 0;
   return {forward, add(add(add(forward.device_bytes, reverse), add(mul(16, p), scratch)), grid_bytes),
       add(forward.host_bytes, finite), mul(24, p), grid_bytes};
+}
+
+/// Exact private mixed SCORE bytes; the immutable shared FP32/master images are excluded.
+inline ComplexScoreCost estimateMixedComplexScoreCost(const PsiFormerExecutionPlan& plan)
+{
+  auto cost = estimateComplexScoreCost(plan);
+  const auto rows = plan.modelShape().electrons();
+  cost.mixed_forward_bytes = PreparedDeviceMixedValueDense::estimateDeviceWorkspaceBytes(plan, rows);
+  cost.mixed_derivative_bytes = PreparedDeviceMixedAffineDerivatives::estimateDeviceWorkspaceBytes(plan, rows);
+  cost.mixed_pivot_bytes = checkedDeviceBytes<double>(plan.modelShape().determinants);
+  for (const auto bytes : {cost.mixed_forward_bytes, cost.mixed_derivative_bytes, cost.mixed_pivot_bytes})
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, bytes, "Mixed complex score bytes overflow");
+  cost.host_bytes = spatial_detail::checkedAdd(cost.host_bytes, 2 * sizeof(PsiFormerDeviceNumericalDiagnostics),
+      "Mixed complex score host diagnostics overflow");
+  return cost;
 }
 
 /// Raw scalar-objective VJP retains one tape/realP, with no inverse or complexP.
@@ -231,6 +247,30 @@ public:
         std::move(image), queue, blas, cost, false, configuredComplexScoreInverseColumns(),
         configuredComplexScorePeriodicGeometry(), configuredComplexScoreCooperativeLu()));
   }
+
+  /// Prepare one matched mixed primal/reverse, retaining the existing FP64 head and reductions.
+  static std::unique_ptr<PreparedDeviceComplexScore> prepareMixed(
+      std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters,
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t budget)
+  {
+    if (!parameters || parameters->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD)
+      throw std::invalid_argument("Mixed complex score requires a paired immutable affine cache");
+    const auto& image = parameters->modelImage();
+    image->validateCurrentDevice();
+    const auto cost = estimateMixedComplexScoreCost(image->plan());
+    if (cost.device_bytes > budget)
+      throw std::length_error("Mixed complex score exceeds its standalone owner budget");
+    auto primal = std::make_shared<PreparedDeviceMixedValueDense>(parameters,
+        image->plan().modelShape().electrons(), queue, blas);
+    auto derivative = std::make_shared<PreparedDeviceMixedAffineDerivatives>(parameters,
+        image->plan().modelShape().electrons(), queue, blas);
+    // The diagnostic factor route owns actual mixed dispatch, independently of ambient LU selectors.
+    return std::unique_ptr<PreparedDeviceComplexScore>(new PreparedDeviceComplexScore(
+        image, queue, blas, cost, false, false, false, false, std::move(primal), std::move(derivative)));
+  }
+
+  /// Report the frozen matched primal/reverse selection without consulting process flags.
+  bool usesMixedAffine() const noexcept { return bool(mixed_forward_); }
 
   /// Prepare raw-orbital mode separately; ordinary score ownership is unchanged.
   static std::unique_ptr<PreparedDeviceComplexScore> prepareOrbitalVJP(std::shared_ptr<const PreparedDeviceModel> image,
@@ -360,13 +400,57 @@ public:
     network_->response_.downloadOnStream(destination.data(), destination.size(), forward_->trunk_->queue_.getNative());
   }
 
-  /// Validate one newer family image before replacing both internal references.
+  /// Preflight the unchanged FP64 score leaves without revoking accepted results.
+  void validateModelRebind(const std::shared_ptr<const PreparedDeviceModel>& image) const
+  {
+    if (mixed_forward_)
+      throw std::invalid_argument("Mixed complex score requires its prepared-cache rebind contract");
+    if (generation_ == std::numeric_limits<std::size_t>::max() ||
+        forward_->generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex score generation exhausted");
+    forward_->validateModelRebind(image);
+    network_->validateModelRebindWithMixedParameters(image, {});
+  }
+
+  /// Adopt only after every composing FP64 leaf preflights under its owner lease.
+  void adoptPreparedModel(const std::shared_ptr<const PreparedDeviceModel>& image) noexcept
+  {
+    forward_->adoptPreparedModel(image);
+    network_->adoptPreparedModelWithMixedParameters(image, {});
+    ready_ = orbital_forward_ready_ = false;
+  }
+
+  /// Preserve the ordinary rebind API through the same all-leaf transaction split.
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> image)
   {
+    validateModelRebind(image);
+    adoptPreparedModel(image);
+  }
+
+  /// Validate all mixed score leaves while the accepted image and compute copy remain bound.
+  void validateMixedParameterRebind(
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) const
+  {
+    if (!mixed_forward_ || !incoming)
+      throw std::invalid_argument("Mixed complex score rebind requires a prepared successor cache");
+    if (generation_ == std::numeric_limits<std::size_t>::max() ||
+        forward_->generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Mixed complex score generation exhausted");
+    const auto& image = incoming->modelImage();
+    forward_->trunk_->validateModelRebindWithMixedParameters(image, incoming);
+    network_->validateModelRebindWithMixedParameters(image, incoming);
+  }
+
+  /// No-throw adoption only after every native leaf and predecessor lifetime are secured.
+  void adoptPreparedMixedParameters(
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
+  {
+    const auto& image = incoming->modelImage();
+    mixed_forward_->adoptPreparedParameters(incoming);
+    forward_->adoptPreparedModel(image);
+    network_->adoptPreparedModelWithMixedParameters(image, incoming);
     ready_ = orbital_forward_ready_ = false;
-    forward_->trunk_->model_->validateSuccessor(image);
-    forward_->rebindModel(image);
-    network_->rebindModel(std::move(image));
+    ++generation_;
   }
 
   /// Expose no matrix/inverse or incomplete objective products.
@@ -407,7 +491,9 @@ private:
   /// Allocate one paired tape and realP; only log-score mode adds complexP/inverses.
   PreparedDeviceComplexScore(std::shared_ptr<const PreparedDeviceModel> image, compute::Queue<PlatformKind::CUDA>& queue,
       AcceleratorBlasHandle& blas, ComplexScoreCost cost, bool orbital_only = false, bool inverse_columns = false,
-      bool periodic_geometry = false, bool cooperative_lu = false)
+      bool periodic_geometry = false, bool cooperative_lu = false,
+      std::shared_ptr<PreparedDeviceMixedValueDense> mixed_forward = {},
+      std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_derivative = {})
       : cost_(cost), orbital_only_(orbital_only),
         inverse_columns_(!orbital_only && inverse_columns &&
             complexScoreInverseColumnsEligible(image->plan())),
@@ -419,9 +505,12 @@ private:
         cooperative_weighted_inverses_(!orbital_only && configuredComplexScoreWeightedInversesCooperative() &&
             image->plan().modelShape().electrons() >= 64 && image->plan().modelShape().electrons() <= 300 &&
             image->plan().modelShape().determinants >= 1 && image->plan().modelShape().determinants <= 16),
+        mixed_forward_(std::move(mixed_forward)),
+        mixed_pivots_(cost.mixed_pivot_bytes / sizeof(double), "ComplexScore::mixed_pivots", __FILE__, __LINE__),
         forward_(new PreparedDeviceComplexValue(image, 1, queue, blas, cost.forward, true, !orbital_only,
             inverse_columns_, periodic_geometry_, cooperative_lu_, cooperative_pair_check_)),
-        network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas)), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
+        network_(new PreparedDeviceNetworkReverse(std::move(image), 1, queue, blas,
+            NetworkReverseOutput::PARAMETER_SCORE, std::move(mixed_derivative))), seed_(cost.forward.matrices, "ComplexScore::seed_", __FILE__, __LINE__),
         feature_(forward_->trunk_->ne_ * forward_->trunk_->shape_.feature_dimension, "ComplexScore::feature_", __FILE__, __LINE__),
         ion_(forward_->trunk_->ne_ * forward_->trunk_->shape_.nuclei, "ComplexScore::ion_", __FILE__, __LINE__),
         pair_(forward_->trunk_->ne_ * (forward_->trunk_->ne_ - 1) / 2, "ComplexScore::pair_", __FILE__, __LINE__),
@@ -431,16 +520,25 @@ private:
         orbital_cotangents_(orbital_only ? cost.forward.matrices : 0, "ComplexScore::orbital_cotangents_", __FILE__, __LINE__),
         weighted_grid_(cost.weighted_grid_bytes ? 1 : 0, "ComplexScore::weighted_grid_", __FILE__, __LINE__)
   {
+    if (mixed_forward_)
+    {
+      if (orbital_only_ || !network_->mixed_ ||
+          network_->mixed_->parameters().get() != mixed_forward_->parameterCache().get())
+        throw std::invalid_argument("Mixed complex score primal and derivative caches differ");
+      forward_->trunk_->setMixedRetainedValueDense(mixed_forward_);
+    }
     if ((cost.weighted_grid_bytes != 0 && cost.weighted_grid_bytes != sizeof(ComplexScoreWeightedGridState)) ||
         (cost.weighted_grid_bytes && (orbital_only || !complexScoreWeightedGridEligible(forward_->trunk_->plan_))))
       throw std::logic_error("Complex score grid differs from its frozen admission");
     const double one = 1;
     unit_.upload(&one, 1);
     const auto actual = forward_->cost().device_bytes + network_->deviceWorkspaceBytes() +
+        (mixed_forward_ ? mixed_forward_->deviceWorkspaceBytes() : 0) + checkedDeviceBytes<double>(mixed_pivots_.capacity()) +
         8 * (seed_.capacity() + feature_.capacity() + ion_.capacity() + pair_.capacity() + unit_.capacity()) +
         same_.capacity() + 16 * (score_.capacity() + orbital_cotangents_.capacity()) +
         sizeof(ComplexScoreWeightedGridState) * weighted_grid_.capacity();
-    if (actual != cost.device_bytes || forward_->cost().host_bytes + network_->hostWorkspaceBytes() != cost.host_bytes ||
+    if (actual != cost.device_bytes || forward_->cost().host_bytes + network_->hostWorkspaceBytes() +
+        (mixed_forward_ ? mixed_forward_->hostWorkspaceBytes() : 0) != cost.host_bytes ||
         8 * network_->response_.capacity() + 16 * score_.capacity() != cost.canonical_bytes)
       throw std::logic_error("Complex score inventory differs from exact preflight/24P");
   }
@@ -469,7 +567,8 @@ private:
     if (generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Complex score generation exhausted");
     ++generation_;
-    forward_->evaluate(positions);
+    if (mixed_forward_) forward_->evaluateRetainedMixedCoordinates(positions, mixed_pivots_);
+    else forward_->evaluate(positions);
     auto& t = *forward_->trunk_;
     const auto weighted_inverse = cooperative_weighted_inverses_ ? launchComplexScoreWeightedInversesCooperative :
         launchComplexScoreWeightedInverses;
@@ -586,6 +685,8 @@ private:
   const bool cooperative_lu_;
   const bool cooperative_pair_check_;
   const bool cooperative_weighted_inverses_;
+  std::shared_ptr<PreparedDeviceMixedValueDense> mixed_forward_;
+  DeviceBuffer<double> mixed_pivots_;
   std::unique_ptr<PreparedDeviceComplexValue> forward_;
   std::unique_ptr<PreparedDeviceNetworkReverse> network_;
   DeviceBuffer<double> seed_, feature_, ion_, pair_;

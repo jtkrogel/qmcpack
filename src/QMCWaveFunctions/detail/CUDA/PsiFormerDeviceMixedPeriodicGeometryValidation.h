@@ -52,7 +52,9 @@ inline pf::Parameters parameters(const ExecutionEnvironment& environment, const 
 {
   const ModelShape production{shape.spin_up_electrons, shape.spin_down_electrons,
                               shape.nuclei, 16, 256, 4, 4};
-  const auto profile = initializePsiFormerParameters(production, 17).profile;
+  auto profile = initializePsiFormerParameters(production, 17).profile;
+  if (environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX)
+    profile = PSIFORMER_COMPLEX_PERIODIC_V1;
   const auto canonical = initializePsiFormerParameters(production, 17, profile, environment);
   const PsiFormerExecutionPlan original(production, canonical.layouts, environment);
   std::vector<pf::Layout> layouts;

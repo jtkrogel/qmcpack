@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/Optimization/OrbitalLossNormalization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 #include <array>
 #include <complex>
 #include <memory>
@@ -40,7 +41,8 @@ public:
                      std::size_t maximum_clone_numeric_bytes,
                      std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0,
                      const std::string& parameter_checkpoint = {}, const std::string& system_kind = "all_electron",
-                     std::size_t maximum_cpu_shared_numeric_bytes = 0, std::size_t cpu_vgl_targets = 0);
+                     std::size_t maximum_cpu_shared_numeric_bytes = 0, std::size_t cpu_vgl_targets = 0,
+                     psiformer::PsiFormerPrecisionPolicy precision_policy = psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE);
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
   ~PsiFormerComplexWF() override;
@@ -57,6 +59,20 @@ public:
   /// Only the CPU sibling participates in generic structured-provider discovery.
   wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override
   { return gpuInferenceEnabled() ? nullptr : this; }
+
+  /// Own one native GPU arithmetic epoch; destruction restores ordinary inference selection.
+  class GpuTrainingEpoch
+  {
+  public:
+    virtual ~GpuTrainingEpoch() = default;
+  };
+
+  /// Report immutable mixed training policy without enabling any derivative capability.
+  bool usesMixedAffineTraining() const noexcept;
+
+  /// Enter a version-bound strict mixed or complete FP64 replay epoch for admitted C1 native preparation.
+  std::unique_ptr<GpuTrainingEpoch> enterGpuTrainingEpoch(std::size_t expected_version,
+      psiformer::PsiFormerGpuTrainingEpochMode mode);
 
   /// Stable physical restart identity, independent of parameter values/version and runtime addresses.
   std::string trainingConfigurationFingerprint() const;

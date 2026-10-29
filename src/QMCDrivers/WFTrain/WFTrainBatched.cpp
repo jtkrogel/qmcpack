@@ -18,6 +18,8 @@
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/GpuTrainingEpochReplay.h"
+#include "QMCDrivers/WFTrain/GpuTrainingEpochObjective.h"
 #include "QMCDrivers/WFTrain/JastrowNeuralTrainingBinding.h"
 #include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
@@ -62,6 +64,12 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceInference.h"
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexValue.h"
+#endif
+#endif
 
 #include <algorithm>
 #include <array>
@@ -94,6 +102,45 @@ namespace
 
 std::size_t checkedMemoryAdd(std::size_t lhs, std::size_t rhs);
 std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs);
+
+/// Collective control signal used only before a native mixed epoch can publish any update.
+class NativeGpuEpochRetry final : public std::runtime_error
+{
+public:
+  NativeGpuEpochRetry() : std::runtime_error("Native mixed numerical epoch requires complete FP64 replay") {}
+};
+
+/// Identify only declared numerical precision failures; geometry/vendor/source failures remain fatal.
+bool isMixedNumericalRejection(const std::exception_ptr& failure)
+{
+  if (!failure) return false;
+  try { std::rethrow_exception(failure); }
+#ifdef ENABLE_CUDA
+  catch (const psiformer::device::MixedPrecisionRetryRequired&) { return true; }
+#ifdef QMC_COMPLEX
+  catch (const psiformer::device::MixedComplexValueFailure& error)
+  { return error.stage() != psiformer::device::ComplexValueFailureStage::PHYSICAL_ENVELOPE; }
+#endif
+  catch (const psiformer::device::InferenceStatusError& error) { return error.stage() != 0; }
+#endif
+  catch (...) { return false; }
+}
+
+/// Every rank agrees on retry versus fatal failure before residual/factor reduction or publication.
+void requireNativeEpochReadiness(Communicate& comm, const std::exception_ptr& failure, bool strict_mixed)
+{
+  int retry = failure && isMixedNumericalRejection(failure) ? 1 : 0;
+  int fatal = failure && !retry ? 1 : 0;
+  comm.allreduce(retry);
+  comm.allreduce(fatal);
+  if (retry && !fatal && strict_mixed)
+    throw NativeGpuEpochRetry();
+  if (retry || fatal)
+  {
+    if (failure) std::rethrow_exception(failure);
+    throw UniformCommunicateError("WFTrainBatched: another rank rejected the pending native precision epoch");
+  }
+}
 
 /** Retain one crowd snapshot without retaining a samples-by-parameters matrix.
  *
@@ -3589,6 +3636,15 @@ void WFTrainBatched::run()
   std::vector<std::shared_ptr<PsiFormerGpuScoreLaneAnchor>> score_lane_anchors;
   std::vector<std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor>> complex_score_lane_anchors;
   auto* device_provider = dynamic_cast<PsiFormerWF*>(selected_provider_);
+  bool native_mixed_training = device_provider && device_provider->usesMixedAffineTraining();
+#ifdef QMC_COMPLEX
+  native_mixed_training = native_mixed_training ||
+      (complex_training_component_ && complex_training_component_->usesMixedAffineTraining());
+#endif
+  int mixed_participants = native_mixed_training ? 1 : 0;
+  myComm->allreduce(mixed_participants);
+  if (mixed_participants && mixed_participants != myComm->size())
+    throw UniformCommunicateError("WFTrainBatched: mixed native training policy differs across ranks");
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
   const bool resident_score_adam = resident_score_adam_;
   const auto cold_moment_allowance = resident_device_authority_ && resident_adam_budget
@@ -4065,6 +4121,14 @@ void WFTrainBatched::run()
       wftrain::TrainingCapability::VALUE_EVALUATION};
   const bool score_training = wftrain::usesEnergyScoreEstimator(training_input_, complex_training);
   const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_training);
+  if (native_mixed_training && (crowds_.size() != 1 ||
+      !population_.get_golden_hamiltonian().hasPhysicalNLPP() || !score_training ||
+      (training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM &&
+       training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::KFAC) ||
+      training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+      training_input_.getMaximumMetricNorm() > 0 || resident_adam_budget || resident_sr_budget.first))
+    throw UniformCommunicateError("Mixed native training requires ECP score Adam/KFAC, one crowd, line search OFF, "
+        "and no resident optimizer or post-epoch metric query");
   // Admit only a scope that can still be the live chain; replay proves FULL again.
   const char* kfac_replay_optin = std::getenv("PSIFORMER_GPU_KFAC_SINGLE_REPLAY");
   const bool kfac_single_replay = kfac_replay_optin && std::string(kfac_replay_optin) == "1" &&
@@ -4688,6 +4752,26 @@ void WFTrainBatched::run()
     if (scalar_write_failed)
       throw UniformCommunicateError("WFTrainBatched: failed to write scalar iteration output");
     const double sampling_seconds = iteration_wall.elapsed();
+    std::unique_ptr<wftrain::GpuTrainingEpochReplay> native_epoch_replay;
+    if (native_mixed_training)
+    {
+      std::exception_ptr snapshot_failure;
+      try
+      {
+        std::vector<NonLocalECPotential*> potentials;
+        for (const auto& crowd : crowds_)
+          for (QMCHamiltonian& ham : crowd->get_walker_hamiltonians())
+            for (int component = 0; component < ham.size(); ++component)
+              if (auto* nonlocal = dynamic_cast<NonLocalECPotential*>(ham.getComponent(component)))
+                potentials.push_back(nonlocal);
+        native_epoch_replay = std::make_unique<wftrain::GpuTrainingEpochReplay>(rngs_, potentials);
+        retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes, native_epoch_replay->retainedBytes());
+        if (retained_configuration_bytes > training_input_.getMaximumRetainedBytes())
+          throw std::length_error("Native mixed predecessor RNG/grid snapshots exceed retained budget");
+      }
+      catch (...) { snapshot_failure = std::current_exception(); }
+      requireNativeEpochReadiness(*myComm, snapshot_failure, false);
+    }
     logTrainingMemoryPhase(*myComm, iteration, "after_sampling_before_preparation");
     memory_phase.transition("retained_configuration_and_product_preparation");
     logTrainingAllocation("prepared_derivative_owners_and_shared_workspace", retained_samples.size(),
@@ -4809,237 +4893,55 @@ void WFTrainBatched::run()
           });
     };
     {
-      if (resident_open_observation_)
-      {
-        if (!resident_observations || resident_observations->sourceVersion() != training_state.parameter_version ||
-            resident_observations->sampleCount() != 2)
-          throw UniformCommunicateError("Resident open iteration has no current W2 complete observations");
-        const auto source_version = training_state.parameter_version;
-        auto pending = training_state;
-        if (pending.completed_iterations == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("Resident open completed iteration count overflow");
-        ++pending.completed_iterations;
-        const double e0 = resident_observations->energy(0)[4], e1 = resident_observations->energy(1)[4];
-        const double mean = (e0 + e1) / 2.0;
-        const double variance = ((e0 - mean) * (e0 - mean) + (e1 - mean) * (e1 - mean)) / 2.0;
-        if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance))
-          throw std::invalid_argument("Resident open iteration energy moments are nonfinite");
-        resident_diagnostics.emplace(ResidentEnergyDiagnostics{2, mean, variance, 0.0});
-        std::unique_ptr<PsiFormerWF::PreparedResidentDeviceAdamPublication> publication;
+      std::unique_ptr<PsiFormerWF::GpuTrainingEpoch> native_real_epoch;
+#ifdef QMC_COMPLEX
+      std::unique_ptr<PsiFormerComplexWF::GpuTrainingEpoch> native_complex_epoch;
+#endif
+      bool strict_native_epoch = true;
+      std::size_t native_epoch_objective_peak_bytes = 0;
+      // Actual production is timed here; the unchanged trainer later times only the merge/update.
+      auto completeNativeObjective = [&](wftrain::GradientProducer& source,
+          const wftrain::StructuredParameterSnapshot* parameters, std::size_t other_retained)
+          -> std::unique_ptr<wftrain::GpuTrainingEpochObjective> {
+        if (!native_mixed_training) return {};
+        std::unique_ptr<wftrain::GpuTrainingEpochObjective> completed;
         std::exception_ptr failure;
         try
         {
-          std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> candidate;
-          first_order_optimizer->proposeResidentDeviceAdam(selected_provider_->parameterSchema(), source_version,
-              [&](const auto& adam, double b1, double b2, double c1, double c2, double epsilon) {
-                candidate = device_provider->consumeResidentOpenAdamDevice(*resident_observations, adam,
-                    b1, b2, c1, c2, epsilon, resident_snapshot_cap_);
-                if (!candidate || candidate->sourceVersion() != source_version)
-                  throw std::invalid_argument("Resident open Adam candidate is foreign or stale");
-                return candidate->gradientNorm();
-              }, resident_diagnostics->gradient_norm);
-          selected_displacement_norm = candidate->displacementNorm();
-          if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance) ||
-              !wftrain::isFiniteTrainingReal(selected_displacement_norm) || selected_displacement_norm < 0)
-            throw std::invalid_argument("Resident open iteration scalar result is nonfinite");
-          publication = device_provider->prepareResidentDeviceAdamPublication(
-              std::move(candidate), source_version, resident_successor_cap_);
-          if (!publication)
-            throw std::logic_error("Resident open Adam publication returned no owning action");
+          std::optional<wftrain::StructuredParameterSnapshot> private_parameters;
+          if (!parameters)
+          {
+            private_parameters.emplace(selected_provider_->snapshotParameters());
+            parameters = &*private_parameters;
+          }
+          const auto p = selected_provider_->parameterSchema().parameterCount();
+          const auto raw_bytes = checkedMemoryMultiply(p, 3 * sizeof(wftrain::DerivativeValue));
+          native_epoch_objective_peak_bytes = checkedMemoryAdd(checkedMemoryMultiply(2, raw_bytes),
+              checkedMemoryMultiply(p, sizeof(double))); // Includes trainer destination and one parameter snapshot.
+          const auto combined = checkedMemoryAdd(retained_configuration_bytes,
+              checkedMemoryAdd(other_retained, native_epoch_objective_peak_bytes));
+          if (combined > training_input_.getMaximumRetainedBytes())
+            throw std::length_error("Mixed native staged objective and trainer peak exceed retained budget");
+          NativeTimerScope timer(phase_timers_.objective);
+          psiformer::memory::Phase memory_objective("native_epoch_objective");
+          completed = std::make_unique<wftrain::GpuTrainingEpochObjective>(
+              selected_provider_->parameterSchema(), *parameters, source, energy_estimator);
+          if (completed->retainedBytes() != raw_bytes)
+            throw std::logic_error("Native staged objective differs from its planned raw-sum inventory");
         }
         catch (...) { failure = std::current_exception(); }
-        try
-        {
-          reduction.validatePublicationReadiness(source_version, true, failure);
-          const auto version = publication->commit();
-          first_order_optimizer->acceptResidentDeviceAdam(version);
-          pending.parameter_version = reduction.completePublication(version);
-        }
-        catch (...)
-        {
-          first_order_optimizer->proposalRejected();
-          throw;
-        }
-        training_state.completed_iterations = pending.completed_iterations;
-        training_state.parameter_version = pending.parameter_version;
-        training_state.schema_fingerprint.swap(pending.schema_fingerprint);
-        cache_observer.parametersPublished(training_state.parameter_version);
-        iteration_result.completed_iteration = training_state.completed_iterations;
-        iteration_result.parameter_version = training_state.parameter_version;
-        resident_observations.reset(); // Retire old sample/image receipts before the next accepted epoch.
-      }
-      else if (orbital_mse)
-      {
-        std::unique_ptr<wftrain::OrbitalPretrainingProducer> producer;
-        std::size_t producer_retained_bytes = 0;
-        std::unique_ptr<wftrain::OrbitalPretrainingCoordinator> coordinator;
-        std::unique_ptr<wftrain::SelectedUpdateRule> update;
-        std::optional<wftrain::TrainingStageState> coordinator_stage;
-        std::optional<wftrain::StructuredParameterSnapshot> parameters;
-        std::exception_ptr preparation_failure;
-        try
-        {
-          NativeTimerScope preparation_timer(phase_timers_.preparation);
-          psiformer::memory::Phase memory_preparation_timer("preparation");
-          parameters.emplace(selected_provider_->snapshotParameters());
+        requireNativeEpochReadiness(*myComm, failure, strict_native_epoch);
+        native_real_epoch.reset();
 #ifdef QMC_COMPLEX
-          if (complex_orbital_target_)
-          {
-            auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerComplexWF,
-                psiformer::ComplexOrbitalTargetEvaluator>>(*complex_training_component_, *complex_orbital_target_, retained_samples,
-                    training_input_.getOrbitalNormalization());
-            producer_retained_bytes = typed->retainedBytes();
-            producer = std::move(typed);
-          }
-          else
+        native_complex_epoch.reset();
 #endif
-          {
-            auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
-            if (jastrow_binding_)
-            {
-              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<wftrain::JastrowNeuralTrainingBinding,
-                  psiformer::OrbitalTargetEvaluator>>(*jastrow_binding_, *orbital_target_, retained_samples);
-              producer_retained_bytes = typed->retainedBytes();
-              producer = std::move(typed);
-            }
-            else
-            {
-              if (!student)
-                throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
-              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerWF,
-                  psiformer::OrbitalTargetEvaluator>>(*student, *orbital_target_, retained_samples);
-              producer_retained_bytes = typed->retainedBytes();
-              producer = std::move(typed);
-            }
-          }
-          coordinator = std::make_unique<wftrain::OrbitalPretrainingCoordinator>(
-              orbital_target_fingerprint_, reduction);
-          coordinator_stage.emplace(coordinator->makeStageState(stage_state.stage_ordinal));
-          coordinator_stage->completed_stage_iterations = stage_state.completed_stage_iterations;
-          update = decorate(*first_order_optimizer);
-        }
-        catch (...)
-        {
-          preparation_failure = std::current_exception();
-        }
-        reduction.preflightOrbital(selected_provider_->parameterSchema(),
-            parameters ? &*parameters : nullptr, orbital_target_fingerprint_,
-            wftrain::OrbitalPretrainingCoordinator::LOSS_FINGERPRINT, preparation_failure);
-        // The outer checkpoint binds all driver controls; the coordinator independently
-        // validates its exact target/loss identity and owns failure-atomic publication.
-        retained_numeric_bytes = checkedMemoryAdd(first_order_optimizer->retainedBytes(),
-            checkedMemoryAdd(producer_retained_bytes,
-                checkedMemoryAdd(orbital_target_bytes_, complex_orbital_score_bytes_)));
-        retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
-            checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 4 * sizeof(double)));
-        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
-                            training_input_.getMaximumRetainedBytes());
-        parameters.reset();
-        auto result = coordinator->runIteration(*selected_provider_, *producer,
-            *update, training_state, *coordinator_stage, &cache_observer);
-        stage_state.completed_stage_iterations = coordinator_stage->completed_stage_iterations;
-        iteration_result.completed_iteration = result.completed_iteration;
-        iteration_result.parameter_version = result.parameter_version;
-        orbital_diagnostics.emplace(std::move(result.objective));
-      }
-      else if (determinant_overlap)
-      {
-        const auto& schema = selected_provider_->parameterSchema();
-        std::optional<wftrain::StructuredParameterSnapshot> parameters;
-        std::vector<std::unique_ptr<psiformer::DeterminantChannelBatch>> batch_owners;
-        std::vector<wftrain::DeterminantOverlapBatchView> overlap_batches;
-        std::exception_ptr preparation_failure;
-        try
-        {
-          parameters.emplace(selected_provider_->snapshotParameters());
-          if (parameters->schema_fingerprint != schema.fingerprint() ||
-              parameters->values.size() != schema.parameterCount())
-            throw std::logic_error(
-                "WFTrainBatched: structured provider returned an inconsistent snapshot");
-          if (training_state.completed_iterations != 0 &&
-              (training_state.schema_fingerprint != schema.fingerprint() ||
-               training_state.parameter_version != parameters->version))
-            throw std::logic_error(
-                "WFTrainBatched: training state does not match the parameter provider");
-          if (training_state.completed_iterations ==
-              std::numeric_limits<std::size_t>::max())
-            throw std::overflow_error("WFTrainBatched: training iteration count overflow");
-          if (overlap_student_twfs_.size() != crowds_.size())
-            throw std::logic_error(
-                "WFTrainBatched: student-clone crowd topology changed after initialization");
-
-          batch_owners.reserve(retained_samples.size());
-          overlap_batches.reserve(retained_samples.size());
-          for (auto& samples : retained_samples)
-          {
-            auto& students = overlap_student_twfs_[samples.crowd_index];
-            RefVectorWithLeader<TrialWaveFunction> student_batch(*students.front());
-            RefVectorWithLeader<ParticleSet> particle_batch(*samples.particles.front());
-            for (std::size_t sample = 0; sample < students.size(); ++sample)
-            {
-              student_batch.push_back(*students[sample]);
-              particle_batch.push_back(*samples.particles[sample]);
-            }
-            batch_owners.push_back(
-                TrialWaveFunction::makeStructuredDeterminantChannelBatch(
-                    student_batch, particle_batch, selected_provider_id_));
-
-            wftrain::DeterminantOverlapBatchView view;
-            view.student = batch_owners.back().get();
-            view.teachers.reserve(students.size());
-            view.electrons.reserve(students.size());
-            for (std::size_t sample = 0; sample < students.size(); ++sample)
-            {
-              view.teachers.emplace_back(*samples.teachers[sample]);
-              view.electrons.emplace_back(*samples.particles[sample]);
-            }
-            overlap_batches.push_back(std::move(view));
-          }
-        }
-        catch (...)
-        {
-          preparation_failure = std::current_exception();
-        }
-
-        reduction.preflightDeterminantOverlap(
-            schema, parameters ? &*parameters : nullptr,
-            determinant_overlap_objective_->targetDescriptor().fingerprint(),
-            determinant_overlap_objective_->configurationFingerprint(),
-            preparation_failure);
-
-        wftrain::DeterminantOverlapObjectiveResult objective =
-            determinant_overlap_objective_->evaluate(*myComm, overlap_batches);
-        if (objective.parameter_version != parameters->version ||
-            objective.parameter_gradient.size() != schema.parameterCount() ||
-            objective.target_fingerprint !=
-                determinant_overlap_objective_->targetDescriptor().fingerprint() ||
-            objective.target_provenance != training_input_.getTargetProvenance())
-          throw UniformCommunicateError(
-              "WFTrainBatched: determinant-overlap objective returned inconsistent identity");
-        if (objective.retained_numeric_bytes >
-            std::numeric_limits<std::size_t>::max() - first_order_optimizer->retainedBytes())
-          throw std::overflow_error(
-              "WFTrainBatched: determinant-overlap retained-byte count overflowed");
-        retained_numeric_bytes =
-            objective.retained_numeric_bytes + first_order_optimizer->retainedBytes();
-        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
-                            training_input_.getMaximumRetainedBytes());
-
-        const wftrain::ParameterGradientView gradient{
-            schema.fingerprint(), parameters->version, wftrain::ReductionDomain::GLOBAL,
-            {objective.parameter_gradient.data(), objective.parameter_gradient.size()}};
-        const std::size_t committed_version = wftrain::completeParameterUpdate(
-            *selected_provider_, *parameters, gradient, *decorate(*first_order_optimizer), reduction);
-        ++training_state.completed_iterations;
-        training_state.parameter_version = committed_version;
-        training_state.schema_fingerprint = schema.fingerprint();
-        cache_observer.parametersPublished(committed_version);
-        iteration_result.completed_iteration = training_state.completed_iterations;
-        iteration_result.parameter_version = committed_version;
-        overlap_diagnostics.emplace(std::move(objective));
-      }
-      else
-      {
+        app_log() << "WFTrain admitted native precision objective: raw_sum_bytes=" << completed->retainedBytes()
+                  << " staged_and_trainer_peak_bound=" << native_epoch_objective_peak_bytes
+                  << " actual_production_passes=1 final_trainer_derivative_passes=0" << std::endl;
+        return completed;
+      };
+      // Reuse the existing ENERGY implementation unchanged for every ordinary FP64 call.
+      auto executeEnergyEpoch = [&]() {
         const auto optimizer_kind = training_input_.getOptimizer();
         const bool capture_ecp_jvp_replay =
             optimizer_kind == WFTrainDriverInput::Optimizer::LINEAR_METHOD ||
@@ -5208,6 +5110,8 @@ void WFTrainBatched::run()
           preparation_failure = std::current_exception();
         }
 
+        if (native_mixed_training)
+          requireNativeEpochReadiness(*myComm, preparation_failure, strict_native_epoch);
         int preparation_failed = preparation_failure ? 1 : 0;
         myComm->allreduce(preparation_failed);
         if (preparation_failed != 0)
@@ -5543,6 +5447,8 @@ void WFTrainBatched::run()
             // These explicit score-only estimators need no local-energy parameter responses.
           }
           catch (...) { preparation_failure = std::current_exception(); }
+          if (native_mixed_training)
+            requireNativeEpochReadiness(*myComm, preparation_failure, strict_native_epoch);
           reduction.preflight(schema, parameters ? &*parameters : nullptr,
                               kfac_estimator, preparation_failure);
           wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
@@ -5557,8 +5463,13 @@ void WFTrainBatched::run()
           catch (...) { preparation_failure = std::current_exception(); }
           reduction.preflight(schema, &*parameters, kfac_estimator, preparation_failure);
           storage_diagnostics = producer->storageDiagnostics();
-          retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
-                                                    statistics->retainedNumericBytes());
+          auto admitted_objective = completeNativeObjective(*producer, &*parameters,
+              checkedMemoryAdd(checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
+                  statistics->retainedNumericBytes()), kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0));
+          wftrain::GradientProducer& update_producer = admitted_objective ?
+              static_cast<wftrain::GradientProducer&>(*admitted_objective) : *producer;
+          retained_numeric_bytes = checkedMemoryAdd(native_epoch_objective_peak_bytes,
+              checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, statistics->retainedNumericBytes()));
           if (kfac_optimizer)
           {
             std::exception_ptr inverse_failure;
@@ -5577,8 +5488,9 @@ void WFTrainBatched::run()
               enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_configuration_bytes, retained_numeric_bytes),
                                   training_input_.getMaximumRetainedBytes());
               applied_scale = kfac_optimizer->effectiveLearningRate();
-              iteration_result = trainer.runIteration(*selected_provider_, *producer, *decorate(*kfac_optimizer),
+              iteration_result = trainer.runIteration(*selected_provider_, update_producer, *decorate(*kfac_optimizer),
                                                        training_state, &cache_observer);
+              if (native_mixed_training) native_epoch_replay->acceptPublishedEpoch();
               if (myComm->rank() == 0)
                 app_log() << "WFTrain persistent KFAC accepted step=" << kfac_optimizer->step()
                           << " data_seen=" << kfac_optimizer->dataSeen()
@@ -5610,8 +5522,9 @@ void WFTrainBatched::run()
             LiveKFACUpdateRule update_rule(*inverse, training_input_.getLearningRate(),
                 training_input_.getKFACConstraint() == WFTrainDriverInput::KFACConstraint::DAMPED_KFAC
                     ? training_input_.getKFACNormConstraint() : 0);
-            iteration_result = trainer.runIteration(*selected_provider_, *producer, *decorate(update_rule),
+            iteration_result = trainer.runIteration(*selected_provider_, update_producer, *decorate(update_rule),
                                                      training_state, &cache_observer);
+            if (native_mixed_training) native_epoch_replay->acceptPublishedEpoch();
             applied_scale = update_rule.constraintScale();
           }
         }
@@ -5644,14 +5557,21 @@ void WFTrainBatched::run()
                 "WFTrainBatched: another rank failed while preparing the first-order objective");
           }
           storage_diagnostics = producer->storageDiagnostics();
-          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-              first_order_optimizer->retainedBytes();
+          std::unique_ptr<wftrain::GpuTrainingEpochObjective> admitted_objective;
+          if (native_mixed_training)
+            admitted_objective = completeNativeObjective(*producer, nullptr,
+                checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, first_order_optimizer->retainedBytes()));
+          wftrain::GradientProducer& update_producer = admitted_objective ?
+              static_cast<wftrain::GradientProducer&>(*admitted_objective) : *producer;
+          retained_numeric_bytes = checkedMemoryAdd(native_epoch_objective_peak_bytes,
+              checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, first_order_optimizer->retainedBytes()));
           const auto aggregate = checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes);
           enforceMemoryBudget(*myComm, aggregate,
                               training_input_.getMaximumRetainedBytes());
-          iteration_result = trainer.runIteration(*selected_provider_, *producer,
+          iteration_result = trainer.runIteration(*selected_provider_, update_producer,
                                                   *decorate(*first_order_optimizer), training_state,
                                                   &cache_observer);
+          if (native_mixed_training) native_epoch_replay->acceptPublishedEpoch();
         }
         else if (optimizer_kind ==
                  WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
@@ -6042,6 +5962,294 @@ void WFTrainBatched::run()
             throw std::logic_error(
                 "WFTrainBatched: unsupported optimizer reached score-factor execution");
         }
+            };
+
+      if (resident_open_observation_)
+      {
+        if (!resident_observations || resident_observations->sourceVersion() != training_state.parameter_version ||
+            resident_observations->sampleCount() != 2)
+          throw UniformCommunicateError("Resident open iteration has no current W2 complete observations");
+        const auto source_version = training_state.parameter_version;
+        auto pending = training_state;
+        if (pending.completed_iterations == std::numeric_limits<std::size_t>::max())
+          throw UniformCommunicateError("Resident open completed iteration count overflow");
+        ++pending.completed_iterations;
+        const double e0 = resident_observations->energy(0)[4], e1 = resident_observations->energy(1)[4];
+        const double mean = (e0 + e1) / 2.0;
+        const double variance = ((e0 - mean) * (e0 - mean) + (e1 - mean) * (e1 - mean)) / 2.0;
+        if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance))
+          throw std::invalid_argument("Resident open iteration energy moments are nonfinite");
+        resident_diagnostics.emplace(ResidentEnergyDiagnostics{2, mean, variance, 0.0});
+        std::unique_ptr<PsiFormerWF::PreparedResidentDeviceAdamPublication> publication;
+        std::exception_ptr failure;
+        try
+        {
+          std::unique_ptr<PsiFormerWF::ResidentDeviceAdamProposal> candidate;
+          first_order_optimizer->proposeResidentDeviceAdam(selected_provider_->parameterSchema(), source_version,
+              [&](const auto& adam, double b1, double b2, double c1, double c2, double epsilon) {
+                candidate = device_provider->consumeResidentOpenAdamDevice(*resident_observations, adam,
+                    b1, b2, c1, c2, epsilon, resident_snapshot_cap_);
+                if (!candidate || candidate->sourceVersion() != source_version)
+                  throw std::invalid_argument("Resident open Adam candidate is foreign or stale");
+                return candidate->gradientNorm();
+              }, resident_diagnostics->gradient_norm);
+          selected_displacement_norm = candidate->displacementNorm();
+          if (!wftrain::isFiniteTrainingReal(mean) || !wftrain::isFiniteTrainingReal(variance) ||
+              !wftrain::isFiniteTrainingReal(selected_displacement_norm) || selected_displacement_norm < 0)
+            throw std::invalid_argument("Resident open iteration scalar result is nonfinite");
+          publication = device_provider->prepareResidentDeviceAdamPublication(
+              std::move(candidate), source_version, resident_successor_cap_);
+          if (!publication)
+            throw std::logic_error("Resident open Adam publication returned no owning action");
+        }
+        catch (...) { failure = std::current_exception(); }
+        try
+        {
+          reduction.validatePublicationReadiness(source_version, true, failure);
+          const auto version = publication->commit();
+          first_order_optimizer->acceptResidentDeviceAdam(version);
+          pending.parameter_version = reduction.completePublication(version);
+        }
+        catch (...)
+        {
+          first_order_optimizer->proposalRejected();
+          throw;
+        }
+        training_state.completed_iterations = pending.completed_iterations;
+        training_state.parameter_version = pending.parameter_version;
+        training_state.schema_fingerprint.swap(pending.schema_fingerprint);
+        cache_observer.parametersPublished(training_state.parameter_version);
+        iteration_result.completed_iteration = training_state.completed_iterations;
+        iteration_result.parameter_version = training_state.parameter_version;
+        resident_observations.reset(); // Retire old sample/image receipts before the next accepted epoch.
+      }
+      else if (orbital_mse)
+      {
+        std::unique_ptr<wftrain::OrbitalPretrainingProducer> producer;
+        std::size_t producer_retained_bytes = 0;
+        std::unique_ptr<wftrain::OrbitalPretrainingCoordinator> coordinator;
+        std::unique_ptr<wftrain::SelectedUpdateRule> update;
+        std::optional<wftrain::TrainingStageState> coordinator_stage;
+        std::optional<wftrain::StructuredParameterSnapshot> parameters;
+        std::exception_ptr preparation_failure;
+        try
+        {
+          NativeTimerScope preparation_timer(phase_timers_.preparation);
+          psiformer::memory::Phase memory_preparation_timer("preparation");
+          parameters.emplace(selected_provider_->snapshotParameters());
+#ifdef QMC_COMPLEX
+          if (complex_orbital_target_)
+          {
+            auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerComplexWF,
+                psiformer::ComplexOrbitalTargetEvaluator>>(*complex_training_component_, *complex_orbital_target_, retained_samples,
+                    training_input_.getOrbitalNormalization());
+            producer_retained_bytes = typed->retainedBytes();
+            producer = std::move(typed);
+          }
+          else
+#endif
+          {
+            auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+            if (jastrow_binding_)
+            {
+              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<wftrain::JastrowNeuralTrainingBinding,
+                  psiformer::OrbitalTargetEvaluator>>(*jastrow_binding_, *orbital_target_, retained_samples);
+              producer_retained_bytes = typed->retainedBytes();
+              producer = std::move(typed);
+            }
+            else
+            {
+              if (!student)
+                throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+              auto typed = std::make_unique<SampledOrbitalPretrainingProducer<PsiFormerWF,
+                  psiformer::OrbitalTargetEvaluator>>(*student, *orbital_target_, retained_samples);
+              producer_retained_bytes = typed->retainedBytes();
+              producer = std::move(typed);
+            }
+          }
+          coordinator = std::make_unique<wftrain::OrbitalPretrainingCoordinator>(
+              orbital_target_fingerprint_, reduction);
+          coordinator_stage.emplace(coordinator->makeStageState(stage_state.stage_ordinal));
+          coordinator_stage->completed_stage_iterations = stage_state.completed_stage_iterations;
+          update = decorate(*first_order_optimizer);
+        }
+        catch (...)
+        {
+          preparation_failure = std::current_exception();
+        }
+        reduction.preflightOrbital(selected_provider_->parameterSchema(),
+            parameters ? &*parameters : nullptr, orbital_target_fingerprint_,
+            wftrain::OrbitalPretrainingCoordinator::LOSS_FINGERPRINT, preparation_failure);
+        // The outer checkpoint binds all driver controls; the coordinator independently
+        // validates its exact target/loss identity and owns failure-atomic publication.
+        retained_numeric_bytes = checkedMemoryAdd(first_order_optimizer->retainedBytes(),
+            checkedMemoryAdd(producer_retained_bytes,
+                checkedMemoryAdd(orbital_target_bytes_, complex_orbital_score_bytes_)));
+        retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+            checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 4 * sizeof(double)));
+        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
+                            training_input_.getMaximumRetainedBytes());
+        parameters.reset();
+        auto result = coordinator->runIteration(*selected_provider_, *producer,
+            *update, training_state, *coordinator_stage, &cache_observer);
+        stage_state.completed_stage_iterations = coordinator_stage->completed_stage_iterations;
+        iteration_result.completed_iteration = result.completed_iteration;
+        iteration_result.parameter_version = result.parameter_version;
+        orbital_diagnostics.emplace(std::move(result.objective));
+      }
+      else if (determinant_overlap)
+      {
+        const auto& schema = selected_provider_->parameterSchema();
+        std::optional<wftrain::StructuredParameterSnapshot> parameters;
+        std::vector<std::unique_ptr<psiformer::DeterminantChannelBatch>> batch_owners;
+        std::vector<wftrain::DeterminantOverlapBatchView> overlap_batches;
+        std::exception_ptr preparation_failure;
+        try
+        {
+          parameters.emplace(selected_provider_->snapshotParameters());
+          if (parameters->schema_fingerprint != schema.fingerprint() ||
+              parameters->values.size() != schema.parameterCount())
+            throw std::logic_error(
+                "WFTrainBatched: structured provider returned an inconsistent snapshot");
+          if (training_state.completed_iterations != 0 &&
+              (training_state.schema_fingerprint != schema.fingerprint() ||
+               training_state.parameter_version != parameters->version))
+            throw std::logic_error(
+                "WFTrainBatched: training state does not match the parameter provider");
+          if (training_state.completed_iterations ==
+              std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("WFTrainBatched: training iteration count overflow");
+          if (overlap_student_twfs_.size() != crowds_.size())
+            throw std::logic_error(
+                "WFTrainBatched: student-clone crowd topology changed after initialization");
+
+          batch_owners.reserve(retained_samples.size());
+          overlap_batches.reserve(retained_samples.size());
+          for (auto& samples : retained_samples)
+          {
+            auto& students = overlap_student_twfs_[samples.crowd_index];
+            RefVectorWithLeader<TrialWaveFunction> student_batch(*students.front());
+            RefVectorWithLeader<ParticleSet> particle_batch(*samples.particles.front());
+            for (std::size_t sample = 0; sample < students.size(); ++sample)
+            {
+              student_batch.push_back(*students[sample]);
+              particle_batch.push_back(*samples.particles[sample]);
+            }
+            batch_owners.push_back(
+                TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+                    student_batch, particle_batch, selected_provider_id_));
+
+            wftrain::DeterminantOverlapBatchView view;
+            view.student = batch_owners.back().get();
+            view.teachers.reserve(students.size());
+            view.electrons.reserve(students.size());
+            for (std::size_t sample = 0; sample < students.size(); ++sample)
+            {
+              view.teachers.emplace_back(*samples.teachers[sample]);
+              view.electrons.emplace_back(*samples.particles[sample]);
+            }
+            overlap_batches.push_back(std::move(view));
+          }
+        }
+        catch (...)
+        {
+          preparation_failure = std::current_exception();
+        }
+
+        reduction.preflightDeterminantOverlap(
+            schema, parameters ? &*parameters : nullptr,
+            determinant_overlap_objective_->targetDescriptor().fingerprint(),
+            determinant_overlap_objective_->configurationFingerprint(),
+            preparation_failure);
+
+        wftrain::DeterminantOverlapObjectiveResult objective =
+            determinant_overlap_objective_->evaluate(*myComm, overlap_batches);
+        if (objective.parameter_version != parameters->version ||
+            objective.parameter_gradient.size() != schema.parameterCount() ||
+            objective.target_fingerprint !=
+                determinant_overlap_objective_->targetDescriptor().fingerprint() ||
+            objective.target_provenance != training_input_.getTargetProvenance())
+          throw UniformCommunicateError(
+              "WFTrainBatched: determinant-overlap objective returned inconsistent identity");
+        if (objective.retained_numeric_bytes >
+            std::numeric_limits<std::size_t>::max() - first_order_optimizer->retainedBytes())
+          throw std::overflow_error(
+              "WFTrainBatched: determinant-overlap retained-byte count overflowed");
+        retained_numeric_bytes =
+            objective.retained_numeric_bytes + first_order_optimizer->retainedBytes();
+        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
+                            training_input_.getMaximumRetainedBytes());
+
+        const wftrain::ParameterGradientView gradient{
+            schema.fingerprint(), parameters->version, wftrain::ReductionDomain::GLOBAL,
+            {objective.parameter_gradient.data(), objective.parameter_gradient.size()}};
+        const std::size_t committed_version = wftrain::completeParameterUpdate(
+            *selected_provider_, *parameters, gradient, *decorate(*first_order_optimizer), reduction);
+        ++training_state.completed_iterations;
+        training_state.parameter_version = committed_version;
+        training_state.schema_fingerprint = schema.fingerprint();
+        cache_observer.parametersPublished(committed_version);
+        iteration_result.completed_iteration = training_state.completed_iterations;
+        iteration_result.parameter_version = committed_version;
+        overlap_diagnostics.emplace(std::move(objective));
+      }
+      else
+      {
+        if (!native_mixed_training)
+          executeEnergyEpoch();
+        else
+          for (std::size_t attempt = 0; attempt < 2; ++attempt)
+          {
+            strict_native_epoch = attempt == 0;
+            const auto mode = strict_native_epoch ? psiformer::PsiFormerGpuTrainingEpochMode::STRICT_MIXED
+                                                 : psiformer::PsiFormerGpuTrainingEpochMode::FP64_REPLAY;
+            const auto predecessor_completed_iterations = training_state.completed_iterations;
+            try
+            {
+              std::exception_ptr entry_failure;
+              try
+              {
+#ifdef QMC_COMPLEX
+                if (complex_training_component_)
+                  native_complex_epoch = complex_training_component_->enterGpuTrainingEpoch(training_state.parameter_version, mode);
+                else
+#endif
+                  native_real_epoch = device_provider->enterGpuTrainingEpoch(training_state.parameter_version, mode);
+              }
+              catch (...) { entry_failure = std::current_exception(); }
+              requireNativeEpochReadiness(*myComm, entry_failure, strict_native_epoch);
+              executeEnergyEpoch();
+              native_real_epoch.reset();
+#ifdef QMC_COMPLEX
+              native_complex_epoch.reset();
+#endif
+              native_epoch_replay->acceptPublishedEpoch();
+              break;
+            }
+            catch (const NativeGpuEpochRetry&)
+            {
+              native_real_epoch.reset();
+#ifdef QMC_COMPLEX
+              native_complex_epoch.reset();
+#endif
+              if (attempt != 0) throw;
+              native_epoch_replay->rewindForFp64Replay();
+              native_epoch_objective_peak_bytes = 0;
+              storage_diagnostics = {};
+              retained_numeric_bytes = 0;
+              memory_phase.transition("mixed_epoch_FP64_replay");
+              app_log() << "WFTrain complete native precision replay: source_version=" << training_state.parameter_version
+                        << " scope=post_MC_pre_EL retained_configs=yes all_ranks=yes extra_MC_moves=0"
+                           " pending_factors_and_objective_discarded=yes" << std::endl;
+            }
+            catch (...)
+            {
+              // A successful transaction must never be followed by predecessor RNG rollback.
+              if (training_state.completed_iterations != predecessor_completed_iterations)
+                native_epoch_replay->acceptPublishedEpoch();
+              throw;
+            }
+          }
       }
     }
 

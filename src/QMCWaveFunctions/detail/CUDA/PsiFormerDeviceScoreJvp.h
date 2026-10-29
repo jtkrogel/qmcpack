@@ -31,12 +31,16 @@ public:
   PreparedDeviceScoreJvp(std::shared_ptr<const PreparedDeviceModel> model,
                          std::size_t capacity,
                          compute::Queue<PlatformKind::CUDA>& queue,
-                         AcceleratorBlasHandle& blas)
-      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
+                         AcceleratorBlasHandle& blas,
+                         std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed = {})
+      : mixed_(std::move(mixed)), model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
   {
     if (!model_ || capacity_ == 0)
       throw std::invalid_argument("Score JVP requires a model and nonzero capacity");
     model_->validateCurrentDevice();
+    if (mixed_ && (mixed_->modelImage().get() != model_.get() ||
+        mixed_->maximumRows() < multiply(capacity_, model_->plan().modelShape().electrons())))
+      throw std::invalid_argument("Mixed score JVP requires a matching prepared affine owner");
     const auto& shape = model_->plan().modelShape();
     const auto features = multiply(multiply(capacity_, shape.electrons()), shape.feature_dimension);
     feature_.reserveNamed(features, "ScoreJvp::feature_", __FILE__, __LINE__);
@@ -117,6 +121,10 @@ public:
     const auto ne = shape.electrons(), width = shape.feature_dimension;
     if (forward.modelImage().get() != model_.get() || count > capacity_)
       throw std::invalid_argument("Score JVP model or capacity mismatch");
+    const auto& primal_cache = forward.valueTapeMixedParameters();
+    if ((mixed_ ? mixed_->parameters().get() : nullptr) != primal_cache.get())
+      throw std::invalid_argument("Score JVP arithmetic differs from its completed primal tape");
+    MixedAffineDerivativeAttempt mixed_attempt(mixed_.get(), model_);
     forward.downloadValueFactorizations(host_factors_);
     for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
       if (!host_factors_[channel].inverse_available)
@@ -137,8 +145,12 @@ public:
     const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
     const DenseForwardLayout feature_dense{count * ne, embedding.shape[0], width,
                                            embedding.shape[0], width, width};
-    denseForward(blas_, feature_dense, forward.valueRawFeatures(),
-                 direction_.data() + embedding.begin, feature_.data());
+    if (mixed_)
+      mixed_->projectDirection(feature_dense, forward.valueRawFeatures(), nullptr,
+          model_->parameters() + embedding.begin, direction_.data() + embedding.begin, feature_.data());
+    else
+      denseForward(blas_, feature_dense, forward.valueRawFeatures(),
+          direction_.data() + embedding.begin, feature_.data());
     const DenseForwardLayout dense{count * ne, width, width, width, width, width};
     const BatchedValueLayout values{count, ne, width, width, ne * width};
     const BatchedAttentionForwardLayout attention{count,
@@ -182,6 +194,7 @@ public:
     checkRuntime(launchLogScoreParameterDirection(stream, count, ne, shape.determinants, shape.spin_up_electrons,
         head.positions, seeds_.data(), orbital_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
         same_alpha_direction_, opposite_alpha_direction_, products_.data(), model_->periodicCell()), "score JVP reduction");
+    mixed_attempt.finish();
     const DerivativeFiniteScanLayout finite{count, count, 1, 0, 1};
     checkRuntime(launchDerivativeFiniteScan(stream, finite, products_.data(), finite_status_.data()), "score JVP finite scan");
     queue_.sync();
@@ -207,7 +220,33 @@ public:
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
     model_->validateSuccessor(successor);
+    if (mixed_ && mixed_->modelImage().get() != successor.get())
+      throw std::invalid_argument("Mixed score JVP successor cache must be rebound before its model");
     model_ = std::move(successor);
+    clearPreparedDirection();
+  }
+
+  /// Preflight model and compute copy while the accepted predecessor stays bound.
+  void validateModelRebindWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) const
+  {
+    model_->validateSuccessor(successor);
+    if (bool(mixed_) != bool(incoming))
+      throw std::invalid_argument("Score JVP rebind cannot change the frozen affine policy");
+    if (mixed_)
+    {
+      if (mixed_->modelImage().get() != model_.get() || incoming->modelImage().get() != successor.get())
+        throw std::invalid_argument("Score JVP rebind has a foreign active or successor affine cache");
+      mixed_->validateParameterRebind(incoming);
+    }
+  }
+
+  /// Caller prevalidates every leaf and keeps the predecessor alive under its idle lease.
+  void adoptPreparedModelWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
+  {
+    if (mixed_) mixed_->adoptPreparedParameters(incoming);
+    model_ = successor;
     clearPreparedDirection();
   }
 
@@ -217,7 +256,8 @@ public:
   {
     return checkedDeviceBytes<device_determinant::DerivativeStatus>(host_status_.capacity()) +
         checkedDeviceBytes<device_determinant::FactorizationMetadata>(host_factors_.capacity()) +
-        checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+        checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity()) +
+        (mixed_ ? mixed_->hostWorkspaceBytes() : 0);
   }
 
   /// Count prepared device tangent, direction and admission buffers.
@@ -232,6 +272,7 @@ public:
       add(checkedDeviceBytes<double>(buffer->capacity()));
     add(checkedDeviceBytes<device_determinant::DerivativeStatus>(status_.capacity()));
     add(checkedDeviceBytes<DerivativeFiniteStatus>(finite_status_.capacity()));
+    if (mixed_) add(mixed_->deviceWorkspaceBytes());
     return bytes;
   }
 
@@ -271,6 +312,12 @@ private:
                ParameterRole role, std::size_t layer, DeviceBuffer<double>& target)
   {
     const auto begin = model_->plan().parameter(role, layer).begin;
+    if (mixed_)
+    {
+      mixed_->projectDirection(layout, source, source_direction, model_->parameters() + begin,
+          direction_.data() + begin, target.data());
+      return;
+    }
     denseForward(blas_, layout, source_direction, model_->parameters() + begin, work_left_.data());
     denseForward(blas_, layout, source, direction_.data() + begin, work_right_.data());
     add(work_left_, work_right_, target, layout.rows * layout.output_width);
@@ -289,6 +336,7 @@ private:
         direction_.data() + model_->plan().parameter(bias, layer).begin, tangent.data()), "score JVP tanh");
   }
 
+  std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_;
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::size_t capacity_, live_count_ = 0;
   compute::Queue<PlatformKind::CUDA>& queue_;

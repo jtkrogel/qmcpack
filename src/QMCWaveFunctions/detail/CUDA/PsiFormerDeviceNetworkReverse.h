@@ -53,8 +53,9 @@ public:
                                std::size_t capacity,
                                compute::Queue<PlatformKind::CUDA>& queue,
                                AcceleratorBlasHandle& blas,
-                               NetworkReverseOutput output = NetworkReverseOutput::PARAMETER_SCORE)
-      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas), output_(output),
+                               NetworkReverseOutput output = NetworkReverseOutput::PARAMETER_SCORE,
+                               std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed = {})
+      : mixed_(std::move(mixed)), model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas), output_(output),
         shared_softmax_means_(configuredSoftmaxKeySharedMeans())
   {
     if (!model_ || capacity_ == 0)
@@ -62,6 +63,10 @@ public:
     model_->validateCurrentDevice();
     if (model_->plan().environment().periodic_profile && output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
       throw std::invalid_argument("Periodic pair-attention coordinate reverse is not prepared");
+    if (mixed_ && (output_ != NetworkReverseOutput::PARAMETER_SCORE ||
+        mixed_->modelImage().get() != model_.get() ||
+        mixed_->maximumRows() < multiply(capacity_, model_->plan().modelShape().electrons())))
+      throw std::invalid_argument("Mixed network reverse requires a matching score-only affine owner");
     const auto& shape = model_->plan().modelShape();
     const auto features = multiply(multiply(capacity_, shape.electrons()), shape.feature_dimension);
     upstream_.reserveNamed(features, "NetworkReverse::upstream_", __FILE__, __LINE__);
@@ -147,6 +152,10 @@ private:
     if (forward.modelImage().get() != model_.get() || count > capacity_ ||
         (device_seed ? !seed.empty() : seed.size() != elements))
       throw std::invalid_argument("Network reverse model, capacity or seed extent mismatch");
+    const auto& primal_cache = forward.valueTapeMixedParameters();
+    if ((mixed_ ? mixed_->parameters().get() : nullptr) != primal_cache.get())
+      throw std::invalid_argument("Network reverse arithmetic differs from its completed primal tape");
+    MixedAffineDerivativeAttempt mixed_attempt(mixed_.get(), model_);
     for (double value : seed)
       if (!device_math::isFiniteBinary64(value))
         throw std::invalid_argument("Network reverse seed is nonfinite");
@@ -173,27 +182,27 @@ private:
       weightReverse(dense, tape.hidden.data(), tanh_.data(), ParameterRole::UPDATE_OUTPUT_WEIGHT, layer, affine);
       biasReverse(dense, tanh_.data(), ParameterRole::UPDATE_OUTPUT_BIAS, layer);
       zero(hidden_, elements);
-      accumulateDenseInputAdjoint(blas_, dense, tanh_.data(),
+      inputReverse(dense, tanh_.data(),
           parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), hidden_.data());
       checkRuntime(launchTanhOutputResidualReverse(stream, values, tape.hidden.data(),
           hidden_.data(), tanh_.data(), discard_.data()), "network hidden tanh reverse");
       weightReverse(dense, tape.residual.data(), tanh_.data(), ParameterRole::UPDATE_HIDDEN_WEIGHT, layer, affine);
       biasReverse(dense, tanh_.data(), ParameterRole::UPDATE_HIDDEN_BIAS, layer);
-      accumulateDenseInputAdjoint(blas_, dense, tanh_.data(),
+      inputReverse(dense, tanh_.data(),
           parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer), residual_.data());
 
       // The attention residual contributes directly to the preceding block input.
       copy(residual_, input_, elements);
       weightReverse(dense, tape.context.data(), residual_.data(), ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer, affine);
       zero(context_, elements);
-      accumulateDenseInputAdjoint(blas_, dense, residual_.data(),
+      inputReverse(dense, residual_.data(),
           parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), context_.data());
       checkRuntime(launchAttentionContextReverse(stream, attention, tape.probabilities.data(),
           tape.value.data(), context_.data(), probability_.data(), value_.data()), "network context reverse");
       // Both context-reverse kernels have consumed context_ on this stream.
       // Projection/affine/raw-input consumers below use Q/K/V, never context_.
-      // valueTapeBatchCount/valueBlockTape requires a valid retained VALUE tape;
-      // setMixedDense rejects such a tape and revokes tape admission on attachment.
+      // The retained tape is admitted only after its actual affine cache matches
+      // this reverse owner; attention reductions themselves remain FP64.
       const auto& environment = model_->plan().environment();
       const bool real_open_means =
           environment.boundary == BoundaryCondition::OPEN && environment.fixed_nuclei &&
@@ -201,8 +210,8 @@ private:
           environment.compute_scalar_domain == ScalarDomain::REAL &&
           environment.amplitude_scalar_domain == ScalarDomain::REAL &&
           environment.head_representation == HeadRepresentation::REAL && !environment.periodic_profile;
-      // Paired FP64 score/affine passes share this real trunk. Retained VALUE
-      // tapes exclude mixed dense; raw-input and new periodic profiles stay out.
+      // Paired score/affine passes share this real trunk. Raw-input and new
+      // periodic profiles retain their existing reduction-path restrictions.
       const bool paired_legacy_means = output_ == NetworkReverseOutput::PARAMETER_SCORE &&
           environment.boundary == BoundaryCondition::PERIODIC && environment.fixed_nuclei &&
           environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
@@ -227,7 +236,7 @@ private:
                                     std::pair{ParameterRole::ATTENTION_VALUE_WEIGHT, &value_}})
       {
         weightReverse(dense, tape.input.data(), projection.second->data(), projection.first, layer, affine);
-        accumulateDenseInputAdjoint(blas_, dense, projection.second->data(),
+        inputReverse(dense, projection.second->data(),
             parameter(projection.first, layer), input_.data());
       }
       copy(input_, upstream_, elements);
@@ -246,13 +255,15 @@ private:
     {
       const auto raw_elements = multiply(multiply(count, ne), embedding.shape[0]);
       zero(raw_feature_, raw_elements);
-      accumulateDenseInputAdjoint(blas_, feature_dense, upstream_.data(),
+      inputReverse(feature_dense, upstream_.data(),
           parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK), raw_feature_.data());
       result = raw_feature_.data();
       scan.element_count = raw_elements;
       scan.status_capacity = raw_elements / scan.elements_per_status +
           (raw_elements % scan.elements_per_status != 0);
     }
+
+    mixed_attempt.finish();
 
     // The composing score owner checks the final sum before making it public.
     if (!admit_response)
@@ -304,7 +315,33 @@ public:
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
     model_->validateSuccessor(successor);
+    if (mixed_ && mixed_->modelImage().get() != successor.get())
+      throw std::invalid_argument("Mixed network reverse successor cache must be rebound before its model");
     model_ = std::move(successor);
+    result_ready_ = false;
+  }
+
+  /// Preflight model and compute copy while the accepted predecessor stays bound.
+  void validateModelRebindWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) const
+  {
+    model_->validateSuccessor(successor);
+    if (bool(mixed_) != bool(incoming))
+      throw std::invalid_argument("Network reverse rebind cannot change the frozen affine policy");
+    if (mixed_)
+    {
+      if (mixed_->modelImage().get() != model_.get() || incoming->modelImage().get() != successor.get())
+        throw std::invalid_argument("Network reverse rebind has a foreign active or successor affine cache");
+      mixed_->validateParameterRebind(incoming);
+    }
+  }
+
+  /// Caller prevalidates every leaf and keeps the predecessor alive under its idle lease.
+  void adoptPreparedModelWithMixedParameters(const std::shared_ptr<const PreparedDeviceModel>& successor,
+      const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& incoming) noexcept
+  {
+    if (mixed_) mixed_->adoptPreparedParameters(incoming);
+    model_ = successor;
     result_ready_ = false;
   }
 
@@ -312,7 +349,8 @@ public:
   /// Count host-side finite-scan storage retained by this reverse lane.
   std::size_t hostWorkspaceBytes() const
   {
-    return checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+    return spatial_detail::checkedAdd(checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity()),
+        mixed_ ? mixed_->hostWorkspaceBytes() : 0, "Mixed reverse host diagnostics overflow");
   }
 
   /// Count prepared device adjoints, selected output and finite-scan buffers.
@@ -323,6 +361,8 @@ public:
                               &query_, &key_, &value_, &probability_, &discard_, &response_, &raw_feature_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(buffer->capacity()),
                                          "Network reverse storage overflow");
+    if (mixed_)
+      bytes = spatial_detail::checkedAdd(bytes, mixed_->deviceWorkspaceBytes(), "Mixed reverse storage overflow");
     return spatial_detail::checkedAdd(bytes,
         checkedDeviceBytes<DerivativeFiniteStatus>(finite_status_.capacity()),
         "Network reverse status storage overflow");
@@ -357,12 +397,29 @@ private:
   void copy(const DeviceBuffer<double>& source, DeviceBuffer<double>& target, std::size_t count)
   { checkRuntime(launchDerivativeCopy(queue_.getNative(), {count, 0, 1, 0, 1}, source.data(), target.data()), "network adjoint copy"); }
 
+  /// Match each input VJP to the selected completed primal arithmetic.
+  void inputReverse(const DenseForwardLayout& layout, const double* adjoint,
+      const double* weight, double* response)
+  {
+    if (mixed_) mixed_->accumulateInputAdjoint(layout, adjoint, weight, response);
+    else accumulateDenseInputAdjoint(blas_, layout, adjoint, weight, response);
+  }
+
   /// Fold configurations/electrons into one canonical shared-weight contraction.
   void weightReverse(const DenseForwardLayout& layout, const double* source, const double* adjoint,
                      ParameterRole role, std::size_t layer, DeviceAffineObservationSink* affine = nullptr)
   {
     if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
       return;
+    if (mixed_)
+    {
+      const auto operands = mixed_->accumulateWeightAdjoint(layout, source, adjoint,
+          parameter(role, layer), response_.data() + model_->plan().parameter(role, layer).begin, affine != nullptr);
+      if (affine)
+        affine->observe(role, layer, operands.source, operands.adjoint,
+            layout.rows, layout.input_width, layout.output_width);
+      return;
+    }
     if (affine)
       affine->observe(role, layer, source, adjoint, layout.rows, layout.input_width, layout.output_width);
     accumulateDenseWeightAdjoint(blas_, layout, source, adjoint,
@@ -379,6 +436,7 @@ private:
         response_.data() + model_->plan().parameter(role, layer).begin), "network bias reverse");
   }
 
+  std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_;
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::size_t capacity_;
   compute::Queue<PlatformKind::CUDA>& queue_;

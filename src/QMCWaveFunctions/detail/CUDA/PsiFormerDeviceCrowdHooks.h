@@ -275,6 +275,14 @@ public:
   std::size_t mixedRetries() const noexcept { return mixed_retries_; }
   const std::string& mixedRetryReason() const noexcept { return mixed_retry_reason_; }
 
+  /// Freeze one native epoch policy only while this physical crowd is released.
+  void setTrainingEpochMode(PsiFormerGpuTrainingEpochMode mode)
+  {
+    if (acquired_ || recorded_ || source_ || failure_)
+      throw std::logic_error("Physical inference epoch selection requires an idle crowd");
+    training_epoch_mode_ = mode;
+  }
+
 private:
   // The named sampler borrows this crowd's existing VALUE graph under its lease.
   friend class PreparedDeviceBatchBackend;
@@ -304,7 +312,17 @@ private:
   /// Preserve atomic result publication while applying the explicitly selected numerical policy.
   void evaluateGraph(PreparedDeviceInference& graph)
   {
-    const bool retried = graph.evaluateWithFp64Retry(positions_, mixed_retry_reason_);
+    bool retried = false;
+    mixed_retry_reason_.clear();
+    if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::FP64_REPLAY)
+    {
+      graph.evaluateFp64(positions_);
+      return; // Explicit native replay is separate from inference's automatic retry counter.
+    }
+    if (training_epoch_mode_ == PsiFormerGpuTrainingEpochMode::STRICT_MIXED)
+      graph.evaluate(positions_);
+    else
+      retried = graph.evaluateWithFp64Retry(positions_, mixed_retry_reason_);
     if (mixed_dense_)
     {
       if (retried)
@@ -416,6 +434,7 @@ private:
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   std::size_t mixed_batches_ = 0, mixed_retries_ = 0;
   std::string mixed_retry_reason_;
+  PsiFormerGpuTrainingEpochMode training_epoch_mode_ = PsiFormerGpuTrainingEpochMode::INFERENCE;
   const PsiFormerAcceleratorSharedModel& owner_;
   const std::uint64_t crowd_identity_;
   PsiFormerAcceleratorModelProvenance model_provenance_;

@@ -356,11 +356,14 @@ try
         (system == "all_electron" || cpu_ecp);
     const bool selected_gpu_training = (selected_pair_gpu || (!pair_profile && gpu_ecp)) && optimization_enabled &&
         optimize_scope == "all" && optimize_indices.empty();
+    const bool paired_mixed_request = explicit_gpu && !pair_profile &&
+        (!optimization_enabled || (gpu_ecp && selected_gpu_training)) &&
+        precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
     if ((!explicit_gpu && request != "no" && request != "cpu") ||
         (optimization_enabled && !cpu_training && !selected_gpu_training) ||
-        precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+        (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && !paired_mixed_request))
       throw std::invalid_argument("Complex PsiFormer requires qualified CPU optimize_scope=all training or "
-                                 "CPU/strict cuda/hip inference, and fp64_reference");
+                                 "CPU/strict cuda/hip inference; mixed training requires explicit legacy GPU ECP SCORE admission");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
         feature_policy != (pair_profile ? "periodic_two_cell_v1" : "periodic_torus_v1") ||
         (system != "all_electron" && !gpu_ecp && !cpu_ecp) ||
@@ -489,13 +492,20 @@ try
       accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
       (nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument("Native paired pseudopotential initialization requires Gamma twist");
-  if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+  const bool mixed_gpu_ecp_training = optimization_enabled && system == "pseudopotential" &&
+      optimize_scope == "all" && optimize_indices.empty() && parameter_checkpoint.empty() &&
+      (direct_model || (internal_initialization && !pair_profile && !jastrow_profile));
+  const bool paired_mixed_inference = complex_profile && !pair_profile && periodic &&
+      feature_policy == "periodic_torus_v1" && (!optimization_enabled || mixed_gpu_ecp_training) && gpu_numeric_limit &&
+      accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
+      precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
+  if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && !paired_mixed_inference &&
       (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
        accelerator_resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
-       optimization_enabled || complex_profile || pair_profile ||
+       (optimization_enabled && !mixed_gpu_ecp_training) || complex_profile || pair_profile ||
        (periodic && feature_policy != "periodic_torus_v1") || nonzero_twist || !particle_twist_is_zero))
     throw std::invalid_argument(
-        "precision=fp32_dense_fp64_islands requires real open or legacy Gamma GPU inference, optimize=no and zero twist");
+        "precision=fp32_dense_fp64_islands requires qualified real inference or legacy GPU ECP SCORE training");
   if (has_explicit_twist)
   {
     constexpr double twist_tolerance = 128.0 * std::numeric_limits<double>::epsilon();
@@ -677,7 +687,7 @@ try
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
                                                          *source_particles, clone_numeric_limit, twist_array,
                                                          gpu_numeric_limit, parameter_checkpoint, system,
-                                                         cpu_shared_numeric_limit, cpu_vgl_targets);
+                                                         cpu_shared_numeric_limit, cpu_vgl_targets, precision);
       const auto storage = complex->numericStorage();
       app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
                                      : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes

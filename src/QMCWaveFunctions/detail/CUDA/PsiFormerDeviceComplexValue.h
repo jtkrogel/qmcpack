@@ -245,6 +245,19 @@ public:
   void evaluate(const std::vector<double>& positions)
   { evaluateCoordinates(positions, nullptr); }
 
+  /// Retained score owners supply and charge one fixed conditioning minimum per matrix.
+  void evaluateRetainedMixedCoordinates(const std::vector<double>& positions, DeviceBuffer<double>& minima)
+  {
+    const auto& t = *trunk_;
+    const auto matrices = spatial_detail::checkedProduct(t.batch_capacity_, t.shape_.determinants,
+        "Mixed retained conditioning extent overflow");
+    if (!t.mixed_retained_attachment_ || t.mode_ != SpatialJetMode::VALUE_ONLY || t.value_tape_.empty() ||
+        !inverse_.capacity() || !permutation_.capacity() || !solve_.capacity() ||
+        minima.capacity() < matrices || minima.deviceOrdinal() != t.positions_.deviceOrdinal())
+      throw std::logic_error("Mixed retained VALUE requires prepared inverse and same-device conditioning storage");
+    evaluateCoordinates(positions, minima.data());
+  }
+
 private:
   friend class PreparedDeviceMixedComplexValue;
   friend struct PeriodicValueTilingValidationAccess;
@@ -506,13 +519,21 @@ private:
   void evaluateOwnedCoordinates(bool virtual_envelope = false, double* minimum_scaled_pivots = nullptr)
   {
     auto& t = *trunk_;
-    if (t.mixed_dense_ && (!minimum_scaled_pivots || inverse_.capacity() || virtual_envelope))
-      throw std::logic_error("Mixed paired VALUE requires private inverse-null conditioning storage");
+    const bool retained_diagnostics = t.mixed_retained_attachment_ &&
+        t.mode_ == SpatialJetMode::VALUE_ONLY && !t.value_tape_.empty() &&
+        inverse_.capacity() && permutation_.capacity() && solve_.capacity();
+    if ((minimum_scaled_pivots && inverse_.capacity() && !retained_diagnostics) ||
+        (t.mixed_dense_ && (!minimum_scaled_pivots || virtual_envelope)))
+      throw std::logic_error("Mixed paired VALUE requires ordinary inverse-null or explicit retained conditioning storage");
     PreparedDeviceInference::MixedValueAttempt mixed_attempt(t.mixed_dense_.get(), t.model_);
     evaluateHeadOwnedCoordinates(true, virtual_envelope);
 
     // The private head epoch ends here: matrix storage now becomes LU IN PLACE.
-    if (minimum_scaled_pivots)
+    if (minimum_scaled_pivots && retained_diagnostics)
+      checkRuntime(launchComplexSpatialFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
+          t.ne_, matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data(),
+          minimum_scaled_pivots), "complex retained VALUE inverse diagnostics");
+    else if (minimum_scaled_pivots)
       checkRuntime(launchComplexValueFactorWithDiagnostics(t.queue_.getNative(), t.batch_ * t.shape_.determinants,
           t.ne_, matrix_.data(), channels_.data(), status_.data(), minimum_scaled_pivots), "complex VALUE diagnostic factorization");
     else if (score_cooperative_lu_)

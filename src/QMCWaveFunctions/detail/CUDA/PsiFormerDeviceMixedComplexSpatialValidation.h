@@ -5,6 +5,8 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_COMPLEX_SPATIAL_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_COMPLEX_SPATIAL_VALIDATION_H
 #include "PsiFormerDeviceMixedComplexSpatial.h"
+#include "PsiFormerDeviceMixedComplexInference.h"
+#include "PsiFormerDeviceComplexProducts.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialExecutor.h"
 #include <complex>
 #include <cstring>
@@ -158,6 +160,225 @@ inline void validateMixedComplexSpatialFullReplays(pf::PsiFormer& model,
   }
 }
 
+/// Exercise the composing native owner's cache accounting and two-leaf publication boundary.
+inline void validateMixedComplexNativeOwners(
+    const std::shared_ptr<const qmcplusplus::psiformer::device::PreparedDeviceModel>& image,
+    const std::vector<double>& positions, std::vector<double> values,
+    qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA>& queue,
+    qmcplusplus::psiformer::device::AcceleratorBlasHandle& blas)
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  using Owner = PreparedDeviceMixedComplexInference;
+  const auto& plan = image->plan();
+  const auto owned = Owner::required(plan, 1), borrowed = Owner::required(plan, 1, 0, false);
+  const auto cache_bytes = checkedDeviceBytes<float>(plan.parameterCount());
+  if (owned.device_bytes - borrowed.device_bytes != cache_bytes || borrowed.pending_device_bytes ||
+      owned.host_bytes - borrowed.host_bytes != sizeof(PsiFormerParameterConversionDiagnostics))
+    throw std::runtime_error("Native mixed owner shared-cache accounting is inconsistent");
+  const auto budget = spatial_detail::checkedAdd(owned.device_bytes, owned.pending_device_bytes,
+      "Native mixed test budget overflow");
+  bool rejected = false;
+  try { (void)Owner::admittedCost(plan, 1, budget - 1); }
+  catch (const std::length_error&) { rejected = true; }
+  if (!rejected) throw std::runtime_error("Native mixed owner accepted cap-minus-one");
+  Owner owner(image, 1, queue, blas, budget);
+  const auto n = plan.modelShape().electrons();
+  struct Fields
+  {
+    std::vector<ComplexValueResult> value, full;
+    std::vector<cuDoubleComplex> gradient, laplacian, ratio;
+  };
+  const auto fetch = [&](Owner& selected) {
+    Fields f{{ComplexValueResult{}}, {ComplexValueResult{}},
+        std::vector<cuDoubleComplex>(3 * n), std::vector<cuDoubleComplex>(n), std::vector<cuDoubleComplex>(n)};
+    selected.downloadValue(f.value);
+    selected.downloadFull(f.full, f.gradient, f.laplacian, f.ratio);
+    return f;
+  };
+  const auto equal = [](const Fields& a, const Fields& b) {
+    const auto bits = [](const auto& x, const auto& y) {
+      return x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0;
+    };
+    return bits(a.value, b.value) && bits(a.full, b.full) && bits(a.gradient, b.gradient) &&
+        bits(a.laplacian, b.laplacian) && bits(a.ratio, b.ratio);
+  };
+  owner.evaluateValue(positions);
+  owner.evaluateFull(positions);
+  const auto accepted = fetch(owner);
+  Owner stale_crowd(image, 1, queue, blas, borrowed.device_bytes, 0, owner.parameterCache());
+  std::weak_ptr<const PreparedDeviceMixedDenseParameters> old_cache = owner.parameterCache();
+  const auto& embedding = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
+  values[embedding.begin] += .125;
+  auto successor = image->makeUpdatedImage(values, image->version() + 1);
+  // A cache for the accepted image cannot authorize either successor leaf.
+  rejected = false;
+  try { owner.validatePreparedRebind(successor, owner.parameterCache()); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected || !equal(accepted, fetch(owner)))
+    throw std::runtime_error("Rejected native mixed publication changed accepted VALUE/FULL bits");
+  auto next = std::make_shared<PreparedDeviceMixedDenseParameters>(successor, queue,
+      MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, true);
+  // Retain both old immutable authorities until all no-throw leaf adoptions complete.
+  auto retired_image = image;
+  auto retired_cache = owner.parameterCache();
+  owner.validatePreparedRebind(successor, next);
+  owner.adoptPreparedRebind(successor, next);
+  rejected = false;
+  try { (void)fetch(owner); } catch (const std::logic_error&) { rejected = true; }
+  if (!rejected) throw std::runtime_error("Native mixed publication retained an old output authority");
+  owner.evaluateValue(positions);
+  owner.evaluateFull(positions);
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "native mixed stale-cache accounting device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "native mixed stale-cache accounting device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto before_retirement = metrics.snapshot();
+  retired_cache.reset();
+  if (old_cache.expired() || metrics.snapshot().live_bytes != before_retirement.live_bytes)
+    throw std::runtime_error("Publication released a cache still owned by an idle crowd");
+  stale_crowd.validatePreparedRebind(successor, next);
+  stale_crowd.adoptPreparedRebind(successor, next);
+  if (!old_cache.expired() || metrics.snapshot().live_bytes + cache_bytes != before_retirement.live_bytes)
+    throw std::runtime_error("Last stale crowd did not release exactly one shared FP32 generation");
+  Owner fresh(successor, 1, queue, blas, borrowed.device_bytes, 0, next);
+  fresh.evaluateValue(positions);
+  fresh.evaluateFull(positions);
+  if (fresh.parameterCache().get() != next.get() || !equal(fetch(owner), fetch(fresh)))
+    throw std::runtime_error("Native mixed changed-weight rebind differs from fresh shared-cache owner");
+  owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
+  owner.evaluateFull(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
+  const auto forced = fetch(owner);
+  auto canonical_value = PreparedDeviceComplexValue::prepare(successor, 1, queue, blas,
+      estimateComplexValueCost(plan, 1, true, false).device_bytes);
+  auto canonical_full = PreparedDeviceComplexSpatial::prepare(successor, 1, queue, blas,
+      estimateComplexSpatialCost(plan, 1).device_bytes);
+  canonical_value->evaluate(positions);
+  canonical_full->evaluate(positions);
+  Fields canonical{{ComplexValueResult{}}, {ComplexValueResult{}},
+      std::vector<cuDoubleComplex>(3 * n), std::vector<cuDoubleComplex>(n), std::vector<cuDoubleComplex>(n)};
+  canonical_value->download(canonical_value->resultView(), canonical.value);
+  canonical_full->download(canonical_full->resultView(), canonical.full, canonical.gradient,
+      canonical.laplacian, canonical.ratio);
+  if (!equal(forced, canonical) || owner.counters().value_epoch_replays != 1 ||
+      owner.counters().full_epoch_replays != 1)
+    throw std::runtime_error("Explicit paired epoch replay differs from complete canonical FP64 owners");
+  // Paired JVP is the declared score-induced operator, not a rounded forward-directional network.
+  using C = std::complex<double>;
+  auto score = PreparedDeviceComplexScore::prepareMixed(next, queue, blas,
+      estimateMixedComplexScoreCost(plan).device_bytes);
+  score->evaluate(positions);
+  std::vector<cuDoubleComplex> canonical_score(plan.parameterCount());
+  ComplexValueResult score_amplitude;
+  score->download(score->resultView(), canonical_score, score_amplitude);
+  const auto chunk = std::min<std::size_t>(257, plan.parameterCount());
+  const auto product_cost = estimateMixedComplexProductsCost(plan, n, 1, 1, chunk);
+  auto products = PreparedDeviceComplexProducts::prepareMixed(next, n, 1, 1, chunk, queue, blas,
+      product_cost.device_bytes, product_cost.host_bytes, 1);
+  std::vector<C> direction(plan.parameterCount());
+  C expected_dot{};
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+  {
+    direction[parameter] = .003 * std::sin(double(parameter + 1));
+    expected_dot += C(cuCreal(canonical_score[parameter]), cuCimag(canonical_score[parameter])) * direction[parameter];
+  }
+  products->evaluateScoreJVP(positions, direction.data(), direction.size());
+  const auto jvp = products->scoreJvpView();
+  products->validate(jvp);
+  const auto dot_error = std::abs(jvp.data[0] - expected_dot);
+  if (dot_error > 2e-5 * (1 + std::abs(expected_dot)))
+    throw std::runtime_error("Paired mixed score-induced JVP differs from independent CPU score dot");
+  const std::vector<double> masses(n, 1.0);
+  const C coefficient{.625, -.375};
+  const std::vector<PreparedDeviceComplexProducts::Channel> channels{
+      {PreparedDeviceComplexProducts::Role::SCORE, &coefficient, 1}};
+  double adjoint_error = 0;
+  for (const bool hermitian : {false, true})
+  {
+    products->evaluate(positions, masses, {0, 0, 0}, channels, hermitian);
+    const auto result = products->resultView();
+    products->validate(result);
+    C contracted{};
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+    {
+      const C o{cuCreal(canonical_score[parameter]), cuCimag(canonical_score[parameter])};
+      const auto expected = coefficient * (hermitian ? std::conj(o) : o);
+      const auto error = std::abs(result.data[parameter] - expected);
+      adjoint_error = std::max(adjoint_error, error);
+      if (error > 2e-5 * (1 + std::abs(expected)))
+        throw std::runtime_error("Paired mixed transpose/Hermitian response differs from CPU score oracle");
+      contracted += result.data[parameter] * direction[parameter];
+    }
+    const auto expected = coefficient * (hermitian ? std::conj(expected_dot) : expected_dot);
+    if (std::abs(contracted - expected) > 2e-5 * (1 + std::abs(expected)))
+      throw std::runtime_error("Paired mixed score-induced JVP/adjoint contraction is inconsistent");
+  }
+  std::cout << "PASS paired mixed score-induced recipe=score_induced_fp64_dot_v1"
+            << " direct_forward_directional=0 dot_abs_error=" << dot_error
+            << " transpose_hermitian_max_abs_error=" << adjoint_error << '\n';
+  // The mixed producer and its FP64 fallback preflight together before a warm update.
+  auto update_values = values;
+  update_values[embedding.begin] += .0625;
+  auto update_image = successor->makeUpdatedImage(update_values, successor->version() + 1);
+  auto update_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(update_image, queue,
+      MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, true);
+  const auto fallback_cost = estimateComplexProductsCost(plan, n, 1, 1, chunk,
+      ComplexProductsHostOutput::RETAINED, ComplexProductsScope::SCORE_ECP_ONLY);
+  auto fallback = PreparedDeviceComplexProducts::prepare(successor, n, 1, 1, chunk, queue, blas,
+      fallback_cost.device_bytes, fallback_cost.host_bytes, 1,
+      ComplexProductsHostOutput::RETAINED, ComplexProductsScope::SCORE_ECP_ONLY);
+  products->validateScoreModelRebind(update_image, update_cache);
+  fallback->validateScoreModelRebind(update_image);
+  products->adoptPreparedScoreModel(update_image, update_cache);
+  fallback->adoptPreparedScoreModel(update_image);
+  auto fresh_products = PreparedDeviceComplexProducts::prepareMixed(update_cache, n, 1, 1, chunk, queue, blas,
+      product_cost.device_bytes, product_cost.host_bytes, 1);
+  products->evaluate(positions, masses, {0, 0, 0}, channels);
+  fresh_products->evaluate(positions, masses, {0, 0, 0}, channels);
+  if (std::memcmp(products->resultView().data, fresh_products->resultView().data,
+      direction.size() * sizeof(C)) != 0)
+    throw std::runtime_error("Mixed paired warm product image differs from a fresh selected-cache owner");
+  fallback->evaluate(positions, masses, {0, 0, 0}, channels);
+  auto fresh_fallback = PreparedDeviceComplexProducts::prepare(update_image, n, 1, 1, chunk, queue, blas,
+      fallback_cost.device_bytes, fallback_cost.host_bytes, 1,
+      ComplexProductsHostOutput::RETAINED, ComplexProductsScope::SCORE_ECP_ONLY);
+  fresh_fallback->evaluate(positions, masses, {0, 0, 0}, channels);
+  if (std::memcmp(fallback->resultView().data, fresh_fallback->resultView().data,
+      direction.size() * sizeof(C)) != 0)
+    throw std::runtime_error("FP64 paired fallback warm image differs from a fresh canonical owner");
+  // Strict training must propagate conversion rejection before either leaf can replay locally.
+  auto strict_values = values;
+  strict_values[embedding.begin] = 1e-300;
+  auto strict_image = successor->makeUpdatedImage(strict_values, successor->version() + 1);
+  auto strict_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(strict_image, queue,
+      MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, true);
+  if (strict_cache->usable()) throw std::runtime_error("Strict replay fixture did not realize conversion rejection");
+  Owner strict_owner(strict_image, 1, queue, blas, borrowed.device_bytes, 0, strict_cache);
+  rejected = false;
+  try { strict_owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::STRICT_MIXED); }
+  catch (const MixedPrecisionRetryRequired&) { rejected = true; }
+  if (!rejected || strict_owner.counters().value_requests || strict_owner.counters().value_replays)
+    throw std::runtime_error("Strict VALUE silently replayed or published a failed mixed request");
+  rejected = false;
+  try { strict_owner.evaluateFull(positions, PsiFormerGpuTrainingEpochMode::STRICT_MIXED); }
+  catch (const MixedPrecisionRetryRequired&) { rejected = true; }
+  if (!rejected || strict_owner.counters().full_requests || strict_owner.counters().full_replays)
+    throw std::runtime_error("Strict FULL silently replayed or published a failed mixed request");
+  strict_owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
+  strict_owner.evaluateFull(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
+  (void)fetch(strict_owner);
+  std::cout << "PASS paired mixed native owners: shared_cache_bytes=" << cache_bytes
+            << " owned_live_bytes=" << owned.device_bytes << " borrowed_live_bytes=" << borrowed.device_bytes
+            << " pending_cache_bytes=" << owned.pending_device_bytes
+            << " rejected_publication_bits=exact changed_weight_fresh_bits=exact"
+            << " stale_cache_last_owner_charge=exact forced_epoch_canonical_bits=exact"
+            << " warm_mixed_and_FP64_products_fresh_bits=exact"
+            << " strict_conversion_rejection_no_local_replay=1 native_admission=unqualified\n";
+}
+
 /// First FULL numerical evidence: finite errors are measured, not assigned VALUE's tolerance.
 template<class ParameterFactory, class ConfigurationFactory>
 inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, ConfigurationFactory configurations)
@@ -194,6 +415,9 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
     auto image = PreparedDeviceModel::preparePairedComplexValue(plan, values, model.cfg.nuclei.x);
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle blas(queue);
+    if (up == 2 && concurrent_targets == 0)
+      validateMixedComplexNativeOwners(image,
+          std::vector<double>(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 12), values, queue, blas);
     int ordinal = -1;
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipGetDevice(&ordinal), "mixed FULL validation device");

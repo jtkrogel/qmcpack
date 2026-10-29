@@ -42,6 +42,17 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
 inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1 =
     "fp32_dense_fp64_islands_affine_ad_v1";
 
+/** Scope one native mixed training epoch without changing the public precision label.
+ * Ordinary inference retains its existing local replay policy. Training either
+ * propagates mixed rejection or selects complete same-image FP64 replay.
+ */
+enum class PsiFormerGpuTrainingEpochMode : std::uint8_t
+{
+  INFERENCE,
+  STRICT_MIXED,
+  FP64_REPLAY
+};
+
 /// Explicit numerical-owner authority; the existing REAL attachment stays the default.
 enum class MixedTrunkHeadPolicy : std::uint8_t
 {
