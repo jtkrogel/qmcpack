@@ -495,6 +495,12 @@ try
   const bool mixed_gpu_ecp_training = optimization_enabled && system == "pseudopotential" &&
       optimize_scope == "all" && optimize_indices.empty() && parameter_checkpoint.empty() &&
       (direct_model || (internal_initialization && !pair_profile && !jastrow_profile));
+#ifdef QMC_COMPLEX
+  // REAL mixed parameter products and epoch authority require their REAL executable.
+  if (!complex_profile && optimization_enabled &&
+      precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
+    throw std::invalid_argument("Mixed real GPU optimization requires a REAL accelerator build");
+#endif
   const bool paired_mixed_inference = complex_profile && !pair_profile && periodic &&
       feature_policy == "periodic_torus_v1" && (!optimization_enabled || mixed_gpu_ecp_training) && gpu_numeric_limit &&
       accelerator_resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU &&
