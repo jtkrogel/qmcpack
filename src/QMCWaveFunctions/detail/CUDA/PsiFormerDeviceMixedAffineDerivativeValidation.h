@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "PsiFormerDeviceBatchBackend.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexScoreExecutor.h"
+#include <cstring>
 #include <limits>
 
 namespace qmcplusplus::psiformer::device
@@ -118,6 +119,7 @@ inline void validateMixedRealProductBinding(const std::shared_ptr<const Prepared
       positions.data(), 1, image->version());
   require(primal.size == 1 && device_math::isFiniteBinary64(primal.logabs[0]),
       "Strict mixed physical primal did not complete");
+  const double canonical_scalar_sign = primal.sign[0], canonical_scalar_log = primal.logabs[0];
   bool committed = false;
   rejected = false;
   try { backend.publishParameters(unchanged, image->version() + 1, [&] { committed = true; }); }
@@ -131,6 +133,9 @@ inline void validateMixedRealProductBinding(const std::shared_ptr<const Prepared
       positions.data(), 1, image->version());
   require(fp64_primal.size == 1 && device_math::isFiniteBinary64(fp64_primal.logabs[0]),
       "Explicit FP64 physical replay did not complete");
+  require(std::memcmp(&canonical_scalar_sign, fp64_primal.sign, sizeof(double)) == 0 &&
+      std::memcmp(&canonical_scalar_log, fp64_primal.logabs, sizeof(double)) == 0,
+      "Native mixed policy scalar VALUE differs from explicit FP64 scalar arithmetic");
   backend.leaveTrainingEpoch(replay);
   require(backend.trainingEpochMode() == Mode::INFERENCE &&
       backend.trainingEpochGeneration() == generation + 4,
@@ -148,7 +153,7 @@ inline void validateMixedRealProductBinding(const std::shared_ptr<const Prepared
   compare(warm_mixed, fresh_sessions.first->score(positions.data(), image->version() + 1), 2e-6);
   compare(warm_fp64, fresh_sessions.second->score(positions.data(), image->version() + 1), 2e-11);
   // A finite FP64 master may fail the explicit FP32 conversion contract.
-  // Strict native execution must preserve that typed rejection through hooks.
+  // Scalar VALUE is canonical FP64; strict mixed FULL must preserve a typed numerical rejection without replay.
   auto out_of_range = unchanged;
   const auto& embedding = image->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
   out_of_range[embedding.begin] = 2. * static_cast<double>(std::numeric_limits<float>::max());
@@ -160,14 +165,14 @@ inline void validateMixedRealProductBinding(const std::shared_ptr<const Prepared
   bool typed_rejection = false;
   try
   {
-    (void)rejected_backend.evaluate(*rejected_physical, pf::DirectBatchMode::VALUE_ONLY,
+    (void)rejected_backend.evaluate(*rejected_physical, pf::DirectBatchMode::FULL_VGL,
         positions.data(), 1, rejected_image->version());
   }
   catch (const MixedPrecisionRetryRequired&) { typed_rejection = true; }
   rejected_backend.leaveTrainingEpoch(rejected_epoch);
-  require(typed_rejection, "Strict real primal erased its typed precision rejection or silently replayed");
+  require(typed_rejection, "Strict real FULL erased its typed precision rejection or silently replayed");
   std::cout << "PASS real mixed native product binding strict/replay=1 distinct_owners=1 warm_publication=1"
-            << " typed_primal_rejection=1\n";
+            << " typed_FULL_rejection=1 canonical_scalar_FP64_bits=1\n";
 }
 
 /// Independent rounded-operand oracle; no production dense helper computes the reference.
