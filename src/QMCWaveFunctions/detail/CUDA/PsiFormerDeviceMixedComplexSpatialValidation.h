@@ -389,6 +389,19 @@ inline void validateMixedComplexNativeOwners(
   if (!equal(forced, canonical) || owner.counters().value_epoch_replays != 1 ||
       owner.counters().full_epoch_replays != 1)
     throw std::runtime_error("Explicit paired epoch replay differs from complete canonical FP64 owners");
+  // A failed canonical VALUE must revoke the prior explicit-replay publication.
+  const auto requests_before_failure = owner.counters().value_requests;
+  rejected = false;
+  try { owner.evaluateValue(std::vector<double>{}); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected || owner.counters().value_requests != requests_before_failure)
+    throw std::runtime_error("Failed native mixed VALUE was counted as a completed request");
+  std::vector<ComplexValueResult> invalidated_value(1);
+  rejected = false;
+  try { owner.downloadValue(invalidated_value); }
+  catch (const std::logic_error&) { rejected = true; }
+  if (!rejected)
+    throw std::runtime_error("Failed native mixed VALUE retained a prior output authority");
   // Paired JVP is the declared score-induced operator, not a rounded forward-directional network.
   using C = std::complex<double>;
   auto score = PreparedDeviceComplexScore::prepareMixed(next, queue, blas,
