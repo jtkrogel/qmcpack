@@ -82,7 +82,7 @@ bool PsiFormerNumericalDiagnostics::requiresFullPrecisionRetry() const noexcept
 {
   return nonfinite_count != 0 || invalid_softmax_count != 0 ||
       small_determinant_pivot_count != 0 || severe_cancellation_count != 0 ||
-      extreme_ecp_ratio_count != 0;
+      extreme_ecp_ratio_count != 0 || ill_conditioned_spatial_count != 0;
 }
 
 void PsiFormerNumericalDiagnostics::merge(const PsiFormerNumericalDiagnostics& other) noexcept
@@ -95,6 +95,8 @@ void PsiFormerNumericalDiagnostics::merge(const PsiFormerNumericalDiagnostics& o
                                             other.severe_cancellation_count);
   extreme_ecp_ratio_count = saturatingAdd(extreme_ecp_ratio_count,
                                           other.extreme_ecp_ratio_count);
+  ill_conditioned_spatial_count = saturatingAdd(ill_conditioned_spatial_count,
+                                               other.ill_conditioned_spatial_count);
   maximum_absolute_laplacian = std::max(maximum_absolute_laplacian,
                                         other.maximum_absolute_laplacian);
   maximum_gradient_norm = std::max(maximum_gradient_norm, other.maximum_gradient_norm);

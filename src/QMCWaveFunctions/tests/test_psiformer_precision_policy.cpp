@@ -236,4 +236,19 @@ TEST_CASE("PsiFormer numerical diagnostics request deterministic FP64 retry",
   CHECK(aggregate.nonfinite_count == std::numeric_limits<std::uint64_t>::max());
 }
 
+TEST_CASE("PsiFormer spatial conditioning hazard requests a complete retry",
+          "[wavefunction][psiformer][precision]")
+{
+  PsiFormerNumericalDiagnostics tile;
+  tile.ill_conditioned_spatial_count = 1;
+  CHECK(tile.requiresFullPrecisionRetry());
+  PsiFormerNumericalDiagnostics aggregate;
+  aggregate.merge(tile);
+  CHECK(aggregate.ill_conditioned_spatial_count == 1);
+  CHECK(aggregate.requiresFullPrecisionRetry());
+  aggregate.ill_conditioned_spatial_count = std::numeric_limits<std::uint64_t>::max();
+  aggregate.merge(tile);
+  CHECK(aggregate.ill_conditioned_spatial_count == std::numeric_limits<std::uint64_t>::max());
+}
+
 } // namespace qmcplusplus::psiformer

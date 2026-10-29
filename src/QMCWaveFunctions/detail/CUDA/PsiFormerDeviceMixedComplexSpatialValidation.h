@@ -12,6 +12,129 @@
 #include <cstring>
 #include <map>
 
+/// Compare the exact device screen decision against independent REAL/complex matrix norms.
+inline void validateMixedSpatialConditioningScreen()
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  using C = std::complex<double>;
+  constexpr std::size_t batch = 4, determinants = 2, n = 2, matrix_count = batch * determinants * n * n;
+  constexpr std::size_t stride = 3 * determinants * n * n;
+  const double shear[batch] = {0, 4, 5, 2};
+  std::vector<double> matrix(matrix_count), inverse(matrix_count), weights(batch * determinants, .5);
+  std::vector<double> envelope(batch * stride, 2), real(batch * stride), imag(batch * stride), cusp(batch, 3.25);
+  std::vector<cuDoubleComplex> complex_inverse(matrix_count);
+  std::vector<device_determinant::FactorizationMetadata> factors(batch * determinants);
+  std::vector<ComplexValueChannel> channels(batch * determinants);
+  std::vector<ComplexValueResult> results(batch);
+  std::vector<C> oracle_matrix(matrix_count), oracle_inverse(matrix_count);
+  for (std::size_t c = 0; c < batch; ++c)
+  {
+    results[c] = {make_cuDoubleComplex(0, 1), std::log(4.) + cusp[c], 1, 0, 0};
+    for (std::size_t d = 0; d < determinants; ++d)
+    {
+      const auto offset = (c * determinants + d) * n * n;
+      factors[c * determinants + d].status = device_determinant::FactorizationStatus::REGULAR;
+      factors[c * determinants + d].inverse_available = true;
+      channels[c * determinants + d] = {make_cuDoubleComplex(0, 1), std::log(2.), 0};
+      for (std::size_t i = 0; i < n * n; ++i)
+      {
+        const double a = i == 1 ? shear[c] : (i == 0 || i == 3 ? 1 : 0);
+        const double inv = i == 1 ? -shear[c] : (i == 0 || i == 3 ? 1 : 0);
+        matrix[offset + i] = a; inverse[offset + i] = inv;
+        oracle_matrix[offset + i] = C(1, 1) * a;
+        oracle_inverse[offset + i] = inv / C(1, 1);
+        const auto z = oracle_inverse[offset + i];
+        complex_inverse[offset + i] = make_cuDoubleComplex(z.real(), z.imag());
+        real[c * stride + d * n * n + i] = oracle_matrix[offset + i].real() / 2;
+        imag[c * stride + d * n * n + i] = oracle_matrix[offset + i].imag() / 2;
+      }
+    }
+  }
+  const auto expected = [&](std::size_t inner) {
+    const double mu = double(inner) * 0x1p-24, gamma = mu / (1 - mu);
+    std::uint64_t count = 0;
+    for (std::size_t c = 0; c < batch; ++c)
+    {
+      double s1 = 0, s2 = 0;
+      for (std::size_t d = 0; d < determinants; ++d)
+      {
+        const auto offset = (c * determinants + d) * n * n;
+        double an = 0, in = 0;
+        for (std::size_t row = 0; row < n; ++row)
+        {
+          double a = 0, inv = 0;
+          for (std::size_t col = 0; col < n; ++col)
+          { a += std::abs(oracle_matrix[offset + row * n + col]); inv += std::abs(oracle_inverse[offset + row * n + col]); }
+          an = std::max(an, a); in = std::max(in, inv);
+        }
+        const double kappa = an * in;
+        s1 += .5 * kappa; s2 += .5 * kappa * kappa;
+      }
+      count += gamma * s1 > 5e-4 || gamma * s2 > 1e-3;
+    }
+    return count;
+  };
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  DeviceBuffer<double> a(matrix_count), inv(matrix_count), w(weights.size()), e(envelope.size()),
+      re(real.size()), im(imag.size()), cp(cusp.size());
+  DeviceBuffer<cuDoubleComplex> ci(matrix_count);
+  DeviceBuffer<device_determinant::FactorizationMetadata> f(factors.size());
+  DeviceBuffer<ComplexValueChannel> ch(channels.size());
+  DeviceBuffer<ComplexValueResult> result(results.size());
+  DeviceBuffer<PsiFormerDeviceNumericalDiagnostics> diagnostics(1);
+  a.upload(matrix.data(), matrix.size()); inv.upload(inverse.data(), inverse.size()); w.upload(weights.data(), weights.size());
+  e.upload(envelope.data(), envelope.size()); re.upload(real.data(), real.size()); im.upload(imag.data(), imag.size());
+  cp.upload(cusp.data(), cusp.size()); ci.upload(complex_inverse.data(), complex_inverse.size());
+  f.upload(factors.data(), factors.size()); ch.upload(channels.data(), channels.size()); result.upload(results.data(), results.size());
+  const auto run = [&](bool paired, std::size_t inner, bool missing_inverse, std::uint64_t wanted) {
+    PsiFormerDeviceNumericalDiagnostics observed{};
+    diagnostics.upload(&observed, 1);
+    if (paired)
+      checkRuntime(launchMixedComplexSpatialConditioning(queue.getNative(), e.data(), re.data(), im.data(), stride,
+          missing_inverse ? nullptr : ci.data(), ch.data(), result.data(), cp.data(), 1,
+          batch, determinants, n, inner, diagnostics.data()), "paired FULL conditioning oracle");
+    else
+      checkRuntime(launchMixedSpatialConditioning(queue.getNative(), a.data(), missing_inverse ? nullptr : inv.data(),
+          w.data(), f.data(), batch, determinants, n, inner, diagnostics.data()), "REAL FULL conditioning oracle");
+    queue.sync(); diagnostics.download(&observed, 1);
+    if (observed.execution.ill_conditioned_spatial_count != wanted)
+      throw std::runtime_error("FULL conditioning screen differs from independent matrix-norm oracle");
+  };
+  // Invalid public-leaf extents fail on the host, before any kernel can touch memory.
+  const auto host_rejects = [](const auto& operation) {
+    bool rejected = false;
+    try { operation(); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    catch (const std::overflow_error&) { rejected = true; }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("FULL conditioning accepted an invalid indexed extent");
+  };
+  host_rejects([&] { launchMixedSpatialConditioning(queue.getNative(), a.data(), inv.data(), w.data(), f.data(),
+      batch, determinants, std::numeric_limits<std::size_t>::max(), 15, diagnostics.data()); });
+  host_rejects([&] { launchMixedSpatialConditioning(queue.getNative(), a.data(), inv.data(), w.data(), f.data(),
+      std::size_t(std::numeric_limits<unsigned int>::max()) + 1, 1, 1, 15, diagnostics.data()); });
+  host_rejects([&] { launchMixedComplexSpatialConditioning(queue.getNative(), e.data(), re.data(), im.data(),
+      determinants * n * n - 1, ci.data(), ch.data(), result.data(), cp.data(), 1,
+      batch, determinants, n, 15, diagnostics.data()); });
+  host_rejects([&] { launchMixedComplexSpatialConditioning(queue.getNative(), e.data(), re.data(), im.data(),
+      std::numeric_limits<std::size_t>::max(), ci.data(), ch.data(), result.data(), cp.data(), 1,
+      batch, determinants, n, 15, diagnostics.data()); });
+  for (bool paired : {false, true})
+  {
+    run(paired, 15, false, expected(15));
+    run(paired, 701, false, expected(701));
+    run(paired, 15, true, batch);
+    run(paired, std::size_t(1) << 24, false, batch);
+  }
+  // Every channel is unsafe, but the typed counter counts configurations once.
+  std::fill(matrix.begin(), matrix.end(), std::numeric_limits<double>::max());
+  a.upload(matrix.data(), matrix.size()); run(false, 15, false, batch);
+  std::fill(real.begin(), real.end(), std::numeric_limits<double>::infinity());
+  re.upload(real.data(), real.size()); run(true, 15, false, batch);
+  std::cout << "PASS mixed FULL conditioning: REAL_paired_CPU_norm_oracle=true inner15_701=true missing_inverse_nonfinite_overflow=true per_configuration=true\n";
+}
+
 /// Optional inverse diagnostics must not perturb one bit of canonical inverse/LU state.
 inline void validateMixedComplexSpatialInverseDiagnostics()
 {
@@ -388,6 +511,7 @@ inline void measureMixedComplexSpatialNumerical(ParameterFactory parameters, Con
   using C = std::complex<double>;
   const auto complex = [](cuDoubleComplex z) { return C(cuCreal(z), cuCimag(z)); };
   std::cout.precision(17);
+  validateMixedSpatialConditioningScreen();
   validateMixedComplexSpatialInverseDiagnostics();
   // Compare replay bits to the SAME trace layout; t0/t8 are not assumed bit-identical.
   for (std::size_t concurrent_targets : {0u, 8u})

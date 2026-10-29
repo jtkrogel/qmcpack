@@ -12,6 +12,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionOrchestration.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -243,7 +244,7 @@ void validateDiagnosticSpan(std::size_t offset,
         "PsiFormer recording diagnostic span exceeds the combined record");
 }
 
-/// Require the aggregate and fingerprint to match the five advertised maxima.
+/// Require the aggregate and fingerprint to match every advertised maximum.
 void validateDiagnosticBoundsIdentity(
     const PsiFormerExecutionDiagnosticBounds& bounds)
 {
@@ -251,7 +252,8 @@ void validateDiagnosticBoundsIdentity(
       makePsiFormerExecutionDiagnosticBounds(
           bounds.nonfinite_count, bounds.invalid_softmax_count,
           bounds.small_determinant_pivot_count,
-          bounds.severe_cancellation_count, bounds.extreme_ecp_ratio_count);
+          bounds.severe_cancellation_count, bounds.extreme_ecp_ratio_count,
+          bounds.ill_conditioned_spatial_count);
   if (bounds.aggregate_count != canonical.aggregate_count ||
       bounds.fingerprint != canonical.fingerprint)
     throw std::invalid_argument(
@@ -344,13 +346,15 @@ PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
     std::uint64_t invalid_softmax_count,
     std::uint64_t small_determinant_pivot_count,
     std::uint64_t severe_cancellation_count,
-    std::uint64_t extreme_ecp_ratio_count)
+    std::uint64_t extreme_ecp_ratio_count,
+    std::uint64_t ill_conditioned_spatial_count)
 {
   std::uint64_t aggregate = checkedDiagnosticSum(
       nonfinite_count, invalid_softmax_count);
   aggregate = checkedDiagnosticSum(aggregate, small_determinant_pivot_count);
   aggregate = checkedDiagnosticSum(aggregate, severe_cancellation_count);
   aggregate = checkedDiagnosticSum(aggregate, extreme_ecp_ratio_count);
+  aggregate = checkedDiagnosticSum(aggregate, ill_conditioned_spatial_count);
 
   std::uint64_t hash = FNV_OFFSET;
   mixInteger(hash, UINT64_C(1));
@@ -359,6 +363,12 @@ PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
   mixInteger(hash, small_determinant_pivot_count);
   mixInteger(hash, severe_cancellation_count);
   mixInteger(hash, extreme_ecp_ratio_count);
+  if (ill_conditioned_spatial_count != 0)
+  {
+    // Preserve existing identities when the appended producer is absent.
+    mixInteger(hash, UINT64_C(0x5350415449414c));
+    mixInteger(hash, ill_conditioned_spatial_count);
+  }
   mixInteger(hash, aggregate);
 
   return {nonfinite_count,
@@ -367,7 +377,8 @@ PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
           severe_cancellation_count,
           extreme_ecp_ratio_count,
           aggregate,
-          hash == 0 ? 1 : hash};
+          hash == 0 ? 1 : hash,
+          ill_conditioned_spatial_count};
 }
 
 PsiFormerPrecisionParticipantMetadata makePsiFormerPrecisionParticipantMetadata(
@@ -568,15 +579,17 @@ void PsiFormerPrecisionRecordingOrchestrator::validateExecutionDiagnostics(
       diagnostic_bounds_.invalid_softmax_count,
       diagnostic_bounds_.small_determinant_pivot_count,
       diagnostic_bounds_.severe_cancellation_count,
-      diagnostic_bounds_.extreme_ecp_ratio_count};
+      diagnostic_bounds_.extreme_ecp_ratio_count,
+      diagnostic_bounds_.ill_conditioned_spatial_count};
   std::uint64_t total = 0;
   const std::uint64_t counters[]{
       diagnostics.nonfinite_count,
       diagnostics.invalid_softmax_count,
       diagnostics.small_determinant_pivot_count,
       diagnostics.severe_cancellation_count,
-      diagnostics.extreme_ecp_ratio_count};
-  for (std::size_t index = 0; index < 5; ++index)
+      diagnostics.extreme_ecp_ratio_count,
+      diagnostics.ill_conditioned_spatial_count};
+  for (std::size_t index = 0; index < std::size(counters); ++index)
   {
     const std::uint64_t count = counters[index];
     if (count > bounds[index])

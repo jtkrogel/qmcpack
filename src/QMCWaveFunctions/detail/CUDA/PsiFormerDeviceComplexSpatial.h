@@ -278,8 +278,14 @@ private:
 
     finishHead(minimum_scaled_pivots);
     if (minimum_scaled_pivots)
+    {
       t.mixed_dense_->checkComplexValueConditioning(minimum_scaled_pivots, channels_.data(), amplitude_.data(),
           t.batch_, t.shape_.determinants);
+      t.mixed_dense_->checkComplexSpatialConditioning(envelope_.data(), projections_.data(),
+          projections_.data() + cost_.head_elements, t.orbitals_.orbitals.configuration_stride, inverse_.data(),
+          channels_.data(), amplitude_.data(), t.cusp_jets_.data(), t.cusp_.output.configuration_stride,
+          t.batch_, t.shape_.determinants, t.ne_);
+    }
     if (concurrent_targets_)
       checkRuntime(launchComplexSpatialTracesConcurrent(t.queue_.getNative(), t.batch_, t.shape_.determinants,
           t.ne_, t.ne_, t.ne_, concurrent_targets_, channels_.data(), amplitude_.data(), inverse_.data(), head_.data(),

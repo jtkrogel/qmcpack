@@ -643,6 +643,34 @@ TEST_CASE("PsiFormer recorder rejects mutated prepared identities",
                     Catch::Matchers::ContainsSubstring("fingerprint"));
 }
 
+TEST_CASE("PsiFormer spatial conditioning hazards retain bounds and canonical retry",
+          "[psiformer][precision_orchestration]")
+{
+  const auto bounds = makePsiFormerExecutionDiagnosticBounds(64, 12, 8, 8, 16, 2);
+  CHECK(bounds.aggregate_count == 110);
+  CHECK(bounds.ill_conditioned_spatial_count == 2);
+  CHECK(bounds.fingerprint != makeDiagnosticBounds().fingerprint);
+  CHECK(makeDiagnosticBounds().fingerprint == UINT64_C(0x0976f7c4044e0394));
+  CHECK(makePsiFormerExecutionDiagnosticBounds(64, 12, 8, 8, 16, 0).fingerprint ==
+        makeDiagnosticBounds().fingerprint);
+  CHECK_THROWS_AS(makePsiFormerExecutionDiagnosticBounds(
+      std::numeric_limits<std::uint64_t>::max(), 0, 0, 0, 0, 1), std::length_error);
+  PsiFormerPrecisionRecordingOrchestrator recorder(
+      makePlan(), makeDescriptors(), bounds, 4, 47, 0);
+  recorder.prepare();
+  recorder.recordPublicationStart();
+  REQUIRE(recorder.observePublicationCompletion({}) == PsiFormerPrecisionPublicationResult::PUBLISHED);
+  recorder.recordValueEvaluationStart(5, recorder.metadata().plan_fingerprint);
+  PsiFormerNumericalDiagnostics failure;
+  failure.ill_conditioned_spatial_count = 1;
+  CHECK(recorder.observeMixedValueCompletion(failure) == PsiFormerPrecisionEvaluationResult::FP64_RETRY_PENDING);
+  CHECK(recorder.observeFullPrecisionRetryCompletion({}) == PsiFormerPrecisionEvaluationResult::FP64_RETRY_SUCCESS);
+  CHECK(countEvents(recorder.events(), PsiFormerPrecisionRecordEventKind::WHOLE_BATCH_FP64_RETRY) == 1);
+  recorder.recordValueEvaluationStart(5, recorder.metadata().plan_fingerprint);
+  failure.ill_conditioned_spatial_count = 3;
+  CHECK_THROWS_AS(recorder.observeMixedValueCompletion(failure), std::invalid_argument);
+}
+
 int main(int argc, char* argv[])
 {
   return Catch::Session().run(argc, argv);

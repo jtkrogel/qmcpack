@@ -272,6 +272,8 @@ struct PsiFormerNumericalDiagnostics
   double maximum_absolute_laplacian          = 0.0;
   double maximum_gradient_norm               = 0.0;
   double maximum_update_norm                 = 0.0;
+  /// Number of configurations rejected by the mixed FULL sensitivity screen.
+  std::uint64_t ill_conditioned_spatial_count = 0;
 
   /// Return whether mixed execution must retry the complete batch in FP64.
   bool requiresFullPrecisionRetry() const noexcept;

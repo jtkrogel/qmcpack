@@ -17,6 +17,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_MIXED_VALUE_DENSE_H
 
 #include "PsiFormerDeviceDense.h"
+#include "Platforms/CUDA/CUDATypeMapping.hpp"
 #include "PsiFormerDeviceResources.h"
 #include "Platforms/CUDA/QueueCUDA.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDeterminantMath.h"
@@ -40,6 +41,17 @@ class MixedPrecisionRetryRequired final : public std::runtime_error
 public:
   explicit MixedPrecisionRetryRequired(const char* reason) : std::runtime_error(reason) {}
 };
+
+/// FULL sensitivity leaves; a null inverse or invalid arithmetic records one hazard per configuration.
+Error launchMixedSpatialConditioning(Stream stream, const double* matrices, const double* inverse,
+    const double* weights, const device_determinant::FactorizationMetadata* factors,
+    std::size_t configurations, std::size_t determinants, std::size_t n, std::size_t affine_inner,
+    PsiFormerDeviceNumericalDiagnostics* diagnostics);
+Error launchMixedComplexSpatialConditioning(Stream stream, const double* envelope, const double* real,
+    const double* imag, std::size_t configuration_stride, const cuDoubleComplex* inverse,
+    const ComplexValueChannel* channels, const ComplexValueResult* results, const double* cusp,
+    std::size_t cusp_stride, std::size_t configurations, std::size_t determinants, std::size_t n,
+    std::size_t affine_inner, PsiFormerDeviceNumericalDiagnostics* diagnostics);
 
 /** Immutable shared FP32 copies of affine weights, retaining their canonical FP64 image. */
 class PreparedDeviceMixedDenseParameters
@@ -123,6 +135,17 @@ public:
   void checkComplexValueConditioning(const double* minimum_scaled_pivots,
                                     const ComplexValueChannel* channels, const ComplexValueResult* results,
                                     std::size_t configurations, std::size_t determinants);
+
+  /// FULL-only sensitivity screen using the resident FP64 head and inverse, with no workspace.
+  void checkSpatialConditioning(const double* matrices, const double* inverse,
+      const double* normalized_weights, const device_determinant::FactorizationMetadata* factors,
+      std::size_t configurations, std::size_t determinants, std::size_t matrix_size);
+
+  /// Reconstruct raw paired VALUE entries in registers from the surviving product-rule operands.
+  void checkComplexSpatialConditioning(const double* envelope, const double* projected_real,
+      const double* projected_imag, std::size_t configuration_stride, const cuDoubleComplex* inverse,
+      const ComplexValueChannel* channels, const ComplexValueResult* results, const double* cusp,
+      std::size_t cusp_stride, std::size_t configurations, std::size_t determinants, std::size_t matrix_size);
 
   /// Admit cast/activation diagnostics before a paired FP64 head; keep the attempt open.
   void admitAffinePrefix();

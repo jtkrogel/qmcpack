@@ -63,6 +63,7 @@ struct PsiFormerExecutionDiagnosticBounds
   std::uint64_t extreme_ecp_ratio_count = 0;
   std::uint64_t aggregate_count = 0;
   std::uint64_t fingerprint = 0;
+  std::uint64_t ill_conditioned_spatial_count = 0;
 };
 
 static_assert(std::is_standard_layout_v<PsiFormerExecutionDiagnosticBounds>);
@@ -74,7 +75,8 @@ PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
     std::uint64_t invalid_softmax_count,
     std::uint64_t small_determinant_pivot_count,
     std::uint64_t severe_cancellation_count,
-    std::uint64_t extreme_ecp_ratio_count);
+    std::uint64_t extreme_ecp_ratio_count,
+    std::uint64_t ill_conditioned_spatial_count = 0);
 
 /** Metadata which must agree across every crowd/rank participant in one operation. */
 struct PsiFormerPrecisionParticipantMetadata

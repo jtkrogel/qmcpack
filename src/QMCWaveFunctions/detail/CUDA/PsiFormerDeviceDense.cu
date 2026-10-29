@@ -853,7 +853,233 @@ __global__ void mixedComplexValueConditioningKernel(const double* minimum_scaled
     atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.severe_cancellation_count), 1ULL);
 }
 
+// Raw REAL matrices survive factorization. Paired VALUE is LU in place, so its
+// exact original e*z product is reconstructed from resident operands, never copied.
+/// Borrowed REAL FULL buffers remain ordered on their owner queue.
+struct MixedRealSpatialView
+{
+  const double *matrix, *inverse, *weights;
+  const device_determinant::FactorizationMetadata* factors;
+
+  /// Read one original REAL head entry by its physical row-major index.
+  __device__ double matrixMagnitude(std::size_t c, std::size_t d, std::size_t i,
+      std::size_t n, std::size_t determinants) const
+  {
+    return matrix ? fabs(matrix[(c * determinants + d) * n * n + i]) : INFINITY;
+  }
+
+  /// Read one REAL inverse entry, rejecting an unavailable inverse numerically.
+  __device__ double inverseMagnitude(std::size_t c, std::size_t d, std::size_t i,
+      std::size_t n, std::size_t determinants) const
+  {
+    return inverse ? fabs(inverse[(c * determinants + d) * n * n + i]) : INFINITY;
+  }
+
+  /// Return the magnitude of the existing normalized REAL determinant weight.
+  __device__ double weight(std::size_t c, std::size_t d, std::size_t determinants) const
+  {
+    const auto index = c * determinants + d;
+    return factors && weights && factors[index].inverse_available &&
+        factors[index].status == device_determinant::FactorizationStatus::REGULAR ? fabs(weights[index]) : INFINITY;
+  }
+};
+
+/// Borrowed paired operands preserve complex magnitudes and the common cusp convention.
+struct MixedComplexSpatialView
+{
+  const double *envelope, *real, *imag;
+  std::size_t configuration_stride;
+  const cuDoubleComplex* inverse;
+  const ComplexValueChannel* channels;
+  const ComplexValueResult* results;
+  const double* cusp;
+  std::size_t cusp_stride;
+
+  /// Reconstruct the exact original paired head entry and use its complex magnitude.
+  __device__ double matrixMagnitude(std::size_t c, std::size_t d, std::size_t i,
+      std::size_t n, std::size_t) const
+  {
+    if (!envelope || !real || !imag)
+      return INFINITY;
+    const auto index = c * configuration_stride + d * n * n + i;
+    // Identical plane-zero multiplication and indexing to complex headKernel.
+    return hypot(envelope[index] * real[index], envelope[index] * imag[index]);
+  }
+
+  /// Read the true complex magnitude of a physical inverse entry.
+  __device__ double inverseMagnitude(std::size_t c, std::size_t d, std::size_t i,
+      std::size_t n, std::size_t determinants) const
+  {
+    if (!inverse)
+      return INFINITY;
+    const auto z = inverse[(c * determinants + d) * n * n + i];
+    return hypot(cuCreal(z), cuCimag(z));
+  }
+
+  /// Normalize a complex determinant magnitude by the complete core amplitude.
+  __device__ double weight(std::size_t c, std::size_t d, std::size_t determinants) const
+  {
+    if (!channels || !results || !cusp)
+      return INFINITY;
+    const auto& channel = channels[c * determinants + d];
+    const auto& result = results[c];
+    if (channel.status || result.status || !device_math::isFiniteBinary64(channel.log_abs) ||
+        !device_math::isFiniteBinary64(result.log_abs) || !device_math::isFiniteBinary64(cusp[c * cusp_stride]))
+      return INFINITY;
+    // result.log_abs includes the common real cusp. Bloch/unit phases do not
+    // change |det_d / sum det|; no REAL signed-weight shortcut is used.
+    return exp(channel.log_abs - (result.log_abs - cusp[c * cusp_stride]));
+  }
+};
+
+/** A sensitivity screen, not a rigorous full-trunk error bound. No persistent scratch. */
+template<class View>
+__global__ void mixedSpatialConditioningKernel(View view, std::size_t determinants, std::size_t n,
+    double gamma, PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  const std::size_t c = blockIdx.x;
+  __shared__ double matrix_norm[value_block_size], inverse_norm[value_block_size];
+  __shared__ unsigned int bad;
+  if (threadIdx.x == 0)
+    bad = !device_math::isFiniteBinary64(gamma) || !(gamma > 0);
+  __syncthreads();
+  double s1 = 0;
+  double s2 = 0;
+  for (std::size_t d = 0; d < determinants; ++d)
+  {
+    double local_matrix_norm = 0;
+    double local_inverse_norm = 0;
+    for (std::size_t row = threadIdx.x; row < n; row += blockDim.x)
+    {
+      double matrix_row_sum = 0;
+      double inverse_row_sum = 0;
+      for (std::size_t col = 0; col < n; ++col)
+      {
+        const auto av = view.matrixMagnitude(c, d, row * n + col, n, determinants);
+        const auto iv = view.inverseMagnitude(c, d, row * n + col, n, determinants);
+        if (!device_math::isFiniteBinary64(av) || !device_math::isFiniteBinary64(iv))
+          atomicExch(&bad, 1u);
+        matrix_row_sum += av;
+        inverse_row_sum += iv;
+      }
+      if (!device_math::isFiniteBinary64(matrix_row_sum) || !device_math::isFiniteBinary64(inverse_row_sum))
+        atomicExch(&bad, 1u);
+      local_matrix_norm = fmax(local_matrix_norm, matrix_row_sum);
+      local_inverse_norm = fmax(local_inverse_norm, inverse_row_sum);
+    }
+    matrix_norm[threadIdx.x] = local_matrix_norm;
+    inverse_norm[threadIdx.x] = local_inverse_norm;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride; stride /= 2)
+    {
+      if (threadIdx.x < stride)
+      {
+        matrix_norm[threadIdx.x] = fmax(matrix_norm[threadIdx.x], matrix_norm[threadIdx.x + stride]);
+        inverse_norm[threadIdx.x] = fmax(inverse_norm[threadIdx.x], inverse_norm[threadIdx.x + stride]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+      const double kappa = matrix_norm[0] * inverse_norm[0];
+      const double square = kappa * kappa;
+      const double weight = view.weight(c, d, determinants);
+      s1 += weight * kappa;
+      s2 += weight * square;
+      if (!(kappa > 0) || !device_math::isFiniteBinary64(kappa) || !device_math::isFiniteBinary64(square) ||
+          !device_math::isFiniteBinary64(weight) || !device_math::isFiniteBinary64(s1) ||
+          !device_math::isFiniteBinary64(s2))
+        atomicExch(&bad, 1u);
+    }
+    // All lanes must finish consuming the shared maxima before the next determinant.
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+  {
+    const double first = gamma * s1;
+    const double second = gamma * s2;
+    if (bad || !device_math::isFiniteBinary64(first) || !device_math::isFiniteBinary64(second) ||
+        first > 5e-4 || second > 1e-3)
+      atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.ill_conditioned_spatial_count), 1ULL);
+  }
+}
+
+/// Include every selected affine reduction dimension, including expanded FFN input.
+std::size_t maximumMixedAffineInner(const PsiFormerExecutionPlan& plan)
+{
+  std::size_t maximum = 0;
+  for (const auto& tensor : plan.parameterTensors())
+    if (isMixedValueDenseWeight(tensor.role))
+    {
+      if (tensor.shape.size() != 2 || !tensor.shape[0])
+        throw std::invalid_argument("Mixed affine conditioning requires typed nonempty matrix shapes");
+      maximum = std::max(maximum, tensor.shape[0]);
+    }
+  return maximum;
+}
+
+/// Validate all indexed extents before the public leaf can launch a block.
+unsigned int mixedSpatialGrid(std::size_t configurations, std::size_t determinants, std::size_t n)
+{
+  if (!configurations || !determinants || !n)
+    throw std::invalid_argument("Mixed FULL conditioning requires nonempty extents");
+  mixedCheckedMultiply(mixedCheckedMultiply(mixedCheckedMultiply(configurations, determinants), n), n);
+  if (configurations > std::numeric_limits<unsigned int>::max())
+    throw std::length_error("Mixed FULL conditioning grid exceeds the CUDA/HIP x dimension");
+  return static_cast<unsigned int>(configurations);
+}
+
+/// Bound the first-order FP32 dot-product rounding factor for the actual inner width.
+double mixedAffineGamma(std::size_t inner)
+{
+  const double product = static_cast<double>(inner) * 0x1p-24;
+  return inner && product < 1 ? product / (1 - product) : INFINITY;
+}
+
 } // namespace
+
+/// Launch the REAL screen on the owning stream after checked host extent admission.
+Error launchMixedSpatialConditioning(Stream stream, const double* matrices, const double* inverse,
+    const double* weights, const device_determinant::FactorizationMetadata* factors,
+    std::size_t configurations, std::size_t determinants, std::size_t n, std::size_t affine_inner,
+    PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  if (!configurations || !determinants || !n || !diagnostics)
+    throw std::invalid_argument("Mixed FULL conditioning requires a nonempty matching batch");
+  const auto blocks = mixedSpatialGrid(configurations, determinants, n);
+  mixedSpatialConditioningKernel<<<blocks, value_block_size, 0, stream>>>(
+      MixedRealSpatialView{matrices, inverse, weights, factors}, determinants, n, mixedAffineGamma(affine_inner), diagnostics);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+/// Launch the paired screen with resident product-rule operands and no extra workspace.
+Error launchMixedComplexSpatialConditioning(Stream stream, const double* envelope, const double* real,
+    const double* imag, std::size_t configuration_stride, const cuDoubleComplex* inverse,
+    const ComplexValueChannel* channels, const ComplexValueResult* results, const double* cusp,
+    std::size_t cusp_stride, std::size_t configurations, std::size_t determinants, std::size_t n,
+    std::size_t affine_inner, PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  if (!configurations || !determinants || !n || !configuration_stride || !cusp_stride || !diagnostics)
+    throw std::invalid_argument("Mixed paired FULL conditioning requires a nonempty matching batch");
+  const auto blocks = mixedSpatialGrid(configurations, determinants, n);
+  const auto matrix_span = mixedCheckedMultiply(mixedCheckedMultiply(determinants, n), n);
+  if (configuration_stride < matrix_span)
+    throw std::invalid_argument("Mixed paired FULL conditioning stride is smaller than its VALUE plane");
+  mixedCheckedMultiply(configurations, configuration_stride);
+  mixedCheckedMultiply(configurations, cusp_stride);
+  mixedSpatialConditioningKernel<<<blocks, value_block_size, 0, stream>>>(
+      MixedComplexSpatialView{envelope, real, imag, configuration_stride, inverse, channels, results, cusp, cusp_stride},
+      determinants, n, mixedAffineGamma(affine_inner), diagnostics);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
 
 PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
     std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue,
@@ -1045,7 +1271,7 @@ void PreparedDeviceMixedValueDense::admitDiagnostics()
   // (some driver test targets link these leaves without that host implementation).
   const auto& execution = diagnostics_.execution;
   if (execution.nonfinite_count || execution.invalid_softmax_count || execution.small_determinant_pivot_count ||
-      execution.severe_cancellation_count || execution.extreme_ecp_ratio_count ||
+      execution.severe_cancellation_count || execution.extreme_ecp_ratio_count || execution.ill_conditioned_spatial_count ||
       mixedConversionNeedsRetry(diagnostics_.conversion))
   {
     // Report the already downloaded evidence without changing admission or retry arithmetic.
@@ -1058,6 +1284,7 @@ void PreparedDeviceMixedValueDense::admitDiagnostics()
            << " small_determinant_pivot=" << execution.small_determinant_pivot_count
            << " severe_cancellation=" << execution.severe_cancellation_count
            << " extreme_ecp_ratio=" << execution.extreme_ecp_ratio_count
+           << " ill_conditioned_spatial=" << execution.ill_conditioned_spatial_count
            << " conversion_nonfinite=" << conversion.nonfinite_input_count
            << " conversion_overflow=" << conversion.overflow_count
            << " conversion_subnormal=" << conversion.subnormal_output_count
@@ -1100,6 +1327,34 @@ void PreparedDeviceMixedValueDense::checkComplexValueConditioning(const double* 
 #else
   checkRuntime(cudaPeekAtLastError(), "mixed paired conditioning admission");
 #endif
+}
+
+/// Screen the FULL REAL head using the current model's actual mixed reduction width.
+void PreparedDeviceMixedValueDense::checkSpatialConditioning(const double* matrices, const double* inverse,
+    const double* weights, const device_determinant::FactorizationMetadata* factors,
+    std::size_t configurations, std::size_t determinants, std::size_t n)
+{
+  if (!active_ || !configurations || configurations > maximum_rows_ ||
+      determinants != modelImage()->plan().modelShape().determinants || n != modelImage()->plan().modelShape().electrons())
+    throw std::invalid_argument("Mixed FULL conditioning requires a live matching determinant batch");
+  checkRuntime(launchMixedSpatialConditioning(queue_.getNative(), matrices, inverse, weights, factors,
+      configurations, determinants, n, maximumMixedAffineInner(modelImage()->plan()), device_diagnostics_.data()),
+      "mixed FULL sensitivity admission");
+}
+
+/// Screen the FULL paired head without retaining a second matrix image.
+void PreparedDeviceMixedValueDense::checkComplexSpatialConditioning(const double* envelope, const double* real,
+    const double* imag, std::size_t configuration_stride, const cuDoubleComplex* inverse,
+    const ComplexValueChannel* channels, const ComplexValueResult* results, const double* cusp,
+    std::size_t cusp_stride, std::size_t configurations, std::size_t determinants, std::size_t n)
+{
+  if (!active_ || parameters_->trunkHeadPolicy() != MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD ||
+      !configurations || configurations > maximum_rows_ || determinants != modelImage()->plan().modelShape().determinants ||
+      n != modelImage()->plan().modelShape().electrons())
+    throw std::invalid_argument("Mixed paired FULL conditioning requires a live matching determinant batch");
+  checkRuntime(launchMixedComplexSpatialConditioning(queue_.getNative(), envelope, real, imag, configuration_stride,
+      inverse, channels, results, cusp, cusp_stride, configurations, determinants, n,
+      maximumMixedAffineInner(modelImage()->plan()), device_diagnostics_.data()), "mixed paired FULL sensitivity admission");
 }
 
 /// Admit a successor cache while retaining the accepted affine image unchanged.

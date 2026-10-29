@@ -1832,7 +1832,11 @@ private:
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
     if (mixed_dense_)
+    {
       mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
+      mixed_dense_->checkSpatialConditioning(matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(),
+          batch_, shape_.determinants, ne_);
+    }
     mixed_attempt.finish();
   }
 
