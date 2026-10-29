@@ -8694,7 +8694,7 @@ std::string PsiFormerWF::trainingConfigurationFingerprint() const
                        state.execution_plan.environment(), state.twist_phase.reduced, state.twist_phase.cartesian,
                        state.physical_source, state.physical_species) +
       (state.precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
-          ? "/arithmetic/" + std::string(psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2) +
+          ? "/arithmetic/" + std::string(psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V3) +
               "/jvp/fp32_affine_directional_v1" : "");
 }
 

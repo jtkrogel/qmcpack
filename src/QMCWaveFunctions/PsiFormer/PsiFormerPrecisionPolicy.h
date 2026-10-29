@@ -46,6 +46,10 @@ inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V1 =
 inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2 =
     "fp32_dense_fp64_islands_canonical_head_affine_ad_v2";
 
+/// Bind exact mixed restarts to inverse-certified canonical-head admission.
+inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V3 =
+    "fp32_dense_fp64_islands_certified_canonical_head_affine_ad_v3";
+
 /** Scope one native mixed training epoch without changing the public precision label.
  * Ordinary inference retains its existing local replay policy. Training either
  * propagates mixed rejection or selects complete same-image FP64 replay.
