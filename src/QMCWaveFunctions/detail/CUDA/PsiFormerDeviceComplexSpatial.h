@@ -421,7 +421,7 @@ private:
           outputs_.data() + 4 * capacity_electrons_ + begin, status_.data()), "concurrent complex target traces");
     else
       checkRuntime(launchComplexSpatialTraces(t.queue_.getNative(), t.orbitals_, channels_.data(), amplitude_.data(),
-          inverse_.data(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data() + 3 * begin,
+          traceInverse(), head_.data(), t.cusp_jets_.data(), product_.data(), outputs_.data() + 3 * begin,
           outputs_.data() + 3 * capacity_electrons_ + begin,
           outputs_.data() + 4 * capacity_electrons_ + begin, status_.data(), t.ne_), "complex target traces");
     admitStatus();
