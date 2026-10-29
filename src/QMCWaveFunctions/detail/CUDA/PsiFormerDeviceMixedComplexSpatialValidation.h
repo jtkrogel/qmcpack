@@ -472,7 +472,7 @@ inline void validateMixedComplexNativeOwners(
   if (std::memcmp(fallback->resultView().data, fresh_fallback->resultView().data,
       direction.size() * sizeof(C)) != 0)
     throw std::runtime_error("FP64 paired fallback warm image differs from a fresh canonical owner");
-  // Strict training must propagate conversion rejection before either leaf can replay locally.
+  // Canonical scalar VALUE stays FP64; strict mixed FULL propagates numerical rejection without local replay.
   auto strict_values = values;
   strict_values[embedding.begin] = 1e-300;
   auto strict_image = successor->makeUpdatedImage(strict_values, successor->version() + 1);
@@ -480,17 +480,26 @@ inline void validateMixedComplexNativeOwners(
       MixedTrunkHeadPolicy::PAIRED_COMPLEX_FP64_HEAD, true);
   if (strict_cache->usable()) throw std::runtime_error("Strict replay fixture did not realize conversion rejection");
   Owner strict_owner(strict_image, 1, queue, blas, borrowed.device_bytes, 0, strict_cache);
-  rejected = false;
-  try { strict_owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::STRICT_MIXED); }
-  catch (const MixedPrecisionRetryRequired&) { rejected = true; }
-  if (!rejected || strict_owner.counters().value_requests || strict_owner.counters().value_replays)
-    throw std::runtime_error("Strict VALUE silently replayed or published a failed mixed request");
+  strict_owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::STRICT_MIXED);
+  std::vector<ComplexValueResult> strict_scalar(1), replay_scalar(1);
+  strict_owner.downloadValue(strict_scalar);
+  if (strict_owner.counters().value_requests != 1 || strict_owner.counters().value_canonical_fp64 != 1 ||
+      strict_owner.counters().value_mixed || strict_owner.counters().value_replays ||
+      strict_owner.counters().value_epoch_replays)
+    throw std::runtime_error("Strict native scalar VALUE did not report its canonical FP64 physical role");
   rejected = false;
   try { strict_owner.evaluateFull(positions, PsiFormerGpuTrainingEpochMode::STRICT_MIXED); }
   catch (const MixedPrecisionRetryRequired&) { rejected = true; }
   if (!rejected || strict_owner.counters().full_requests || strict_owner.counters().full_replays)
     throw std::runtime_error("Strict FULL silently replayed or published a failed mixed request");
+  bool unavailable = false;
+  try { (void)fetch(strict_owner); }
+  catch (const std::logic_error&) { unavailable = true; }
+  if (!unavailable) throw std::runtime_error("Strict failed FULL retained public result authority");
   strict_owner.evaluateValue(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
+  strict_owner.downloadValue(replay_scalar);
+  if (std::memcmp(strict_scalar.data(), replay_scalar.data(), sizeof(ComplexValueResult)) != 0)
+    throw std::runtime_error("Native paired canonical scalar VALUE differs from explicit FP64 replay");
   strict_owner.evaluateFull(positions, PsiFormerGpuTrainingEpochMode::FP64_REPLAY);
   (void)fetch(strict_owner);
   std::cout << "PASS paired mixed native owners: shared_cache_bytes=" << cache_bytes
@@ -499,7 +508,7 @@ inline void validateMixedComplexNativeOwners(
             << " rejected_publication_bits=exact changed_weight_fresh_bits=exact"
             << " stale_cache_last_owner_charge=exact forced_epoch_canonical_bits=exact"
             << " warm_mixed_and_FP64_products_fresh_bits=exact"
-            << " strict_conversion_rejection_no_local_replay=1 native_admission=unqualified\n";
+            << " strict_FULL_rejection_no_local_replay=1 canonical_scalar_FP64_bits=1 native_admission=unqualified\n";
 }
 
 /// First FULL numerical evidence: finite errors are measured, not assigned VALUE's tolerance.
