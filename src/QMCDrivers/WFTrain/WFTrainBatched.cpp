@@ -134,7 +134,19 @@ void requireNativeEpochReadiness(Communicate& comm, const std::exception_ptr& fa
   comm.allreduce(retry);
   comm.allreduce(fatal);
   if (retry && !fatal && strict_mixed)
+  {
+    // Preserve each rejecting rank's numerical cause before the collective control signal replaces it.
+    if (failure)
+    {
+      try { std::rethrow_exception(failure); }
+      catch (const std::exception& error)
+      {
+        std::clog << "WFTrain local native precision rejection: rank=" << comm.rank()
+                  << " cause=" << error.what() << std::endl;
+      }
+    }
     throw NativeGpuEpochRetry();
+  }
   if (retry || fatal)
   {
     if (failure) std::rethrow_exception(failure);
