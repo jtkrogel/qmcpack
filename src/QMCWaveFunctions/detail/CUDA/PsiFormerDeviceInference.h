@@ -1749,7 +1749,7 @@ private:
     const bool request_local_factor_reuse = reuse_flag && reuse_flag[0] == '1' && reuse_flag[1] == '\0' &&
         target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
         !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
-        plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
+        !mixed_value_lu_excluded_ && plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
     if ((parallel_traces_ && !retained_targets_) || request_local_factor_reuse)
     {
       // Only later tiles of this request may reuse successful bitwise-equal bases.
@@ -2014,7 +2014,7 @@ public:
         supportsCooperativeRealValueLuEnvironment(environment);
   }
 
-  /// Permanently preserve scalar VALUE LU for both sides of a mixed request/replay.
+  /// Permanently exclude cooperative VALUE LU and target factor reuse throughout mixed request/replay.
   void excludeCooperativeValueLuForMixedRequest()
   {
     if (mixed_value_lu_excluded_)
