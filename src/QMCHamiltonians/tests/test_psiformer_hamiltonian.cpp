@@ -9,6 +9,7 @@
  * @brief End-to-end Hamiltonian tests for the public PsiFormer interface.
  */
 
+#include "QMCDrivers/WFTrain/GpuTrainingEpochReplay.h"
 #include <cstring>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -634,6 +635,49 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
         streaming_result.local_energies.size() * sizeof(streaming_result.local_energies[0])) == 0);
     CHECK(std::memcmp(fixed_capture.result().data(), ecp_capture.result().data(),
         sizeof(ecp_capture.result())) == 0);
+  }
+
+  // The native retry owner rewinds only EL-side RNG/grid state, never particle configurations.
+  {
+    RandomGenerator native_rng(137);
+    RefVector<RandomBase<FullPrecReal>> native_rngs{native_rng};
+    std::vector<NonLocalECPotential*> grid_owners;
+    for (auto& ham : hamiltonians)
+      for (int component = 0; component < ham.get().size(); ++component)
+        if (auto* nonlocal = dynamic_cast<NonLocalECPotential*>(ham.get().getComponent(component)))
+          grid_owners.push_back(nonlocal);
+    REQUIRE(!grid_owners.empty());
+    const auto original_grid = grid_owners.front()->captureQuadratureState();
+    auto alternate_grid = original_grid;
+    for (std::size_t point = 0; point < alternate_grid.coordinates.size(); point += 3)
+      std::swap(alternate_grid.coordinates[point], alternate_grid.coordinates[point + 1]);
+    grid_owners.front()->validateQuadratureState(alternate_grid);
+    std::vector<RandomBase<FullPrecReal>::uint_type> predecessor, observed, accepted_rng;
+    native_rng.save(predecessor);
+    {
+      wftrain::GpuTrainingEpochReplay pending(native_rngs, grid_owners);
+      CHECK(pending.retainedBytes() >= 2 * sizeof(RandomGenerator));
+      (void)native_rng();
+      grid_owners.front()->restoreQuadratureStateUnchecked(alternate_grid);
+      pending.rewindForFp64Replay();
+      native_rng.save(observed);
+      CHECK(observed == predecessor);
+      CHECK(grid_owners.front()->captureQuadratureState().coordinates == original_grid.coordinates);
+      CHECK_THROWS_AS(pending.rewindForFp64Replay(), std::logic_error);
+      (void)native_rng();
+      grid_owners.front()->restoreQuadratureStateUnchecked(alternate_grid);
+    }
+    native_rng.save(observed);
+    CHECK(observed == predecessor);
+    CHECK(grid_owners.front()->captureQuadratureState().coordinates == original_grid.coordinates);
+    {
+      wftrain::GpuTrainingEpochReplay pending(native_rngs, grid_owners);
+      (void)native_rng();
+      native_rng.save(accepted_rng);
+      pending.acceptPublishedEpoch();
+    }
+    native_rng.save(observed);
+    CHECK(observed == accepted_rng);
   }
 
   auto kinetic_derivative = psiformer_leader.makeStreamingDerivativeOperator(

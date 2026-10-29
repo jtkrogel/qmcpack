@@ -14,6 +14,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/GpuTrainingEpochObjective.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/NonLocalEnergyAccumulator.h"
@@ -1237,6 +1238,41 @@ TEST_CASE("High-parameter iteration publishes then refreshes sampler state",
   CHECK(after.values[0] == Catch::Approx(1.125));
   CHECK(after.values[1] == Catch::Approx(-2.32));
   CHECK(after.values[2] == Catch::Approx(7.0));
+}
+
+TEST_CASE("Native completed epoch transfers one actual production pass", "[drivers][training][gpu_epoch]")
+{
+  ToyProvider candidate, control;
+  ReferenceProducer source, direct;
+  source.bindSchema(candidate.parameterSchema());
+  direct.bindSchema(control.parameterSchema());
+  const auto parameters = candidate.snapshotParameters();
+  source.failNext();
+  CHECK_THROWS(GpuTrainingEpochObjective(candidate.parameterSchema(), parameters, source,
+      EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN));
+  CHECK(candidate.snapshotParameters().values == parameters.values);
+  CHECK(candidate.snapshotParameters().version == parameters.version);
+  REQUIRE(source.calls == 1);
+  GpuTrainingEpochObjective staged(candidate.parameterSchema(), parameters, source,
+      EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN);
+  REQUIRE(source.calls == 2);
+  CHECK(staged.retainedBytes() == 3 * candidate.parameterSchema().parameterCount() * sizeof(DerivativeValue));
+  ScaleAndSubtract candidate_update(.1), control_update(.1);
+  TrainingIterationState candidate_state, control_state;
+  HighParameterTraining trainer({});
+  const auto actual = trainer.runIteration(candidate, staged, candidate_update, candidate_state);
+  const auto expected = trainer.runIteration(control, direct, control_update, control_state);
+  CHECK(source.calls == 2); // The trainer merged the admitted sums; no second derivative pass.
+  CHECK(direct.calls == 1);
+  CHECK(staged.retainedBytes() == 0);
+  CHECK(actual.objective.gradient == expected.objective.gradient);
+  CHECK(actual.objective.mean_energy == expected.objective.mean_energy);
+  CHECK(actual.objective.sample_count == expected.objective.sample_count);
+  CHECK(candidate.snapshotParameters().values == control.snapshotParameters().values);
+  CHECK(candidate_state.parameter_version == control_state.parameter_version);
+  CHECK(candidate_state.completed_iterations == control_state.completed_iterations);
+  EnergyGradientAccumulator duplicate(candidate.parameterSchema(), parameters.version);
+  CHECK_THROWS_WITH(staged.accumulate(parameters, duplicate), "Native epoch objective can be consumed only once");
 }
 
 TEST_CASE("Streaming and stale publication failures are atomic and retryable",
