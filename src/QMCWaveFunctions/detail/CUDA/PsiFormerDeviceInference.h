@@ -3403,6 +3403,8 @@ private:
     storage_->graph->factors_.download(storage_->factors.data(), channels);
     storage_->graph->combinations_.download(storage_->sums.data(), count);
     std::size_t bad_factors = 0, bad_inverse = 0, small_pivots = 0, bad_sums = 0;
+    bool inverse_checked = false;
+    double worst_inverse_rho = 0.0, worst_inverse_relative = 0.0;
     for (std::size_t i = 0; i < channels; ++i)
     {
       const auto& factor = storage_->factors[i];
@@ -3426,9 +3428,13 @@ private:
       if (bad_factors || bad_inverse || bad_sums)
       {
         std::ostringstream reason;
+        reason.precision(std::numeric_limits<double>::max_digits10);
         reason << "Canonical FP64 head requires a complete physical FP64 retry; invalid_factor=" << bad_factors
                << " uncertified_fp64_inverse=" << bad_inverse << " small_determinant_pivot_diagnostic="
-               << small_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0";
+               << small_pivots << " severe_cancellation=" << bad_sums << " ill_conditioned_spatial=0"
+               << " inverse_certificate_checked=" << inverse_checked << " inverse_rho_upper_max="
+               << worst_inverse_rho << " relative_inverse_error_upper_max=" << worst_inverse_relative
+               << " relative_inverse_error_budget=" << inverse_certificate::relative_budget;
         throw MixedPrecisionRetryRequired(reason.str().c_str());
       }
     };
@@ -3438,8 +3444,17 @@ private:
         storage_->graph->inverse_.data(), channels, state_->electrons, storage_->inverse_quality.data()),
         "canonical REAL inverse certificate");
     storage_->inverse_quality.downloadOnStream(storage_->host_inverse_quality.data(), channels, queue_.getNative());
+    inverse_checked = true;
     for (std::size_t i = 0; i < channels; ++i)
-      if (!inverse_certificate::isCertified(storage_->host_inverse_quality[i])) ++bad_inverse;
+    {
+      const auto& quality = storage_->host_inverse_quality[i];
+      if (!device_math::isFiniteBinary64(quality.rho_upper) || quality.rho_upper > worst_inverse_rho)
+        worst_inverse_rho = quality.rho_upper;
+      if (!device_math::isFiniteBinary64(quality.relative_inverse_error_upper) ||
+          quality.relative_inverse_error_upper > worst_inverse_relative)
+        worst_inverse_relative = quality.relative_inverse_error_upper;
+      if (!inverse_certificate::isCertified(quality)) ++bad_inverse;
+    }
     require_admitted();
     state_->coordinates = coordinates; state_->count = count; state_->ready = true;
     return view();
