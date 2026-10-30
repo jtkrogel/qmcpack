@@ -6,6 +6,9 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_CANONICAL_HEAD_VALIDATION_H
 #include "PsiFormerDeviceMixedTargetValidation.h"
 #include "PsiFormerDeviceScoreReverse.h"
+#include "PsiFormerDeviceScoreJvp.h"
+#include "PsiFormerDeviceBatchBackend.h"
+#include <limits>
 
 namespace qmcplusplus::psiformer::device::canonical_head_validation
 {
@@ -202,6 +205,135 @@ inline void validate()
       std::cout << "PASS REAL canonical score canonical_FP64_identity_bits=exact KFAC_observations=exact"
                    " actual_mixed_primal_reverse=1 implicit_head_refused=1 warm_DeviceBuffer_alloc_free_delta=0\n";
     }
+    {
+      // Same immutable image, one ordinary configuration and one near same-spin coalescence.
+      // The tiny finite displacement creates derivative sensitivity without changing the policy threshold.
+      auto sensitive = first;
+      sensitive[3] = first[0] + 1e-5; sensitive[4] = first[1]; sensitive[5] = first[2];
+      for (bool reversed : {false, true})
+      {
+        auto population = reversed ? sensitive : first;
+        const auto& tail = reversed ? first : sensitive;
+        population.insert(population.end(), tail.begin(), tail.end());
+        const auto head = producer->evaluate(population);
+        require(head.derivativeSensitive(reversed ? 0 : 1) && !head.derivativeSensitive(reversed ? 1 : 0),
+            "Heterogeneous fixture failed to bind one sensitive and one ordinary head");
+        const auto member = head.subview(1, 1);
+        require(member.coordinates().sameSourceRange(head.coordinates().subview(1, 1)),
+            "Canonical subview changed its source interval");
+        require(member.subview(0, 1).coordinates().sameSourceRange(member.coordinates()),
+            "Nested canonical subview changed its source interval");
+        for (auto range : {std::pair<std::size_t, std::size_t>{0, 0}, {2, 1}, {1, 2}})
+        {
+          bool refused = false;
+          try { (void)head.subview(range.first, range.second); } catch (const std::invalid_argument&) { refused = true; }
+          require(refused, "Canonical subview admitted an empty or out-of-range interval");
+          refused = false;
+          try { (void)head.coordinates().subview(range.first, range.second); }
+          catch (const std::invalid_argument&) { refused = true; }
+          require(refused, "Coordinate subview admitted an empty or out-of-range interval");
+        }
+        {
+          PreparedDeviceInference too_small(image, 1, queue, blas, SpatialJetMode::FULL_VGL);
+          auto arithmetic = std::make_shared<PreparedDeviceMixedValueDense>(cache,
+              too_small.mixedDenseRowCapacity(), queue, blas);
+          too_small.setMixedDense(arithmetic);
+          bool refused = false;
+          try { too_small.evaluateCanonicalHead(head); } catch (const std::invalid_argument&) { refused = true; }
+          require(refused && !too_small.sensitiveDerivativeConfigurations() && !too_small.ordinaryDerivativeConfigurations(),
+              "Heterogeneous FULL exceeded output capacity before singleton scatter");
+        }
+        for (std::size_t k : {std::size_t(0), std::size_t(3)})
+        {
+          const auto preparation = mixed_target_validation::realPreparation(plan, 2, k);
+          PreparedDeviceInference full(image, 2, queue, blas, SpatialJetMode::FULL_VGL, false, false,
+              configuredInferenceStatusPolicy(), preparation);
+          auto arithmetic = std::make_shared<PreparedDeviceMixedValueDense>(cache, full.mixedDenseRowCapacity(), queue, blas);
+          full.setMixedDense(arithmetic);
+          full.evaluateCanonicalHead(head);
+          const auto actual = mixed_target_validation::realFields(full, 2, 4);
+          require(full.sensitiveDerivativeConfigurations() == 1 && full.ordinaryDerivativeConfigurations() == 1 &&
+              full.sensitiveFp64AffineProjections() && full.ordinaryFp32AffineProjections(),
+              "Heterogeneous FULL promoted an ordinary member or lost selected arithmetic receipts");
+          for (std::size_t c = 0; c < 2; ++c)
+          {
+            const auto one = head.subview(c, 1);
+            PreparedDeviceInference singleton(image, 1, queue, blas, SpatialJetMode::FULL_VGL, false, false,
+                configuredInferenceStatusPolicy(), mixed_target_validation::realPreparation(plan, 1, k));
+            auto single_arithmetic = std::make_shared<PreparedDeviceMixedValueDense>(cache,
+                singleton.mixedDenseRowCapacity(), queue, blas);
+            singleton.setMixedDense(single_arithmetic); singleton.evaluateCanonicalHead(one);
+            const auto expected = mixed_target_validation::realFields(singleton, 1, 4);
+            const auto stride = full.resultLayout().configuration_stride;
+            require(actual.phases[c] == expected.phases[0] &&
+                identical(std::vector<double>(actual.jets.begin() + c * stride, actual.jets.begin() + (c + 1) * stride), expected.jets) &&
+                identical(std::vector<double>(actual.ratios.begin() + c * 4, actual.ratios.begin() + (c + 1) * 4), expected.ratios),
+                "Heterogeneous FULL changed singleton arithmetic or result order");
+          }
+        }
+        {
+          PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, {}, false);
+          auto sessions = backend.prepareMixedTrainingProductSessions(2);
+          auto& session = *sessions.first;
+          session.prepareScoreContractions(1, image->version());
+          const std::vector<double> weights{.25, -.75};
+          std::vector<std::complex<double>> batched(values.size()), serial(values.size());
+          session.beginScoreContraction(1, image->version());
+          session.accumulateWeightedScoreTile(population.data(), weights.data(), 2, image->version());
+          session.finishScoreContraction(image->version());
+          session.downloadScoreContraction(0, batched.data(), batched.size(), image->version());
+          session.beginScoreContraction(1, image->version());
+          for (std::size_t c = 0; c < 2; ++c)
+            session.accumulateWeightedScoreTile(population.data() + 12 * c, weights.data() + c, 1, image->version());
+          session.finishScoreContraction(image->version());
+          session.downloadScoreContraction(0, serial.data(), serial.size(), image->version());
+          require(identical(batched, serial), "Heterogeneous weighted tile changed singleton fold order or sample weights");
+          std::vector<double> direction(values.size());
+          for (std::size_t i = 0; i < direction.size(); ++i) direction[i] = .01 * std::sin(.19 * (i + 1));
+          session.prepareScoreDirection(direction, image->version());
+          const auto products = session.scoreJvpPreparedTile(population.data(), 2, image->version());
+          for (std::size_t c = 0; c < 2; ++c)
+          {
+            const auto score = session.score(population.data() + c * 12, image->version());
+            long double dot = 0;
+            for (std::size_t i = 0; i < direction.size(); ++i) dot += direction[i] * score[i];
+            require(std::abs(products[c] - dot) <= 2e-5L * (1 + std::abs(dot)),
+                "Heterogeneous canonical JVP/VJP lost arithmetic or configuration correspondence");
+          }
+          require(session.ordinaryDerivativeConfigurations() && session.ordinaryFp32PrimalAffines() &&
+              session.sensitiveDerivativeConfigurations() && session.sensitiveFp64PrimalAffines() &&
+              session.sensitiveFp64ReverseAffines() && session.sensitiveFp64JvpAffines() &&
+              session.mixedReverseStatistics()->fp32_gemms && session.mixedJvpStatistics()->fp32_gemms,
+              "Heterogeneous score products lost ordinary FP32 or selected FP64 launch receipts");
+          const auto selected_before = session.sensitiveDerivativeConfigurations();
+          const auto ordinary_before = session.ordinaryDerivativeConfigurations();
+          const std::vector<double> zero_weights{0., 0.};
+          session.beginScoreContraction(1, image->version());
+          session.accumulateWeightedScoreTile(population.data(), zero_weights.data(), 2, image->version());
+          session.finishScoreContraction(image->version());
+          require(session.sensitiveDerivativeConfigurations() == selected_before + 1 &&
+              session.ordinaryDerivativeConfigurations() == ordinary_before + 1,
+              "Zero score weights skipped configuration arithmetic or head validation");
+          session.beginScoreContraction(1, image->version());
+          const std::vector<double> bad_weights{1., std::numeric_limits<double>::quiet_NaN()};
+          bool failed = false;
+          try { session.accumulateWeightedScoreTile(population.data(), bad_weights.data(), 2, image->version()); }
+          catch (const std::invalid_argument&) { failed = true; }
+          require(failed, "Sensitive weighted tile admitted a nonfinite late member");
+          failed = false;
+          try { session.downloadScoreContraction(0, serial.data(), serial.size(), image->version()); }
+          catch (const std::logic_error&) { failed = true; }
+          require(failed, "Failed weighted tile exposed partial contraction publication");
+        }
+        const auto stale_member = head.subview(0, 1);
+        (void)producer->evaluate(first);
+        bool refused = false;
+        try { (void)stale_member.derivativeSensitive(0); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused, "Stale canonical subview retained sensitivity authority");
+      }
+      std::cout << "PASS REAL sensitive_population both_orders=exact ordinary_FP32=1 selected_FP64=1"
+                   " FULL_K0_K3=exact subview_bounds_stale=reject\n";
+    }
     auto external = image->prepareCoordinates(2, checkedDeviceBytes<double>(24));
     auto two = first; two.insert(two.end(), first.begin(), first.end()); external->upload(two);
     require(!external->view(0, 1).sameSourceRange(external->view(1, 1)), "Coordinate range comparison ignored interval begin");
@@ -247,7 +379,7 @@ inline void validate()
       return f.minimum_scaled_pivot < 1e-3;
     }), "Canonical low-pivot positive did not exercise a small pivot");
     std::cout << "PASS REAL canonical accurate_low_pivot inverse_certificate=valid mixed_jet_accuracy_claim=0\n";
-    // A certified FP64 seed head must reach the retained mixed affine VJP without raw-head screening.
+    // A certified sensitive head selects an explicit FP64 derivative island before mixed work.
     {
       auto low_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(low_pivot_image, queue);
       require(low_cache->usable(), "Low-pivot retained regression has no usable mixed cache");
@@ -263,9 +395,26 @@ inline void validate()
       require(response.size() == values.size() && std::all_of(response.begin(), response.end(), [](double value) {
         return device_math::isFiniteBinary64(value);
       }), "Certified low-pivot retained SCORE did not publish a complete finite response");
-      require(primal->statistics().projections && derivative->statistics().fp32_gemms &&
-          derivative->statistics().completed && !derivative->statistics().rejected,
-          "Certified low-pivot retained SCORE did not complete genuine mixed primal/reverse work");
+      require(!primal->statistics().projections && !derivative->statistics().fp32_gemms &&
+          retained.valueTapeDerivativeIsland() && !retained.valueTapeMixedParameters() &&
+          retained.sensitiveDerivativeConfigurations() == 1 && retained.sensitiveFp64AffineProjections() &&
+          reverse.sensitiveFp64AffineProjections(),
+          "Sensitive retained SCORE did not report truthful FP64 primal/reverse arithmetic");
+      PreparedDeviceInference reference(low_pivot_image, 1, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+      PreparedDeviceScoreReverse reference_reverse(low_pivot_image, 1, queue, blas);
+      reference.evaluateRetainedCanonicalHead(head);
+      reference_reverse.reverseCanonicalHead(reference, head, {1.});
+      std::vector<double> expected(response.size()); reference_reverse.downloadResponse(expected);
+      require(identical(expected, response), "Selected sensitive score differs from same-head FP64 reference");
+      PreparedDeviceScoreJvp jvp(low_pivot_image, 1, queue, blas, derivative);
+      std::vector<double> direction(response.size()), product(1);
+      long double dot = 0;
+      for (std::size_t i = 0; i < direction.size(); ++i)
+      { direction[i] = .01 * std::sin(.19 * (i + 1)); dot += direction[i] * response[i]; }
+      jvp.prepareDirection(direction); jvp.evaluatePrepared(retained, &head); jvp.downloadProducts(product);
+      require(jvp.sensitiveFp64AffineProjections() && !derivative->statistics().fp32_gemms &&
+          std::abs(product[0] - dot) <= 2e-10L * (1 + std::abs(dot)),
+          "Sensitive canonical JVP/VJP disagree or report hidden FP32 arithmetic");
     }
     // The same approximate model must retain the original raw FP32-produced-head pivot guard.
     {
@@ -281,8 +430,8 @@ inline void validate()
       }
       require(rejected, "Raw FP32-produced low-pivot head lost its original rejection");
     }
-    std::cout << "PASS REAL canonical low_pivot_retained_SCORE actual_mixed_reverse=1"
-                 " certified_FP64_head=accepted raw_FP32_head=typed_reject mixed_jet_accuracy_claim=0\n";
+    std::cout << "PASS REAL canonical low_pivot_retained_SCORE declared_FP64_derivative_island=1 actual_FP32_GEMMs=0"
+                 " certified_FP64_head=accepted raw_FP32_head=typed_reject FP64_score_bits=exact JVP_VJP=consistent\n";
     head = {};
     // A zero orbital column has no inverse and must never mint a head borrow.
     for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
