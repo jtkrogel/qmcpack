@@ -96,6 +96,12 @@ public:
     NewTimer* spatial_evaluation_api = nullptr;
     NewTimer* hamiltonian_evaluation_api = nullptr;
     wftrain::TrainingWorkCounters* work_counters = nullptr;
+    /// Index one is the middle proposal round when three substeps are requested.
+    /// Host scopes add no synchronization and do not assert DEVICE completion.
+    NewTimer& warmup_middle_substep_host =
+        createGlobalTimer("VMCSampling::warmup_middle_substep_host", timer_level_fine);
+    NewTimer& production_middle_substep_host =
+        createGlobalTimer("VMCSampling::production_middle_substep_host", timer_level_fine);
   };
 
   /** Reject unsupported collective-move combinations before walker creation. */

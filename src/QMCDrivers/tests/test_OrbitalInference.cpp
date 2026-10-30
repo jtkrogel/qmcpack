@@ -104,6 +104,8 @@ public:
     VMCBatchedSampling::Timers timers{timers_.resource_timer, timers_.movepbyp_timer, timers_.buffer_timer,
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
         [](Crowd&, std::string_view) {}};
+    const auto previous_timer_level = getGlobalTimerManager().get_timer_threshold_string();
+    getGlobalTimerManager().set_timer_threshold(timer_level_fine);
     VMCBatchedSampling::runWarmupStep(0, state, timers, rngs_, crowds_);
     CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
     CHECK(*physical == 0);
@@ -116,6 +118,14 @@ public:
     CHECK(crowds_[0]->get_walker_twfs()[0].get().hasValidLaplacians());
     CHECK(*physical > 0);
     CHECK(*auxiliary > 0);
+    if (qmcdriver_input_.get_sub_steps() >= 2)
+    {
+#ifdef ENABLE_TIMERS
+      CHECK(timers.warmup_middle_substep_host.get_num_calls() == 1);
+      CHECK(timers.production_middle_substep_host.get_num_calls() == 1);
+#endif
+    }
+    getGlobalTimerManager().set_timer_threshold(previous_timer_level);
     CHECK(crowds_[0]->get_estimator_manager_crowd().get_block_weight() == 0.0);
   }
 };
@@ -208,7 +218,7 @@ TEST_CASE("PsiFormer no-drift collective warmup keeps value-only state until pro
       "<qmc move='alle'><parameter name='walkers_per_rank'>1</parameter>"
       "<parameter name='crowds'>1</parameter><parameter name='blocks'>1</parameter>"
       "<parameter name='steps'>1</parameter><parameter name='warmupsteps'>1</parameter>"
-      "<parameter name='substeps'>1</parameter><parameter name='timestep'>0.01</parameter>"
+      "<parameter name='substeps'>3</parameter><parameter name='timestep'>0.01</parameter>"
       "<parameter name='usedrift'>no</parameter></qmc>"));
   QMCDriverInput input;
   input.readXML(document.getRoot());

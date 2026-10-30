@@ -346,6 +346,9 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
         for (int sub_step = 0; sub_step < sft.qmcdrv_input.get_sub_steps(); ++sub_step)
         {
+          OptionalNativeTimerScope middle_substep(sub_step == 1
+              ? &(warmup ? timers.warmup_middle_substep_host : timers.production_middle_substep_host)
+              : nullptr);
           makeGaussRandomWithEngine(gaussian_displacements, random_generator);
           selected_indices.clear();
           walker_offsets[0] = 0;
@@ -479,6 +482,9 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
       for (int sub_step = 0; sub_step < sft.qmcdrv_input.get_sub_steps(); sub_step++)
       {
+        OptionalNativeTimerScope middle_substep(sub_step == 1
+            ? &(warmup ? timers.warmup_middle_substep_host : timers.production_middle_substep_host)
+            : nullptr);
         //This generates an entire steps worth of deltas.
         makeGaussRandomWithEngine(walker_deltas, random_generator);
 
