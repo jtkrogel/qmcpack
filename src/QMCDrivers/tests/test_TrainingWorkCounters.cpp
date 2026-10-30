@@ -5,7 +5,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
 
-#include "catch.hpp"
+#include <catch2/catch_test_macros.hpp>
 
 namespace qmcplusplus::wftrain
 {
