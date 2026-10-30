@@ -461,8 +461,8 @@ TEST_CASE("Orbital inference scalar observer controls every Hamiltonian evaluati
     inference.run();
     CHECK(inference.complete());
     CHECK(samples == 1);
-    CHECK((*physical > 0) == energy);
-    CHECK((*auxiliary > 0) == energy);
+    CHECK(*physical == (energy ? 1 : 0));
+    CHECK(*auxiliary == (energy ? 1 : 0));
     if (comm->rank() == 0)
     {
       std::ifstream scalar(prefix + ".scalar.dat");
