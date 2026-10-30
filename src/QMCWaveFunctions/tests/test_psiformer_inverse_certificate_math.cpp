@@ -21,7 +21,7 @@ struct C
 using CMat = std::array<C, 4>;
 
 /// Apply the shared real bound core to the complete two-row fixture.
-cert::Result real(const Mat& A, const Mat& B)
+cert::Result realFast(const Mat& A, const Mat& B)
 {
   double rho = 0;
   std::uint32_t status = cert::CERTIFIED;
@@ -31,13 +31,37 @@ cert::Result real(const Mat& A, const Mat& B)
 }
 
 /// Apply the shared complex bound core to both fixture rows.
-cert::Result paired(const CMat& A, const CMat& B)
+cert::Result pairedFast(const CMat& A, const CMat& B)
 {
   double rho = 0;
   std::uint32_t status = cert::CERTIFIED;
   for (std::size_t i = 0; i < 2; ++i)
     rho = std::max(rho, cert::math::complexRow(A.data(), B.data(), 2, i, status));
   return cert::math::finish(rho, status);
+}
+
+/// Match the device selection contract while keeping fast bounds observable.
+cert::Result real(const Mat& A, const Mat& B)
+{
+  auto original = realFast(A, B);
+  if (original.status != cert::BOUND_EXCEEDED) return original;
+  double rho = 0; std::uint32_t status = cert::CERTIFIED;
+  for (std::size_t i=0; i<2; ++i)
+    rho = std::max(rho, cert::math::compensatedRealRow(A.data(), B.data(), 2, i, status));
+  const auto refined = cert::math::finish(rho, status);
+  return (refined.status == cert::CERTIFIED || refined.status == cert::BOUND_EXCEEDED) &&
+      refined.rho_upper < original.rho_upper ? refined : original;
+}
+cert::Result paired(const CMat& A, const CMat& B)
+{
+  auto original = pairedFast(A, B);
+  if (original.status != cert::BOUND_EXCEEDED) return original;
+  double rho = 0; std::uint32_t status = cert::CERTIFIED;
+  for (std::size_t i=0; i<2; ++i)
+    rho = std::max(rho, cert::math::compensatedComplexRow(A.data(), B.data(), 2, i, status));
+  const auto refined = cert::math::finish(rho, status);
+  return (refined.status == cert::CERTIFIED || refined.status == cert::BOUND_EXCEEDED) &&
+      refined.rho_upper < original.rho_upper ? refined : original;
 }
 
 /// Independently accumulate the real residual at wider precision for enclosure tests.
@@ -74,7 +98,7 @@ TEST_CASE("Canonical inverse validity permits accurate small pivots, not approxi
   REQUIRE(cert::isCertified(paired(Z, W)));
 }
 
-TEST_CASE("Canonical inverse certificate rejects corrupt inverse and roundoff-dominated dependence",
+TEST_CASE("Canonical inverse certificate rejects corrupt inverse and refines roundoff-dominated dependence",
           "[psiformer][inverse_certificate]")
 {
   const Mat I{1, 0, 0, 1}, wrong{1.001, 0, 0, 1};
@@ -83,12 +107,73 @@ TEST_CASE("Canonical inverse certificate rejects corrupt inverse and roundoff-do
   REQUIRE(r.rho_upper >= exactResidual(I, wrong));
   const Mat A{1, 1, 1, 1 + 0x1p-30}, B{1 + 0x1p30, -0x1p30, -0x1p30, 0x1p30};
   REQUIRE(exactResidual(A, B) == 0);
-  const auto wide = real(A, B);
+  const auto wide = realFast(A, B);
   REQUIRE(wide.status == cert::BOUND_EXCEEDED);
   REQUIRE_FALSE(cert::isCertified(wide));
   const CMat Z{{{1, 0}, {1, 0}, {1, 0}, {1 + 0x1p-30, 0}}};
   const CMat W{{{1 + 0x1p30, 0}, {-0x1p30, 0}, {-0x1p30, 0}, {0x1p30, 0}}};
-  REQUIRE(paired(Z, W).status == cert::BOUND_EXCEEDED);
+  REQUIRE(pairedFast(Z, W).status == cert::BOUND_EXCEEDED);
+  REQUIRE(cert::isCertified(real(A, B)));
+  REQUIRE(cert::isCertified(paired(Z, W)));
+}
+
+TEST_CASE("Compensated refinement safe domain is bounded and never repairs corruption",
+          "[psiformer][inverse_certificate]")
+{
+  for (double x : {0., -0., 0x1p-450, -0x1p-450, 0x1p450, -0x1p450})
+    REQUIRE(cert::math::refinementOperand(x));
+  for (double x : {0x1p-451, -0x1p451, std::numeric_limits<double>::denorm_min(),
+      std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+    REQUIRE_FALSE(cert::math::refinementOperand(x));
+  const Mat A{1,1,1,1+0x1p-30}, B{1+0x1p30,-0x1p30,-0x1p30,0x1p30};
+  for (double scale : {0x1p-419, 0x1p420})
+  {
+    Mat scaledA, scaledB;
+    for (int i=0; i<4; ++i) { scaledA[i]=A[i]*scale; scaledB[i]=B[i]/scale; }
+    REQUIRE(cert::isCertified(real(scaledA,scaledB)));
+  }
+  Mat unsafeA, unsafeB;
+  for (int i=0; i<4; ++i) { unsafeA[i]=A[i]*0x1p451; unsafeB[i]=B[i]*0x1p-451; }
+  const auto rejected=real(unsafeA,unsafeB), fast=realFast(unsafeA,unsafeB);
+  REQUIRE(rejected.status==cert::BOUND_EXCEEDED);
+  REQUIRE(rejected.rho_upper==fast.rho_upper);
+  auto corrupt=B; corrupt[0]+=0.001;
+  REQUIRE_FALSE(cert::isCertified(real(A,corrupt)));
+  REQUIRE(real(A,corrupt).rho_upper>=exactResidual(A,corrupt));
+  cert::math::CompensatedDot dot;
+  dot.add(0x1p450,0x1p450); dot.add(-0x1p450,0x1p450);
+  REQUIRE(dot.status==cert::CERTIFIED);
+  REQUIRE(dot.high==0); REQUIRE(dot.low==0);
+  REQUIRE(cert::math::compensatedResidualUpper(dot,0,2)<0x1p-24);
+  cert::math::CompensatedDot product_error;
+  product_error.add(1+0x1p-27,1-0x1p-27); product_error.add(-1,1);
+  REQUIRE(product_error.high==0); REQUIRE(product_error.low==-0x1p-54);
+  REQUIRE(cert::math::compensatedResidualUpper(product_error,0,2)>=0x1p-54);
+  REQUIRE(cert::math::compensatedResidualUpper(product_error,0,2)<0x1p-53);
+  cert::math::CompensatedDot sum_error;
+  sum_error.add(1,1); sum_error.add(0x1p-54,1); sum_error.add(-1,1);
+  REQUIRE(sum_error.high==0); REQUIRE(sum_error.low==0x1p-54);
+  REQUIRE(cert::math::compensatedResidualUpper(sum_error,0,3)>=0x1p-54);
+  REQUIRE(cert::math::compensatedResidualUpper(sum_error,0,3)<0x1p-53);
+  cert::math::CompensatedDot tiny;
+  tiny.add(0x1p-450,0x1p-450); tiny.add(-0x1p-450,0x1p-450);
+  REQUIRE(tiny.status==cert::CERTIFIED); REQUIRE(tiny.high==0); REQUIRE(tiny.low==0);
+}
+
+TEST_CASE("Compensation captures nonzero product residuals in a roundoff-heavy inverse",
+          "[psiformer][inverse_certificate]")
+{
+  const double x=0x1p26+.5, y=1-0x1p-27, z=1+0x1p26;
+  const Mat A{1,x,y,z}, B{z,-x,-y,1};
+  REQUIRE(realFast(A,B).status==cert::BOUND_EXCEEDED);
+  REQUIRE(exactResidual(A,B)==0x1p-28L);
+  const auto refined=real(A,B);
+  REQUIRE(cert::isCertified(refined)); REQUIRE(refined.rho_upper>=exactResidual(A,B));
+  REQUIRE(refined.rho_upper<0x1p-27);
+  CMat Z, W;
+  for (std::size_t i=0;i<4;++i) { Z[i]={A[i],A[i]}; W[i]={B[i]/2,-B[i]/2}; }
+  REQUIRE(pairedFast(Z,W).status==cert::BOUND_EXCEEDED);
+  REQUIRE(cert::isCertified(paired(Z,W)));
 }
 
 TEST_CASE("Outward AB residual bounds enclose independent long-double residuals",
@@ -153,8 +238,8 @@ TEST_CASE("Malformed nonfinite unsupported or unknown certificate inputs never p
   REQUIRE_THROWS_AS(cert::requiredScalarWork(0, 2, false), std::invalid_argument);
   REQUIRE_THROWS_AS(cert::requiredScalarWork(1, 0, true), std::invalid_argument);
   REQUIRE_THROWS_AS(cert::requiredScalarWork(std::numeric_limits<std::size_t>::max(), 2, false), std::length_error);
-  REQUIRE(cert::requiredScalarWork(1, 100, false) == 33283264);
-  REQUIRE(cert::requiredScalarWork(1, 100, true) == 130563264);
+  REQUIRE(cert::requiredScalarWork(1, 100, false) == 258566528);
+  REQUIRE(cert::requiredScalarWork(1, 100, true) == 517126528);
 }
 
 /// Run only the dependency-light certificate algebra and guard cases.

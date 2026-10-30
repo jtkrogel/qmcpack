@@ -668,7 +668,8 @@ add_executable(test_psiformer_inverse_certificate_math test_psiformer_inverse_ce
 target_link_libraries(test_psiformer_inverse_certificate_math qmc_external_catch2)
 target_include_directories(test_psiformer_inverse_certificate_math PRIVATE "${qmcpack_SOURCE_DIR}/src")
 target_compile_options(test_psiformer_inverse_certificate_math PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,IntelLLVM>:-fno-fast-math>)
+    $<$<CXX_COMPILER_ID:GNU,Clang,IntelLLVM>:-fno-fast-math>
+    $<$<CXX_COMPILER_ID:GNU,Clang,IntelLLVM>:-ffp-contract=off>)
 add_unit_test(deterministic-unit_test_psiformer_inverse_certificate_math
               1 1 $<TARGET_FILE:test_psiformer_inverse_certificate_math>)
 set_tests_properties(deterministic-unit_test_psiformer_inverse_certificate_math

@@ -18,35 +18,52 @@ __global__ void certifyKernel(const T* A, const T* B, std::size_t n, Result* out
   const auto head = std::size_t(blockIdx.x), offset = head * n * n;
   __shared__ double maxima[block_size];
   __shared__ unsigned int bad_input, bad_bound;
-  if (threadIdx.x == 0)
-    bad_input = bad_bound = 0;
-  __syncthreads();
-  double maximum = 0;
-  for (std::size_t row = threadIdx.x; row < n; row += block_size)
+  __shared__ bool refine;
+  for (unsigned int pass = 0; pass < 2; ++pass)
   {
-    std::uint32_t status = CERTIFIED;
-    double bound;
-    if constexpr (complex)
-      bound = math::complexRow(A + offset, B + offset, n, row, status);
-    else
-      bound = math::realRow(A + offset, B + offset, n, row, status);
-    if (status == NONFINITE_INPUT)
-      atomicExch(&bad_input, 1u);
-    else if (status != CERTIFIED)
-      atomicExch(&bad_bound, 1u);
-    maximum = maximum > bound ? maximum : bound;
-  }
-  maxima[threadIdx.x] = maximum;
-  __syncthreads();
-  for (unsigned int stride = block_size / 2; stride; stride /= 2)
-  {
-    if (threadIdx.x < stride)
-      maxima[threadIdx.x] = maxima[threadIdx.x] > maxima[threadIdx.x + stride] ?
-          maxima[threadIdx.x] : maxima[threadIdx.x + stride];
+    if (threadIdx.x == 0) bad_input = bad_bound = 0;
     __syncthreads();
+    double maximum = 0;
+    for (std::size_t row = threadIdx.x; row < n; row += block_size)
+    {
+      std::uint32_t status = CERTIFIED;
+      double bound;
+      if constexpr (complex)
+        bound = pass ? math::compensatedComplexRow(A + offset, B + offset, n, row, status) :
+            math::complexRow(A + offset, B + offset, n, row, status);
+      else
+        bound = pass ? math::compensatedRealRow(A + offset, B + offset, n, row, status) :
+            math::realRow(A + offset, B + offset, n, row, status);
+      if (status == NONFINITE_INPUT) atomicExch(&bad_input, 1u);
+      else if (status != CERTIFIED) atomicExch(&bad_bound, 1u);
+      maximum = maximum > bound ? maximum : bound;
+    }
+    maxima[threadIdx.x] = maximum;
+    __syncthreads();
+    for (unsigned int stride = block_size / 2; stride; stride /= 2)
+    {
+      if (threadIdx.x < stride)
+        maxima[threadIdx.x] = maxima[threadIdx.x] > maxima[threadIdx.x + stride] ?
+            maxima[threadIdx.x] : maxima[threadIdx.x + stride];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+      const auto result = math::finish(maxima[0], bad_input ? NONFINITE_INPUT : bad_bound ? UNCERTIFIABLE : CERTIFIED);
+      if (!pass)
+      {
+        output[head] = result;
+        refine = result.status == BOUND_EXCEEDED;
+      }
+      else if ((result.status == CERTIFIED || result.status == BOUND_EXCEEDED) &&
+          result.rho_upper < output[head].rho_upper)
+        output[head] = result;
+    }
+    __syncthreads();
+    // Every thread takes the same branch. Unsafe refinement retains the exact
+    // original rejection; a successful first pass never pays the second pass.
+    if (!refine) return;
   }
-  if (threadIdx.x == 0)
-    output[head] = math::finish(maxima[0], bad_input ? NONFINITE_INPUT : bad_bound ? UNCERTIFIABLE : CERTIFIED);
 }
 
 /// Detect output/input overlap without overflowing pointer-end arithmetic.

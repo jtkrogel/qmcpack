@@ -66,7 +66,7 @@ inline std::size_t requiredScalarWork(std::size_t count, std::size_t n, bool com
     return a + b;
   };
   const auto nn = mul(n, n), nnn = mul(nn, n);
-  return mul(count, add(add(mul(complex ? 128 : 32, nnn), mul(complex ? 256 : 128, nn)), add(mul(32, n), 64)));
+  return mul(count, add(add(mul(complex ? 512 : 256, nnn), mul(complex ? 512 : 256, nn)), add(mul(64, n), 128)));
 }
 
 namespace math
@@ -250,6 +250,112 @@ QMC_PF_INV_HD inline double complexRow(const Complex* A, const Complex* B, std::
   }
   if (!device_math::isFiniteBinary64(total) && status == CERTIFIED)
     status = UNCERTIFIABLE;
+  return total;
+}
+/// The refinement-only domain puts inputs on a 2^-502 grid, exact products on
+/// a 2^-1004 grid. Every nonzero finite center/EFT intermediate is therefore
+/// normal (>=2^-1004); no backend FTZ assumption is needed. Zeros are exact.
+QMC_PF_INV_HD inline bool refinementOperand(double x) noexcept
+{
+  const double a = ::fabs(x);
+  return device_math::isFiniteBinary64(x) && (a == 0 || (a >= 0x1p-450 && a <= 0x1p450));
+}
+
+/// Materialize each rounded operation; strict host/device compilation also
+/// prohibits reassociation. Explicit fma below is the only contracted operation.
+QMC_PF_INV_HD inline double roundedAdd(double a, double b) noexcept
+{ volatile double r = a + b; return r; }
+QMC_PF_INV_HD inline double roundedSubtract(double a, double b) noexcept
+{ volatile double r = a - b; return r; }
+QMC_PF_INV_HD inline double roundedMultiply(double a, double b) noexcept
+{ volatile double r = a * b; return r; }
+
+/// Dot2: FMA captures each product error; TwoSum captures each high-sum error.
+/// Only the low residual accumulation is rounded without its own EFT. Its
+/// ordinary gamma bound scales with captured residuals, not |A|*|B|.
+struct CompensatedDot
+{
+  double high = 0, low = 0, residual_absolute_upper = 0;
+  std::uint32_t status = CERTIFIED;
+
+  QMC_PF_INV_HD void add(double a, double b) noexcept
+  {
+    if (status != CERTIFIED) return;
+    if (!refinementOperand(a) || !refinementOperand(b))
+    { status = UNCERTIFIABLE; return; }
+    const double p = roundedMultiply(a, b);
+    const double e = ::fma(a, b, -p);
+    const double sum = roundedAdd(high, p);
+    const double bb = roundedSubtract(sum, high);
+    const double aa = roundedSubtract(sum, bb);
+    const double br = roundedSubtract(p, bb);
+    const double ar = roundedSubtract(high, aa);
+    const double q = roundedAdd(ar, br);
+    const double next_low = roundedAdd(low, e);
+    const double final_low = roundedAdd(next_low, q);
+    const double centers[] = {p, e, sum, bb, aa, br, ar, q, next_low, final_low};
+    for (double x : centers)
+      if (!device_math::isFiniteBinary64(x))
+      { status = UNCERTIFIABLE; return; }
+    high = sum; low = final_low;
+    residual_absolute_upper = addUp(residual_absolute_upper, addUp(::fabs(e), ::fabs(q)));
+    if (!device_math::isFiniteBinary64(residual_absolute_upper)) status = UNCERTIFIABLE;
+  }
+};
+
+/// Enclose I-(high+exact_low) without first rounding high+low. The two residual
+/// subtractions have error <=u*|computed|/(1-u); their centers share the safe grid.
+QMC_PF_INV_HD inline double compensatedResidualUpper(const CompensatedDot& dot,
+    double identity, std::size_t products) noexcept
+{
+  if (dot.status != CERTIFIED || products > (std::numeric_limits<std::size_t>::max() - 1) / 2)
+    return infinity();
+  const double r0 = roundedSubtract(identity, dot.high), r1 = roundedSubtract(r0, dot.low);
+  if (!device_math::isFiniteBinary64(r0) || !device_math::isFiniteBinary64(r1)) return infinity();
+  const double low_error = mulUp(gamma(2 * products + 1), dot.residual_absolute_upper);
+  const double residual = divUp(addUp(::fabs(r1), mulUp(0x1p-53, ::fabs(r0))), down(1.0 - 0x1p-53));
+  return addUp(residual, low_error);
+}
+
+/// Refine one fixed AB real row; a failed safe-domain check has no authority.
+QMC_PF_INV_HD inline double compensatedRealRow(const double* A, const double* B,
+    std::size_t n, std::size_t row, std::uint32_t& status) noexcept
+{
+  if (!A || !B || !n || row >= n)
+  { status = UNCERTIFIABLE; return infinity(); }
+  double total = 0;
+  for (std::size_t col = 0; col < n; ++col)
+  {
+    CompensatedDot dot;
+    for (std::size_t k = 0; k < n; ++k) dot.add(A[row*n+k], B[k*n+col]);
+    if (dot.status != CERTIFIED) status = UNCERTIFIABLE;
+    total = addUp(total, compensatedResidualUpper(dot, row == col ? 1.0 : 0.0, n));
+  }
+  if (!device_math::isFiniteBinary64(total)) status = UNCERTIFIABLE;
+  return total;
+}
+
+/// Preserve explicit real/imaginary signs and the original component-L1 norm.
+template<class Complex>
+QMC_PF_INV_HD inline double compensatedComplexRow(const Complex* A, const Complex* B,
+    std::size_t n, std::size_t row, std::uint32_t& status) noexcept
+{
+  if (!A || !B || !n || row >= n || n > std::numeric_limits<std::size_t>::max()/2)
+  { status = UNCERTIFIABLE; return infinity(); }
+  double total = 0;
+  for (std::size_t col = 0; col < n; ++col)
+  {
+    CompensatedDot re, im;
+    for (std::size_t k = 0; k < n; ++k)
+    {
+      const auto a = A[row*n+k], b = B[k*n+col];
+      re.add(a.x,b.x); re.add(-a.y,b.y); im.add(a.x,b.y); im.add(a.y,b.x);
+    }
+    if (re.status != CERTIFIED || im.status != CERTIFIED) status = UNCERTIFIABLE;
+    total = addUp(total, addUp(compensatedResidualUpper(re, row == col ? 1.0 : 0.0, 2*n),
+        compensatedResidualUpper(im, 0.0, 2*n)));
+  }
+  if (!device_math::isFiniteBinary64(total)) status = UNCERTIFIABLE;
   return total;
 }
 } // namespace math

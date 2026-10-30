@@ -23,7 +23,7 @@ inline void validateCanonicalInverseCertificates()
     if (!ok)
       throw std::runtime_error(why);
   };
-  constexpr std::size_t count = 8, n = 2;
+  constexpr std::size_t count = 12, n = 2;
   const std::array<double, 4> I{1, 0, 0, 1};
   std::vector<double> A(count * 4), B(count * 4);
   for (std::size_t h = 0; h < count; ++h)
@@ -33,7 +33,7 @@ inline void validateCanonicalInverseCertificates()
   }
   A[4] = 0x1p-40;
   B[4] = 0x1p40; // Accurate inverse of a very small pivot.
-  // Exact dyadic inverses separate a useful positive from a roundoff-wide negative.
+  // Exact dyadic inverses separate a useful positive from a roundoff-refined positive.
   const auto dependence = [&](std::size_t h, int power) {
     const double e = std::ldexp(1., -power), inv = std::ldexp(1., power);
     const std::array<double, 4> a{1, 1, 1, 1 + e}, b{1 + inv, -inv, -inv, inv};
@@ -46,6 +46,17 @@ inline void validateCanonicalInverseCertificates()
   A[20] = std::numeric_limits<double>::quiet_NaN();
   B[24] = std::numeric_limits<double>::infinity();
   A[29] = std::numeric_limits<double>::denorm_min();
+  for (std::size_t h = 8; h < 11; ++h)
+  {
+    dependence(h, 30);
+    const double scale = h == 8 ? 0x1p-419 : h == 9 ? 0x1p420 : 0x1p451;
+    for (std::size_t i = 0; i < 4; ++i) { A[4*h+i] *= scale; B[4*h+i] /= scale; }
+  }
+  // Nonzero FMA product residual: exact stored AB differs from I by2^-28.
+  const double x=0x1p26+.5, y=1-0x1p-27, z=1+0x1p26;
+  const std::array<double,4> productA{1,x,y,z}, productB{z,-x,-y,1};
+  std::copy(productA.begin(), productA.end(), A.begin()+44);
+  std::copy(productB.begin(), productB.end(), B.begin()+44);
   DeviceBuffer<double> da(A.size()), db(B.size());
   DeviceBuffer<cert::Result> output(count);
   da.upload(A.data(), A.size());
@@ -68,11 +79,16 @@ inline void validateCanonicalInverseCertificates()
   const auto verify = [&](const auto& results) {
     for (std::size_t h = 0; h < 3; ++h)
       require(cert::isCertified(results[h]), "Accurate canonical inverse was rejected by copied pivot heuristic");
-    require(results[3].status == cert::BOUND_EXCEEDED, "Roundoff-dominated dependence was certified");
+    require(cert::isCertified(results[3]), "Exact cancellation-heavy inverse did not receive compensated certification");
     require(!cert::isCertified(results[4]), "Corrupt inverse was certified");
     require(results[5].status == cert::NONFINITE_INPUT && results[6].status == cert::NONFINITE_INPUT,
             "Nonfinite inverse certificate succeeded");
     require(results[7].status == cert::UNCERTIFIABLE, "Unsupported subnormal input was certified");
+    require(cert::isCertified(results[8]) && cert::isCertified(results[9]),
+            "Safe scaled cancellation-heavy inverse was rejected");
+    require(results[10].status == cert::BOUND_EXCEEDED, "Unsafe refinement range changed fast rejection");
+    require(cert::isCertified(results[11]) && results[11].rho_upper >= 0x1p-28 && results[11].rho_upper < 0x1p-27,
+            "Compensated device product-error enclosure is incorrect");
   };
   verify(actual);
   std::vector<cuDoubleComplex> ca(A.size()), cb(B.size());
@@ -81,6 +97,13 @@ inline void validateCanonicalInverseCertificates()
     ca[i] = make_cuDoubleComplex(A[i], 0);
     cb[i] = make_cuDoubleComplex(B[i], 0);
   }
+  // Nonzero real/imaginary cancellation exercises both compensated component dots.
+  for (std::size_t h : {std::size_t(3), std::size_t(8), std::size_t(9), std::size_t(10), std::size_t(11)})
+    for (std::size_t i=0; i<4; ++i)
+    {
+      ca[4*h+i] = make_cuDoubleComplex(A[4*h+i], A[4*h+i]);
+      cb[4*h+i] = make_cuDoubleComplex(B[4*h+i]/2, -B[4*h+i]/2);
+    }
   // A non-real accurate low-pivot pair exercises both component dots.
   ca[4] = make_cuDoubleComplex(0, 0x1p-40);
   cb[4] = make_cuDoubleComplex(0, -0x1p40);
@@ -108,7 +131,7 @@ inline void validateCanonicalInverseCertificates()
   require(before.live_bytes == after.live_bytes && before.allocation_calls == after.allocation_calls,
           "Warm inverse certificate allocated numeric storage");
   std::cout << "PASS canonical inverse certificate fixed_AB=1 accurate_low_pivot=allowed corrupt_inverse=reject"
-               " roundoff_bound=reject real_complex=1 nonfinite_unknown=reject warm_DeviceBuffer_delta=0"
+               " roundoff_refinement=pass safe_range_boundaries=1 unsafe_range=reject real_complex=1 nonfinite_unknown=reject warm_DeviceBuffer_delta=0"
                " mixed_jet_accuracy_claim=0\n";
 }
 } // namespace qmcplusplus::psiformer::device
