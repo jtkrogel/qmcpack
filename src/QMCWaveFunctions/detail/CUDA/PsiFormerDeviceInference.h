@@ -3225,6 +3225,7 @@ inline CanonicalRealHeadCost estimateCanonicalRealHeadCost(const PsiFormerExecut
     cost.host_bytes = add(cost.host_bytes, bytes);
   cost.device_bytes = add(cost.device_bytes, checkedDeviceBytes<inverse_certificate::Result>(factors));
   cost.host_bytes = add(cost.host_bytes, checkedDeviceBytes<inverse_certificate::Result>(factors));
+  cost.host_bytes = add(cost.host_bytes, checkedDeviceBytes<unsigned char>(batch));
   return cost;
 }
 
@@ -3282,6 +3283,8 @@ public:
     result.weights_ = storage_->graph->normalized_.data(); result.factors_ = storage_->graph->factors_.data();
     result.combinations_ = storage_->graph->combinations_.data(); result.phase_ = storage_->graph->phase_.data();
     result.log_ = storage_->graph->output_.data(); result.log_stride_ = storage_->graph->final_.output.configuration_stride;
+    result.derivative_sensitive_ = storage_->derivative_sensitive.data();
+    result.electrons_ = state_->electrons; result.determinants_ = state_->determinants;
     result.validate(state_->image, state_->model_version, &queue_, state_->count, state_->electrons, state_->determinants);
     return result;
   }
@@ -3335,7 +3338,8 @@ public:
     auto bytes = storage_->graph->hostWorkspaceBytes();
     for (auto amount : {checkedDeviceBytes<device_determinant::FactorizationMetadata>(storage_->factors.capacity()),
         checkedDeviceBytes<device_determinant::CombinationMetadata>(storage_->sums.capacity()),
-        checkedDeviceBytes<inverse_certificate::Result>(storage_->host_inverse_quality.capacity())})
+        checkedDeviceBytes<inverse_certificate::Result>(storage_->host_inverse_quality.capacity()),
+        checkedDeviceBytes<unsigned char>(storage_->derivative_sensitive.capacity())})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Canonical REAL HOST inventory overflow");
     return bytes;
   }
@@ -3356,6 +3360,7 @@ private:
     std::vector<device_determinant::CombinationMetadata> sums;
     DeviceBuffer<inverse_certificate::Result> inverse_quality;
     std::vector<inverse_certificate::Result> host_inverse_quality;
+    std::vector<unsigned char> derivative_sensitive;
   };
 
   /// Construct the exact admitted inventory with no reverse/JVP or per-request numeric allocation.
@@ -3373,6 +3378,7 @@ private:
     storage_->factors.resize(channels); storage_->sums.resize(capacity);
     storage_->inverse_quality.reserveNamed(channels, "CanonicalRealHead::inverse_quality", __FILE__, __LINE__);
     storage_->host_inverse_quality.resize(channels);
+    storage_->derivative_sensitive.resize(capacity);
     state_->image = std::move(image); state_->storage = storage_; state_->queue = &queue;
     state_->model_version = state_->image->version(); state_->electrons = shape.electrons();
     state_->determinants = shape.determinants;
@@ -3404,6 +3410,7 @@ private:
     storage_->graph->factors_.download(storage_->factors.data(), channels);
     storage_->graph->combinations_.download(storage_->sums.data(), count);
     std::size_t bad_factors = 0, bad_inverse = 0, small_pivots = 0, bad_sums = 0;
+    std::fill_n(storage_->derivative_sensitive.begin(), count, 0);
     bool inverse_checked = false;
     double worst_inverse_rho = 0.0, worst_inverse_relative = 0.0;
     for (std::size_t i = 0; i < channels; ++i)
@@ -3415,7 +3422,12 @@ private:
           !device_math::isFiniteBinary64(factor.minimum_scaled_pivot) ||
           !device_math::isFiniteBinary64(factor.maximum_scaled_pivot))
         ++bad_factors;
-      if (factor.minimum_scaled_pivot < 1.0e-3) ++small_pivots; // Report only: A is FP64, not an FP32 proposal.
+      if (factor.minimum_scaled_pivot < 1.0e-3)
+      {
+        ++small_pivots;
+        // Advisory selects derivative arithmetic; it never rejects a certified FP64 inverse.
+        storage_->derivative_sensitive[i / determinants] = 1;
+      }
     }
     for (std::size_t i = 0; i < count; ++i)
     {

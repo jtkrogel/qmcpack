@@ -80,6 +80,19 @@ public:
   /// Return the complete checked coordinate-element extent of this borrow.
   std::size_t elements() const noexcept { return count_ * electrons_ * 3; }
 
+  /// Borrow a checked subinterval without changing source generation or reading coordinates.
+  PackedDeviceCoordinatesView subview(std::size_t begin, std::size_t count) const
+  {
+    const auto state = state_.lock();
+    if (!state) throw std::invalid_argument("Device coordinate subview source expired");
+    std::lock_guard lock(state->mutex);
+    if (!state->ready || state.get() != identity_ || state->generation != generation_ ||
+        begin_ > state->live || count_ > state->live - begin_ ||
+        !count || begin > count_ || count > count_ - begin)
+      throw std::invalid_argument("Device coordinate subview is stale or outside its parent interval");
+    return PackedDeviceCoordinatesView(state, begin_ + begin, count);
+  }
+
   /// Identify the device that owns the source allocation.
   int deviceOrdinal() const noexcept { return device_; }
 
