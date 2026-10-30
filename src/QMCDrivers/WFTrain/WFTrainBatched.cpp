@@ -41,6 +41,7 @@
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
@@ -64,6 +65,7 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
+#include "Utilities/NativeTimerScope.h"
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceInference.h"
 #ifdef QMC_COMPLEX
@@ -3658,6 +3660,18 @@ void WFTrainBatched::run()
   if (selected_provider_ == nullptr)
     throw UniformCommunicateError("WFTrainBatched: process() must select a provider before run()");
 
+  std::unique_ptr<wftrain::TrainingWorkCounters> work_counter_storage;
+  if (wftrain::TrainingWorkCounters::traceEnabled())
+    work_counter_storage = std::make_unique<wftrain::TrainingWorkCounters>();
+  auto* work_counters = work_counter_storage.get();
+  auto record_work = [&](const char* phase, long long iteration,
+                         std::uint64_t factor_builds, std::uint64_t inverse_builds) {
+    if (work_counters)
+      wftrain::TrainingWorkCounterTrace::instance().record(
+          phase, iteration, work_counters->snapshotAndReset(), factor_builds, inverse_builds,
+          "WFTrainBatched.cpp", get_root_name().c_str());
+  };
+
   // Declare before every iteration owner: snapshots and callbacks die before these driver-phase anchors.
   std::vector<std::shared_ptr<PsiFormerGpuScoreLaneAnchor>> score_lane_anchors;
   std::vector<std::shared_ptr<PsiFormerComplexGpuScoreLaneAnchor>> complex_score_lane_anchors;
@@ -4112,6 +4126,12 @@ void WFTrainBatched::run()
         components.push_back(*wf.getOrbitals()[0]);
       const auto& leader = dynamic_cast<const PsiFormerWF&>(components[0].get());
       resident_observations = leader.observeResidentOpenAccepted({components[0], components});
+      if (work_counters)
+      {
+        const bool ecp_bearing = crowd.get_walker_hamiltonians()[0].get().hasPhysicalNLPP();
+        const auto samples = resident_observations->sampleCount();
+        work_counters->addHamiltonianEvaluations(samples, ecp_bearing ? samples : 0);
+      }
       const auto precision = app_log().precision();
       app_log() << std::setprecision(std::numeric_limits<double>::max_digits10);
       for (std::size_t sample = 0; sample < resident_observations->sampleCount(); ++sample)
@@ -4139,7 +4159,9 @@ void WFTrainBatched::run()
       timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
       [this](Crowd& crowd, std::string_view location) {
         checkLogAndGL(crowd, location, serializing_crowd_walkers_);
-      }};
+      },
+      &phase_timers_.spatial_evaluation_api, &phase_timers_.hamiltonian_evaluation_api,
+      work_counters};
 
   wftrain::DistributedReductionPolicy reduction_policy;
   reduction_policy.maximum_chunk_size = training_input_.getParameterChunkSize();
@@ -4452,6 +4474,9 @@ void WFTrainBatched::run()
   if (resident_device_authority_ && resident_adam_budget)
     first_order_optimizer->seedResidentDeviceAdam(cold_moment_allowance); // Seed BEFORE vacating initial/restart HOST state.
 
+  std::uint64_t last_factor_generation_builds = kfac_optimizer ? kfac_optimizer->factorGenerationBuilds() : 0;
+  std::uint64_t last_inverse_generation_builds = kfac_optimizer ? kfac_optimizer->inverseGenerationBuilds() : 0;
+
   // Validate the entire existing output family before sampling or opening files.
   // An older checkpoint may branch under a new root, but cannot replace future data.
   const std::filesystem::path training_directory(get_root_name() + ".training");
@@ -4557,25 +4582,36 @@ void WFTrainBatched::run()
     const bool value_only_warmup = warmup_pending &&
         !vmcdriver_input_.get_use_drift() &&
         qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF;
-    const auto initialize = value_only_warmup
-        ? initialLogEvaluationWarmupValueOnly
-        : training_input_.samplesOrbitalStudent() || warmup_pending
-            ? initialLogEvaluationWavefunctionOnly
-            : resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
-    crowd_task(crowds_.size(), initialize, crowds_, step_context_refs,
-               serializing_crowd_walkers_);
+    const bool evaluate_initial_energy = !training_input_.samplesOrbitalStudent() && !warmup_pending;
+    const bool deterministic_initial_energy = resumed && evaluate_initial_energy;
+    const auto request = value_only_warmup ? WaveFunctionEvaluationRequest::VALUE_ONLY
+                                           : WaveFunctionEvaluationRequest::FULL_SPATIAL;
+    {
+      NativeTimerScope initial_evaluation_timer(phase_timers_.initial_evaluation);
+      crowd_task(crowds_.size(), initialLogEvaluationWithContext, crowds_, step_context_refs,
+          serializing_crowd_walkers_, deterministic_initial_energy, evaluate_initial_energy, request,
+          &phase_timers_.spatial_evaluation_api, &phase_timers_.hamiltonian_evaluation_api,
+          work_counters);
+    }
+    record_work("initial_evaluation", -1, 0, 0);
     print_mem("WFTrainBatched after initialLogEvaluation", app_summary());
   }
   enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
   ScopedTimer production_timer(timers_.production_timer);
   if (!resumed)
-    for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
+  {
     {
-      ScopedTimer step_timer(timers_.run_steps_timer);
-      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
-                 sampling_timers, rngs_, crowds_);
+      NativeTimerScope initial_warmup_timer(phase_timers_.initial_warmup);
+      for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
+      {
+        ScopedTimer step_timer(timers_.run_steps_timer);
+        crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
+                   sampling_timers, rngs_, crowds_);
+      }
     }
+    record_work("initial_warmup", -1, 0, 0);
+  }
   myComm->barrier();
 
   int completed_blocks = 0;
@@ -4666,6 +4702,7 @@ void WFTrainBatched::run()
        iteration < num_iterations; ++iteration)
   {
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
+    NativeTimerScope completed_iteration_timer(phase_timers_.completed_iteration_wall);
     Timer iteration_wall;
     const auto sample_version = training_state.parameter_version;
     if (resident_device_authority_)
@@ -4700,13 +4737,18 @@ void WFTrainBatched::run()
       throw UniformCommunicateError("WFTrainBatched: cannot start scalar-only iteration output");
     // This equilibration is separate from the initial qmc warmup. Warmup moves
     // honor substeps but contribute neither retained samples nor scalar statistics.
-    for (std::size_t warmup = 0; warmup < training_input_.getWarmupSteps(); ++warmup)
     {
-      ScopedTimer step_timer(timers_.run_steps_timer);
-      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
-                 sampling_timers, rngs_, crowds_);
-      ++global_step;
+      NativeTimerScope iteration_warmup_timer(phase_timers_.iteration_warmup);
+      for (std::size_t warmup = 0; warmup < training_input_.getWarmupSteps(); ++warmup)
+      {
+        ScopedTimer step_timer(timers_.run_steps_timer);
+        crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
+                   sampling_timers, rngs_, crowds_);
+        ++global_step;
+      }
     }
+    if (training_input_.getWarmupSteps() > 0)
+      record_work("iteration_warmup", iteration, 0, 0);
 
     std::vector<RetainedCrowdSamples> retained_samples;
     std::size_t retained_configuration_bytes = checkedMemoryAdd(complex_affine_score_bytes,
@@ -4749,6 +4791,8 @@ void WFTrainBatched::run()
                   (resident_adam_budget || resident_sr_budget.first || kfac_single_replay)
                       ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
               const auto& snapshot = retained_samples.back();
+              if (work_counters)
+                work_counters->addRetainedConfigurations(snapshot.particles.size());
               if (snapshot.replay_version)
                 retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
                     checkedMemoryAdd(sizeof(*snapshot.replay_version), checkedMemoryMultiply(
@@ -4779,6 +4823,7 @@ void WFTrainBatched::run()
       wlog_manager.writeBuffers();
       ++completed_blocks;
     }
+    record_work("iteration_sampling", iteration, 0, 0);
 
     int scalar_write_failed = 0;
     try { if (sampling_state.evaluate_energy) estimator_manager_->stopDriverRun(); }
@@ -6297,7 +6342,7 @@ void WFTrainBatched::run()
     if (selected_alpha != 0.0)
     {
       if (!resident_open_observation_)
-        refreshPublishedParameters(iteration_result.parameter_version);
+        refreshPublishedParameters(iteration_result.parameter_version, iteration, work_counters);
       ++accepted_updates;
     }
     if (resident_device_authority_)
@@ -6481,8 +6526,22 @@ void WFTrainBatched::run()
           auto& h = hamiltonians[sample].get();
           auto& walker = crowd.get_walkers()[sample].get();
           p.update();
-          wf.evaluateLog(p);
-          const double energy = h.evaluate(wf, p);
+          {
+            NativeTimerScope spatial_timer(phase_timers_.spatial_evaluation_api);
+            wf.evaluateLog(p);
+          }
+          if (work_counters)
+          {
+            work_counters->addRequestedProducts(true, true, true);
+            work_counters->addComputedProducts(true, true, true);
+          }
+          double energy;
+          {
+            NativeTimerScope hamiltonian_timer(phase_timers_.hamiltonian_evaluation_api);
+            energy = h.evaluate(wf, p);
+          }
+          if (work_counters)
+            work_counters->addHamiltonianEvaluations(1, h.hasPhysicalNLPP() ? 1 : 0);
           p.saveWalker(walker);
           walker.resetProperty(wf.getLogPsi(), wf.getPhase(), energy);
           h.saveProperty(walker.getPropertyBase());
@@ -6490,6 +6549,7 @@ void WFTrainBatched::run()
           walker.wasTouched = false;
         }
         resident_host_dirty = false;
+        record_work("checkpoint_cold_refresh", iteration, 0, 0);
         app_log() << "Resident open cold refresh complete: parameter_version="
                   << training_state.parameter_version << std::endl;
       }
@@ -6510,6 +6570,13 @@ void WFTrainBatched::run()
                   << " completed iteration(s) under " << get_root_name()
                   << std::endl;
     }
+    const auto factor_generation_builds = kfac_optimizer ? kfac_optimizer->factorGenerationBuilds() : 0;
+    const auto inverse_generation_builds = kfac_optimizer ? kfac_optimizer->inverseGenerationBuilds() : 0;
+    record_work("iteration_update", iteration,
+        factor_generation_builds - last_factor_generation_builds,
+        inverse_generation_builds - last_inverse_generation_builds);
+    last_factor_generation_builds = factor_generation_builds;
+    last_inverse_generation_builds = inverse_generation_builds;
     if (stop_requested)
     {
       if (myComm->rank() == 0)
@@ -6912,7 +6979,8 @@ void WFTrainBatched::validateHamiltonianForTraining()
         "at most one consistently registered nonlocal ECP operator");
 }
 
-void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
+void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, int iteration,
+                                               wftrain::TrainingWorkCounters* work_counters)
 {
   NativeTimerScope timer(phase_timers_.refresh);
   psiformer::memory::Phase memory_timer("refresh");
@@ -6939,10 +7007,10 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
   {
     ParallelExecutor<> refresh_task;
     auto step_context_refs = getContextForStepsRefs();
-    const auto refresh = training_input_.samplesOrbitalStudent()
-        ? initialLogEvaluationWavefunctionOnly : initialLogEvaluation;
-    refresh_task(crowds_.size(), refresh, crowds_, step_context_refs,
-                 serializing_crowd_walkers_);
+    refresh_task(crowds_.size(), initialLogEvaluationWithContext, crowds_, step_context_refs,
+        serializing_crowd_walkers_, false, !training_input_.samplesOrbitalStudent(),
+        WaveFunctionEvaluationRequest::FULL_SPATIAL, &phase_timers_.spatial_evaluation_api,
+        &phase_timers_.hamiltonian_evaluation_api, work_counters);
   }
   catch (...)
   {
@@ -6959,6 +7027,10 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
         "WFTrainBatched: another rank failed while refreshing published parameter version " +
         std::to_string(parameter_version));
   }
+  if (work_counters)
+    wftrain::TrainingWorkCounterTrace::instance().record(
+        "parameter_refresh", iteration, work_counters->snapshotAndReset(), 0, 0,
+        "WFTrainBatched.cpp", get_root_name().c_str());
   if (myComm->rank() == 0)
     app_log() << "WFTrain refreshed parameter version " << parameter_version
               << " across " << crowds_.size() << " crowd(s)" << std::endl;

@@ -9,6 +9,7 @@
 #include "QMCDrivers/WFTrain/WFTrainInferenceInput.h"
 #include "QMCDrivers/VMC/VMCBatchedSampling.h"
 #include "QMCDrivers/Crowd.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "Estimators/EstimatorManagerNew.h"
 #include "Concurrency/ParallelExecutor.hpp"
@@ -17,6 +18,7 @@
 #include "Message/CommOperators.h"
 #include <fstream>
 #include <functional>
+#include <memory>
 
 namespace qmcplusplus
 {
@@ -57,6 +59,16 @@ public:
 
   void run() override
   {
+    std::unique_ptr<wftrain::TrainingWorkCounters> work_counter_storage;
+    if (wftrain::TrainingWorkCounters::traceEnabled())
+      work_counter_storage = std::make_unique<wftrain::TrainingWorkCounters>();
+    auto* work_counters = work_counter_storage.get();
+    auto record_work = [&](const char* phase) {
+      if (work_counters)
+        wftrain::TrainingWorkCounterTrace::instance().record(
+            phase, static_cast<long long>(iteration_), work_counters->snapshotAndReset(), 0, 0,
+            "WFTrainInference.h", get_root_name().c_str());
+    };
     std::ofstream orbital_scalar;
     if (orbital_observer_)
     {
@@ -77,8 +89,20 @@ public:
     RefVector<ContextForSteps> refs;
     for (auto& context : contexts_)
       refs.push_back(*context);
-    const auto initialize = input_.evaluate_energy ? initialLogEvaluation : initialLogEvaluationWavefunctionOnly;
-    task(crowds_.size(), initialize, crowds_, refs, serializing_crowd_walkers_);
+    const bool warmup_pending = qmcdriver_input_.get_warmup_steps() > 0;
+    const bool value_only_warmup = warmup_pending && !input_.vmc.get_use_drift() &&
+        qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF;
+    const bool evaluate_initial_energy = input_.evaluate_energy && !warmup_pending;
+    const auto initial_request = value_only_warmup ? WaveFunctionEvaluationRequest::VALUE_ONLY
+                                                   : WaveFunctionEvaluationRequest::FULL_SPATIAL;
+    {
+      NativeTimerScope initial_evaluation_timer(timers_.initial_evaluation_timer);
+      task(crowds_.size(), initialLogEvaluationWithContext, crowds_, refs, serializing_crowd_walkers_,
+          false, evaluate_initial_energy, initial_request,
+          &timers_.spatial_evaluation_api_timer, &timers_.hamiltonian_evaluation_api_timer,
+          work_counters);
+    }
+    record_work("inference_initial_evaluation");
     VMCBatchedSampling::State state(qmcdriver_input_, input_.vmc, *drift_modifier_, population_,
                                     steps_per_block_, serializing_crowd_walkers_);
     state.evaluate_energy = input_.evaluate_energy;
@@ -89,7 +113,9 @@ public:
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
         [this](Crowd& crowd, std::string_view location) {
           checkLogAndGL(crowd, location, serializing_crowd_walkers_);
-        }};
+        },
+        &timers_.spatial_evaluation_api_timer, &timers_.hamiltonian_evaluation_api_timer,
+        work_counters};
     LoopTimer<> loop;
     // Do not create another RunTimeControl: its default stop-file cleanup must
     // not clear the outer training driver's stop request.
@@ -102,13 +128,18 @@ public:
       return stop;
     };
     bool stop = stopped();
-    for (int warmup = 0; warmup < qmcdriver_input_.get_warmup_steps() && !stop; ++warmup)
     {
-      loop.start();
-      task(crowds_.size(), VMCBatchedSampling::runWarmupStep, state, timers, rngs_, crowds_);
-      loop.stop();
-      stop = stopped();
+      NativeTimerScope initial_warmup_timer(timers_.initial_warmup_timer);
+      for (int warmup = 0; warmup < qmcdriver_input_.get_warmup_steps() && !stop; ++warmup)
+      {
+        loop.start();
+        task(crowds_.size(), VMCBatchedSampling::runWarmupStep, state, timers, rngs_, crowds_);
+        loop.stop();
+        stop = stopped();
+      }
     }
+    if (qmcdriver_input_.get_warmup_steps() > 0)
+      record_work("inference_warmup");
     int global_step = 0;
     for (int block = 0; block < qmcdriver_input_.get_max_blocks() && !stop; ++block)
     {
@@ -159,6 +190,7 @@ public:
       loop.stop();
       stop = stopped();
     }
+    record_work("inference_sampling");
     complete_ = completed_blocks_ == qmcdriver_input_.get_max_blocks();
     if (orbital_observer_)
       orbital_scalar.close();

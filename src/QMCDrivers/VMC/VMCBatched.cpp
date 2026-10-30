@@ -18,9 +18,13 @@
 #include "TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
+#include "Utilities/NativeTimerScope.h"
 #include "Particle/MCSample.h"
 #include "MemoryUsage.h"
 #include "WalkerLogManager.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
+
+#include <memory>
 
 namespace qmcplusplus
 {
@@ -114,6 +118,16 @@ size_t VMCBatched::compute_samples_per_rank(const size_t num_blocks,
 void VMCBatched::run()
 {
   IndexType num_blocks = qmcdriver_input_.get_max_blocks();
+  std::unique_ptr<wftrain::TrainingWorkCounters> work_counter_storage;
+  if (wftrain::TrainingWorkCounters::traceEnabled())
+    work_counter_storage = std::make_unique<wftrain::TrainingWorkCounters>();
+  auto* work_counters = work_counter_storage.get();
+  auto record_work = [&](const char* phase, long long iteration) {
+    if (work_counters)
+      wftrain::TrainingWorkCounterTrace::instance().record(
+          phase, iteration, work_counters->snapshotAndReset(), 0, 0,
+          "VMCBatched.cpp", get_root_name().c_str());
+  };
   //start the main estimator
   estimator_manager_->startDriverRun();
 
@@ -133,7 +147,8 @@ void VMCBatched::run()
       timers_.hamiltonian_timer,  timers_.collectables_timer, timers_.estimators_timer,
       [this](Crowd& crowd, std::string_view location) {
         checkLogAndGL(crowd, location, serializing_crowd_walkers_);
-      }};
+      },
+      &timers_.spatial_evaluation_api_timer, &timers_.hamiltonian_evaluation_api_timer, work_counters};
 
   LoopTimer<> vmc_loop;
   RunTimeControl<> runtimeControl(run_time_manager, project_data_.getMaxCPUSeconds(), project_data_.getTitle(),
@@ -146,12 +161,16 @@ void VMCBatched::run()
     const bool value_only_warmup = qmcdriver_input_.get_warmup_steps() > 0 &&
         !vmcdriver_input_.get_use_drift() &&
         qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF;
-    const auto initialize = value_only_warmup
-        ? initialLogEvaluationWarmupValueOnly
-        : qmcdriver_input_.get_warmup_steps() > 0
-            ? initialLogEvaluationWavefunctionOnly
-            : initialLogEvaluation;
-    section_start_task(crowds_.size(), initialize, crowds_, step_contexts_refs, serializing_crowd_walkers_);
+    const auto request = value_only_warmup ? WaveFunctionEvaluationRequest::VALUE_ONLY
+                                           : WaveFunctionEvaluationRequest::FULL_SPATIAL;
+    {
+      NativeTimerScope initial_evaluation_timer(timers_.initial_evaluation_timer);
+      section_start_task(crowds_.size(), initialLogEvaluationWithContext, crowds_, step_contexts_refs,
+          serializing_crowd_walkers_, false, qmcdriver_input_.get_warmup_steps() == 0,
+          request, &timers_.spatial_evaluation_api_timer, &timers_.hamiltonian_evaluation_api_timer,
+          work_counters);
+    }
+    record_work("initial_evaluation", -1);
     print_mem("VMCBatched after initialLogEvaluation", app_summary());
     if (qmcdriver_input_.get_measure_imbalance())
       measureImbalance("InitialLogEvaluation");
@@ -164,11 +183,15 @@ void VMCBatched::run()
   {
     // Run warm-up steps
     Timer warmup_timer;
-    for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
     {
-      ScopedTimer local_timer(timers_.run_steps_timer);
-      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, vmc_state, sampling_timers, rngs_, crowds_);
+      NativeTimerScope initial_warmup_timer(timers_.initial_warmup_timer);
+      for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
+      {
+        ScopedTimer local_timer(timers_.run_steps_timer);
+        crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, vmc_state, sampling_timers, rngs_, crowds_);
+      }
     }
+    record_work("initial_warmup", -1);
 
     print_mem("VMCBatched after Warmup", app_log());
     if (qmcdriver_input_.get_measure_imbalance())
@@ -210,8 +233,11 @@ void VMCBatched::run()
           {
             samples_.appendSample(MCSample(*walker));
           }
+          if (work_counters)
+            work_counters->addRetainedConfigurations(elec_psets.size());
         }
       }
+      record_work("production_block", block);
 
       print_mem("VMCBatched after a block", app_debug_stream());
       if (qmcdriver_input_.get_measure_imbalance())

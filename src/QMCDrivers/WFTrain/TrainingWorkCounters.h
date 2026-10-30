@@ -32,10 +32,13 @@ struct TrainingWorkCountSnapshot
   std::uint64_t requested_value_product_batches = 0;
   std::uint64_t requested_gradient_product_batches = 0;
   std::uint64_t requested_laplacian_product_batches = 0;
+  /// Accepted-state FULL VGL replay needed before production when products are invalid.
+  std::uint64_t pre_move_full_spatial_handoff_batches = 0;
   std::uint64_t computed_value_product_batches = 0;
   std::uint64_t computed_gradient_product_batches = 0;
   std::uint64_t computed_laplacian_product_batches = 0;
   std::uint64_t computed_product_status_unknown_batches = 0;
+  /// Successful physical local-energy evaluations; auxiliary component saves are excluded.
   std::uint64_t hamiltonian_walker_evaluations = 0;
   std::uint64_t ecp_bearing_hamiltonian_walker_evaluations = 0;
   std::uint64_t retained_configurations = 0;
@@ -83,6 +86,10 @@ public:
   {
     computed_product_status_unknown_batches_.fetch_add(1, std::memory_order_relaxed);
   }
+  void addPreMoveFullSpatialHandoffBatch() noexcept
+  {
+    pre_move_full_spatial_handoff_batches_.fetch_add(1, std::memory_order_relaxed);
+  }
   void addHamiltonianEvaluations(std::uint64_t walkers, std::uint64_t ecp_bearing_walkers = 0) noexcept
   {
     hamiltonian_walker_evaluations_.fetch_add(walkers, std::memory_order_relaxed);
@@ -103,6 +110,7 @@ public:
             requested_value_product_batches_.exchange(0, std::memory_order_relaxed),
             requested_gradient_product_batches_.exchange(0, std::memory_order_relaxed),
             requested_laplacian_product_batches_.exchange(0, std::memory_order_relaxed),
+            pre_move_full_spatial_handoff_batches_.exchange(0, std::memory_order_relaxed),
             computed_value_product_batches_.exchange(0, std::memory_order_relaxed),
             computed_gradient_product_batches_.exchange(0, std::memory_order_relaxed),
             computed_laplacian_product_batches_.exchange(0, std::memory_order_relaxed),
@@ -130,6 +138,7 @@ private:
   std::atomic<std::uint64_t> requested_value_product_batches_{0};
   std::atomic<std::uint64_t> requested_gradient_product_batches_{0};
   std::atomic<std::uint64_t> requested_laplacian_product_batches_{0};
+  std::atomic<std::uint64_t> pre_move_full_spatial_handoff_batches_{0};
   std::atomic<std::uint64_t> computed_value_product_batches_{0};
   std::atomic<std::uint64_t> computed_gradient_product_batches_{0};
   std::atomic<std::uint64_t> computed_laplacian_product_batches_{0};
@@ -201,6 +210,7 @@ public:
             << ",\"requested_value_product_batches\":" << counts.requested_value_product_batches
             << ",\"requested_gradient_product_batches\":" << counts.requested_gradient_product_batches
             << ",\"requested_laplacian_product_batches\":" << counts.requested_laplacian_product_batches
+            << ",\"pre_move_full_spatial_handoff_batches\":" << counts.pre_move_full_spatial_handoff_batches
             << ",\"computed_value_product_batches\":" << counts.computed_value_product_batches
             << ",\"computed_gradient_product_batches\":" << counts.computed_gradient_product_batches
             << ",\"computed_laplacian_product_batches\":" << counts.computed_laplacian_product_batches

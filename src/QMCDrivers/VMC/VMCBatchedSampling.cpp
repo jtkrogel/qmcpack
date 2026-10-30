@@ -18,8 +18,10 @@
 #include "QMCDrivers/WalkerProperties.h"
 #include "QMCDrivers/VMC/ElectronSubsetSelector.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
 #include "QMCWaveFunctions/TWFGrads.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "Utilities/NativeTimerScope.h"
 #include "TauParams.hpp"
 #include <Hdispatcher.h>
 #include <PSdispatcher.h>
@@ -36,6 +38,44 @@ using MCPWalker = MCPopulation::MCPWalker;
 
 namespace
 {
+
+class OptionalNativeTimerScope
+{
+public:
+  explicit OptionalNativeTimerScope(NewTimer* timer)
+  {
+    if (timer)
+      scope_.emplace(*timer);
+  }
+
+private:
+  std::optional<NativeTimerScope> scope_;
+};
+
+void recordEvaluationProducts(wftrain::TrainingWorkCounters* counters,
+                              WaveFunctionEvaluationRequest request)
+{
+  if (!counters)
+    return;
+  switch (request)
+  {
+  case WaveFunctionEvaluationRequest::VALUE_ONLY:
+    counters->addRequestedProducts(true, false, false);
+    counters->addComputedProducts(true, false, false);
+    // Generic wavefunction components may implement a reduced request with FULL products.
+    counters->addUnknownComputedProducts();
+    break;
+  case WaveFunctionEvaluationRequest::GRADIENT_ONLY:
+    counters->addRequestedProducts(true, true, false);
+    counters->addComputedProducts(true, true, false);
+    counters->addUnknownComputedProducts();
+    break;
+  case WaveFunctionEvaluationRequest::FULL_SPATIAL:
+    counters->addRequestedProducts(true, true, true);
+    counters->addComputedProducts(true, true, true);
+    break;
+  }
+}
 
 /// Discover the one explicit PsiFormer-only route without changing default moves.
 const PsiFormerWF* deviceSamplingComponent(const TrialWaveFunction& wavefunction)
@@ -159,6 +199,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   const TWFdispatcher twf_dispatcher(!sft.serializing_crowd_walkers);
   const Hdispatcher ham_dispatcher(!sft.serializing_crowd_walkers);
   auto& walkers = crowd.get_walkers();
+  const auto accepted_before = crowd.get_accept();
+  const auto rejected_before = crowd.get_reject();
   const RefVectorWithLeader<ParticleSet> walker_elecs(crowd.get_walker_elecs()[0], crowd.get_walker_elecs());
   const RefVectorWithLeader<TrialWaveFunction> walker_twfs(crowd.get_walker_twfs()[0], crowd.get_walker_twfs());
 
@@ -179,7 +221,15 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
                         !wavefunction.hasValidLaplacians();
                   });
   if (missing_full_products)
-    twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, false);
+  {
+    {
+      OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+      twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, false);
+    }
+    recordEvaluationProducts(timers.work_counters, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+    if (!warmup && timers.work_counters)
+      timers.work_counters->addPreMoveFullSpatialHandoffBatch();
+  }
   if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD)
     timers.check_log_and_gl(crowd, "checkGL_after_load");
 
@@ -238,6 +288,14 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
             for (std::size_t d = 0; d < 3; ++d)
               result[d] = drift[d];
           }, sft.resident_device_observation, particles_per_move, select_indices);
+      if (timers.work_counters)
+      {
+        timers.work_counters->addRatioApiBatches();
+        timers.work_counters->addRequestedProducts(true, use_drift, false);
+        timers.work_counters->addComputedProducts(true, use_drift, false);
+        if (use_drift)
+          timers.work_counters->addDriftGradientApiBatches();
+      }
       if (selector)
         *subset_cursor = selector->cyclicCursor();
       for (std::size_t count = 0; count < counts.first; ++count)
@@ -324,10 +382,18 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
           }
 
           const MCMultiParticleMoves<CoordsType::POS> moves(walker_offsets, selected_indices, proposed_positions);
-          TrialWaveFunction::mw_evaluateMultiParticleMove(
-              walker_twfs, walker_elecs, moves, log_ratios,
-              warmup && !use_drift ? WaveFunctionEvaluationRequest::VALUE_ONLY
-                                   : WaveFunctionEvaluationRequest::FULL_SPATIAL);
+          const auto request = warmup && !use_drift
+              ? WaveFunctionEvaluationRequest::VALUE_ONLY : WaveFunctionEvaluationRequest::FULL_SPATIAL;
+          {
+            OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+            TrialWaveFunction::mw_evaluateMultiParticleMove(
+                walker_twfs, walker_elecs, moves, log_ratios, request);
+          }
+          if (timers.work_counters)
+          {
+            timers.work_counters->addRatioApiBatches();
+            recordEvaluationProducts(timers.work_counters, request);
+          }
 
           std::fill(log_gf.begin(), log_gf.end(), RealType{});
           std::fill(log_gb.begin(), log_gb.end(), RealType{});
@@ -432,7 +498,16 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
             if (use_drift)
             {
-              twf_dispatcher.flex_evalGrad(walker_twfs, walker_elecs, iat, grads_now);
+              {
+                OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+                twf_dispatcher.flex_evalGrad(walker_twfs, walker_elecs, iat, grads_now);
+              }
+              if (timers.work_counters)
+              {
+                timers.work_counters->addDriftGradientApiBatches();
+                timers.work_counters->addRequestedProducts(false, true, false);
+                timers.work_counters->addComputedProducts(false, true, false);
+              }
               sft.drift_modifier.getDrifts(taus, grads_now, drifts);
               drifts += deltas;
             }
@@ -444,7 +519,17 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
             // This is inelegant
             if (use_drift)
             {
-              twf_dispatcher.flex_calcRatioGrad(walker_twfs, walker_elecs, iat, ratios, grads_new);
+              {
+                OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+                twf_dispatcher.flex_calcRatioGrad(walker_twfs, walker_elecs, iat, ratios, grads_new);
+              }
+              if (timers.work_counters)
+              {
+                timers.work_counters->addRatioApiBatches();
+                timers.work_counters->addDriftGradientApiBatches();
+                timers.work_counters->addRequestedProducts(true, true, false);
+                timers.work_counters->addComputedProducts(true, true, false);
+              }
 
               computeLogGreensFunction(deltas, taus, log_gf);
 
@@ -455,7 +540,18 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
               computeLogGreensFunction(drifts_reverse, taus, log_gb);
             }
             else
-              twf_dispatcher.flex_calcRatio(walker_twfs, walker_elecs, iat, ratios);
+            {
+              {
+                OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+                twf_dispatcher.flex_calcRatio(walker_twfs, walker_elecs, iat, ratios);
+              }
+              if (timers.work_counters)
+              {
+                timers.work_counters->addRatioApiBatches();
+                timers.work_counters->addRequestedProducts(true, false, false);
+                timers.work_counters->addComputedProducts(true, false, false);
+              }
+            }
 
             std::transform(ratios.begin(), ratios.end(), prob.begin(), [](auto ratio) { return std::norm(ratio); });
 
@@ -484,6 +580,13 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
       ps_dispatcher.flex_donePbyP(walker_elecs);
     }
+  }
+
+  if (timers.work_counters)
+  {
+    timers.work_counters->addProposalRounds(static_cast<std::uint64_t>(sft.qmcdrv_input.get_sub_steps()));
+    timers.work_counters->addMoveDecisions(crowd.get_accept() - accepted_before,
+                                           crowd.get_reject() - rejected_before);
   }
 
   if (sft.resident_device_observation)
@@ -518,11 +621,23 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
         reuse_full = canReuseRejectedDeviceFullState(walker_twfs[walker], walker_elecs[walker],
                                                     device_accepted_moves, recompute);
       if (!reuse_full)
-        twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
+      {
+        {
+          OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+          twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
+        }
+        recordEvaluationProducts(timers.work_counters, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+      }
     }
     else if (!(warmup && !sft.vmcdrv_input.get_use_drift() &&
                sft.qmcdrv_input.get_debug_checks() == DriverDebugChecks::ALL_OFF))
-      twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
+    {
+      {
+        OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);
+        twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
+      }
+      recordEvaluationProducts(timers.work_counters, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+    }
     if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_MOVES)
       timers.check_log_and_gl(crowd, "checkGL_after_moves");
     ps_dispatcher.flex_saveWalker(walker_elecs, walkers);
@@ -542,8 +657,17 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   {
     ScopedTimer hamiltonian_local_timer(timers.hamiltonian);
     ResourceCollectionTeamLock<QMCHamiltonian> hams_res_lock(crowd.getSharedResource().ham_res, walker_hamiltonians);
-    std::vector<QMCHamiltonian::FullPrecRealType> local_energies(
-        ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs));
+    std::vector<QMCHamiltonian::FullPrecRealType> local_energies;
+    {
+      OptionalNativeTimerScope hamiltonian_timer(timers.hamiltonian_evaluation_api);
+      local_energies = ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
+    }
+    if (timers.work_counters)
+    {
+      const auto ecp_walkers = std::count_if(walker_hamiltonians.begin(), walker_hamiltonians.end(),
+          [](const QMCHamiltonian& hamiltonian) { return hamiltonian.hasPhysicalNLPP(); });
+      timers.work_counters->addHamiltonianEvaluations(local_energies.size(), ecp_walkers);
+    }
 
     auto resetSigNLocalEnergy = [](MCPWalker& walker, TrialWaveFunction& twf, auto& local_energy) {
       walker.resetProperty(twf.getLogPsi(), twf.getPhase(), local_energy);

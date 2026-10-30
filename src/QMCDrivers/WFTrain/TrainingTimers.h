@@ -23,6 +23,8 @@ struct TrainingTimers
   NewTimer& initial_warmup = createGlobalTimer("WFTrain::initial_warmup", timer_level_fine);
   NewTimer& iteration_warmup = createGlobalTimer("WFTrain::iteration_warmup", timer_level_fine);
   NewTimer& completed_iteration_wall = createGlobalTimer("WFTrain::completed_iteration_wall", timer_level_fine);
+  NewTimer& spatial_evaluation_api = createGlobalTimer("WFTrain::spatial_evaluation_api", timer_level_fine);
+  NewTimer& hamiltonian_evaluation_api = createGlobalTimer("WFTrain::hamiltonian_evaluation_api", timer_level_fine);
 
   NewTimer& preparation = createGlobalTimer("WFTrain::product_preparation", timer_level_medium);
   NewTimer& objective = createGlobalTimer("WFTrain::objective_gradient", timer_level_medium);

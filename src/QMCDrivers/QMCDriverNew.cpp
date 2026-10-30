@@ -14,6 +14,7 @@
 #include <cmath>
 #include <sstream>
 #include <numeric>
+#include <optional>
 
 #include "QMCDriverNew.h"
 #include "Concurrency/ParallelExecutor.hpp"
@@ -34,10 +35,12 @@
 #include <Hdispatcher.h>
 #include "Utilities/StlPrettyPrint.hpp"
 #include "Utilities/Timer.h"
+#include "Utilities/NativeTimerScope.h"
 #include "Message/UniformCommunicateError.h"
 #include "EstimatorInputDelegates.h"
 #include "WalkerLogManager.h"
 #include "RandomNumberControl.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
 
 namespace qmcplusplus
 {
@@ -66,6 +69,8 @@ QMCDriverNew::QMCDriverNew(const ProjectData& project_data,
       project_data_(project_data),
       walker_configs_ref_(wc)
 {
+  // Fix the native timer owner before any driver launches crowd workers.
+  (void)nativeTimerRecordingThread();
   // when there is no actual estimator_manager provided, construct one with local energy only.
   if (estimator_manager)
     estimator_manager_ = std::move(estimator_manager);
@@ -270,7 +275,8 @@ void QMCDriverNew::initialLogEvaluationDeterministic(int crowd_id,
 void QMCDriverNew::initialLogEvaluationWavefunctionOnly(int crowd_id,
     UPtrVector<Crowd>& crowds, const RefVector<ContextForSteps>& contexts, bool serializing)
 {
-  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false, false);
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false, false,
+                           WaveFunctionEvaluationRequest::FULL_SPATIAL);
 }
 
 /** Initialize value caches for a no-drift warmup. */
@@ -284,6 +290,23 @@ void QMCDriverNew::initialLogEvaluationWarmupValueOnly(
                            WaveFunctionEvaluationRequest::VALUE_ONLY);
 }
 
+void QMCDriverNew::initialLogEvaluationWithContext(
+    int crowd_id,
+    UPtrVector<Crowd>& crowds,
+    const RefVector<ContextForSteps>& contexts,
+    bool serializing,
+    bool deterministic_hamiltonian,
+    bool evaluate_energy,
+    WaveFunctionEvaluationRequest request,
+    NewTimer* spatial_evaluation_api,
+    NewTimer* hamiltonian_evaluation_api,
+    wftrain::TrainingWorkCounters* work_counters)
+{
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, deterministic_hamiltonian,
+                           evaluate_energy, request, spatial_evaluation_api,
+                           hamiltonian_evaluation_api, work_counters);
+}
+
 /** Initialize resident walker caches with optional ordinary or fixed-grid energies. */
 void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
                                         UPtrVector<Crowd>& crowds,
@@ -291,7 +314,10 @@ void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
                                         const bool serializing_crowd_walkers,
                                         const bool deterministic_hamiltonian,
                                         const bool evaluate_energy,
-                                        WaveFunctionEvaluationRequest request)
+                                        WaveFunctionEvaluationRequest request,
+                                        NewTimer* spatial_evaluation_api,
+                                        NewTimer* hamiltonian_evaluation_api,
+                                        wftrain::TrainingWorkCounters* work_counters)
 {
   Crowd& crowd = *(crowds[crowd_id]);
   if (crowd.size() == 0)
@@ -316,7 +342,33 @@ void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
   std::vector<bool> recompute_mask(walkers.size(), true);
   ps_dispatcher.flex_loadWalker(walker_elecs, walkers, recompute_mask, true);
   ps_dispatcher.flex_donePbyP(walker_elecs);
-  twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs, request);
+  {
+    std::optional<NativeTimerScope> spatial_timer;
+    if (spatial_evaluation_api)
+      spatial_timer.emplace(*spatial_evaluation_api);
+    twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs, request);
+  }
+  if (work_counters)
+  {
+    switch (request)
+    {
+    case WaveFunctionEvaluationRequest::VALUE_ONLY:
+      work_counters->addRequestedProducts(true, false, false);
+      work_counters->addComputedProducts(true, false, false);
+      // The generic component interface permits a FULL fallback; no result reports the route taken.
+      work_counters->addUnknownComputedProducts();
+      break;
+    case WaveFunctionEvaluationRequest::GRADIENT_ONLY:
+      work_counters->addRequestedProducts(true, true, false);
+      work_counters->addComputedProducts(true, true, false);
+      work_counters->addUnknownComputedProducts();
+      break;
+    case WaveFunctionEvaluationRequest::FULL_SPATIAL:
+      work_counters->addRequestedProducts(true, true, true);
+      work_counters->addComputedProducts(true, true, true);
+      break;
+    }
+  }
 
   // For consistency this should be in ParticleSet as a flex call, but I think its a problem
   // in the algorithm logic and should be removed.
@@ -338,15 +390,26 @@ void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
   }
 
   std::vector<QMCHamiltonian::FullPrecRealType> local_energies;
-  if (deterministic_hamiltonian)
   {
-    local_energies.reserve(walkers.size());
-    for (int walker = 0; walker < crowd.size(); ++walker)
-      local_energies.push_back(walker_hamiltonians[walker].evaluateDeterministic(
-          walker_twfs[walker], walker_elecs[walker]));
+    std::optional<NativeTimerScope> hamiltonian_timer;
+    if (hamiltonian_evaluation_api)
+      hamiltonian_timer.emplace(*hamiltonian_evaluation_api);
+    if (deterministic_hamiltonian)
+    {
+      local_energies.reserve(walkers.size());
+      for (int walker = 0; walker < crowd.size(); ++walker)
+        local_energies.push_back(walker_hamiltonians[walker].evaluateDeterministic(
+            walker_twfs[walker], walker_elecs[walker]));
+    }
+    else
+      local_energies = ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
   }
-  else
-    local_energies = ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
+  if (work_counters)
+  {
+    const auto ecp_walkers = std::count_if(walker_hamiltonians.begin(), walker_hamiltonians.end(),
+        [](const QMCHamiltonian& hamiltonian) { return hamiltonian.hasPhysicalNLPP(); });
+    work_counters->addHamiltonianEvaluations(local_energies.size(), ecp_walkers);
+  }
 
   // \todo rename these are sets not resets.
   auto resetSigNLocalEnergy = [](MCPWalker& walker, TrialWaveFunction& twf, auto local_energy) {

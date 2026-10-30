@@ -40,6 +40,7 @@ class WorkReportTests(unittest.TestCase):
         total = report['totals'][0]
         self.assertEqual(total['proposal_rounds'], 7)
         self.assertEqual(total['requested_value_product_batches'], 11)
+        self.assertEqual(total['pre_move_full_spatial_handoff_batches'], 0)
         self.assertEqual(total['computed_product_status_unknown_batches'], 1)
         self.assertEqual(total['hamiltonian_walker_evaluations'], 18)
         self.assertIn('not elapsed time', report['scope'])

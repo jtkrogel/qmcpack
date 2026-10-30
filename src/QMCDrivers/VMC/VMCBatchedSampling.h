@@ -21,6 +21,11 @@
 namespace qmcplusplus
 {
 
+namespace wftrain
+{
+class TrainingWorkCounters;
+}
+
 class ParticleSet;
 class TrialWaveFunction;
 class Crowd;
@@ -87,6 +92,10 @@ public:
     NewTimer& collectables;
     NewTimer& estimators;
     std::function<void(Crowd&, std::string_view)> check_log_and_gl;
+    /// Master-thread host API scopes; these do not imply device completion.
+    NewTimer* spatial_evaluation_api = nullptr;
+    NewTimer* hamiltonian_evaluation_api = nullptr;
+    wftrain::TrainingWorkCounters* work_counters = nullptr;
   };
 
   /** Reject unsupported collective-move combinations before walker creation. */

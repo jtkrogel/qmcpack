@@ -54,6 +54,11 @@ class EstimatorManagerNew;
 class TrialWaveFunction;
 class QMCHamiltonian;
 
+namespace wftrain
+{
+class TrainingWorkCounters;
+}
+
 namespace testing
 {
 class DMCBatchedTest;
@@ -270,6 +275,19 @@ public:
       const RefVector<ContextForSteps>& step_context,
       bool serializing_crowd_walkers);
 
+  /// Timed/counted initializer with the same callback shape plus driver-owned context.
+  static void initialLogEvaluationWithContext(
+      int crowd_id,
+      UPtrVector<Crowd>& crowds,
+      const RefVector<ContextForSteps>& step_context,
+      bool serializing_crowd_walkers,
+      bool deterministic_hamiltonian,
+      bool evaluate_energy,
+      WaveFunctionEvaluationRequest request,
+      NewTimer* spatial_evaluation_api,
+      NewTimer* hamiltonian_evaluation_api,
+      wftrain::TrainingWorkCounters* work_counters);
+
   /// Common initialization body; public wrappers preserve the four-argument crowd ABI.
   static void initialLogEvaluationImpl(int crowd_id,
                                        UPtrVector<Crowd>& crowds,
@@ -278,7 +296,10 @@ public:
                                        bool deterministic_hamiltonian,
                                        bool evaluate_energy = true,
                                        WaveFunctionEvaluationRequest request =
-                                           WaveFunctionEvaluationRequest::FULL_SPATIAL);
+                                           WaveFunctionEvaluationRequest::FULL_SPATIAL,
+                                       NewTimer* spatial_evaluation_api = nullptr,
+                                       NewTimer* hamiltonian_evaluation_api = nullptr,
+                                       wftrain::TrainingWorkCounters* work_counters = nullptr);
 
 
   /** should be set in input don't see a reason to set individually
@@ -389,6 +410,10 @@ protected:
     NewTimer& buffer_timer;
     NewTimer& movepbyp_timer;
     NewTimer& hamiltonian_timer;
+    NewTimer& spatial_evaluation_api_timer;
+    NewTimer& hamiltonian_evaluation_api_timer;
+    NewTimer& initial_evaluation_timer;
+    NewTimer& initial_warmup_timer;
     NewTimer& collectables_timer;
     NewTimer& estimators_timer;
     NewTimer& imbalance_timer;
@@ -404,6 +429,10 @@ protected:
           buffer_timer(createGlobalTimer(prefix + "Buffer", timer_level_medium)),
           movepbyp_timer(createGlobalTimer(prefix + "MovePbyP", timer_level_medium)),
           hamiltonian_timer(createGlobalTimer(prefix + "Hamiltonian", timer_level_medium)),
+          spatial_evaluation_api_timer(createGlobalTimer(prefix + "SpatialEvaluationAPI", timer_level_fine)),
+          hamiltonian_evaluation_api_timer(createGlobalTimer(prefix + "HamiltonianEvaluationAPI", timer_level_fine)),
+          initial_evaluation_timer(createGlobalTimer(prefix + "InitialEvaluation", timer_level_fine)),
+          initial_warmup_timer(createGlobalTimer(prefix + "InitialWarmup", timer_level_fine)),
           collectables_timer(createGlobalTimer(prefix + "Collectables", timer_level_medium)),
           estimators_timer(createGlobalTimer(prefix + "Estimators", timer_level_medium)),
           imbalance_timer(createGlobalTimer(prefix + "Imbalance", timer_level_medium)),

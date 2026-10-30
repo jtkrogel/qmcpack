@@ -17,6 +17,7 @@ TEST_CASE("WFTrain work counters preserve requested and computed product counts"
   counters.addDriftGradientApiBatches(2);
   counters.addMoveDecisions(7, 4);
   counters.addRequestedProducts(true, false, false);
+  counters.addPreMoveFullSpatialHandoffBatch();
   counters.addComputedProducts(true, true, true); // Compatibility FULL work stays visible.
   counters.addUnknownComputedProducts();
   counters.addHamiltonianEvaluations(12, 8);
@@ -30,6 +31,7 @@ TEST_CASE("WFTrain work counters preserve requested and computed product counts"
   CHECK(counts.rejected_move_decisions == 4);
   CHECK(counts.requested_value_product_batches == 1);
   CHECK(counts.requested_gradient_product_batches == 0);
+  CHECK(counts.pre_move_full_spatial_handoff_batches == 1);
   CHECK(counts.computed_value_product_batches == 1);
   CHECK(counts.computed_gradient_product_batches == 1);
   CHECK(counts.computed_laplacian_product_batches == 1);

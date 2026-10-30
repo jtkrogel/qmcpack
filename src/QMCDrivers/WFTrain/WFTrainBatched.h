@@ -29,6 +29,7 @@ class DeterminantOverlapObjective;
 class StructuredParameterProvider;
 class TrainingWaveFunctionBinding;
 class JastrowNeuralTrainingBinding;
+class TrainingWorkCounters;
 }
 
 namespace qmcplusplus
@@ -155,7 +156,8 @@ private:
   void validateHamiltonianForTraining();
 
   /** Refresh all crowd wavefunction, drift, and local-energy caches after publication. */
-  void refreshPublishedParameters(std::size_t parameter_version);
+  void refreshPublishedParameters(std::size_t parameter_version, int iteration,
+                                  wftrain::TrainingWorkCounters* work_counters);
 
   /** Sample accepted parameters in a fresh isolated native VMC population. */
   bool runInference(std::size_t iteration, std::size_t parameter_version);
