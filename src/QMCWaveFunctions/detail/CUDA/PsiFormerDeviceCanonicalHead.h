@@ -14,9 +14,13 @@ namespace qmcplusplus::psiformer::device
 template<class Adapter> class ScopedDerivativeFp64Adapter
 {
 public:
+  /// Retain the prepared owner while this request explicitly selects FP64 execution.
   ScopedDerivativeFp64Adapter(std::shared_ptr<Adapter>& slot, bool selected) : slot_(slot), selected_(selected)
   { if (selected_) saved_ = std::move(slot_); }
+
+  /// Restore policy ownership on every exit without changing the completed tape stamp.
   ~ScopedDerivativeFp64Adapter() { if (selected_) slot_ = std::move(saved_); }
+
   ScopedDerivativeFp64Adapter(const ScopedDerivativeFp64Adapter&) = delete;
   ScopedDerivativeFp64Adapter& operator=(const ScopedDerivativeFp64Adapter&) = delete;
 private:
@@ -146,6 +150,7 @@ public:
     return derivative_sensitive_[configuration] != 0;
   }
 
+  /// Select splitting only when this issued population contains a sensitive member.
   bool hasSensitiveDerivatives() const
   {
     for (std::size_t c = 0; c < identity_.batchCount(); ++c)

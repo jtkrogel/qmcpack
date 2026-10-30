@@ -1435,9 +1435,50 @@ public:
 
   /// Contract spatial jets at a same-request full-FP64 primal head, without using a mixed inverse.
   void evaluateCanonicalHead(const RealCanonicalHeadView& head)
-  { evaluateCanonicalRequest(head, false); }
+  {
+    result_valid_ = value_tape_valid_ = target_tape_valid_ = false;
+    const auto count = head.identity().batchCount();
+    head.validate(model_, model_->version(), &queue_, count, ne_, shape_.determinants);
+    if (!count || count > batch_capacity_)
+      throw std::invalid_argument("Canonical FULL population exceeds its prepared output capacity");
+    if (!mixed_dense_ || !head.hasSensitiveDerivatives() || count == 1)
+    { evaluateCanonicalRequest(head, false); return; }
+    // Every singleton writes only its compact prefix. Save suffix slots in reverse
+    // order so later prefix evaluations cannot overwrite a completed member.
+    try
+    {
+      for (std::size_t c = count; c-- > 0;)
+      {
+        evaluateCanonicalRequest(head.subview(c, 1), false);
+        if (c)
+        {
+          const auto copy = [&](double* base, std::size_t stride) {
+#ifdef QMC_CUDA2HIP
+            checkRuntime(hipMemcpyAsync(base + c * stride, base, checkedDeviceBytes<double>(stride),
+                hipMemcpyDeviceToDevice, queue_.getNative()), "canonical singleton result scatter");
+#else
+            checkRuntime(cudaMemcpyAsync(base + c * stride, base, checkedDeviceBytes<double>(stride),
+                cudaMemcpyDeviceToDevice, queue_.getNative()), "canonical singleton result scatter");
+#endif
+            deviceMemoryMetrics(phase_.deviceOrdinal()).copied(checkedDeviceBytes<double>(stride));
+          };
+          copy((target_preparation_.max_targets ? full_phase_ : phase_).data(), 1);
+          copy((target_preparation_.max_targets ? full_output_ : output_).data(), result_layout_.configuration_stride);
+          copy((target_preparation_.max_targets ? full_lap_ratio_ : lap_ratio_).data(), result_layout_.laplacian_lanes);
+        }
+        result_valid_ = false;
+      }
+      setBatchCount(count);
+      evaluation_coordinates_ = head.coordinates();
+      value_tape_valid_ = target_tape_valid_ = false;
+      queue_.sync();
+      result_valid_ = true;
+    }
+    catch (...)
+    { result_valid_ = value_tape_valid_ = false; throw; }
+  }
 
-  /// Retain mixed VALUE activations while sourcing every physical determinant coefficient from FP64.
+  /// Retain selected VALUE activations with physical determinant coefficients from the same FP64 head.
   void evaluateRetainedCanonicalHead(const RealCanonicalHeadView& head)
   { evaluateCanonicalRequest(head, true); }
 
@@ -1455,17 +1496,31 @@ private:
     head.coordinates().copyTo(positions_, queue_, model_->metadataFamily(), ne_);
     setBatchCount(head.coordinates().batchCount());
     evaluation_coordinates_ = head.coordinates();
+    const bool sensitive = bool(mixed_dense_) && head.hasSensitiveDerivatives();
+    if (sensitive && head.identity().batchCount() != 1)
+      throw std::invalid_argument("Sensitive canonical derivative requests require singleton splitting");
+    ScopedDerivativeFp64Adapter<PreparedDeviceMixedValueDense> selected(mixed_dense_, sensitive);
+    executing_derivative_island_ = sensitive;
     const auto borrow = head;
     canonical_head_ = &borrow;
     try
     {
       evaluateOwnedCoordinates();
       canonical_retained_head_ = retained_value;
+      value_tape_derivative_island_ = retained_value && sensitive;
+      if (sensitive) ++sensitive_derivative_configurations_;
+      else if (mixed_dense_)
+      {
+        ordinary_derivative_configurations_ += batch_;
+        ordinary_fp32_affine_projections_ += mixed_dense_->statistics().projections;
+      }
       canonical_head_ = nullptr;
+      executing_derivative_island_ = false;
     }
     catch (...)
     {
       canonical_head_ = nullptr;
+      executing_derivative_island_ = false;
       result_valid_ = value_tape_valid_ = canonical_retained_head_ = false;
       throw;
     }
@@ -1476,6 +1531,7 @@ private:
   {
     evaluation_coordinates_ = {};
     canonical_retained_head_ = false;
+    value_tape_derivative_island_ = false;
     cusp_state_valid_ = false;
     cusp_state_canonical_replay_ = false;
     if (parallel_traces_) parallel_traces_->invalidate();
@@ -2543,6 +2599,15 @@ public:
     return evaluation_coordinates_;
   }
 
+  /// Authority belongs to the completed canonical singleton tape, never the attached policy.
+  bool valueTapeDerivativeIsland() const
+  { (void)valueTapeBatchCount(); return value_tape_derivative_island_; }
+
+  std::size_t sensitiveDerivativeConfigurations() const noexcept { return sensitive_derivative_configurations_; }
+  std::size_t sensitiveFp64AffineProjections() const noexcept { return sensitive_fp64_affine_projections_; }
+  std::size_t ordinaryDerivativeConfigurations() const noexcept { return ordinary_derivative_configurations_; }
+  std::size_t ordinaryFp32AffineProjections() const noexcept { return ordinary_fp32_affine_projections_; }
+
   /// Completed primal identity, not the currently attached retry policy; null means FP64.
   const std::shared_ptr<const PreparedDeviceMixedDenseParameters>& valueTapeMixedParameters() const
   {
@@ -2907,7 +2972,10 @@ private:
     if (mixed_dense_)
       mixed_dense_->projectSpatial(layout, source, weight, target);
     else
+    {
       denseForward(blas_, makeFoldedSpatialDenseLayout(layout), source, weight, target);
+      if (executing_derivative_island_) ++sensitive_fp64_affine_projections_;
+    }
   }
 
   /// Reset ordered sticky diagnostics for this attempt before any numerical launch.
@@ -3086,6 +3154,9 @@ private:
   PackedDeviceCoordinatesView evaluation_coordinates_;
   bool canonical_scalar_value_ = false;
   bool canonical_retained_head_ = false;
+  bool value_tape_derivative_island_ = false, executing_derivative_island_ = false;
+  std::size_t sensitive_derivative_configurations_ = 0, sensitive_fp64_affine_projections_ = 0;
+  std::size_t ordinary_derivative_configurations_ = 0, ordinary_fp32_affine_projections_ = 0;
   const RealCanonicalHeadView* canonical_head_ = nullptr;
   const bool retained_targets_;
   const bool real_trunk_only_;

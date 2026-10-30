@@ -3601,13 +3601,19 @@ private:
       if (!reported)
       {
         app_log() << "  PsiFormer numerical device parameter product completed: parameter_version="
-                  << parameter_version_ << ", arithmetic=" << (mixed ? "strict_mixed_affine" : "explicit_FP64_replay")
+                  << parameter_version_ << ", arithmetic=" << (mixed ? psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V4 : "explicit_FP64_replay")
                   << ", epoch_generation=" << training_epoch_generation_;
         if (const auto* reverse = session.mixedReverseStatistics())
           app_log() << ", reverse_completed=" << reverse->completed << ", reverse_FP32_GEMMs=" << reverse->fp32_gemms
                     << ", reverse_logical_cast_bytes=" << reverse->logicalTransferBytes();
         if (const auto* jvp = session.mixedJvpStatistics())
           app_log() << ", JVP_completed=" << jvp->completed << ", JVP_FP32_GEMMs=" << jvp->fp32_gemms;
+        app_log() << ", derivative_fp64_island_configurations=" << session.sensitiveDerivativeConfigurations()
+                  << ", derivative_ordinary_configurations=" << session.ordinaryDerivativeConfigurations()
+                  << ", primal_FP32_affines=" << session.ordinaryFp32PrimalAffines()
+                  << ", primal_FP64_island_affines=" << session.sensitiveFp64PrimalAffines()
+                  << ", reverse_FP64_island_affines=" << session.sensitiveFp64ReverseAffines()
+                  << ", JVP_FP64_island_affines=" << session.sensitiveFp64JvpAffines();
         app_log() << "; private numeric completion, whole-epoch admission remains pending" << std::endl;
         reported = true;
       }
@@ -8694,7 +8700,7 @@ std::string PsiFormerWF::trainingConfigurationFingerprint() const
                        state.execution_plan.environment(), state.twist_phase.reduced, state.twist_phase.cartesian,
                        state.physical_source, state.physical_species) +
       (state.precision == psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
-          ? "/arithmetic/" + std::string(psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V3) +
+          ? "/arithmetic/" + std::string(psiformer::PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V4) +
               "/jvp/fp32_affine_directional_v1" : "");
 }
 

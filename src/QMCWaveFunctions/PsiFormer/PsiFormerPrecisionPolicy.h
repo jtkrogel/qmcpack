@@ -50,6 +50,10 @@ inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V2 =
 inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V3 =
     "fp32_dense_fp64_islands_certified_canonical_head_affine_ad_v3";
 
+/// Bind REAL restarts to explicit per-configuration canonical derivative sensitivity islands.
+inline constexpr const char* PSIFORMER_MIXED_AFFINE_TRAINING_ARITHMETIC_V4 =
+    "fp32_dense_fp64_islands_sensitive_canonical_derivatives_affine_ad_v4";
+
 /** Scope one native mixed training epoch without changing the public precision label.
  * Ordinary inference retains its existing local replay policy. Training either
  * propagates mixed rejection or selects complete same-image FP64 replay.

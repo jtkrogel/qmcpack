@@ -308,6 +308,10 @@ public:
   std::size_t mixedBatches() const noexcept { return mixed_batches_; }
   std::size_t mixedRetries() const noexcept { return mixed_retries_; }
   std::size_t canonicalValueBatches() const noexcept { return canonical_value_batches_; }
+  std::size_t sensitiveDerivativeConfigurations() const noexcept { return sensitive_derivative_configurations_; }
+  std::size_t ordinaryDerivativeConfigurations() const noexcept { return ordinary_derivative_configurations_; }
+  std::size_t sensitiveFp64AffineProjections() const noexcept { return sensitive_fp64_affine_projections_; }
+  std::size_t ordinaryFp32AffineProjections() const noexcept { return ordinary_fp32_affine_projections_; }
   const std::string& mixedRetryReason() const noexcept { return mixed_retry_reason_; }
 
   /// Freeze one native epoch policy only while this physical crowd is released.
@@ -361,6 +365,10 @@ private:
       ++canonical_value_batches_;
       return;
     }
+    const auto ordinary_before = graph.ordinaryDerivativeConfigurations();
+    const auto sensitive_before = graph.sensitiveDerivativeConfigurations();
+    const auto fp32_before = graph.ordinaryFp32AffineProjections();
+    const auto fp64_before = graph.sensitiveFp64AffineProjections();
     if (canonical_head_)
     {
       try
@@ -390,9 +398,26 @@ private:
         ++mixed_retries_;
       else
       {
-        if (mixed_dense_->statistics().projections == 0)
-          throw std::logic_error("Mixed inference completed without an affine projection");
-        ++mixed_batches_;
+        const auto ordinary = graph.ordinaryDerivativeConfigurations() - ordinary_before;
+        const auto sensitive = graph.sensitiveDerivativeConfigurations() - sensitive_before;
+        const auto fp32 = graph.ordinaryFp32AffineProjections() - fp32_before;
+        const auto fp64 = graph.sensitiveFp64AffineProjections() - fp64_before;
+        if (canonical_head_)
+        {
+          if ((!ordinary && !sensitive) || (ordinary && !fp32) || (sensitive && !fp64))
+            throw std::logic_error("Canonical derivative completion has no matching arithmetic receipt");
+          ordinary_derivative_configurations_ += ordinary;
+          sensitive_derivative_configurations_ += sensitive;
+          ordinary_fp32_affine_projections_ += fp32;
+          sensitive_fp64_affine_projections_ += fp64;
+          if (ordinary) ++mixed_batches_;
+        }
+        else
+        {
+          if (mixed_dense_->statistics().projections == 0)
+            throw std::logic_error("Mixed inference completed without an affine projection");
+          ++mixed_batches_;
+        }
       }
     }
   }
@@ -496,6 +521,8 @@ private:
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   const TargetVglPreparation target_preparation_;
   const bool lazy_spatial_;
+  std::size_t sensitive_derivative_configurations_ = 0, ordinary_derivative_configurations_ = 0;
+  std::size_t sensitive_fp64_affine_projections_ = 0, ordinary_fp32_affine_projections_ = 0;
   std::unique_ptr<PreparedDeviceCanonicalRealHead> canonical_head_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   std::size_t mixed_batches_ = 0, mixed_retries_ = 0, canonical_value_batches_ = 0;

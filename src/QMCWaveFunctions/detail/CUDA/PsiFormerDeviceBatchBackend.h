@@ -106,11 +106,16 @@ class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
                   << ", contexts=" << contexts.load(std::memory_order_relaxed)
                   << ", mixed_batches=" << successes.load(std::memory_order_relaxed)
                   << ", canonical_fp64_value_batches=" << canonical_values.load(std::memory_order_relaxed)
+                  << ", derivative_fp64_island_configurations=" << sensitive_configurations.load(std::memory_order_relaxed)
+                  << ", derivative_ordinary_configurations=" << ordinary_configurations.load(std::memory_order_relaxed)
+                  << ", derivative_FP64_affines=" << sensitive_affines.load(std::memory_order_relaxed)
+                  << ", derivative_FP32_affines=" << ordinary_affines.load(std::memory_order_relaxed)
                   << ", whole_fp64_retries=" << retries.load(std::memory_order_relaxed) << std::endl;
       }
       catch (...) {} // Diagnostics must not throw during resource destruction.
     }
     std::atomic<std::size_t> contexts{0}, successes{0}, retries{0}, canonical_values{0};
+    std::atomic<std::size_t> sensitive_configurations{0}, ordinary_configurations{0}, sensitive_affines{0}, ordinary_affines{0};
   };
 
 public:
@@ -545,6 +550,10 @@ private:
                              context->hooks.mixedRetries() != previous_mixed_retries))
       std::clog << "PsiFormer explicit mixed inference completed: mixed_batches=" << context->hooks.mixedBatches()
                 << ", canonical_fp64_value_batches=" << context->hooks.canonicalValueBatches()
+                << ", derivative_fp64_island_configurations=" << context->hooks.sensitiveDerivativeConfigurations()
+                << ", derivative_ordinary_configurations=" << context->hooks.ordinaryDerivativeConfigurations()
+                << ", derivative_FP64_affines=" << context->hooks.sensitiveFp64AffineProjections()
+                << ", derivative_FP32_affines=" << context->hooks.ordinaryFp32AffineProjections()
                 << ", whole_fp64_retries=" << context->hooks.mixedRetries()
                 << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
     if (valid_hint && hint->live_cookie->load(std::memory_order_acquire) != hint->request_generation)
@@ -1196,6 +1205,10 @@ private:
       {
         mixed_statistics->successes.fetch_add(hooks.mixedBatches(), std::memory_order_relaxed);
         mixed_statistics->canonical_values.fetch_add(hooks.canonicalValueBatches(), std::memory_order_relaxed);
+        mixed_statistics->sensitive_configurations.fetch_add(hooks.sensitiveDerivativeConfigurations(), std::memory_order_relaxed);
+        mixed_statistics->ordinary_configurations.fetch_add(hooks.ordinaryDerivativeConfigurations(), std::memory_order_relaxed);
+        mixed_statistics->sensitive_affines.fetch_add(hooks.sensitiveFp64AffineProjections(), std::memory_order_relaxed);
+        mixed_statistics->ordinary_affines.fetch_add(hooks.ordinaryFp32AffineProjections(), std::memory_order_relaxed);
         mixed_statistics->retries.fetch_add(hooks.mixedRetries(), std::memory_order_relaxed);
         mixed_statistics->contexts.fetch_add(1, std::memory_order_relaxed);
       }

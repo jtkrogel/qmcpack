@@ -48,6 +48,8 @@ struct RawFeatureAdjointView
 class PreparedDeviceNetworkReverse
 {
 public:
+  std::size_t sensitiveFp64AffineProjections() const noexcept { return sensitive_fp64_affines_; }
+
   /// Prepare reusable adjoints and one canonical accumulator outside the hot path.
   PreparedDeviceNetworkReverse(std::shared_ptr<const PreparedDeviceModel> model,
                                std::size_t capacity,
@@ -152,6 +154,8 @@ private:
     if (forward.modelImage().get() != model_.get() || count > capacity_ ||
         (device_seed ? !seed.empty() : seed.size() != elements))
       throw std::invalid_argument("Network reverse model, capacity or seed extent mismatch");
+    active_derivative_island_ = forward.valueTapeDerivativeIsland();
+    ScopedDerivativeFp64Adapter<PreparedDeviceMixedAffineDerivatives> selected(mixed_, active_derivative_island_);
     const auto& primal_cache = forward.valueTapeMixedParameters();
     if ((mixed_ ? mixed_->parameters().get() : nullptr) != primal_cache.get())
       throw std::invalid_argument("Network reverse arithmetic differs from its completed primal tape");
@@ -402,7 +406,11 @@ private:
       const double* weight, double* response)
   {
     if (mixed_) mixed_->accumulateInputAdjoint(layout, adjoint, weight, response);
-    else accumulateDenseInputAdjoint(blas_, layout, adjoint, weight, response);
+    else
+    {
+      accumulateDenseInputAdjoint(blas_, layout, adjoint, weight, response);
+      if (active_derivative_island_) ++sensitive_fp64_affines_;
+    }
   }
 
   /// Fold configurations/electrons into one canonical shared-weight contraction.
@@ -424,6 +432,7 @@ private:
       affine->observe(role, layer, source, adjoint, layout.rows, layout.input_width, layout.output_width);
     accumulateDenseWeightAdjoint(blas_, layout, source, adjoint,
         response_.data() + model_->plan().parameter(role, layer).begin);
+    if (active_derivative_island_) ++sensitive_fp64_affines_;
   }
 
   /// Sum bias cotangents into the exact canonical interval.
@@ -436,6 +445,8 @@ private:
         response_.data() + model_->plan().parameter(role, layer).begin), "network bias reverse");
   }
 
+  bool active_derivative_island_ = false;
+  std::size_t sensitive_fp64_affines_ = 0;
   std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_;
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::size_t capacity_;

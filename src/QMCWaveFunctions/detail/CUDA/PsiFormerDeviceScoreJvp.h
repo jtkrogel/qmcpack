@@ -27,6 +27,8 @@ class PreparedDeviceScoreJvp
 {
   friend class PreparedDeviceSrMetric;
 public:
+  std::size_t sensitiveFp64AffineProjections() const noexcept { return sensitive_fp64_affines_; }
+
   /// Prepare O(P) direction storage and bounded tile scratch before evaluation.
   PreparedDeviceScoreJvp(std::shared_ptr<const PreparedDeviceModel> model,
                          std::size_t capacity,
@@ -109,7 +111,8 @@ public:
   /** Apply a previously uploaded direction to an immutable ordinary tape.
    * Coordinate changes do not require another O(P) host-to-device transfer.
    */
-  const double* evaluatePrepared(const PreparedDeviceInference& forward)
+  const double* evaluatePrepared(const PreparedDeviceInference& forward,
+      const RealCanonicalHeadView* canonical_head = nullptr)
   {
     ready_ = false;
     live_count_ = 0;
@@ -121,16 +124,27 @@ public:
     const auto ne = shape.electrons(), width = shape.feature_dimension;
     if (forward.modelImage().get() != model_.get() || count > capacity_)
       throw std::invalid_argument("Score JVP model or capacity mismatch");
+    active_derivative_island_ = forward.valueTapeDerivativeIsland();
+    ScopedDerivativeFp64Adapter<PreparedDeviceMixedAffineDerivatives> selected(mixed_, active_derivative_island_);
     const auto& primal_cache = forward.valueTapeMixedParameters();
     if ((mixed_ ? mixed_->parameters().get() : nullptr) != primal_cache.get())
       throw std::invalid_argument("Score JVP arithmetic differs from its completed primal tape");
     MixedAffineDerivativeAttempt mixed_attempt(mixed_.get(), model_);
-    forward.downloadValueFactorizations(host_factors_);
-    for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
-      if (!host_factors_[channel].inverse_available)
-        throw std::runtime_error("GPU score JVP requires regular determinant channels; cofactor fallback unavailable");
+    if (canonical_head)
+    {
+      canonical_head->validate(model_, model_->version(), &queue_, count, ne, shape.determinants);
+      if (!forward.evaluationCoordinates().sameSourceRange(canonical_head->coordinates()))
+        throw std::invalid_argument("Canonical JVP head and primal tape consumed different coordinates");
+    }
+    else
+    {
+      forward.downloadValueFactorizations(host_factors_);
+      for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
+        if (!host_factors_[channel].inverse_available)
+          throw std::runtime_error("GPU score JVP requires regular determinant channels; cofactor fallback unavailable");
+    }
     const auto stream = queue_.getNative();
-    const auto head = forward.valueHeadTape();
+    const auto head = canonical_head ? forward.valueHeadTape(*canonical_head) : forward.valueHeadTape();
     checkRuntime(launchDeterminantMatrixReverseSeeds(stream, head.factorizations, head.combinations,
         head.normalized_weights, head.inverses, count, shape.determinants, ne, seeds_.data(), status_.data()),
         "score JVP determinant seeds");
@@ -149,8 +163,11 @@ public:
       mixed_->projectDirection(feature_dense, forward.valueRawFeatures(), nullptr,
           model_->parameters() + embedding.begin, direction_.data() + embedding.begin, feature_.data());
     else
+    {
       denseForward(blas_, feature_dense, forward.valueRawFeatures(),
           direction_.data() + embedding.begin, feature_.data());
+      if (active_derivative_island_) ++sensitive_fp64_affines_;
+    }
     const DenseForwardLayout dense{count * ne, width, width, width, width, width};
     const BatchedValueLayout values{count, ne, width, width, ne * width};
     const BatchedAttentionForwardLayout attention{count,
@@ -214,6 +231,14 @@ public:
     if (destination.size() != live_count_)
       throw std::invalid_argument("Score JVP destination extent mismatch");
     products_.download(destination.data(), destination.size());
+  }
+
+  /// Copy completed scalar products directly into an existing tile interval.
+  void downloadProductsInto(double* destination, std::size_t count) const
+  {
+    if (!ready_ || !destination || count != live_count_)
+      throw std::invalid_argument("Score JVP tile interval is incomplete or has wrong extent");
+    products_.downloadOnStream(destination, count, queue_.getNative());
   }
 
   /// Rebind immutable weights while preserving prepared tangent/direction storage.
@@ -319,7 +344,9 @@ private:
       return;
     }
     denseForward(blas_, layout, source_direction, model_->parameters() + begin, work_left_.data());
+    if (active_derivative_island_) ++sensitive_fp64_affines_;
     denseForward(blas_, layout, source, direction_.data() + begin, work_right_.data());
+    if (active_derivative_island_) ++sensitive_fp64_affines_;
     add(work_left_, work_right_, target, layout.rows * layout.output_width);
   }
 
@@ -336,6 +363,8 @@ private:
         direction_.data() + model_->plan().parameter(bias, layer).begin, tangent.data()), "score JVP tanh");
   }
 
+  bool active_derivative_island_ = false;
+  std::size_t sensitive_fp64_affines_ = 0;
   std::shared_ptr<PreparedDeviceMixedAffineDerivatives> mixed_;
   std::shared_ptr<const PreparedDeviceModel> model_;
   std::size_t capacity_, live_count_ = 0;

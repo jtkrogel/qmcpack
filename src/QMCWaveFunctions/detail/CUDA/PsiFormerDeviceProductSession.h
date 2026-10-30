@@ -134,6 +134,8 @@ inline ScoreTileStorage estimateMixedScoreTileStorage(const PsiFormerExecutionPl
       "Mixed canonical score inventory overflow");
   cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes, canonical.host_bytes,
       "Mixed canonical score HOST inventory overflow");
+  cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes, sizeof(double),
+      "Mixed singleton score weight HOST inventory overflow");
   cost.host_numeric_bytes = spatial_detail::checkedAdd(cost.host_numeric_bytes,
       3 * sizeof(PsiFormerDeviceNumericalDiagnostics), "Mixed score HOST diagnostics overflow");
   return cost;
@@ -345,6 +347,7 @@ public:
       throw std::invalid_argument("Independent product lanes require score-only preparation");
     if (mixed_forward_)
     {
+      singleton_weight_.reserve(1);
       canonical_head_ = PreparedDeviceCanonicalRealHead::prepare(image_, score_capacity_, queue_, blas_,
           PreparedDeviceCanonicalRealHead::required(image_->plan(), score_capacity_).device_bytes);
       values_.setMixedRetainedValueDense(mixed_forward_);
@@ -368,6 +371,25 @@ public:
         throw std::logic_error("Large REAL score graph differs from its cold storage descriptor");
     }
     executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
+  }
+
+  /// Report cumulative actual arithmetic after every request has released this session.
+  ~PreparedDeviceProductSession() noexcept
+  {
+    if (!mixed_forward_) return;
+    try
+    {
+      std::clog << "PsiFormer explicit REAL derivative arithmetic summary: parameter_version=" << image_->version()
+                << ", derivative_fp64_island_configurations=" << sensitiveDerivativeConfigurations()
+                << ", derivative_ordinary_configurations=" << ordinaryDerivativeConfigurations()
+                << ", primal_FP32_affines=" << ordinaryFp32PrimalAffines()
+                << ", primal_FP64_island_affines=" << sensitiveFp64PrimalAffines()
+                << ", reverse_FP32_GEMMs=" << mixed_reverse_->statistics().fp32_gemms
+                << ", reverse_FP64_island_affines=" << sensitiveFp64ReverseAffines()
+                << ", JVP_FP32_GEMMs=" << mixed_jvp_->statistics().fp32_gemms
+                << ", JVP_FP64_island_affines=" << sensitiveFp64JvpAffines() << std::endl;
+    }
+    catch (...) {} // Optional receipts cannot interfere with numeric resource retirement.
   }
 
   // Prepared graphs borrow this address-stable session's queue and BLAS handle.
@@ -394,6 +416,13 @@ public:
   /// Keep independently rounded direct JVP arithmetic separate from reverse counts.
   const MixedAffineDerivativeStatistics* mixedJvpStatistics() const noexcept
   { return mixed_jvp_ ? &mixed_jvp_->statistics() : nullptr; }
+
+  std::size_t sensitiveDerivativeConfigurations() const noexcept { return values_.sensitiveDerivativeConfigurations(); }
+  std::size_t ordinaryDerivativeConfigurations() const noexcept { return values_.ordinaryDerivativeConfigurations(); }
+  std::size_t ordinaryFp32PrimalAffines() const noexcept { return values_.ordinaryFp32AffineProjections(); }
+  std::size_t sensitiveFp64PrimalAffines() const noexcept { return values_.sensitiveFp64AffineProjections(); }
+  std::size_t sensitiveFp64ReverseAffines() const noexcept { return score_.sensitiveFp64AffineProjections(); }
+  std::size_t sensitiveFp64JvpAffines() const noexcept { return jvp_.sensitiveFp64AffineProjections(); }
 
   /// Return the explicit per-provider coordinate limit; zero retains host input.
   std::size_t retainedCoordinateBudget() const noexcept
@@ -672,9 +701,14 @@ public:
       std::copy_n(weights, count, tile_weights_.begin());
       // reverse() validates every finite signed weight and every determinant,
       // including configurations with zero weight. It returns a weighted sum.
-      const double* response = reversePhysicalScore(tile_weights_);
       const std::complex<double> unit(1, 0);
-      score_contraction_->accumulate(response, channels ? channels : &unit, channel_count);
+      if (!canonical_head_)
+        score_contraction_->accumulate(reversePhysicalScore(tile_weights_), channels ? channels : &unit, channel_count);
+      else
+      {
+        const auto head = canonical_head_->evaluate(positions_);
+        foldCanonicalScore(head, tile_weights_, channels ? channels : &unit, channel_count);
+      }
     }, count);
     ++weighted_score_tiles_;
     weighted_score_configurations_ += count;
@@ -690,9 +724,14 @@ public:
         throw std::invalid_argument("Weighted score tile requires weights and a prepared contraction");
       tile_weights_.resize(count);
       std::copy_n(weights, count, tile_weights_.begin());
-      const double* response = reversePhysicalScoreDevice(positions, tile_weights_);
       const std::complex<double> unit(1, 0);
-      score_contraction_->accumulate(response, &unit, 1);
+      if (!canonical_head_)
+        score_contraction_->accumulate(reversePhysicalScoreDevice(positions, tile_weights_), &unit, 1);
+      else
+      {
+        const auto head = canonical_head_->evaluateDeviceCoordinates(positions);
+        foldCanonicalScore(head, tile_weights_, &unit, 1);
+      }
     }, count, &positions);
     ++weighted_score_tiles_;
     weighted_score_configurations_ += count;
@@ -918,10 +957,19 @@ public:
   double scoreJvp(const double* positions, const std::vector<double>& direction, std::size_t version)
   {
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
-      values_.evaluate(positions_);
-      jvp_.evaluate(values_, direction);
-      products_.resize(1);
-      jvp_.downloadProducts(products_);
+      if (canonical_head_)
+      {
+        jvp_.prepareDirection(direction);
+        const auto head = canonical_head_->evaluate(positions_);
+        evaluateCanonicalJvp(head);
+      }
+      else
+      {
+        values_.evaluate(positions_);
+        jvp_.evaluate(values_, direction);
+        products_.resize(1);
+        jvp_.downloadProducts(products_);
+      }
     });
     return products_[0];
   }
@@ -957,10 +1005,18 @@ public:
     try
     {
       execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
-        values_.evaluate(positions_);
-        jvp_.evaluatePrepared(values_);
-        products_.resize(count);
-        jvp_.downloadProducts(products_);
+        if (canonical_head_)
+        {
+          const auto head = canonical_head_->evaluate(positions_);
+          evaluateCanonicalJvp(head);
+        }
+        else
+        {
+          values_.evaluate(positions_);
+          jvp_.evaluatePrepared(values_);
+          products_.resize(count);
+          jvp_.downloadProducts(products_);
+        }
       }, count);
     }
     catch (...)
@@ -978,10 +1034,18 @@ public:
     try
     {
       execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
-        values_.evaluateDeviceCoordinates(positions);
-        jvp_.evaluatePrepared(values_);
-        products_.resize(positions.batchCount());
-        jvp_.downloadProducts(products_);
+        if (canonical_head_)
+        {
+          const auto head = canonical_head_->evaluateDeviceCoordinates(positions);
+          evaluateCanonicalJvp(head);
+        }
+        else
+        {
+          values_.evaluateDeviceCoordinates(positions);
+          jvp_.evaluatePrepared(values_);
+          products_.resize(positions.batchCount());
+          jvp_.downloadProducts(products_);
+        }
       }, positions.batchCount(), &positions);
     }
     catch (...)
@@ -1122,7 +1186,7 @@ public:
     for (const auto* values : {&positions_, &drift_, &masses_, &score_response_,
                                &kinetic_response_, &products_, &weights_, &channel_coefficients_,
                                &channel_phases_, &channel_logs_, &cusp_, &orbital_backflow_,
-                               &orbital_envelope_, &orbital_seeds_, &tile_weights_})
+                               &orbital_envelope_, &orbital_seeds_, &tile_weights_, &singleton_weight_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(values->capacity()),
                                          "Device product host staging overflow");
     for (auto amount : {values_.hostWorkspaceBytes(), score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes()})
@@ -1245,6 +1309,49 @@ private:
       return acceleratorOperationBit(PsiFormerAcceleratorOperation::PARAMETER_SCORE);
     return acceleratorOperationBit(PsiFormerAcceleratorOperation::PARAMETER_SCORE) |
         acceleratorOperationBit(PsiFormerAcceleratorOperation::KINETIC_RESPONSE);
+  }
+
+  /// Fold sensitive tiles in original configuration order without retaining a B-by-P response.
+  void foldCanonicalScore(const RealCanonicalHeadView& head, const std::vector<double>& weights,
+      const std::complex<double>* channels, std::size_t channel_count)
+  {
+    if (head.identity().batchCount() != weights.size())
+      throw std::invalid_argument("Canonical score tile and weight extents differ");
+    if (!head.hasSensitiveDerivatives() || weights.size() == 1)
+    {
+      values_.evaluateRetainedCanonicalHead(head);
+      score_contraction_->accumulate(score_.reverseCanonicalHead(values_, head, weights), channels, channel_count);
+      return;
+    }
+    singleton_weight_.resize(1);
+    for (std::size_t c = 0; c < weights.size(); ++c)
+    {
+      const auto member = head.subview(c, 1);
+      singleton_weight_[0] = weights[c];
+      values_.evaluateRetainedCanonicalHead(member);
+      score_contraction_->accumulate(score_.reverseCanonicalHead(values_, member, singleton_weight_), channels, channel_count);
+    }
+  }
+
+  /// Keep direct/transpose products on the same canonical head and effective arithmetic.
+  void evaluateCanonicalJvp(const RealCanonicalHeadView& head)
+  {
+    const auto count = head.identity().batchCount();
+    products_.resize(count);
+    if (!head.hasSensitiveDerivatives() || count == 1)
+    {
+      values_.evaluateRetainedCanonicalHead(head);
+      jvp_.evaluatePrepared(values_, &head);
+      jvp_.downloadProductsInto(products_.data(), count);
+      return;
+    }
+    for (std::size_t c = 0; c < count; ++c)
+    {
+      const auto member = head.subview(c, 1);
+      values_.evaluateRetainedCanonicalHead(member);
+      jvp_.evaluatePrepared(values_, &member);
+      jvp_.downloadProductsInto(products_.data() + c, 1);
+    }
   }
 
   /// Keep canonical-head borrows request-local, so publication never retains stale coefficients.
@@ -1514,7 +1621,7 @@ private:
   std::vector<double> channel_coefficients_, channel_phases_, channel_logs_;
   std::vector<device_determinant::FactorizationMetadata> factors_;
   std::vector<double> cusp_, orbital_backflow_, orbital_envelope_, orbital_seeds_;
-  std::vector<double> tile_weights_;
+  std::vector<double> tile_weights_, singleton_weight_;
   const std::vector<double> weights_{1.0};
   const std::function<void()>* action_ = nullptr;
   std::exception_ptr failure_;

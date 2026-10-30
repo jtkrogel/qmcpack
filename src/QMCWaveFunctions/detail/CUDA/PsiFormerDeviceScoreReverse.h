@@ -65,6 +65,8 @@ public:
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
 
+  std::size_t sensitiveFp64AffineProjections() const noexcept { return network_.sensitiveFp64AffineProjections(); }
+
   /** Reverse one completed value tape into a canonical weighted score vector.
    * Weights are arbitrary finite signed contractions, not implicitly normalized
    * probabilities. Sample/model version and coordinates remain owned by forward.
