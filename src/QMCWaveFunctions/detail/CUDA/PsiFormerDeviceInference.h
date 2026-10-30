@@ -1860,7 +1860,8 @@ private:
       checkRuntime(launchFinalValueCombination(stream, batch_, head_combinations, cusp_jets_.data(),
           phase_.data(), output_.data(), open_status_.data()), "model final values");
       checkOpen(batch_);
-      if (mixed_dense_)
+      // Certified canonical FP64 metadata has its own admission; this screen applies only to raw mixed heads.
+      if (mixed_dense_ && !canonical_head_)
         mixed_dense_->checkValueConditioning(head_factors, head_combinations, batch_, shape_.determinants);
       if (canonical_head_) copyCanonicalPrimal();
       mixed_attempt.finish();
@@ -1918,12 +1919,12 @@ private:
         trace_gradient, trace_lap_log, cusp_jets_.data(), phase_.data(), output_.data(),
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
-    if (mixed_dense_)
+    // Preserve the raw FP32-head screens without reapplying them to certified canonical FP64 factors.
+    if (mixed_dense_ && !canonical_head_)
     {
       mixed_dense_->checkValueConditioning(head_factors, head_combinations, batch_, shape_.determinants);
-      if (!canonical_head_)
-        mixed_dense_->checkSpatialConditioning(matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(),
-          batch_, shape_.determinants, ne_);
+      mixed_dense_->checkSpatialConditioning(matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(),
+        batch_, shape_.determinants, ne_);
     }
     if (canonical_head_) copyCanonicalPrimal();
     mixed_attempt.finish();

@@ -247,6 +247,42 @@ inline void validate()
       return f.minimum_scaled_pivot < 1e-3;
     }), "Canonical low-pivot positive did not exercise a small pivot");
     std::cout << "PASS REAL canonical accurate_low_pivot inverse_certificate=valid mixed_jet_accuracy_claim=0\n";
+    // A certified FP64 seed head must reach the retained mixed affine VJP without raw-head screening.
+    {
+      auto low_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(low_pivot_image, queue);
+      require(low_cache->usable(), "Low-pivot retained regression has no usable mixed cache");
+      auto primal = std::make_shared<PreparedDeviceMixedValueDense>(low_cache, 4, queue, blas);
+      auto derivative = std::make_shared<PreparedDeviceMixedAffineDerivatives>(low_cache, 4, queue, blas);
+      PreparedDeviceInference retained(low_pivot_image, 1, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+      PreparedDeviceScoreReverse reverse(low_pivot_image, 1, queue, blas, derivative);
+      retained.setMixedRetainedValueDense(primal);
+      retained.evaluateRetainedCanonicalHead(head);
+      reverse.reverseCanonicalHead(retained, head, {1.});
+      std::vector<double> response(values.size());
+      reverse.downloadResponse(response);
+      require(response.size() == values.size() && std::all_of(response.begin(), response.end(), [](double value) {
+        return device_math::isFiniteBinary64(value);
+      }), "Certified low-pivot retained SCORE did not publish a complete finite response");
+      require(primal->statistics().projections && derivative->statistics().fp32_gemms &&
+          derivative->statistics().completed && !derivative->statistics().rejected,
+          "Certified low-pivot retained SCORE did not complete genuine mixed primal/reverse work");
+    }
+    // The same approximate model must retain the original raw FP32-produced-head pivot guard.
+    {
+      auto low_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(low_pivot_image, queue);
+      auto primal = std::make_shared<PreparedDeviceMixedValueDense>(low_cache, 4, queue, blas);
+      PreparedDeviceInference raw(low_pivot_image, 1, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+      raw.setMixedRetainedValueDense(primal);
+      rejected = false;
+      try { raw.evaluate(first); }
+      catch (const MixedPrecisionRetryRequired& error)
+      {
+        rejected = mixed_target_validation::diagnosticCount(error.what(), "small_determinant_pivot") != 0;
+      }
+      require(rejected, "Raw FP32-produced low-pivot head lost its original rejection");
+    }
+    std::cout << "PASS REAL canonical low_pivot_retained_SCORE actual_mixed_reverse=1"
+                 " certified_FP64_head=accepted raw_FP32_head=typed_reject mixed_jet_accuracy_claim=0\n";
     head = {};
     // A zero orbital column has no inverse and must never mint a head borrow.
     for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
