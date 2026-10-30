@@ -1512,7 +1512,6 @@ private:
       else if (mixed_dense_)
       {
         ordinary_derivative_configurations_ += batch_;
-        ordinary_fp32_affine_projections_ += mixed_dense_->statistics().projections;
       }
       canonical_head_ = nullptr;
       executing_derivative_island_ = false;
@@ -2970,7 +2969,10 @@ private:
                const double* weight, double* target)
   {
     if (mixed_dense_)
+    {
       mixed_dense_->projectSpatial(layout, source, weight, target);
+      if (canonical_head_) ++ordinary_fp32_affine_projections_;
+    }
     else
     {
       denseForward(blas_, makeFoldedSpatialDenseLayout(layout), source, weight, target);

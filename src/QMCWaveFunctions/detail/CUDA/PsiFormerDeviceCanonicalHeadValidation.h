@@ -255,6 +255,11 @@ inline void validate()
           require(full.sensitiveDerivativeConfigurations() == 1 && full.ordinaryDerivativeConfigurations() == 1 &&
               full.sensitiveFp64AffineProjections() && full.ordinaryFp32AffineProjections(),
               "Heterogeneous FULL promoted an ordinary member or lost selected arithmetic receipts");
+          const auto tiles = k ? (4 / k + (4 % k != 0)) : 1;
+          const auto expected_affines = tiles * (1 + 6 * shape.attention_blocks);
+          require(full.sensitiveFp64AffineProjections() == expected_affines &&
+              full.ordinaryFp32AffineProjections() == expected_affines,
+              "Heterogeneous FULL counters omitted a complete or tail target tile");
           for (std::size_t c = 0; c < 2; ++c)
           {
             const auto one = head.subview(c, 1);
