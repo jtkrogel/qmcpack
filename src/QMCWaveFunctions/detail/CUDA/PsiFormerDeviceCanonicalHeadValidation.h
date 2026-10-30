@@ -277,9 +277,19 @@ inline void validate()
           }
         }
         {
-          PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, {}, false);
-          auto sessions = backend.prepareMixedTrainingProductSessions(2);
-          auto& session = *sessions.first;
+          // The native factory intentionally caps this four-nucleus fixture at one.
+          // Exercise the existing explicitly admitted numerical owner without widening that policy.
+          std::shared_ptr<const PreparedDeviceModel> active_image = image;
+          std::shared_ptr<const PreparedDeviceMixedDenseParameters> active_cache = cache;
+          PsiFormerAcceleratorSharedModel owner(PreparedDeviceCrowdHooks::backend(),
+              makePsiFormerDeviceLayout(plan).fingerprint, image->version());
+          std::mutex control;
+          PreparedDeviceProductSession session(active_image, owner, control, 1, ProductSessionProfile::SCORE_ONLY,
+              2, {}, true, false, &active_cache);
+          const auto descriptor = estimateMixedScoreTileStorage(plan, 2);
+          require(session.scoreCapacity() == 2 && session.deviceWorkspaceBytes() == descriptor.device_bytes &&
+              session.hostWorkspaceBytes() >= descriptor.host_numeric_bytes,
+              "Explicit heterogeneous score owner lost its admitted capacity or cold inventory");
           session.prepareScoreContractions(1, image->version());
           const std::vector<double> weights{.25, -.75};
           std::vector<std::complex<double>> batched(values.size()), serial(values.size());
