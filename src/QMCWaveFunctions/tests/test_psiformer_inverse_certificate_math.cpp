@@ -8,6 +8,9 @@
 #include <array>
 #include <complex>
 #include <limits>
+#if defined(__SSE2__)
+#include <xmmintrin.h>
+#endif
 namespace cert = qmcplusplus::psiformer::device::inverse_certificate;
 namespace
 {
@@ -125,6 +128,16 @@ TEST_CASE("Compensated refinement safe domain is bounded and never repairs corru
   for (double x : {0x1p-451, -0x1p451, std::numeric_limits<double>::denorm_min(),
       std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
     REQUIRE_FALSE(cert::math::refinementOperand(x));
+#if defined(__SSE2__)
+  // A parent fast-math link may enable DAZ/FTZ even for a strict test TU.
+  // Numeric x==0 then sees a subnormal as zero; the bit guard must still reject.
+  const auto saved_csr = _mm_getcsr();
+  volatile double subnormal = std::numeric_limits<double>::denorm_min();
+  _mm_setcsr(saved_csr | 0x8040u);
+  const bool admitted_subnormal = cert::math::refinementOperand(subnormal);
+  _mm_setcsr(saved_csr);
+  REQUIRE_FALSE(admitted_subnormal);
+#endif
   const Mat A{1,1,1,1+0x1p-30}, B{1+0x1p30,-0x1p30,-0x1p30,0x1p30};
   for (double scale : {0x1p-419, 0x1p420})
   {

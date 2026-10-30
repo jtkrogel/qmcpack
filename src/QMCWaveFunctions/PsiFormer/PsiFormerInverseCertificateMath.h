@@ -257,8 +257,9 @@ QMC_PF_INV_HD inline double complexRow(const Complex* A, const Complex* B, std::
 /// normal (>=2^-1004); no backend FTZ assumption is needed. Zeros are exact.
 QMC_PF_INV_HD inline bool refinementOperand(double x) noexcept
 {
+  if (!device_math::isFiniteBinary64(x) || !normalOrZero(x)) return false;
   const double a = ::fabs(x);
-  return device_math::isFiniteBinary64(x) && (a == 0 || (a >= 0x1p-450 && a <= 0x1p450));
+  return a == 0 || (a >= 0x1p-450 && a <= 0x1p450);
 }
 
 /// Materialize each rounded operation; strict host/device compilation also
