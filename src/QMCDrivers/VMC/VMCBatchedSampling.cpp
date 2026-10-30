@@ -146,6 +146,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 {
   if (crowd.size() == 0)
     return;
+  if (warmup && sft.resident_device_observation && !sft.resident_device_mark_host_dirty)
+    throw UniformCommunicateError("Resident warmup requires a host-dirty notification.");
   // Reject HOST/debug consumers before any random draws or accepted-state mutation.
   if (sft.resident_device_observation &&
       (!sft.resident_device_observe || sft.qmcdrv_input.get_debug_checks() != DriverDebugChecks::ALL_OFF ||
@@ -476,8 +478,6 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     {
       // A resident observation callback is a production consumer, even when
       // scalar accumulation is disabled. Keep its host energy unavailable.
-      if (!sft.resident_device_mark_host_dirty)
-        throw UniformCommunicateError("Resident warmup requires a host-dirty notification.");
       sft.resident_device_mark_host_dirty();
       for (int iw = 0; iw < crowd.size(); ++iw)
         walkers[iw].get().Properties(WalkerProperties::LOCALENERGY) =
