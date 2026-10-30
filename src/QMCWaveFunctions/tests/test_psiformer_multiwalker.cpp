@@ -112,7 +112,8 @@ public:
     SCALAR_RATIO_GRADIENT_ACTIVE,
     MW_CALC_RATIO_VALUE,
     MW_RATIO_GRADIENT_ACTIVE,
-    MW_SELECTED_FULL_VGL
+    MW_SELECTED_FULL_VGL,
+    MW_SELECTED_VALUE_ONLY
   };
 
   /// Stable test spelling of one deliberately malformed ratio-arena condition.
@@ -375,6 +376,11 @@ public:
             PsiFormerWF::AcceptedStateRequirement::FULL_SPATIAL);
   }
 
+  /// Report clone-local VALUE and spatial owners for request-mode tests.
+  static PsiFormerWorkspaceDiagnostics directWorkspaceDiagnostics(
+      const PsiFormerWF& component)
+  { return component.directWorkspaceDiagnosticsForTesting(); }
+
   static bool hasCurrentValueOnlyAcceptedState(
       const PsiFormerWF& component, const ParticleSet& particles)
   {
@@ -543,6 +549,8 @@ public:
       return ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
     case PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL:
       return ProposalOrigin::MW_SELECTED_FULL_VGL;
+    case PsiFormerWF::ProposalOrigin::MW_SELECTED_VALUE_ONLY:
+      return ProposalOrigin::MW_SELECTED_VALUE_ONLY;
     }
     throw std::logic_error("Unknown PsiFormer proposal origin");
   }
@@ -628,6 +636,9 @@ public:
       break;
     case ProposalOrigin::NONE:
     case ProposalOrigin::MW_SELECTED_FULL_VGL:
+      throw std::invalid_argument(
+          "Test single-particle proposal requires a single-particle origin");
+    case ProposalOrigin::MW_SELECTED_VALUE_ONLY:
       throw std::invalid_argument(
           "Test single-particle proposal requires a single-particle origin");
     }
@@ -798,6 +809,8 @@ private:
       return PsiFormerWF::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
     case ProposalOrigin::MW_SELECTED_FULL_VGL:
       return PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL;
+    case ProposalOrigin::MW_SELECTED_VALUE_ONLY:
+      return PsiFormerWF::ProposalOrigin::MW_SELECTED_VALUE_ONLY;
     }
     throw std::logic_error("Unknown PsiFormer proposal-origin test value");
   }
@@ -7526,6 +7539,273 @@ TEST_CASE("PsiFormer planned selected resolution commits whole-crowd masks",
         *crowd.components[lane], *crowd.walkers[lane]));
 }
 
+TEST_CASE("PsiFormer planned VALUE proposals preserve value caches and rebuild FULL state",
+          "[wavefunction][psiformer][multiwalker][selected_resolution][value_only]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id =
+      "test/psiformer/planned-selected-value-resolution";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {walker_count}, {3}, participant_id,
+      "planned-selected-value-resolution-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection wf_template("psiformer_planned_value_resolution_template");
+  crowd.leader.createResource(wf_template);
+  ResourceCollection wf_resource(wf_template);
+  wf_resource.prepareBatchResources({plan, 0});
+  ResourceCollection particle_resource("psiformer_planned_value_resolution_particles");
+  crowd.walkers.front()->createResource(particle_resource);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(
+      particle_resource, *crowd.p_list);
+  ResourceCollectionTeamLock<WaveFunctionComponent> wf_lock(
+      wf_resource, crowd.wfc_list);
+
+  const std::size_t electron_count = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> initial_g(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> initial_l(walker_count);
+  RefVector<ParticleSet::ParticleGradient> initial_g_list;
+  RefVector<ParticleSet::ParticleLaplacian> initial_l_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    initial_g[lane].resize(electron_count);
+    initial_l[lane].resize(electron_count);
+    initial_g[lane] = Value(0);
+    initial_l[lane] = Value(0);
+    initial_g_list.push_back(initial_g[lane]);
+    initial_l_list.push_back(initial_l[lane]);
+  }
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              initial_g_list, initial_l_list,
+                              WaveFunctionEvaluationRequest::VALUE_ONLY);
+  for (const PsiFormerWF* component : crowd.components)
+    CHECK(Probe::cloneState(*component).accepted_state_requirement ==
+          Probe::valueOnlyAcceptedStateRequirement());
+
+  Moves::PosType moved0 = crowd.walkers[0]->R[0];
+  Moves::PosType moved1 = crowd.walkers[1]->R[1];
+  moved0[0] += 0.004;
+  moved0[2] -= 0.002;
+  moved1[1] -= 0.003;
+  moved1[2] += 0.001;
+  const Moves moves({0, 1, 2}, {0, 1}, {moved0, moved1});
+
+  std::vector<ParticleSet::ParticleGradient> proposed_g(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> proposed_l(walker_count);
+  RefVector<ParticleSet::ParticleGradient> proposed_g_list;
+  RefVector<ParticleSet::ParticleLaplacian> proposed_l_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    proposed_g[lane].resize(electron_count);
+    proposed_l[lane].resize(electron_count);
+    proposed_g[lane] = Value(0.019 * static_cast<double>(lane + 1));
+    proposed_l[lane] = Value(-0.027 * static_cast<double>(lane + 1));
+    proposed_g_list.push_back(proposed_g[lane]);
+    proposed_l_list.push_back(proposed_l[lane]);
+  }
+  const auto proposed_g_before = proposed_g;
+  const auto proposed_l_before = proposed_l;
+  std::vector<PsiFormerWF::LogValue> ratios(
+      walker_count, PsiFormerWF::LogValue(5));
+  crowd.leader.mw_evaluateMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, ratios, proposed_g_list,
+      proposed_l_list, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 1);
+  for (const PsiFormerWF* component : crowd.components)
+    CHECK(Probe::proposalOrigin(*component) ==
+          Probe::ProposalOrigin::MW_SELECTED_VALUE_ONLY);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(sameVectorBits(proposed_g[lane], proposed_g_before[lane]));
+    CHECK(sameVectorBits(proposed_l[lane], proposed_l_before[lane]));
+  }
+
+  Moves::PosType stale_position = moved1;
+  stale_position[0] += 0.001;
+  const Moves stale_moves({0, 1, 2}, {0, 1}, {moved0, stale_position});
+  const std::vector<testing::PsiFormerCloneStateSnapshot> pending_state = {
+      Probe::cloneState(*crowd.components[0]),
+      Probe::cloneState(*crowd.components[1])};
+  CHECK_THROWS_AS(crowd.leader.mw_accept_rejectMultiParticleMove(
+                      crowd.wfc_list, *crowd.p_list, stale_moves,
+                      {false, false}),
+                  std::logic_error);
+  Probe::setProposalOrigin(*crowd.components[1],
+                           Probe::ProposalOrigin::MW_SELECTED_FULL_VGL);
+  CHECK_THROWS_AS(crowd.leader.mw_accept_rejectMultiParticleMove(
+                      crowd.wfc_list, *crowd.p_list, moves,
+                      {false, false}),
+                  std::logic_error);
+  Probe::setProposalOrigin(*crowd.components[1],
+                           Probe::ProposalOrigin::MW_SELECTED_VALUE_ONLY);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    CHECK(Probe::cloneStateMatches(*crowd.components[lane],
+                                   pending_state[lane]));
+
+  Probe::cancelPlannedSelectedProposal(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, moves,
+      crowd.leader.parameterVersion());
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+
+  crowd.leader.mw_evaluateMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, ratios, proposed_g_list,
+      proposed_l_list, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  std::vector<bool> position_valid;
+  ParticleSet::mw_makeMoveSelectedParticles(
+      *crowd.p_list, moves, position_valid);
+  CHECK(std::all_of(position_valid.begin(), position_valid.end(),
+                    [](bool value) { return value; }));
+  crowd.leader.mw_accept_rejectMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, {true, false});
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(
+      *crowd.p_list, {true, false});
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::cloneState(*crowd.components[lane]).accepted_state_requirement ==
+          Probe::valueOnlyAcceptedStateRequirement());
+    CHECK_FALSE(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+  }
+
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    initial_g[lane] = Value(0);
+    initial_l[lane] = Value(0);
+  }
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              initial_g_list, initial_l_list);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::cloneState(*crowd.components[lane]).accepted_state_requirement !=
+          Probe::valueOnlyAcceptedStateRequirement());
+    CHECK(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+  }
+}
+
+TEST_CASE("PsiFormer CPU target VALUE proposals use clone-local forward workspaces",
+          "[wavefunction][psiformer][multiwalker][cpu_target][value_only]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "2");
+  ScopedEnvironmentVariable budget(
+      "PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  Crowd crowd(files, simulation_cell, walker_count);
+
+  ResourceCollection wf_template("psiformer_cpu_target_value_template");
+  crowd.leader.createResource(wf_template);
+  ResourceCollection wf_resource(wf_template);
+  ResourceCollection particle_resource("psiformer_cpu_target_value_particles");
+  crowd.walkers.front()->createResource(particle_resource);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(
+      particle_resource, *crowd.p_list);
+  ResourceCollectionTeamLock<WaveFunctionComponent> wf_lock(
+      wf_resource, crowd.wfc_list);
+
+  const std::size_t electron_count = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> accepted_g(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> accepted_l(walker_count);
+  RefVector<ParticleSet::ParticleGradient> accepted_g_list;
+  RefVector<ParticleSet::ParticleLaplacian> accepted_l_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    accepted_g[lane].resize(electron_count);
+    accepted_l[lane].resize(electron_count);
+    accepted_g[lane] = Value(0);
+    accepted_l[lane] = Value(0);
+    accepted_g_list.push_back(accepted_g[lane]);
+    accepted_l_list.push_back(accepted_l[lane]);
+  }
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              accepted_g_list, accepted_l_list,
+                              WaveFunctionEvaluationRequest::VALUE_ONLY);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    const auto scratch = Probe::directWorkspaceDiagnostics(
+        *crowd.components[lane]);
+    CHECK_FALSE(scratch.owns_full_spatial_workspace);
+    CHECK_FALSE(scratch.full_spatial_is_target);
+  }
+
+  Moves::PosType moved0 = crowd.walkers[0]->R[0];
+  Moves::PosType moved1 = crowd.walkers[1]->R[1];
+  moved0[0] += 0.003;
+  moved1[2] -= 0.002;
+  const Moves moves({0, 1, 2}, {0, 1}, {moved0, moved1});
+  std::vector<ParticleSet::ParticleGradient> proposed_g(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> proposed_l(walker_count);
+  RefVector<ParticleSet::ParticleGradient> proposed_g_list;
+  RefVector<ParticleSet::ParticleLaplacian> proposed_l_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    proposed_g[lane].resize(electron_count);
+    proposed_l[lane].resize(electron_count);
+    proposed_g[lane] = Value(0.014 * static_cast<double>(lane + 1));
+    proposed_l[lane] = Value(-0.021 * static_cast<double>(lane + 1));
+    proposed_g_list.push_back(proposed_g[lane]);
+    proposed_l_list.push_back(proposed_l[lane]);
+  }
+  const auto proposed_g_before = proposed_g;
+  const auto proposed_l_before = proposed_l;
+  std::vector<PsiFormerWF::LogValue> ratios(walker_count);
+  crowd.leader.mw_evaluateMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, ratios, proposed_g_list,
+      proposed_l_list, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::proposalOrigin(*crowd.components[lane]) ==
+          Probe::ProposalOrigin::MW_SELECTED_VALUE_ONLY);
+    CHECK(sameVectorBits(proposed_g[lane], proposed_g_before[lane]));
+    CHECK(sameVectorBits(proposed_l[lane], proposed_l_before[lane]));
+    const auto scratch = Probe::directWorkspaceDiagnostics(
+        *crowd.components[lane]);
+    CHECK_FALSE(scratch.owns_full_spatial_workspace);
+    CHECK(scratch.owns_value_workspace);
+  }
+
+  std::vector<bool> position_valid;
+  ParticleSet::mw_makeMoveSelectedParticles(
+      *crowd.p_list, moves, position_valid);
+  CHECK(std::all_of(position_valid.begin(), position_valid.end(),
+                    [](bool value) { return value; }));
+  crowd.leader.mw_accept_rejectMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, {true, false});
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(
+      *crowd.p_list, {true, false});
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::cloneState(*crowd.components[lane]).accepted_state_requirement ==
+          Probe::valueOnlyAcceptedStateRequirement());
+    CHECK_FALSE(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+  }
+
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    accepted_g[lane] = Value(0);
+    accepted_l[lane] = Value(0);
+  }
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              accepted_g_list, accepted_l_list);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    CHECK(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+}
+
 TEST_CASE("PsiFormer planned selected resolution failures retain cancellation evidence",
           "[wavefunction][psiformer][multiwalker][selected_resolution][atomic]")
 {
@@ -8035,6 +8315,8 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
   selected_resolve.descriptor_fingerprint = selected_descriptor;
   selected_resolve.expected_proposal_version =
       selected_evidence.proposal_version;
+  selected_resolve.expected_proposal_origin =
+      Probe::ProposalOrigin::MW_SELECTED_FULL_VGL;
   require_unchanged(crowd.wfc_list, *crowd.p_list, selected_resolve, false);
   CHECK(Probe::requirePlannedRuntime(
             sibling_crowd.leader, sibling_crowd.wfc_list,
@@ -8046,6 +8328,10 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
   malformed_selected = selected_resolve;
   malformed_selected.expected_proposal_version =
       selected_evidence.proposal_version + 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
+  malformed_selected = selected_resolve;
+  malformed_selected.expected_proposal_origin =
+      Probe::ProposalOrigin::MW_SELECTED_VALUE_ONLY;
   require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
   malformed_selected = selected_resolve;
   malformed_selected.expected_proposal_version.reset();

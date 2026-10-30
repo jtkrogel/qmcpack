@@ -38,6 +38,15 @@
  */
 namespace qmcplusplus
 {
+/// Spatial products requested from a wavefunction evaluation boundary.
+/// Components that do not implement a reduced request keep the full-product behavior.
+enum class WaveFunctionEvaluationRequest
+{
+  VALUE_ONLY,
+  GRADIENT_ONLY,
+  FULL_SPATIAL
+};
+
 ///forward declaration
 class WaveFunctionComponent;
 class TrialWaveFunction;
@@ -267,6 +276,12 @@ public:
                                ParticleSet::ParticleGradient& G,
                                ParticleSet::ParticleLaplacian& L) = 0;
 
+  /// Request-specific evaluation; the compatibility fallback computes full spatial products.
+  virtual LogValue evaluateLog(const ParticleSet& P,
+                               ParticleSet::ParticleGradient& G,
+                               ParticleSet::ParticleLaplacian& L,
+                               WaveFunctionEvaluationRequest request);
+
   /** evaluate from scratch the same type WaveFunctionComponent of multiple walkers
    * @param wfc_list the list of WaveFunctionComponent pointers of the same component in a walker batch
    * @param p_list the list of ParticleSet pointers in a walker batch
@@ -278,6 +293,13 @@ public:
                               const RefVectorWithLeader<ParticleSet>& p_list,
                               const RefVector<ParticleSet::ParticleGradient>& G_list,
                               const RefVector<ParticleSet::ParticleLaplacian>& L_list) const;
+
+  /// Request-specific batched evaluation; the compatibility fallback computes full spatial products.
+  virtual void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+                              const RefVectorWithLeader<ParticleSet>& p_list,
+                              const RefVector<ParticleSet::ParticleGradient>& G_list,
+                              const RefVector<ParticleSet::ParticleLaplacian>& L_list,
+                              WaveFunctionEvaluationRequest request) const;
 
   /** recompute the value of the WaveFunctionComponents which require critical accuracy.
    * needed for Slater Determinants but not needed for most types of WaveFunctionComponents
@@ -453,6 +475,16 @@ public:
       std::vector<LogValue>& log_ratios,
       const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
       const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const;
+
+  /// Request-specific selected proposal; the compatibility fallback computes full spatial products.
+  virtual void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list,
+      WaveFunctionEvaluationRequest request) const;
 
   /// Resolve the complete selected-electron proposal for every walker.
   virtual void mw_accept_rejectMultiParticleMove(

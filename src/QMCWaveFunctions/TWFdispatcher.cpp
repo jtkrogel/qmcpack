@@ -21,12 +21,20 @@ TWFdispatcher::TWFdispatcher(bool use_batch) : use_batch_(use_batch) {}
 void TWFdispatcher::flex_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                                      const RefVectorWithLeader<ParticleSet>& p_list) const
 {
+  flex_evaluateLog(wf_list, p_list, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+void TWFdispatcher::flex_evaluateLog(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    WaveFunctionEvaluationRequest request) const
+{
   assert(wf_list.size() == p_list.size());
   if (use_batch_)
-    TrialWaveFunction::mw_evaluateLog(wf_list, p_list);
+    TrialWaveFunction::mw_evaluateLog(wf_list, p_list, request);
   else
     for (size_t iw = 0; iw < wf_list.size(); iw++)
-      wf_list[iw].evaluateLog(p_list[iw]);
+      wf_list[iw].evaluateLog(p_list[iw], request);
 }
 
 void TWFdispatcher::flex_recompute(const RefVectorWithLeader<TrialWaveFunction>& wf_list,

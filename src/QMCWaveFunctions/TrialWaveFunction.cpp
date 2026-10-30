@@ -1455,6 +1455,13 @@ RefVector<MultiSlaterDetTableMethod> TrialWaveFunction::findMSD() const
 */
 TrialWaveFunction::RealType TrialWaveFunction::evaluateLog(ParticleSet& P)
 {
+  return evaluateLog(P, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+TrialWaveFunction::RealType TrialWaveFunction::evaluateLog(
+    ParticleSet& P,
+    WaveFunctionEvaluationRequest request)
+{
   ScopedTimer local_timer(TWF_timers_[RECOMPUTE_TIMER]);
   P.G = 0.0;
   P.L = 0.0;
@@ -1462,14 +1469,10 @@ TrialWaveFunction::RealType TrialWaveFunction::evaluateLog(ParticleSet& P)
   for (int i = 0; i < Z.size(); ++i)
   {
     ScopedTimer z_timer(WFC_timers_[RECOMPUTE_TIMER + TIMER_SKIP * i]);
-#ifndef NDEBUG
     // Best way I've found yet to quickly see if WFC made it over the wire successfully
-    auto subterm = Z[i]->evaluateLog(P, P.G, P.L);
+    auto subterm = Z[i]->evaluateLog(P, P.G, P.L, request);
     // std::cerr << "evaluate log Z element:" <<  i << "  value: " << subterm << '\n';
     logpsi += subterm;
-#else
-    logpsi += Z[i]->evaluateLog(P, P.G, P.L);
-#endif
   }
 
   G = P.G;
@@ -1477,11 +1480,34 @@ TrialWaveFunction::RealType TrialWaveFunction::evaluateLog(ParticleSet& P)
 
   log_real_  = std::real(logpsi);
   PhaseValue = std::imag(logpsi);
+  if (request == WaveFunctionEvaluationRequest::VALUE_ONLY)
+    invalidateSpatialProducts(P);
+  else
+  {
+    gradients_valid_ = true;
+    laplacians_valid_ = request == WaveFunctionEvaluationRequest::FULL_SPATIAL;
+    if (!laplacians_valid_)
+    {
+      const RealType invalid = std::numeric_limits<RealType>::quiet_NaN();
+      for (auto& laplacian : L)
+        laplacian = ValueType(invalid);
+      for (auto& laplacian : P.L)
+        laplacian = ValueType(invalid);
+    }
+  }
   return log_real_;
 }
 
 void TrialWaveFunction::mw_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                                        const RefVectorWithLeader<ParticleSet>& p_list)
+{
+  mw_evaluateLog(wf_list, p_list, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+void TrialWaveFunction::mw_evaluateLog(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    WaveFunctionEvaluationRequest request)
 {
   auto& wf_leader = wf_list.getLeader();
   auto& p_leader  = p_list.getLeader();
@@ -1513,7 +1539,7 @@ void TrialWaveFunction::mw_evaluateLog(const RefVectorWithLeader<TrialWaveFuncti
   {
     ScopedTimer z_timer(wf_leader.WFC_timers_[RECOMPUTE_TIMER + TIMER_SKIP * i]);
     const auto wfc_list(extractWFCRefList(wf_list, i));
-    wavefunction_components[i]->mw_evaluateLog(wfc_list, p_list, g_list, l_list);
+    wavefunction_components[i]->mw_evaluateLog(wfc_list, p_list, g_list, l_list, request);
   }
 
   for (int iw = 0; iw < wf_list.size(); iw++)
@@ -1531,7 +1557,40 @@ void TrialWaveFunction::mw_evaluateLog(const RefVectorWithLeader<TrialWaveFuncti
     // remove when KineticEnergy use WF.G/L instead of P.G/L
     pset.G = twf.G;
     pset.L = twf.L;
+    if (request == WaveFunctionEvaluationRequest::VALUE_ONLY)
+      twf.invalidateSpatialProducts(pset);
+    else
+    {
+      twf.gradients_valid_ = true;
+      twf.laplacians_valid_ = request == WaveFunctionEvaluationRequest::FULL_SPATIAL;
+      if (!twf.laplacians_valid_)
+      {
+        const RealType invalid = std::numeric_limits<RealType>::quiet_NaN();
+        for (auto& laplacian : twf.L)
+          laplacian = ValueType(invalid);
+        for (auto& laplacian : pset.L)
+          laplacian = ValueType(invalid);
+      }
+    }
   }
+}
+
+void TrialWaveFunction::invalidateSpatialProducts(ParticleSet& particles)
+{
+  const RealType invalid = std::numeric_limits<RealType>::quiet_NaN();
+  auto invalidate_gradients = [invalid](auto& gradients) {
+    for (auto& gradient : gradients)
+      for (auto& component : gradient)
+        component = invalid;
+  };
+  invalidate_gradients(G);
+  invalidate_gradients(particles.G);
+  for (auto& laplacian : L)
+    laplacian = ValueType(invalid);
+  for (auto& laplacian : particles.L)
+    laplacian = ValueType(invalid);
+  gradients_valid_ = false;
+  laplacians_valid_ = false;
 }
 
 void TrialWaveFunction::recompute(const ParticleSet& P)
@@ -2161,6 +2220,17 @@ void TrialWaveFunction::mw_evaluateMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves,
     std::vector<LogValue>& log_ratios)
 {
+  mw_evaluateMultiParticleMove(wf_list, p_list, moves, log_ratios,
+                               WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+void TrialWaveFunction::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios,
+    WaveFunctionEvaluationRequest request)
+{
   if (wf_list.size() != p_list.size() || moves.walkerCount() != wf_list.size())
     throw std::invalid_argument(
         "Selected-electron wavefunction proposal has inconsistent walker counts");
@@ -2186,6 +2256,7 @@ void TrialWaveFunction::mw_evaluateMultiParticleMove(
     wavefunction.multi_particle_proposed_gradient_  = ValueType(0);
     wavefunction.multi_particle_proposed_laplacian_ = ValueType(0);
     wavefunction.multi_particle_proposed_log_ratio_ = LogValue(0);
+    wavefunction.multi_particle_product_request_ = request;
     wavefunction.multi_particle_proposal_fingerprint_ = proposal_fingerprint;
     log_ratios[walker] = LogValue(0);
   }
@@ -2210,7 +2281,7 @@ void TrialWaveFunction::mw_evaluateMultiParticleMove(
       std::vector<LogValue> component_log_ratios(wf_list.size(), LogValue(0));
       leader.Z[component_index]->mw_evaluateMultiParticleMove(
           component_list, p_list, moves, component_log_ratios,
-          proposed_gradient_list, proposed_laplacian_list);
+          proposed_gradient_list, proposed_laplacian_list, request);
       for (std::size_t walker = 0; walker < wf_list.size(); ++walker)
         log_ratios[walker] += component_log_ratios[walker];
       ++completed_components;
@@ -2230,6 +2301,8 @@ void TrialWaveFunction::mw_evaluateMultiParticleMove(
     {
       wavefunction.multi_particle_proposal_fingerprint_ = 0;
       wavefunction.multi_particle_proposed_log_ratio_    = LogValue(0);
+      wavefunction.multi_particle_product_request_ =
+          WaveFunctionEvaluationRequest::FULL_SPATIAL;
     }
     throw;
   }
@@ -2272,10 +2345,31 @@ void TrialWaveFunction::mw_accept_rejectMultiParticleMove(
     TrialWaveFunction& wavefunction = wf_list[walker];
     if (accepted[walker])
     {
-      wavefunction.G = wavefunction.multi_particle_proposed_gradient_;
-      wavefunction.L = wavefunction.multi_particle_proposed_laplacian_;
-      p_list[walker].G = wavefunction.G;
-      p_list[walker].L = wavefunction.L;
+      if (wavefunction.multi_particle_product_request_ ==
+          WaveFunctionEvaluationRequest::VALUE_ONLY)
+        wavefunction.invalidateSpatialProducts(p_list[walker]);
+      else
+      {
+        wavefunction.G = wavefunction.multi_particle_proposed_gradient_;
+        p_list[walker].G = wavefunction.G;
+        wavefunction.gradients_valid_ = true;
+        wavefunction.laplacians_valid_ =
+            wavefunction.multi_particle_product_request_ ==
+            WaveFunctionEvaluationRequest::FULL_SPATIAL;
+        if (wavefunction.laplacians_valid_)
+        {
+          wavefunction.L = wavefunction.multi_particle_proposed_laplacian_;
+          p_list[walker].L = wavefunction.L;
+        }
+        else
+        {
+          const RealType invalid = std::numeric_limits<RealType>::quiet_NaN();
+          for (auto& laplacian : wavefunction.L)
+            laplacian = ValueType(invalid);
+          for (auto& laplacian : p_list[walker].L)
+            laplacian = ValueType(invalid);
+        }
+      }
       wavefunction.log_real_  = 0;
       wavefunction.PhaseValue = 0;
       for (const auto& component : wavefunction.Z)
@@ -2288,6 +2382,8 @@ void TrialWaveFunction::mw_accept_rejectMultiParticleMove(
     wavefunction.multi_particle_proposal_pending_ = false;
     wavefunction.multi_particle_proposal_fingerprint_ = 0;
     wavefunction.multi_particle_proposed_log_ratio_ = LogValue(0);
+    wavefunction.multi_particle_product_request_ =
+        WaveFunctionEvaluationRequest::FULL_SPATIAL;
   }
 }
 
@@ -2295,6 +2391,9 @@ const ParticleSet::ParticleGradient& TrialWaveFunction::multiParticleProposalGra
 {
   if (!multi_particle_proposal_pending_)
     throw std::logic_error("TrialWaveFunction has no pending selected-electron proposal");
+  if (multi_particle_product_request_ == WaveFunctionEvaluationRequest::VALUE_ONLY)
+    throw std::logic_error(
+        "TrialWaveFunction selected proposal did not request a gradient");
   return multi_particle_proposed_gradient_;
 }
 
@@ -2348,6 +2447,8 @@ TrialWaveFunction::LogValue TrialWaveFunction::evaluateGL(ParticleSet& P, bool f
   L          = P.L;
   log_real_  = std::real(logpsi);
   PhaseValue = std::imag(logpsi);
+  gradients_valid_ = true;
+  laplacians_valid_ = true;
   return logpsi;
 }
 
@@ -2399,6 +2500,8 @@ void TrialWaveFunction::mw_evaluateGL(const RefVectorWithLeader<TrialWaveFunctio
     // remove when KineticEnergy use WF.G/L instead of P.G/L
     pset.G = twf.G;
     pset.L = twf.L;
+    twf.gradients_valid_ = true;
+    twf.laplacians_valid_ = true;
   }
 }
 

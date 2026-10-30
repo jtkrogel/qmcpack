@@ -36,6 +36,10 @@ public:
   void flex_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                         const RefVectorWithLeader<ParticleSet>& p_list) const;
 
+  void flex_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+                        const RefVectorWithLeader<ParticleSet>& p_list,
+                        WaveFunctionEvaluationRequest request) const;
+
   void flex_recompute(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                       const RefVectorWithLeader<ParticleSet>& p_list,
                       const std::vector<bool>& recompute) const;

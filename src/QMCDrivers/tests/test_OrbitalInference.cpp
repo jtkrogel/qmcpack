@@ -93,7 +93,9 @@ public:
   {
     ContextForSteps context(rngs_[0]);
     RefVector<ContextForSteps> contexts{context};
-    initialLogEvaluationWavefunctionOnly(0, crowds_, contexts, false);
+    initialLogEvaluationWarmupValueOnly(0, crowds_, contexts, false);
+    CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
+    CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidLaplacians());
     CHECK(*physical == 0);
     CHECK(*auxiliary == 0);
     VMCBatchedSampling::State state(qmcdriver_input_, vmc, *drift_modifier_, population_, 1, false);
@@ -101,12 +103,15 @@ public:
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
         [](Crowd&, std::string_view) {}};
     VMCBatchedSampling::runWarmupStep(0, state, timers, rngs_, crowds_);
+    CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
     CHECK(*physical == 0);
     CHECK(*auxiliary == 0);
     CHECK_FALSE(wftrain::isFiniteTrainingReal(
         crowds_[0]->get_walkers()[0].get().Properties(WalkerProperties::LOCALENERGY)));
     state.accumulate_estimators = false;
     VMCBatchedSampling::runVMCStep(0, state, timers, rngs_, crowds_);
+    CHECK(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
+    CHECK(crowds_[0]->get_walker_twfs()[0].get().hasValidLaplacians());
     CHECK(*physical > 0);
     CHECK(*auxiliary > 0);
     CHECK(crowds_[0]->get_estimator_manager_crowd().get_block_weight() == 0.0);

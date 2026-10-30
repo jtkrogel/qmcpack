@@ -143,8 +143,14 @@ void VMCBatched::run()
     ScopedTimer local_timer(timers_.init_walkers_timer);
     ParallelExecutor<> section_start_task;
     auto step_contexts_refs = getContextForStepsRefs();
-    const auto initialize = qmcdriver_input_.get_warmup_steps() > 0
-        ? initialLogEvaluationWavefunctionOnly : initialLogEvaluation;
+    const bool value_only_warmup = qmcdriver_input_.get_warmup_steps() > 0 &&
+        !vmcdriver_input_.get_use_drift() &&
+        qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF;
+    const auto initialize = value_only_warmup
+        ? initialLogEvaluationWarmupValueOnly
+        : qmcdriver_input_.get_warmup_steps() > 0
+            ? initialLogEvaluationWavefunctionOnly
+            : initialLogEvaluation;
     section_start_task(crowds_.size(), initialize, crowds_, step_contexts_refs, serializing_crowd_walkers_);
     print_mem("VMCBatched after initialLogEvaluation", app_summary());
     if (qmcdriver_input_.get_measure_imbalance())

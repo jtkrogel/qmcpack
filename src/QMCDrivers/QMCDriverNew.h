@@ -263,13 +263,22 @@ public:
                                                    const RefVector<ContextForSteps>& step_context,
                                                    bool serializing_crowd_walkers);
 
+  /// Initialize a no-drift warmup with accepted values and no spatial products.
+  static void initialLogEvaluationWarmupValueOnly(
+      int crowd_id,
+      UPtrVector<Crowd>& crowds,
+      const RefVector<ContextForSteps>& step_context,
+      bool serializing_crowd_walkers);
+
   /// Common initialization body; public wrappers preserve the four-argument crowd ABI.
   static void initialLogEvaluationImpl(int crowd_id,
                                        UPtrVector<Crowd>& crowds,
                                        const RefVector<ContextForSteps>& step_context,
                                        bool serializing_crowd_walkers,
                                        bool deterministic_hamiltonian,
-                                       bool evaluate_energy = true);
+                                       bool evaluate_energy = true,
+                                       WaveFunctionEvaluationRequest request =
+                                           WaveFunctionEvaluationRequest::FULL_SPATIAL);
 
 
   /** should be set in input don't see a reason to set individually

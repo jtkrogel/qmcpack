@@ -4554,9 +4554,14 @@ void WFTrainBatched::run()
     auto step_context_refs = getContextForStepsRefs();
     const bool warmup_pending = training_input_.getWarmupSteps() > 0 ||
         (!resumed && qmcdriver_input_.get_warmup_steps() > 0);
-    const auto initialize = training_input_.samplesOrbitalStudent() || warmup_pending
-        ? initialLogEvaluationWavefunctionOnly
-        : resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
+    const bool value_only_warmup = warmup_pending &&
+        !vmcdriver_input_.get_use_drift() &&
+        qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF;
+    const auto initialize = value_only_warmup
+        ? initialLogEvaluationWarmupValueOnly
+        : training_input_.samplesOrbitalStudent() || warmup_pending
+            ? initialLogEvaluationWavefunctionOnly
+            : resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
     crowd_task(crowds_.size(), initialize, crowds_, step_context_refs,
                serializing_crowd_walkers_);
     print_mem("WFTrainBatched after initialLogEvaluation", app_summary());

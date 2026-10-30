@@ -245,9 +245,17 @@ public:
   /** evalaute the log (internally gradients and laplacian) of the trial wavefunction. gold reference */
   RealType evaluateLog(ParticleSet& P);
 
+  /// Evaluate only the requested products; old callers continue to request full spatial data.
+  RealType evaluateLog(ParticleSet& P, WaveFunctionEvaluationRequest request);
+
   /** batched version of evaluateLog. gold reference */
   static void mw_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                              const RefVectorWithLeader<ParticleSet>& p_list);
+
+  /// Batched request-specific evaluation; the old overload remains full-spatial.
+  static void mw_evaluateLog(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+                             const RefVectorWithLeader<ParticleSet>& p_list,
+                             WaveFunctionEvaluationRequest request);
 
   /** recompute the value of the orbitals which require critical accuracy */
   void recompute(const ParticleSet& P);
@@ -572,12 +580,24 @@ public:
   /// Return true only when every component supports selected-electron transactions.
   bool supportsMultiParticleMoves() const noexcept;
 
+  /// Report explicit validity; NaN-filled storage is only a diagnostic sentinel.
+  bool hasValidGradients() const noexcept { return gradients_valid_; }
+  bool hasValidLaplacians() const noexcept { return laplacians_valid_; }
+
   /// Evaluate complete proposed value/G/L state without modifying accepted state.
   static void mw_evaluateMultiParticleMove(
       const RefVectorWithLeader<TrialWaveFunction>& wf_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       const MCMultiParticleMoves<CoordsType::POS>& moves,
       std::vector<LogValue>& log_ratios);
+
+  /// Request-specific selected proposal; old calls retain full proposed products.
+  static void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      WaveFunctionEvaluationRequest request);
 
   /// Promote or discard each walker's complete proposed wavefunction state.
   static void mw_accept_rejectMultiParticleMove(
@@ -880,6 +900,13 @@ private:
   LogValue multi_particle_proposed_log_ratio_ = LogValue(0);
   std::uint64_t multi_particle_proposal_fingerprint_ = 0;
   bool multi_particle_proposal_pending_ = false;
+  WaveFunctionEvaluationRequest multi_particle_product_request_ =
+      WaveFunctionEvaluationRequest::FULL_SPATIAL;
+  bool gradients_valid_ = false;
+  bool laplacians_valid_ = false;
+
+  /// Mark aggregate and ParticleSet derivatives unavailable after a VALUE-only evaluation.
+  void invalidateSpatialProducts(ParticleSet& particles);
 
   /// if true, using internal tasking implementation
   const bool use_tasking_;

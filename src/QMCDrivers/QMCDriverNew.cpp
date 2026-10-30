@@ -273,13 +273,25 @@ void QMCDriverNew::initialLogEvaluationWavefunctionOnly(int crowd_id,
   initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false, false);
 }
 
+/** Initialize value caches for a no-drift warmup. */
+void QMCDriverNew::initialLogEvaluationWarmupValueOnly(
+    int crowd_id,
+    UPtrVector<Crowd>& crowds,
+    const RefVector<ContextForSteps>& contexts,
+    bool serializing)
+{
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false, false,
+                           WaveFunctionEvaluationRequest::VALUE_ONLY);
+}
+
 /** Initialize resident walker caches with optional ordinary or fixed-grid energies. */
 void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
                                         UPtrVector<Crowd>& crowds,
                                         const RefVector<ContextForSteps>& context_for_steps,
                                         const bool serializing_crowd_walkers,
                                         const bool deterministic_hamiltonian,
-                                        const bool evaluate_energy)
+                                        const bool evaluate_energy,
+                                        WaveFunctionEvaluationRequest request)
 {
   Crowd& crowd = *(crowds[crowd_id]);
   if (crowd.size() == 0)
@@ -304,7 +316,7 @@ void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
   std::vector<bool> recompute_mask(walkers.size(), true);
   ps_dispatcher.flex_loadWalker(walker_elecs, walkers, recompute_mask, true);
   ps_dispatcher.flex_donePbyP(walker_elecs);
-  twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
+  twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs, request);
 
   // For consistency this should be in ParticleSet as a flex call, but I think its a problem
   // in the algorithm logic and should be removed.

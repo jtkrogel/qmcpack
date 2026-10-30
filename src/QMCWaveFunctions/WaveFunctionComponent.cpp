@@ -103,6 +103,25 @@ void WaveFunctionComponent::mw_evaluateLog(const RefVectorWithLeader<WaveFunctio
     wfc_list[iw].evaluateLog(p_list[iw], G_list[iw], L_list[iw]);
 }
 
+WaveFunctionComponent::LogValue WaveFunctionComponent::evaluateLog(
+    const ParticleSet& P,
+    ParticleSet::ParticleGradient& G,
+    ParticleSet::ParticleLaplacian& L,
+    WaveFunctionEvaluationRequest)
+{
+  return evaluateLog(P, G, L);
+}
+
+void WaveFunctionComponent::mw_evaluateLog(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVector<ParticleSet::ParticleGradient>& G_list,
+    const RefVector<ParticleSet::ParticleLaplacian>& L_list,
+    WaveFunctionEvaluationRequest) const
+{
+  mw_evaluateLog(wfc_list, p_list, G_list, L_list);
+}
+
 void WaveFunctionComponent::recompute(const ParticleSet& P)
 {
   ParticleSet::ParticleGradient temp_G(P.getTotalNum());
@@ -302,6 +321,19 @@ void WaveFunctionComponent::mw_evaluateMultiParticleMove(
 {
   throw std::runtime_error(getClassName() +
                            " does not support atomic selected-electron proposals");
+}
+
+void WaveFunctionComponent::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios,
+    const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+    const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list,
+    WaveFunctionEvaluationRequest) const
+{
+  mw_evaluateMultiParticleMove(wfc_list, p_list, moves, log_ratios,
+                               proposed_gradient_list, proposed_laplacian_list);
 }
 
 void WaveFunctionComponent::mw_accept_rejectMultiParticleMove(

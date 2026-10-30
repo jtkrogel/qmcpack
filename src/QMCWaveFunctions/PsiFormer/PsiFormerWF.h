@@ -584,6 +584,12 @@ public:
                        ParticleSet::ParticleGradient& gradient,
                        ParticleSet::ParticleLaplacian& laplacian) override;
 
+  /// Evaluate the accepted value without constructing spatial products when requested.
+  LogValue evaluateLog(const ParticleSet& particles,
+                       ParticleSet::ParticleGradient& gradient,
+                       ParticleSet::ParticleLaplacian& laplacian,
+                       WaveFunctionEvaluationRequest request) override;
+
   /// Query the explicitly enabled resolved GPU sampler, rejecting hard-plan overlap.
   bool deviceSamplingEnabled() const;
 
@@ -783,6 +789,13 @@ public:
                       const RefVector<ParticleSet::ParticleGradient>& gradient_list,
                       const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list) const override;
 
+  /// Use the existing VALUE recompute engine when spatial products are not requested.
+  void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+                      const RefVectorWithLeader<ParticleSet>& p_list,
+                      const RefVector<ParticleSet::ParticleGradient>& gradient_list,
+                      const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list,
+                      WaveFunctionEvaluationRequest request) const override;
+
   /// Reuse the same direct full-spatial batch for evaluateGL callers.
   void mw_evaluateGL(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                      const RefVectorWithLeader<ParticleSet>& p_list,
@@ -801,6 +814,16 @@ public:
       std::vector<LogValue>& log_ratios,
       const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
       const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const override;
+
+  /// Use native VALUE evaluation for no-drift collective proposals where admitted.
+  void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list,
+      WaveFunctionEvaluationRequest request) const override;
 
   /// Atomically promote or discard each clone's complete selected-electron proposal.
   void mw_accept_rejectMultiParticleMove(
@@ -1123,7 +1146,8 @@ private:
     SCALAR_RATIO_GRADIENT_ACTIVE = 2,
     MW_CALC_RATIO_VALUE          = 3,
     MW_RATIO_GRADIENT_ACTIVE     = 4,
-    MW_SELECTED_FULL_VGL         = 5
+    MW_SELECTED_FULL_VGL         = 5,
+    MW_SELECTED_VALUE_ONLY       = 6
   };
   static_assert(sizeof(ProposalOrigin) == sizeof(std::uint8_t));
 
@@ -1428,6 +1452,15 @@ private:
   /// Publish previously validated target products with no allocation or failure.
   void publishCpuTargetFullVGL(ParticleSet::ParticleGradient& gradients,
                               ParticleSet::ParticleLaplacian& laplacians) noexcept;
+
+  /// Evaluate legacy unplanned collective proposals with VALUE only.
+  void mw_evaluateMultiParticleValueOnly(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const;
 
   /// Validate one homogeneous clone crowd and return its exclusively acquired resource.
   PsiFormerMultiWalkerResource& requireMultiWalkerResource(

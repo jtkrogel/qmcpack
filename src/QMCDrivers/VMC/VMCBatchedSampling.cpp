@@ -169,6 +169,17 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   ResourceCollectionTeamLock<ParticleSet> pset_res_lock(crowd.getSharedResource().pset_res, walker_elecs);
   ResourceCollectionTeamLock<TrialWaveFunction> twfs_res_lock(crowd.getSharedResource().twf_res, walker_twfs);
   timers.resource.stop();
+  const bool use_drift = sft.vmcdrv_input.get_use_drift();
+  const bool needs_full_products = !warmup ||
+      (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD);
+  const bool missing_full_products = needs_full_products &&
+      std::any_of(walker_twfs.begin(), walker_twfs.end(),
+                  [](const TrialWaveFunction& wavefunction) {
+                    return !wavefunction.hasValidGradients() ||
+                        !wavefunction.hasValidLaplacians();
+                  });
+  if (missing_full_products)
+    twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, false);
   if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD)
     timers.check_log_and_gl(crowd, "checkGL_after_load");
 
@@ -313,14 +324,16 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
           }
 
           const MCMultiParticleMoves<CoordsType::POS> moves(walker_offsets, selected_indices, proposed_positions);
-          TrialWaveFunction::mw_evaluateMultiParticleMove(walker_twfs, walker_elecs, moves, log_ratios);
+          TrialWaveFunction::mw_evaluateMultiParticleMove(
+              walker_twfs, walker_elecs, moves, log_ratios,
+              warmup && !use_drift ? WaveFunctionEvaluationRequest::VALUE_ONLY
+                                   : WaveFunctionEvaluationRequest::FULL_SPATIAL);
 
           std::fill(log_gf.begin(), log_gf.end(), RealType{});
           std::fill(log_gb.begin(), log_gb.end(), RealType{});
           for (int iw = 0; iw < num_walkers; ++iw)
           {
             const auto move_slice     = moves.slice(iw);
-            const auto& proposed_grad = walker_twfs[iw].multiParticleProposalGradient();
             for (int local_index = 0; local_index < particles_per_move; ++local_index)
             {
               const int flat_index = iw * particles_per_move + local_index;
@@ -330,7 +343,10 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
                   sft.qmcdrv_input.get_tau() / walker_leader.get_mass_by_group()[group];
               ParticleSet::PosType reverse_drift;
               if (use_drift)
+              {
+                const auto& proposed_grad = walker_twfs[iw].multiParticleProposalGradient();
                 sft.drift_modifier.getDrift(tau_over_mass, proposed_grad[iat], reverse_drift);
+              }
               else
                 reverse_drift = ParticleSet::PosType{};
 
@@ -504,7 +520,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
       if (!reuse_full)
         twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
     }
-    else
+    else if (!(warmup && !sft.vmcdrv_input.get_use_drift() &&
+               sft.qmcdrv_input.get_debug_checks() == DriverDebugChecks::ALL_OFF))
       twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
     if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_MOVES)
       timers.check_log_and_gl(crowd, "checkGL_after_moves");
