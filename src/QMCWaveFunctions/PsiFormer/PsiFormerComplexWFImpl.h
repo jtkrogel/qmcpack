@@ -1013,10 +1013,10 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Prepare a whole candidate while old proposed products remain live and charged.
-    void prepareCpuCollective(std::size_t walkers)
+    void prepareCpuCollective(std::size_t walkers, bool spatial)
     {
       const char* message = "Complex CPU collective staging overflow";
-      const auto elements = pf::checkedStorageProduct(walkers, state->model.ne, message);
+      const auto elements = spatial ? pf::checkedStorageProduct(walkers, state->model.ne, message) : gradient.size();
       if (walkers <= amplitude.size() && elements <= gradient.size())
         return;
       auto bytes = pf::checkedStorageProduct(walkers,
@@ -1152,6 +1152,7 @@ struct PsiFormerComplexWF::Impl
     bool collective_pending = false;
     std::size_t collective_version = 0;
     std::uint64_t collective_descriptor = 0;
+    bool collective_value_only = false;
   };
 
   /// Fixed ions are part of the captured derivative problem, not an unchecked caller convention.
@@ -3187,9 +3188,10 @@ struct PsiFormerComplexWF::Impl
       state->pending_proposals.fetch_sub(1, std::memory_order_relaxed);
     }
     collective_pending = false;
+    proposed_value_only = false;
   }
 
-  /// Mixed entrypoints must not revoke a collectively retained FULL transaction.
+  /// Mixed entrypoints must not revoke a collectively retained proposal transaction.
   void requireNoCollective() const
   {
     if (collective_pending)
@@ -3603,7 +3605,7 @@ struct PsiFormerComplexWF::Impl
         (accepted_gradient ? lane.dense_eval_grad_calls : lane.dense_vgl_calls)) : lane.dense_value_calls);
     if (dense_tiles && calls++ == 0)
       app_log() << "  Complex PsiFormer numerical dense tile completed: operation="
-                << (collective ? "COLLECTIVE_FULL" : (spatial ? (proposed_gradient ? "RATIO_GRAD_FULL" :
+                << (collective ? (spatial ? "COLLECTIVE_FULL" : "COLLECTIVE_VALUE") : (spatial ? (proposed_gradient ? "RATIO_GRAD_FULL" :
                     (accepted_gradient ? "ACCEPTED_GRAD_FULL" : "FULL_VGL")) : "VALUE"))
                 << ", walkers=" << targets.size() << ", tile_capacity=" << lane.capacity
                 << ", dense_tiles=" << dense_tiles << ", last_tile_count=" << tail
@@ -3712,7 +3714,7 @@ struct PsiFormerComplexWF::Impl
       auto& workspace = result.cpu_owner
           ? result.cpu_owner->prepare(result.cpu_owner->value, state->cpu_requirements[0],
               [&] { return state->value.makeWorkspace(); }, CpuLane::Mode::VALUE) : *value;
-      positions(workspace, p, replacement, absolute);
+      positions(workspace, p, replacement, absolute, collective);
       const auto evaluated = state->value.evaluate(workspace);
       result.amplitude = evaluated.amplitude;
       result.parameter_version = evaluated.parameter_version;
@@ -3764,30 +3766,31 @@ struct PsiFormerComplexWF::Impl
     return false;
   }
 
-  /// Reuse one crowd FULL tape, copying each borrowed result before releasing its lease.
+  /// Reuse one bounded crowd tape, copying each borrowed result before releasing its lease.
   void stageCpuCollective(MultiWalkerResource& resource, const RefVectorWithLeader<ParticleSet>& targets,
-      const MCMultiParticleMoves<CoordsType::POS>& moves)
+      const MCMultiParticleMoves<CoordsType::POS>& moves, bool spatial = true)
   {
-    resource.prepareCpuCollective(targets.size());
+    resource.prepareCpuCollective(targets.size(), spatial);
     const auto n = state->model.ne;
     for (std::size_t walker = 0; walker < targets.size(); ++walker)
     {
       auto& clone = *resource.components[walker]->impl_;
       const auto slice = moves.slice(walker);
-      const auto result = clone.core(targets[walker], true, -1, -1, nullptr, &slice);
+      const auto result = clone.core(targets[walker], spatial, -1, -1, nullptr, &slice);
       resource.amplitude[walker] = result.amplitude;
       resource.logs[walker] = clone.physicalLog(result.amplitude, targets[walker], slice);
       resource.keys[walker] = configurationIdentity(targets[walker], slice);
-      for (std::size_t e = 0; e < n; ++e)
-      {
-        for (int d = 0; d < 3; ++d)
-          resource.gradient[walker * n + e][d] = clone.physicalGradient(result.gradient[3 * e + d], d);
-        const auto value = result.laplacian_log[e];
-        const auto converted = makePsiFormerScalar<ValueType>(value.real(), value.imag());
-        if (!isFiniteWavefunctionValue(converted))
-          throw std::overflow_error("Complex CPU collective Laplacian conversion overflow");
-        resource.laplacian[walker * n + e] = converted;
-      }
+      if (spatial)
+        for (std::size_t e = 0; e < n; ++e)
+        {
+          for (int d = 0; d < 3; ++d)
+            resource.gradient[walker * n + e][d] = clone.physicalGradient(result.gradient[3 * e + d], d);
+          const auto value = result.laplacian_log[e];
+          const auto converted = makePsiFormerScalar<ValueType>(value.real(), value.imag());
+          if (!isFiniteWavefunctionValue(converted))
+            throw std::overflow_error("Complex CPU collective Laplacian conversion overflow");
+          resource.laplacian[walker * n + e] = converted;
+        }
     }
   }
 
@@ -3899,6 +3902,7 @@ struct PsiFormerComplexWF::Impl
   std::size_t accepted_version = 0, proposed_version = 0, accepted_epoch_generation = 0;
   int proposed_particle = -1;
   bool accepted_valid = false, pending = false, own_full_valid = false, collective_pending = false;
+  bool proposed_value_only = false;
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
 };
 
@@ -5651,13 +5655,25 @@ bool PsiFormerComplexWF::supportsMultiParticleMoves() const noexcept
   return bool(impl_->state->cpu_budget) || impl_->state->gpu_limit != 0;
 }
 
-/// Retain pure FULL products until a matching collective resolution, with all-output atomicity.
+/// Retain proposed products until a matching collective resolution, with all-output atomicity.
 void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
     const RefVectorWithLeader<WaveFunctionComponent>& components, const RefVectorWithLeader<ParticleSet>& targets,
     const MCMultiParticleMoves<CoordsType::POS>& moves, std::vector<LogValue>& log_ratios,
     const RefVector<ParticleSet::ParticleGradient>& gradients,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
 {
+  mw_evaluateMultiParticleMove(components, targets, moves, log_ratios, gradients, laplacians,
+      WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+/// VALUE retains amplitudes only; gradient requests use the existing FULL drift fallback.
+void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& components, const RefVectorWithLeader<ParticleSet>& targets,
+    const MCMultiParticleMoves<CoordsType::POS>& moves, std::vector<LogValue>& log_ratios,
+    const RefVector<ParticleSet::ParticleGradient>& gradients,
+    const RefVector<ParticleSet::ParticleLaplacian>& laplacians, WaveFunctionEvaluationRequest request) const
+{
+  const bool spatial = request != WaveFunctionEvaluationRequest::VALUE_ONLY;
   if (!supportsMultiParticleMoves())
     throw std::logic_error("Complex collective proposals require shared CPU or native GPU inference");
   NativeTimerScope timer(impl_->phase_timers.batch_vgl);
@@ -5702,21 +5718,22 @@ void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
     }
   }
   if (impl_->state->cpu_budget)
-    impl_->stageCpuCollective(resource, targets, moves);
+    impl_->stageCpuCollective(resource, targets, moves, spatial);
   else
-    impl_->stageDense(resource, targets, true, -1, false, &moves);
+    impl_->stageDense(resource, targets, spatial, -1, false, &moves);
   for (std::size_t i = 0; i < walkers; ++i)
   {
     if (!isFiniteWavefunctionValue(resource.logs[i] - resource.components[i]->log_value_))
       throw std::overflow_error("Complex collective physical log ratio overflow");
-    for (std::size_t e = 0; e < n; ++e)
-    {
-      for (int d = 0; d < 3; ++d)
-        if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
-          throw std::overflow_error("Complex collective gradient scatter overflow");
-      if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
-        throw std::overflow_error("Complex collective Laplacian scatter overflow");
-    }
+    if (spatial)
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
+            throw std::overflow_error("Complex collective gradient scatter overflow");
+        if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
+          throw std::overflow_error("Complex collective Laplacian scatter overflow");
+      }
   }
   // Every failure point precedes publication; retain the unmodified proposed G/L buffer.
   for (std::size_t i = 0; i < walkers; ++i)
@@ -5724,25 +5741,28 @@ void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
     auto& component = *resource.components[i];
     auto& clone = *component.impl_;
     log_ratios[i] = resource.logs[i] - component.log_value_;
-    for (std::size_t e = 0; e < n; ++e)
-    {
-      gradients[i].get()[e] += resource.gradient[i * n + e];
-      laplacians[i].get()[e] += resource.laplacian[i * n + e];
-    }
+    if (spatial)
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        gradients[i].get()[e] += resource.gradient[i * n + e];
+        laplacians[i].get()[e] += resource.laplacian[i * n + e];
+      }
     clone.proposed = resource.amplitude[i];
     clone.proposed_log = resource.logs[i];
     clone.proposed_key = resource.keys[i];
     clone.proposed_particle = -1;
     clone.proposed_version = impl_->state->model.p.version();
+    clone.proposed_value_only = !spatial;
     clone.pending = clone.collective_pending = true;
     impl_->state->pending_proposals.fetch_add(1, std::memory_order_relaxed);
   }
   resource.collective_version = impl_->state->model.p.version();
   resource.collective_descriptor = moves.fingerprint();
+  resource.collective_value_only = !spatial;
   resource.collective_pending = true;
 }
 
-/// Validate the whole mask and every receipt before committing accepted FULL or discarding proposals.
+/// Validate the whole mask and mode receipt before accepting or discarding proposals.
 void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
     const RefVectorWithLeader<WaveFunctionComponent>& components, const RefVectorWithLeader<ParticleSet>& targets,
     const MCMultiParticleMoves<CoordsType::POS>& moves, const std::vector<bool>& accepted) const
@@ -5761,6 +5781,7 @@ void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
     const auto& clone = *resource.components[i]->impl_;
     if (!clone.pending || !clone.collective_pending || clone.proposed_particle != -1 ||
         clone.proposed_version != resource.collective_version || clone.proposed_key != resource.keys[i] ||
+        clone.proposed_value_only != resource.collective_value_only ||
         clone.own_gradient.size() != n || clone.own_laplacian.size() != n ||
         (accepted[i] && clone.proposed_key != configurationIdentity(targets[i])))
       throw std::logic_error("Complex collective resolution has incoherent products or accepted coordinates");
@@ -5771,16 +5792,18 @@ void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
     auto& clone = *component.impl_;
     if (accepted[i])
     {
-      for (std::size_t e = 0; e < n; ++e)
-      {
-        clone.own_gradient[e] = resource.gradient[i * n + e];
-        clone.own_laplacian[e] = resource.laplacian[i * n + e];
-      }
+      if (!resource.collective_value_only)
+        for (std::size_t e = 0; e < n; ++e)
+        {
+          clone.own_gradient[e] = resource.gradient[i * n + e];
+          clone.own_laplacian[e] = resource.laplacian[i * n + e];
+        }
       clone.accepted = clone.proposed;
       clone.accepted_key = clone.proposed_key;
       clone.accepted_version = clone.proposed_version;
       clone.accepted_epoch_generation = clone.nativeEpochGeneration();
-      clone.accepted_valid = clone.own_full_valid = true;
+      clone.accepted_valid = true;
+      clone.own_full_valid = !resource.collective_value_only;
       component.log_value_ = clone.proposed_log;
     }
     clone.discardPending();
@@ -5794,10 +5817,28 @@ void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionCo
     const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
 {
+  mw_evaluateLog(components, targets, gradients, laplacians, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+/// VALUE uses the bounded native value lane; gradient requests retain the FULL fallback.
+void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
+    const RefVector<ParticleSet::ParticleLaplacian>& laplacians, WaveFunctionEvaluationRequest request) const
+{
+  const bool spatial = request != WaveFunctionEvaluationRequest::VALUE_ONLY;
   psiformer::CompletedCapabilityDispatch dispatch(impl_->state->capability_dispatch, components.size(), true);
   if (!impl_->denseEnabled())
   {
-    WaveFunctionComponent::mw_evaluateLog(components, targets, gradients, laplacians);
+    if (spatial)
+      WaveFunctionComponent::mw_evaluateLog(components, targets, gradients, laplacians);
+    else
+    {
+      if (&components.getLeader() != this || targets.size() != components.size() ||
+          gradients.size() != components.size() || laplacians.size() != components.size())
+        throw std::invalid_argument("Complex VALUE evaluation leader/list mismatch");
+      for (std::size_t i = 0; i < components.size(); ++i)
+        components[i].evaluateLog(targets[i], gradients[i], laplacians[i], request);
+    }
     return;
   }
   NativeTimerScope timer(impl_->phase_timers.batch_vgl);
@@ -5824,33 +5865,36 @@ void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionCo
         throw std::invalid_argument("Dense complex GPU walker outputs overlap");
     }
   }
-  impl_->stageDense(resource, targets, true);
-  for (std::size_t i = 0; i < components.size(); ++i)
-    for (std::size_t e = 0; e < n; ++e)
-    {
-      for (int d = 0; d < 3; ++d)
-        if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
-          throw std::overflow_error("Dense complex GPU gradient scatter overflow");
-      if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
-        throw std::overflow_error("Dense complex GPU Laplacian scatter overflow");
-    }
+  impl_->stageDense(resource, targets, spatial);
+  if (spatial)
+    for (std::size_t i = 0; i < components.size(); ++i)
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
+            throw std::overflow_error("Dense complex GPU gradient scatter overflow");
+        if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
+          throw std::overflow_error("Dense complex GPU Laplacian scatter overflow");
+      }
   for (std::size_t i = 0; i < components.size(); ++i)
   {
     auto& component = *resource.components[i];
     auto& clone = *component.impl_;
     clone.invalidate();
-    for (std::size_t e = 0; e < n; ++e)
-    {
-      clone.own_gradient[e] = resource.gradient[i * n + e];
-      clone.own_laplacian[e] = resource.laplacian[i * n + e];
-      gradients[i].get()[e] += clone.own_gradient[e];
-      laplacians[i].get()[e] += clone.own_laplacian[e];
-    }
+    if (spatial)
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        clone.own_gradient[e] = resource.gradient[i * n + e];
+        clone.own_laplacian[e] = resource.laplacian[i * n + e];
+        gradients[i].get()[e] += clone.own_gradient[e];
+        laplacians[i].get()[e] += clone.own_laplacian[e];
+      }
     clone.accepted = resource.amplitude[i];
     clone.accepted_key = resource.keys[i];
     clone.accepted_version = impl_->state->model.p.version();
     clone.accepted_epoch_generation = clone.nativeEpochGeneration();
-    clone.accepted_valid = clone.own_full_valid = true;
+    clone.accepted_valid = true;
+    clone.own_full_valid = spatial;
     component.log_value_ = resource.logs[i];
   }
 }
@@ -6033,8 +6077,33 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateGL(const ParticleSet& p
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& p,
     ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
 {
+  return evaluateLog(p, g, l, WaveFunctionEvaluationRequest::FULL_SPATIAL);
+}
+
+/// Publish the accepted complex amplitude without touching G/L for an explicit VALUE request.
+PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& p,
+    ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l,
+    WaveFunctionEvaluationRequest request)
+{
   psiformer::CompletedCapabilityDispatch dispatch(impl_->state->capability_dispatch, 1, false);
   std::shared_lock read(impl_->state->mutex);
+  if (request == WaveFunctionEvaluationRequest::VALUE_ONLY)
+  {
+    impl_->requireNoCollective();
+    impl_->invalidate();
+    impl_->validate(p);
+    if (g.size() != static_cast<std::size_t>(p.getTotalNum()) || l.size() != g.size())
+      throw std::invalid_argument("Complex PsiFormer value-only shape mismatch");
+    const auto result = impl_->core(p, false);
+    const LogValue physical = impl_->physicalLog(result.amplitude, p);
+    impl_->accepted = result.amplitude;
+    impl_->accepted_key = configurationIdentity(p);
+    impl_->accepted_version = result.parameter_version;
+    impl_->accepted_epoch_generation = impl_->nativeEpochGeneration();
+    impl_->accepted_valid = true;
+    impl_->own_full_valid = false;
+    return log_value_ = physical;
+  }
   return evaluateLogLocked(p, g, l);
 }
 

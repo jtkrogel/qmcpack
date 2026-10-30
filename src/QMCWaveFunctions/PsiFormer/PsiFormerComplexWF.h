@@ -277,6 +277,10 @@ public:
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
   LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&) override;
 
+  /// Evaluate VALUE without publishing spatial products when requested.
+  LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&,
+      ParticleSet::ParticleLaplacian&, WaveFunctionEvaluationRequest request) override;
+
   /// Add current accepted FULL products, recomputing when forced or invalidated.
   LogValue evaluateGL(const ParticleSet&, ParticleSet::ParticleGradient&,
       ParticleSet::ParticleLaplacian&, bool fromscratch) override;
@@ -285,6 +289,11 @@ public:
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,
       const RefVector<ParticleSet::ParticleLaplacian>&) const override;
+
+  void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,
+      const RefVector<ParticleSet::ParticleLaplacian>&,
+      WaveFunctionEvaluationRequest request) const override;
 
   void mw_evaluateGL(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,
@@ -316,6 +325,12 @@ public:
       const RefVectorWithLeader<ParticleSet>&, const MCMultiParticleMoves<CoordsType::POS>&,
       std::vector<LogValue>&, const RefVector<ParticleSet::ParticleGradient>&,
       const RefVector<ParticleSet::ParticleLaplacian>&) const override;
+
+  void mw_evaluateMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const MCMultiParticleMoves<CoordsType::POS>&,
+      std::vector<LogValue>&, const RefVector<ParticleSet::ParticleGradient>&,
+      const RefVector<ParticleSet::ParticleLaplacian>&,
+      WaveFunctionEvaluationRequest request) const override;
 
   /// Commit matching installed accepted coordinates, or discard rejected proposals before installation.
   void mw_accept_rejectMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>&,

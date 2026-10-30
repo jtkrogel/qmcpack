@@ -1183,6 +1183,270 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   CHECK(family.numericStorage().shared_cpu_fingerprint == before.shared_cpu_fingerprint);
 }
 
+TEST_CASE("Complex CPU VALUE warmup retains amplitudes and reconstructs FULL products",
+          "[wavefunction][psiformer][complex_wf][complex_value_warmup]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell), p1 = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const auto selected = GENERATE(1, 4);
+  const auto vgl_targets = GENERATE(std::size_t{0}, std::size_t{3});
+  PsiFormerComplexWF family("value", parameters(), p0, source, clone_cap, {.17, -.11, .07},
+      0, {}, "all_electron", clone_cap, vgl_targets);
+  auto other = family.makeClone(p1);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*other);
+  RefVectorWithLeader<WaveFunctionComponent> team(family, {family, clone});
+  RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+  RefVector<ParticleSet::ParticleGradient> accepted_g{p0.G, p1.G};
+  RefVector<ParticleSet::ParticleLaplacian> accepted_l{p0.L, p1.L};
+  const C sentinel{7, 3};
+  p0.G = p1.G = WaveFunctionComponent::GradType{sentinel, sentinel, sentinel};
+  p0.L = p1.L = sentinel;
+  family.mw_evaluateLog(team, targets, accepted_g, accepted_l, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  const std::array<C, 2> old_logs{family.get_log_value(), clone.get_log_value()};
+  for (auto* p : {&p0, &p1})
+    for (int e = 0; e < 4; ++e)
+    {
+      CHECK(p->L[e] == sentinel);
+      for (int d = 0; d < 3; ++d) CHECK(p->G[e][d] == sentinel);
+    }
+  CHECK(family.numericStorage().shared_cpu_retained_mode_bytes[1] == 0);
+  CHECK(family.numericStorage().shared_cpu_retained_mode_bytes[3] == 0);
+  // Give the rejected walker a legitimate FULL cache which rejection must preserve.
+  close(evaluate(clone, p1), old_logs[1], 2e-12);
+  const auto rejected_full_log = clone.get_log_value();
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  std::vector<ParticleSet::IndexType> indices;
+  std::vector<ParticleSet::PosType> positions;
+  for (int walker = 0; walker < 2; ++walker)
+    for (int e = 0; e < selected; ++e)
+    {
+      indices.push_back(e);
+      positions.push_back(targets[walker].R[e] + ParticleSet::PosType{.003, -.002, .004});
+    }
+  const Moves moves({0, std::size_t(selected), std::size_t(2 * selected)}, indices, positions);
+  std::array<ParticleSet::ParticleGradient, 2> proposed_g{ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> proposed_l{ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  for (int i = 0; i < 2; ++i)
+  {
+    proposed_g[i] = WaveFunctionComponent::GradType{sentinel, sentinel, sentinel};
+    proposed_l[i] = sentinel;
+  }
+  RefVector<ParticleSet::ParticleGradient> gradients{proposed_g[0], proposed_g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{proposed_l[0], proposed_l[1]};
+  ResourceCollection prototype("CPU VALUE collective");
+  family.createResource(prototype);
+  ResourceCollection resource(prototype);
+  const auto cursor = resource.getCursor();
+  family.acquireResource(resource, team);
+  std::vector<C> ratios(2);
+  family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians,
+      WaveFunctionEvaluationRequest::VALUE_ONLY);
+  CHECK_THROWS(family.mw_evaluateMultiParticleMove(team, targets, moves, ratios, gradients, laplacians));
+  CHECK_THROWS(family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{false}));
+  for (int i = 0; i < 2; ++i)
+    for (int e = 0; e < 4; ++e)
+    {
+      CHECK(proposed_l[i][e] == sentinel);
+      for (int d = 0; d < 3; ++d) CHECK(proposed_g[i][e][d] == sentinel);
+    }
+  for (int e = 0; e < selected; ++e) p0.R[e] = positions[e];
+  p0.update();
+  family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false});
+  close(family.get_log_value(), old_logs[0] + ratios[0], 2e-12);
+  CHECK(clone.get_log_value() == rejected_full_log);
+  CHECK_THROWS(family.observeCoulombEnergy(p0, 0));
+  CHECK_NOTHROW(clone.observeCoulombEnergy(p1, 0));
+  CHECK_THROWS(family.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>{true, false}));
+  const auto accepted_log = family.get_log_value();
+  family.mw_evaluateGL(team, targets, accepted_g, accepted_l, false);
+  close(family.get_log_value(), accepted_log, 2e-12);
+  CHECK_NOTHROW(family.observeCoulombEnergy(p0, 0));
+  auto oracle_p = electrons(simulation_cell);
+  oracle_p.R = p0.R;
+  oracle_p.update();
+  PsiFormerComplexWF oracle("oracle", parameters(), oracle_p, source, clone_cap, {.17, -.11, .07});
+  close(evaluate(oracle, oracle_p), accepted_log, 2e-12);
+  // The accepted VALUE products were deliberately untouched before fresh FULL scatter.
+  p0.G = C{};
+  p0.L = C{};
+  family.evaluateGL(p0, p0.G, p0.L, false);
+  for (int e = 0; e < 4; ++e)
+  {
+    close(p0.L[e], oracle_p.L[e], 2e-12);
+    for (int d = 0; d < 3; ++d) close(p0.G[e][d], oracle_p.G[e][d], 2e-12);
+  }
+  resource.rewind(cursor);
+  family.releaseResource(resource, team);
+}
+
+TEST_CASE("Complex dense GPU VALUE warmup commits mixed selected moves and rebuilds FULL products",
+          "[wavefunction][psiformer][complex_gpu_value_warmup]")
+{
+#ifndef ENABLE_CUDA
+  WARN("NOT_RUN: dense paired VALUE warmup qualification requires a CUDA/HIP build");
+  return;
+#else
+  namespace dev = ps::device;
+  int devices = 0;
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: dense paired VALUE warmup qualification requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: dense paired VALUE warmup qualification requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  if (!dev::configuredDeviceMemoryAdmission().limit_bytes)
+  {
+    WARN("NOT_RUN: dense paired VALUE warmup qualification requires explicit device admission");
+    return;
+  }
+
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  const auto selected = GENERATE(std::size_t{1}, std::size_t{4});
+  const auto twist = std::array<double, 3>{.17, -.11, .07};
+  const SimulationCell simulation_cell(cell());
+  auto p0 = electrons(simulation_cell);
+  auto p1 = electrons(simulation_cell);
+  p1.R[0][2] += .021;
+  p1.update();
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+
+  ps::ExecutionEnvironment environment;
+  environment.boundary = ps::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.periodic_axes = {true, true, true};
+  environment.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+  environment.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      environment.lattice_vectors[i][j] = simulation_cell.getLattice().R(i, j);
+  const auto plan = ps::PsiFormerExecutionPlan::fromParameters(
+      initialized, initialized.model_shape, environment);
+  const auto device_bytes = dev::estimateComplexValueCost(plan, 2).device_bytes +
+      dev::estimateComplexSpatialCost(plan, 2).device_bytes;
+  REQUIRE(device_bytes > 0);
+
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto before = metrics.snapshot();
+  PsiFormerComplexWF dense("dense_value", initialized, p0, source, clone_cap, twist, device_bytes);
+  auto dense_clone_base = dense.makeClone(p1);
+  auto& dense_clone = dynamic_cast<PsiFormerComplexWF&>(*dense_clone_base);
+  REQUIRE(dense.gpuInferenceEnabled());
+  RefVectorWithLeader<WaveFunctionComponent> dense_team(dense, {dense, dense_clone});
+  RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1});
+  RefVector<ParticleSet::ParticleGradient> accepted_g{p0.G, p1.G};
+  RefVector<ParticleSet::ParticleLaplacian> accepted_l{p0.L, p1.L};
+  ResourceCollection dense_resources("dense GPU VALUE warmup");
+  dense.createResource(dense_resources);
+  ResourceCollectionTeamLock<WaveFunctionComponent> dense_lease(dense_resources, dense_team);
+
+  const C sentinel{7, 3};
+  p0.G = p1.G = WaveFunctionComponent::GradType{sentinel, sentinel, sentinel};
+  p0.L = p1.L = sentinel;
+  dense.mw_evaluateLog(dense_team, targets, accepted_g, accepted_l,
+                       WaveFunctionEvaluationRequest::VALUE_ONLY);
+  const std::array<C, 2> old_logs{dense.get_log_value(), dense_clone.get_log_value()};
+  for (auto* p : {&p0, &p1})
+    for (std::size_t e = 0; e < p->getTotalNum(); ++e)
+    {
+      CHECK(p->L[e] == sentinel);
+      for (int d = 0; d < 3; ++d)
+        CHECK(p->G[e][d] == sentinel);
+    }
+  CHECK(metrics.snapshot().allocation_calls > before.allocation_calls);
+
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  std::vector<ParticleSet::IndexType> indices;
+  std::vector<ParticleSet::PosType> positions;
+  for (int walker = 0; walker < 2; ++walker)
+    for (std::size_t electron = 0; electron < selected; ++electron)
+    {
+      indices.push_back(electron);
+      positions.push_back(targets[walker].R[electron] +
+          ParticleSet::PosType{.003 * (walker + 1), -.002, .004});
+    }
+  const Moves moves({0, selected, 2 * selected}, indices, positions);
+  std::array<ParticleSet::ParticleGradient, 2> proposed_g{
+      ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> proposed_l{
+      ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  for (int i = 0; i < 2; ++i)
+  {
+    proposed_g[i] = WaveFunctionComponent::GradType{sentinel, sentinel, sentinel};
+    proposed_l[i] = sentinel;
+  }
+  RefVector<ParticleSet::ParticleGradient> proposed_g_list{proposed_g[0], proposed_g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> proposed_l_list{proposed_l[0], proposed_l[1]};
+  std::vector<C> ratios(2);
+  dense.mw_evaluateMultiParticleMove(dense_team, targets, moves, ratios,
+      proposed_g_list, proposed_l_list, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  for (int i = 0; i < 2; ++i)
+    for (std::size_t e = 0; e < p0.getTotalNum(); ++e)
+    {
+      CHECK(proposed_l[i][e] == sentinel);
+      for (int d = 0; d < 3; ++d)
+        CHECK(proposed_g[i][e][d] == sentinel);
+    }
+
+  for (std::size_t electron = 0; electron < selected; ++electron)
+    p0.R[electron] = positions[electron];
+  p0.update();
+  dense.mw_accept_rejectMultiParticleMove(dense_team, targets, moves, {true, false});
+  close(dense.get_log_value(), old_logs[0] + ratios[0], 2e-12);
+  CHECK(dense_clone.get_log_value() == old_logs[1]);
+
+  PsiFormerComplexWF reference("cpu_value", initialized, p0, source, clone_cap, twist);
+  auto reference_clone_base = reference.makeClone(p1);
+  auto& reference_clone = dynamic_cast<PsiFormerComplexWF&>(*reference_clone_base);
+  RefVectorWithLeader<WaveFunctionComponent> reference_team(reference, {reference, reference_clone});
+  ResourceCollection reference_resources("CPU FULL reference");
+  reference.createResource(reference_resources);
+  ResourceCollectionTeamLock<WaveFunctionComponent> reference_lease(reference_resources, reference_team);
+
+  std::array<ParticleSet::ParticleGradient, 2> cpu_full_g{
+      ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> cpu_full_l{
+      ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  std::array<ParticleSet::ParticleGradient, 2> gpu_full_g{
+      ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> gpu_full_l{
+      ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  RefVector<ParticleSet::ParticleGradient> cpu_full_g_list{cpu_full_g[0], cpu_full_g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> cpu_full_l_list{cpu_full_l[0], cpu_full_l[1]};
+  RefVector<ParticleSet::ParticleGradient> gpu_full_g_list{gpu_full_g[0], gpu_full_g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> gpu_full_l_list{gpu_full_l[0], gpu_full_l[1]};
+  reference.mw_evaluateGL(reference_team, targets, cpu_full_g_list, cpu_full_l_list, true);
+  dense.mw_evaluateGL(dense_team, targets, gpu_full_g_list, gpu_full_l_list, true);
+  for (std::size_t walker = 0; walker < 2; ++walker)
+  {
+    const auto& gpu_component = walker == 0 ? dense : dense_clone;
+    const auto& cpu_component = walker == 0 ? reference : reference_clone;
+    close(gpu_component.get_log_value(), cpu_component.get_log_value(), 2e-9);
+    for (std::size_t e = 0; e < p0.getTotalNum(); ++e)
+    {
+      close(gpu_full_l[walker][e], cpu_full_l[walker][e], 2e-9);
+      for (int d = 0; d < 3; ++d)
+        close(gpu_full_g[walker][e][d], cpu_full_g[walker][e][d], 2e-9);
+    }
+  }
+  CHECK(metrics.snapshot().failed_frees == before.failed_frees);
+  std::printf("COMPLEX_GPU_VALUE_WARMUP PASS selected=%zu device=%d mixed_accept_reject=1 fresh_full=1\n",
+              selected, ordinal);
+#endif
+}
+
 TEST_CASE("Complex CPU collective products obey exact family admission and growth rollback",
           "[wavefunction][psiformer][complex_wf][complex_cpu_collective]")
 {
