@@ -11033,7 +11033,8 @@ void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
     const bool has_planned_proposal = batch_execution_plan_ && has_proposal_ &&
         (proposal_origin_ == ProposalOrigin::MW_CALC_RATIO_VALUE ||
          proposal_origin_ == ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE ||
-         proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL);
+         proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL ||
+         proposal_origin_ == ProposalOrigin::MW_SELECTED_VALUE_ONLY);
     if (has_planned_proposal)
       throw std::logic_error(
           "PsiFormer planned proposal cannot be cleared by parameter-version synchronization");
@@ -11087,7 +11088,9 @@ void PsiFormerWF::cacheSingleParticleProposal(double sign,
 // Selected transactions must be resolved rather than silently replaced by another lifecycle call.
 void PsiFormerWF::requireNoSelectedParticleProposal(const char* operation) const
 {
-  if (has_proposal_ && proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL)
+  if (has_proposal_ &&
+      (proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL ||
+       proposal_origin_ == ProposalOrigin::MW_SELECTED_VALUE_ONLY))
     throw std::logic_error(std::string("PsiFormer ") + operation +
                            " cannot run while a selected-electron proposal is pending");
 }
@@ -11101,7 +11104,8 @@ void PsiFormerWF::requireNoPlannedProposalMutation(const char* operation) const
   const bool has_planned_proposal = batch_execution_plan_ && has_proposal_ &&
       (proposal_origin_ == ProposalOrigin::MW_CALC_RATIO_VALUE ||
        proposal_origin_ == ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE ||
-       proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL);
+       proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL ||
+       proposal_origin_ == ProposalOrigin::MW_SELECTED_VALUE_ONLY);
   if (model_state_->planned_single_transaction_count.load(
           std::memory_order_acquire) != 0 ||
       model_state_->planned_selected_transaction_count.load(

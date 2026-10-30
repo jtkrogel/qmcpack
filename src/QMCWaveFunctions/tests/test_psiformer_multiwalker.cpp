@@ -7776,6 +7776,10 @@ TEST_CASE("PsiFormer CPU target VALUE proposals use clone-local forward workspac
     CHECK_FALSE(scratch.owns_full_spatial_workspace);
     CHECK(scratch.owns_value_workspace);
   }
+  CHECK_THROWS_AS(crowd.components[0]->evaluateLog(
+                      *crowd.walkers[0], accepted_g[0], accepted_l[0],
+                      WaveFunctionEvaluationRequest::VALUE_ONLY),
+                  std::logic_error);
 
   std::vector<bool> position_valid;
   ParticleSet::mw_makeMoveSelectedParticles(
