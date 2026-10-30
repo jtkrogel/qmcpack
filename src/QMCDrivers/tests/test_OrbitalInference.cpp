@@ -73,6 +73,7 @@ public:
     process(nullptr);
     ContextForSteps context(rngs_[0]);
     RefVector<ContextForSteps> contexts{context};
+    crowds_[0]->startBlock(1);
     initialLogEvaluationWavefunctionOnly(0, crowds_, contexts, false);
     VMCBatchedSampling::State state(qmcdriver_input_, vmc, *drift_modifier_, population_, 1, false);
     state.evaluate_energy = false;
@@ -93,6 +94,7 @@ public:
   {
     ContextForSteps context(rngs_[0]);
     RefVector<ContextForSteps> contexts{context};
+    crowds_[0]->startBlock(1);
     initialLogEvaluationWarmupValueOnly(0, crowds_, contexts, false);
     CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
     CHECK_FALSE(crowds_[0]->get_walker_twfs()[0].get().hasValidLaplacians());
