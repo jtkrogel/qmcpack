@@ -57,6 +57,8 @@ public:
     // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
     bool resident_device_observation = false;
     std::function<void(Crowd&, bool)> resident_device_observe;
+    /// Record device coordinate changes without running a scalar observation.
+    std::function<void()> resident_device_mark_host_dirty;
     /// One independent cyclic stream per crowd, shared by warmup and production.
     mutable std::vector<IndexType> subset_cursors;
 
@@ -120,6 +122,7 @@ private:
                              RandomBase<FullPrecRealType>& random_generator,
                              bool recompute,
                              bool accumulate_this_step,
+                             bool warmup,
                              IndexType* subset_cursor);
 };
 

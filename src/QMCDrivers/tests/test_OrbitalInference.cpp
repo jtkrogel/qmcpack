@@ -87,19 +87,28 @@ public:
         crowds_[0]->get_walkers()[0].get().Properties(WalkerProperties::LOCALENERGY)));
   }
 
-  void exerciseEnergy(const VMCDriverInput& vmc)
+  void exerciseEnergy(const VMCDriverInput& vmc,
+                      const std::shared_ptr<std::size_t>& physical,
+                      const std::shared_ptr<std::size_t>& auxiliary)
   {
     ContextForSteps context(rngs_[0]);
     RefVector<ContextForSteps> contexts{context};
-    initialLogEvaluation(0, crowds_, contexts, false);
+    initialLogEvaluationWavefunctionOnly(0, crowds_, contexts, false);
+    CHECK(*physical == 0);
+    CHECK(*auxiliary == 0);
     VMCBatchedSampling::State state(qmcdriver_input_, vmc, *drift_modifier_, population_, 1, false);
     VMCBatchedSampling::Timers timers{timers_.resource_timer, timers_.movepbyp_timer, timers_.buffer_timer,
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
         [](Crowd&, std::string_view) {}};
     VMCBatchedSampling::runWarmupStep(0, state, timers, rngs_, crowds_);
-    CHECK(std::isfinite(crowds_[0]->get_walkers()[0].get().Properties(WalkerProperties::LOCALENERGY)));
+    CHECK(*physical == 0);
+    CHECK(*auxiliary == 0);
+    CHECK_FALSE(wftrain::isFiniteTrainingReal(
+        crowds_[0]->get_walkers()[0].get().Properties(WalkerProperties::LOCALENERGY)));
     state.accumulate_estimators = false;
     VMCBatchedSampling::runVMCStep(0, state, timers, rngs_, crowds_);
+    CHECK(*physical > 0);
+    CHECK(*auxiliary > 0);
     CHECK(crowds_[0]->get_estimator_manager_crowd().get_block_weight() == 0.0);
   }
 };
@@ -136,7 +145,7 @@ TEST_CASE("Objective-only sampling never evaluates physical or auxiliary Hamilto
   driver.exercise(vmc);
   CHECK(*physical == 0);
   CHECK(*auxiliary == 0);
-  driver.exerciseEnergy(vmc);
+  driver.exerciseEnergy(vmc, physical, auxiliary);
   CHECK(*physical > 0);
   CHECK(*auxiliary > 0);
 }

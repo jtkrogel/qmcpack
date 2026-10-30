@@ -15,6 +15,7 @@
 #include "QMCDrivers/GreenFunctionModifiers/DriftModifierBase.h"
 #include "QMCDrivers/MCPopulation.h"
 #include "QMCDrivers/QMCDriverInput.h"
+#include "QMCDrivers/WalkerProperties.h"
 #include "QMCDrivers/VMC/ElectronSubsetSelector.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
 #include "QMCWaveFunctions/TWFGrads.hpp"
@@ -140,6 +141,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
                                          RandomBase<FullPrecRealType>& random_generator,
                                          bool recompute,
                                          bool accumulate_this_step,
+                                         bool warmup,
                                          IndexType* subset_cursor)
 {
   if (crowd.size() == 0)
@@ -470,6 +472,18 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   {
     if (!device_moves_completed)
       throw UniformCommunicateError("Resident device observation did not complete device moves.");
+    if (warmup)
+    {
+      // A resident observation callback is a production consumer, even when
+      // scalar accumulation is disabled. Keep its host energy unavailable.
+      if (!sft.resident_device_mark_host_dirty)
+        throw UniformCommunicateError("Resident warmup requires a host-dirty notification.");
+      sft.resident_device_mark_host_dirty();
+      for (int iw = 0; iw < crowd.size(); ++iw)
+        walkers[iw].get().Properties(WalkerProperties::LOCALENERGY) =
+            std::numeric_limits<QMCTraits::FullPrecRealType>::quiet_NaN();
+      return;
+    }
     // The admitted driver owns scalar properties/statistics and the later cold
     // fence. Never invoke generic estimators, native H, FULL or logging here.
     sft.resident_device_observe(crowd, accumulate_this_step);
@@ -497,7 +511,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     ps_dispatcher.flex_saveWalker(walker_elecs, walkers);
   }
 
-  if (!sft.evaluate_energy)
+  if (warmup || !sft.evaluate_energy)
   {
     // Sampling still publishes current positions/logs, but no fictitious local energy.
     for (int iw = 0; iw < crowd.size(); ++iw)
@@ -554,6 +568,7 @@ template void VMCBatchedSampling::advanceWalkers<CoordsType::POS>(const State& s
                                                                   RandomBase<FullPrecRealType>& random_generator,
                                                                   bool recompute,
                                                                   bool accumulate_this_step,
+                                                                  bool warmup,
                                                                   IndexType* subset_cursor);
 
 template void VMCBatchedSampling::advanceWalkers<CoordsType::POS_SPIN>(const State& state,
@@ -562,6 +577,7 @@ template void VMCBatchedSampling::advanceWalkers<CoordsType::POS_SPIN>(const Sta
                                                                        RandomBase<FullPrecRealType>& random_generator,
                                                                        bool recompute,
                                                                        bool accumulate_this_step,
+                                                                       bool warmup,
                                                                        IndexType* subset_cursor);
 
 void VMCBatchedSampling::runVMCStep(int crowd_id,
@@ -580,9 +596,9 @@ void VMCBatchedSampling::runVMCStep(int crowd_id,
   const bool accumulate = state.step % state.qmcdrv_input.get_estimator_measurement_period() == 0;
   IndexType* cursor = state.subset_cursors.empty() ? nullptr : &state.subset_cursors.at(crowd_id);
   if (state.population.get_golden_electrons().isSpinor())
-    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, recompute, accumulate, cursor);
+    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, recompute, accumulate, false, cursor);
   else
-    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, recompute, accumulate, cursor);
+    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, recompute, accumulate, false, cursor);
 }
 
 void VMCBatchedSampling::runWarmupStep(int crowd_id,
@@ -591,16 +607,14 @@ void VMCBatchedSampling::runWarmupStep(int crowd_id,
                                        const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                        UPtrVector<Crowd>& crowds)
 {
-  if (!state.evaluate_energy && state.resident_device_observation)
-    throw std::invalid_argument("Objective-only sampling requires the CPU observation path");
   validateResidentWalkerLogs(state, crowds);
   Crowd& crowd = *crowds[crowd_id];
   RandomBase<FullPrecRealType>& random_generator = random_generators[crowd_id];
   IndexType* cursor = state.subset_cursors.empty() ? nullptr : &state.subset_cursors.at(crowd_id);
   if (state.population.get_golden_electrons().isSpinor())
-    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, false, false, cursor);
+    advanceWalkers<CoordsType::POS_SPIN>(state, crowd, timers, random_generator, false, false, true, cursor);
   else
-    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, false, false, cursor);
+    advanceWalkers<CoordsType::POS>(state, crowd, timers, random_generator, false, false, true, cursor);
 }
 
 } // namespace qmcplusplus

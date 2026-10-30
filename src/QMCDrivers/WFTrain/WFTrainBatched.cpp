@@ -4102,6 +4102,7 @@ void WFTrainBatched::run()
   if (resident_open_observation_)
   {
     sampling_state.resident_device_observation = true;
+    sampling_state.resident_device_mark_host_dirty = [&]() { resident_host_dirty = true; };
     sampling_state.resident_device_observe = [&](Crowd& crowd, bool accumulate) {
       resident_host_dirty = true; // Native R/G/L, walker geometry and H are not published here.
       if (!accumulate)
@@ -4551,7 +4552,10 @@ void WFTrainBatched::run()
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);
     auto step_context_refs = getContextForStepsRefs();
-    const auto initialize = training_input_.samplesOrbitalStudent() ? initialLogEvaluationWavefunctionOnly
+    const bool warmup_pending = training_input_.getWarmupSteps() > 0 ||
+        (!resumed && qmcdriver_input_.get_warmup_steps() > 0);
+    const auto initialize = training_input_.samplesOrbitalStudent() || warmup_pending
+        ? initialLogEvaluationWavefunctionOnly
         : resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
     crowd_task(crowds_.size(), initialize, crowds_, step_context_refs,
                serializing_crowd_walkers_);
