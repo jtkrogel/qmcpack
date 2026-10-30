@@ -17412,18 +17412,19 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
   auto& batch = *resource.batch_workspace;
   const bool cpu_target_scalar_value =
       transaction.state().cpu_target_vgl.targets != 0;
+  const bool clone_local_value = cpu_target_scalar_value || !batch_execution_plan_;
   pf::DirectBatchValueResultView batch_result;
   const DirectBackendMode value_mode = transaction.state().direct_value_mode;
   if (!resource.walker_indices.empty() && value_mode != DirectBackendMode::ORACLE)
   {
-    if (cpu_target_scalar_value)
+    if (clone_local_value)
     {
       for (const std::size_t walker : resource.walker_indices)
       {
         auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
         const auto selected_moves = moves.slice(walker);
         std::size_t selected = 0;
-        if (transaction.state().numerical_tile_backend)
+        if (cpu_target_scalar_value && transaction.state().numerical_tile_backend)
         {
           auto& clone_batch = component.requireDirectBatchWorkspace();
           clone_batch.resize(pf::DirectBatchMode::VALUE_ONLY, 1);
@@ -17519,7 +17520,7 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
     {
       if (value_mode != DirectBackendMode::ORACLE)
       {
-        if (cpu_target_scalar_value)
+        if (clone_local_value)
         {
           proposed_signs[walker] = direct_signs[walker];
           proposed_logabs[walker] = direct_logabs[walker];

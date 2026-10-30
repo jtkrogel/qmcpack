@@ -155,6 +155,74 @@ TEST_CASE("Objective-only sampling never evaluates physical or auxiliary Hamilto
   CHECK(*auxiliary > 0);
 }
 
+TEST_CASE("PsiFormer no-drift collective warmup keeps value-only state until production",
+          "[wftrain][orbital_inference][psiformer]")
+{
+  using namespace psiformer;
+  using namespace testing;
+  Concurrency::OverrideMaxCapacity<> capacity(1);
+  auto* comm = OHMMS::Controller;
+  ProjectData project("psiformer_collective_warmup", ProjectData::DriverVersion::BATCH);
+  const SimulationCell cell;
+  ParticleSet electrons(cell), ions(cell);
+  electrons.setName("e");
+  electrons.create({1, 2});
+  auto& electron_species = electrons.getSpeciesSet();
+  electron_species.addSpecies("u");
+  electron_species.addSpecies("d");
+  const int mass = electron_species.addAttribute("mass");
+  electron_species(mass, 0) = electron_species(mass, 1) = 1.0;
+  electrons.resetGroups();
+  ions.setName("ion0");
+  ions.create({1, 1});
+  auto& ion_species = ions.getSpeciesSet();
+  ion_species.addSpecies("Li");
+  ion_species.addSpecies("H");
+  const int charge = ion_species.addAttribute("charge");
+  ion_species(charge, 0) = 3.0;
+  ion_species(charge, 1) = 1.0;
+  ions.resetGroups();
+  ions.R[0] = {0.0, 0.0, 0.0};
+  ions.R[1] = {3.0, 0.0, 0.0};
+  for (int electron = 0; electron < 3; ++electron)
+    electrons.R[electron] = {0.2 * (electron + 1), 0.1, 0.3};
+  electrons.update();
+  ions.update();
+
+  RuntimeOptions options;
+  TrialWaveFunction trial_wavefunction(options);
+  auto initialized = initializePsiFormerParameters(ModelShape{1, 2, 2, 16, 256, 4, 4}, 41);
+  trial_wavefunction.addComponent(std::make_unique<PsiFormerWF>(
+      "collective_warmup", std::move(initialized), electrons, ions));
+  QMCHamiltonian hamiltonian("collective_warmup_h");
+  auto physical = std::make_shared<std::size_t>(0);
+  auto auxiliary = std::make_shared<std::size_t>(0);
+  hamiltonian.addOperator(std::make_unique<CountingObservation>(physical), "physical_counter", true);
+  hamiltonian.addOperator(std::make_unique<CountingObservation>(auxiliary), "auxiliary_counter", false);
+  hamiltonian.addObservables(electrons);
+
+  Libxml2Document document;
+  REQUIRE(document.parseFromString(
+      "<qmc move='alle'><parameter name='walkers_per_rank'>1</parameter>"
+      "<parameter name='crowds'>1</parameter><parameter name='blocks'>1</parameter>"
+      "<parameter name='steps'>1</parameter><parameter name='warmupsteps'>1</parameter>"
+      "<parameter name='substeps'>1</parameter><parameter name='timestep'>0.01</parameter>"
+      "<parameter name='usedrift'>no</parameter></qmc>"));
+  QMCDriverInput input;
+  input.readXML(document.getRoot());
+  VMCDriverInput vmc;
+  vmc.readXML(document.getRoot());
+  WalkerConfigurations walkers;
+  RandomNumberGeneratorPool generators(1);
+  OrbitalObservationTestDriver driver(project, std::move(input), walkers,
+      MCPopulation(comm->size(), comm->rank(), electrons, trial_wavefunction, hamiltonian),
+      generators.getRngRefs(), comm);
+  driver.process(nullptr);
+  driver.exerciseEnergy(vmc, physical, auxiliary);
+  CHECK(*physical > 0);
+  CHECK(*auxiliary > 0);
+}
+
 TEST_CASE("Value-only orbital forward reproduces the native spin-normalized MSE",
           "[wftrain][orbital_inference]")
 {
