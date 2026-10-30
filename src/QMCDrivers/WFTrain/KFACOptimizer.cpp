@@ -158,6 +158,9 @@ void KFACOptimizer::prepareStatistics(const KFACFactorAccumulator& statistics)
   pending->state->inverse = pending->inverse->inverseSnapshot();
   pending->state->dense_generation = pending->inverse->denseGeneration();
   pending_ = std::move(pending);
+  ++factor_generation_builds_;
+  if (refresh)
+    ++inverse_generation_builds_;
   traceStorage();
 }
 

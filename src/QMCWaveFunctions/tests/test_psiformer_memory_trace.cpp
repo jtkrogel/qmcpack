@@ -93,6 +93,26 @@ template<class F> void throws(F&& f)
 // Constructed before the sink; optional late destruction tests process-lifetime safety.
 std::unique_ptr<qmcplusplus::psiformer::device::DeviceBuffer<double>> late_buffer;
 
+struct TracedHostPayload
+{
+  qmcplusplus::psiformer::memory::HostAllocation trace;
+  std::vector<double> values;
+
+  explicit TracedHostPayload(std::size_t count)
+  {
+    trace.requestAt(__FILE__, __LINE__, "test::host_cycle", count * sizeof(double), "float64",
+                    "[8]", reinterpret_cast<std::uintptr_t>(this));
+    values.resize(count);
+    trace.allocationSucceeded(values.capacity() * sizeof(double));
+  }
+
+  void releaseStorageEarly()
+  {
+    std::vector<double>().swap(values);
+    trace.storageReleased();
+  }
+};
+
 int main()
 {
   namespace mem = qmcplusplus::psiformer::memory;
@@ -149,6 +169,15 @@ int main()
     mem::HostCapacity replacement;
     replacement.snapshot("host::replacement", 32);
     replacement = std::move(moved);
+  }
+  {
+    auto old_payload = std::make_unique<TracedHostPayload>(8);
+    auto replacement = std::make_unique<TracedHostPayload>(8);
+    replacement->releaseStorageEarly(); // Explicit capacity release precedes owner destruction.
+    replacement.reset();
+    old_payload.reset();
+    auto recreated = std::make_unique<TracedHostPayload>(8); // Same-size later lifetime is visible as churn.
+    recreated->releaseStorageEarly();
   }
   std::vector<std::thread> threads;
   for (int i = 0; i < 4; ++i)

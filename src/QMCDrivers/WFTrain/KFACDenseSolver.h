@@ -102,6 +102,7 @@ private:
   KFACDenseGeneration(std::shared_ptr<KFACDenseSolver> resource, std::size_t slot, std::size_t blocks);
   std::shared_ptr<KFACDenseSolver> resource_;
   std::size_t slot_;
+  std::uint64_t event_generation_id_;
   std::vector<unsigned char> prepared_;
   std::vector<std::uint64_t> fingerprints_;
   bool complete_ = false;

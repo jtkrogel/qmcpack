@@ -9,10 +9,19 @@
 #include "config.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unistd.h>
 
 #if defined(ENABLE_CUDA)
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
@@ -29,6 +38,107 @@ namespace qmcplusplus::wftrain
 {
 namespace
 {
+std::uint64_t nextKfacEventGenerationId() noexcept
+{
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool kfacGpuEventTraceRequested() noexcept
+{
+  static const bool enabled = [] {
+    const char* setting = std::getenv("PSIFORMER_KFAC_GPU_EVENT_TRACE");
+    return setting && *setting && std::string_view(setting) != "0";
+  }();
+  return enabled;
+}
+
+void warnKfacEventTrace(const char* reason) noexcept
+{
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true))
+    std::fprintf(stderr, "KFAC GPU event timing disabled: %s; scientific execution continues\n", reason);
+}
+
+class KFACGpuEventTraceSink
+{
+public:
+  KFACGpuEventTraceSink() noexcept
+  {
+    try
+    {
+      const char* prefix = std::getenv("PSIFORMER_KFAC_GPU_EVENT_TRACE");
+      if (!prefix || !*prefix)
+        return;
+      std::string rank = "unknown";
+      for (const char* name : {"OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID"})
+        if (const char* value = std::getenv(name))
+        {
+          if (*value && std::string_view(value).find_first_not_of("0123456789") == std::string_view::npos)
+            rank = value;
+          break;
+        }
+      rank_ = rank;
+      pid_ = getpid();
+      const std::string path = std::string(prefix) + ".rank" + rank_ + ".pid" +
+          std::to_string(pid_) + ".jsonl";
+      file_.open(path, std::ios::out | std::ios::app);
+      if (!file_)
+        warnKfacEventTrace("cannot open sidecar path");
+    }
+    catch (...)
+    {
+      warnKfacEventTrace("sidecar initialization failed");
+    }
+  }
+
+  void record(int device, std::uint64_t generation, std::size_t slot, std::size_t block,
+              double milliseconds, const char* status) noexcept
+  {
+    try
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!file_)
+        return;
+#ifdef QMC_CUDA2HIP
+      constexpr const char* backend = "hip";
+#else
+      constexpr const char* backend = "cuda";
+#endif
+      file_ << "{\"schema\":1,\"kind\":\"gpu_event\",\"phase\":\"kfac_factor_stream\","
+               "\"scope\":\"factor stream including uploads, vendor factorization, validation kernels, and downloads\","
+               "\"completion\":\"stop event read after existing queue sync\",\"source\":\"KFACDenseSolver.cpp\","
+               "\"generation_scope\":\"factor generation; not QMC iteration or model version\",\"rank\":\""
+            << rank_ << "\",\"pid\":" << pid_ << ",\"backend\":\""
+            << backend << "\",\"device\":" << device << ",\"generation_id\":" << generation
+            << ",\"slot\":" << slot << ",\"block\":" << block << ",\"mono_ns\":"
+            << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count()
+            << ",\"duration_ms\":"
+            << std::setprecision(9) << milliseconds << ",\"status\":\"" << status << "\"}\n";
+      file_.flush();
+      if (!file_)
+        warnKfacEventTrace("sidecar write failed");
+    }
+    catch (...)
+    {
+      warnKfacEventTrace("sidecar write failed");
+    }
+  }
+
+  static KFACGpuEventTraceSink& instance() noexcept
+  {
+    static auto* sink = new KFACGpuEventTraceSink();
+    return *sink;
+  }
+
+private:
+  std::mutex mutex_;
+  std::ofstream file_;
+  std::string rank_ = "unknown";
+  long long pid_ = -1;
+};
+
 /// Keep all fixed resource extents in the checked size_t domain.
 std::size_t add(std::size_t a, std::size_t b)
 {
@@ -66,6 +176,7 @@ std::uint64_t fingerprint(const std::vector<double>& a, const std::vector<double
 using psiformer::device::checkRuntime;
 using psiformer::device::DeviceBuffer;
 using psiformer::device::Stream;
+using psiformer::device::success;
 
 /// Separate rocBLAS solver handle: a hipBLAS handle is never reinterpreted.
 class VendorQueue
@@ -90,6 +201,7 @@ public:
       check(cublasSetStream(blas_, stream_), "cublasSetStream");
       check(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_HOST), "cublasSetPointerMode");
 #endif
+      createEventTimer();
     }
     catch (...) { release(); throw; }
   }
@@ -144,6 +256,66 @@ public:
     psiformer::device::deviceMemoryMetrics(device_).downloaded(mul(n, sizeof(double)));
   }
   Stream stream() const noexcept { return stream_; }
+  int device() const noexcept { return device_; }
+
+  /// Record a selected factor stream interval only when explicitly requested.
+  bool beginEventInterval() noexcept
+  {
+    if (!event_timing_enabled_ || event_interval_active_)
+      return false;
+#ifdef QMC_CUDA2HIP
+    const auto result = hipEventRecord(event_start_, stream_);
+#else
+    const auto result = cudaEventRecord(event_start_, stream_);
+#endif
+    if (result != success)
+    {
+      disableEventTimer("start event record failed");
+      return false;
+    }
+    event_interval_active_ = true;
+    event_interval_stopped_ = false;
+    return true;
+  }
+
+  /// Place the interval endpoint before the caller's already-required sync.
+  bool stopEventInterval() noexcept
+  {
+    if (!event_timing_enabled_ || !event_interval_active_ || event_interval_stopped_)
+      return false;
+#ifdef QMC_CUDA2HIP
+    const auto result = hipEventRecord(event_stop_, stream_);
+#else
+    const auto result = cudaEventRecord(event_stop_, stream_);
+#endif
+    if (result != success)
+    {
+      disableEventTimer("stop event record failed");
+      return false;
+    }
+    event_interval_stopped_ = true;
+    return true;
+  }
+
+  /// Query only after the caller's normal stream sync has completed.
+  bool readEventIntervalMilliseconds(float& milliseconds) noexcept
+  {
+    if (!event_timing_enabled_ || !event_interval_active_ || !event_interval_stopped_)
+      return false;
+#ifdef QMC_CUDA2HIP
+    const auto result = hipEventElapsedTime(&milliseconds, event_start_, event_stop_);
+#else
+    const auto result = cudaEventElapsedTime(&milliseconds, event_start_, event_stop_);
+#endif
+    event_interval_active_ = false;
+    event_interval_stopped_ = false;
+    if (result != success)
+    {
+      disableEventTimer("elapsed-time query failed after queue sync");
+      return false;
+    }
+    return true;
+  }
 
   /// Upload deliberate staging traffic and charge existing transfer diagnostics.
   template<class T> void upload(T* target, const T* source, std::size_t count) const
@@ -255,26 +427,74 @@ public:
   }
 
 private:
+  void createEventTimer() noexcept
+  {
+    if (!kfacGpuEventTraceRequested())
+      return;
+#ifdef QMC_CUDA2HIP
+    if (hipEventCreate(&event_start_) != success || hipEventCreate(&event_stop_) != success)
+    {
+      if (event_start_) (void)hipEventDestroy(event_start_);
+      if (event_stop_) (void)hipEventDestroy(event_stop_);
+      event_start_ = nullptr;
+      event_stop_ = nullptr;
+      warnKfacEventTrace("event creation failed");
+      return;
+    }
+#else
+    if (cudaEventCreate(&event_start_) != success || cudaEventCreate(&event_stop_) != success)
+    {
+      if (event_start_) cudaEventDestroy(event_start_);
+      if (event_stop_) cudaEventDestroy(event_stop_);
+      event_start_ = nullptr;
+      event_stop_ = nullptr;
+      warnKfacEventTrace("event creation failed");
+      return;
+    }
+#endif
+    event_timing_enabled_ = true;
+  }
+
+  void disableEventTimer(const char* reason) noexcept
+  {
+    event_timing_enabled_ = false;
+    event_interval_active_ = false;
+    event_interval_stopped_ = false;
+    warnKfacEventTrace(reason);
+  }
+
   /// Nonthrowing cleanup also handles partially constructed vendor resources.
   void release() noexcept
   {
 #ifdef QMC_CUDA2HIP
-    if (solver_) rocblas_destroy_handle(solver_);
-    if (stream_) hipStreamDestroy(stream_);
+    if (event_start_) { (void)hipEventDestroy(event_start_); event_start_ = nullptr; }
+    if (event_stop_) { (void)hipEventDestroy(event_stop_); event_stop_ = nullptr; }
+    if (solver_) { rocblas_destroy_handle(solver_); solver_ = nullptr; }
+    if (stream_) { (void)hipStreamDestroy(stream_); stream_ = nullptr; }
 #else
-    if (blas_) cublasDestroy(blas_);
-    blas_ = nullptr;
-    if (solver_) cusolverDnDestroy(solver_);
-    if (stream_) cudaStreamDestroy(stream_);
+    if (event_start_) { cudaEventDestroy(event_start_); event_start_ = nullptr; }
+    if (event_stop_) { cudaEventDestroy(event_stop_); event_stop_ = nullptr; }
+    if (blas_) { cublasDestroy(blas_); blas_ = nullptr; }
+    if (solver_) { cusolverDnDestroy(solver_); solver_ = nullptr; }
+    if (stream_) { cudaStreamDestroy(stream_); stream_ = nullptr; }
 #endif
-    solver_ = nullptr; stream_ = nullptr;
+    event_timing_enabled_ = false;
+    event_interval_active_ = false;
+    event_interval_stopped_ = false;
   }
 
   int device_ = -1;
   Stream stream_ = nullptr;
+  bool event_timing_enabled_ = false;
+  bool event_interval_active_ = false;
+  bool event_interval_stopped_ = false;
 #ifdef QMC_CUDA2HIP
+  hipEvent_t event_start_ = nullptr;
+  hipEvent_t event_stop_ = nullptr;
   rocblas_handle solver_ = nullptr;
 #else
+  cudaEvent_t event_start_ = nullptr;
+  cudaEvent_t event_stop_ = nullptr;
   cusolverDnHandle_t solver_ = nullptr;
   cublasHandle_t blas_ = nullptr;
 #endif
@@ -443,7 +663,9 @@ std::shared_ptr<KFACDenseGeneration> KFACDenseSolver::beginGeneration()
 }
 
 KFACDenseGeneration::KFACDenseGeneration(std::shared_ptr<KFACDenseSolver> resource, std::size_t slot, std::size_t blocks)
-    : resource_(std::move(resource)), slot_(slot), prepared_(blocks, 0), fingerprints_(blocks, 0),
+    : resource_(std::move(resource)), slot_(slot),
+      event_generation_id_(kfacGpuEventTraceRequested() ? nextKfacEventGenerationId() : 0),
+      prepared_(blocks, 0), fingerprints_(blocks, 0),
       host_cache_(resource_->deviceAuthority() ? blocks : 0) {}
 
 KFACDenseGeneration::~KFACDenseGeneration() { resource_->impl_->occupied[slot_] = false; }
@@ -459,9 +681,13 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
   const auto& layout = p.blocks.at(block);
   if (activation.size() != mul(layout.a, layout.a) || sensitivity.size() != mul(layout.g, layout.g))
     throw std::invalid_argument("KFAC damped matrix extent mismatch");
+  bool event_interval = false;
+  bool event_elapsed_available = false;
+  float event_duration_ms = 0.0f;
   try
   {
     p.queue.current();
+    event_interval = p.queue.beginEventInterval();
     auto* A = p.blockPointer(slot_, block); auto* G = A + activation.size();
     p.queue.upload(A, activation.data(), activation.size());
     p.queue.upload(G, sensitivity.data(), sensitivity.size());
@@ -484,7 +710,14 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
       p.queue.download(activation.data(), A, activation.size());
       p.queue.download(sensitivity.data(), G, sensitivity.size());
     }
+    if (event_interval)
+      p.queue.stopEventInterval();
     p.queue.sync();
+    if (event_interval)
+    {
+      event_elapsed_available = p.queue.readEventIntervalMilliseconds(event_duration_ms);
+      event_interval = false;
+    }
     if (status[0] || status[1]) throw MatrixFreeNumericalError("KFAC vendor Cholesky rejected non-SPD factor");
     if (p.device_authority)
     {
@@ -499,6 +732,9 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
       std::vector<double>().swap(sensitivity);
       factorized_ = true;
       prepared_[block] = 1;
+      if (event_elapsed_available)
+        KFACGpuEventTraceSink::instance().record(p.queue.device(), event_generation_id_, slot_, block,
+            event_duration_ms, "complete");
       return;
     }
     for (auto item : {std::make_pair(&activation, layout.a), std::make_pair(&sensitivity, layout.g)})
@@ -512,8 +748,24 @@ void KFACDenseGeneration::factorize(std::size_t block, std::vector<double>& acti
       }
     fingerprints_[block] = fingerprint(activation, sensitivity);
     prepared_[block] = 1;
+    if (event_elapsed_available)
+      KFACGpuEventTraceSink::instance().record(p.queue.device(), event_generation_id_, slot_, block,
+          event_duration_ms, "complete");
   }
-  catch (...) { failed_ = true; try { p.queue.sync(); } catch (...) {} throw; }
+  catch (...)
+  {
+    failed_ = true;
+    if (event_interval)
+      p.queue.stopEventInterval();
+    try { p.queue.sync(); } catch (...) {}
+    if (event_interval && p.queue.readEventIntervalMilliseconds(event_duration_ms))
+      KFACGpuEventTraceSink::instance().record(p.queue.device(), event_generation_id_, slot_, block,
+          event_duration_ms, "failed");
+    else if (event_elapsed_available)
+      KFACGpuEventTraceSink::instance().record(p.queue.device(), event_generation_id_, slot_, block,
+          event_duration_ms, "validation_failed");
+    throw;
+  }
 #else
   throw std::logic_error("KFAC device backend unavailable");
 #endif

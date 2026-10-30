@@ -19,11 +19,13 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace qmcplusplus::wftrain
@@ -811,8 +813,17 @@ struct KFACAffineInverseGeneration
   // Canonical per-block vectors retain the existing dense-solver vector interface.
   struct Block
   {
+    Block() = default;
+    Block(const Block&) = delete;
+    Block& operator=(const Block&) = delete;
+    Block(Block&&) noexcept = default;
+    Block& operator=(Block&&) = delete;
+
     KFACAffineBlockDescriptor descriptor;
     DerivativeReal curvature_inverse_scale = 1.0;
+    // Declared before the vectors so their storage is destroyed before release is recorded.
+    psiformer::memory::HostAllocation trace_activation;
+    psiformer::memory::HostAllocation trace_sensitivity;
     std::vector<DerivativeReal> activation_cholesky;
     std::vector<DerivativeReal> sensitivity_cholesky;
   };
@@ -823,7 +834,6 @@ struct KFACAffineInverseGeneration
   std::vector<Block> blocks;
   // Non-null only for fresh, explicitly admitted resident-authoritative factors.
   std::shared_ptr<KFACDenseGeneration> resident_authority;
-  psiformer::memory::HostCapacity trace_capacity;
 
   // Explicit HOST access may materialize; resident solve never calls this helper.
   const std::vector<double>& activation(std::size_t block) const
@@ -858,9 +868,6 @@ void KFACPreconditioner::publishAffineGeneration()
       throw std::logic_error("KFAC resident publication has mixed factor authority");
     building_->resident_authority = dense_generation_;
   }
-  if (psiformer::memory::enabled())
-    building_->trace_capacity.snapshotAt(__FILE__, __LINE__, "KFACPreconditioner::immutable_affine_generation",
-        building_->numericBytes(), reinterpret_cast<std::uintptr_t>(building_.get()), -1, parameterVersion());
   affine_ = std::move(building_);
 }
 
@@ -925,8 +932,35 @@ void KFACPreconditioner::prepareBlock(std::size_t ordinal, std::size_t activatio
   if (!finite(repeats) || repeats <= 0.0)
     throw std::invalid_argument("KFAC factor has an invalid repeated-row count");
   prepared.curvature_inverse_scale = repeats;
+  char activation_shape[64];
+  char sensitivity_shape[64];
+  constexpr const char* derivative_dtype = std::is_same_v<DerivativeReal, double> ? "float64" :
+      std::is_same_v<DerivativeReal, float> ? "float32" : "opaque_pod";
+  const auto generation_owner = reinterpret_cast<std::uintptr_t>(building_.get());
+  if (psiformer::memory::enabled())
+  {
+    std::snprintf(activation_shape, sizeof(activation_shape), "[%zu,%zu]", activation_dimension,
+                  activation_dimension);
+    std::snprintf(sensitivity_shape, sizeof(sensitivity_shape), "[%zu,%zu]", sensitivity_dimension,
+                  sensitivity_dimension);
+    prepared.trace_activation.requestAt(__FILE__, __LINE__,
+        "KFACAffineInverseGeneration::activation_cholesky",
+        checkedProduct(activation.size(), sizeof(DerivativeReal), "KFAC activation HOST allocation"),
+        derivative_dtype, activation_shape, generation_owner, -1, parameterVersion());
+  }
   prepared.activation_cholesky.assign(activation.begin(), activation.end());
+  if (psiformer::memory::enabled())
+    prepared.trace_activation.allocationSucceeded(checkedProduct(prepared.activation_cholesky.capacity(),
+        sizeof(DerivativeReal), "KFAC activation HOST capacity"));
+  if (psiformer::memory::enabled())
+    prepared.trace_sensitivity.requestAt(__FILE__, __LINE__,
+        "KFACAffineInverseGeneration::sensitivity_cholesky",
+        checkedProduct(sensitivity.size(), sizeof(DerivativeReal), "KFAC sensitivity HOST allocation"),
+        derivative_dtype, sensitivity_shape, generation_owner, -1, parameterVersion());
   prepared.sensitivity_cholesky.assign(sensitivity.begin(), sensitivity.end());
+  if (psiformer::memory::enabled())
+    prepared.trace_sensitivity.allocationSucceeded(checkedProduct(prepared.sensitivity_cholesky.capacity(),
+        sizeof(DerivativeReal), "KFAC sensitivity HOST capacity"));
   for (DerivativeReal& value : prepared.activation_cholesky)
     value /= sample_weight;
   for (DerivativeReal& value : prepared.sensitivity_cholesky)
@@ -977,7 +1011,15 @@ void KFACPreconditioner::prepareBlock(std::size_t ordinal, std::size_t activatio
     prepared.sensitivity_cholesky[diagonal * sensitivity_dimension + diagonal] +=
         sensitivity_damping;
   if (dense_generation_)
+  {
     dense_generation_->factorize(ordinal, prepared.activation_cholesky, prepared.sensitivity_cholesky);
+    // Resident-authority factorization releases these HOST staging vectors
+    // before the immutable inverse generation itself is destroyed.
+    if (prepared.activation_cholesky.capacity() == 0)
+      prepared.trace_activation.storageReleased();
+    if (prepared.sensitivity_cholesky.capacity() == 0)
+      prepared.trace_sensitivity.storageReleased();
+  }
   else
   {
     cholesky(prepared.activation_cholesky, activation_dimension);
@@ -1139,20 +1181,49 @@ KFACPreconditioner::KFACPreconditioner(KFACBlockRegistry registry, std::size_t p
     KFACAffineInverseGeneration::Block block;
     block.descriptor = descriptor;
     const auto input = descriptor.input_width + (descriptor.bias_block == NO_KFAC_BIAS_BLOCK ? 0 : 1);
-    for (auto pair : {std::make_pair(&block.activation_cholesky, input),
-                      std::make_pair(&block.sensitivity_cholesky, descriptor.output_width)})
-    {
-      pair.first->assign(state.values.begin() + offset, state.values.begin() + offset + pair.second * pair.second);
-      offset += pair.second * pair.second;
-      for (std::size_t row = 0; row < pair.second; ++row)
+    const auto load_factor = [&](std::vector<DerivativeReal>& factor,
+                                 psiformer::memory::HostAllocation& trace,
+                                 const char* owner, std::size_t dimension, const char* description) {
+      const auto elements = checkedProduct(dimension, dimension, description);
+      char shape[64];
+      if (psiformer::memory::enabled())
       {
-        if ((*pair.first)[row * pair.second + row] <= 0.0)
+        std::snprintf(shape, sizeof(shape), "[%zu,%zu]", dimension, dimension);
+        constexpr const char* derivative_dtype = std::is_same_v<DerivativeReal, double> ? "float64" :
+            std::is_same_v<DerivativeReal, float> ? "float32" : "opaque_pod";
+        trace.requestAt(__FILE__, __LINE__, owner,
+            checkedProduct(elements, sizeof(DerivativeReal), "KFAC restored HOST factor bytes"),
+            derivative_dtype, shape, reinterpret_cast<std::uintptr_t>(building_.get()), -1,
+            parameterVersion());
+      }
+      try
+      {
+        factor.assign(state.values.begin() + offset, state.values.begin() + offset + elements);
+      }
+      catch (...)
+      {
+        if (psiformer::memory::enabled())
+          trace.allocationFailed();
+        throw;
+      }
+      if (psiformer::memory::enabled())
+        trace.allocationSucceeded(checkedProduct(factor.capacity(), sizeof(DerivativeReal),
+            "KFAC restored HOST factor capacity"));
+      offset += elements;
+      for (std::size_t row = 0; row < dimension; ++row)
+      {
+        if (factor[row * dimension + row] <= 0.0)
           throw std::invalid_argument("KFAC inverse state has invalid Cholesky diagonal");
-        for (std::size_t column = row + 1; column < pair.second; ++column)
-          if ((*pair.first)[row * pair.second + column] != 0.0)
+        for (std::size_t column = row + 1; column < dimension; ++column)
+          if (factor[row * dimension + column] != 0.0)
             throw std::invalid_argument("KFAC inverse state Cholesky storage is not lower triangular");
       }
-    }
+    };
+    load_factor(block.activation_cholesky, block.trace_activation,
+        "KFACAffineInverseGeneration::activation_cholesky", input, "KFAC restored activation factor");
+    load_factor(block.sensitivity_cholesky, block.trace_sensitivity,
+        "KFACAffineInverseGeneration::sensitivity_cholesky", descriptor.output_width,
+        "KFAC restored sensitivity factor");
     block.curvature_inverse_scale = state.values[offset++];
     if (block.curvature_inverse_scale <= 0.0)
       throw std::invalid_argument("KFAC inverse state has invalid repeat scale");

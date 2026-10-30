@@ -7,6 +7,7 @@
 #define QMCPLUSPLUS_PSIFORMER_MEMORY_TRACE_H
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 namespace qmcplusplus::psiformer::memory
@@ -331,6 +333,148 @@ private:
   std::uint64_t id_ = 0;
   const char* name_ = "unknown";
   std::size_t bytes_ = 0;
+};
+
+/** Trace one selected owning HOST allocation whose vector lifetime is explicit.
+ *
+ * This is a narrow ownership annotation, not a HOST allocator interceptor.
+ * Call requestAt immediately before the backing container allocates, then
+ * allocationSucceeded after success (or allocationFailed on exception).
+ * Declare this object before the backing container so C++ destroys the storage
+ * before the tracker emits its release event. Bytes are the container's owned
+ * capacity payload, not allocator overhead, RSS, pinned memory, or physical
+ * residency.
+ */
+class HostAllocation
+{
+public:
+  HostAllocation() noexcept = default;
+  HostAllocation(const HostAllocation&) = delete;
+  HostAllocation& operator=(const HostAllocation&) = delete;
+
+  HostAllocation(HostAllocation&& other) noexcept { take(other); }
+  HostAllocation& operator=(HostAllocation&&) = delete;
+
+  ~HostAllocation() noexcept { release(); }
+
+  /// Record intent immediately before a selected container allocates storage.
+  void requestAt(const char* file, int line, const char* owner, std::size_t requested_bytes,
+                 const char* dtype, const char* shape, std::uintptr_t resource = 0,
+                 long long crowd = -1, std::uint64_t generation = 0) noexcept
+  {
+    if (!enabled() || !requested_bytes)
+      return;
+    release();
+    id_ = nextIdentity();
+    if (!id_)
+      return;
+    owner_ = owner ? owner : "unknown";
+    category_ = "host_tracked_capacity";
+    backend_ = "host";
+    file_ = file ? file : "unknown";
+    line_ = line;
+    requested_bytes_ = requested_bytes;
+    bytes_ = 0;
+    dtype_ = dtype ? dtype : "unknown";
+    resource_ = resource;
+    crowd_ = crowd;
+    generation_ = generation;
+    std::snprintf(shape_.data(), shape_.size(), "%s", shape ? shape : "unknown");
+    emitRecord("request", requested_bytes_);
+  }
+
+  /// Mark successful storage creation using its observed container capacity.
+  void allocationSucceeded(std::size_t capacity_bytes) noexcept
+  {
+    if (!id_)
+      return;
+    bytes_ = capacity_bytes;
+    allocated_ = true;
+    emitRecord("allocated", bytes_);
+  }
+
+  /// Preserve failed allocation intent without claiming bytes became live.
+  void allocationFailed() noexcept
+  {
+    if (!id_)
+      return;
+    emitRecord("allocation_failed", requested_bytes_);
+    id_ = 0;
+    requested_bytes_ = 0;
+    bytes_ = 0;
+    allocated_ = false;
+  }
+
+  /// End tracking after the backing container explicitly relinquishes capacity.
+  void storageReleased() noexcept
+  {
+    if (!id_ || !allocated_)
+      return;
+    emitRecord("release", bytes_);
+    id_ = 0;
+    requested_bytes_ = 0;
+    bytes_ = 0;
+    allocated_ = false;
+  }
+
+private:
+  void emitRecord(const char* kind, std::size_t bytes) noexcept
+  {
+    Event event{kind, id_, owner_, category_, backend_, -1, bytes};
+    event.logical = bytes;
+    event.file = file_;
+    event.line = line_;
+    event.dtype = dtype_;
+    event.shape = shape_.data();
+    event.resource = resource_;
+    event.crowd = crowd_;
+    event.generation = generation_;
+    emit(event);
+  }
+
+  void take(HostAllocation& other) noexcept
+  {
+    id_ = std::exchange(other.id_, 0);
+    owner_ = other.owner_;
+    category_ = other.category_;
+    backend_ = other.backend_;
+    file_ = other.file_;
+    line_ = other.line_;
+    bytes_ = std::exchange(other.bytes_, 0);
+    requested_bytes_ = std::exchange(other.requested_bytes_, 0);
+    dtype_ = other.dtype_;
+    shape_ = other.shape_;
+    resource_ = other.resource_;
+    crowd_ = other.crowd_;
+    generation_ = other.generation_;
+    allocated_ = std::exchange(other.allocated_, false);
+  }
+
+  void release() noexcept
+  {
+    if (!id_)
+      return;
+    emitRecord(allocated_ ? "release" : "allocation_failed", allocated_ ? bytes_ : requested_bytes_);
+    id_ = 0;
+    requested_bytes_ = 0;
+    bytes_ = 0;
+    allocated_ = false;
+  }
+
+  std::uint64_t id_ = 0;
+  const char* owner_ = "unknown";
+  const char* category_ = "host_tracked_capacity";
+  const char* backend_ = "host";
+  const char* file_ = "unknown";
+  int line_ = 0;
+  std::size_t requested_bytes_ = 0;
+  std::size_t bytes_ = 0;
+  const char* dtype_ = "unknown";
+  std::array<char, 128> shape_{{'u', 'n', 'k', 'n', 'o', 'w', 'n', '\0'}};
+  std::uintptr_t resource_ = 0;
+  long long crowd_ = -1;
+  std::uint64_t generation_ = 0;
+  bool allocated_ = false;
 };
 }
 #endif

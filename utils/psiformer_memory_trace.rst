@@ -76,6 +76,23 @@ and value/full/active clone workspaces use existing exact diagnostics. Adam
 reports its existing host moment mirrors. KFAC reports accepted/pending factors,
 exported inverse banks, prepared preconditioner storage, and solve vectors.
 
+KFAC's immutable affine generation additionally uses ``HostAllocation`` for its
+activation and sensitivity Cholesky vectors, including construction from a
+restored inverse state. The tracer records the requested extent immediately
+before each vector assignment and its actual vector capacity after success.
+Its tracker is declared before the vector, so the vector is destroyed before
+the release event. In resident-authority mode, factorization swaps the staging
+vectors empty; the tracker emits release immediately after confirming their
+capacity is zero, even though the containing inverse generation remains alive.
+Entries are grouped by affine block role, source site, dtype, shape and crowd;
+allocation IDs and generation/resource addresses remain on each owner record.
+Lifecycle outcomes are attributed to the request's group metadata, so differences
+in outcome metadata or source line cannot split one request/allocation lifecycle.
+Shared preconditioner references do not create duplicate records.
+These HOST bytes are vector payload capacity; allocator metadata, RSS and
+physical residency remain outside the trace. Other KFAC host arrays continue
+to use boundary-only ``HostCapacity`` observations.
+
 Host observations are boundary snapshots, not interceptions of std::vector
 allocations. They can miss temporary coexistence within a growth operation,
 factor update, checkpoint restore, or exception before the next observation.
@@ -116,6 +133,19 @@ separately as the maximum observed native interval high water and
 counter fields are not a coherent transaction during concurrent activity.
 Reconcile live totals at a quiescent boundary; no extra allocator lock or stream
 synchronization was introduced for attribution.
+
+The reducer pairs ``request`` with ``allocated``, ``allocation_failed`` or
+``rejected`` by identity. It reports per-owner-group allocation/free counts,
+payload bytes, trace-event lifetime, outstanding requests, failed frees and
+same-size reallocations after a prior same-size allocation has fully closed.
+Overlapping replacements do not count as sequential churn. For selected HOST
+vectors, allocated/released events cover the container's payload lifetime;
+``HostCapacity`` still reports only observed capacity changes and observed
+capacity intervals. It does not become allocation/free activity merely because
+the reducer sees a tracker ID. Unreleased IDs at a normal process-end marker are
+listed as open owners because the marker can precede late static destruction.
+Missing outcomes, unmatched frees, dropped events and absent end markers are
+reported explicitly.
 
 Each file begins with schema version 1, PID, rank, wall-clock nanoseconds since
 the Unix epoch, and monotonic nanoseconds. Event monotonic timestamps are taken

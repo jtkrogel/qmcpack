@@ -17,6 +17,13 @@ struct TrainingTimers
   TrainingTimers() { (void)nativeTimerRecordingThread(); }
   TrainingTimers(const TrainingTimers&) : TrainingTimers() {}
 
+  // These scopes split driver setup/warmup from recurring work without
+  // changing run_steps or training_info.csv meanings.
+  NewTimer& initial_evaluation = createGlobalTimer("WFTrain::initial_evaluation", timer_level_fine);
+  NewTimer& initial_warmup = createGlobalTimer("WFTrain::initial_warmup", timer_level_fine);
+  NewTimer& iteration_warmup = createGlobalTimer("WFTrain::iteration_warmup", timer_level_fine);
+  NewTimer& completed_iteration_wall = createGlobalTimer("WFTrain::completed_iteration_wall", timer_level_fine);
+
   NewTimer& preparation = createGlobalTimer("WFTrain::product_preparation", timer_level_medium);
   NewTimer& objective = createGlobalTimer("WFTrain::objective_gradient", timer_level_medium);
   NewTimer& affine_observation = createGlobalTimer("WFTrain::affine_observation_factors", timer_level_fine);

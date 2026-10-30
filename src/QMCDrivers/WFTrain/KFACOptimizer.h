@@ -69,6 +69,10 @@ public:
   /// Return the pre-update step that last refreshed affine inverse factors.
   std::uint64_t inverseStep() const noexcept;
 
+  /// Return successful factor and inverse generations built in this process.
+  std::uint64_t factorGenerationBuilds() const noexcept { return factor_generation_builds_; }
+  std::uint64_t inverseGenerationBuilds() const noexcept { return inverse_generation_builds_; }
+
   /// Evaluate the pre-update inverse learning-rate schedule in its declared dtype.
   DerivativeReal effectiveLearningRate() const noexcept;
 
@@ -108,6 +112,8 @@ private:
   std::unique_ptr<Pending> pending_;
   void traceStorage() noexcept;
   std::array<psiformer::memory::HostCapacity, 4> trace_storage_;
+  std::uint64_t factor_generation_builds_ = 0;
+  std::uint64_t inverse_generation_builds_ = 0;
   DerivativeReal last_metric_ = 0.0;
   DerivativeReal last_scale_ = 1.0;
 };
