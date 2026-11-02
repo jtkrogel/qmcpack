@@ -128,6 +128,11 @@ add_executable(psiformer_device_concurrency_validation EXCLUDE_FROM_ALL
                ../../PsiFormer/PsiFormerInitialization.cpp
                ../../PsiFormer/PsiFormerGeometry.cpp)
 target_link_libraries(psiformer_device_concurrency_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio qmcutil)
+if(QMC_OMP)
+  # HIP executable links must resolve the native timer library's host OpenMP calls.
+  target_link_libraries(psiformer_device_model_validation PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(psiformer_device_concurrency_validation PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(psiformer_device_concurrency_validation PRIVATE
                            "${qmcpack_SOURCE_DIR}/src/Containers"
                            "${qmcpack_SOURCE_DIR}/src/QMCDrivers"
