@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_WFTRAIN_INFERENCE_H
 
 #include "QMCDrivers/QMCDriverNew.h"
+#include "QMCDrivers/CompletedSequenceTimer.h"
 #include "QMCDrivers/WFTrain/WFTrainInferenceInput.h"
 #include "QMCDrivers/VMC/VMCBatchedSampling.h"
 #include "QMCDrivers/Crowd.h"
@@ -140,9 +141,11 @@ public:
     }
     if (qmcdriver_input_.get_warmup_steps() > 0)
       record_work("inference_warmup");
+    CompletedSequenceTimer sequence_wall(*myComm, "inference_step", steps_per_block_, qmcdriver_input_.get_max_blocks());
     int global_step = 0;
     for (int block = 0; block < qmcdriver_input_.get_max_blocks() && !stop; ++block)
     {
+      sequence_wall.beginUnit();
       loop.start();
       state.recalculate_properties_period = input_.vmc.get_move_kind() == VMCDriverInput::MoveKind::PBYP
           ? qmcdriver_input_.get_recalculate_properties_period() : 0;
@@ -189,7 +192,9 @@ public:
       ++completed_blocks_;
       loop.stop();
       stop = stopped();
+      sequence_wall.completeUnit();
     }
+    sequence_wall.reportIncomplete();
     record_work("inference_sampling");
     complete_ = completed_blocks_ == qmcdriver_input_.get_max_blocks();
     if (orbital_observer_)

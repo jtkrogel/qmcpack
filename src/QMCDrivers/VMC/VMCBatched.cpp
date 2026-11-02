@@ -10,6 +10,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include "VMCBatched.h"
+#include "QMCDrivers/CompletedSequenceTimer.h"
 #include "EstimatorInputDelegates.h"
 #include "Concurrency/ParallelExecutor.hpp"
 #include "Concurrency/Info.hpp"
@@ -203,9 +204,11 @@ void VMCBatched::run()
   // this barrier fences all previous load imbalance. Avoid block 0 timing pollution.
   myComm->barrier();
 
+  CompletedSequenceTimer sequence_wall(*myComm, "inference_step", steps_per_block_, num_blocks);
   int global_step = 0;
   for (int block = 0; block < num_blocks; ++block)
   {
+    sequence_wall.beginUnit();
     {
       ScopeGuard<LoopTimer<>> vmc_local_timer(vmc_loop);
       vmc_state.recalculate_properties_period =
@@ -255,6 +258,7 @@ void VMCBatched::run()
     // Progress messages before possibly stopping
     if (!myComm->rank())
       app_log() << runtimeControl.generateProgressMessage("VMCBatched", block, num_blocks);
+    sequence_wall.completeUnit();
     if (stop_requested)
     {
       if (!myComm->rank())
@@ -263,6 +267,7 @@ void VMCBatched::run()
       break;
     }
   }
+  sequence_wall.reportIncomplete();
   // This is confusing logic from VMC.cpp want this functionality write documentation of this
   // and clean it up
   // bool wrotesamples = qmcdriver_input_.get_dump_config();

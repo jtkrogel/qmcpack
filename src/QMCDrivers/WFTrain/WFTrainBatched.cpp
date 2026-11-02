@@ -7,6 +7,7 @@
 
 #include "Estimators/EstimatorInputDelegates.h"
 #include "WFTrainBatched.h"
+#include "QMCDrivers/CompletedSequenceTimer.h"
 
 #include "Concurrency/ParallelExecutor.hpp"
 #include "MemoryUsage.h"
@@ -4724,9 +4725,12 @@ void WFTrainBatched::run()
               << " schedule_precision=" << (training_input_.getKFACScheduleFloat32() ? "float32" : "float64")
               << " effective_learning_rate=" << kfac_optimizer->effectiveLearningRate() << std::endl;
 
+  CompletedSequenceTimer sequence_wall(*myComm, "training_update", num_blocks * steps_per_block_,
+      num_iterations - stage_state.completed_stage_iterations);
   for (int iteration = static_cast<int>(stage_state.completed_stage_iterations);
        iteration < num_iterations; ++iteration)
   {
+    sequence_wall.beginUnit();
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
     NativeTimerScope completed_iteration_timer(phase_timers_.completed_iteration_wall);
     Timer iteration_wall;
@@ -6533,6 +6537,7 @@ void WFTrainBatched::run()
     myComm->bcast(stop_requested);
     if (myComm->rank() == 0)
       app_log() << runtime_control.generateProgressMessage("WFTrainBatched", iteration, num_iterations);
+    sequence_wall.completeUnit();
     const bool periodic_checkpoint =
         training_state.completed_iterations % training_input_.getCheckpointInterval() == 0;
     const bool final_block = iteration + 1 == num_iterations;
@@ -6645,6 +6650,7 @@ void WFTrainBatched::run()
     }
   }
 
+  sequence_wall.reportIncomplete();
   if (myComm->rank() == 0)
     app_log() << "WFTrain completed " << completed_blocks << " block(s) and "
               << accepted_updates << " committed update(s), "
