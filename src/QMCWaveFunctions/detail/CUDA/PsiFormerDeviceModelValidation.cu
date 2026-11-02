@@ -132,6 +132,71 @@ void writeReferences(const std::string& filename, const std::vector<Reference>& 
   if (!output) throw std::runtime_error("Reference output write failed");
 }
 
+/// Export the two shared configurations without the broad model/lifecycle matrix.
+void writeSharedObservables(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+                            const std::string& output_path, const std::string& score_path)
+{
+  if (model.cfg.nconfig != 2)
+    throw std::invalid_argument("Shared observables require exactly two complete configurations");
+  qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  AcceleratorBlasHandle handle(queue);
+  const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+  PreparedDeviceInference value(image, 2, queue, handle, SpatialJetMode::VALUE_ONLY, !score_path.empty());
+  value.evaluate(model.cfg.electrons.x);
+  std::vector<double> value_sign(2), value_log(2), no_laplacians;
+  value.downloadResults(value_sign, value_log, no_laplacians);
+  PreparedDeviceInference full(image, 2, queue, handle, SpatialJetMode::FULL_VGL);
+  full.evaluate(model.cfg.electrons.x);
+  const auto& layout = full.resultLayout();
+  std::vector<double> sign(2), jets(spatialJetSpanElements(layout)), ratios(2 * model.ne);
+  full.downloadResults(sign, jets, ratios);
+  std::vector<Reference> rows(2);
+  std::ofstream values(output_path + ".value");
+  if (!values) throw std::runtime_error("Cannot open shared VALUE output");
+  values << std::setprecision(17) << "# index sign logabs\n";
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    auto& row = rows[configuration];
+    row.sign = sign[configuration];
+    row.logabs = jets[layout.uncheckedValueOffset(configuration, 0)];
+    near(value_sign[configuration], row.sign, "shared VALUE/FULL sign");
+    near(value_log[configuration], row.logabs, "shared VALUE/FULL logabs");
+    for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+      row.gradient.push_back(jets[layout.uncheckedGradientOffset(configuration, lane, 0)]);
+    for (std::size_t electron = 0; electron < model.ne; ++electron)
+    {
+      row.lap_log.push_back(jets[layout.uncheckedLaplacianOffset(configuration, electron, 0)]);
+      row.lap_ratio.push_back(ratios[configuration * model.ne + electron]);
+      row.kinetic -= 0.5 * row.lap_ratio.back();
+    }
+    for (const auto* field : {&row.gradient, &row.lap_log, &row.lap_ratio})
+      for (const double element : *field)
+        if (!device_math::isFiniteBinary64(element))
+          throw std::runtime_error("Shared spatial output is nonfinite");
+    if (!device_math::isFiniteBinary64(row.kinetic))
+      throw std::runtime_error("Shared kinetic contraction is nonfinite");
+    values << configuration << ' ' << value_sign[configuration] << ' ' << value_log[configuration] << '\n';
+  }
+  if (!values) throw std::runtime_error("Cannot write shared VALUE output");
+  writeReferences(output_path, rows);
+  if (!score_path.empty())
+  {
+    PreparedDeviceScoreReverse score(image, 2, queue, handle);
+    score.reverse(value, {0.7, -0.25});
+    std::vector<double> response(plan.parameterCount());
+    score.downloadResponse(response);
+    for (const double element : response)
+      if (!device_math::isFiniteBinary64(element))
+        throw std::runtime_error("Shared weighted score output is nonfinite");
+    std::ofstream output(score_path, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(response.data()), response.size() * sizeof(double));
+    if (!output) throw std::runtime_error("Cannot write shared weighted score output");
+  }
+  std::cout << "PASS shared GPU observables: configurations=2 score_weights=0.7,-0.25 parameters="
+            << plan.parameterCount() << " VGL=" << output_path << " VALUE=" << output_path + ".value"
+            << " score_export=" << !score_path.empty() << '\n';
+}
+
 /// Exercise composite ownership independently of unrelated reverse/score graphs.
 void validateParallelVgl(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
                          const std::vector<Reference>& references, std::size_t batch)
@@ -331,13 +396,14 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--device-candidate-only] [--ecp-observation-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] [--retained-energy-sr-only] "
+                                  "[--shared-observables-only] [--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--device-candidate-only] [--ecp-observation-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] [--retained-energy-sr-only] "
                                   "[--vgl-ownership FULL|K<positive integer>] [--vgl-trace-bytes BYTES] [--parallel-vgl-check] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
+    bool shared_observables_only = false, shared_incompatible_option = false;
     bool cpu_only = false;
     bool parallel_vgl_check = false;
     bool coordinate_only = false;
@@ -364,7 +430,11 @@ int main(int argc, char** argv)
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
-      if (option == "--cpu-only" && !cpu_only)
+      if (option != "--shared-observables-only" && option != "--shape" && option != "--score-output")
+        shared_incompatible_option = true;
+      if (option == "--shared-observables-only" && !shared_observables_only)
+        shared_observables_only = true;
+      else if (option == "--cpu-only" && !cpu_only)
         cpu_only = true;
       else if (option == "--parallel-vgl-check" && !parallel_vgl_check)
         parallel_vgl_check = true;
@@ -434,6 +504,8 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
+    if (shared_observables_only && shared_incompatible_option)
+      throw std::invalid_argument("Shared observables permit only --shape and optional --score-output");
     if (int(ecp_observation_only) + int(device_candidate_only) + int(sr_metric_only) + int(resident_adam_only) + int(resident_pcg_only) + int(energy_sr_only) + int(retained_energy_sr_only) > 1)
       throw std::invalid_argument("Resident Adam/SR metric/PCG/ENERGY SR qualifications are mutually exclusive");
     if ((ecp_observation_only || device_candidate_only || resident_adam_only || sr_metric_only || resident_pcg_only || energy_sr_only || retained_energy_sr_only) && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
@@ -471,6 +543,15 @@ int main(int argc, char** argv)
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
+    if (shared_observables_only)
+    {
+      int devices = 0;
+      checkRuntime(cudaGetDeviceCount(&devices), "shared observables device discovery");
+      if (!devices)
+      { std::cerr << "NOT_RUN: shared observables require a usable GPU\n"; return 77; }
+      writeSharedObservables(model, plan, argv[3], score_output);
+      return 0;
+    }
     if (parallel_vgl_check)
     {
       if (argc != 10 || !shape_supplied || model.ne != 4)
