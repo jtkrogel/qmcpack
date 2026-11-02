@@ -18,6 +18,10 @@
 #include "NonLocalECPotential.h"
 
 #include <limits>
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
 #include <cstring>
 #include <cmath>
 #include <optional>
@@ -1386,6 +1390,39 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
     }
     ve_samples = Real(0);
     vi_samples = Real(0);
+  }
+
+  // Report completed logical work only under the existing work-trace opt-in.
+  // Counts describe actual cutoff-admitted pairs/virtual points, not capacity.
+  static const bool trace_work = [] {
+    const char* setting = std::getenv("PSIFORMER_WORK_COUNTER_TRACE");
+    return setting && *setting && std::string_view(setting) != "0";
+  }();
+  if (trace_work)
+  {
+    static std::atomic<std::size_t> sequence{0};
+    std::size_t candidate_pairs = 0;
+    Real maximum_radius = 0;
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      const auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+      const auto& table = p_list[walker].getDistTableAB(potential.myTableIndex);
+      for (int electron = 0; electron < p_list[walker].getTotalNum(); ++electron)
+        for (std::size_t ion = 0; ion < potential.PP.size(); ++ion)
+          if (potential.PP[ion])
+          {
+            ++candidate_pairs;
+            maximum_radius = std::max(maximum_radius, table.getDistRow(electron)[ion]);
+          }
+    }
+    const auto work = resource.virtual_batch->statistics();
+    std::clog << "NonLocalECP work: route=flattened_vp sequence=" << sequence.fetch_add(1)
+              << " walkers=" << walker_count << " candidate_pairs=" << candidate_pairs
+              << " pairs=" << work.logical_jobs << " virtual_ratio_points=" << work.logical_knots
+              << " outer_tiles=" << work.tiles_packed
+              << " cutoff_skips=" << candidate_pairs - work.logical_jobs
+              << " maximum_candidate_radius=" << maximum_radius
+              << " keep_grid=" << keep_grid << " determinant_locality=" << leader.use_DLA << std::endl;
   }
 }
 
