@@ -35,6 +35,7 @@
 #include "ResourceCollection.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -237,6 +238,46 @@ TEST_CASE("Device sampling reuses FULL state only after proved rejection",
   electrons.createResource(particle_prototype);
   ResourceCollection particle_resources(particle_prototype);
   ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  // After publication, no-drift sampling may retain only the new value. Even
+  // an all-rejected round must rebuild FULL before kinetic energy consumes G/L.
+  for (const bool take : {false, true})
+  {
+    auto updated = component.snapshotParameters();
+    updated.values[0] += 2e-4;
+    component.publishParameters(updated, updated.version);
+    TrialWaveFunction::mw_evaluateLog(trials, particles, WaveFunctionEvaluationRequest::VALUE_ONLY);
+    const auto refreshed_log = trial.getLogPsi();
+    CHECK_FALSE(trial.hasValidGradients());
+    CHECK_FALSE(trial.hasValidLaplacians());
+    CHECK_FALSE(VMCBatchedSampling::canReuseRejectedDeviceFullState(trial, electrons, 0, false));
+    const MCMultiParticleMoves<CoordsType::POS> move({0, 2}, {0, 1},
+        {electrons.R[0] + ParticleSet::PosType{.003, -.002, .001},
+         electrons.R[1] + ParticleSet::PosType{-.001, .002, -.003}});
+    std::vector<TrialWaveFunction::LogValue> ratios(1);
+    TrialWaveFunction::mw_evaluateMultiParticleMove(
+        trials, particles, move, ratios, WaveFunctionEvaluationRequest::VALUE_ONLY);
+    const auto expected_log = refreshed_log + (take ? std::real(ratios[0]) : 0.0);
+    std::vector<bool> valid;
+    ParticleSet::mw_makeMoveSelectedParticles(particles, move, valid);
+    REQUIRE(std::all_of(valid.begin(), valid.end(), [](bool value) { return value; }));
+    TrialWaveFunction::mw_accept_rejectMultiParticleMove(trials, particles, move, {take});
+    ParticleSet::mw_accept_rejectMoveSelectedParticles(particles, {take});
+    CHECK(trial.getLogPsi() == Catch::Approx(expected_log).margin(2e-12));
+    CHECK_FALSE(trial.hasValidGradients());
+    CHECK_FALSE(trial.hasValidLaplacians());
+    const auto restore_before = metrics.snapshot();
+    TrialWaveFunction::mw_evaluateGL(trials, particles, false);
+    CHECK(metrics.snapshot().download_calls > restore_before.download_calls);
+    CHECK(trial.hasValidGradients());
+    CHECK(trial.hasValidLaplacians());
+    electrons.update();
+    const auto restored_energy = energy();
+    CHECK(std::isfinite(restored_energy));
+    CHECK(trial.getLogPsi() == Catch::Approx(expected_log).margin(2e-12));
+    TrialWaveFunction::mw_evaluateGL(trials, particles, true);
+    CHECK(energy() == Catch::Approx(restored_energy).epsilon(2e-12).margin(2e-12));
+  }
+
   for (const bool take : {false, true})
   {
     const MCMultiParticleMoves<CoordsType::POS> move({0, 1}, {0},

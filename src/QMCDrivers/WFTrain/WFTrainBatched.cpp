@@ -985,7 +985,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     std::size_t scalar_ecp_budget = 0,
     bool capture_inline_ecp_vjp = false,
     ImmediateFullReplayReceipt* full_handoff = nullptr,
-    std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score = nullptr)
+    std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score = nullptr,
+    wftrain::TrainingWorkCounters* work_counters = nullptr)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -1278,6 +1279,11 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     // An old-version or stale-context owner must die BEFORE canonical refresh/recreation.
     prepared_score.reset();
     TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+    if (work_counters)
+    {
+      work_counters->addRequestedProducts(true, true, true);
+      work_counters->addComputedProducts(true, true, true);
+    }
   }
   if (full_handoff)
     app_log() << "Immediate ECP FULL handoff: full_elided=" << reuse_immediate_full
@@ -1322,6 +1328,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     ReplayOnlyECPSink sink;
     const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
         hamiltonian_batch, twf_batch, electron_batch, energy, {&channel, 1}, sink);
+    if (work_counters)
+      work_counters->addHamiltonianEvaluations(result.local_energies.size(), result.local_energies.size());
     if (energy.gridFingerprint() != result.grid_fingerprint || result.local_energies.size() != samples)
       throw std::logic_error("GPU score-only ECP accepted energy/grid identity mismatch");
     batch.local_energies.reserve(samples);
@@ -4229,6 +4237,24 @@ void WFTrainBatched::run()
            complex_training_component_->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()))
 #endif
       );
+  // The sole same-version snapshot may retain complete accepted products;
+  // admission is independent of the optional immediate-handoff contrast.
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  const bool sampled_score_reuse =
+      training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY && score_training &&
+      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
+      !vmcdriver_input_.get_use_drift() &&
+      vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
+      qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
+      device_provider && device_provider->usesAcceleratorParameterProducts() &&
+      !device_provider->residentECPObservationEnabled() &&
+      population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+      crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
+#else
+  constexpr bool sampled_score_reuse = false;
+#endif
   if (score_handoff_optin && std::string(score_handoff_optin) == "1")
     app_log() << "Score Adam ECP FULL handoff: eligible=" << score_ecp_full_handoff
               << "; per-replay proof, native Hamiltonian/grid/RNG unchanged" << std::endl;
@@ -4788,7 +4814,7 @@ void WFTrainBatched::run()
             {
               retained_samples.push_back(retainCrowdSamples(
                   *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training,
-                  (resident_adam_budget || resident_sr_budget.first || kfac_single_replay)
+                  (resident_adam_budget || resident_sr_budget.first || kfac_single_replay || sampled_score_reuse)
                       ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
               const auto& snapshot = retained_samples.back();
               if (work_counters)
@@ -5093,13 +5119,45 @@ void WFTrainBatched::run()
             Crowd& crowd = *crowds_[samples.crowd_index];
             // KFAC reuses only FULL wavefunction state; ECP capture below still
             // evaluates its complete Hamiltonian and draws its accepted grid.
-            const bool resident_single_snapshot = (kfac_single_replay ||
+            const bool resident_single_snapshot = (sampled_score_reuse || kfac_single_replay ||
                 ((resident_adam_budget || resident_sr_budget.first) &&
                  (!has_nonlocal_ecp || resident_device_authority_))) && !complex_training &&
                 retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
             const bool fresh_full = replayCrowdSamples(crowd, samples, resident_single_snapshot
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
+            if (fresh_full && work_counters)
+            {
+              work_counters->addRequestedProducts(true, true, true);
+              work_counters->addComputedProducts(true, true, true);
+            }
+            // A score-only owner differentiates log(Psi), not EL or its ECP grid.
+            // Successful same-state FULL replay proof also validates the finite,
+            // current-version energy retained by collection. No grid consumer remains.
+            if (sampled_score_reuse && !fresh_full &&
+                samples.replay_version == std::optional<std::size_t>(training_state.parameter_version))
+            {
+              wftrain::PreparedEnergyGradientBatch batch;
+              batch.weights.assign(samples.local_energies.size(), 1.0);
+              batch.local_energy_term_mask = 0;
+              for (const double energy : samples.local_energies)
+              {
+                if (!wftrain::isFiniteTrainingReal(energy))
+                  throw std::logic_error("Collection energy reuse requires finite accepted energies");
+                batch.local_energies.emplace_back(energy, 0.0);
+              }
+              batch.derivative_operator = prepareImmediateGpuScoreBatch(
+                  crowd, batch_ordinal++, sample_offset, training_input_.getParameterChunkSize());
+              if (batch.derivative_operator->parameterVersion() != *samples.replay_version)
+                throw std::logic_error("Collection energy reuse observed a different parameter version");
+              app_log() << "WFTrain collection energy reuse: version=" << *samples.replay_version
+                        << " samples=" << samples.local_energies.size()
+                        << " full_evaluations=0 hamiltonian_evaluations=0"
+                        << " score_ecp_full_handoff=" << score_ecp_full_handoff << std::endl;
+              sample_offset += crowd.size();
+              batches.push_back(std::move(batch));
+              continue;
+            }
             std::size_t scalar_ecp_budget = 0;
             if (!complex_training && score_training && has_nonlocal_ecp &&
                 selected_provider_->usesAcceleratorParameterProducts())
@@ -5116,7 +5174,7 @@ void WFTrainBatched::run()
             }
             std::optional<ImmediateFullReplayReceipt> full_handoff;
             std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score;
-            if ((kfac_ecp_full_handoff || score_ecp_full_handoff) && fresh_full &&
+            if ((kfac_ecp_full_handoff || score_ecp_full_handoff) && (fresh_full || sampled_score_reuse) &&
                 score_training && has_nonlocal_ecp && !capture_ecp_jvp_replay)
             {
               if (complex_training)
@@ -5157,7 +5215,7 @@ void WFTrainBatched::run()
                 nullptr,
 #endif
                 scalar_ecp_budget, usesInlinePairedECPResponse(training_input_),
-                full_handoff ? &*full_handoff : nullptr, std::move(prepared_score)));
+                full_handoff ? &*full_handoff : nullptr, std::move(prepared_score), work_counters));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
@@ -5203,6 +5261,7 @@ void WFTrainBatched::run()
         }
         enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
+        record_work("iteration_preparation", iteration, 0, 0);
         logTrainingMemoryPhase(*myComm, iteration, "after_preparation_before_update");
         memory_phase.transition("objective_gradients_and_optimizer_update");
         logTrainingAllocation("optimizer_reductions_and_proposal", storage_diagnostics.sample_count,
@@ -7002,14 +7061,38 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
     return;
   }
 
+  // A joint no-drift score update needs the new value for the next ratio,
+  // but does not consume spatial products or an energy at the publication boundary.
+  // The next production observation rebuilds FULL before evaluating its Hamiltonian.
+  // Keep other move, estimator, debug and parameter-authority paths unchanged.
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  const auto* refresh_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+  const bool value_only_refresh =
+      training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
+      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      wftrain::usesEnergyScoreEstimator(training_input_, false) &&
+      !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
+      !vmcdriver_input_.get_use_drift() &&
+      vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
+      qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
+      refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
+      !refresh_provider->residentECPObservationEnabled() &&
+      population_.get_golden_twf().getOrbitals().size() == 1 &&
+      population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN;
+#else
+  constexpr bool value_only_refresh = false;
+#endif
+
   std::exception_ptr refresh_failure;
   try
   {
     ParallelExecutor<> refresh_task;
     auto step_context_refs = getContextForStepsRefs();
     refresh_task(crowds_.size(), initialLogEvaluationWithContext, crowds_, step_context_refs,
-        serializing_crowd_walkers_, false, !training_input_.samplesOrbitalStudent(),
-        WaveFunctionEvaluationRequest::FULL_SPATIAL, &phase_timers_.spatial_evaluation_api,
+        serializing_crowd_walkers_, false, !training_input_.samplesOrbitalStudent() && !value_only_refresh,
+        value_only_refresh ? WaveFunctionEvaluationRequest::VALUE_ONLY
+                           : WaveFunctionEvaluationRequest::FULL_SPATIAL,
+        &phase_timers_.spatial_evaluation_api,
         &phase_timers_.hamiltonian_evaluation_api, work_counters);
   }
   catch (...)

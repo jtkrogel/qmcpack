@@ -115,7 +115,7 @@ else()
   set_target_properties(psiformer_device_model_validation PROPERTIES
                         CUDA_SEPARABLE_COMPILATION ON)
 endif()
-target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
+target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio qmcutil)
 
 # Focused native crowd concurrency validation with generated parameters only.
 add_executable(psiformer_device_concurrency_validation EXCLUDE_FROM_ALL
@@ -127,7 +127,7 @@ add_executable(psiformer_device_concurrency_validation EXCLUDE_FROM_ALL
                ../../PsiFormer/PsiFormerExecutionPlan.cpp
                ../../PsiFormer/PsiFormerInitialization.cpp
                ../../PsiFormer/PsiFormerGeometry.cpp)
-target_link_libraries(psiformer_device_concurrency_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
+target_link_libraries(psiformer_device_concurrency_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio qmcutil)
 target_include_directories(psiformer_device_concurrency_validation PRIVATE
                            "${qmcpack_SOURCE_DIR}/src/Containers"
                            "${qmcpack_SOURCE_DIR}/src/QMCDrivers"

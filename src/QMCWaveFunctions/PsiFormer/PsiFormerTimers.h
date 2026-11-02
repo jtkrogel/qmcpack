@@ -37,6 +37,11 @@ struct PsiFormerTimers
   NewTimer& cpu_kinetic = createGlobalTimer("PsiFormer::CPU_kinetic_parameter_complete", timer_level_fine);
   NewTimer& gpu_call = createGlobalTimer("PsiFormer::GPU_HOST_call", timer_level_fine);
   NewTimer& gpu_evaluate = createGlobalTimer("PsiFormer::GPU_HOST_evaluate_complete", timer_level_fine);
+  NewTimer& gpu_vgl_trunk = createGlobalTimer("PsiFormer::GPU_HOST_VGL_trunk", timer_level_fine);
+  NewTimer& gpu_vgl_orbitals = createGlobalTimer("PsiFormer::GPU_HOST_VGL_orbitals", timer_level_fine);
+  NewTimer& gpu_vgl_determinants = createGlobalTimer("PsiFormer::GPU_HOST_VGL_determinants", timer_level_fine);
+  NewTimer& gpu_vgl_traces = createGlobalTimer("PsiFormer::GPU_HOST_VGL_spatial_traces", timer_level_fine);
+  NewTimer& gpu_vgl_finalize = createGlobalTimer("PsiFormer::GPU_HOST_VGL_cusp_finalize", timer_level_fine);
   NewTimer& gpu_download = createGlobalTimer("PsiFormer::GPU_HOST_download_complete", timer_level_fine);
 };
 }

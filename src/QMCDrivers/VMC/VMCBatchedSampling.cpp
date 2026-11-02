@@ -212,7 +212,10 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   ResourceCollectionTeamLock<TrialWaveFunction> twfs_res_lock(crowd.getSharedResource().twf_res, walker_twfs);
   timers.resource.stop();
   const bool use_drift = sft.vmcdrv_input.get_use_drift();
-  const bool needs_full_products = !warmup ||
+  // Collective no-drift proposals consume only current values. Restore spatial
+  // products at the energy/debug boundary after the final proposal instead.
+  const bool needs_full_products = (!warmup &&
+      (use_drift || sft.vmcdrv_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP)) ||
       (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD);
   const bool missing_full_products = needs_full_products &&
       std::any_of(walker_twfs.begin(), walker_twfs.end(),
@@ -385,7 +388,7 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
           }
 
           const MCMultiParticleMoves<CoordsType::POS> moves(walker_offsets, selected_indices, proposed_positions);
-          const auto request = warmup && !use_drift
+          const auto request = !use_drift
               ? WaveFunctionEvaluationRequest::VALUE_ONLY : WaveFunctionEvaluationRequest::FULL_SPATIAL;
           {
             OptionalNativeTimerScope spatial_timer(timers.spatial_evaluation_api);

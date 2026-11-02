@@ -1404,6 +1404,12 @@ private:
   }
 
 public:
+  /// Optional production-owned host attribution. The callback adds no device fences.
+  /// Its context must outlive evaluation; standalone numerical callers need no timer library.
+  using HostStageObserver = void (*)(void*, const char*, bool);
+  void setHostStageObserver(void* context, HostStageObserver observer) noexcept
+  { host_stage_context_ = context; host_stage_observer_ = observer; }
+
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
   void evaluate(const std::vector<double>& positions)
   {
@@ -1708,6 +1714,22 @@ private:
     }
   }
 
+  class HostStageScope
+  {
+  public:
+    HostStageScope(PreparedDeviceInference& graph, const char* stage) : graph_(graph), stage_(stage)
+    { record(true); }
+    ~HostStageScope() { record(false); }
+    void next(const char* stage) { record(false); stage_ = stage; record(true); }
+  private:
+    void record(bool begin)
+    { if (graph_.host_stage_observer_) graph_.host_stage_observer_(graph_.host_stage_context_, stage_, begin); }
+    PreparedDeviceInference& graph_;
+    const char* stage_;
+  };
+  void* host_stage_context_ = nullptr;
+  HostStageObserver host_stage_observer_ = nullptr;
+
   /// Execute one admitted shape against the geometry uploaded by the logical request.
   void evaluatePreparedTile(bool reuse_target_base = false)
   {
@@ -1720,6 +1742,7 @@ private:
   /// Shared real prefix in its original order; no head or determinant publication.
   void evaluatePreparedTrunk()
   {
+    HostStageScope host_stage(*this, "trunk");
     const auto stream = queue_.getNative();
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
@@ -1808,6 +1831,7 @@ private:
   /// Complete the unchanged real head after the shared neural prefix is admitted.
   void finishPreparedTile(MixedValueAttempt& mixed_attempt, bool reuse_target_base = false)
   {
+    HostStageScope host_stage(*this, "orbitals");
     const auto stream = queue_.getNative();
     if (sparse_envelope_ && sparse_envelope_->tile.references)
     {
@@ -1863,6 +1887,7 @@ private:
     if (sparse_envelope_ && sparse_envelope_->tile.capture)
       sparse_envelope_->ready = true;
 
+    host_stage.next("determinants");
     // Only values need compact packing for factorization and the score-head ABI.
     // Spatial traces borrow the existing orbital planes with a configuration stride,
     // avoiding a second B*4Ne*D*Ne^2 derivative tensor and two copies per configuration.
@@ -1922,6 +1947,7 @@ private:
       mixed_attempt.finish();
       return;
     }
+    host_stage.next("spatial_traces");
     device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_,
         final_.output.laplacian_lanes,
         orbitals_.orbitals.configuration_stride, orbitals_.orbitals.configuration_stride};
@@ -1968,6 +1994,7 @@ private:
         head_weights, head_inverse, orbitalStorage().data() + orbitals_.orbitals.plane_stride,
         orbitalStorage().data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
+    host_stage.next("cusp_finalize");
     evaluateCusp();
     checkOpen(batch_);
     checkRuntime(launchFinalSpatialCombination(stream, final_, head_combinations, trace_status,

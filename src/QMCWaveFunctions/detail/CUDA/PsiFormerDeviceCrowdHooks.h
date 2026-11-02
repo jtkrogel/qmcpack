@@ -15,6 +15,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_CROWD_HOOKS_H
 
 #include "PsiFormerDeviceInference.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerTimers.h"
 #include "PsiFormerDeviceExecutionPreparation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
@@ -222,6 +223,19 @@ public:
           throw std::logic_error("Numerical dispatch has incomplete graphs after failed preparation; rebuild before retry");
         if (event.operation == PsiFormerAcceleratorOperation::VGL)
         {
+#ifdef ENABLE_TIMERS
+          spatial_->setHostStageObserver(this, [](void* context, const char* stage, bool begin) {
+            if (std::this_thread::get_id() != nativeTimerRecordingThread()) return;
+            auto& timers = static_cast<PreparedDeviceCrowdHooks*>(context)->phase_timers_;
+            const std::string_view name(stage);
+            NewTimer& timer = name == "trunk" ? timers.gpu_vgl_trunk :
+                name == "orbitals" ? timers.gpu_vgl_orbitals :
+                name == "determinants" ? timers.gpu_vgl_determinants :
+                name == "spatial_traces" ? timers.gpu_vgl_traces : timers.gpu_vgl_finalize;
+            if (begin) timer.start(); else timer.stop();
+          });
+#endif
+          NativeTimerScope timer(phase_timers_.gpu_evaluate);
           evaluateGraph(*spatial_);
           last_graph_ = spatial_.get();
           ++numerical_batches_;
@@ -257,7 +271,10 @@ public:
       ratios_.resize(event.item_count * last_graph_->resultLayout().laplacian_lanes);
       // Synchronous transfers are the initial baseline. Results remain hidden
       // until RESULT_WAIT, even though the copy is complete at this boundary.
-      last_graph_->downloadResults(phases_, jets_, ratios_);
+      {
+        NativeTimerScope timer(phase_timers_.gpu_download);
+        last_graph_->downloadResults(phases_, jets_, ratios_);
+      }
       recorded_ = true;
       return;
     case PsiFormerAcceleratorEventKind::RESULT_WAIT:
@@ -533,6 +550,7 @@ private:
   PsiFormerAcceleratorModelProvenance model_provenance_;
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
+  PsiFormerTimers phase_timers_;
   std::unique_ptr<PreparedDeviceInference> values_, spatial_;
   bool retain_values_ = false;
   PreparedDeviceInference* last_graph_ = nullptr;
