@@ -99,6 +99,18 @@ DiracDeterminantBatched<PL, VT, FPVT>::DiracDeterminantBatched(SPOSet& phi,
 }
 
 template<PlatformKind PL, typename VT, typename FPVT>
+void DiracDeterminantBatched<PL, VT, FPVT>::copyInverseTranspose(SPOSet::ValueMatrix& inverse_transpose)
+{
+  // The host copy may be stale after an accelerator operation.  Local-energy
+  // evaluation is an energy boundary, so explicitly synchronize this read.
+  psiMinv_.updateFrom();
+  inverse_transpose.resize(NumOrbitals, NumOrbitals);
+  for (int i = 0; i < NumOrbitals; ++i)
+    for (int j = 0; j < NumOrbitals; ++j)
+      inverse_transpose(i, j) = psiMinv_(i, j);
+}
+
+template<PlatformKind PL, typename VT, typename FPVT>
 void DiracDeterminantBatched<PL, VT, FPVT>::invertPsiM(const DualMatrix<Value>& psiM, DualMatrix<Value>& psiMinv)
 {
   ScopedTimer inverse_timer(InverseTimer);

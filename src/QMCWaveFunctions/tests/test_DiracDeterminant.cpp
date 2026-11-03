@@ -16,6 +16,7 @@
 #include "OhmmsPETE/OhmmsMatrix.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
+#include "QMCWaveFunctions/Fermion/OneBodyOperatorTrace.hpp"
 #include "QMCWaveFunctions/tests/FakeSPO.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "QMCWaveFunctions/SpinorSet.h"
@@ -64,6 +65,10 @@ void test_DiracDeterminant_first(const DetMatInvertor inverter_kind)
 
   elec.create({3});
   ddb.recompute(elec);
+
+  SPOSet::ValueMatrix inverse_transpose;
+  ddb.copyInverseTranspose(inverse_transpose);
+  check_matrix(ddb.psiM, inverse_transpose);
 
   Matrix<Value> b;
   b.resize(3, 3);
@@ -135,6 +140,46 @@ void test_DiracDeterminant_first(const DetMatInvertor inverter_kind)
 
   CHECK(std::real(ratio_1) == Approx(0.9308456444));
   CHECK(std::real(ddb.get_log_value()) == Approx(1.9891064655));
+}
+
+TEST_CASE("one-body determinant action trace uses algebraic complex contraction", "[wavefunction][fermion][mfr]")
+{
+  Matrix<Value> inverse_transpose;
+  Matrix<Value> action;
+  inverse_transpose.resize(2, 2);
+  action.resize(2, 2);
+#if defined(QMC_COMPLEX)
+  inverse_transpose(0, 0) = Value(1.0, 2.0);
+  inverse_transpose(0, 1) = Value(3.0, -1.0);
+  inverse_transpose(1, 0) = Value(-2.0, 0.5);
+  inverse_transpose(1, 1) = Value(0.25, 4.0);
+  action(0, 0) = Value(0.5, -1.0);
+  action(0, 1) = Value(2.0, 0.25);
+  action(1, 0) = Value(-1.5, 2.0);
+  action(1, 1) = Value(0.75, -0.5);
+  const QMCTraits::FullPrecValueType expected =
+      QMCTraits::FullPrecValueType(1.0, 2.0) * QMCTraits::FullPrecValueType(0.5, -1.0) +
+      QMCTraits::FullPrecValueType(3.0, -1.0) * QMCTraits::FullPrecValueType(2.0, 0.25) +
+      QMCTraits::FullPrecValueType(-2.0, 0.5) * QMCTraits::FullPrecValueType(-1.5, 2.0) +
+      QMCTraits::FullPrecValueType(0.25, 4.0) * QMCTraits::FullPrecValueType(0.75, -0.5);
+  CHECK(oneBodyOperatorTrace(inverse_transpose, action) == ComplexApprox(expected));
+  const QMCTraits::FullPrecValueType conjugated_result =
+      std::conj(QMCTraits::FullPrecValueType(1.0, 2.0)) * QMCTraits::FullPrecValueType(0.5, -1.0) +
+      std::conj(QMCTraits::FullPrecValueType(3.0, -1.0)) * QMCTraits::FullPrecValueType(2.0, 0.25) +
+      std::conj(QMCTraits::FullPrecValueType(-2.0, 0.5)) * QMCTraits::FullPrecValueType(-1.5, 2.0) +
+      std::conj(QMCTraits::FullPrecValueType(0.25, 4.0)) * QMCTraits::FullPrecValueType(0.75, -0.5);
+  CHECK_FALSE(oneBodyOperatorTrace(inverse_transpose, action) == ComplexApprox(conjugated_result).epsilon(1.0e-12));
+#else
+  inverse_transpose(0, 0) = 1.0;
+  inverse_transpose(0, 1) = 3.0;
+  inverse_transpose(1, 0) = -2.0;
+  inverse_transpose(1, 1) = 0.25;
+  action(0, 0) = 0.5;
+  action(0, 1) = 2.0;
+  action(1, 0) = -1.5;
+  action(1, 1) = 0.75;
+  CHECK(oneBodyOperatorTrace(inverse_transpose, action) == ValueApprox(0.5 + 6.0 + 3.0 + 0.1875));
+#endif
 }
 
 TEST_CASE("DiracDeterminant_first", "[wavefunction][fermion]")
@@ -379,6 +424,9 @@ void test_DiracDeterminant_delayed_update(const DetMatInvertor inverter_kind)
   // force update Ainv in ddc using SM-1 code path
   // also force population of dpsiM or you will have invalid grad below
   ddc.completeUpdates();
+  SPOSet::ValueMatrix copied_inverse_transpose;
+  ddc.copyInverseTranspose(copied_inverse_transpose);
+  check_matrix(a_update1, copied_inverse_transpose);
   check_matrix(a_update1, ddc.psiM);
 
   grad = ddc.evalGrad(elec, 1);

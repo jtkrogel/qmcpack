@@ -5,8 +5,8 @@
 
 #====================================================================#
 #  qmcpack_converters.py                                             #
-#    Nexus interfaces for orbital converter tools of QMCPACK:        #
-#    pw2qmcpack and convert4qmc                                      #
+#    Nexus interfaces for orbital converter tools used by QMCPACK:    #
+#    pw2qmcpack, pw2mfr_core, and convert4qmc                         #
 #                                                                    #
 #  Content summary:                                                  #
 #    generate_pw2qmcpack                                             #
@@ -23,6 +23,12 @@
 #                                                                    #
 #    Pw2qmcpackAnalyzer                                              #
 #      SimulationAnalyzer class for pw2qmcpack.                      #
+#                                                                    #
+#    Pw2mfrCore / Pw2mfrCoreInput                                    #
+#      QE core-action exporter simulation and input.                 #
+#                                                                    #
+#    generate_pw2mfr_core                                            #
+#      User-facing function to generate the QE action exporter.      #
 #                                                                    #
 #                                                                    #
 #    Convert4qmcInput                                                #
@@ -554,6 +560,154 @@ def generate_pw2qmcpack(**kwargs):
 
     return pw2qmcpack
 #end def generate_pw2qmcpack
+
+
+class Pw2mfrCoreInput(Pw2qmcpackInput):
+    ints   = ('last_band',)
+    floats = ()
+    strs   = ('outdir','prefix')
+    bools  = ('write_diagnostics',)
+
+    var_types = dict(last_band=int,outdir=str,prefix=str,write_diagnostics=bool)
+    var_types: MappingProxyType[str, type] = MappingProxyType(var_types)
+    allowed = frozenset(ints+floats+strs+bools)
+#end class Pw2mfrCoreInput
+
+
+def generate_pw2mfr_core_input(prefix='pwscf',outdir='pwscf_output',*,last_band=0,write_diagnostics=False):
+    return Pw2mfrCoreInput(
+        prefix = prefix,
+        outdir = outdir,
+        last_band = last_band,
+        write_diagnostics = write_diagnostics,
+        )
+#end def generate_pw2mfr_core_input
+
+
+class Pw2mfrCoreAnalyzer(SimulationAnalyzer):
+    def __init__(self,arg0):
+        if isinstance(arg0,Simulation):
+            self.infile = arg0.infile
+            self.dir = arg0.locdir
+            self.h5file = arg0.get_result('mfr_core_action',None).h5file
+        else:
+            self.infile = arg0
+        #end if
+    #end def __init__
+
+    def analyze(self):
+        pass
+    #end def analyze
+
+    def get_result(self,result_name):
+        raise NotImplementedError
+    #end def get_result
+#end class Pw2mfrCoreAnalyzer
+
+
+class Pw2mfrCore(Simulation):
+    input_type = Pw2mfrCoreInput
+    analyzer_type = Pw2mfrCoreAnalyzer
+    generic_identifier = 'pw2mfr_core'
+    application = 'pw2mfr_core.x'
+    application_properties = frozenset({'serial'})
+    application_results = frozenset({'mfr_core_action'})
+    allowed_requirements = ('orbitals',)
+
+    def check_result(self,result_name,sim):
+        return result_name=='mfr_core_action'
+    #end def check_result
+
+    def get_result(self,result_name,sim):
+        if result_name!='mfr_core_action':
+            raise NotImplementedError(f'ability to get result "{result_name}" has not been implemented')
+        inputpp = self.input.inputpp
+        prefix = inputpp.get('prefix','pwscf')
+        outdir = inputpp.get('outdir','./')
+        if outdir.startswith('./'):
+            outdir = outdir[2:]
+        return obj(h5file=os.path.join(self.locdir,outdir,prefix+'.mfr_core.h5'))
+    #end def get_result
+
+    def incorporate_result(self,result_name,result,sim):
+        if result_name!='orbitals' or not isinstance(sim,Pwscf):
+            raise NotImplementedError(
+                f'incorporating result "{result_name}" from {type(sim).__name__} has not been implemented'
+                )
+        pwin = sim.input.control
+        p2in = self.input.inputpp
+        pwprefix = pwin.prefix if 'prefix' in pwin else 'pwscf'
+        p2prefix = p2in.prefix if 'prefix' in p2in else 'pwscf'
+        pwoutdir = pwin.outdir if 'outdir' in pwin else './'
+        p2outdir = p2in.outdir if 'outdir' in p2in else './'
+        if pwoutdir.startswith('./'):
+            pwoutdir = pwoutdir[2:]
+        if p2outdir.startswith('./'):
+            p2outdir = p2outdir[2:]
+        pwdir = os.path.abspath(os.path.join(sim.locdir,pwoutdir))
+        p2dir = os.path.abspath(os.path.join(self.locdir,p2outdir))
+        if pwdir!=p2dir or pwprefix!=p2prefix:
+            raise RuntimeError(
+                'pw2mfr_core must use the same prefix and outdir as its pwscf dependency\n'
+                f'  pwscf prefix/outdir: {pwprefix} / {pwdir}\n'
+                f'  pw2mfr_core prefix/outdir: {p2prefix} / {p2dir}'
+                )
+    #end def incorporate_result
+
+    def check_sim_status(self):
+        result = self.get_result('mfr_core_action',None)
+        output_path = os.path.join(self.locdir,self.outfile)
+        output = ''
+        if os.path.isfile(output_path):
+            with open(output_path) as stream:
+                output = stream.read()
+            #end with
+        #end if
+        # A failed rerun intentionally leaves the previous complete HDF5 file
+        # intact.  File existence alone must not release downstream QMC jobs.
+        success = (os.path.isfile(result.h5file)
+                   and 'Bare MFR core actions written to ' in output
+                   and 'JOB DONE.' in output)
+        self.finished = self.job.finished and success
+        self.succeeded = self.finished
+        self.failed = self.job.finished and not success
+    #end def check_sim_status
+
+    def get_output_files(self):
+        result = self.get_result('mfr_core_action',None)
+        return [os.path.relpath(result.h5file,self.locdir)]
+    #end def get_output_files
+
+    def app_command(self):
+        return self.app_name+'<'+self.infile
+    #end def app_command
+
+    def fill_produces(self):
+        self.produces.add('mfr_core_action')
+    #end def fill_produces
+
+    def fill_products(self):
+        self.products.mfr_core_action = self.get_result('mfr_core_action',None).h5file
+    #end def fill_products
+#end class Pw2mfrCore
+
+
+def generate_pw2mfr_core(**kwargs):
+    if nexus_config.dynamic:
+        dp,dyn_args = DynamicProcess.check_first_gen(kwargs)
+        if dp is not None:
+            return dp
+        #end if
+    #end if
+    sim_args,inp_args = Simulation.separate_inputs(kwargs)
+    if 'input' not in sim_args:
+        sim_args.input = generate_pw2mfr_core_input(**inp_args)
+    #end if
+    pw2mfr_core = Pw2mfrCore(**sim_args)
+    if nexus_config.dynamic:
+        pw2mfr_core = DynamicProcess(sim=pw2mfr_core,**dyn_args)
+    return pw2mfr_core
+#end def generate_pw2mfr_core
 
 
 

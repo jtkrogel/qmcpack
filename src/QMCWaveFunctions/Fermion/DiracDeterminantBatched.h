@@ -273,6 +273,7 @@ public:
 
   void evaluateRatiosAlltoOne(ParticleSet& P, std::vector<Value>& ratios) override;
 
+  void copyInverseTranspose(SPOSet::ValueMatrix& inverse_transpose) override;
   const auto& get_psiMinv() const { return psiMinv_; }
 
 private:

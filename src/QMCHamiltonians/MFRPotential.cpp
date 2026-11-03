@@ -213,7 +213,7 @@ bool MFRPotential::put(xmlNodePtr cur)
       throw std::runtime_error("MFR grid dimensions must be at least four for cubic splines");
 
     const std::vector<double> lattice_values = readDoubleDataset(file, "/mfr/lattice_vectors", {3, 3});
-    Tensor<RealType, OHMMS_DIM> lattice;
+    Tensor<FullPrecRealType, OHMMS_DIM> lattice;
     for (int i = 0; i < OHMMS_DIM; ++i)
       for (int j = 0; j < OHMMS_DIM; ++j)
         lattice(i, j) = lattice_values[i * OHMMS_DIM + j];
@@ -224,7 +224,7 @@ bool MFRPotential::put(xmlNodePtr cur)
     {
       if (!simulation_lattice.getBoxBConds()[i])
         throw std::runtime_error("MFR potential requires a fully periodic simulation cell");
-      const PosType reduced_vector = field_lattice_.toUnit(simulation_lattice.a(i));
+      const auto reduced_vector = field_lattice_.toUnit(simulation_lattice.a(i));
       for (int j = 0; j < OHMMS_DIM; ++j)
         if (std::abs(reduced_vector[j] - std::round(reduced_vector[j])) > 1.0e-8)
           throw std::runtime_error("QMCPACK simulation cell is not commensurate with the MFR field lattice");
@@ -319,7 +319,9 @@ MFRPotential::FullPrecRealType MFRPotential::evaluateOne(const ParticleSet& pset
   const int channel = spin_channels_ == 1 ? 0 : pset.getGroupID(particle_index);
   if (channel < 0 || channel >= spin_channels_)
     throw std::runtime_error("electron group is incompatible with MFR spin channels");
-  const PosType reduced = field_lattice_.toUnit_floor(pset.R[particle_index]);
+  // Promote before wrapping so the lattice helper uses double epsilon; keep
+  // its full-precision result below the excluded periodic upper endpoint.
+  const auto reduced = field_lattice_.toUnit_floor(QMCTraits::QTFull::PosType(pset.R[particle_index]));
   double value = 0.0;
   eval_UBspline_3d_d(splines_[channel].get(), reduced[0], reduced[1], reduced[2], &value);
   return value;

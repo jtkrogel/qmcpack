@@ -850,8 +850,8 @@ def test_empty_init():
 def test_input_spec():
     documented_sections = input_spec.section_order[:15]
     documented_count = sum(len(input_spec.section_contents[s]) for s in documented_sections)
-    assert(documented_count==271)
-    assert(len(input_spec.keywords)==284)
+    assert(documented_count==272)
+    assert(len(input_spec.keywords)==285)
 
     added_keywords = {
         'AFM',
@@ -914,6 +914,8 @@ def test_input_spec():
     assert(added_keywords <= set(input_spec.keywords.keys()))
 
     assert(input_spec.keywords.AFM.key_type=='boolean')
+    assert(input_spec.keywords.write_mfr_potential.key_type=='boolean')
+    assert(input_spec.keywords.write_mfr_potential.default is False)
     assert(input_spec.keywords.adaptive_cmix.max_value==10.0)
     assert(input_spec.keywords.electric_field.key_type=='double array')
     assert(input_spec.keywords.tddft_mode.allowed=={'electric field','point charge','vector potential'})
@@ -1491,7 +1493,7 @@ def test_generate():
     gkeys = set(gi.keys())
     kkeys = set(ki.keys())
 
-    skeys = mkeys & gkeys & kkeys
+    skeys = (mkeys & gkeys & kkeys) - {'kpoint_mesh'}
 
     skeys_ref = {
         'atomic_coordinate_type', 'atoms', 'calculation_mode',
@@ -1547,6 +1549,7 @@ def test_generate():
     assert(check_object_eq(kr,kr_ref))
 
     gr_ref = obj(
+        kpoint_mesh     = np.array([0, 0, 0],dtype=int),
         lattice_units   = 'Bohr',
         lattice_vector  = np.array([[3.37316115, 3.37316115, 0.        ],
                                     [0.        , 3.37316115, 3.37316115],

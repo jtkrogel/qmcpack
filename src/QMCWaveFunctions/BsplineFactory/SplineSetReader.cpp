@@ -122,6 +122,8 @@ std::unique_ptr<SPOSet> SplineSetReader<ST>::create_spline_set(const std::string
     //baseclass handles twists
     check_twists(*bspline, bandgroup);
   }
+  bspline->setMFRCoreActionSources(bandgroup, spin, use_duplex_splines_, rotate, mybuilder->MeshSize, half_g,
+                                   mybuilder->H5FileName.string(), mybuilder->SourcePtcl);
 
   bool foundspline = lookforSplineDataDumpFile(bandgroup, bspline->getKeyword(), sizeof(ST));
   if (foundspline && myComm->rank() == 0)

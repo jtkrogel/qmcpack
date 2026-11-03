@@ -53,7 +53,7 @@ from .qmcpack_input import (  # noqa: F401
     check_excitation_type,
     )
 from .qmcpack_analyzer import QmcpackAnalyzer
-from .qmcpack_converters import Pw2qmcpack, Convert4qmc, Convertpw4qmc, PyscfToAfqmc
+from .qmcpack_converters import Pw2qmcpack, Pw2mfrCore, Convert4qmc, Convertpw4qmc, PyscfToAfqmc
 from .pyscf_sim import Pyscf
 from .developer import DevBase, obj, NexusError, FileFormatError
 from .nexus_base import nexus_config
@@ -61,6 +61,7 @@ from .pseudoset import PseudoSet
 from .hdfreader import read_hdf
 from .unit_converter import convert
 from .pwscf import Pwscf
+from .rmg import Rmg
 from .xmlreader import XMLreader
 from . import numpy_extensions as npe
 
@@ -853,7 +854,31 @@ class Qmcpack(Simulation):
     def incorporate_result(self,result_name,result,sim):
         input = self.input
         system = self.system
-        if result_name=='restart':
+        if result_name=='mfr_potential' and isinstance(sim,Rmg):
+            # Generate the MFR XML element up front so Hamiltonian/driver mode
+            # selection is explicit even during generate-only workflows.
+            potential = input.get('MFRPotential')
+            if potential is None:
+                raise ValueError(
+                    'An RMG MFR dependency requires mfr_potential in generate_qmcpack; '
+                    'use a placeholder path with check_paths=False until SCF completes.'
+                    )
+            #end if
+            if not os.path.isfile(result.h5file):
+                raise FileNotFoundError(result.h5file)
+            #end if
+            potential.href = os.path.relpath(result.h5file,self.locdir)
+        elif result_name=='mfr_core_action' and isinstance(sim,Pw2mfrCore):
+            action = input.get('MFRCoreAction')
+            if action is None:
+                raise ValueError(
+                    'A pw2mfr_core dependency requires mfr_core_action in generate_qmcpack; '
+                    'use a placeholder path with check_paths=False until export completes.'
+                    )
+            if not os.path.isfile(result.h5file):
+                raise FileNotFoundError(result.h5file)
+            action.href = os.path.relpath(result.h5file,self.locdir)
+        elif result_name=='restart':
             nrestart = len(result.restarts)
             downstream_bundled = self.should_twist_average
             upstream_bundled = nrestart>1
@@ -887,9 +912,9 @@ class Qmcpack(Simulation):
             #end if
         elif result_name=='orbitals':
             gcta_possible = False
-            if isinstance(sim,Pw2qmcpack) or isinstance(sim,Convertpw4qmc):
+            if isinstance(sim,(Pw2qmcpack,Convertpw4qmc,Rmg)):
 
-                gcta_possible = True
+                gcta_possible = not isinstance(sim,Rmg)
                 h5file = result.h5file
 
                 wavefunction = input.get('wavefunction')

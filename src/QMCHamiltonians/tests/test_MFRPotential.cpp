@@ -247,6 +247,14 @@ void addStandaloneSkeleton(QMCHamiltonian& hamiltonian)
   hamiltonian.addOperator(constantOperator("MFRPotential"), "MFRPotential", false);
   hamiltonian.addOperator(constantOperator("KineticJastrowResidual"), "KineticJastrowResidual", false);
 }
+
+void addStandaloneCoreActionSkeleton(QMCHamiltonian& hamiltonian)
+{
+  hamiltonian.addOperator(constantOperator("BareKineticEnergy"), "Kinetic");
+  hamiltonian.addOperator(constantOperator("CoulombPotential"), "ElecElec");
+  hamiltonian.addOperator(constantOperator("MFRCoreAction"), "MFRCoreAction", false);
+  hamiltonian.addOperator(constantOperator("KineticJastrowResidual"), "KineticJastrowResidual", false);
+}
 } // namespace
 
 TEST_CASE("MFRPotential deterministic interpolation", "[hamiltonian][mfr]")
@@ -292,6 +300,34 @@ TEST_CASE("MFRPotential periodic wrapping", "[hamiltonian][mfr]")
   const double reference = potential.evaluate(electrons);
   electrons.R[0] += QMCTraits::PosType{4.0, -2.0, 6.0};
   CHECK(potential.evaluate(electrons) == Approx(reference).margin(1.e-6));
+}
+
+TEST_CASE("MFR scalar retains precision just below a periodic endpoint", "[hamiltonian][mfr][mfr_boundary]")
+{
+  TemporaryMFRFile file({0.0});
+  std::array<double, 64> values{};
+  const std::array<double, 4> odd{0, 1, 0, -1};
+  for (int z = 0; z < 4; ++z)
+    for (int y = 0; y < 4; ++y)
+      for (int x = 0; x < 4; ++x)
+        values[(z * 4 + y) * 4 + x] = odd[x];
+  const hid_t f = H5Fopen(file.name().c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+  REQUIRE(f >= 0);
+  const hid_t d = H5Dopen2(f, "/mfr/v_hxc/spin_1", H5P_DEFAULT);
+  REQUIRE(d >= 0);
+  REQUIRE(H5Dwrite(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data()) >= 0);
+  H5Dclose(d);
+  H5Fclose(f);
+  auto electrons = makeElectrons({1});
+  MFRPotential potential(electrons);
+  loadMFRPotential(potential, file.name());
+  electrons.R[0]        = {2e-9, .3, .7};
+  const double positive = potential.evaluate(electrons);
+  electrons.R[0]        = {-2e-9, .3, .7};
+  const double negative = potential.evaluate(electrons);
+  CHECK(positive > 2.5e-9);
+  CHECK(positive < 3.5e-9); // Ry -> Ha is unchanged.
+  CHECK(std::abs(positive + negative) < 1e-12);
 }
 
 TEST_CASE("MFRPotential rejects invalid metadata", "[hamiltonian][mfr]")
@@ -375,6 +411,24 @@ TEST_CASE("QMCHamiltonian MFR mode resolution", "[hamiltonian][mfr]")
     addStandaloneSkeleton(hamiltonian);
     hamiltonian.configureMFRQMCMode(MFRQMCModeRequest::AUTO);
     CHECK(hamiltonian.getMFRQMCMode() == QMCHamiltonian::MFRQMCMode::MFR);
+  }
+
+  SECTION("direct action standalone and comparison")
+  {
+    QMCHamiltonian hamiltonian;
+    addStandaloneCoreActionSkeleton(hamiltonian);
+    hamiltonian.configureMFRQMCMode(MFRQMCModeRequest::AUTO);
+    CHECK(hamiltonian.getMFRQMCMode() == QMCHamiltonian::MFRQMCMode::MFR);
+    hamiltonian.configureMFRQMCMode(MFRQMCModeRequest::NO);
+    CHECK(hamiltonian.getMFRQMCMode() == QMCHamiltonian::MFRQMCMode::STANDARD_WITH_MFR);
+  }
+
+  SECTION("scalar and action routes cannot be combined")
+  {
+    QMCHamiltonian hamiltonian;
+    addStandaloneCoreActionSkeleton(hamiltonian);
+    hamiltonian.addOperator(constantOperator("MFRPotential"), "MFRPotential", false);
+    CHECK_THROWS(hamiltonian.configureMFRQMCMode(MFRQMCModeRequest::AUTO));
   }
 
   SECTION("explicit comparison")

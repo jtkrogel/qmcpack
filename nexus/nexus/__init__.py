@@ -56,6 +56,7 @@ from .pyscf_sim import Pyscf, PyscfInput, PyscfAnalyzer, generate_pyscf_input, g
 from .rmg import Rmg, RmgInput, RmgAnalyzer, generate_rmg_input, generate_rmg
 
 from .qmcpack_converters import Pw2qmcpack , Pw2qmcpackInput , Pw2qmcpackAnalyzer , generate_pw2qmcpack_input , generate_pw2qmcpack
+from .qmcpack_converters import Pw2mfrCore, Pw2mfrCoreInput, Pw2mfrCoreAnalyzer, generate_pw2mfr_core_input, generate_pw2mfr_core
 from .qmcpack_converters import Convert4qmc, Convert4qmcInput, Convert4qmcAnalyzer, generate_convert4qmc_input, generate_convert4qmc
 from .qmcpack_converters import Convertpw4qmc, Convertpw4qmcInput, Convertpw4qmcAnalyzer, generate_convertpw4qmc_input, generate_convertpw4qmc
 from .qmcpack_converters import PyscfToAfqmc, PyscfToAfqmcInput, PyscfToAfqmcAnalyzer, generate_pyscf_to_afqmc_input, generate_pyscf_to_afqmc

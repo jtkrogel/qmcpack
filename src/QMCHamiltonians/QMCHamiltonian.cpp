@@ -26,6 +26,7 @@
 #include "BareKineticEnergy.h"
 #include "NonLocalECPotential.h"
 #include "MFRPotential.h"
+#include "MFRCoreAction.h"
 #include "KineticJastrowResidual.h"
 #include "Message/UniformCommunicateError.h"
 #include "Containers/MinimalContainers/RecordArray.hpp"
@@ -182,9 +183,13 @@ void QMCHamiltonian::configureMFRQMCMode(MFRQMCModeRequest requested_mode)
     return nullptr;
   };
 
-  const bool has_mfr = find_aux("MFRPotential") != nullptr;
+  const bool has_scalar_mfr = find_aux("MFRPotential") != nullptr;
+  const bool has_core_action = find_aux("MFRCoreAction") != nullptr;
+  if (has_scalar_mfr && has_core_action)
+    throw UniformCommunicateError("Choose either scalar MFRPotential or MFRCoreAction, not both.");
+  const bool has_mfr = has_scalar_mfr || has_core_action;
   if (requested_mode == MFRQMCModeRequest::YES && !has_mfr)
-    throw UniformCommunicateError("mfr_qmc=yes requires an MFRPotential in the Hamiltonian.");
+    throw UniformCommunicateError("mfr_qmc=yes requires MFRPotential or MFRCoreAction in the Hamiltonian.");
 
   if (!has_mfr)
     mfr_qmc_mode_ = MFRQMCMode::STANDARD;
@@ -236,6 +241,36 @@ void QMCHamiltonian::configureMFRQMCMode(MFRQMCModeRequest requested_mode)
 
 void QMCHamiltonian::applyMFREnergy(TrialWaveFunction& psi, ParticleSet& pset)
 {
+  MFRCoreAction* core_action = nullptr;
+  for (const auto& op : auxH)
+    if (op->getName() == "MFRCoreAction")
+      core_action = dynamic_cast<MFRCoreAction*>(op.get());
+
+  if (core_action != nullptr)
+  {
+    KineticJastrowResidual* kinetic_residual = nullptr;
+    FullPrecRealType electron_electron = 0.0;
+    for (const auto& op : auxH)
+      if (op->getName() == "KineticJastrowResidual")
+        kinetic_residual = dynamic_cast<KineticJastrowResidual*>(op.get());
+    for (const auto& op : H)
+      if (op->getName() == "ElecElec")
+        electron_electron = op->getValue();
+    if (kinetic_residual == nullptr)
+      throw std::runtime_error("MFRCoreAction requires KineticJastrowResidual during evaluation.");
+
+    const auto action_trace = core_action->evaluateTrace(psi, pset);
+    kinetic_residual->evaluate(psi, pset);
+    core_action->setObservables(Observables);
+    kinetic_residual->setObservables(Observables);
+    core_action->setParticlePropertyList(pset.PropertyList, myIndex);
+    kinetic_residual->setParticlePropertyList(pset.PropertyList, myIndex);
+    if (mfr_qmc_mode_ == MFRQMCMode::MFR)
+      LocalEnergy = std::real(action_trace) + core_action->getIonIonEnergyMF() + kinetic_residual->getValue() +
+          electron_electron;
+    return;
+  }
+
   if (mfr_qmc_mode_ != MFRQMCMode::MFR)
     return;
 

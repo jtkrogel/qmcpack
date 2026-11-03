@@ -253,6 +253,8 @@ public:
   ValueMatrix& getPsiMinv() { return psiM; }
 #endif
 
+  void copyInverseTranspose(SPOSet::ValueMatrix& inverse_transpose) override { inverse_transpose = psiM; }
+
   /// psiM(j,i) \f$= \psi_j({\bf r}_i)\f$
   ValueMatrix psiM_temp;
 

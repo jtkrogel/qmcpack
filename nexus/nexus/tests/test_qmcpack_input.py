@@ -2414,4 +2414,35 @@ def test_generate_mfr_potential(tmp_path):
             jastrows = [],
             calculations = [],
             )
+
+    action_file = tmp_path/'field.core_action.h5'
+    action_file.touch()
+    action_input = generate_qmcpack_input(
+        input_type = 'basic',
+        system = system,
+        orbitals_h5 = 'MISSING.h5',
+        mfr_core_action = str(action_file),
+        run_path = str(run_path),
+        corrections = [],
+        jastrows = [],
+        calculations = [],
+        )
+    action_text = action_input.write()
+    assert('type="mfr_core_action"' in action_text)
+    assert('name="MFRCoreAction"' in action_text)
+    assert(f'href="{os.path.relpath(action_file,run_path)}"' in action_text)
+    assert('name="IonIon"' not in action_text)
+    assert('name="ElecIon"' not in action_text)
+
+    with pytest.raises(ValueError,match='only one'):
+        generate_qmcpack_input(
+            input_type = 'basic',
+            system = system,
+            orbitals_h5 = 'MISSING.h5',
+            mfr_potential = str(mfr_file),
+            mfr_core_action = str(action_file),
+            corrections = [],
+            jastrows = [],
+            calculations = [],
+            )
 #end def test_generate_mfr_potential

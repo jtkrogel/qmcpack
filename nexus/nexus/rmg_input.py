@@ -669,6 +669,17 @@ Control options
     Description:  If true then a QMCPACK restart file is written as well as a serial
                   restart file.
 
+    Key name:     write_mfr_potential
+    Required:     no
+    Key type:     boolean
+    Expert:       No
+    Experimental: Yes
+    Default:      "false"
+    Description:  Export the converged Hartree plus XC potential and occupied KS
+                  energy metadata to a schema-v2 MFR HDF5 file. Also enables
+                  QMCPACK ES-HDF orbital output. Requires the supported neutral,
+                  periodic, single-twist PZ/PBE norm-conserving configuration.
+
     Key name:     write_qmcpack_restart_localized
     Required:     no
     Key type:     boolean
@@ -4167,8 +4178,8 @@ def generate_any_rmg_input(**kwargs):
             raise ValueError(msg)
         #end if
         rmg_length_units = rmg_units_map[cu]
-        if 'crd_units' not in ri and 'atomic_coordinate_type' in ri and ri.atomic_coordinate_type=='Absolute':
-            ri.crd_units = rmg_length_units
+        if 'crds_units' not in ri and 'atomic_coordinate_type' in ri and ri.atomic_coordinate_type=='Absolute':
+            ri.crds_units = rmg_length_units
         #end if
         s = system.structure
         elem = np.array(s.elem)
@@ -4230,6 +4241,8 @@ def generate_any_rmg_input(**kwargs):
                 kpoints = kpu.copy(),
                 weights = s.kweights.copy(),
                 )
+            # RMG otherwise defaults to a Gamma mesh and ignores this list.
+            ri.kpoint_mesh = np.zeros(3,dtype=int)
             if 'kpoint_is_shift' in ri:
                 del ri.kpoint_is_shift
             #end if

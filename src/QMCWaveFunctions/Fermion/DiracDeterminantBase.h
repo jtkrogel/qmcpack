@@ -20,6 +20,7 @@
 #include "QMCWaveFunctions/SPOSet.h"
 #include "Utilities/TimerManager.h"
 #include "CPU/math.hpp"
+#include <stdexcept>
 
 namespace qmcplusplus
 {
@@ -65,6 +66,15 @@ public:
   // get FirstIndex, Last Index
   inline int getFirstIndex() const { return FirstIndex; }
   inline int getLastIndex() const { return LastIndex; }
+
+  /** Copy the inverse-transpose matrix used for this determinant.
+   *  Call TrialWaveFunction::completeUpdates() before reading it so pending
+   *  delayed particle updates have been applied.
+   */
+  virtual void copyInverseTranspose(SPOSet::ValueMatrix& inverse_transpose)
+  {
+    throw std::logic_error("inverse-transpose access is unavailable for this determinant type");
+  }
 
 #ifndef NDEBUG
   virtual ValueMatrix& getPsiMinv() { return dummy_vmt; }

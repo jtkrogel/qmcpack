@@ -48,6 +48,11 @@ void test_DiracDeterminantBatched_first()
   elec.create({3});
   ddb.recompute(elec);
 
+  SPOSet::ValueMatrix inverse_transpose;
+  ddb.copyInverseTranspose(inverse_transpose);
+  auto inverse_check = checkMatrix(inverse_transpose, ddb.get_psiMinv());
+  CHECKED_ELSE(inverse_check.result) { FAIL(inverse_check.result_message); }
+
   Matrix<Value> b;
   b.resize(3, 3);
 
@@ -350,6 +355,10 @@ void test_DiracDeterminantBatched_delayed_update(int delay_rank, DetMatInvertor 
   // force update Ainv in ddc using SM-1 code path
   ddc.completeUpdates();
 
+  SPOSet::ValueMatrix copied_inverse_transpose;
+  ddc.copyInverseTranspose(copied_inverse_transpose);
+  auto copied_check = checkMatrix(a_update1, copied_inverse_transpose);
+  CHECKED_ELSE(copied_check.result) { FAIL(copied_check.result_message); }
   auto check = checkMatrix(a_update1, ddc.get_psiMinv());
   CHECKED_ELSE(check.result) { FAIL(check.result_message); }
 

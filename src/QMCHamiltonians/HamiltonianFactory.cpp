@@ -37,6 +37,7 @@
 #include "QMCHamiltonians/HarmonicExternalPotential.h"
 #include "QMCHamiltonians/GridExternalPotential.h"
 #include "QMCHamiltonians/MFRPotential.h"
+#include "QMCHamiltonians/MFRCoreAction.h"
 #include "QMCHamiltonians/KineticJastrowResidual.h"
 #include "QMCHamiltonians/StaticStructureFactor.h"
 #include "QMCHamiltonians/SpinDensity.h"
@@ -162,6 +163,15 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
         std::unique_ptr<MFRPotential> mfr = std::make_unique<MFRPotential>(targetPtcl);
         mfr->put(element);
         targetH->addOperator(std::move(mfr), "MFRPotential", false);
+        targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
+                             "KineticJastrowResidual", false);
+      }
+      else if (potType == "mfr_core_action")
+      {
+        TrialWaveFunction* psi = psi_optional_ ? &psi_optional_->get() : nullptr;
+        std::unique_ptr<MFRCoreAction> action = std::make_unique<MFRCoreAction>(targetPtcl, psi);
+        action->put(element);
+        targetH->addOperator(std::move(action), "MFRCoreAction", false);
         targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
                              "KineticJastrowResidual", false);
       }

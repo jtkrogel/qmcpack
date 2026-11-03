@@ -2531,7 +2531,7 @@ class mfrpotential(QIxml):
 
 extpot = QIxmlFactory(
     name = 'extpot',
-    types = dict(mfr=mfrpotential),
+    types = dict(mfr=mfrpotential,mfr_core_action=mfrpotential),
     typekey = 'type'
     )
 
@@ -6934,8 +6934,9 @@ def generate_hamiltonian(name         = 'h0',
                          wf_elem      = None,
                          interactions = 'default',
                          nrule        = None,
-                         mfr_potential = None,
-                         mfr_qmc       = False,
+                         mfr_potential   = None,
+                         mfr_core_action = None,
+                         mfr_qmc         = False,
                          ):
     if system is None:
         msg = 'generate_hamiltonian argument system must not be None'
@@ -7147,13 +7148,24 @@ def generate_hamiltonian(name         = 'h0',
         hmltn.pairpots = make_collection(pairpots)
     #end if
 
+    extpots = []
     if mfr_potential is not None:
-        hmltn.extpots = make_collection([mfrpotential(
+        extpots.append(mfrpotential(
             type  = 'mfr',
             name  = 'MFRPotential',
             href  = mfr_potential,
             scale = 1.0,
-            )])
+            ))
+    #end if
+    if mfr_core_action is not None:
+        extpots.append(mfrpotential(
+            type = 'mfr_core_action',
+            name = 'MFRCoreAction',
+            href = mfr_core_action,
+            ))
+    #end if
+    if len(extpots) > 0:
+        hmltn.extpots = make_collection(extpots)
     #end if
 
     if len(estimators)>0:
@@ -9410,6 +9422,7 @@ gen_basic_input_defaults = obj(
     hybrid_lmax      = None,
     orbitals_h5      = 'MISSING.h5',
     mfr_potential    = None,
+    mfr_core_action  = None,
     mfr_qmc          = None,
     rotated_orbitals = False,
     run_path         = None,
@@ -9836,10 +9849,13 @@ def generate_basic_input(**kwargs):
     if kw.mfr_qmc is not None and not isinstance(kw.mfr_qmc,bool):
         raise TypeError('mfr_qmc must be a bool or None')
     #end if
-    if kw.mfr_qmc is True and kw.mfr_potential is None:
-        raise ValueError('mfr_qmc=True requires mfr_potential')
+    if kw.mfr_potential is not None and kw.mfr_core_action is not None:
+        raise ValueError('provide only one of mfr_potential or mfr_core_action')
     #end if
-    standalone_mfr = kw.mfr_potential is not None and kw.mfr_qmc is not False
+    if kw.mfr_qmc is True and kw.mfr_potential is None and kw.mfr_core_action is None:
+        raise ValueError('mfr_qmc=True requires mfr_potential or mfr_core_action')
+    #end if
+    standalone_mfr = (kw.mfr_potential is not None or kw.mfr_core_action is not None) and kw.mfr_qmc is not False
     if standalone_mfr:
         kw.corrections = []
         kw.estimators = [est for est in kw.estimators if not (isinstance(est,str) and est.lower() == 'mpc')]
@@ -9859,6 +9875,22 @@ def generate_basic_input(**kwargs):
         #end if
         if kw.run_path is not None:
             kw.mfr_potential = os.path.relpath(kw.mfr_potential,kw.run_path)
+        #end if
+    #end if
+    if kw.mfr_core_action is not None:
+        if not isinstance(kw.mfr_core_action,str):
+            raise TypeError('mfr_core_action must be a file path')
+        #end if
+        if kw.check_paths and not os.path.exists(kw.mfr_core_action):
+            msg = (
+                'user provided "mfr_core_action" path does not exist\n'
+                f'Path provided: {kw.mfr_core_action}\n'
+                'To disable this check, set check_paths=False'
+                )
+            raise FileNotFoundError(msg)
+        #end if
+        if kw.run_path is not None:
+            kw.mfr_core_action = os.path.relpath(kw.mfr_core_action,kw.run_path)
         #end if
     #end if
 
@@ -9887,8 +9919,9 @@ def generate_basic_input(**kwargs):
         interactions = kw.interactions,
         estimators   = h_estimators,
         wf_elem      = wfn,
-        mfr_potential = kw.mfr_potential,
-        mfr_qmc       = standalone_mfr,
+        mfr_potential   = kw.mfr_potential,
+        mfr_core_action = kw.mfr_core_action,
+        mfr_qmc         = standalone_mfr,
         )
 
     qmcsys = qmcsystem(

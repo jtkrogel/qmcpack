@@ -22,6 +22,9 @@
 #define QMCPLUSPLUS_BSPLINESET_H
 
 #include "QMCWaveFunctions/SPOSet.h"
+#include "QMCWaveFunctions/BandInfo.h"
+#include <complex>
+#include <string>
 
 namespace qmcplusplus
 {
@@ -37,6 +40,25 @@ class HybridRepSetReader;
  */
 class BsplineSet : public SPOSet
 {
+public:
+  enum class MFRCoreActionPart
+  {
+    COMPLEX,
+    REAL,
+    IMAGINARY
+  };
+
+  struct MFRCoreActionOrbitalSource
+  {
+    int spin = 0;
+    int twist = 0;
+    int band = -1;
+    int distinct_orbital = -1;
+    MFRCoreActionPart part = MFRCoreActionPart::REAL;
+    PosType qmc_k_cart{0.0};
+    std::complex<double> rotation_phase{1.0, 0.0};
+  };
+
 protected:
   static const int D = DIM;
   ///primitive cell
@@ -52,6 +74,13 @@ protected:
   std::vector<SPOSet::PosType> kPoints;
   ///remap splines to orbitals
   aligned_vector<int> BandIndexMap;
+  std::vector<MFRCoreActionOrbitalSource> mfr_core_action_sources_;
+  TinyVector<int, 3> mfr_core_action_mesh_{0, 0, 0};
+  TinyVector<int, 3> mfr_core_action_half_g_{0, 0, 0};
+  bool mfr_core_action_use_duplex_ = false;
+  bool mfr_core_action_rotate_ = true;
+  std::string mfr_core_action_orbital_file_;
+  const ParticleSet* mfr_core_action_ions_ = nullptr;
 
 public:
   BsplineSet(const std::string& my_name, size_t size, const Lattice& prim_lattice)
@@ -61,6 +90,73 @@ public:
   virtual std::string getKeyword() const = 0;
 
   auto& getHalfG() const { return HalfG; }
+
+  /** Record the source-state ordering used by the selected B-spline SPOs.
+   *  Real builds can split one complex state into its real and imaginary
+   *  time-reversal pair; this mapping preserves that exact order.
+   */
+  void setMFRCoreActionSources(const BandInfoGroup& bandgroup,
+                               int spin,
+                               bool use_duplex_splines,
+                               bool rotate,
+                               const TinyVector<int, 3>& mesh_size,
+                               const TinyVector<int, 3>& half_g,
+                               std::string orbital_file,
+                               const ParticleSet* ions = nullptr)
+  {
+    mfr_core_action_ions_ = ions;
+    mfr_core_action_sources_.clear();
+    mfr_core_action_mesh_ = mesh_size;
+    mfr_core_action_half_g_ = half_g;
+    mfr_core_action_use_duplex_ = use_duplex_splines;
+    mfr_core_action_rotate_ = rotate;
+    mfr_core_action_orbital_file_ = std::move(orbital_file);
+
+    const int num_distinct = bandgroup.getNumDistinctOrbitals();
+    for (int distinct = 0; distinct < num_distinct; ++distinct)
+    {
+      const BandInfo& source_band = bandgroup.myBands[BandIndexMap[distinct]];
+      MFRCoreActionOrbitalSource source;
+      source.spin = spin;
+      source.twist = source_band.TwistIndex;
+      source.band = source_band.BandIndex;
+      source.distinct_orbital = distinct;
+#if defined(QMC_COMPLEX)
+      source.part = MFRCoreActionPart::COMPLEX;
+      source.qmc_k_cart = kPoints[distinct];
+      mfr_core_action_sources_.push_back(source);
+#else
+      if (use_duplex_splines && MakeTwoCopies[distinct])
+      {
+        source.part = MFRCoreActionPart::REAL;
+        source.qmc_k_cart = kPoints[distinct];
+        mfr_core_action_sources_.push_back(source);
+        source.part = MFRCoreActionPart::IMAGINARY;
+        mfr_core_action_sources_.push_back(source);
+      }
+      else
+      {
+        source.part = MFRCoreActionPart::REAL;
+        source.qmc_k_cart = use_duplex_splines ? kPoints[distinct] : PosType(0.0);
+        mfr_core_action_sources_.push_back(source);
+      }
+#endif
+    }
+    if (mfr_core_action_sources_.size() != OrbitalSetSize)
+      throw std::runtime_error("B-spline MFR action source map does not match the SPO count");
+  }
+
+  const std::vector<MFRCoreActionOrbitalSource>& getMFRCoreActionSources() const
+  { return mfr_core_action_sources_; }
+  std::vector<MFRCoreActionOrbitalSource>& getMFRCoreActionSources() { return mfr_core_action_sources_; }
+  const ParticleSet* getMFRCoreActionIons() const { return mfr_core_action_ions_; }
+  const std::string& getMFRCoreActionOrbitalFile() const { return mfr_core_action_orbital_file_; }
+  void setMFRCoreActionRotationPhase(int orbital, const std::complex<double>& phase)
+  { mfr_core_action_sources_.at(orbital).rotation_phase = phase; }
+  const TinyVector<int, 3>& getMFRCoreActionMesh() const { return mfr_core_action_mesh_; }
+  const TinyVector<int, 3>& getMFRCoreActionHalfG() const { return mfr_core_action_half_g_; }
+  bool usesDuplexSplinesForMFRCoreAction() const { return mfr_core_action_use_duplex_; }
+  bool rotatesOrbitalsForMFRCoreAction() const { return mfr_core_action_rotate_; }
 
   inline void init_base(int n)
   {

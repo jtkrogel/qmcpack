@@ -343,3 +343,24 @@ def test_mfr_local_energy(tmp_path):
     assert('LocalEnergyMFR' in out)
     assert('-6.00000000' in out)
 #end def test_mfr_local_energy
+
+
+def test_mfr_core_action_local_energy(tmp_path):
+    scalar_file = tmp_path / 'mfr_core_action.s000.scalar.dat'
+    scalar_file.write_text(
+        '# index LocalEnergy ElecElec KineticJastrowResidual MFRCoreAction MFRCoreActionImag IonIonMF BlockWeight\n'
+        '0 -7.0 5.0 1.0 -12.0 0.1 0.5 1.0\n'
+        '1 -7.0 6.0 2.0 -11.0 -0.1 0.5 1.0\n'
+        '2 -7.0 7.0 3.0 -10.0 0.0 0.5 1.0\n'
+        '3 -7.0 8.0 4.0 -9.0 0.2 0.5 1.0\n'
+        )
+
+    command = f"{sys.executable} {QMCA_EXE} -e 0 -q 'e mca ii_mf emfr' --fp=16.8f {scalar_file}"
+    out,err,rc = execute(command)
+
+    assert(rc==0)
+    assert('MFRCoreAction' in out)
+    assert('IonIonMF' in out)
+    assert('LocalEnergyMFR' in out)
+    assert('-1.00000000' in out)
+#end def test_mfr_core_action_local_energy

@@ -3,6 +3,10 @@
 ##################################################################
 
 
+import glob
+import os
+
+from .developer import obj
 from .simulation import Simulation
 from .pseudoset import PseudoSet
 from .rmg_input import RmgInput, generate_rmg_input
@@ -16,20 +20,31 @@ class Rmg(Simulation):
     generic_identifier     = 'rmg'
     application            = 'rmg-cpu'
     application_properties = frozenset({'serial','mpi'})
-    application_results    = frozenset({''})
+    application_results    = frozenset({'orbitals','mfr_potential'})
 
 
     def check_result(self,result_name,sim):
-        calculating_result = False
-        return calculating_result
+        mfr = getattr(self.input,'write_mfr_potential',False)
+        if result_name=='orbitals':
+            return mfr or getattr(self.input,'write_qmcpack_restart',False)
+        elif result_name=='mfr_potential':
+            return mfr
+        #end if
+        return False
     #end def check_result
 
 
     def get_result(self,result_name,sim):
-        result = None
-        msg = 'Ability to get result '+result_name+' has not been implemented.'
-        raise NotImplementedError(msg)
-        return result
+        if not self.check_result(result_name,sim):
+            raise ValueError('RMG is not calculating result '+result_name)
+        #end if
+        prefix = getattr(self.input,'output_wave_function_file','Waves/wave.out')
+        prefix = os.path.abspath(os.path.join(self.locdir,prefix))
+        if result_name=='orbitals':
+            return obj(h5file=prefix+'.h5')
+        elif result_name=='mfr_potential':
+            return obj(h5file=prefix+'.mfr.h5')
+        #end if
     #end def get_result
 
 
@@ -45,15 +60,44 @@ class Rmg(Simulation):
 
 
     def check_sim_status(self):
-        # assume all is well
-        self.succeeded = True
-        self.failed    = False
-        self.finished  = self.job.finished
+        # Each invocation increments the numbered log. A successful older log
+        # must not release dependencies after a failed retry.
+        logs = sorted(glob.glob(os.path.join(self.locdir,self.infile+'.[0-9][0-9].log')))
+        output = ''
+        if logs:
+            with open(logs[-1]) as f:
+                output = f.read()
+            #end with
+        #end if
+        completed = 'TIMING INFORMATION FOR THREADS' in output
+        converged = 'potential convergence has been achieved' in output.lower()
+        if getattr(self.input,'calculation_mode','Quench Electrons')=='Quench Electrons':
+            completed = completed and converged
+        #end if
+        for result_name in self.application_results:
+            if self.check_result(result_name,None):
+                path = self.get_result(result_name,None).h5file
+                completed = completed and os.path.isfile(path) and os.path.getsize(path)>0
+            #end if
+        #end for
+        if getattr(self.input,'write_mfr_potential',False):
+            completed = completed and 'Wrote converged MFR potential to ' in output
+        #end if
+        self.succeeded = bool(self.job.finished and completed)
+        self.failed    = bool(self.job.finished and not completed)
+        self.finished  = bool(self.job.finished)
     #end def check_sim_status
 
 
     def get_output_files(self): # returns list of output files to save
-        return []
+        files = []
+        for result_name in sorted(self.application_results):
+            if self.check_result(result_name,None):
+                path = self.get_result(result_name,None).h5file
+                files.append(os.path.relpath(path,self.locdir))
+            #end if
+        #end for
+        return files
     #end def get_output_files
 #end class Rmg
 
