@@ -83,3 +83,32 @@ def test_rmg_scalar_core_completion_requires_both_current_paths(tmp_path):
     sim.check_sim_status()
     assert sim.succeeded and not sim.failed
 #end def test_rmg_scalar_core_completion_requires_both_current_paths
+
+
+@isolate_nexus_core
+def test_rmg_mfr_completion_uses_numeric_latest_log(tmp_path):
+    sim = generate_rmg(
+        job = job(machine='ws1', cores=1),
+        output_wave_function_file = 'scf',
+        write_mfr_core_action = True,
+        )
+    sim.locdir = str(tmp_path)
+    sim.job.finished = True
+    for kind in ['orbitals', 'mfr_core_action']:
+        Path(sim.get_result(kind, None).h5file).write_bytes(b'old result')
+    #end for
+    complete = ('potential convergence has been achieved. stopping ...\n'
+                'Wrote converged MFR core actions to scf.mfr_core.h5\n'
+                'TIMING INFORMATION FOR THREADS\n')
+    (tmp_path/(sim.infile+'.99.log')).write_text(complete)
+    sim.check_sim_status()
+    assert sim.succeeded and not sim.failed
+    latest = tmp_path/(sim.infile+'.100.log')
+    latest.write_text('native retry failed\n')
+    sim.check_sim_status()
+    assert sim.failed and not sim.succeeded
+    latest.write_text(complete)
+    (tmp_path/(sim.infile+'.999extra.log')).write_text('unrelated file\n')
+    sim.check_sim_status()
+    assert sim.succeeded and not sim.failed
+#end def test_rmg_mfr_completion_uses_numeric_latest_log

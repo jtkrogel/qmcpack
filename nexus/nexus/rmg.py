@@ -73,10 +73,14 @@ class Rmg(Simulation):
     def check_sim_status(self):
         # Each invocation increments the numbered log. A successful older log
         # must not release dependencies after a failed retry.
-        logs = sorted(glob.glob(os.path.join(self.locdir,self.infile+'.[0-9][0-9].log')))
+        log_prefix = os.path.join(self.locdir,self.infile)+'.'
+        logs = glob.glob(glob.escape(log_prefix)+'[0-9][0-9]*.log')
+        logs = [path for path in logs
+                if re.fullmatch(r'[0-9]{2,}',path[len(log_prefix):-4])]
         output = ''
         if logs:
-            with open(logs[-1]) as f:
+            latest_log = max(logs,key=lambda path: int(path[len(log_prefix):-4]))
+            with open(latest_log) as f:
                 output = f.read()
             #end with
         #end if

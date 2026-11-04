@@ -1156,3 +1156,17 @@ isolation decorator, and the first native-log harness reused an identifier.
 The final baseline and corrected suites use valid isolated cases and unique
 identifiers. No C++ executable changes or rebuilds are needed for this Python
 completion-guard correction. The separate64^3 Ti SCF remains pending.
+
+2026-11-04 17:19 EST -- native retry numbering companion guard
+-------------------------------------------------------------
+
+RMG InitIo.cpp:456 uses %02d log numbering, which expands beyond two digits.
+Nexus's former two-digit-only glob ignored a failed .100.log and could
+release a stale successful .99.log. The companion regression reproduces
+that assertion failure. rmg.py now accepts only numeric native log suffixes
+of at least two digits and selects the maximum numerically; similarly named
+unrelated files are excluded. All21 affected completion/dependency tests
+pass, and the same three real native success/failure cases retain their
+expected status. Evidence and before/after source are in
+sol/nexus_rmg_marker_binding_20261104/numeric_retry/. This is completion-guard
+coverage, not new physical acceptance or RMG meta development.
