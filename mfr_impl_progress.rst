@@ -614,3 +614,34 @@ physical/functional/state/workflow criteria stay open. Evidence, reproduction
 scripts, resource logs and immutable binary/source hashes are under
 /home/j1k/projects/mstd/34_mfrqmc/work/05_hubbard_u_impl/functional_extension_validation/
 sol/cost/action_import_reuse_20261104/{application_matrix,startup_benchmark_rankpin_v2}/.
+
+
+2026-11-04 16:30 EST -- fresh native Nexus QE-meta workflow milestone
+---------------------------------------------------------------------
+
+A fresh local Nexus graph scheduled high-cutoff two-atom He r2SCAN SCF,
+pw2qmcpack and paired pw2mfr_core conversion, followed by batched comparison
+VMC with double orbitals and meshfactor2. The600/9600 Ry SCF strictly
+converged in77 iterations,8.4e-14 Ry against unchanged1e-12 Ry target.
+Explicit Gamma k points avoid the optimized-gamma exporter guard. Prefix/
+outdir, native flags, actual result paths and both MFR dependencies bind
+the generated QMC input to the fresh converter outputs. All four native
+programs completed. Schema/state identity and core/meta coefficients pass;
+comparison mode retains the physical local ECP and ion-ion terms.
+
+The actual qmca CLI emits LocalEnergy, LocalEnergyMFR, LocalEnergyMFRMeta
+and MetaMinusAction. The DatAnalyzer API's derived arrays match independent
+per-block arithmetic exactly, and its mean/variance/error/kappa match direct
+simstats calls. This is a two-block software/dependency/statistics regression,
+not useful physical statistics or acceptance of the economical meta estimator.
+Earlier preview CLI-option failure is preserved; no native job was submitted
+by that preview. The corrected twelve-band RMG Ti+U core-only control is
+running separately; the inherited invalid scalar-export setup is preserved
+as a correctly rejected attempt. No RMG convergence/physical result is inferred.
+
+Reproduction and immutable input/output/source hashes:
+/home/j1k/projects/mstd/34_mfrqmc/work/05_hubbard_u_impl/functional_extension_validation/
+sol/nexus_native_qe_r2scan_20261104/ (he_r2scan_nexus.py, validation.json,
+qmca_stats_validation.json, native/preview logs and final_manifest.json).
+This closes the selected fresh QE-meta native scheduling/hand-off subcase,
+not all F13 combinations, the physical criterion or the complete Goal.
