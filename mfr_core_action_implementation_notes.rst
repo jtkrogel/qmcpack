@@ -1126,3 +1126,33 @@ sol/nexus_native_qe_r2scan_20261104/ (he_r2scan_nexus.py, validation.json,
 qmca_stats_validation.json, native/preview logs and final_manifest.json).
 This closes the selected fresh QE-meta native scheduling/hand-off subcase,
 not all F13 combinations, the physical criterion or the complete Goal.
+
+2026-11-04 17:16 EST -- bind native RMG completion markers to result paths
+-----------------------------------------------------------------------
+
+Nexus rmg.py previously bound only the historical meta writer marker to its
+expected output path. Scalar/core completion accepted a marker naming any
+file, provided a nonempty expected file already existed. A completed retry
+could therefore release a stale scalar/core result after writing another
+prefix. check_sim_status now normalizes and compares each enabled writer's
+reported path with its get_result path. Plain and native progress-prefixed
+messages remain accepted, including absolute and normalized relative paths.
+Unrelated text containing the marker cannot complete a result. The latest
+log, native convergence, nonempty file and job-finished guards remain active.
+Existing meta behavior is retained; RMG meta development remains excluded.
+
+Five new regressions fail by assertion against the snapshotted old method
+in a process-local baseline injection. The corrected implementation passes
+all20 selected scalar/core/dependency/meta-preservation/simulation tests.
+Actual native input/log rechecks accept the converged Ti Bessel20/Bessel40
+runs and reject the retained failed U-occupation-guard run. Native data are
+read only. This proves a bounded hand-off safety correction, not fresh
+Nexus scheduling or physical core-standard acceptance.
+
+Evidence and source snapshots are under functional_extension_validation/
+sol/nexus_rmg_marker_binding_20261104/. Initial harness failures are retained:
+the parameterized form was incompatible with Nexus's single-fixture
+isolation decorator, and the first native-log harness reused an identifier.
+The final baseline and corrected suites use valid isolated cases and unique
+identifiers. No C++ executable changes or rebuilds are needed for this Python
+completion-guard correction. The separate64^3 Ti SCF remains pending.

@@ -91,20 +91,22 @@ class Rmg(Simulation):
                 completed = completed and os.path.isfile(path) and os.path.getsize(path)>0
             #end if
         #end for
-        if getattr(self.input,'write_mfr_potential',False):
-            completed = completed and 'Wrote converged MFR potential to ' in output
-        #end if
-        if getattr(self.input,'write_mfr_core_action',False):
-            completed = completed and 'Wrote converged MFR core actions to ' in output
-        #end if
-        if getattr(self.input,'write_mfr_meta_fields',False):
-            marker = 'Wrote converged MFR meta fields to '
-            expected_path = os.path.abspath(self.get_result('mfr_meta_fields',None).h5file)
+        export_markers = (
+            ('mfr_potential', 'Wrote converged MFR potential to '),
+            ('mfr_core_action', 'Wrote converged MFR core actions to '),
+            ('mfr_meta_fields', 'Wrote converged MFR meta fields to '),
+            )
+        for result_name,marker in export_markers:
+            if not self.check_result(result_name,None):
+                continue
+            #end if
+            expected_path = os.path.abspath(self.get_result(result_name,None).h5file)
             marker_present = False
             for line in output.splitlines():
                 line = line.strip()
-                # Native rmg_printf can prepend its progress/source tag to
-                # the first message, notably for meta-only exports.
+                # Native rmg_printf can prepend its progress/source tag.
+                # Bind every writer marker to this result, so a message for
+                # another prefix cannot release a stale expected file.
                 match = re.match(r'^(?:\[[^\]]+\]\s+[^:]+:\s+)?'+re.escape(marker)+r'(.+)$',line)
                 if match:
                     reported_path = match.group(1).strip()
@@ -116,7 +118,7 @@ class Rmg(Simulation):
                 #end if
             #end for
             completed = completed and marker_present
-        #end if
+        #end for
         self.succeeded = bool(self.job.finished and completed)
         self.failed    = bool(self.job.finished and not completed)
         self.finished  = bool(self.job.finished)
