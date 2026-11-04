@@ -255,8 +255,9 @@ private:
   ///cached block averages of the values
 
   Vector<FullPrecRealType> AverageCache;
-  ///cached block averages of properties, e.g. BlockCPU
-  Vector<RealType> PropertyCache;
+  /// Block properties include the scalar normalization weight. Preserve
+  /// accumulator precision through collection, MPI reduction and division.
+  Vector<FullPrecRealType> PropertyCache;
   ///manager of scalar data
   RecordNamedProperty<FullPrecRealType> BlockAverages;
   ///manager of property data

@@ -43,6 +43,7 @@ set(HAMSRCS
     GridExternalPotential.cpp
     MFRPotential.cpp
     MFRCoreAction.cpp
+    MFRMetaFields.cpp
     KineticJastrowResidual.cpp
     StaticStructureFactor.cpp
     OrbitalImages.cpp

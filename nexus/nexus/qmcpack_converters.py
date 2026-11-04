@@ -565,21 +565,42 @@ def generate_pw2qmcpack(**kwargs):
 class Pw2mfrCoreInput(Pw2qmcpackInput):
     ints   = ('last_band',)
     floats = ()
-    strs   = ('outdir','prefix')
-    bools  = ('write_diagnostics',)
+    strs   = ('outdir','prefix','meta_q_source')
+    bools  = ('write_diagnostics','write_meta_fields')
 
-    var_types = dict(last_band=int,outdir=str,prefix=str,write_diagnostics=bool)
+    var_types = dict(
+        last_band=int,
+        outdir=str,
+        prefix=str,
+        meta_q_source=str,
+        write_diagnostics=bool,
+        write_meta_fields=bool,
+        )
     var_types: MappingProxyType[str, type] = MappingProxyType(var_types)
     allowed = frozenset(ints+floats+strs+bools)
 #end class Pw2mfrCoreInput
 
 
-def generate_pw2mfr_core_input(prefix='pwscf',outdir='pwscf_output',*,last_band=0,write_diagnostics=False):
+def generate_pw2mfr_core_input(
+    prefix='pwscf',
+    outdir='pwscf_output',
+    *,
+    last_band=0,
+    write_diagnostics=False,
+    write_meta_fields=False,
+    meta_q_source='functional_derivative',
+    ):
+    if meta_q_source not in ('functional_derivative','effective_smooth'):
+        raise ValueError(
+            'meta_q_source must be functional_derivative or effective_smooth'
+            )
     return Pw2mfrCoreInput(
         prefix = prefix,
         outdir = outdir,
         last_band = last_band,
         write_diagnostics = write_diagnostics,
+        write_meta_fields = write_meta_fields,
+        meta_q_source = meta_q_source,
         )
 #end def generate_pw2mfr_core_input
 
@@ -611,22 +632,34 @@ class Pw2mfrCore(Simulation):
     generic_identifier = 'pw2mfr_core'
     application = 'pw2mfr_core.x'
     application_properties = frozenset({'serial'})
-    application_results = frozenset({'mfr_core_action'})
+    application_results = frozenset({'mfr_core_action','mfr_meta_fields'})
     allowed_requirements = ('orbitals',)
 
     def check_result(self,result_name,sim):
-        return result_name=='mfr_core_action'
+        if result_name=='mfr_core_action':
+            return True
+        if result_name=='mfr_meta_fields':
+            return bool(self.input.inputpp.get('write_meta_fields',False))
+        return False
     #end def check_result
 
     def get_result(self,result_name,sim):
-        if result_name!='mfr_core_action':
+        if result_name=='mfr_core_action':
+            suffix = '.mfr_core.h5'
+        elif result_name=='mfr_meta_fields':
+            if not self.check_result(result_name,sim):
+                raise NotImplementedError(
+                    'mfr_meta_fields is available only when write_meta_fields is enabled'
+                    )
+            suffix = '.mfr_meta.h5'
+        else:
             raise NotImplementedError(f'ability to get result "{result_name}" has not been implemented')
         inputpp = self.input.inputpp
         prefix = inputpp.get('prefix','pwscf')
         outdir = inputpp.get('outdir','./')
         if outdir.startswith('./'):
             outdir = outdir[2:]
-        return obj(h5file=os.path.join(self.locdir,outdir,prefix+'.mfr_core.h5'))
+        return obj(h5file=os.path.join(self.locdir,outdir,prefix+suffix))
     #end def get_result
 
     def incorporate_result(self,result_name,result,sim):
@@ -636,6 +669,12 @@ class Pw2mfrCore(Simulation):
                 )
         pwin = sim.input.control
         p2in = self.input.inputpp
+        if (p2in.get('write_meta_fields',False)
+            and ('write_mfr_meta_fields' not in pwin or not pwin.write_mfr_meta_fields)):
+            raise RuntimeError(
+                'QE meta export requires write_mfr_meta_fields=True in the pwscf dependency'
+                )
+        #end if
         pwprefix = pwin.prefix if 'prefix' in pwin else 'pwscf'
         p2prefix = p2in.prefix if 'prefix' in p2in else 'pwscf'
         pwoutdir = pwin.outdir if 'outdir' in pwin else './'
@@ -655,7 +694,13 @@ class Pw2mfrCore(Simulation):
     #end def incorporate_result
 
     def check_sim_status(self):
-        result = self.get_result('mfr_core_action',None)
+        meta_requested = self.check_result('mfr_meta_fields',None)
+        results = [
+            ('mfr_core_action','Bare MFR core actions written to '),
+            ]
+        if meta_requested:
+            results.append(('mfr_meta_fields','Paired MFR meta fields written to '))
+        #end if
         output_path = os.path.join(self.locdir,self.outfile)
         output = ''
         if os.path.isfile(output_path):
@@ -663,19 +708,48 @@ class Pw2mfrCore(Simulation):
                 output = stream.read()
             #end with
         #end if
-        # A failed rerun intentionally leaves the previous complete HDF5 file
-        # intact.  File existence alone must not release downstream QMC jobs.
-        success = (os.path.isfile(result.h5file)
-                   and 'Bare MFR core actions written to ' in output
-                   and 'JOB DONE.' in output)
+        # Require the latest successful conversion log as well as its files;
+        # file existence alone must not release downstream QMC jobs.
+        success = 'JOB DONE.' in output
+        for result_name,marker in results:
+            result = self.get_result(result_name,None)
+            success = success and os.path.isfile(result.h5file)
+            if success:
+                success = os.path.getsize(result.h5file)>0
+            #end if
+            if meta_requested:
+                expected_path = os.path.abspath(result.h5file)
+                marker_paths = []
+                for line in output.splitlines():
+                    stripped_line = line.strip()
+                    if stripped_line.startswith(marker):
+                        marker_paths.append(stripped_line[len(marker):].strip())
+                    #end if
+                #end for
+                marker_present = any(
+                    os.path.abspath(os.path.join(self.locdir,path))==expected_path
+                    for path in marker_paths
+                    )
+            else:
+                # Keep the existing core-only log check semantics.
+                marker_present = marker in output
+            #end if
+            success = success and marker_present
+        #end for
         self.finished = self.job.finished and success
         self.succeeded = self.finished
         self.failed = self.job.finished and not success
     #end def check_sim_status
 
     def get_output_files(self):
-        result = self.get_result('mfr_core_action',None)
-        return [os.path.relpath(result.h5file,self.locdir)]
+        result_names = ['mfr_core_action']
+        if self.check_result('mfr_meta_fields',None):
+            result_names.append('mfr_meta_fields')
+        #end if
+        return [
+            os.path.relpath(self.get_result(name,None).h5file,self.locdir)
+            for name in result_names
+            ]
     #end def get_output_files
 
     def app_command(self):
@@ -684,10 +758,16 @@ class Pw2mfrCore(Simulation):
 
     def fill_produces(self):
         self.produces.add('mfr_core_action')
+        if self.check_result('mfr_meta_fields',None):
+            self.produces.add('mfr_meta_fields')
+        #end if
     #end def fill_produces
 
     def fill_products(self):
         self.products.mfr_core_action = self.get_result('mfr_core_action',None).h5file
+        if self.check_result('mfr_meta_fields',None):
+            self.products.mfr_meta_fields = self.get_result('mfr_meta_fields',None).h5file
+        #end if
     #end def fill_products
 #end class Pw2mfrCore
 

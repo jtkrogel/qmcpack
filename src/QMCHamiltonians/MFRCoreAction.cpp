@@ -409,7 +409,8 @@ std::map<GKey, std::complex<double>> readESHDFOrbitals(const std::string& file_n
 }
 } // namespace
 
-MFRCoreAction::MFRCoreAction(ParticleSet& pset, TrialWaveFunction* psi) : pset_(pset), psi_(psi)
+MFRCoreAction::MFRCoreAction(ParticleSet& pset, TrialWaveFunction* psi, ReferencePayload payload)
+    : payload_(payload), pset_(pset), psi_(psi)
 {
   setEnergyDomain(POTENTIAL);
   oneBodyQuantumDomain(pset);
@@ -417,15 +418,16 @@ MFRCoreAction::MFRCoreAction(ParticleSet& pset, TrialWaveFunction* psi) : pset_(
 
 bool MFRCoreAction::put(xmlNodePtr cur)
 {
-  std::string name("MFRCoreAction"), file_name;
+  const std::string expected_name = payload_ == ReferencePayload::CORE_ACTION ? "MFRCoreAction" : "MFRMetaFields";
+  std::string name(expected_name), file_name;
   OhmmsAttributeSet attributes;
   attributes.add(file_name, "href");
   attributes.add(name, "name");
   attributes.put(cur);
   if (file_name.empty())
     throw std::runtime_error("MFRCoreAction requires an href attribute");
-  if (name != "MFRCoreAction")
-    throw std::runtime_error("MFRCoreAction observable name must be 'MFRCoreAction'");
+  if (name != expected_name)
+    throw std::runtime_error("MFR reference observable name must be '" + expected_name + "'");
 
   // Reconfiguration owns a fresh snapshot. Existing clones retain their
   // immutable shared tables; no state/row from the old payload is reused.
@@ -453,13 +455,15 @@ void MFRCoreAction::readHeader()
     throw std::runtime_error("MFRCoreAction failed to open HDF5 file '" + file_name_ + "'");
   try
   {
-    if (readStringAttribute(file, "schema_family") != "mfr_core_action")
+    const bool core_payload = payload_ == ReferencePayload::CORE_ACTION;
+    if (readStringAttribute(file, "schema_family") != (core_payload ? "mfr_core_action" : "mfr_meta_fields"))
       throw std::runtime_error("unexpected MFR core-action schema family");
     if (readIntAttribute(file, "schema_version") != 1)
       throw std::runtime_error("unsupported MFR core-action schema version");
     if (readIntAttribute(file, "complete") != 1)
       throw std::runtime_error("MFR core-action file is incomplete");
-    if (readStringAttribute(file, "representation") != "periodic_bloch_core_action_grid")
+    if (readStringAttribute(file, "representation") !=
+        (core_payload ? "periodic_bloch_core_action_grid" : "periodic_bloch_meta_fields"))
       throw std::runtime_error("unsupported MFR core-action representation");
     if (readStringAttribute(file, "energy_units") != "hartree")
       throw std::runtime_error("MFR core-action energy units must be Hartree");
@@ -469,12 +473,22 @@ void MFRCoreAction::readHeader()
       throw std::runtime_error("unsupported MFR core-action orbital normalization");
     if (readStringAttribute(file, "bloch_phase") != "exp(+2 pi i reduced_k.reduced_r)")
       throw std::runtime_error("unsupported MFR core-action Bloch-phase convention");
-    if (readStringAttribute(file, "grid_order") != "HDF5: z,y,x; x fastest")
+    if (core_payload && readStringAttribute(file, "grid_order") != "HDF5: z,y,x; x fastest")
       throw std::runtime_error("unsupported MFR core-action grid ordering");
     if (readStringAttribute(file, "periodic_grid_endpoint") != "excluded")
       throw std::runtime_error("MFR core-action grid must exclude the periodic endpoint");
 
-    grid_dimensions_   = readArrayAttribute<int, 3>(file, "grid_dimensions", H5T_NATIVE_INT);
+    if (core_payload)
+      grid_dimensions_ = readArrayAttribute<int, 3>(file, "grid_dimensions", H5T_NATIVE_INT);
+    else
+    {
+      if (readStringAttribute(file, "tau_definition") != "sum_j occupation_j*abs(grad(phi_j))^2/2" ||
+          readStringAttribute(file, "differential_operator") != "-0.5*div(q*grad)" ||
+          readStringAttribute(file, "approximation") != "two_field_no_reference_residual" ||
+          readStringAttribute(file, "potential_includes_ions") != "false" ||
+          readDoubleAttribute(file, "hartree_g0") != 0.0)
+        throw std::runtime_error("unsupported MFR meta-field differential/potential convention");
+    }
     spin_channels_     = readIntAttribute(file, "spin_channels");
     number_of_kpoints_ = readIntAttribute(file, "number_of_kpoints");
     number_of_states_  = readIntAttribute(file, "number_of_states");
@@ -483,7 +497,7 @@ void MFRCoreAction::readHeader()
       throw std::runtime_error("MFRCoreAction requires one or two collinear spin channels");
     if (number_of_kpoints_ < 1 || number_of_states_ < 1)
       throw std::runtime_error("MFRCoreAction file has no k points or states");
-    if (std::any_of(grid_dimensions_.begin(), grid_dimensions_.end(), [](int n) { return n < 4; }))
+    if (core_payload && std::any_of(grid_dimensions_.begin(), grid_dimensions_.end(), [](int n) { return n < 4; }))
       throw std::runtime_error("MFRCoreAction grid dimensions must be at least four for cubic splines");
     if (!isFiniteHDFValue(ion_ion_energy_mf_))
       throw std::runtime_error("MFRCoreAction ion-ion energy is non-finite");
@@ -661,43 +675,46 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
                      [](double value) { return isFiniteHDFValue(value); }))
       throw std::runtime_error("MFRCoreAction state has a non-finite eigenvalue or reduced k point");
 
-    const auto real_values =
-        readDoubleDataset(file, state_path + "/action_real",
-                          {static_cast<hsize_t>(grid_dimensions_[2]), static_cast<hsize_t>(grid_dimensions_[1]),
-                           static_cast<hsize_t>(grid_dimensions_[0])});
-    const auto imag_values =
-        readDoubleDataset(file, state_path + "/action_imag",
-                          {static_cast<hsize_t>(grid_dimensions_[2]), static_cast<hsize_t>(grid_dimensions_[1]),
-                           static_cast<hsize_t>(grid_dimensions_[0])});
-    Array<double, 3> real_grid(grid_dimensions_[0], grid_dimensions_[1], grid_dimensions_[2]);
-    Array<double, 3> imag_grid(grid_dimensions_[0], grid_dimensions_[1], grid_dimensions_[2]);
-    for (int i = 0; i < grid_dimensions_[0]; ++i)
-      for (int j = 0; j < grid_dimensions_[1]; ++j)
-        for (int k = 0; k < grid_dimensions_[2]; ++k)
-        {
-          const size_t index = (static_cast<size_t>(k) * grid_dimensions_[1] + j) * grid_dimensions_[0] + i;
-          real_grid(i, j, k) = real_values[index];
-          imag_grid(i, j, k) = imag_values[index];
-        }
-
-    Ugrid grids[3];
-    BCtype_d boundaries[3];
-    for (int d = 0; d < 3; ++d)
+    if (payload_ == ReferencePayload::CORE_ACTION)
     {
-      grids[d].start      = 0.0;
-      grids[d].end        = 1.0;
-      grids[d].num        = grid_dimensions_[d];
-      boundaries[d].lCode = boundaries[d].rCode = PERIODIC;
-      boundaries[d].lVal = boundaries[d].rVal = 0.0;
+      const auto real_values =
+          readDoubleDataset(file, state_path + "/action_real",
+                            {static_cast<hsize_t>(grid_dimensions_[2]), static_cast<hsize_t>(grid_dimensions_[1]),
+                             static_cast<hsize_t>(grid_dimensions_[0])});
+      const auto imag_values =
+          readDoubleDataset(file, state_path + "/action_imag",
+                            {static_cast<hsize_t>(grid_dimensions_[2]), static_cast<hsize_t>(grid_dimensions_[1]),
+                             static_cast<hsize_t>(grid_dimensions_[0])});
+      Array<double, 3> real_grid(grid_dimensions_[0], grid_dimensions_[1], grid_dimensions_[2]);
+      Array<double, 3> imag_grid(grid_dimensions_[0], grid_dimensions_[1], grid_dimensions_[2]);
+      for (int i = 0; i < grid_dimensions_[0]; ++i)
+        for (int j = 0; j < grid_dimensions_[1]; ++j)
+          for (int k = 0; k < grid_dimensions_[2]; ++k)
+          {
+            const size_t index = (static_cast<size_t>(k) * grid_dimensions_[1] + j) * grid_dimensions_[0] + i;
+            real_grid(i, j, k) = real_values[index];
+            imag_grid(i, j, k) = imag_values[index];
+          }
+
+      Ugrid grids[3];
+      BCtype_d boundaries[3];
+      for (int d = 0; d < 3; ++d)
+      {
+        grids[d].start      = 0.0;
+        grids[d].end        = 1.0;
+        grids[d].num        = grid_dimensions_[d];
+        boundaries[d].lCode = boundaries[d].rCode = PERIODIC;
+        boundaries[d].lVal = boundaries[d].rVal = 0.0;
+      }
+      state.real = std::shared_ptr<UBspline_3d_d>(create_UBspline_3d_d(grids[0], grids[1], grids[2], boundaries[0],
+                                                                       boundaries[1], boundaries[2], real_grid.data()),
+                                                  destroy_Bspline);
+      state.imag = std::shared_ptr<UBspline_3d_d>(create_UBspline_3d_d(grids[0], grids[1], grids[2], boundaries[0],
+                                                                       boundaries[1], boundaries[2], imag_grid.data()),
+                                                  destroy_Bspline);
+      if (!state.real || !state.imag)
+        throw std::runtime_error("failed to create periodic MFRCoreAction cubic splines");
     }
-    state.real = std::shared_ptr<UBspline_3d_d>(create_UBspline_3d_d(grids[0], grids[1], grids[2], boundaries[0],
-                                                                     boundaries[1], boundaries[2], real_grid.data()),
-                                                destroy_Bspline);
-    state.imag = std::shared_ptr<UBspline_3d_d>(create_UBspline_3d_d(grids[0], grids[1], grids[2], boundaries[0],
-                                                                     boundaries[1], boundaries[2], imag_grid.data()),
-                                                destroy_Bspline);
-    if (!state.real || !state.imag)
-      throw std::runtime_error("failed to create periodic MFRCoreAction cubic splines");
 
     if (orbital_set != nullptr)
     {
@@ -711,16 +728,20 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
         throw std::runtime_error("MFRCoreAction G-vector and orbital coefficient counts differ");
 
       std::map<GKey, std::complex<double>> action_orbital;
-      std::vector<TinyVector<int, 3>> gvector_values(num_gvectors);
-      Vector<std::complex<double>> coefficients(num_gvectors);
+      const bool needs_action_phase = payload_ == ReferencePayload::CORE_ACTION;
+      std::vector<TinyVector<int, 3>> gvector_values(needs_action_phase ? num_gvectors : 0);
+      Vector<std::complex<double>> coefficients(needs_action_phase ? num_gvectors : 0);
       for (size_t ig = 0; ig < num_gvectors; ++ig)
       {
         GKey g{gvectors_flat[3 * ig], gvectors_flat[3 * ig + 1], gvectors_flat[3 * ig + 2]};
         const std::complex<double> coefficient(orbital_g_real[ig], orbital_g_imag[ig]);
         if (!action_orbital.emplace(g, coefficient).second)
           throw std::runtime_error("duplicate G vector in MFRCoreAction orbital identity data");
-        gvector_values[ig] = TinyVector<int, 3>(g[0], g[1], g[2]);
-        coefficients[ig]   = coefficient;
+        if (needs_action_phase)
+        {
+          gvector_values[ig] = TinyVector<int, 3>(g[0], g[1], g[2]);
+          coefficients[ig]   = coefficient;
+        }
       }
 
       const auto paired_orbital =
@@ -734,12 +755,19 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
           throw std::runtime_error("MFRCoreAction orbital coefficients do not match the selected ES-HDF state");
       }
 
-      OneSplineOrbData phase_orbital(orbital_set->getMFRCoreActionMesh(), orbital_set->getMFRCoreActionHalfG(),
-                                     orbital_set->usesDuplexSplinesForMFRCoreAction());
-      phase_orbital.fft_spline(coefficients, gvector_values,
-                               TinyVector<double, 3>(state.reduced_k[0], state.reduced_k[1], state.reduced_k[2]),
-                               orbital_set->rotatesOrbitalsForMFRCoreAction());
-      orbital_set->setMFRCoreActionRotationPhase(orbital_index, phase_orbital.getRotatePhase());
+      // The core-action grids must follow the SPO's real/complex phase.
+      // Meta fields act on the actual SPO VGL and need identity validation
+      // only; reconstructing a phase here wastes an orbital-sized FFT and
+      // can also overwrite phase state owned by a comparison core provider.
+      if (needs_action_phase)
+      {
+        OneSplineOrbData phase_orbital(orbital_set->getMFRCoreActionMesh(), orbital_set->getMFRCoreActionHalfG(),
+                                       orbital_set->usesDuplexSplinesForMFRCoreAction());
+        phase_orbital.fft_spline(coefficients, gvector_values,
+                                 TinyVector<double, 3>(state.reduced_k[0], state.reduced_k[1], state.reduced_k[2]),
+                                 orbital_set->rotatesOrbitalsForMFRCoreAction());
+        orbital_set->setMFRCoreActionRotationPhase(orbital_index, phase_orbital.getRotatePhase());
+      }
     }
   }
   catch (...)
@@ -796,6 +824,8 @@ void MFRCoreAction::prepareWaveFunction(TrialWaveFunction& psi)
 
 std::complex<double> MFRCoreAction::evaluatePeriodicAction(int spin, int twist, int band, const PosType& position) const
 {
+  if (payload_ != ReferencePayload::CORE_ACTION)
+    throw std::logic_error("meta reference contains no orbital-action splines");
   const auto iter = data_->states.find(StateKey{spin, twist, band});
   if (iter == data_->states.end())
     throw std::runtime_error("requested MFRCoreAction state was not loaded");
@@ -845,8 +875,33 @@ std::complex<double> MFRCoreAction::evaluateOrbitalAction(const BsplineSet& orbi
   throw std::logic_error("unknown MFRCoreAction real/complex orbital component");
 }
 
+void MFRCoreAction::ensureReference(TrialWaveFunction& psi)
+{
+  if (data_->states.empty())
+    prepareWaveFunction(psi);
+}
+
+bool MFRCoreAction::matchesReference(const MFRCoreAction& other) const
+{
+  if (spin_channels_ != other.spin_channels_ || data_->states.size() != other.data_->states.size() ||
+      std::abs(ion_ion_energy_mf_ - other.ion_ion_energy_mf_) > 1e-12)
+    return false;
+  for (const auto& [key, state] : data_->states)
+  {
+    const auto found = other.data_->states.find(key);
+    if (found == other.data_->states.end() || std::abs(state.eigenvalue - found->second.eigenvalue) > 1e-12)
+      return false;
+    for (int d = 0; d < 3; ++d)
+      if (std::abs(state.reduced_k[d] - found->second.reduced_k[d]) > 1e-12)
+        return false;
+  }
+  return true;
+}
+
 MFRCoreAction::FullPrecValueType MFRCoreAction::evaluateTrace(TrialWaveFunction& psi, ParticleSet& pset)
 {
+  if (payload_ != ReferencePayload::CORE_ACTION)
+    throw std::logic_error("meta reference cannot evaluate a core-action trace");
   if (data_->states.empty())
     prepareWaveFunction(psi);
   psi.completeUpdates();
@@ -921,45 +976,45 @@ bool MFRCoreAction::get(std::ostream& os) const
 
 void MFRCoreAction::addObservables(PropertySetType& plist, BufferType& collectables)
 {
-  my_index_ = plist.size();
-  plist.add("MFRCoreAction");
-  plist.add("MFRCoreActionImag");
-  plist.add("TotalEnergyMF");
-  plist.add("IonIonMF");
+  observable_indices_[0] = plist.add("MFRCoreAction");
+  observable_indices_[1] = plist.add("MFRCoreActionImag");
+  observable_indices_[2] = plist.add("TotalEnergyMF");
+  observable_indices_[3] = plist.add("IonIonMF");
 }
 
 void MFRCoreAction::registerObservables(std::vector<ObservableHelper>& h5desc, hdf_archive& file) const
 {
-  const std::vector<int> dimensions(1, 1);
-  h5desc.emplace_back(hdf_path{"MFRCoreAction"});
-  h5desc.back().set_dimensions(dimensions, my_index_);
-  h5desc.emplace_back(hdf_path{"MFRCoreActionImag"});
-  h5desc.back().set_dimensions(dimensions, my_index_ + 1);
-  h5desc.emplace_back(hdf_path{"TotalEnergyMF"});
-  h5desc.back().set_dimensions(dimensions, my_index_ + 2);
-  h5desc.emplace_back(hdf_path{"IonIonMF"});
-  h5desc.back().set_dimensions(dimensions, my_index_ + 3);
+  const char* names[] = {"MFRCoreAction", "MFRCoreActionImag", "TotalEnergyMF", "IonIonMF"};
+  for (size_t i = 0; i < observable_indices_.size(); ++i)
+  {
+    if (std::any_of(h5desc.begin(), h5desc.end(), [&](const auto& h) {
+          return h.lower_bound == observable_indices_[i];
+        }))
+      continue;
+    h5desc.emplace_back(hdf_path{names[i]});
+    h5desc.back().set_dimensions(std::vector<int>(1, 1), observable_indices_[i]);
+  }
 }
 
 void MFRCoreAction::setObservables(PropertySetType& plist)
 {
-  plist[my_index_]     = value_;
-  plist[my_index_ + 1] = imaginary_trace_;
-  plist[my_index_ + 2] = total_energy_mf_;
-  plist[my_index_ + 3] = ion_ion_energy_mf_;
+  plist[observable_indices_[0]] = value_;
+  plist[observable_indices_[1]] = imaginary_trace_;
+  plist[observable_indices_[2]] = total_energy_mf_;
+  plist[observable_indices_[3]] = ion_ion_energy_mf_;
 }
 
 void MFRCoreAction::setParticlePropertyList(PropertySetType& plist, int offset)
 {
-  plist[my_index_ + offset]     = value_;
-  plist[my_index_ + offset + 1] = imaginary_trace_;
-  plist[my_index_ + offset + 2] = total_energy_mf_;
-  plist[my_index_ + offset + 3] = ion_ion_energy_mf_;
+  plist[observable_indices_[0] + offset] = value_;
+  plist[observable_indices_[1] + offset] = imaginary_trace_;
+  plist[observable_indices_[2] + offset] = total_energy_mf_;
+  plist[observable_indices_[3] + offset] = ion_ion_energy_mf_;
 }
 
 std::unique_ptr<OperatorBase> MFRCoreAction::makeClone(ParticleSet& pset) const
 {
-  auto clone                = std::make_unique<MFRCoreAction>(pset, nullptr);
+  auto clone                = std::make_unique<MFRCoreAction>(pset, nullptr, payload_);
   clone->file_name_         = file_name_;
   clone->grid_dimensions_   = grid_dimensions_;
   clone->spin_channels_     = spin_channels_;
@@ -969,7 +1024,7 @@ std::unique_ptr<OperatorBase> MFRCoreAction::makeClone(ParticleSet& pset) const
   clone->total_energy_mf_   = total_energy_mf_;
   clone->imaginary_trace_   = imaginary_trace_;
   clone->data_              = data_;
-  clone->my_index_          = my_index_;
+  clone->observable_indices_ = observable_indices_;
   clone->setName(getName());
   return clone;
 }

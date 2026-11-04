@@ -13,7 +13,7 @@ set(SRC_DIR einspline)
 set(UTEST_EXE test_${SRC_DIR})
 set(UTEST_NAME deterministic-unit_test_${SRC_DIR})
 
-set(SRCS test_one.cpp test_3d.cpp)
+set(SRCS test_one.cpp test_3d.cpp test_scalar_gradient.cpp)
 add_executable(${UTEST_EXE} ${SRCS})
 target_link_libraries(${UTEST_EXE} catch_main einspline qmcutil)
 

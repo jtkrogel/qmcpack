@@ -187,15 +187,25 @@ public:
   bool isFermionic() const override { return fermionic_; }
   std::string getClassName() const override { return "PrescribedOrbital"; }
 
+  int log_calls = 0;
+  int gl_calls = 0;
+
   LogValue evaluateLog(const ParticleSet& particles,
                        ParticleSet::ParticleGradient& gradients,
                        ParticleSet::ParticleLaplacian& laplacians) override
   {
-    for (int particle = 0; particle < particles.getTotalNum(); ++particle)
-    {
-      gradients[particle]  = gradient_;
-      laplacians[particle] = laplacian_;
-    }
+    ++log_calls;
+    accumulate(particles, gradients, laplacians);
+    return 0.0;
+  }
+
+  LogValue evaluateGL(const ParticleSet& particles,
+                      ParticleSet::ParticleGradient& gradients,
+                      ParticleSet::ParticleLaplacian& laplacians,
+                      bool fromscratch) override
+  {
+    ++gl_calls;
+    accumulate(particles, gradients, laplacians);
     return 0.0;
   }
 
@@ -205,6 +215,16 @@ public:
   }
 
 private:
+  void accumulate(const ParticleSet& particles,
+                  ParticleSet::ParticleGradient& gradients,
+                  ParticleSet::ParticleLaplacian& laplacians)
+  {
+    for (int particle = 0; particle < particles.getTotalNum(); ++particle)
+    {
+      gradients[particle] += gradient_;
+      laplacians[particle] += laplacian_;
+    }
+  }
   bool fermionic_;
   GradType gradient_;
   ValueType laplacian_;
@@ -382,6 +402,7 @@ TEST_CASE("KineticJastrowResidual analytic values", "[hamiltonian][mfr]")
     wavefunction.addComponent(
         std::make_unique<PrescribedOrbital>(false, QMCTraits::GradType{3.0, 0.0, 0.0}, 4.0));
     KineticJastrowResidual residual(electrons);
+    wavefunction.evaluateLog(electrons);
     CHECK(residual.evaluate(wavefunction, electrons) == Approx(-9.5));
   }
 
@@ -392,6 +413,57 @@ TEST_CASE("KineticJastrowResidual analytic values", "[hamiltonian][mfr]")
         std::make_unique<PrescribedOrbital>(false, QMCTraits::GradType{0.0, 0.0, 0.0}, 0.0));
     KineticJastrowResidual residual(electrons);
     CHECK_THROWS(residual.evaluate(wavefunction, electrons));
+  }
+}
+
+TEST_CASE("KineticJastrowResidual reuses current wavefunction derivatives", "[hamiltonian][mfr]")
+{
+  ParticleSet electrons = makeElectrons({2,1});
+  auto& species = electrons.getSpeciesSet();
+  species(species.addAttribute("mass"),1)=2.0;
+  RuntimeOptions options;
+  TrialWaveFunction psi(options);
+  using Value = QMCTraits::ValueType;
+  using Grad = QMCTraits::GradType;
+  Grad gd{.7,-.4,.2}, gj1{.3,.1,-.2}, gj2{-.1,.2,.5};
+  Value lj1=.6, lj2=-.3;
+#if defined(QMC_COMPLEX)
+  gd[0]+=Value(0,.23);
+  gj1[1]+=Value(0,-.17);
+  gj2[2]+=Value(0,.11);
+  lj2+=Value(0,.13);
+#endif
+  auto fermion = std::make_unique<PrescribedOrbital>(true,gd,Value(1.2));
+  auto first = std::make_unique<PrescribedOrbital>(false,gj1,lj1);
+  auto second = std::make_unique<PrescribedOrbital>(false,gj2,lj2);
+  auto* determinant=fermion.get();
+  auto* j1=first.get();
+  auto* j2=second.get();
+  psi.addComponent(std::move(fermion));
+  psi.addComponent(std::move(first));
+  psi.addComponent(std::move(second));
+  psi.evaluateLog(electrons);
+  const auto saved_g=electrons.G;
+  const auto saved_l=electrons.L;
+  const auto gj=gj1+gj2;
+  // Independent expansion of T[D exp(J)] - T[D], with unequal masses.
+  Value correction=lj1+lj2;
+  for(int axis=0;axis<3;++axis) correction+=gj[axis]*gj[axis]+Value(2)*gd[axis]*gj[axis];
+  const double expected=-(2*.5+.25)*std::real(correction);
+  const double tolerance=sizeof(QMCTraits::RealType)==sizeof(float)?2e-6:1e-12;
+  KineticJastrowResidual residual(electrons);
+  for(int repeat=0;repeat<3;++repeat)
+    CHECK(residual.evaluate(psi,electrons)==Approx(expected).margin(tolerance));
+  CHECK(determinant->log_calls==1);
+  CHECK(determinant->gl_calls==0);
+  CHECK(j1->log_calls==1);
+  CHECK(j2->log_calls==1);
+  CHECK(j1->gl_calls==3);
+  CHECK(j2->gl_calls==3);
+  for(int particle=0;particle<3;++particle)
+  {
+    CHECK(electrons.L[particle]==saved_l[particle]);
+    for(int axis=0;axis<3;++axis)CHECK(electrons.G[particle][axis]==saved_g[particle][axis]);
   }
 }
 

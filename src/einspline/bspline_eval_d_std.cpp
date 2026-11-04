@@ -133,3 +133,38 @@ void eval_UBspline_3d_d(UBspline_3d_d* restrict spline, double x, double y, doub
                b[3] * (P(3, 3, 0) * c[0] + P(3, 3, 1) * c[1] + P(3, 3, 2) * c[2] + P(3, 3, 3) * c[3])));
 #undef P
 }
+
+
+// Coordinate derivatives include each native grid's inverse spacing.
+void eval_UBspline_3d_d_vg(UBspline_3d_d* restrict spline, double x, double y, double z,
+                          double* restrict val, double* restrict grad)
+{
+  int index[3];
+  double t[3];
+  coeff_offset_UBspline_d(&spline->x_grid, &spline->xBC, x, index[0], t[0]);
+  coeff_offset_UBspline_d(&spline->y_grid, &spline->yBC, y, index[1], t[1]);
+  coeff_offset_UBspline_d(&spline->z_grid, &spline->zBC, z, index[2], t[2]);
+  const double inverse_spacing[3] = {spline->x_grid.delta_inv, spline->y_grid.delta_inv,
+                                      spline->z_grid.delta_inv};
+  double basis[3][4], derivative[3][4];
+  for (int axis = 0; axis < 3; ++axis)
+    for (int i = 0; i < 4; ++i)
+    {
+      const double* a = Ad + 4 * i;
+      basis[axis][i] = ((a[0] * t[axis] + a[1]) * t[axis] + a[2]) * t[axis] + a[3];
+      derivative[axis][i] = ((3.0 * a[0] * t[axis] + 2.0 * a[1]) * t[axis] + a[2]) *
+          inverse_spacing[axis];
+    }
+  *val = grad[0] = grad[1] = grad[2] = 0.0;
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j)
+      for (int k = 0; k < 4; ++k)
+      {
+        const double coefficient = spline->coefs[(index[0] + i) * spline->x_stride +
+                                                 (index[1] + j) * spline->y_stride + index[2] + k];
+        *val += coefficient * basis[0][i] * basis[1][j] * basis[2][k];
+        grad[0] += coefficient * derivative[0][i] * basis[1][j] * basis[2][k];
+        grad[1] += coefficient * basis[0][i] * derivative[1][j] * basis[2][k];
+        grad[2] += coefficient * basis[0][i] * basis[1][j] * derivative[2][k];
+      }
+}

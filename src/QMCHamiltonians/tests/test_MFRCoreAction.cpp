@@ -23,6 +23,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include <array>
+#include <filesystem>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -33,6 +34,7 @@
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
 #include "QMCHamiltonians/MFRCoreAction.h"
+#include "QMCHamiltonians/MFRMetaFields.h"
 #if !defined(QMC_COMPLEX)
 #include "QMCWaveFunctions/BsplineFactory/SplineR2R.h"
 #include "spline2/MultiBsplineOffloadMapperBase.hpp"
@@ -385,6 +387,8 @@ namespace
 {
 using Z  = std::complex<double>;
 using R3 = QMCTraits::QTFull::PosType;
+void convertToMetaFixture(const std::string& filename, const Lattice& lattice, int spins);
+void loadMeta(MFRMetaFields& fields, const std::string& filename);
 
 struct AnalyticCoreModel
 {
@@ -746,6 +750,10 @@ TEST_CASE("MFR core action integrated periodic determinant and DLA identity", "[
     std::vector<std::unique_ptr<SPOSet>> sets;
     sets.push_back(std::move(spo));
     sets.push_back(std::move(down_spo));
+    // Legacy determinant matrices attach directly to the walker buffer.
+    // Both buffers must outlive the wavefunction that may reference them.
+    ParticleSet::Walker_t buffer_walker(electrons.getTotalNum());
+    ParticleSet::Walker_t checkpoint_walker(electrons.getTotalNum());
     RuntimeOptions options;
     TrialWaveFunction psi(options);
     psi.addComponent(std::make_unique<SlaterDet>(electrons, std::move(sets), std::move(determinants)));
@@ -865,6 +873,86 @@ TEST_CASE("MFR core action integrated periodic determinant and DLA identity", "[
       }
     const double algebra_tol = sizeof(QMCTraits::RealType) == sizeof(float) ? 2e-5 : 1e-10;
     CHECK(std::abs(Z(actual) - matched) < algebra_tol);
+    // Independently contract analytic u/q fields with explicit determinant
+    // cofactors and the actual orbital spline VGL. Q acts on D, even with J.
+    TemporaryCoreActionFile meta_file;
+    std::filesystem::copy_file(files.core.name(),meta_file.name(),std::filesystem::copy_options::overwrite_existing);
+    convertToMetaFixture(meta_file.name(),lattice,1);
+    // Metadata-only validation must not reconstruct or replace SPO phases:
+    // its differential evaluator reuses accepted determinant derivatives.
+    std::vector<Z> saved_phases;
+    for (int orbital=0;orbital<bsp->getMFRCoreActionSources().size();++orbital)
+    {
+      saved_phases.push_back(bsp->getMFRCoreActionSources()[orbital].rotation_phase);
+      bsp->setMFRCoreActionRotationPhase(orbital, Z(.25, .75));
+    }
+    MFRMetaFields meta(electrons,&psi);
+    loadMeta(meta,meta_file.name());
+    const auto saved_meta_g=electrons.G;
+    const auto saved_meta_l=electrons.L;
+    const Z meta_actual=Z(meta.evaluateTrace(psi,electrons));
+    for (int orbital=0;orbital<saved_phases.size();++orbital)
+    {
+      CHECK(bsp->getMFRCoreActionSources()[orbital].rotation_phase==Z(.25,.75));
+      bsp->setMFRCoreActionRotationPhase(orbital,saved_phases[orbital]);
+    }
+    Z meta_expected{};
+    for (int i=0;i<3;++i)
+    {
+      const auto r=lattice.toUnit(R3(electrons.R[i]));
+      const double q=.11+.2*std::cos(2*M_PI*r[0])+.3*std::sin(2*M_PI*(r[1]+r[2]));
+      const double dq[]={-.4*M_PI*std::sin(2*M_PI*r[0]),
+                          .6*M_PI*std::cos(2*M_PI*(r[1]+r[2])),
+                          .6*M_PI*std::cos(2*M_PI*(r[1]+r[2]))};
+      for (int band=0;band<(i==2 ? 1 : 2);++band)
+      {
+        Z value=q*Z(lap(i,band));
+        for (int cart=0;cart<3;++cart)
+          for (int reduced=0;reduced<3;++reduced)
+            value+=lattice.G(cart,reduced)*dq[reduced]*Z(grad(i,band)[cart]);
+        meta_expected-=.5*weights[i][band]*value;
+      }
+    }
+    CHECK(std::abs(meta_actual-meta_expected)<3e-4+algebra_tol);
+    // Tight matched-grid oracle: explicit cofactors times native SPO VGL,
+    // independent of accepted P.G/P.L and Jastrow derivative subtraction.
+    Z meta_matched{};
+    for (int row=0;row<3;++row)
+    {
+      const auto field=meta.evaluateFields(0,electrons.R[row]);
+      for (int band=0;band<(row==2 ? 1 : 2);++band)
+      {
+        Z action=field.q*Z(lap(row,band));
+        for (int axis=0;axis<3;++axis)
+          action+=field.grad_q[axis]*Z(grad(row,band)[axis]);
+        meta_matched-=.5*weights[row][band]*action;
+      }
+    }
+    CHECK(std::abs(meta_actual-meta_matched)<algebra_tol);
+    for (int repeat=0;repeat<3;++repeat)
+      CHECK(std::abs(Z(meta.evaluateTrace(psi,electrons))-meta_matched)<algebra_tol);
+    for (int particle=0;particle<3;++particle)
+    {
+      CHECK(electrons.L[particle]==saved_meta_l[particle]);
+      for (int axis=0;axis<3;++axis)
+        CHECK(electrons.G[particle][axis]==saved_meta_g[particle][axis]);
+    }
+    CHECK(meta.getValue()==Approx(6.0).margin(algebra_tol));
+    CHECK(meta.getTotalEnergyMF()==Approx(core.getTotalEnergyMF()).margin(algebra_tol));
+    CHECK(meta.matchesCoreReference(core));
+    // Reference constants may already exist, or be added after meta columns.
+    OperatorBase::PropertySetType shared_properties;
+    shared_properties.add("TotalEnergyMF");
+    shared_properties.add("IonIonMF");
+    OperatorBase::BufferType collectables;
+    meta.addObservables(shared_properties,collectables);
+    core.addObservables(shared_properties,collectables);
+    meta.setObservables(shared_properties);
+    core.setObservables(shared_properties);
+    CHECK(shared_properties[shared_properties.add("TotalEnergyMF")]==Approx(-3.375));
+    CHECK(shared_properties[shared_properties.add("MFRMetaU")]==Approx(6.0));
+    CHECK(shared_properties[shared_properties.add("MFRCoreAction")]==Approx(std::real(actual)).margin(algebra_tol));
+
     // A matching fixed occupied-space rotation of M and G must leave the
     // two-electron block trace unchanged. The down block occupies one state.
     const double cs = std::cos(.37), sn = std::sin(.37);
@@ -959,6 +1047,32 @@ TEST_CASE("MFR core action integrated periodic determinant and DLA identity", "[
     ham.addObservables(electrons);
     CHECK(ham.evaluate(psi, electrons) == Approx(mfr + .37).margin(algebra_tol));
 
+    QMCHamiltonian meta_ham;
+    meta_ham.addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+    meta_ham.addOperator(std::make_unique<IdentityElectronEnergy>(), "ElecElec");
+    meta_ham.addOperator(meta.makeClone(electrons), "MFRMetaFields", false);
+    meta_ham.addOperator(std::make_unique<KineticJastrowResidual>(electrons), "KineticJastrowResidual", false);
+    meta_ham.configureMFRQMCMode(MFRQMCModeRequest::YES);
+    CHECK(meta_ham.getMFREnergyProvider()==QMCHamiltonian::MFREnergyProvider::META_FIELDS);
+    meta_ham.addObservables(electrons);
+    const double meta_energy=meta.getTotalEnergyMF()+residual.getValue()+.37-6.0-meta_actual.real();
+    CHECK(meta_ham.evaluate(psi,electrons)==Approx(meta_energy).margin(algebra_tol));
+
+    // Reverse provider order and reject an ambiguous standalone selection.
+    QMCHamiltonian comparison;
+    comparison.addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+    comparison.addOperator(std::make_unique<IdentityElectronEnergy>(), "ElecElec");
+    comparison.addOperator(meta.makeClone(electrons), "MFRMetaFields", false);
+    comparison.addOperator(core.makeClone(electrons), "MFRCoreAction", false);
+    comparison.addOperator(std::make_unique<KineticJastrowResidual>(electrons), "KineticJastrowResidual", false);
+    CHECK_THROWS(comparison.configureMFRQMCMode(MFRQMCModeRequest::AUTO));
+    CHECK_THROWS(comparison.configureMFRQMCMode(MFRQMCModeRequest::YES));
+    comparison.configureMFRQMCMode(MFRQMCModeRequest::NO);
+    comparison.addObservables(electrons);
+    BareKineticEnergy ordinary_kinetic(electrons);
+    const double ordinary=ordinary_kinetic.evaluate(psi,electrons)+.37;
+    CHECK(comparison.evaluate(psi,electrons)==Approx(ordinary).margin(algebra_tol));
+
     REQUIRE(core.getActionRowEvaluationCount() == 3);
     core.evaluateTrace(psi, electrons);
     CHECK(core.getActionRowEvaluationCount() == 3);
@@ -1048,7 +1162,269 @@ TEST_CASE("MFR core action integrated periodic determinant and DLA identity", "[
       CHECK(core.getActionRowEvaluationCount() == 0);
       CHECK(std::abs(Z(core.evaluateTrace(psi, electrons)) - Z(actual)) < algebra_tol);
       CHECK(core.getActionRowEvaluationCount() == 3);
+
+      if (mesh == 16)
+      {
+        // Use the production legacy-driver buffer protocol with either
+        // determinant implementation, not a manual R/evaluateLog restore.
+        buffer_walker.Properties = electrons.Properties;
+        electrons.saveWalker(buffer_walker);
+        buffer_walker.registerData();
+        psi.registerData(electrons, buffer_walker.DataSet);
+        buffer_walker.DataSet.allocate();
+        psi.copyFromBuffer(electrons, buffer_walker.DataSet);
+        psi.evaluateLog(electrons);
+        psi.updateBuffer(electrons, buffer_walker.DataSet, false);
+
+        electrons.makeMove(0, R3(.047, -.029, .013));
+        psi.calcRatio(electrons, 0);
+        psi.acceptMove(electrons, 0, true);
+        electrons.acceptMove(0);
+        psi.completeUpdates();
+        psi.updateBuffer(electrons, buffer_walker.DataSet, false);
+        electrons.saveWalker(buffer_walker);
+        buffer_walker.updateBuffer();
+        checkpoint_walker = buffer_walker; // A deep copy, as in walker replication.
+        const auto checkpoint_g = electrons.G;
+        const auto checkpoint_l = electrons.L;
+        const auto checkpoint_log = psi.getLogPsi();
+        const auto checkpoint_phase = psi.getPhase();
+        const Z checkpoint_core = core.evaluateTrace(psi, electrons);
+        const Z checkpoint_meta = meta.evaluateTrace(psi, electrons);
+        const auto checkpoint_energy = ham.evaluate(psi, electrons);
+        const auto checkpoint_meta_energy = meta_ham.evaluate(psi, electrons);
+        const auto checkpoint_rows = core.getActionRowEvaluationCount();
+
+        for (const int electron : {1, 2})
+        {
+          electrons.makeMove(electron, R3(-.036, .021, .017));
+          psi.calcRatio(electrons, electron);
+          psi.acceptMove(electrons, electron, true);
+          electrons.acceptMove(electron);
+        }
+        psi.completeUpdates();
+        psi.updateBuffer(electrons, buffer_walker.DataSet, false);
+        electrons.saveWalker(buffer_walker);
+        buffer_walker.updateBuffer();
+        core.evaluateTrace(psi, electrons);
+        CHECK(core.getActionRowEvaluationCount() == checkpoint_rows + 2);
+        ham.evaluate(psi, electrons);
+        meta_ham.evaluate(psi, electrons);
+
+        electrons.loadWalker(checkpoint_walker, true);
+        psi.copyFromBuffer(electrons, checkpoint_walker.DataSet);
+        // Reconstruct GL from buffered component derivatives, without a fresh LU.
+        psi.evaluateGL(electrons, false);
+        for (int electron = 0; electron < 3; ++electron)
+        {
+          for (int axis = 0; axis < 3; ++axis)
+          {
+            CHECK(electrons.R[electron][axis] == checkpoint_walker.R[electron][axis]);
+            CHECK(std::abs(electrons.G[electron][axis] - checkpoint_g[electron][axis]) < algebra_tol);
+          }
+          CHECK(std::abs(electrons.L[electron] - checkpoint_l[electron]) < algebra_tol);
+        }
+        CHECK(psi.getLogPsi() == Approx(checkpoint_log).margin(algebra_tol));
+        CHECK(std::abs(std::exp(Z(0, psi.getPhase() - checkpoint_phase)) - Z(1)) < algebra_tol);
+        CHECK(std::abs(Z(core.evaluateTrace(psi, electrons)) - checkpoint_core) < algebra_tol);
+        CHECK(core.getActionRowEvaluationCount() == checkpoint_rows + 4);
+        CHECK(std::abs(Z(meta.evaluateTrace(psi, electrons)) - checkpoint_meta) < algebra_tol);
+        CHECK(residual.evaluate(psi, electrons) == Approx(0).margin(algebra_tol));
+        CHECK(ham.evaluate(psi, electrons) == Approx(checkpoint_energy).margin(algebra_tol));
+        CHECK(meta_ham.evaluate(psi, electrons) == Approx(checkpoint_meta_energy).margin(algebra_tol));
+
+        // Independent 2x2 cofactors and actual SPO values test the buffered
+        // determinant inverse before evaluateLog can replace it.
+        orbitals.evaluate_notranspose(electrons, 0, 3, m, grad, lap);
+        const auto det = m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0);
+        const Z inverse[3][2] = {{Z(m(1, 1) / det), Z(-m(1, 0) / det)},
+                                 {Z(-m(0, 1) / det), Z(m(0, 0) / det)},
+                                 {Z(1) / Z(m(2, 0)), Z(0)}};
+        Z fresh{};
+        for (int row = 0; row < 3; ++row)
+          for (int band = 0; band < (row == 2 ? 1 : 2); ++band)
+            fresh += inverse[row][band] * core.evaluateOrbitalAction(*bsp, band, electrons.R[row]);
+        CHECK(std::abs(checkpoint_core - fresh) < algebra_tol);
+        psi.evaluateLog(electrons);
+        CHECK(std::abs(Z(core.evaluateTrace(psi, electrons)) - fresh) < algebra_tol);
+        CHECK(std::abs(Z(meta.evaluateTrace(psi, electrons)) - checkpoint_meta) < algebra_tol);
+        CHECK(ham.evaluate(psi, electrons) == Approx(checkpoint_energy).margin(algebra_tol));
+        CHECK(meta_ham.evaluate(psi, electrons) == Approx(checkpoint_meta_energy).margin(algebra_tol));
+        CHECK(core.getActionRowEvaluationCount() == checkpoint_rows + 4);
+      }
     }
   }
 }
+} // namespace qmcplusplus
+
+namespace qmcplusplus
+{
+
+namespace
+{
+void convertToMetaFixture(const std::string& filename, const Lattice& lattice, int spins=1)
+{
+  const hid_t file=H5Fopen(filename.c_str(),H5F_ACC_RDWR,H5P_DEFAULT);
+  REQUIRE(file>=0);
+  for (const char* name:{"schema_family","representation","spin_channels","grid_dimensions","grid_order"})
+    REQUIRE(H5Adelete(file,name)>=0);
+  writeStringAttribute(file,"schema_family","mfr_meta_fields");
+  writeStringAttribute(file,"representation","periodic_bloch_meta_fields");
+  writeScalarAttribute(file,"spin_channels",H5T_NATIVE_INT,spins);
+  writeStringAttribute(file,"tau_definition","sum_j occupation_j*abs(grad(phi_j))^2/2");
+  writeStringAttribute(file,"differential_operator","-0.5*div(q*grad)");
+  writeStringAttribute(file,"approximation","two_field_no_reference_residual");
+  writeStringAttribute(file,"potential_includes_ions","false");
+  writeScalarAttribute(file,"hartree_g0",H5T_NATIVE_DOUBLE,0.0);
+  const hid_t cell=H5Dopen2(file,"lattice_vectors",H5P_DEFAULT);
+  REQUIRE(cell>=0);
+  REQUIRE(H5Dwrite(cell,H5T_NATIVE_DOUBLE,H5S_ALL,H5S_ALL,H5P_DEFAULT,lattice.R.data())>=0);
+  H5Dclose(cell);
+  for (int band=0;;++band)
+  {
+    const std::string path="/kpoint_0/spin_0/state_"+std::to_string(band);
+    if (H5Lexists(file,path.c_str(),H5P_DEFAULT)<=0) break;
+    REQUIRE(H5Ldelete(file,(path+"/action_real").c_str(),H5P_DEFAULT)>=0);
+    REQUIRE(H5Ldelete(file,(path+"/action_imag").c_str(),H5P_DEFAULT)>=0);
+  }
+  const hid_t fields=H5Gcreate2(file,"fields",H5P_DEFAULT,H5P_DEFAULT,H5P_DEFAULT);
+  REQUIRE(fields>=0);
+  for (int kind=0;kind<2;++kind)
+  {
+    const hid_t group=H5Gcreate2(fields,kind==0 ? "u" : "q",H5P_DEFAULT,H5P_DEFAULT,H5P_DEFAULT);
+    REQUIRE(group>=0);
+    writeStringAttribute(group,"units",kind==0 ? "hartree" : "dimensionless");
+    writeStringAttribute(group,"grid_order","HDF5: z,y,x; x fastest");
+    writeStringAttribute(group,"grid_origin","fractional coordinates (0,0,0)");
+    writeStringAttribute(group,"periodic_grid_endpoint","excluded");
+    const std::array<int,3> dims=kind==0 ? std::array<int,3>{8,10,12} : std::array<int,3>{32,36,40};
+    writeArrayAttribute(group,"grid_dimensions",H5T_NATIVE_INT,dims);
+    for (int spin=0;spin<spins;++spin)
+    {
+      std::vector<double> values(dims[0]*dims[1]*dims[2]);
+      for (int z=0;z<dims[2];++z)
+        for (int y=0;y<dims[1];++y)
+          for (int x=0;x<dims[0];++x)
+            values[(z*dims[1]+y)*dims[0]+x]=kind==0 ? 2.0+spin :
+                .11+.5*spin+.2*std::cos(2*M_PI*x/dims[0])+
+                .3*std::sin(2*M_PI*(double(y)/dims[1]+double(z)/dims[2]));
+      writeDoubleDataset(group,("spin_"+std::to_string(spin+1)).c_str(),
+                         {hsize_t(dims[2]),hsize_t(dims[1]),hsize_t(dims[0])},values);
+    }
+    H5Gclose(group);
+  }
+  H5Gclose(fields);
+  H5Fclose(file);
+}
+
+void loadMeta(MFRMetaFields& fields,const std::string& filename)
+{
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<extpot type='mfr_meta_fields' href='"+filename+"'/>"));
+  REQUIRE(fields.put(document.getRoot()));
+}
+} // namespace
+
+TEST_CASE("meta fields use independent grids and Cartesian q gradients in skew cells", "[hamiltonian][mfr_meta]")
+{
+  TemporaryCoreActionFile file;
+  Lattice lattice=makePeriodicLattice();
+  lattice.R={2.0,.3,.1, .2,2.4,.5, .1,-.2,1.8};
+  lattice.reset();
+  SimulationCell cell(lattice);
+  ParticleSet electrons(cell);
+  electrons.create({1,1});
+  convertToMetaFixture(file.name(),lattice,2);
+  MFRMetaFields meta(electrons);
+  loadMeta(meta,file.name());
+  const MFRMetaFields::PosType reduced(.137,.284,.463);
+  const auto position=lattice.toCart(reduced);
+  for (int spin=0;spin<2;++spin)
+  {
+    const auto value=meta.evaluateFields(spin,position);
+    CHECK(value.u==Approx(2.0+spin).margin(1e-12));
+    CHECK(value.q==Approx(.11+.5*spin+.2*std::cos(2*M_PI*reduced[0])+
+                          .3*std::sin(2*M_PI*(reduced[1]+reduced[2]))).margin(2e-5));
+    const double gradient[]={-.4*M_PI*std::sin(2*M_PI*reduced[0]),
+                              .6*M_PI*std::cos(2*M_PI*(reduced[1]+reduced[2])),
+                              .6*M_PI*std::cos(2*M_PI*(reduced[1]+reduced[2]))};
+    for (int cart=0;cart<3;++cart)
+    {
+      double expected=0.0;
+      for (int d=0;d<3;++d) expected+=lattice.G(cart,d)*gradient[d];
+      CHECK(value.grad_q[cart]==Approx(expected).margin(2e-4));
+      // Cartesian finite differences independently test the reciprocal-tensor
+      // orientation, rather than duplicating its analytic transformation.
+      auto plus=position, minus=position;
+      const bool mixed=sizeof(QMCTraits::RealType)==sizeof(float);
+      const double step=mixed ? 1e-3 : 1e-5;
+      plus[cart]+=step; minus[cart]-=step;
+      const double numerical=(meta.evaluateFields(spin,plus).q-meta.evaluateFields(spin,minus).q)/(2*step);
+      CHECK(value.grad_q[cart]==Approx(numerical).margin(mixed ? 2e-4 : 2e-8));
+    }
+    const auto shifted=meta.evaluateFields(spin,position+lattice.a(0)-lattice.a(1)*2.0+lattice.a(2)*3.0);
+    CHECK(shifted.q==Approx(value.q).margin(1e-12));
+    // Float coordinates lose low bits when translated by several cell vectors.
+    const double translation_tolerance=sizeof(QMCTraits::RealType)==sizeof(float) ? 5e-6 : 2e-12;
+    for (int d=0;d<3;++d)
+      CHECK(shifted.grad_q[d]==Approx(value.grad_q[d]).margin(translation_tolerance));
+    auto clone=meta.makeClone(electrons);
+    const auto cloned=dynamic_cast<MFRMetaFields&>(*clone).evaluateFields(spin,position);
+    CHECK(cloned.q==Approx(value.q).margin(1e-12));
+  }
+  CHECK_THROWS(meta.evaluateFields(2,position));
+}
+
+TEST_CASE("meta field reader rejects corrupted schema and numeric data", "[hamiltonian][mfr_meta]")
+{
+  const int corruption=GENERATE(0,1,2,3,4,5);
+  TemporaryCoreActionFile file;
+  auto electrons=makeElectrons();
+  convertToMetaFixture(file.name(),electrons.getLattice());
+  const hid_t f=H5Fopen(file.name().c_str(),H5F_ACC_RDWR,H5P_DEFAULT);
+  REQUIRE(f>=0);
+  const hid_t q=H5Gopen2(f,"fields/q",H5P_DEFAULT);
+  REQUIRE(q>=0);
+  if (corruption==0)
+  {
+    REQUIRE(H5Adelete(q,"units")>=0);
+    writeStringAttribute(q,"units","hartree");
+  }
+  else if (corruption==1 || corruption==2)
+  {
+    const hid_t dataset=H5Dopen2(q,"spin_1",H5P_DEFAULT);
+    REQUIRE(dataset>=0);
+    std::vector<double> data(32*36*40,0.0);
+    data[3]=corruption==1 ? std::numeric_limits<double>::quiet_NaN() : std::numeric_limits<double>::infinity();
+    REQUIRE(H5Dwrite(dataset,H5T_NATIVE_DOUBLE,H5S_ALL,H5S_ALL,H5P_DEFAULT,data.data())>=0);
+    H5Dclose(dataset);
+  }
+  else if (corruption==3)
+  {
+    REQUIRE(H5Adelete(q,"grid_dimensions")>=0);
+    const hsize_t n=3;
+    const hid_t space=H5Screate_simple(1,&n,nullptr);
+    const hid_t attribute=H5Acreate2(q,"grid_dimensions",H5T_NATIVE_INT,space,H5P_DEFAULT,H5P_DEFAULT);
+    const int dims[3]={32,36,40};
+    REQUIRE(H5Awrite(attribute,H5T_NATIVE_INT,dims)>=0);
+    H5Aclose(attribute); H5Sclose(space);
+  }
+  else if (corruption==4)
+    writeDoubleDataset(q,"spin_2",{4,4,4},std::vector<double>(64,0.0));
+  else
+  {
+    REQUIRE(H5Ldelete(q,"spin_1",H5P_DEFAULT)>=0);
+    const hsize_t dims[3]={40,36,32};
+    const hid_t space=H5Screate_simple(3,dims,nullptr);
+    const hid_t dataset=H5Dcreate2(q,"spin_1",H5T_IEEE_F32LE,space,H5P_DEFAULT,H5P_DEFAULT,H5P_DEFAULT);
+    REQUIRE(dataset>=0);
+    H5Dclose(dataset); H5Sclose(space);
+  }
+  H5Gclose(q); H5Fclose(f);
+  MFRMetaFields meta(electrons);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<extpot type='mfr_meta_fields' href='"+file.name()+"'/>"));
+  CHECK_THROWS(meta.put(document.getRoot()));
+}
+
 } // namespace qmcplusplus

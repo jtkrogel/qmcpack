@@ -27,6 +27,7 @@
 #include "NonLocalECPotential.h"
 #include "MFRPotential.h"
 #include "MFRCoreAction.h"
+#include "MFRMetaFields.h"
 #include "KineticJastrowResidual.h"
 #include "Message/UniformCommunicateError.h"
 #include "Containers/MinimalContainers/RecordArray.hpp"
@@ -185,11 +186,19 @@ void QMCHamiltonian::configureMFRQMCMode(MFRQMCModeRequest requested_mode)
 
   const bool has_scalar_mfr = find_aux("MFRPotential") != nullptr;
   const bool has_core_action = find_aux("MFRCoreAction") != nullptr;
-  if (has_scalar_mfr && has_core_action)
-    throw UniformCommunicateError("Choose either scalar MFRPotential or MFRCoreAction, not both.");
-  const bool has_mfr = has_scalar_mfr || has_core_action;
+  const bool has_meta_fields = find_aux("MFRMetaFields") != nullptr;
+  if (has_scalar_mfr && (has_core_action || has_meta_fields))
+    throw UniformCommunicateError("Choose either scalar MFRPotential or the orbital-paired core/meta providers, not both.");
+  const bool has_mfr = has_scalar_mfr || has_core_action || has_meta_fields;
   if (requested_mode == MFRQMCModeRequest::YES && !has_mfr)
-    throw UniformCommunicateError("mfr_qmc=yes requires MFRPotential or MFRCoreAction in the Hamiltonian.");
+    throw UniformCommunicateError("mfr_qmc=yes requires MFRPotential, MFRCoreAction or MFRMetaFields in the Hamiltonian.");
+
+  if (has_core_action && has_meta_fields && requested_mode != MFRQMCModeRequest::NO)
+    throw UniformCommunicateError("Core and meta providers together require comparison mode mfr_qmc=no; "
+                                  "standalone MFR-QMC requires a single energy provider.");
+  mfr_energy_provider_ = has_core_action ? MFREnergyProvider::CORE_ACTION :
+      (has_meta_fields ? MFREnergyProvider::META_FIELDS :
+       (has_scalar_mfr ? MFREnergyProvider::SCALAR : MFREnergyProvider::NONE));
 
   if (!has_mfr)
     mfr_qmc_mode_ = MFRQMCMode::STANDARD;
@@ -241,63 +250,65 @@ void QMCHamiltonian::configureMFRQMCMode(MFRQMCModeRequest requested_mode)
 
 void QMCHamiltonian::applyMFREnergy(TrialWaveFunction& psi, ParticleSet& pset)
 {
-  MFRCoreAction* core_action = nullptr;
+  MFRCoreAction* core = nullptr;
+  MFRMetaFields* meta = nullptr;
+  MFRPotential* scalar = nullptr;
+  KineticJastrowResidual* residual = nullptr;
   for (const auto& op : auxH)
-    if (op->getName() == "MFRCoreAction")
-      core_action = dynamic_cast<MFRCoreAction*>(op.get());
-
-  if (core_action != nullptr)
   {
-    KineticJastrowResidual* kinetic_residual = nullptr;
-    FullPrecRealType electron_electron = 0.0;
-    for (const auto& op : auxH)
-      if (op->getName() == "KineticJastrowResidual")
-        kinetic_residual = dynamic_cast<KineticJastrowResidual*>(op.get());
-    for (const auto& op : H)
-      if (op->getName() == "ElecElec")
-        electron_electron = op->getValue();
-    if (kinetic_residual == nullptr)
-      throw std::runtime_error("MFRCoreAction requires KineticJastrowResidual during evaluation.");
-
-    const auto action_trace = core_action->evaluateTrace(psi, pset);
-    kinetic_residual->evaluate(psi, pset);
-    core_action->setObservables(Observables);
-    kinetic_residual->setObservables(Observables);
-    core_action->setParticlePropertyList(pset.PropertyList, myIndex);
-    kinetic_residual->setParticlePropertyList(pset.PropertyList, myIndex);
-    if (mfr_qmc_mode_ == MFRQMCMode::MFR)
-      LocalEnergy = std::real(action_trace) + core_action->getIonIonEnergyMF() + kinetic_residual->getValue() +
-          electron_electron;
-    return;
+    if (op->getName() == "MFRCoreAction") core = dynamic_cast<MFRCoreAction*>(op.get());
+    else if (op->getName() == "MFRMetaFields") meta = dynamic_cast<MFRMetaFields*>(op.get());
+    else if (op->getName() == "MFRPotential") scalar = dynamic_cast<MFRPotential*>(op.get());
+    else if (op->getName() == "KineticJastrowResidual") residual = dynamic_cast<KineticJastrowResidual*>(op.get());
   }
+  // Preserve the existing scalar comparison schedule. Its auxiliary quantities
+  // are evaluated by the ordinary auxiliary-estimator boundary.
+  if (!core && !meta && mfr_qmc_mode_ != MFRQMCMode::MFR)
+    return;
+  if (!residual || (!core && !meta && !scalar))
+    throw std::runtime_error("MFR-QMC Hamiltonian components are unavailable during evaluation.");
 
+  FullPrecRealType electron_electron = 0.0;
+  for (const auto& op : H)
+    if (op->getName() == "ElecElec") electron_electron = op->getValue();
+  residual->evaluate(psi, pset);
+  residual->setObservables(Observables);
+  residual->setParticlePropertyList(pset.PropertyList, myIndex);
+  if (core)
+  {
+    core->evaluateTrace(psi, pset);
+    core->setObservables(Observables);
+    core->setParticlePropertyList(pset.PropertyList, myIndex);
+  }
+  if (meta)
+  {
+    meta->evaluateTrace(psi, pset);
+    if (core && !meta->matchesCoreReference(*core))
+      throw std::runtime_error("MFR core and meta providers use different selected reference states/energies.");
+    meta->setObservables(Observables);
+    meta->setParticlePropertyList(pset.PropertyList, myIndex);
+  }
   if (mfr_qmc_mode_ != MFRQMCMode::MFR)
     return;
 
-  MFRPotential* mfr = nullptr;
-  KineticJastrowResidual* kinetic_residual = nullptr;
-  FullPrecRealType electron_electron = 0.0;
-  for (const auto& op : auxH)
+  switch (mfr_energy_provider_)
   {
-    if (op->getName() == "MFRPotential")
-      mfr = dynamic_cast<MFRPotential*>(op.get());
-    else if (op->getName() == "KineticJastrowResidual")
-      kinetic_residual = dynamic_cast<KineticJastrowResidual*>(op.get());
+  case MFREnergyProvider::CORE_ACTION:
+    LocalEnergy = core->getValue() + core->getIonIonEnergyMF() + residual->getValue() + electron_electron;
+    break;
+  case MFREnergyProvider::META_FIELDS:
+    LocalEnergy = meta->getTotalEnergyMF() + residual->getValue() + electron_electron -
+        meta->getValue() - meta->getDifferential();
+    break;
+  case MFREnergyProvider::SCALAR:
+    scalar->evaluate(pset);
+    scalar->setObservables(Observables);
+    scalar->setParticlePropertyList(pset.PropertyList, myIndex);
+    LocalEnergy = scalar->getTotalEnergyMF() + residual->getValue() + electron_electron - scalar->getValue();
+    break;
+  default:
+    throw std::runtime_error("Standalone MFR-QMC has no selected energy provider.");
   }
-  for (const auto& op : H)
-    if (op->getName() == "ElecElec")
-      electron_electron = op->getValue();
-
-  if (mfr == nullptr || kinetic_residual == nullptr)
-    throw std::runtime_error("MFR-QMC Hamiltonian components are unavailable during evaluation.");
-
-  mfr->evaluate(pset);
-  kinetic_residual->evaluate(psi, pset);
-  mfr->setObservables(Observables);
-  kinetic_residual->setObservables(Observables);
-  mfr->setParticlePropertyList(pset.PropertyList, myIndex);
-  kinetic_residual->setParticlePropertyList(pset.PropertyList, myIndex);
-  LocalEnergy = mfr->getTotalEnergyMF() + kinetic_residual->getValue() + electron_electron - mfr->getValue();
 }
 
 ///** remove a named Hamiltonian from the list
@@ -1157,6 +1168,7 @@ std::unique_ptr<QMCHamiltonian> QMCHamiltonian::makeClone(ParticleSet& qp, Trial
 {
   auto myclone = std::make_unique<QMCHamiltonian>(myName);
   myclone->mfr_qmc_mode_ = mfr_qmc_mode_;
+  myclone->mfr_energy_provider_ = mfr_energy_provider_;
   for (int i = 0; i < H.size(); ++i)
     H[i]->add2Hamiltonian(qp, psi, *myclone);
   for (int i = 0; i < auxH.size(); ++i)

@@ -38,6 +38,7 @@
 #include "QMCHamiltonians/GridExternalPotential.h"
 #include "QMCHamiltonians/MFRPotential.h"
 #include "QMCHamiltonians/MFRCoreAction.h"
+#include "QMCHamiltonians/MFRMetaFields.h"
 #include "QMCHamiltonians/KineticJastrowResidual.h"
 #include "QMCHamiltonians/StaticStructureFactor.h"
 #include "QMCHamiltonians/SpinDensity.h"
@@ -112,6 +113,7 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
       addPseudoPotential(element);
   });
 
+  bool mfr_residual_added = false;
   processChildren(cur, [&](const std::string& cname, const xmlNodePtr element) {
     std::string notype = "0";
     std::string noname = "any";
@@ -163,8 +165,12 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
         std::unique_ptr<MFRPotential> mfr = std::make_unique<MFRPotential>(targetPtcl);
         mfr->put(element);
         targetH->addOperator(std::move(mfr), "MFRPotential", false);
-        targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
-                             "KineticJastrowResidual", false);
+        if (!mfr_residual_added)
+        {
+          targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
+                               "KineticJastrowResidual", false);
+          mfr_residual_added = true;
+        }
       }
       else if (potType == "mfr_core_action")
       {
@@ -172,8 +178,25 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
         std::unique_ptr<MFRCoreAction> action = std::make_unique<MFRCoreAction>(targetPtcl, psi);
         action->put(element);
         targetH->addOperator(std::move(action), "MFRCoreAction", false);
-        targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
-                             "KineticJastrowResidual", false);
+        if (!mfr_residual_added)
+        {
+          targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
+                               "KineticJastrowResidual", false);
+          mfr_residual_added = true;
+        }
+      }
+      else if (potType == "mfr_meta_fields")
+      {
+        TrialWaveFunction* psi = psi_optional_ ? &psi_optional_->get() : nullptr;
+        auto fields = std::make_unique<MFRMetaFields>(targetPtcl, psi);
+        fields->put(element);
+        targetH->addOperator(std::move(fields), "MFRMetaFields", false);
+        if (!mfr_residual_added)
+        {
+          targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
+                               "KineticJastrowResidual", false);
+          mfr_residual_added = true;
+        }
       }
     }
     else if (cname == "estimator")

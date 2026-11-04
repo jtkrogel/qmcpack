@@ -1,6 +1,37 @@
 QMCPACK mean-field-residual implementation: consumer and driver record
 ======================================================================
 
+
+2026-11-04 native QE functional hand-off and consumer checkpoint
+---------------------------------------------------------------
+
+The current Libxc/HDF5 producer checkpoint and immutable binary/source hashes
+are recorded in functional_extension_validation/sol/qe_meta_libxc_20261104/
+(review.rst and review_final_manifest.json) in the Hubbard-U project.
+Actual completed native r2SCAN, r2SCAN+rVV10 and TPSS jobs were checked through
+the local Nexus status/get_result paths: seven paired hand-offs passed;
+see native_nexus_handoff_results.json. Existing generic import machinery
+accepted the new functional provenance without a new QMCPACK algorithm.
+
+Eight Ti complex-twist standalone cases covered full/mixed precision,
+legacy/batched drivers and bare-core/two-field providers, each with short
+VMC and DMC. Validation checked 2056 walker observations and 16 scalar series
+against the selected estimator arithmetic using the pre-existing precision
+bounds. Runtime Hamiltonians contained electron-electron and the selected
+MFR provider, without ion-ion or pseudopotential evaluation. Legacy restart
+cases required a native legacy checkpoint sidecar; initial attempts using a
+batched-only checkpoint were preserved as failed controls. The eight-case
+success is execution/arithmetic evidence, not physical acceptance or a claim
+of cross-driver restart identity. See ti_standalone_validation.json.
+
+The economical two-field Ti meta-core RMS remains about 90--100 mHa per
+primitive cell. An independent direct-plane-wave/cubic-field evaluation
+reproduced 89.485412 mHa versus 89.530594 mHa from the meshfactor-2 consumer;
+the difference between those difference traces was 0.184834 mHa RMS.
+See ti_independent_PW_cubic_diagnostic.json. Thus consumer orbital splines
+explain little of this particular discrepancy. No physical tolerance has
+been adopted and neither this meta route nor the full Goal is accepted.
+
 Audit date: 2026-10-29. Repository:
 ``/home/j1k/repositories/qmcpack_dev_new5``. Snapshot:
 ``72ab2e5277da627c23c71f12d155232a4b1c93f8`` (branch ``qp_mfr``).

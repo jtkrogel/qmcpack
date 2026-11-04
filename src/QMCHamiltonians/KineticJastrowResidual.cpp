@@ -10,6 +10,7 @@
 
 #include "BareKineticHelper.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "Utilities/TimerManager.h"
 
 namespace qmcplusplus
 {
@@ -33,6 +34,9 @@ KineticJastrowResidual::KineticJastrowResidual(ParticleSet& pset)
 
 KineticJastrowResidual::Return_t KineticJastrowResidual::evaluate(TrialWaveFunction& psi, ParticleSet& pset)
 {
+  // Separate timers also support flat-timer builds with concurrent walkers.
+  static thread_local auto* residual_timer = &createGlobalTimer("MFR::KineticJastrowResidual", timer_level_fine);
+  ScopedTimer scope(*residual_timer);
   bool has_fermionic = false;
   bool has_nonfermionic = false;
   for (const auto& component : psi.getOrbitals())
@@ -49,20 +53,17 @@ KineticJastrowResidual::Return_t KineticJastrowResidual::evaluate(TrialWaveFunct
     return value_;
   }
 
-  ParticleSet::ParticleGradient fermion_g(pset.getTotalNum());
-  ParticleSet::ParticleGradient nonfermion_g(pset.getTotalNum());
-  ParticleSet::ParticleLaplacian fermion_l(pset.getTotalNum());
-  ParticleSet::ParticleLaplacian nonfermion_l(pset.getTotalNum());
-  fermion_g = 0.0;
-  nonfermion_g = 0.0;
-  fermion_l = 0.0;
-  nonfermion_l = 0.0;
-
+  // As for BareKineticEnergy, the caller has current total log derivatives
+  // in P.G at the accepted energy boundary. Obtain only the nonfermionic
+  // derivatives from each component's supported cached-GL interface.
+  // Re-evaluating D here would rebuild its inverse solely for the residual.
+  nonfermion_g_.resize(pset.getTotalNum());
+  nonfermion_l_.resize(pset.getTotalNum());
+  nonfermion_g_ = 0.0;
+  nonfermion_l_ = 0.0;
   for (const auto& component : psi.getOrbitals())
-    if (component->isFermionic())
-      component->evaluateLog(pset, fermion_g, fermion_l);
-    else
-      component->evaluateLog(pset, nonfermion_g, nonfermion_l);
+    if (!component->isFermionic())
+      component->evaluateGL(pset, nonfermion_g_, nonfermion_l_, false);
 
   value_ = 0.0;
   for (int group = 0; group < pset.groups(); ++group)
@@ -70,10 +71,11 @@ KineticJastrowResidual::Return_t KineticJastrowResidual::evaluate(TrialWaveFunct
     Return_t group_residual = 0.0;
     for (int particle = pset.first(group); particle < pset.last(group); ++particle)
     {
-      const auto total_g = fermion_g[particle] + nonfermion_g[particle];
-      const auto total_l = fermion_l[particle] + nonfermion_l[particle];
-      group_residual +=
-          laplacian(total_g, total_l) - laplacian(fermion_g[particle], fermion_l[particle]);
+      const auto determinant_g = pset.G[particle] - nonfermion_g_[particle];
+      // Delta T_J = -1/(2m) Re[L_J + G_J.G_J + 2 G_D.G_J].
+      // The dot products are algebraic, without complex conjugation.
+      group_residual += laplacian(nonfermion_g_[particle], nonfermion_l_[particle]) +
+          2.0 * std::real(dot(determinant_g, nonfermion_g_[particle]));
     }
     value_ += group_residual * (same_mass_ ? -one_over_2m_ : minus_over_2m_[group]);
   }

@@ -481,3 +481,565 @@ file replaces only its project-local final source/evidence refresh. The older
 repository-local scalar note
 ``/home/j1k/repositories/qmcpack_dev_new5/mfr_qmcpack_implementation_notes.rst``
 was not edited.
+
+Meta-GGA two-field alternative and hybrid extension (2026-11-03)
+----------------------------------------------------------------
+
+The economical generalized-KS meta-GGA alternative stores two real scalar
+fields per distinct spin: ``u = v_H + v_xc^mult`` and
+``q = partial f_xc / partial tau`` for ``tau = sum |grad phi|^2/2``.  In the
+QE convention, ``u`` is the converged ``v%of_r`` converted from Ry to Ha;
+``q`` corresponds to ``v%kin_r`` under the convention used by
+``h_psi_meta.f90`` and is dimensionless, not an energy field.  This mapping
+must be checked against an explicit QE differential-action oracle, including
+the interpolation from the dense grid to ``dffts``.  The QMC spline of ``q``
+provides both ``q`` and its Cartesian gradient.
+
+For a determinant ``D``, define
+
+.. math::
+
+   Q_L[D] = -\frac12\sum_i\left[q_{\sigma_i}(r_i)
+   \frac{\nabla_i^2 D}{D} + \nabla q_{\sigma_i}(r_i)\cdot
+   \frac{\nabla_i D}{D}\right].
+
+The economical estimate is ``TotalEnergyMF + KineticJastrowResidual +
+ElecElec - sum_i u_sigma(r_i) - Q_L[D]``.  The finite-basis residual
+``Delta_MF = sum_sigma Tr(M_sigma^-1 R_sigma)`` must be added for an exact
+continuum identity, where ``R_j = (h_ref - epsilon_j) phi_j``.  The two
+scalar fields alone cannot reconstruct ``Delta_MF`` pointwise.  Thus this
+route is explicitly approximate and its paired error must be measured against
+the existing bare-core-action route on identical configurations, with and
+without Jastrow.  No empirical constant should be used to conceal its
+fluctuations.  It needs a distinct schema and observable name; the current
+``MFRPotential`` is the LDA/GGA Hartree-plus-XC scalar field and must retain
+that meaning.
+
+The planned QE meta-GGA producer must require a fully converged, supported
+collinear norm-conserving reference; export the two fields on the declared
+dense periodic grid with spin, units, tau convention, selected-orbital and
+ionic metadata.  It must keep ``write_mfr_potential`` unchanged for LDA/GGA.
+QMCPACK must evaluate the meta-GGA differential contraction using its
+Slater inverse and orbital gradients/Laplacians.  The coefficient acts on the
+determinant only; the physical Jastrow kinetic residual and DMC diffusion
+retain the ordinary constant-mass form.  Validate the q-gradient spline and
+spin mapping in real/complex full/mixed builds; compare to the exact action
+route on a common set of walkers and under single-particle updates.
+
+Hybrids use the existing bare-core-action representation and QMCPACK reader:
+no Fock-action spline or exchange application is needed in QMCPACK.  QE must
+accept a converged hybrid save in ``pw2mfr_core.x``, retain the same paired
+orbital coefficients, and compute only kinetic, ionic local and bare ionic
+nonlocal actions.  A hybrid reference needs an additional outer-exchange-loop
+completion check: QE's general SCF convergence flag may be set when the EXX
+iteration limit is reached solely to write restart data.  Successful and
+iteration-limited PBE0/HSE saves must both be tested.  Exchange fraction,
+screening, divergence and grid settings should be recorded as provenance.
+The existing unsupported spinor, PAW/USPP, background and nonlocal-correlation
+operators remain subject to their explicit guards.
+
+
+2026-11-03 meta-field consumer development checkpoint
+------------------------------------------------------
+
+New src/QMCHamiltonians/MFRMetaFields.h/.cpp reads common meta v1 u/q
+fields on independently specified periodic binary64 grids. It evaluates
+analytic q gradients with einspline's new scalar value/gradient routine,
+transforms fractional derivatives to Cartesian coordinates and contracts
+Q phi with the completed Slater inverse using determinant-only SPO VGL.
+Native SPO output precision is promoted for contraction. No ECP is evaluated
+by this operator. MFRCoreAction's metadata-only payload mode reuses geometry,
+selected spin/band/twist and ES-HDF coefficient pairing without action splines.
+
+HamiltonianFactory registers mfr_meta_fields/MFRMetaFields. QMCHamiltonian
+selects a scalar/core/meta energy provider, preserves conventional comparison
+LocalEnergy, rejects ambiguous standalone core+meta combinations and applies
+TotalEnergyMF + KineticJastrowResidual + ElecElec - MFRMetaU -
+MFRMetaDifferential in standalone meta mode. Imaginary differential values
+are separately reported. Explicit property indices support core/meta
+shared constants in either XML order; cloned Hamiltonians retain the provider.
+
+Focused unit tests pass real/complex full/mixed, covering skew-cell field
+values/gradients, corrupted inputs, analytic contractions, Jastrow, twists,
+legacy/batched determinants, clones, energy signs and ambiguity guards.
+Real/full QE TPSS import/VMC/DMC smoke tests execute, but physical two-field
+low-error validation FAILS the current carbon pilots; native projected
+SCF convergence does not establish pointwise replacement. See project
+functional_extension_validation/sol/qe_meta/meta_pointwise_pilot.rst.
+RMG meta export, full lifecycle/driver/logging coverage, qmca meta output,
+workflow result dependencies and required cost work remain open. Earlier
+immutable final inventories refer to their older source snapshot only.
+
+2026-11-03 13:36 EST -- Import phase and residual cost updates
+-------------------------------------------------------------
+
+MFRCoreAction.cpp:731-773 skips unused phase FFTs/temporary vectors for
+META_FIELDS, while retaining state/orbital/ion identity checks. Core-action
+phase handling is unchanged. test_MFRCoreAction.cpp:877 verifies metadata
+import leaves existing SPO phase state intact. All4 focused builds pass.
+
+src/QMCHamiltonians/KineticJastrowResidual.cpp:34-82 now uses current total
+log gradients P.G and nonfermionic evaluateGL(...,false), instead of
+calling fermionic/nonfermionic evaluateLog. P.G must be current at the
+accepted energy boundary, the same precondition as BareKineticEnergy.
+For J=sum nonfermionic logs and G_D=P.G-G_J, it computes
+-1/(2m) Re[L_J+G_J.G_J+2G_D.G_J], with algebraic complex dots.
+Fermionic Laplacians and reconstruction/inversion are unnecessary.
+Member scratch gradients/Laplacians in the header are resized/reused;
+no-J still returns0 before their allocation. Scratch is O(N), owned per
+operator/walker, not a new grid per clone. The timer is thread-local to
+avoid shared flat-timer state across concurrently evaluated walkers.
+
+src/QMCHamiltonians/tests/test_MFRPotential.cpp:419 adds independent
+complex/unequal-mass arithmetic, multiple factors, repeated evaluation,
+unchanged P.G/P.L and component call counts. Its fake component now obeys
+the additive derivative API. Existing Slater/Jastrow analytic values first
+initialize total wavefunction derivatives. No production tolerance changed.
+
+Validation
+----------
+
+Final focused MFR unit matrix passes: real/full and real/mixed22cases,
+16033assertions; complex/full and complex/mixed21cases,15938assertions.
+The first complex/mixed build rejected a double scalar literal in the
+independent oracle, corrected to Value(2); failure log retained.
+
+Scalar/core/meta before/after fixed72 (scalar random-initialized but fixed
+with the same seed) runs have identical inputs. Across28800 walker
+measurements per repetition, final energy max differences0/8.89e-16/1.78e-15
+Ha; field differences and repeat logs retained. Actual moving legacy and
+batched VMC/DMC pairs (12processes) agree in energy<=1.78e-15Ha and positions
+<=4.45e-16bohr. Full field errors retained; scalar batched unwrapped phase
+can differ2pi, with exp(i delta_phase) error<1e-12. This does not establish
+all restart/reset/buffer/precision/near-node lifecycles. Two-thread legacy
+scalar and two-crowd meta VMC/DMC final-binary smoke tests succeed; raw
+MFR arithmetic agrees<=1.78e-15Ha.
+
+Performance and reproducibility
+------------------------------
+
+Immutable instrumented pre-optimization and final executable/source copies
+are in before/ and after/, with SHA256 manifests. The intermediate static-
+timer candidate was superseded by a thread-local timer; its timed binary
+was not retained before relink, so use the final set for reproducible
+acceptance. Initial noisy and intermediate controlled observations remain
+separately labeled. Final interleaved3repetitions use72walkers,20blocks,
+20steps, timestep1e-100, one pinned CPU/thread and fine timers. These are
+fixed-position cost measurements, not statistical estimates or realistic
+trajectory-efficiency measurements. No concurrent parent builds in final
+measurements; shared-machine noise remains visible in the repeat spread.
+
+Final median residual-inclusive speedups: scalar47.84x, core43.58x,
+meta42.32x. Final median VMC execution-time speedups: scalar1.127x,
+core1.049x, meta1.056x. See mfr_residual_bench_final_comparison.json for
+all times/calls/error fields. Baseline profiles show determinant inverse
+and SPO VGL work nested under residual at both Hamiltonian and auxiliary
+boundaries; those inverse/recompute child calls disappear in the candidate.
+The duplicate residual boundary itself remains, now inexpensive, and needs
+a supported lifecycle-aware scheduling design before further elimination.
+
+The targeted bottleneck benefit and small-He sweep benefit are demonstrated.
+Do not generalize to larger systems, complex/mixed production, MPI scaling,
+DMC time-to-error or the required broader batch/layout/memory acceptance.
+An exact rearrangement does not itself reduce physical estimator variance.
+Physical meta approximation gaps and native functional support are independent
+requirements and remain open.
+
+Project evidence: functional_extension_validation/sol/cost/kinetic_residual_20261103.
+
+2026-11-03 larger cost and long-range regression checkpoint
+----------------------------------------------------------
+
+Derivative reuse has immutable moving Ti12e core and hBN16e scalar
+real/complex VMC timings: median speedups1.095x/1.052x/1.129x. Walker paths
+and saved RNG agree exactly, and per-walker fields pass fixed/moving
+full-precision comparison. Detailed hashes, schedules, spread, memory,
+parent validators and corrected complex-layout parser records are under
+functional_extension_validation/sol/cost/larger_derivative_reuse_20261103
+in the Hubbard implementation project. These do not establish physical
+meta accuracy or broad mixed/driver/lifecycle acceptance.
+
+A CPU-only StructFact host-dispatch experiment was evaluated and rejected:
+Ti/hBN medians0.9907x/0.9492x fail the frozen performance gate. Production
+src/Particle/LongRange/StructFact.cpp is restored exactly; it contains no
+retained optimization from this experiment. The independent Fourier oracle
+in src/Particle/LongRange/tests/test_StructFact.cpp, test case "StructFact
+batched phases and per-particle storage", is retained. It covers cubic/skew
+cells, unequal species, both coordinate kinds, changed walker positions
+and per-particle storage. All4 real/complex full/mixed long-range suites
+pass16,183 assertions in8cases. An actual rebuilt real batched standalone
+meta VMC/DMC restoration comparison matches every raw field exactly.
+All candidate/baseline sources, executables, run leaves and failures are
+retained under sol/cost/structure_factor_host_dispatch_20261103 and
+mfr_test_runs/functional_extension/structure_factor_dispatch_benchmark.
+
+2026-11-03 15:32 EST -- Actual walker-buffer and precision lifecycle checkpoint
+-----------------------------------------------------------------------------
+
+Extended the analytic periodic determinant/DLA test in
+src/QMCHamiltonians/tests/test_MFRCoreAction.cpp, starting near lines754
+and1142. Added production Walker registration/allocation, accepted delayed
+moves, wavefunction-buffer update, deep walker copy, further accepted moves,
+loadWalker/copyFromBuffer and cached-GL reconstruction. Buffers are declared
+before the wavefunction because legacy determinant matrices reference them.
+The no-J test varies both determinant implementations, cubic/skew cells and
+periodic/Bloch boundary cases at mesh16, in all four precision/complex builds.
+
+Restoration asserts exact positions, gradients/Laplacians, log magnitude,
+unit phase, core/meta traces and standalone Hamiltonian energies, no-J kinetic
+residual and precise changed-row cache counts. An independent2x2 inverse/
+actual-SPO action contraction checks the restored inverse before evaluateLog
+can hide a failed buffer reload. Fresh determinant recomputation then agrees.
+This tests buffer restoration through both determinant implementations, not
+the batched QMC driver's distinct population/recompute protocol. Production
+Jastrow buffer internals are not claimed covered by this no-J unit fixture.
+
+A deliberate test-only omission of checkpoint copyFromBuffer fails100
+assertions on real/full, including stale derivatives and core/meta energies.
+Positive source is restored exactly. Four isolated positive focused suites
+pass: real/full and real/mixed22cases/16,321 assertions; complex/full and
+complex/mixed21cases/16,226 assertions. Original bounds1e-10 full/2e-5 mixed
+are retained. An initial parallel invocation mistakenly shared the source
+working directory, causing HDF fixture filename collisions in two variants.
+All four first-attempt logs are retained; the final separate working-directory
+runs pass. No production code was changed for the buffer test.
+
+Ten new short production-Jastrow standalone application cases complete:
+mixed-real scalar/core/meta, each legacy/batched; full and mixed complex
+actual off-Gamma meta, each legacy/batched. Each has72 VMC observations;
+DMC has32 except scalar mixed-real legacy34, so replication is exercised.
+All1,042 logged observations satisfy independent signed MFR arithmetic
+(max3.56e-15Ha), finite numeric fields and actual per-walker movement.
+TotalEnergyMF agrees exactly with independently summed selected export
+KS eigenvalues plus ion-ion constant (scalar Ry metadata converted to Ha).
+These prove scoped production integration, not physical two-field accuracy,
+continuous-vs-split trajectory equivalence or deterministic branch selection.
+
+Five separate-process checkpoint pairs add missing combinations: mixed-real
+scalar batched/core legacy/meta legacy, mixed-complex off-Gamma meta batched,
+and full-complex off-Gamma meta legacy. For each, a fixed-position VMC loader
+probe recovers the original DMC checkpoint coordinates bit-for-bit as a
+multiset; another independent process continues DMC directly. All10 processes
+pass raw MFR arithmetic/finiteness. Logs confirm RNG stream reload; source
+walker/RNG checkpoint hashes remain unchanged. RNG stream correctness beyond
+the observed production reload is not inferred from the message alone.
+
+New unresolved legacy driver reset issue
+----------------------------------------
+
+An initial combined tiny-timestep loader-VMC then normal-DMC restart succeeds
+for scalar batched but aborts for legacy core in
+SimpleFixedNodeBranch::resetRun: cannot initialize WalkerController. All
+failed outputs are retained. Direct DMC continuation passes. Separate normal-
+timestep.02->.02 restart VMC/DMC reproductions abort in both mfr_qmc=yes and
+comparison mfr_qmc=no. Comparison uses standard T+EE with the same auxiliary
+core provider, not the original physical ionic Hamiltonian; it suffices to
+show the reset failure is not exclusive to standalone energy replacement.
+SimpleFixedNodeBranch.cpp has no worktree diff. Its restored DMC-mode flag
+and null-controller check around lines549-594 are the next source path to
+investigate; the exact fix and broader reset acceptance remain open.
+Separating probes is not claimed to fix or accept this failed transition.
+
+The common schema, native functional/operator, physical meta convergence,
+production Jastrow-buffer, deterministic DMC branch-selection and remaining
+restart/precision matrix requirements stay open; the Goal remains active.
+
+Evidence: sol/lifecycle/{walker_buffer,precision_driver}_20261103.
+New run trees: functional_extension/precision_driver_lifecycle_20261103,
+precision_restart_lifecycle_20261103 (initial failed transition retained),
+precision_restart_lifecycle_20261103_split_probes, and
+legacy_restart_transition_diagnostic_20261103.
+
+2026-11-03 15:44 EST -- Legacy restart VMC->DMC controller reset fixed
+--------------------------------------------------------------------
+
+Source investigation confirms a legitimate restored state: DMC flags and
+statistics survive restart, but WalkerController is process-local and absent.
+QMCMain.cpp calls the reused engine's resetRun before the next DMC driver
+runs initWalkerController. The old resetRun abort therefore incorrectly
+assumed that a historical DMC flag guaranteed a local controller.
+
+Changed src/QMCDrivers/SimpleFixedNodeBranch.cpp near line592: after reading
+new section parameters, return/defer controller-specific work if the local
+controller is absent. Keep restart flags, energy/variance history, reference/
+trial energy and parsed parameters. The existing population-aware
+initWalkerController creates it later. An already-created controller still
+uses the original reset path. No DMC energy formula, population policy,
+pseudopotential treatment or producer format changes in this fix.
+
+Added deterministic regression in tests/test_fixed_node_branch.cpp near
+line57. It reproduces restored DMC/no-controller state, preserves histories
+and parameters across deferred reset, initializes a real controller using
+actual walker offsets, then changes timestep/warmup and verifies the same
+controller is reused/reset. The initial real/full regression aborts as
+expected on the old production code; that log is retained.
+
+Final complete driver suites pass in all4 CPU variants: full real478
+assertions/35cases, full complex678/37, mixed real472/34, mixed complex672/36.
+The focused regression passes28 assertions per rank on an actual2-rank MPI
+population. Earlier21-assertion positive logs predate the added active-
+controller continuation check and are superseded by final suites/MPI logs.
+
+Twelve actual checkpoint->VMC->DMC processes complete: all4 variants times
+standalone normal.02, comparison normal.02 and standalone tiny1e-100 loader
+probe followed by DMC.02. All produce finite raw walker logs and satisfy
+independent standard T+EE or MFR core+J-residual+EE+ion constant arithmetic
+(max error1.78e-15Ha). The four tiny probes reproduce saved checkpoint
+coordinates bit-for-bit. Source walker/RNG checkpoint hashes remain unchanged;
+logs show RNG reload and deferred controller initialization. Original failed
+normal/tiny/comparison attempts remain untouched. Comparison uses auxiliary
+MFR plus standard T+EE, so it diagnoses generic driver reset behavior, not
+an original ionic-Hamiltonian physical energy comparison.
+
+This resolves the specific legacy reset failure recorded at15:32. Broader
+state/precision/restart invariants, production Jastrow-buffer oracles,
+deterministic DMC branch-selection checks and native functional/physical-
+accuracy requirements remain open. No continuous/split stochastic trajectory
+identity is inferred from these short transition tests. Goal stays active.
+
+Evidence: sol/lifecycle/legacy_branch_restart_20261103. Application outputs
+are at qmcpack_dev_new5/mfr_test_runs/functional_extension/
+legacy_restart_transition_fixed_20261103; older failures remain in the
+precision_restart_lifecycle_20261103 and legacy_restart_transition_diagnostic_20261103 trees.
+
+2026-11-03 17:40 EST -- batched determinant log-Laplacian precision
+=================================================================
+
+A separate definite cancellation defect was reproduced and fixed in
+src/QMCWaveFunctions/Fermion/DiracDeterminantBatched.cpp:602--613.
+computeGL previously formed lap-dot(grad,grad) in the SPO value precision,
+then added it to double particle log derivatives. FullPrecGrad/FullPrecValue
+now hold the intermediates before this subtraction, matching the legacy
+path. SPO storage and dot accumulation remain unchanged; cached Jastrow
+residual evaluation still avoids rebuilding the determinant.
+
+src/QMCWaveFunctions/tests/test_DiracDeterminantBatched.cpp adds the
+[gl_precision] test using the existing ConstantSPOSet fixture. It supplies
+one-orbital Taylor jets with phi=1, Lap(phi)=1 and large exactly representable
+real/complex gradients. The inverse is perfectly conditioned and kinetic
+energy is analytically-1/2. Both unchanged full builds pass27 assertions;
+old mixed-real/mixed-complex fail6/9 assertions. After the production fix,
+all four pass27. Initial test-engine and executable-location harness mistakes
+are retained; corrected invocations use the existing host OMPTARGET engine.
+
+All four CPU applications rebuild. Full determinant suites pass532/938
+assertions in real/complex builds (both precisions). MFR Hamiltonian suites
+pass16321/16226 assertions, and full driver suites pass478/678/472/672 for
+real/complex/mixed-real/mixed-complex. These include existing mode, cache,
+buffer and restart checks; they are not GPU acceptance.
+
+Matched24-case integration inputs retain their hashes. Full-precision and
+standalone MFR paths/energies are preserved at the recorded checks. Those
+inputs use legacy determinants even with batched drivers, so they do not
+exercise the corrected computeGL path. Six additional application cases
+explicitly enable batched determinants and pass arithmetic/MFR checks.
+One frozen-before mixed batched comparison has identical VMC coordinates;
+the fix changes conventional kinetic energy by up to2.29e-7Ha, with zero
+MFR field/residual change. Before binaries and failed analytic tests are
+preserved in sol/lifecycle/batched_gl_precision_20261103.
+
+This verified cancellation fix did NOT remove the larger mixed spline/
+kinetic-reference discrepancy exposed by the legacy-determinant matrix.
+The earlier attribution of that entire discrepancy to this defect was too
+broad. That failed check remains open, along with mixed weighted-scalar
+reporting and all broader native meta, physical, lifecycle and performance
+requirements. No Goal completion or changed physical acceptance criterion.
+
+2026-11-03 17:40 EST -- native complex TPSS handoff and open diagnostics
+======================================================================
+
+The current RMG executable reproduces the off-Gamma He TPSS failure with
+Pulay mixing0.5. Mixing0.1 stays bounded and reaches native energy stopping;
+linear0.1 stays bounded but does not converge in40 steps. Two subsequent
+strict-RMS1e-8 runs exhaust their120/200 iteration limits without publishing
+MFR output. A multigrid control fails. These failed strict studies remain
+failed; charge/tau mixing consistency and native complex convergence remain
+open. No SCF/operator regularization or tolerance change was made in RMG.
+
+A separate import fixture uses native energy criterion1e-12, more stringent
+than the original1e-9. It completes at9.85e-13 with potential RMS4.00e-6,
+so it is explicitly an energy-converged format/import fixture, not a passed
+strict-RMS reference. It exports common binary64 real-space u/q fields on
+64^3 grids and a companion core file. All4 states pair exactly with ES-HDF;
+independent reconstruction verifies the exported bare-core action. The
+native source is complex, unpolarized TPSS with one twist and a local XML
+He pseudopotential. Native spin meta remains guarded.
+
+The corrected-QMC application matrix contains24 cases: full/mixed complex,
+legacy/batched drivers, no-J/J2, comparison and standalone core/meta modes,
+with VMC followed by DMC. Six additional J2 cases explicitly set determinant
+batch=yes, distinguishing batched determinants from batched drivers. Both
+sets pass raw arithmetic and the unchanged independent MFR field/action
+trace limits. There are2496+624 observations; maximum assembly error is
+1.78e-15Ha. The largest independent MFR trace error is1.74e-6Ha. Full build
+trace limits remain1e-8*(1+scale), mixed2e-5*(1+scale). J2 coefficients are
+frozen smoke fixtures; no statistical or optimized-wavefunction claim.
+
+The same independent checker also records two FAILED diagnostics. Mixed
+conventional determinant kinetic energy differs from a double-arithmetic
+cubic reference by up to2.10e-4Ha, exceeding the attempted fixed bound.
+Mixed builds force float orbital coefficients despite precision=double;
+modeling coefficient quantization alone does not explain this discrepancy.
+Float kernel arithmetic/coordinate transforms and derivative accumulation
+need further isolation. Full trace comparisons pass. No failed mixed kinetic
+check is reclassified as passed, and no numerical bound was loosened.
+
+In mixed batched DMC, the conventional scalar IonIon differs from the stable
+raw-walker inferred constant by up to3.26e-7Ha; the original5e-10 scalar/raw
+check remains flagged failed. Raw TotalEnergyMF and IonIonMF are constant
+and match the HDF metadata/selected occupied sum at the checked bounds.
+Weighted scalar reporting remains a separate open diagnostic. The checker
+first assumed IonIon was logged per walker; it is actually omitted there
+and retained in scalar.dat. The failed harness attempts are preserved.
+
+Physical accuracy remains OPEN. Unshifted standard-minus-core RMS ranges
+0.0387--0.1571Ha; meta-minus-core RMS0.0080--0.0123Ha over the comparison
+series. No offset fit, clipping, physical acceptance or long-statistics
+claim was made. Coarse action/orbital/field resolution, native residuals
+and near-node behavior require further convergence tests.
+
+Records: runs/functional_extension/rmg/complex_meta_*_20261103 and QMCPACK
+mfr_test_runs/functional_extension/rmg_complex_meta_{pipeline,
+gl_precision_fixed,batched_determinants}_20261103. Current numerical reports
+are qmc_validation.json, qmc_validation.batched_determinants.json and
+summary.json in sol/rmg_meta/complex_native_pipeline_20261103.
+
+2026-11-03 18:16 EST -- scalar weight normalization correction
+=============================================================
+
+The mixed batched-DMC scalar constant drift is now explained and corrected.
+ScalarEstimatorBase/LocalEnergyEstimator accumulate weighted sums in double,
+but EstimatorManagerCrowd held the total weight in QMCTraits::RealType
+(float in mixed builds), and EstimatorManagerNew narrowed it again in its
+PropertyCache before normalization. The old raw weight sums versus printed
+weights independently predict both the constant drift and varying-energy
+mean error to output precision; native_before_prediction.json preserves
+that calculation and the original source-file hashes.
+
+src/Estimators/EstimatorManagerCrowd.h now stores and returns block_weight_
+in FullPrecRealType. src/Estimators/EstimatorManagerNew.h uses
+Vector<FullPrecRealType> for PropertyCache, retaining denominator precision
+through crowd collection, MPI reduction and division. Estimator sums,
+normalization formula, observable names, input syntax and output format are
+unchanged. The change applies to every scalar column, including energy
+second moments and TotalEnergyMF/IonIonMF; it adds no MFR special case.
+
+The new [scalar_weight_precision] case in tests/test_EstimatorManagerCrowd.cpp
+uses actual crowd accumulation, main-estimator collection, normalization
+and output. Two blocks, uneven crowds, fractional weights, constant energy
+and a varying potential are checked against an independent long-double
+reference. A separate exact-weight-argument section isolates the manager
+cache. The old code passes all32 assertions in full real/complex and fails20
+in each mixed build. The fixed code passes32 in all four. The registered
+focused two-rank CTest passes in all four; MPI rank0 has32 assertions and
+rank1 has16. A CTest resource lock serializes estimator tests sharing files.
+
+All four applications rebuild. Full estimator suites pass1523 assertions/
+107 cases in real and1293/114 in complex, at both precisions. Driver suites
+pass478/678/472/672 assertions for real/complex/mixed-real/mixed-complex.
+The existing three-rank estimator suite is rebuilding its previously unbuilt
+dependencies; its result is pending at this timestamp and is not claimed.
+
+Nine fresh corrected application cases cover real/complex full/mixed VMC
+and DMC, conventional comparison and standalone meta mode, plus actual
+MPI2/crowds2. All934 raw observations and metadata constants are finite.
+Independently weighted walker records reproduce every checked scalar column,
+including LocalEnergy_sq, within the printed precision; maximum column error
+is4.88e-10. All constant-column errors are <=3.15e-11Ha under the original
+5e-10 check. A frozen-before executable/control reproduces constant drift
+up to5.69e-7Ha. No shift, fit, or tolerance relaxation was used to accept the
+corrected records. Inputs, outputs, dependency identities and binary hashes
+are retained in qmcpack_dev_new5/mfr_test_runs/functional_extension/
+scalar_weight_precision_20261103 and this checkpoint.
+
+This closes the identified scalar-normalization cause from the17:40 meta
+checkpoint for the checked scope. It does not close the separate mixed
+spline/kinetic-reference discrepancy, native meta convergence/physical
+accuracy, spin-meta implementation, or the full functional/workflow/state/
+performance acceptance matrix. Goal and F1--F18 scope remain active.
+
+2026-11-03 18:22 EST -- final scalar normalization review
+--------------------------------------------------------
+
+The existing three-rank estimator suites now PASS in all four builds,
+superseding the18:16 pending-build statement. All focused unit/MPI checks,
+full estimator suites, full driver suites and the nine corrected native
+application cases have completed. Source diff whitespace checks pass.
+
+For the completed scope, the mixed weighted-scalar discrepancy is CLOSED:
+full-precision sums and normalization now use consistent weights. The
+frozen-before control and failed20/32 mixed assertions remain unchanged
+on disk. The independent reconstruction covers constant and varying scalar
+columns, second moments, actual MPI2/crowds2, and metadata constants. This
+is a producer-independent QMCPACK correction; no QE/RMG source or common
+export schema changed for this fix.
+
+The separate mixed spline/kinetic-reference diagnostic, native spin-meta
+implementation, strict complex meta SCF convergence, physical accuracy and
+remaining functional/state/workflow/performance matrix remain OPEN. The
+read-only spin-meta inventory and exploratory backend probe provide the
+next bounded implementation foundation; backend discrepancies are not
+reclassified as accepted. The full Goal stays active and unchanged.
+
+
+2026-11-03 18:58 EST -- mixed spline representation discrepancy explained
+---------------------------------------------------------------------------
+
+The two unequal mixed meta differential failures were comparison-representation
+differences, not evidence of wrong spin/q contraction. Native phase rotation
+precedes float coefficient rounding; the earlier independent oracle rounded
+unrotated coefficients and evaluated in double. Actual save_coefs replays
+have bit-identical raw trajectories/properties. Independent phase/prefilter
+reconstruction matches>99.99995% of checked native float coefficients exactly.
+
+All40 balanced/unequal full/mixed noJ/J2 legacy/batched VMC/DMC cases
+(4160 observations) pass matched-representation field/core/kinetic checks at
+unchanged1e-8/full and2e-5/mixed bounds. Reconstructed tables plus the native
+float kernel and independent matrix contraction give maxQ error3.81e-8Ha
+and maxkinetic1.023e-6Ha. Original failed double-reference reports remain
+retained and explicitly distinguished; no tolerance was loosened. No
+production code changed. Strict SCF, backend derivatives and physical grid
+accuracy remain open; full Goal remains active.
+
+Correction: both preceding spin exports contain7 bands/spin (14 actions each,
+28 total), not4/16. Actual oracle arrays always covered all stored bands.
+Reports and plans corrected, with original prose preserved.
+
+Next cost candidate: accepted determinant G/L reuse for the meta q contraction
+using Q_L=-0.5*sum[q*(L_D+G_D.G_D)+grad(q).G_D], with G_D/L_D obtained by
+subtracting nonfermion log derivatives from current accepted P.G/P.L. Keep
+state/reference checks and prove precision/state/move equivalence and timing
+against immutable current baselines before acceptance (existing G7/F16-F18).
+
+Evidence: functional_extension_validation/sol/lifecycle/
+native_float_spline_reference_20261103/review.rst.
+
+
+2026-11-03 19:24 EST -- accepted meta derivative reuse (bounded G7/F16-F18 contribution)
+------------------------------------------------------------------------------
+
+MFRMetaFields now contracts q with accepted determinant log derivatives,
+obtained from total P.G/P.L minus nonfermion cached GL. It removes repeated
+SPO VGL, inverse copying and quadratic action scratch, using per-clone O(N)
+scratch and a fine timer. Formula: Q_L=-0.5*sum[q*(L_D+G_D.G_D)+grad(q).G_D].
+Reference/state checks and scalar/input formats remain unchanged.
+
+All4 app builds, affected MFR suites(real16833/complex16738 assertions) and
+full driver suites PASS. Tight independent cofactor/native-VGL tests cover
+J/non-J, complex/skew/boundary, both determinants, first/repeated nonmutation
+and existing moves/clones/buffers. Native49 candidate contexts (real/Gamma,
+balanced/unequal complex, VMC/DMC, MPI2/crowds2) preserve accepted R/G/L
+bit-for-bit across5197 observations; original precision bounds pass.
+
+Three interleaved original-baseline timing pairs/target show coarse VMC
+medians1.137x(He complex),1.004x(He mixed),1.011x(C real),1.041x(C complex).
+Mixed He/real carbon are near noise. Matched fine-instrumented evaluator
+trials demonstrate2.22--2.88x meta-evaluator speedup. Both benchmark forms
+preserve final configs and physical scalars. Persistent linear full-precision
+scratch can exceed prior payload for tiny mixed cases; no universal RSS
+improvement or whole-run speedup is claimed.
+
+Detailed source/code/validation/performance records:
+functional_extension_validation/sol/cost/meta_accepted_gl_20261103/review.rst.
+The full Goal remains active. Strict SCF, physical convergence, remaining
+functional/state/workflow and full cost-matrix requirements remain open.

@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/Fermion/DiracDeterminantBatched.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/tests/FakeSPO.h"
+#include "QMCWaveFunctions/tests/ConstantSPOSet.h"
 #include "QMCWaveFunctions/SpinorSet.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "checkMatrix.hpp"
@@ -32,6 +33,50 @@ using Pos      = QMCTraits::PosType;
 using Grad     = QMCTraits::GradType;
 using LogValue = std::complex<QMCTraits::QTFull::RealType>;
 using PsiValue = QMCTraits::QTFull::ValueType;
+
+// A one-orbital Taylor jet at r=0: phi=1, prescribed gradient, lap(phi)=1.
+// Its kinetic energy is exactly -1/2 even when the log-Laplacian and
+// squared log gradient are individually large. All input values are dyadic
+// and exactly representable in both SPO precisions.
+TEST_CASE("DiracDeterminantBatched_log_laplacian_precision", "[wavefunction][fermion][gl_precision]")
+{
+  using FullValue = QMCTraits::QTFull::ValueType;
+  const SimulationCell simulation_cell;
+  ParticleSet electrons(simulation_cell);
+  electrons.create({1});
+  for (double scale : {1.0, 8.0, 32.0})
+  {
+    auto spo = std::make_unique<ConstantSPOSet<Value>>("TaylorJet", 1, 1);
+    SPOSet::ValueMatrix values(1, 1), laplacians(1, 1);
+    SPOSet::GradMatrix gradients(1, 1);
+    values(0, 0) = Value(1);
+    laplacians(0, 0) = Value(1);
+    gradients(0, 0) = Grad(128.0625 * scale, 64.03125 * scale, -32.015625 * scale);
+#if defined(QMC_COMPLEX)
+    gradients(0, 0)[0] += Value(0, 16.015625 * scale);
+    gradients(0, 0)[1] += Value(0, -8.0078125 * scale);
+    gradients(0, 0)[2] += Value(0, 4.00390625 * scale);
+#endif
+    spo->setRefVals(values);
+    spo->setRefEGrads(gradients);
+    spo->setRefELapls(laplacians);
+    DiracDeterminantBatched<PlatformKind::OMPTARGET, Value, FullValue> determinant(*spo, 0, 1);
+    ParticleSet::ParticleGradient g(1);
+    ParticleSet::ParticleLaplacian l(1);
+    g = 0.0;
+    l = 0.0;
+    determinant.evaluateLog(electrons, g, l);
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      CHECK(std::real(g[0][axis]) == std::real(gradients(0, 0)[axis]));
+      CHECK(std::imag(g[0][axis]) == std::imag(gradients(0, 0)[axis]));
+    }
+    const FullValue laplacian_ratio = l[0] + dot(g[0], g[0]);
+    CHECK(std::real(laplacian_ratio) == Approx(1.0).margin(1e-12));
+    CHECK(std::imag(laplacian_ratio) == Approx(0.0).margin(1e-12));
+    CHECK(-0.5 * std::real(laplacian_ratio) == Approx(-0.5).margin(1e-12));
+  }
+}
 
 template<PlatformKind PL>
 void test_DiracDeterminantBatched_first()

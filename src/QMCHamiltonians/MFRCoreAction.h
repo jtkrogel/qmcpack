@@ -38,7 +38,12 @@ public:
     }
   };
 
-  explicit MFRCoreAction(ParticleSet& pset, TrialWaveFunction* psi = nullptr);
+  /// Meta payloads reuse strict selected-orbital pairing without action splines.
+  enum class ReferencePayload { CORE_ACTION, META_FIELDS };
+  explicit MFRCoreAction(ParticleSet& pset, TrialWaveFunction* psi = nullptr,
+                         ReferencePayload payload = ReferencePayload::CORE_ACTION);
+  const Lattice& getReferenceLattice() const { return data_->field_lattice; }
+  int getReferenceSpinChannels() const { return spin_channels_; }
   std::string getClassName() const override { return "MFRCoreAction"; }
   bool put(xmlNodePtr cur) override;
   bool get(std::ostream& os) const override;
@@ -48,6 +53,10 @@ public:
   void setObservables(PropertySetType& plist) override;
   void setParticlePropertyList(PropertySetType& plist, int offset) override;
   std::unique_ptr<OperatorBase> makeClone(ParticleSet& pset) const final;
+
+  /// Lazily validate the selected determinant for readers constructed before the wavefunction.
+  void ensureReference(TrialWaveFunction& psi);
+  bool matchesReference(const MFRCoreAction& other) const;
 
   /** Compute and store the determinant-contracted core action at an energy boundary. */
   FullPrecValueType evaluateTrace(TrialWaveFunction& psi, ParticleSet& pset);
@@ -102,6 +111,7 @@ private:
   ActionState readState(const StateKey& key, BsplineSet* orbital_set, int orbital_index);
   void validateCell(const ParticleSet& pset) const;
 
+  const ReferencePayload payload_;
   const ParticleSet& pset_;
   TrialWaveFunction* psi_;
   std::string file_name_;
@@ -113,7 +123,7 @@ private:
   FullPrecRealType total_energy_mf_   = 0.0;
   FullPrecRealType imaginary_trace_   = 0.0;
   std::shared_ptr<SharedData> data_   = std::make_shared<SharedData>();
-  int my_index_                       = -1;
+  std::array<int, 4> observable_indices_{{-1, -1, -1, -1}};
 };
 } // namespace qmcplusplus
 

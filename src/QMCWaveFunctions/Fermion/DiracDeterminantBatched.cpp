@@ -604,8 +604,11 @@ void DiracDeterminantBatched<PL, VT, FPVT>::computeGL(ParticleSet::ParticleGradi
 {
   for (size_t i = 0, iat = FirstIndex; i < NumPtcls; ++i, ++iat)
   {
-    Grad rv   = simd::dot(psiMinv_[i], dpsiM[i], NumOrbitals);
-    Value lap = simd::dot(psiMinv_[i], d2psiM[i], NumOrbitals);
+    // Form log derivatives in the particle-set precision, as in the legacy
+    // determinant. A float log-Laplacian loses the small laplacian ratio
+    // when |grad(log D)|^2 is large, even though G and L are stored in double.
+    FullPrecGrad rv   = simd::dot(psiMinv_[i], dpsiM[i], NumOrbitals);
+    FullPrecValue lap = simd::dot(psiMinv_[i], d2psiM[i], NumOrbitals);
     G[iat] += rv;
     L[iat] += lap - dot(rv, rv);
   }

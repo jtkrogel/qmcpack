@@ -9,6 +9,7 @@
 // File created by: Jaron T. Krogel, krogeljt@ornl.gov, Oak Ridge National Laboratory
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <cstdio>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Message/Communicate.h"
@@ -129,4 +130,57 @@ TEST_CASE("WalkerLogCollector::collect", "[estimators]")
 }
 
 
+} // namespace qmcplusplus
+
+
+namespace qmcplusplus
+{
+TEST_CASE("Walker logs retain signed MFR scalar values and layout", "[drivers][mfr_walkerlog]")
+{
+  const SimulationCell cell;
+  ParticleSet particles(cell);
+  particles.create({2});
+  particles.R[0]={.1,.2,.3}; particles.R[1]={.4,.5,.6};
+  particles.G=QMCTraits::GradType(.1);
+  particles.L=0.0;
+  const std::vector<std::string> names={"MFRPotential","MFRCoreAction","MFRCoreActionImag","TotalEnergyMF",
+      "IonIonMF","KineticJastrowResidual","MFRMetaU","MFRMetaDifferential","MFRMetaDifferentialImag"};
+  std::vector<int> indices;
+  for (const auto& name:names) indices.push_back(particles.PropertyList.add(name));
+  ProjectData project("mfr_log",ProjectData::DriverVersion::BATCH);
+  TrialWaveFunction psi(project.getRuntimeOptions());
+  QMCHamiltonian ham;
+  Walker<QMCTraits,PtclOnLatticeTraits> walker(2);
+  walker.R=particles.R;
+  walker.resizeProperty(1,particles.PropertyList.size());
+  for (int i=0;i<particles.PropertyList.size();++i) walker.Properties(0,i)=0.0;
+  for (size_t i=0;i<indices.size();++i) walker.Properties(0,indices[i])=-(i+1.0)*.25;
+  WalkerLogState state{true,1,false};
+  WalkerLogCollector collector(state);
+  collector.collect(walker,particles,psi,ham,0);
+  for (const int index:indices) walker.Properties(0,index)+=.5;
+  collector.collect(walker,particles,psi,ham,1);
+  const std::string filename="mfr_walker_log_scalars_unit.h5";
+  hdf_archive file;
+  REQUIRE(file.create(filename));
+  collector.walker_property_real_buffer.registerHDFData(file);
+  collector.walker_property_real_buffer.writeHDF(file);
+  file.close();
+  REQUIRE(file.open(filename,H5F_ACC_RDONLY));
+  Matrix<double> data;
+  REQUIRE_NOTHROW(file.read(data,"walker_property_real/data"));
+  REQUIRE(data.rows()==2);
+  for (size_t i=0;i<indices.size();++i)
+  {
+    size_t first=0,last=0;
+    const std::string path="walker_property_real/data_layout/"+names[i];
+    REQUIRE_NOTHROW(file.read(first,path+"/index_start"));
+    REQUIRE_NOTHROW(file.read(last,path+"/index_end"));
+    REQUIRE(last==first+1);
+    CHECK(data(0,first)==Approx(-(i+1.0)*.25));
+    CHECK(data(1,first)==Approx(-(i+1.0)*.25+.5));
+  }
+  file.close();
+  std::remove(filename.c_str());
+}
 } // namespace qmcplusplus

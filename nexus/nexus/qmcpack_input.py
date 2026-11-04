@@ -2531,7 +2531,11 @@ class mfrpotential(QIxml):
 
 extpot = QIxmlFactory(
     name = 'extpot',
-    types = dict(mfr=mfrpotential,mfr_core_action=mfrpotential),
+    types = dict(
+        mfr = mfrpotential,
+        mfr_core_action = mfrpotential,
+        mfr_meta_fields = mfrpotential,
+        ),
     typekey = 'type'
     )
 
@@ -6936,6 +6940,7 @@ def generate_hamiltonian(name         = 'h0',
                          nrule        = None,
                          mfr_potential   = None,
                          mfr_core_action = None,
+                         mfr_meta_fields = None,
                          mfr_qmc         = False,
                          ):
     if system is None:
@@ -7162,6 +7167,13 @@ def generate_hamiltonian(name         = 'h0',
             type = 'mfr_core_action',
             name = 'MFRCoreAction',
             href = mfr_core_action,
+            ))
+    #end if
+    if mfr_meta_fields is not None:
+        extpots.append(mfrpotential(
+            type = 'mfr_meta_fields',
+            name = 'MFRMetaFields',
+            href = mfr_meta_fields,
             ))
     #end if
     if len(extpots) > 0:
@@ -9423,6 +9435,7 @@ gen_basic_input_defaults = obj(
     orbitals_h5      = 'MISSING.h5',
     mfr_potential    = None,
     mfr_core_action  = None,
+    mfr_meta_fields  = None,
     mfr_qmc          = None,
     rotated_orbitals = False,
     run_path         = None,
@@ -9852,10 +9865,30 @@ def generate_basic_input(**kwargs):
     if kw.mfr_potential is not None and kw.mfr_core_action is not None:
         raise ValueError('provide only one of mfr_potential or mfr_core_action')
     #end if
-    if kw.mfr_qmc is True and kw.mfr_potential is None and kw.mfr_core_action is None:
-        raise ValueError('mfr_qmc=True requires mfr_potential or mfr_core_action')
+    if (
+        kw.mfr_potential is not None
+        and kw.mfr_meta_fields is not None
+        ):
+        raise ValueError('mfr_potential and mfr_meta_fields cannot be used together')
     #end if
-    standalone_mfr = (kw.mfr_potential is not None or kw.mfr_core_action is not None) and kw.mfr_qmc is not False
+    if (
+        kw.mfr_core_action is not None
+        and kw.mfr_meta_fields is not None
+        and kw.mfr_qmc is not False
+        ):
+        raise ValueError('mfr_core_action and mfr_meta_fields together require explicit mfr_qmc=False')
+    #end if
+    if (
+        kw.mfr_qmc is True
+        and kw.mfr_potential is None
+        and kw.mfr_core_action is None
+        and kw.mfr_meta_fields is None
+        ):
+        raise ValueError('mfr_qmc=True requires mfr_potential, mfr_core_action or mfr_meta_fields')
+    #end if
+    standalone_mfr = (
+        kw.mfr_potential is not None or kw.mfr_core_action is not None or kw.mfr_meta_fields is not None
+        ) and kw.mfr_qmc is not False
     if standalone_mfr:
         kw.corrections = []
         kw.estimators = [est for est in kw.estimators if not (isinstance(est,str) and est.lower() == 'mpc')]
@@ -9894,6 +9927,23 @@ def generate_basic_input(**kwargs):
         #end if
     #end if
 
+    if kw.mfr_meta_fields is not None:
+        if not isinstance(kw.mfr_meta_fields,str):
+            raise TypeError('mfr_meta_fields must be a file path')
+        #end if
+        if kw.check_paths and not os.path.exists(kw.mfr_meta_fields):
+            msg = (
+                'user provided "mfr_meta_fields" path does not exist\n'
+                f'Path provided: {kw.mfr_meta_fields}\n'
+                'To disable this check, set check_paths=False'
+                )
+            raise FileNotFoundError(msg)
+        #end if
+        if kw.run_path is not None:
+            kw.mfr_meta_fields = os.path.relpath(kw.mfr_meta_fields,kw.run_path)
+        #end if
+    #end if
+
     h_estimators = kw.estimators
     d_estimators = None
     if batched:
@@ -9921,6 +9971,7 @@ def generate_basic_input(**kwargs):
         wf_elem      = wfn,
         mfr_potential   = kw.mfr_potential,
         mfr_core_action = kw.mfr_core_action,
+        mfr_meta_fields = kw.mfr_meta_fields,
         mfr_qmc         = standalone_mfr,
         )
 

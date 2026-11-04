@@ -680,6 +680,50 @@ Control options
                   QMCPACK ES-HDF orbital output. Requires the supported neutral,
                   periodic, single-twist PZ/PBE norm-conserving configuration.
 
+    Key name:     write_mfr_core_action
+    Required:     no
+    Key type:     boolean
+    Expert:       No
+    Experimental: Yes
+    Default:      "false"
+    Description:  Export converged bare kinetic plus ionic local and nonlocal
+                  core actions, with orbital-pairing metadata, to an action-v1
+                  MFR HDF5 file. Also enables QMCPACK ES-HDF orbital output.
+                  Native RMG validation limits this export to supported
+                  converged fixed-ion, single-twist collinear NC runs.
+
+    Key name:     write_mfr_core_diagnostics
+    Required:     no
+    Key type:     boolean
+    Expert:       No
+    Experimental: Yes
+    Default:      "false"
+    Description:  Include ionic-local and bare-projector diagnostic grids in
+                  the action file for independent operator validation. Requires
+                  write_mfr_core_action=true.
+
+    Key name:     write_mfr_meta_fields
+    Required:     no
+    Key type:     boolean
+    Expert:       No
+    Experimental: Yes
+    Default:      "false"
+    Description:  Export the converged TPSS meta-GGA fields and reference
+                  orbital identities as an mfr_meta_fields-v1 HDF5 file.
+                  Also enables QMCPACK ES-HDF orbital output. The native
+                  producer requires an unpolarized, fixed-ion, single-twist
+                  supported meta-GGA calculation.
+
+    Key name:     mfr_meta_q_source
+    Required:     no
+    Key type:     string
+    Expert:       No
+    Experimental: Yes
+    Default:      "functional_derivative"
+    Allowed:      "functional_derivative" "effective_smooth"
+    Description:  Choose the native functional-derivative q field or the
+                  effective smooth-grid q field for write_mfr_meta_fields.
+
     Key name:     write_qmcpack_restart_localized
     Required:     no
     Key type:     boolean

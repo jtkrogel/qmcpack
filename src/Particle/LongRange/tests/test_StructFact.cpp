@@ -9,12 +9,14 @@
 // File created by: Yubo "Paul" Yang, yubo.paul.yang@gmail.com, University of Illinois Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include <vector>
 #include <complex>
 #include "ParticleSet.h"
 #include "LongRange/StructFact.h"
+#include "ResourceCollection.h"
 
 namespace qmcplusplus
 {
@@ -67,6 +69,79 @@ TEST_CASE("StructFact", "[lrhandler]")
     //app_log() << std::setprecision(14) << rhok_sum << std::endl;
     CHECK(ComplexApprox(rhok_sum).epsilon(5e-5) == rhok_sum_ref[i]);
   }
+}
+
+TEST_CASE("StructFact batched phases and per-particle storage", "[lrhandler][structfact_batch]")
+{
+  const bool skew = GENERATE(false, true);
+  const auto kind = GENERATE(DynamicCoordinateKind::DC_POS, DynamicCoordinateKind::DC_POS_OFFLOAD);
+  Lattice lattice;
+  lattice.BoxBConds     = true;
+  lattice.LR_dim_cutoff = 8.0;
+  lattice.R = skew ? ParticleSet::Tensor_t(4.2, .3, -.2, .4, 3.8, .1, -.1, .2, 5.3)
+                   : ParticleSet::Tensor_t(5., 0., 0., 0., 5., 0., 0., 0., 5.);
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet first(cell, kind);
+  first.getSpeciesSet().addSpecies("u");
+  first.getSpeciesSet().addSpecies("d");
+  first.create({3, 1});
+  first.R[0] = {-.000000001, .2, 5.300000001};
+  first.R[1] = {.33, 2.14, -.4};
+  first.R[2] = {-.72, 1.23, 2.4};
+  first.R[3] = {1.7, .6, 2.77};
+  first.update();
+  ParticleSet second(first);
+  second.R[1][0] += .17;
+  second.update();
+  RefVectorWithLeader<ParticleSet> particles(first, {first, second});
+  ResourceCollection resources("structure_factor_batch");
+  first.createResource(resources);
+  ResourceCollectionTeamLock<ParticleSet> lock(resources, particles);
+  ParticleSet::mw_update(particles);
+  StructFact first_sk(first.getLRBox(), cell.getKLists());
+  StructFact second_sk(second.getLRBox(), cell.getKLists());
+  // Production initializes each structure factor before batched updates.
+  first_sk.updateAllPart(first);
+  second_sk.updateAllPart(second);
+  RefVectorWithLeader<StructFact> factors(first_sk, {first_sk, second_sk});
+  SKMultiWalkerMem staging;
+  const double tolerance = sizeof(QMCTraits::RealType) == sizeof(float) ? 3e-5 : 1e-12;
+  auto check_phases       = [&]()
+  {
+    for (int walker = 0; walker < 2; ++walker)
+      for (int group = 0; group < particles[walker].groups(); ++group)
+        for (int ik = 0; ik < cell.getKLists().getNumK(); ++ik)
+        {
+          std::complex<double> expected{};
+          for (int ip = particles[walker].first(group); ip < particles[walker].last(group); ++ip)
+          {
+            double phase = 0.0;
+            for (int axis = 0; axis < 3; ++axis)
+              phase += static_cast<double>(cell.getKLists().getKptsCart()[ik][axis]) *
+                  static_cast<double>(particles[walker].R[ip][axis]);
+            const std::complex<double> one(std::cos(phase), std::sin(phase));
+            expected += one;
+            if (factors[walker].isStorePerParticle())
+            {
+              CHECK(std::abs(factors[walker].eikr_r(ip, ik) - one.real()) < tolerance);
+              CHECK(std::abs(factors[walker].eikr_i(ip, ik) - one.imag()) < tolerance);
+            }
+          }
+          CHECK(std::abs(factors[walker].rhok_r(group, ik) - expected.real()) < tolerance);
+          CHECK(std::abs(factors[walker].rhok_i(group, ik) - expected.imag()) < tolerance);
+        }
+  };
+  StructFact::mw_updateAllPart(factors, particles, staging);
+  check_phases();
+  second.R[2][1] -= .23;
+  ParticleSet::mw_update(particles);
+  StructFact::mw_updateAllPart(factors, particles, staging);
+  check_phases();
+  first_sk.turnOnStorePerParticle(first);
+  second_sk.turnOnStorePerParticle(second);
+  StructFact::mw_updateAllPart(factors, particles, staging);
+  check_phases();
 }
 
 } // namespace qmcplusplus

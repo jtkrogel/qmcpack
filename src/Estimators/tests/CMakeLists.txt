@@ -97,8 +97,15 @@ if(USE_OBJECT_TARGET)
 endif()
 
 add_unit_test(${UTEST_NAME} 1 1 $<TARGET_FILE:${UTEST_EXE}>)
+# The scalar normalization regression writes estimator files; serialize the
+# estimators tests sharing this working directory.
+set_tests_properties(${UTEST_NAME} PROPERTIES RESOURCE_LOCK estimators_scalar_output)
 
 if(HAVE_MPI)
+  add_unit_test(deterministic-unit_test_estimators_scalar_weight_precision_mpi 2 1
+                $<TARGET_FILE:test_estimators> "[scalar_weight_precision]")
+  set_tests_properties(deterministic-unit_test_estimators_scalar_weight_precision_mpi
+                      PROPERTIES TIMEOUT 60 RESOURCE_LOCK estimators_scalar_output)
   set(UTEST_EXE test_${SRC_DIR}_mpi)
   set(UTEST_NAME deterministic-unit_test_${SRC_DIR}_mpi)
 
@@ -127,6 +134,7 @@ if(HAVE_MPI)
   test_estimators_help minimal_test_pools mock_walker_elements)
   # Right now the unified driver mpi tests are hard coded for 3 MPI ranks
   add_unit_test(${UTEST_NAME} 3 1 $<TARGET_FILE:${UTEST_EXE}>)
+  set_tests_properties(${UTEST_NAME} PROPERTIES RESOURCE_LOCK estimators_scalar_output)
 endif()
 
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)

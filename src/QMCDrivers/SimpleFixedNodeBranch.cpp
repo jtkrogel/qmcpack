@@ -591,7 +591,11 @@ int SimpleFixedNodeBranch::resetRun(xmlNodePtr cur)
 
   if (WalkerController == nullptr)
   {
-    APP_ABORT("SimpleFixedNodeBranch::resetRun cannot initialize WalkerController");
+    // Restarted DMC flags/statistics can precede a local controller, e.g.
+    // after a resumed VMC section. The next DMC driver creates it in
+    // initWalkerController, where the actual walker population is available.
+    app_log() << "  Defer walker-controller initialization to the next DMC driver." << std::endl;
+    return 1;
   }
 
   if (!same_wc)

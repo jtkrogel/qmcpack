@@ -88,6 +88,9 @@ class ControlDefinitions(NamelistEnumBase):
     verbosity     = 'verbosity',     str,   False, None, ('high', 'low')
     restart_mode  = 'restart_mode',  str,   False, None, ('from_scratch', 'restart')
     wf_collect    = 'wf_collect',    bool,  False
+    write_mfr_potential = 'write_mfr_potential', bool, False
+    write_mfr_reference_status = 'write_mfr_reference_status', bool, False
+    write_mfr_meta_fields = 'write_mfr_meta_fields', bool, False
     nstep         = 'nstep',         int,   False
     iprint        = 'iprint',        int,   False
     tstress       = 'tstress',       bool,  False

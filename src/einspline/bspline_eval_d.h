@@ -20,4 +20,8 @@ void eval_UBspline_1d_d(UBspline_1d_d* restrict spline, double x, double* restri
 void eval_UBspline_3d_d(UBspline_3d_d* restrict spline, double x, double y, double z, double* restrict val);
 
 
+/** Value and analytic coordinate gradient of the same cubic interpolant. */
+void eval_UBspline_3d_d_vg(UBspline_3d_d* restrict spline, double x, double y, double z,
+                          double* restrict val, double* restrict grad);
+
 #endif

@@ -868,16 +868,46 @@ class Qmcpack(Simulation):
                 raise FileNotFoundError(result.h5file)
             #end if
             potential.href = os.path.relpath(result.h5file,self.locdir)
-        elif result_name=='mfr_core_action' and isinstance(sim,Pw2mfrCore):
+        elif result_name=='mfr_core_action' and isinstance(sim,(Pw2mfrCore,Rmg)):
             action = input.get('MFRCoreAction')
             if action is None:
                 raise ValueError(
-                    'A pw2mfr_core dependency requires mfr_core_action in generate_qmcpack; '
+                    'An MFR core-action dependency requires mfr_core_action in generate_qmcpack; '
                     'use a placeholder path with check_paths=False until export completes.'
                     )
             if not os.path.isfile(result.h5file):
                 raise FileNotFoundError(result.h5file)
             action.href = os.path.relpath(result.h5file,self.locdir)
+        elif result_name=='mfr_meta_fields' and isinstance(sim,(Pw2mfrCore,Rmg)):
+            if not sim.check_result('mfr_meta_fields',self):
+                if isinstance(sim,Rmg):
+                    raise ValueError(
+                        'An RMG meta-fields dependency requires write_mfr_meta_fields=True.'
+                        )
+                else:
+                    raise ValueError(
+                        'A pw2mfr_core meta-fields dependency requires write_meta_fields=True.'
+                        )
+                #end if
+            #end if
+            meta_fields = input.get('MFRMetaFields')
+            if meta_fields is None:
+                if isinstance(sim,Rmg):
+                    raise ValueError(
+                        'An RMG meta-fields dependency requires mfr_meta_fields in '
+                        'generate_qmcpack; use a placeholder path with check_paths=False '
+                        'until export completes.'
+                        )
+                else:
+                    raise ValueError(
+                        'A pw2mfr_core meta-fields dependency requires mfr_meta_fields in '
+                        'generate_qmcpack; use a placeholder path with check_paths=False '
+                        'until export completes.'
+                        )
+                #end if
+            if not os.path.isfile(result.h5file) or os.path.getsize(result.h5file)==0:
+                raise FileNotFoundError(result.h5file)
+            meta_fields.href = os.path.relpath(result.h5file,self.locdir)
         elif result_name=='restart':
             nrestart = len(result.restarts)
             downstream_bundled = self.should_twist_average

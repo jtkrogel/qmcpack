@@ -87,7 +87,7 @@ public:
   RefVector<qmcplusplus::OperatorEstBase> get_operator_estimators() { return convertUPtrToRefVector(operator_ests_); }
 
   RealType get_block_num_samples() const { return block_num_samples_; }
-  RealType get_block_weight() const { return block_weight_; }
+  FullPrecRealType get_block_weight() const { return block_weight_; }
 
   /** This registers the crowd lever estimators that require listeners into the QMCHamiltonianMultiWalkerResources
    *  We really only need a QMCHamiltonian leader but resource acquisition and release works better this way.
@@ -97,8 +97,8 @@ public:
 private:
   ///number of samples accumulated in a block
   RealType block_num_samples_;
-  ///total weight accumulated in a block
-  RealType block_weight_;
+  /// Total weight must match the precision of the scalar weighted sums.
+  FullPrecRealType block_weight_;
 
   UPtr<ScalarEstimatorBase> main_estimator_;
   ///estimators of simple scalars

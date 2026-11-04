@@ -5,6 +5,7 @@
 
 import glob
 import os
+import re
 
 from .developer import obj
 from .simulation import Simulation
@@ -20,15 +21,21 @@ class Rmg(Simulation):
     generic_identifier     = 'rmg'
     application            = 'rmg-cpu'
     application_properties = frozenset({'serial','mpi'})
-    application_results    = frozenset({'orbitals','mfr_potential'})
+    application_results    = frozenset({'orbitals','mfr_potential','mfr_core_action','mfr_meta_fields'})
 
 
     def check_result(self,result_name,sim):
         mfr = getattr(self.input,'write_mfr_potential',False)
+        mfr_core = getattr(self.input,'write_mfr_core_action',False)
+        mfr_meta = getattr(self.input,'write_mfr_meta_fields',False)
         if result_name=='orbitals':
-            return mfr or getattr(self.input,'write_qmcpack_restart',False)
+            return mfr or mfr_core or mfr_meta or getattr(self.input,'write_qmcpack_restart',False)
         elif result_name=='mfr_potential':
             return mfr
+        elif result_name=='mfr_core_action':
+            return mfr_core
+        elif result_name=='mfr_meta_fields':
+            return mfr_meta
         #end if
         return False
     #end def check_result
@@ -44,6 +51,10 @@ class Rmg(Simulation):
             return obj(h5file=prefix+'.h5')
         elif result_name=='mfr_potential':
             return obj(h5file=prefix+'.mfr.h5')
+        elif result_name=='mfr_core_action':
+            return obj(h5file=prefix+'.mfr_core.h5')
+        elif result_name=='mfr_meta_fields':
+            return obj(h5file=prefix+'.mfr_meta.h5')
         #end if
     #end def get_result
 
@@ -82,6 +93,29 @@ class Rmg(Simulation):
         #end for
         if getattr(self.input,'write_mfr_potential',False):
             completed = completed and 'Wrote converged MFR potential to ' in output
+        #end if
+        if getattr(self.input,'write_mfr_core_action',False):
+            completed = completed and 'Wrote converged MFR core actions to ' in output
+        #end if
+        if getattr(self.input,'write_mfr_meta_fields',False):
+            marker = 'Wrote converged MFR meta fields to '
+            expected_path = os.path.abspath(self.get_result('mfr_meta_fields',None).h5file)
+            marker_present = False
+            for line in output.splitlines():
+                line = line.strip()
+                # Native rmg_printf can prepend its progress/source tag to
+                # the first message, notably for meta-only exports.
+                match = re.match(r'^(?:\[[^\]]+\]\s+[^:]+:\s+)?'+re.escape(marker)+r'(.+)$',line)
+                if match:
+                    reported_path = match.group(1).strip()
+                    reported_path = os.path.abspath(os.path.join(self.locdir,reported_path))
+                    if reported_path == expected_path:
+                        marker_present = True
+                        break
+                    #end if
+                #end if
+            #end for
+            completed = completed and marker_present
         #end if
         self.succeeded = bool(self.job.finished and completed)
         self.failed    = bool(self.job.finished and not completed)

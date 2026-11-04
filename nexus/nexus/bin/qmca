@@ -178,8 +178,11 @@ class QBase(DevBase):
     autocorr = True
 
     quantity_abbreviations = obj(
-        e   = 'LocalEnergy',    emfr = 'LocalEnergyMFR', mfr  = 'MFRPotential',
-        mca = 'MFRCoreAction', ii_mf = 'IonIonMF',
+        e     = 'LocalEnergy',        emfr  = 'LocalEnergyMFR',
+        emeta = 'LocalEnergyMFRMeta', dmeta = 'MetaMinusAction',
+        mfr   = 'MFRPotential',       mca   = 'MFRCoreAction',
+        m_u   = 'MFRMetaU',           m_d   = 'MFRMetaDifferential',
+        m_di  = 'MFRMetaDifferentialImag', ii_mf = 'IonIonMF',
         emf = 'TotalEnergyMF',  tj   = 'KineticJastrowResidual',
         v   = 'Variance',       k    = 'Kinetic',
         p   = 'LocalPotential', ee = 'ElecElec',       ii   = 'IonIon',
@@ -232,7 +235,13 @@ class QBase(DevBase):
 
 
 class DatAnalyzer(QBase):
-    first = ('LocalEnergy', 'LocalEnergyMFR', 'Variance', 'Kinetic', 'LocalPotential', 'ElecElec', 'MFRPotential', 'MFRCoreAction', 'MFRCoreActionImag', 'IonIonMF', 'KineticJastrowResidual', 'TotalEnergyMF', 'LocalECP', 'NonLocalECP', 'IonIon')
+    first = (
+        'LocalEnergy', 'LocalEnergyMFR', 'LocalEnergyMFRMeta', 'MetaMinusAction',
+        'Variance', 'Kinetic', 'LocalPotential', 'ElecElec', 'MFRPotential',
+        'MFRCoreAction', 'MFRCoreActionImag', 'MFRMetaU', 'MFRMetaDifferential',
+        'MFRMetaDifferentialImag', 'IonIonMF', 'KineticJastrowResidual',
+        'TotalEnergyMF', 'LocalECP', 'NonLocalECP', 'IonIon',
+        )
     last = ('MPC', 'KEcorr', 'BlockWeight', 'BlockCPU', 'AcceptRatio', 'Efficiency', 'TotalTime', 'TotalSamples', 'TrialEnergy', 'DiffEff', 'Weight', 'NumOfWalkers', 'LivingFraction', 'AvgSentWalkers', 'CorrectedEnergy')
 
     nonenergy = frozenset({'AcceptRatio', 'TotalSamples', 'Weight', 'NumOfWalkers', 'AvgSentWalkers', 'BlockWeight', 'LivingFraction', 'Efficiency', 'TotalTime', 'DiffEff', 'BlockCPU'})
@@ -368,6 +377,45 @@ class DatAnalyzer(QBase):
         nbe = self.get_equilibration()
         data  = self.data
         stats = self.stats
+        action_inputs = (
+            'MFRCoreAction', 'KineticJastrowResidual', 'ElecElec', 'IonIonMF'
+            )
+        action_markers = ('MFRCoreAction', 'MFRCoreActionImag')
+        meta_columns = (
+            'MFRMetaU', 'MFRMetaDifferential', 'MFRMetaDifferentialImag'
+            )
+        meta_present = any(quantity in data for quantity in meta_columns)
+        if meta_present:
+            if 'MFRPotential' in data:
+                raise ValueError('scalar MFRPotential and MFR meta fields cannot be analyzed together')
+            # MFRMetaDifferentialImag is a diagnostic companion; the real
+            # energy formula requires U, the real differential term, and
+            # its three shared scalar inputs.
+            required_meta_inputs = (
+                'MFRMetaU', 'MFRMetaDifferential', 'TotalEnergyMF',
+                'KineticJastrowResidual', 'ElecElec',
+                )
+            missing_meta_inputs = [
+                quantity for quantity in required_meta_inputs if quantity not in data
+                ]
+            if missing_meta_inputs:
+                raise ValueError(
+                    'incomplete MFR meta input; missing required columns: '
+                    + ', '.join(missing_meta_inputs)
+                    )
+            #end if
+            if any(quantity in data for quantity in action_markers):
+                missing_action_inputs = [
+                    quantity for quantity in action_inputs if quantity not in data
+                    ]
+                if missing_action_inputs:
+                    raise ValueError(
+                        'incomplete MFR core/meta comparison input; missing required columns: '
+                        + ', '.join(missing_action_inputs)
+                        )
+                #end if
+            #end if
+        #end if
         for varname,samples in data.items():
             if nbe>=len(samples):
                 msg = (
@@ -384,7 +432,6 @@ class DatAnalyzer(QBase):
             stats.Variance = self.stat_value(v[nbe:])
         #end if
 
-        action_inputs = ("MFRCoreAction", "KineticJastrowResidual", "ElecElec", "IonIonMF")
         scalar_inputs = ("TotalEnergyMF", "KineticJastrowResidual", "ElecElec", "MFRPotential")
         if all(quantity in data for quantity in action_inputs):
             emfr = (data.MFRCoreAction + data.KineticJastrowResidual +
@@ -396,6 +443,18 @@ class DatAnalyzer(QBase):
                     data.ElecElec - data.MFRPotential)
             data.LocalEnergyMFR = emfr
             stats.LocalEnergyMFR = self.stat_value(emfr[nbe:])
+        #end if
+
+        if meta_present:
+            emeta = (data.TotalEnergyMF + data.KineticJastrowResidual +
+                     data.ElecElec - data.MFRMetaU - data.MFRMetaDifferential)
+            data.LocalEnergyMFRMeta = emeta
+            stats.LocalEnergyMFRMeta = self.stat_value(emeta[nbe:])
+            if all(quantity in data for quantity in action_inputs):
+                meta_minus_action = emeta - data.LocalEnergyMFR
+                data.MetaMinusAction = meta_minus_action
+                stats.MetaMinusAction = self.stat_value(meta_minus_action[nbe:])
+            #end if
         #end if
 
         # Find finite size corrected energy

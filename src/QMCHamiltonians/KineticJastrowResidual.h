@@ -16,7 +16,9 @@ namespace qmcplusplus
  * multiply the fermionic (Slater determinant) component.
  *
  * For Psi = D exp(J), this evaluates T[Psi]/Psi - T[D]/D, including the
- * determinant-Jastrow gradient cross term.
+ * determinant-Jastrow gradient cross term. The caller must supply current
+ * total log gradients in P.G, as for the ordinary kinetic estimator.
+ * Nonfermionic components supply their current derivatives through evaluateGL.
  */
 class KineticJastrowResidual : public OperatorBase
 {
@@ -33,6 +35,8 @@ private:
   bool same_mass_;
   FullPrecRealType one_over_2m_;
   std::vector<FullPrecRealType> minus_over_2m_;
+  ParticleSet::ParticleGradient nonfermion_g_;
+  ParticleSet::ParticleLaplacian nonfermion_l_;
 };
 } // namespace qmcplusplus
 

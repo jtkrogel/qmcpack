@@ -33,7 +33,9 @@ WalkerLogCollector::WalkerLogCollector(const WalkerLogState& state)
 void WalkerLogCollector::init()
 {
   properties_include = {"R2Accepted", "R2Proposed", "LocalEnergy", "LocalPotential", "Kinetic",
-                        "ElecElec",   "ElecIon",    "LocalECP",    "NonLocalECP"};
+                        "ElecElec",   "ElecIon",    "LocalECP",    "NonLocalECP",
+                        "MFRPotential", "MFRCoreAction", "MFRCoreActionImag", "TotalEnergyMF", "IonIonMF",
+                        "KineticJastrowResidual", "MFRMetaU", "MFRMetaDifferential", "MFRMetaDifferentialImag"};
   energy_index       = -1;
   // empty walker steps and energy vectors for the MC block
   steps.resize(0);

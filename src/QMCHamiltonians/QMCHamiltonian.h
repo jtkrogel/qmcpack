@@ -58,6 +58,9 @@ public:
     MFR
   };
 
+  enum class MFREnergyProvider { NONE, SCALAR, CORE_ACTION, META_FIELDS };
+  MFREnergyProvider getMFREnergyProvider() const { return mfr_energy_provider_; }
+
   using Return_t         = OperatorBase::Return_t;
   using PosType          = OperatorBase::PosType;
   using TensorType       = OperatorBase::TensorType;
@@ -438,6 +441,7 @@ private:
   ///vector of Hamiltonians
   std::vector<std::unique_ptr<OperatorBase>> auxH;
   MFRQMCMode mfr_qmc_mode_ = MFRQMCMode::STANDARD;
+  MFREnergyProvider mfr_energy_provider_ = MFREnergyProvider::NONE;
   /// Total timer for H evaluation
   NewTimer& ham_timer_;
   /// Total timer for H evaluation
