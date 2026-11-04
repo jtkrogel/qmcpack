@@ -582,3 +582,5 @@ from the local-He control and preserving common format/state semantics.
 Detailed source anchors, terminal runs, independent probes and follow-up:
 functional_extension_validation/sol/rmg_meta/grid96_convergence_20261103/
 review.rst. Goal remains active with all F1-F18 requirements unchanged.
+
+2026-11-04 15:59 EST: committed preceding MFR meta/lifecycle checkpoint 44f22a6aa63add9b5538a70bdd051bf148b34225; cache correctness checkpoint follows with four-build and16-context/4104-observation evidence. Controlled performance and physical meta acceptance remain open. Future accepted milestones include local qp_mfr commits.

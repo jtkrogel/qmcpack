@@ -77,6 +77,8 @@ public:
   FullPrecRealType getImaginaryTrace() const { return imaginary_trace_; }
   /// Cumulative number of refreshed electron rows (also useful for diagnostics).
   size_t getActionRowEvaluationCount() const { return action_row_evaluations_; }
+  /// Number of distinct immutable action grids constructed in this shared snapshot.
+  size_t getActionGridLoadCount() const { return data_->action_grid_loads; }
 
 private:
   struct ActionState
@@ -90,6 +92,7 @@ private:
   {
     Lattice field_lattice;
     std::map<StateKey, ActionState> states;
+    size_t action_grid_loads = 0;
   };
 
   // Instance-local, never shared between walker/operator clones. At an energy
@@ -114,6 +117,7 @@ private:
   const ReferencePayload payload_;
   const ParticleSet& pset_;
   TrialWaveFunction* psi_;
+  bool reference_prepared_ = false;
   std::string file_name_;
   std::array<int, 3> grid_dimensions_{};
   int spin_channels_                  = 0;

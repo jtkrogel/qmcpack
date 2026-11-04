@@ -205,6 +205,10 @@ TEST_CASE("MFRCoreAction reads periodic complex action grids and clones shared d
   loadAction(action, file.name());
   action.loadActionState(0, 0, 0);
 
+  CHECK(action.getActionGridLoadCount() == 1);
+  action.loadActionState(0, 0, 0);
+  CHECK(action.getActionGridLoadCount() == 1);
+
   const auto value = action.evaluatePeriodicAction(0, 0, 0, MFRCoreAction::PosType(0.25, 0.5, 0.75));
   CHECK(value.real() == Approx(2.5).margin(1e-12));
   CHECK(value.imag() == Approx(-0.75).margin(1e-12));
@@ -763,8 +767,64 @@ TEST_CASE("MFR core action integrated periodic determinant and DLA identity", "[
     MFRCoreAction core(electrons, &psi);
     loadAction(core, files.core.name());
     const auto actual = core.evaluateTrace(psi, electrons);
+    CHECK(core.getActionGridLoadCount() == 2); // up occupies 0/1, down shares spatial state 0
     if (mesh == 16 && !batched && !boundary && !skew && jastrow_a == 0)
     {
+      // A partially preloaded grid is not a prepared determinant reference.
+      // Binding must load the missing state and restore each SPO's own phase.
+      auto& down_orbitals = psi.findSD()[0].get().getDet(1).getPhi();
+      auto* down_bspline = dynamic_cast<BsplineSet*>(&down_orbitals);
+      REQUIRE(down_bspline);
+      const auto down_phase = down_bspline->getMFRCoreActionSources()[0].rotation_phase;
+      down_bspline->setMFRCoreActionRotationPhase(0, Z(.25, .75));
+      MFRCoreAction preloaded(electrons);
+      loadAction(preloaded, files.core.name());
+      preloaded.loadActionState(0, 0, 0);
+      CHECK(preloaded.getActionGridLoadCount() == 1);
+      preloaded.ensureReference(psi);
+      CHECK(preloaded.getActionGridLoadCount() == 2);
+      CHECK(preloaded.getTotalEnergyMF() == core.getTotalEnergyMF());
+      CHECK(down_bspline->getMFRCoreActionSources()[0].rotation_phase == down_phase);
+      CHECK(Z(preloaded.evaluateTrace(psi, electrons)) == Z(actual));
+      preloaded.ensureReference(psi);
+      CHECK(preloaded.getActionGridLoadCount() == 2);
+
+      // Warming an action grid must not bypass paired-orbital validation.
+      MFRCoreAction invalid_cached(electrons);
+      loadAction(invalid_cached, files.core.name());
+      invalid_cached.loadActionState(0, 0, 0);
+      const char* coefficient_path = "/electrons/kpoint_0/spin_0/state_0/psi_g";
+      std::array<double, 14> original_coefficients;
+      {
+        const hid_t file = H5Fopen(files.orbital_file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+        REQUIRE(file >= 0);
+        const hid_t dataset = H5Dopen2(file, coefficient_path, H5P_DEFAULT);
+        REQUIRE(dataset >= 0);
+        const hid_t space = H5Dget_space(dataset);
+        REQUIRE(H5Sget_simple_extent_npoints(space) == original_coefficients.size());
+        REQUIRE(H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                        original_coefficients.data()) >= 0);
+        H5Sclose(space);
+        H5Dclose(dataset);
+        H5Fclose(file);
+      }
+      auto write_coefficients = [&](const std::array<double, 14>& values) {
+        const hid_t file = H5Fopen(files.orbital_file.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+        REQUIRE(file >= 0);
+        const hid_t dataset = H5Dopen2(file, coefficient_path, H5P_DEFAULT);
+        REQUIRE(dataset >= 0);
+        REQUIRE(H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data()) >= 0);
+        H5Dclose(dataset);
+        H5Fclose(file);
+      };
+      auto corrupted_coefficients = original_coefficients;
+      corrupted_coefficients[0] += .01;
+      write_coefficients(corrupted_coefficients);
+      CHECK_THROWS_WITH(invalid_cached.ensureReference(psi),
+                        Catch::Matchers::ContainsSubstring("orbital coefficients do not match"));
+      write_coefficients(original_coefficients);
+      CHECK(invalid_cached.getActionGridLoadCount() == 1);
+
       auto must_reject = [&](const std::string& diagnostic) {
         MFRCoreAction invalid(electrons, &psi);
         Libxml2Document input;

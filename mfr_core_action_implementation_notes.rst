@@ -1043,3 +1043,25 @@ Detailed source/code/validation/performance records:
 functional_extension_validation/sol/cost/meta_accepted_gl_20261103/review.rst.
 The full Goal remains active. Strict SCF, physical convergence, remaining
 functional/state/workflow and full cost-matrix requirements remain open.
+
+
+2026-11-04 accepted cache correctness checkpoint and branch policy
+------------------------------------------------------------------
+
+Immutable action grids are reused across determinants sharing source states.
+Reference binding is tracked separately from partial grid preload, preserving
+all per-SPO geometry/coefficient/phase checks and clone/reconfiguration
+semantics. The targeted suites pass in all four real/complex full/mixed CPU
+builds (22 real cases/16890 assertions;21 complex cases/16795 assertions).
+Sixteen moving VMC/DMC before/after contexts compare4104 walker observations
+and all non-timing scalar columns exactly; five actual QE-meta ionic-term/
+provider rejection cases pass. Controlled repeated startup/memory benchmarking
+is still running and is not accepted at this checkpoint. The two-field Ti
+meta route remains physically unaccepted (1200 Ry mesh2 RMS88.37 mHa).
+
+Evidence and immutable binaries:
+functional_extension_validation/sol/cost/action_import_reuse_20261104/
+in /home/j1k/projects/mstd/34_mfrqmc/work/05_hubbard_u_impl/.
+At each subsequent bounded acceptance milestone, commit the validated source,
+tests and associated status records to qp_mfr rather than accumulating a
+multi-day implementation diff. Keep physical/performance acceptance explicit.

@@ -435,6 +435,7 @@ bool MFRCoreAction::put(xmlNodePtr cur)
   data_      = std::make_shared<SharedData>();
   row_cache_.clear();
   action_row_evaluations_ = 0;
+  reference_prepared_ = false;
   value_ = imaginary_trace_ = total_energy_mf_ = 0.0;
   readHeader();
   validateCell(pset_);
@@ -650,7 +651,8 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
   const hid_t file = H5Fopen(file_name_.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file < 0)
     throw std::runtime_error("MFRCoreAction failed to reopen HDF5 file '" + file_name_ + "'");
-  ActionState state;
+  const auto cached = data_->states.find(key);
+  ActionState state = cached == data_->states.end() ? ActionState{} : cached->second;
   try
   {
     const std::string k_path     = indexedPath("/kpoint_%d", key.twist);
@@ -675,7 +677,10 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
                      [](double value) { return isFiniteHDFValue(value); }))
       throw std::runtime_error("MFRCoreAction state has a non-finite eigenvalue or reduced k point");
 
-    if (payload_ == ReferencePayload::CORE_ACTION)
+    // A spatial state can be occupied by both spin determinants. Reuse its
+    // immutable action splines, but keep all per-SPO validation and phase
+    // reconstruction below, including when the state was explicitly preloaded.
+    if (payload_ == ReferencePayload::CORE_ACTION && cached == data_->states.end())
     {
       const auto real_values =
           readDoubleDataset(file, state_path + "/action_real",
@@ -714,6 +719,7 @@ MFRCoreAction::ActionState MFRCoreAction::readState(const StateKey& key, Bspline
                                                   destroy_Bspline);
       if (!state.real || !state.imag)
         throw std::runtime_error("failed to create periodic MFRCoreAction cubic splines");
+      ++data_->action_grid_loads;
     }
 
     if (orbital_set != nullptr)
@@ -788,6 +794,7 @@ void MFRCoreAction::loadActionState(int spin, int twist, int band)
 
 void MFRCoreAction::prepareWaveFunction(TrialWaveFunction& psi)
 {
+  reference_prepared_ = false;
   if (!psi.findMSD().empty())
     throw std::runtime_error("MFRCoreAction currently requires a single Slater determinant product");
   auto slater_dets = psi.findSD();
@@ -820,6 +827,7 @@ void MFRCoreAction::prepareWaveFunction(TrialWaveFunction& psi)
       total_energy_mf_ += iter->second.eigenvalue;
     }
   }
+  reference_prepared_ = true;
 }
 
 std::complex<double> MFRCoreAction::evaluatePeriodicAction(int spin, int twist, int band, const PosType& position) const
@@ -877,7 +885,7 @@ std::complex<double> MFRCoreAction::evaluateOrbitalAction(const BsplineSet& orbi
 
 void MFRCoreAction::ensureReference(TrialWaveFunction& psi)
 {
-  if (data_->states.empty())
+  if (!reference_prepared_)
     prepareWaveFunction(psi);
 }
 
@@ -902,8 +910,7 @@ MFRCoreAction::FullPrecValueType MFRCoreAction::evaluateTrace(TrialWaveFunction&
 {
   if (payload_ != ReferencePayload::CORE_ACTION)
     throw std::logic_error("meta reference cannot evaluate a core-action trace");
-  if (data_->states.empty())
-    prepareWaveFunction(psi);
+  ensureReference(psi);
   psi.completeUpdates();
   const auto slater_dets = psi.findSD();
   if (slater_dets.size() != 1)
@@ -1024,6 +1031,7 @@ std::unique_ptr<OperatorBase> MFRCoreAction::makeClone(ParticleSet& pset) const
   clone->total_energy_mf_   = total_energy_mf_;
   clone->imaginary_trace_   = imaginary_trace_;
   clone->data_              = data_;
+  clone->reference_prepared_ = reference_prepared_;
   clone->observable_indices_ = observable_indices_;
   clone->setName(getName());
   return clone;
