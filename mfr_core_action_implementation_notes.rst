@@ -1170,3 +1170,39 @@ pass, and the same three real native success/failure cases retain their
 expected status. Evidence and before/after source are in
 sol/nexus_rmg_marker_binding_20261104/numeric_retry/. This is completion-guard
 coverage, not new physical acceptance or RMG meta development.
+
+2026-11-04 17:30 EST -- fresh native RMG scalar/core Nexus workflow
+-----------------------------------------------------------------
+
+A fresh local Nexus graph scheduled a shared-XML two-He/5bohr PBE SCF on a
+48^3 orbital grid with potential refinement2, followed by separate real/full
+batched scalar and bare-core comparison VMC consumers. The fresh SCF
+converged in29 iterations at potential RMS9.97e-9 against unchanged1e-8,
+with energy criterion1e-20. Both exports plus ES-HDF complete natively.
+Nexus releases the actual result APIs after the path-bound writer checks;
+no ordering-only dependency or manual pending-path substitution is used.
+Actual hrefs are ../scf/Waves/scf.h5 and the corresponding .mfr.h5 or
+.mfr_core.h5. Both QMC executions finish; standard local ECP and ion-ion
+terms are retained, mfr_qmc=no. All QMC jobs reside under
+qmcpack_dev_new5/mfr_test_runs/functional_extension/nexus_rmg_pbe_20261104/.
+
+Scalar-v2 and paired-core-v1 schemas pass. All9 native exported states pass
+independent ES-HDF pairing and T/local/action reconstruction, maximum
+1.12e-12 Ha*orbital under the existing1e-9 bound. QMC occupies2 states
+per spin; the actual native exported state count is recorded rather than
+assuming the earlier32-grid fixture's band count. Both two-block consumers
+have exactly identical shared non-timing standard scalar columns. The qmca
+CLI succeeds, and derived MFR arrays/statistics match independent arithmetic
+and direct simstats calls. Scalar-minus-core block means are9.04e-6 and
+-4.40e-6 Ha; this short software regression does not establish physical
+expectation values, precision/error bars or complete functional acceptance.
+
+This closes the selected fresh RMG PBE scalar/core scheduling+ingestion
+subcase of F13, not the full functional/state/workflow matrix or Goal.
+The helper's API audit used other checkouts and was discarded; primary
+inspected/tested the actual qmcpack_dev_new5 source. An initial generator
+launch used a directory before creating it and failed to start; no native
+job was submitted by that failed launch or by the successful preview.
+RMG meta remains excluded. Detailed scripts, logs, validation.json and
+reproduction hashes are in functional_extension_validation/sol/
+nexus_native_rmg_pbe_20261104/.
