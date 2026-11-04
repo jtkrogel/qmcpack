@@ -584,3 +584,33 @@ functional_extension_validation/sol/rmg_meta/grid96_convergence_20261103/
 review.rst. Goal remains active with all F1-F18 requirements unchanged.
 
 2026-11-04 15:59 EST: committed preceding MFR meta/lifecycle checkpoint 44f22a6aa63add9b5538a70bdd051bf148b34225; cache correctness checkpoint follows with four-build and16-context/4104-observation evidence. Controlled performance and physical meta acceptance remain open. Future accepted milestones include local qp_mfr commits.
+
+
+2026-11-04 bounded action-import milestone: verified startup benefit
+--------------------------------------------------------------------
+
+Source/cache correctness is committed in fd61a3077, following the broader
+paired-meta/lifecycle checkpoint44f22a6aa. All four CPU variants passed focused
+MFR tests. Sixteen real/complex, full/mixed, legacy/batched moving VMC/DMC
+before/after contexts matched4104 raw walker observations and every scalar
+column except BlockCPU exactly; five actual QE-meta invalid-input controls
+rejected the expected ionic/provider combinations.
+
+Three interleaved repeats per immutable binary on one explicitly bound CPU
+now verify the large Ti1200 meshfactor2 combined core/meta comparison import.
+Median startup falls from111.1139 to92.6679 seconds (1.19905x); paired speedups
+are1.17024x,1.32853x,1.18351x. Baseline range108.4433--120.2102s and candidate
+range90.4836--93.8849s are retained. Median peak RSS falls by219.0703 MiB,
+6.1711%. All1241 half-second rank-affinity samples show CPU8; the monitor uses
+CPU19. Inputs are pre-warmed and hash-identical. Each paired raw walker array
+and all non-timing scalar columns match exactly. The first launcher-bound
+series is excluded after an observed affinity violation and remains archived.
+
+This accepts a bounded warm-cache startup/memory benefit, not a per-sample,
+production-efficiency, physical meta-accuracy or complete F18 claim. The host
+was not exclusively reserved, and repeat spread is reported. No further
+startup timing expansion is planned for this checkpoint. The remaining
+physical/functional/state/workflow criteria stay open. Evidence, reproduction
+scripts, resource logs and immutable binary/source hashes are under
+/home/j1k/projects/mstd/34_mfrqmc/work/05_hubbard_u_impl/functional_extension_validation/
+sol/cost/action_import_reuse_20261104/{application_matrix,startup_benchmark_rankpin_v2}/.
