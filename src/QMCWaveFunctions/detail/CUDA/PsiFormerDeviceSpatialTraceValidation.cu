@@ -499,6 +499,107 @@ void compareCanonical(const Results& actual, const Results& expected)
             "Canonical trace differs bitwise from the original GPU oracle");
 }
 
+// Exercise the bounded target route against both existing GPU arithmetic routes.
+void smallTargetChecks(Stream stream)
+{
+  struct RestoreOption
+  {
+    const char* name;
+    bool present;
+    std::string value;
+    explicit RestoreOption(const char* key) : name(key), present(std::getenv(key) != nullptr),
+        value(present ? std::getenv(key) : "") {}
+    ~RestoreOption()
+    {
+      if (present) setenv(name, value.c_str(), 1);
+      else unsetenv(name);
+    }
+  } restore_targets("PSIFORMER_GPU_SMALL_MATRIX_SPATIAL_TARGETS"),
+      restore_cooperative("PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES");
+  const auto check = [&](const Fixture& fixture) {
+    DeviceFixture device(fixture);
+    auto input = device.upload(fixture);
+    Results output(fixture.layout);
+    DeviceBuffer<double> scratch(fixture.layout.configuration_count * 44 * 44),
+        gradient(output.gradient.size()), ratio(output.ratio.size()), log(output.log.size());
+    DeviceBuffer<determinant::DerivativeStatus> status(output.status.size());
+    int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&ordinal), "small target metrics device");
+#else
+    checkRuntime(cudaGetDevice(&ordinal), "small target metrics device");
+#endif
+    const auto run = [&]() {
+      const auto before = deviceMemoryMetrics(ordinal).snapshot();
+      checkRuntime(launchDeterminantSpatialTraces(stream, fixture.layout, input.factorizations,
+          input.combinations, input.normalized_weights, input.inverses, input.gradients, input.laplacians,
+          scratch.data(), gradient.data(), ratio.data(), log.data(), status.data()), "small target traces");
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipStreamSynchronize(stream), "small target completion");
+#else
+      checkRuntime(cudaStreamSynchronize(stream), "small target completion");
+#endif
+      const auto after = deviceMemoryMetrics(ordinal).snapshot();
+      require(before.allocation_calls == after.allocation_calls && before.live_bytes == after.live_bytes,
+              "Small target traces allocated hidden owners");
+      gradient.download(output.gradient.data(), output.gradient.size());
+      ratio.download(output.ratio.data(), output.ratio.size());
+      log.download(output.log.data(), output.log.size());
+      status.download(output.status.data(), output.status.size());
+      return output;
+    };
+    setenv(restore_targets.name, "0", 1);
+    setenv(restore_cooperative.name, "0", 1);
+    const auto scalar = run();
+    setenv(restore_cooperative.name, "1", 1);
+    const auto cooperative = run();
+    setenv(restore_targets.name, "1", 1);
+    const auto candidate = run();
+    compareCanonical(candidate, scalar);
+    compareCanonical(candidate, cooperative);
+    compare(candidate, reference(fixture));
+    auto failed = fixture;
+    failed.gradients[0] = std::numeric_limits<double>::quiet_NaN();
+    input = device.upload(failed);
+    compare(run(), reference(failed));
+    input = device.upload(fixture);
+    compareCanonical(run(), candidate); // Same owners must reset failure flags and status.
+  };
+  for (const std::size_t channels : {16u, 64u})
+    for (const std::size_t targets : {3u, 44u})
+    {
+      check(Fixture(44, targets, 2, channels));
+      std::cout << "PASS small_matrix_spatial_targets N44 B2 D" << channels << " K" << targets
+                << " exact_scalar_cooperative_GPU native_CPU_bound\n";
+    }
+  Fixture good(44, 3, 2, 16);
+  Fixture broken = good;
+  broken.weights[1] = -0.0;
+  broken.factors[1].status = determinant::FactorizationStatus::SINGULAR;
+  broken.factors[1].inverse_available = false;
+  std::fill_n(broken.inverses.data() + 44 * 44, 44 * 44, std::numeric_limits<double>::quiet_NaN());
+  check(broken); // Ignore the unavailable inverse, but scan all channel derivatives.
+  broken.gradients[44 * 44] = std::numeric_limits<double>::quiet_NaN();
+  check(broken);
+  broken = good;
+  broken.laplacians[(2 * 16 + 15) * 44 * 44 + 44 * 44 - 1] = std::numeric_limits<double>::infinity();
+  check(broken); // Last target/channel must clear the whole configuration.
+  broken = good;
+  broken.factors[0].inverse_available = false;
+  check(broken);
+  broken = good;
+  broken.factors[0].status = determinant::FactorizationStatus::SINGULAR;
+  check(broken);
+  broken = good;
+  broken.inverses[0] = std::numeric_limits<double>::max();
+  broken.gradients[(6 * 16) * 44 * 44] = std::numeric_limits<double>::max();
+  check(broken); // Arithmetic failure in one target must clear successful siblings.
+  broken.combinations[0].phase = 0;
+  check(broken); // Configuration availability takes precedence over finite scans.
+  check(good);
+  std::cout << "PASS small_matrix_spatial_targets zero_weight/nonfinite/singular/unavailable/overflow/clear/recovery\n";
+}
+
 // Preserve the caller's ordinary trace selector while forcing the old GPU oracle.
 struct RestoreCanonicalTraceSelector
 {
@@ -703,13 +804,15 @@ int main(int argc, char** argv)
 {
   try
   {
-    bool host_only = false, large_probes = false, canonical_only = false;
+    bool host_only = false, large_probes = false, canonical_only = false, small_targets_only = false;
     std::string report;
     for (int argument = 1; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
       if (option == "--host-check")
         host_only = true;
+      else if (option == "--small-targets-only")
+        small_targets_only = true;
       else if (option == "--large-probes")
         large_probes = true;
       else if (option == "--canonical-retained-only")
@@ -717,7 +820,7 @@ int main(int argc, char** argv)
       else if (option == "--benchmark" && argument + 1 < argc)
         report = argv[++argument];
       else
-        throw std::invalid_argument("Usage: psiformer_device_spatial_trace_validation [--host-check] [--benchmark CSV] [--large-probes] [--canonical-retained-only]");
+        throw std::invalid_argument("Usage: psiformer_device_spatial_trace_validation [--host-check] [--small-targets-only] [--benchmark CSV] [--large-probes] [--canonical-retained-only]");
     }
     hostChecks();
     if (host_only)
@@ -730,6 +833,11 @@ int main(int argc, char** argv)
     checkRuntime(cudaGetDevice(&ordinal), "trace metrics device");
 #endif
     auto& metrics = deviceMemoryMetrics(ordinal);
+    if (small_targets_only)
+    {
+      smallTargetChecks(owner.stream);
+      return 0;
+    }
     if (canonical_only)
     {
       canonicalChecks(owner.stream, metrics);

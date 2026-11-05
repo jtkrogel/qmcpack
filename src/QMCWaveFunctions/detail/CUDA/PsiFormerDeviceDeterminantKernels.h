@@ -16,9 +16,28 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDeterminantMath.h"
 
 #include <cstddef>
+#include <cstdlib>
+#include <stdexcept>
+#include <string_view>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Explicit bounded extension of the existing real cooperative LU algorithms.
+inline bool configuredSmallMatrixCooperativeLu()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_SMALL_MATRIX_COOPERATIVE_LU");
+  if (!value || std::string_view(value) == "0")
+    return false;
+  if (std::string_view(value) == "1")
+    return true;
+  throw std::invalid_argument("PSIFORMER_GPU_SMALL_MATRIX_COOPERATIVE_LU must be 0 or 1");
+}
+
+inline bool supportsCooperativeLuSize(std::size_t n, bool small_matrix_opt_in) noexcept
+{
+  return n >= 64 || (small_matrix_opt_in && n >= 32 && n < 64);
+}
 
 /** VALUE-only cooperative alternative; no inverse/solve owners or alias expansion. */
 Error launchDeterminantValueFactorizationCooperative(

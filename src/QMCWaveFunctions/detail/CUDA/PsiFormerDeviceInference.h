@@ -1104,6 +1104,7 @@ private:
         target_preparation_(target_preparation), retained_targets_(retained_targets), real_trunk_only_(real_trunk_only),
         forward_phase_bank_requested_(configuredForwardPhaseBank()),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
+        small_matrix_cooperative_lu_requested_(configuredSmallMatrixCooperativeLu()),
         cooperative_open_features_requested_(configuredCooperativeOpenFeatures()),
         periodic_value_geometry_requested_(configuredPeriodicValueGeometryCooperative()),
         periodic_feature_jets_requested_(configuredPeriodicFeatureJetsCooperative()),
@@ -1357,7 +1358,8 @@ private:
     if (cooperative_value_lu_requested_)
       std::clog << "PsiFormer VALUE LU preparation: selected="
                 << (usesCooperativeValueLu() ? "cooperative" : "scalar")
-                << " Ne=" << ne_ << " static_shared_control_bytes<=64; no inverse or extra global owner\n";
+                << " Ne=" << ne_ << " bounded_small_matrix_opt_in=" << small_matrix_cooperative_lu_requested_
+                << " static_shared_control_bytes<=64; no inverse or extra global owner\n";
     if (periodic_value_geometry_requested_)
       std::clog << "PsiFormer periodic VALUE geometry preparation: selected="
                 << (usesCooperativePeriodicValueGeometry() ? "cooperative" : "scalar")
@@ -2170,7 +2172,7 @@ public:
   bool usesCooperativeValueLu() const noexcept
   {
     const auto& environment = plan_.environment();
-    return cooperative_value_lu_requested_ && ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY &&
+    return cooperative_value_lu_requested_ && supportsCooperativeLuSize(ne_, small_matrix_cooperative_lu_requested_) && mode_ == SpatialJetMode::VALUE_ONLY &&
         value_tape_.empty() && !mixed_value_lu_excluded_ && !mixed_dense_ && !kinetic_trunk_only_ &&
         supportsCooperativeRealValueLuEnvironment(environment);
   }
@@ -3193,6 +3195,7 @@ private:
   bool forward_phase_bank_ = false;
   std::size_t phase_bank_saved_bytes_ = 0;
   const bool cooperative_value_lu_requested_;
+  const bool small_matrix_cooperative_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
   const bool cooperative_open_features_requested_;
   const bool periodic_value_geometry_requested_;

@@ -1342,14 +1342,15 @@ int main(int argc, char** argv)
     const bool vectors_only = argc == 2 && std::string(argv[1]) == "--real-vectors-only";
     const bool value_lu_only = argc == 2 && std::string(argv[1]) == "--value-lu-only";
     const bool inverse_lu_only = argc == 2 && std::string(argv[1]) == "--inverse-lu-only";
+    const bool small_lu_only = argc == 2 && std::string(argv[1]) == "--small-lu-only";
     const bool value_scale_only = argc == 2 && std::string(argv[1]) == "--value-scale-only";
     const bool reverse_seeds_only = argc == 2 && std::string(argv[1]) == "--matrix-reverse-seeds-only";
     const bool jet_reverse_only = argc == 2 && std::string(argv[1]) == "--jet-reverse-only";
     const bool shared_means_only = argc == 2 && std::string(argv[1]) == "--softmax-shared-means-only";
     const bool periodic_geometry_only = argc == 2 && std::string(argv[1]) == "--periodic-value-geometry-only";
     const bool open_feature_only = argc == 2 && std::string(argv[1]) == "--open-feature-only";
-    if (argc != 1 && !vectors_only && !value_lu_only && !inverse_lu_only && !open_feature_only && !value_scale_only && !reverse_seeds_only && !jet_reverse_only && !shared_means_only && !periodic_geometry_only)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only|--value-lu-only|--inverse-lu-only|--open-feature-only|--value-scale-only|--matrix-reverse-seeds-only|--jet-reverse-only|--softmax-shared-means-only|--periodic-value-geometry-only]");
+    if (argc != 1 && !vectors_only && !value_lu_only && !inverse_lu_only && !open_feature_only && !value_scale_only && !small_lu_only && !reverse_seeds_only && !jet_reverse_only && !shared_means_only && !periodic_geometry_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--small-lu-only|--real-vectors-only|--value-lu-only|--inverse-lu-only|--open-feature-only|--value-scale-only|--matrix-reverse-seeds-only|--jet-reverse-only|--softmax-shared-means-only|--periodic-value-geometry-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -1383,6 +1384,11 @@ int main(int argc, char** argv)
     if (reverse_seeds_only)
     {
       validateCooperativeMatrixReverseSeeds(queue);
+      return 0;
+    }
+    if (small_lu_only)
+    {
+      validateCooperativeValueScale(queue, true);
       return 0;
     }
     if (value_scale_only)

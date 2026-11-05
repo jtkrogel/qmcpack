@@ -145,3 +145,38 @@ status and unpublished partial scratch. Existing memory/work limits still apply.
 are process-scoped, not a whole-job sum. Defaults and admitted products are
 unchanged. ``psiformer_device_runtime_validation --open-feature-only`` checks
 the bounded raw layout, padding, failure/recovery and small-size fallback cases.
+
+Bounded small real determinant LU
+--------------------------------
+
+``PSIFORMER_GPU_SMALL_MATRIX_COOPERATIVE_LU=1`` additionally admits sizes32--63
+through the existing real cooperative VALUE LU and independent-column inverse.
+The VALUE graph still requires ``PSIFORMER_GPU_VALUE_COOPERATIVE_LU=1`` and its
+existing real/domain/mode eligibility; preparation logs the effective selection.
+Inverse preparation independently requires ``PSIFORMER_GPU_COOPERATIVE_LU_INVERSE=1``.
+The new selector accepts only0 or1; unset/0 preserves previous size admission.
+In-place input/LU aliasing retains the scalar route. No new global owner is added.
+
+``psiformer_device_runtime_validation --small-lu-only`` compares N44 scalar and
+cooperative VALUE/inverse results for eight configurations with D16 and D64,
+checking all LU/permutation/metadata/inverse fields, the native CPU oracle,
+inverse identity products, singular/nonfinite/scaled/near-singular fixtures,
+failed refresh/recovery and in-place fallback. Run on an actual CUDA/HIP device;
+no usable device exits77. This focused qualification does not cover complex or
+mixed-precision execution.
+
+``PSIFORMER_GPU_SMALL_MATRIX_SPATIAL_TARGETS=1`` independently selects one block
+per(configuration,electron) for real spatial traces at sizes32--63 with at most
+N*N targets. It uses N*N doubles of dynamic shared memory per target block
+(15488bytes at N44), reusing the existing global matrix scratch for independent
+failure flags. Stream-ordered admission/finite scans and completion preserve
+configuration-wide status and clearing without status atomics or new owners.
+Unset/0 and unsupported dimensions preserve the previous spatial selection.
+The selector accepts only0 or1. The existing cooperative-spatial flag can remain
+set; the bounded target selection takes priority when admitted.
+
+``psiformer_device_spatial_trace_validation --small-targets-only`` checks N44,
+two configurations, D16/D64 and3/44 targets against both previous GPU routes
+bitwise and the native CPU tolerance. It also checks zero-weight derivative
+scans, singular/unavailable factors, nonfinite inputs, arithmetic overflow,
+configuration-wide clearing, failed refresh/recovery and zero hidden allocations.

@@ -83,11 +83,12 @@ inline void compareMetadata(const device_determinant::FactorizationMetadata& act
 } // namespace value_scale_validation
 
 /// Check the new scale map against its unchanged GPU map and native host factorization.
-inline void validateCooperativeValueScale(compute::Queue<PlatformKind::CUDA>& queue)
+inline void validateCooperativeValueScale(compute::Queue<PlatformKind::CUDA>& queue, bool small_matrices = false)
 {
   using namespace device_determinant;
   using namespace value_scale_validation;
-  constexpr const char* selector = "PSIFORMER_GPU_VALUE_LU_PARALLEL_SCALE";
+  const char* selector = small_matrices ? "PSIFORMER_GPU_SMALL_MATRIX_COOPERATIVE_LU" :
+      "PSIFORMER_GPU_VALUE_LU_PARALLEL_SCALE";
   RestoreOption restore_scale(selector);
   RestoreOption restore_inverse("PSIFORMER_GPU_COOPERATIVE_LU_INVERSE");
   // A fast-math executable startup may set host FTZ/DAZ even for this strict TU.
@@ -109,9 +110,14 @@ inline void validateCooperativeValueScale(compute::Queue<PlatformKind::CUDA>& qu
     }
   } restore_floating_environment;
   ::setenv("PSIFORMER_GPU_COOPERATIVE_LU_INVERSE", "1", 1);
-  for (const std::size_t n : {2u, 63u, 64u, 65u, 100u, 200u, 300u})
+  const std::vector<std::size_t> sizes = small_matrices ? std::vector<std::size_t>{44, 44} :
+      std::vector<std::size_t>{2, 63, 64, 65, 100, 200, 300};
+  std::size_t fixture_index = 0;
+  for (const std::size_t n : sizes)
   {
-    constexpr std::size_t batch = 2, determinants = 10, count = batch * determinants;
+    const std::size_t batch = small_matrices ? 8 : 2;
+    const std::size_t determinants = small_matrices ? (fixture_index++ == 0 ? 16 : 64) : 10;
+    const std::size_t count = batch * determinants;
     const auto elements = n * n;
     std::vector<double> input(count * elements);
     for (std::size_t m = 0; m < count; ++m)
@@ -240,6 +246,22 @@ inline void validateCooperativeValueScale(compute::Queue<PlatformKind::CUDA>& qu
         }
       }
 
+      if (small_matrices && inverse)
+      {
+        // Exercise the inverse's matrix-product consumer independently of factor parity.
+        // These regular channels include swapped and extreme uniformly scaled inputs.
+        for (const std::size_t m : {0u, 1u, 10u, 11u})
+          for (std::size_t row = 0; row < n; ++row)
+            for (std::size_t column = 0; column < n; ++column)
+            {
+              CompensatedSumBinary64 product;
+              for (std::size_t inner = 0; inner < n; ++inner)
+                product.add(input[m * elements + row * n + inner] *
+                            actual_inverse[m * elements + inner * n + column]);
+              compareDouble(product.value(), row == column ? 1.0 : 0.0, false, "inverse identity consumer");
+            }
+      }
+
       // A failed refresh must overwrite successful old contents, then recover exactly.
       auto failed = input;
       failed[0] = std::numeric_limits<double>::quiet_NaN();
@@ -289,7 +311,7 @@ inline void validateCooperativeValueScale(compute::Queue<PlatformKind::CUDA>& qu
         for (std::size_t m = 0; m < count; ++m)
           compareMetadata(alias_metadata[m], reference_metadata[m], true);
       }
-      std::cout << "PASS cooperative_VALUE_scale Ne=" << n << " matrices=" << count << " inverse=" << inverse
+      std::cout << (small_matrices ? "PASS small_matrix_cooperative_LU Ne=" : "PASS cooperative_VALUE_scale Ne=") << n << " matrices=" << count << " inverse=" << inverse
                 << " exact_GPU_LU_permutation_metadata_inverse native_CPU zero_hidden_owner failed_refresh_recovery\n";
     }
   }

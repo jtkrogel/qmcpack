@@ -598,6 +598,191 @@ __global__ void determinantSpatialTracesCooperativeKernel(
   }
 }
 
+// Bounded target parallelism uses existing scratch only for per-target failure flags.
+__global__ void determinantSpatialTargetsPrepareKernel(
+    device_determinant::SpatialLayout layout,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights, const double* inverses,
+    const double* matrix_gradients, const double* matrix_laplacians,
+    device_determinant::DerivativeStatus* status)
+{
+  using device_determinant::DerivativeStatus;
+  const auto configuration = std::size_t(blockIdx.x);
+  const auto n = layout.matrix_size;
+  const auto elements = n * n;
+  const auto channels = layout.determinant_count;
+  const auto channel_elements = channels * elements;
+  const auto* weights = normalized_weights + configuration * channels;
+  const auto* inverse_base = inverses + configuration * channel_elements;
+  const auto* gradients = matrix_gradients + configuration * layout.gradient_configuration_stride;
+  const auto* laplacians = matrix_laplacians + configuration * layout.laplacian_configuration_stride;
+  __shared__ unsigned int admission, nonfinite_input;
+  if (threadIdx.x == 0)
+  {
+    admission = static_cast<unsigned int>(device_determinant::derivativeAvailability(
+        factorization_metadata + configuration * channels, combination_metadata[configuration], weights, channels));
+    nonfinite_input = 0;
+  }
+  __syncthreads();
+  if (admission == static_cast<unsigned int>(DerivativeStatus::AVAILABLE))
+  {
+    // Scan every logical derivative, including zero-weight channels; skip only
+    // their unavailable inverse. Padding between configurations is not input.
+    bool finite = true;
+    for (std::size_t entry = threadIdx.x; entry < channel_elements; entry += blockDim.x)
+      if (weights[entry / elements] != 0.0 && !device_determinant::isFiniteBinary64(inverse_base[entry]))
+        finite = false;
+    for (std::size_t entry = threadIdx.x; entry < layout.gradient_lanes * channel_elements; entry += blockDim.x)
+      if (!device_determinant::isFiniteBinary64(gradients[entry]))
+        finite = false;
+    for (std::size_t entry = threadIdx.x; entry < layout.electron_count * channel_elements; entry += blockDim.x)
+      if (!device_determinant::isFiniteBinary64(laplacians[entry]))
+        finite = false;
+    if (!finite)
+      atomicExch(&nonfinite_input, 1U);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && nonfinite_input)
+    admission = static_cast<unsigned int>(DerivativeStatus::NONFINITE_INPUT_OR_RESULT);
+  __syncthreads();
+  if (threadIdx.x == 0)
+    status[configuration] = static_cast<DerivativeStatus>(admission);
+}
+
+__global__ void determinantSpatialTargetsKernel(
+    device_determinant::SpatialLayout layout,
+    const double* normalized_weights, const double* inverses,
+    const double* matrix_gradients, const double* matrix_laplacians,
+    double* matrix_product_scratch, double* output_log_gradient,
+    double* output_lap_ratio, double* output_lap_log,
+    const device_determinant::DerivativeStatus* status)
+{
+  using device_determinant::CompensatedSumBinary64;
+  using device_determinant::DerivativeStatus;
+  const auto configuration = std::size_t(blockIdx.x) / layout.electron_count;
+  const auto electron = std::size_t(blockIdx.x) % layout.electron_count;
+  const auto n = layout.matrix_size;
+  const auto elements = n * n;
+  const auto channels = layout.determinant_count;
+  const auto channel_elements = channels * elements;
+  const auto* weights = normalized_weights + configuration * channels;
+  const auto* inverse_base = inverses + configuration * channel_elements;
+  const auto* gradients = matrix_gradients + configuration * layout.gradient_configuration_stride;
+  const auto* laplacians = matrix_laplacians + configuration * layout.laplacian_configuration_stride;
+  extern __shared__ double product[];
+  auto* gradient_output = output_log_gradient + configuration * layout.gradient_lanes;
+  auto* ratio_output = output_lap_ratio + configuration * layout.electron_count;
+  auto* log_output = output_lap_log + configuration * layout.electron_count;
+  __shared__ unsigned int admission;
+  if (threadIdx.x == 0)
+  {
+    admission = static_cast<unsigned int>(status[configuration]);
+    // Existing N*N scratch has one exclusive flag per target; no shared status writes.
+    matrix_product_scratch[configuration * elements + electron] = 0.0;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && admission == static_cast<unsigned int>(DerivativeStatus::AVAILABLE))
+    for (std::size_t lane = 3 * electron; lane < 3 * electron + 3; ++lane)
+    {
+      CompensatedSumBinary64 combined;
+      for (std::size_t channel = 0; channel < channels; ++channel)
+        if (weights[channel] != 0.0)
+          combined.add(weights[channel] * device_determinant::traceProductBinary64(
+              inverse_base + channel * elements, gradients + lane * channel_elements + channel * elements, n));
+      gradient_output[lane] = combined.value();
+      if (!device_determinant::isFiniteBinary64(gradient_output[lane]))
+        admission = static_cast<unsigned int>(DerivativeStatus::NONFINITE_INPUT_OR_RESULT);
+    }
+  __syncthreads();
+  if (admission == static_cast<unsigned int>(DerivativeStatus::AVAILABLE))
+  {
+    CompensatedSumBinary64 combined_laplacian;
+    for (std::size_t channel = 0; channel < channels; ++channel)
+    {
+      if (weights[channel] == 0.0)
+        continue;
+      const auto* inverse = inverse_base + channel * elements;
+      CompensatedSumBinary64 bracket;
+      if (threadIdx.x == 0)
+        bracket.add(device_determinant::traceProductBinary64(
+            inverse, laplacians + electron * channel_elements + channel * elements, n));
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const auto* gradient = gradients + (3 * electron + dimension) * channel_elements + channel * elements;
+        for (std::size_t entry = threadIdx.x; entry < elements; entry += blockDim.x)
+        {
+          const auto row = entry / n, column = entry % n;
+          CompensatedSumBinary64 value;
+          for (std::size_t inner = 0; inner < n; ++inner)
+            value.add(inverse[row * n + inner] * gradient[inner * n + column]);
+          product[entry] = value.value();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+          const auto trace = device_determinant::traceProductBinary64(inverse, gradient, n);
+          bracket.add(trace * trace);
+          bracket.add(-device_determinant::traceProductBinary64(product, product, n));
+        }
+        // The signed-square reader must finish before reusing the product.
+        __syncthreads();
+      }
+      if (threadIdx.x == 0)
+        combined_laplacian.add(weights[channel] * bracket.value());
+    }
+    if (threadIdx.x == 0)
+    {
+      ratio_output[electron] = combined_laplacian.value();
+      CompensatedSumBinary64 squared_gradient;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const auto component = gradient_output[3 * electron + dimension];
+        squared_gradient.add(component * component);
+      }
+      log_output[electron] = ratio_output[electron] - squared_gradient.value();
+      if (!device_determinant::isFiniteBinary64(ratio_output[electron]) ||
+          !device_determinant::isFiniteBinary64(log_output[electron]))
+        admission = static_cast<unsigned int>(DerivativeStatus::NONFINITE_INPUT_OR_RESULT);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    matrix_product_scratch[configuration * elements + electron] =
+        admission == static_cast<unsigned int>(DerivativeStatus::AVAILABLE) ? 0.0 : 1.0;
+}
+
+/// Complete the stream-ordered target launch before publishing configuration status.
+__global__ void determinantSpatialTargetsCompleteKernel(
+    device_determinant::SpatialLayout layout, const double* target_failures,
+    double* output_log_gradient, double* output_lap_ratio, double* output_lap_log,
+    device_determinant::DerivativeStatus* status)
+{
+  using device_determinant::DerivativeStatus;
+  const auto configuration = std::size_t(blockIdx.x);
+  __shared__ unsigned int admission;
+  if (threadIdx.x == 0)
+  {
+    admission = static_cast<unsigned int>(status[configuration]);
+    if (admission == static_cast<unsigned int>(DerivativeStatus::AVAILABLE))
+      for (std::size_t electron = 0; electron < layout.electron_count; ++electron)
+        if (target_failures[configuration * layout.matrix_size * layout.matrix_size + electron] != 0.0)
+          admission = static_cast<unsigned int>(DerivativeStatus::NONFINITE_INPUT_OR_RESULT);
+    status[configuration] = static_cast<DerivativeStatus>(admission);
+  }
+  __syncthreads();
+  if (admission != static_cast<unsigned int>(DerivativeStatus::AVAILABLE))
+  {
+    for (std::size_t lane = threadIdx.x; lane < layout.gradient_lanes; lane += blockDim.x)
+      output_log_gradient[configuration * layout.gradient_lanes + lane] = 0.0;
+    for (std::size_t electron = threadIdx.x; electron < layout.electron_count; electron += blockDim.x)
+    {
+      output_lap_ratio[configuration * layout.electron_count + electron] = 0.0;
+      output_lap_log[configuration * layout.electron_count + electron] = 0.0;
+    }
+  }
+}
+
 __global__ void determinantFactorJetsKernel(
     LiftedDeterminantLayout layout,
     const device_determinant::FactorizationMetadata* factorization_metadata,
@@ -805,7 +990,8 @@ Error launchDeterminantFactorization(
 
   const char* cooperative_inverse = std::getenv("PSIFORMER_GPU_COOPERATIVE_LU_INVERSE");
   if (prepare_inverse && cooperative_inverse && cooperative_inverse[0] == '1' &&
-      cooperative_inverse[1] == '\0' && matrix_size >= 64 && matrices != lu &&
+      cooperative_inverse[1] == '\0' &&
+      supportsCooperativeLuSize(matrix_size, configuredSmallMatrixCooperativeLu()) && matrices != lu &&
       matrix_count <= static_cast<std::size_t>(std::numeric_limits<int>::max()))
   {
     const auto error = launchDeterminantValueFactorizationCooperative(stream, matrices,
@@ -847,8 +1033,8 @@ Error launchDeterminantValueFactorizationCooperative(
   (void)checkedProduct(count, matrix_size, "PsiFormer cooperative VALUE permutation extent overflow");
   if (!matrices || !lu || !permutation || !metadata)
     throw std::invalid_argument("PsiFormer cooperative VALUE requires matrix/LU/permutation/metadata storage");
-  // Keep small matrices and the pre-existing in-place contract on the scalar path.
-  if (matrix_size < 64 || matrices == lu)
+  // Keep the pre-existing in-place contract and unselected sizes on the scalar path.
+  if (!supportsCooperativeLuSize(matrix_size, configuredSmallMatrixCooperativeLu()) || matrices == lu)
     return launchDeterminantFactorization(stream, matrices, configuration_count,
         determinant_count, matrix_size, false, lu, nullptr, permutation, nullptr, metadata);
   if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -1068,7 +1254,42 @@ Error launchDeterminantSpatialTraces(
   const unsigned int block_count = static_cast<unsigned int>(
       (layout.configuration_count + determinant_block_size - 1) / determinant_block_size);
   const char* cooperative = std::getenv("PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES");
-  if (cooperative && cooperative[0] == '1' && cooperative[1] == '\0' && layout.electron_count != 0)
+  const char* target_option = std::getenv("PSIFORMER_GPU_SMALL_MATRIX_SPATIAL_TARGETS");
+  if (target_option && !(target_option[0] == '0' && target_option[1] == '\0') &&
+      !(target_option[0] == '1' && target_option[1] == '\0'))
+    throw std::invalid_argument("PSIFORMER_GPU_SMALL_MATRIX_SPATIAL_TARGETS must be 0 or 1");
+  if (target_option && target_option[0] == '1' && layout.matrix_size >= 32 && layout.matrix_size < 64 &&
+      layout.electron_count != 0 && layout.electron_count <= matrix_elements)
+  {
+    const auto target_blocks = checkedProduct(layout.configuration_count, layout.electron_count,
+        "PsiFormer determinant spatial target grid overflow");
+    if (target_blocks > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::length_error("PsiFormer determinant spatial target grid exceeds portable CUDA/HIP x dimension");
+    // N<=63 bounds dynamic product storage below32KiB (N44:15488bytes).
+    const auto shared_bytes = checkedProduct(matrix_elements, sizeof(double),
+        "PsiFormer determinant spatial target shared-memory overflow");
+    determinantSpatialTargetsPrepareKernel<<<static_cast<unsigned int>(layout.configuration_count),
+        determinant_block_size, 0, stream>>>(layout, factorization_metadata, combination_metadata,
+        normalized_weights, inverses, matrix_gradients, matrix_laplacians, status);
+#ifdef QMC_CUDA2HIP
+    if (const auto error = hipPeekAtLastError(); error != success) return error;
+#else
+    if (const auto error = cudaPeekAtLastError(); error != success) return error;
+#endif
+    determinantSpatialTargetsKernel<<<static_cast<unsigned int>(target_blocks), determinant_block_size,
+        shared_bytes, stream>>>(layout, normalized_weights,
+        inverses, matrix_gradients, matrix_laplacians, matrix_product_scratch,
+        output_log_gradient, output_lap_ratio, output_lap_log, status);
+#ifdef QMC_CUDA2HIP
+    if (const auto error = hipPeekAtLastError(); error != success) return error;
+#else
+    if (const auto error = cudaPeekAtLastError(); error != success) return error;
+#endif
+    determinantSpatialTargetsCompleteKernel<<<static_cast<unsigned int>(layout.configuration_count),
+        determinant_block_size, 0, stream>>>(layout, matrix_product_scratch,
+        output_log_gradient, output_lap_ratio, output_lap_log, status);
+  }
+  else if (cooperative && cooperative[0] == '1' && cooperative[1] == '\0' && layout.electron_count != 0)
     determinantSpatialTracesCooperativeKernel<<<static_cast<unsigned int>(layout.configuration_count),
                                                determinant_block_size, 0, stream>>>(
         layout, factorization_metadata, combination_metadata, normalized_weights,
