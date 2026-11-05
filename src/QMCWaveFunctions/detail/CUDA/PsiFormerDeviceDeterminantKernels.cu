@@ -26,7 +26,7 @@ constexpr unsigned int determinant_block_size = 128;
 /** One block per VALUE matrix, preserving scalar pivot order and per-cell arithmetic.
  * Shared control is POD; global LU/permutation/metadata are the existing owners.
  */
-template<bool parallel_scale>
+template<bool parallel_scale, bool shared_matrix = false>
 __global__ void determinantValueCooperativeKernel(
     const double* matrices, std::size_t matrix_size, double* all_lu,
     std::size_t* all_permutations, device_determinant::FactorizationMetadata* metadata)
@@ -34,7 +34,9 @@ __global__ void determinantValueCooperativeKernel(
   const std::size_t matrix = blockIdx.x;
   const std::size_t elements = matrix_size * matrix_size;
   const double* input = matrices + matrix * elements;
-  double* lu = all_lu + matrix * elements;
+  double* global_lu = all_lu + matrix * elements;
+  extern __shared__ double local_matrix[];
+  double* lu = shared_matrix ? local_matrix : global_lu;
   std::size_t* permutation = all_permutations + matrix * matrix_size;
   __shared__ double scale, phase, log_abs, min_pivot, max_pivot, pivot;
   __shared__ std::size_t pivot_row;
@@ -117,6 +119,12 @@ __global__ void determinantValueCooperativeKernel(
   __syncthreads();
   if (state != 0)
   {
+    if constexpr (shared_matrix)
+    {
+      for (std::size_t element = threadIdx.x; element < elements; element += blockDim.x)
+        global_lu[element] = lu[element];
+      __syncthreads();
+    }
     if (threadIdx.x == 0)
     {
       device_determinant::FactorizationMetadata result;
@@ -181,6 +189,13 @@ __global__ void determinantValueCooperativeKernel(
       const std::size_t entry = column + 1 + cell % remaining;
       lu[row * matrix_size + entry] -= lu[row * matrix_size + column] * lu[column * matrix_size + entry];
     }
+    __syncthreads();
+  }
+  // Publish the identical complete/partially factored bank before metadata.
+  if constexpr (shared_matrix)
+  {
+    for (std::size_t element = threadIdx.x; element < elements; element += blockDim.x)
+      global_lu[element] = lu[element];
     __syncthreads();
   }
   if (threadIdx.x == 0)
@@ -1040,7 +1055,23 @@ Error launchDeterminantValueFactorizationCooperative(
   if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::length_error("PsiFormer cooperative VALUE grid exceeds the portable CUDA/HIP x dimension");
   const char* parallel_scale = std::getenv("PSIFORMER_GPU_VALUE_LU_PARALLEL_SCALE");
-  if (parallel_scale && parallel_scale[0] == '1' && parallel_scale[1] == '\0')
+  const bool parallel = parallel_scale && parallel_scale[0] == '1' && parallel_scale[1] == '\0';
+  const char* shared_option = std::getenv("PSIFORMER_GPU_SMALL_MATRIX_LU_SHARED");
+  if (shared_option && std::string_view(shared_option) != "0" && std::string_view(shared_option) != "1")
+    throw std::invalid_argument("PSIFORMER_GPU_SMALL_MATRIX_LU_SHARED must be 0 or 1");
+  const bool shared = shared_option && shared_option[0] == '1' && matrix_size >= 32 && matrix_size < 64;
+  if (shared)
+  {
+    const auto bytes = checkedProduct(checkedProduct(matrix_size, matrix_size,
+        "Shared LU matrix extent overflow"), sizeof(double), "Shared LU byte extent overflow");
+    if (parallel)
+      determinantValueCooperativeKernel<true, true><<<static_cast<unsigned int>(count), determinant_block_size, bytes, stream>>>(
+          matrices, matrix_size, lu, permutation, metadata);
+    else
+      determinantValueCooperativeKernel<false, true><<<static_cast<unsigned int>(count), determinant_block_size, bytes, stream>>>(
+          matrices, matrix_size, lu, permutation, metadata);
+  }
+  else if (parallel)
     determinantValueCooperativeKernel<true><<<static_cast<unsigned int>(count), determinant_block_size, 0, stream>>>(
         matrices, matrix_size, lu, permutation, metadata);
   else
