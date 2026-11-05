@@ -155,6 +155,11 @@ public:
             preparation_.active_inference_crowds == 1 && image_->plan().modelShape().electrons() >= 64 &&
             image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
             supportsLazyRealInferenceEnvironment(image_->plan().environment())),
+        ecp_projection_requested_(configuredEcpValueProjectedBackflow()),
+        ecp_projection_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
+            lazy_spatial && preparation_.active_inference_crowds == 1 &&
+            image_->plan().environment().boundary == BoundaryCondition::OPEN &&
+            supportsLazyRealInferenceEnvironment(image_->plan().environment())),
         inference_concurrency_(preparation_.active_inference_crowds),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
@@ -173,6 +178,8 @@ public:
     }
     else if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
+    if (ecp_projection_requested_ && !ecp_projection_eligible_)
+      throw std::invalid_argument("ECP VALUE projection hints require single-crowd lazy real OPEN FP64");
     if (sparse_envelope_requested_ && !sparse_envelope_eligible_)
       std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=profile_or_automatic_target_selection\n";
     if (pair_geometry_requested_ && !pair_geometry_eligible_)
@@ -395,10 +402,11 @@ public:
     return evaluateTile(workspace, mode, coordinates, size, parameter_version, nullptr);
   }
 
-  /// Freeze hint storage only for the bounded ordinary legacy Gamma FP64 route.
+  /// Freeze hint storage for the separately admitted envelope/projection policies.
   bool sparseValueHintsRequested() const noexcept override
   {
-    return sparse_envelope_requested_ && sparse_envelope_eligible_;
+    return (sparse_envelope_requested_ && sparse_envelope_eligible_) ||
+        (ecp_projection_requested_ && ecp_projection_eligible_);
   }
 
   /// Request only the narrow cold pair policy, independently of anchor reuse.
@@ -1331,6 +1339,8 @@ private:
   const bool pair_geometry_eligible_;
   const bool sparse_envelope_requested_;
   const bool sparse_envelope_eligible_;
+  const bool ecp_projection_requested_;
+  const bool ecp_projection_eligible_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;

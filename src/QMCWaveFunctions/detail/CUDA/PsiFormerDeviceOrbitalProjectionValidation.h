@@ -287,6 +287,7 @@ inline void validateOrbitalDeterminantBatches()
         const auto before = metrics.snapshot();
         projectOpenOrbitalJets(blas, layout, x.data(), wu.data(), wd.data(), old_output.data());
         bank.project(blas, queue.getNative(), layout, x.data(), wu.data(), wd.data(), new_output.data());
+        bank.projectAllConfigurations(blas, queue.getNative(), layout, x.data(), wu.data(), wd.data(), new_output.data());
         queue.sync();
         const auto after = metrics.snapshot();
         if (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls ||

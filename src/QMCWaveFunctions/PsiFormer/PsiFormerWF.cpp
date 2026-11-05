@@ -5312,6 +5312,29 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::thread::id scalar_value_acquisition_thread;
   mutable std::atomic<bool> scalar_value_borrow_active{false};
 
+  /// Select only the dedicated virtual VALUE owner; ordinary spatial owners are unchanged.
+  static std::size_t ecpValueTileCapacity()
+  {
+    const char* value = std::getenv("PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY");
+    if (!value)
+      return 16;
+    std::size_t capacity = 0;
+    if (*value == '\0')
+      throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY must be a positive decimal integer");
+    for (const char* digit = value; *digit; ++digit)
+    {
+      if (*digit < '0' || *digit > '9')
+        throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY must be a positive decimal integer");
+      const auto entry = static_cast<std::size_t>(*digit - '0');
+      if (capacity > (std::numeric_limits<std::size_t>::max() - entry) / 10)
+        throw std::length_error("PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY overflows size_t");
+      capacity = capacity * 10 + entry;
+    }
+    if (capacity == 0)
+      throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY must be positive");
+    return capacity;
+  }
+
   /// Pass actual driver topology, not the backend's concurrency limit.
   void noteLargeScorePreparation(bool declared_single_crowd) const
   {
@@ -5361,7 +5384,7 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
       if (dedicated_value16 && !ecp_value_workspace)
       {
         auto candidate = model_state->direct_batch_executor.makeWorkspace();
-        candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, 16);
+        candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, ecpValueTileCapacity());
         candidate->prepareSparseValueContext();
         ecp_value_workspace = std::move(candidate);
       }
@@ -5434,7 +5457,7 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
     if (!ecp_value_workspace)
     {
       auto candidate = model_state->direct_batch_executor.makeWorkspace();
-      candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, 16);
+      candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, ecpValueTileCapacity());
       ecp_value_workspace = std::move(candidate);
     }
     return *ecp_value_workspace;

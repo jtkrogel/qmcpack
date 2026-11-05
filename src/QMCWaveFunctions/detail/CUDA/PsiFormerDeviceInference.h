@@ -24,6 +24,7 @@
 #include "PsiFormerDeviceCanonicalHead.h"
 #include "PsiFormerDeviceInverseCertificate.h"
 #include "PsiFormerDeviceSpatial.h"
+#include "PsiFormerDeviceOrbitalProjection.h"
 #include "PsiFormerDeviceSpatialTraces.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
@@ -556,6 +557,15 @@ inline bool configuredPeriodicValuePairGeometry()
   if (std::string_view(value) == "1")
     return true;
   throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_PAIR_GEOMETRY must be 0 or 1");
+}
+
+/// Select the separately admitted ordinary ECP VALUE projection.
+inline bool configuredEcpValueProjectedBackflow()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW must be 0 or 1");
 }
 
 /// Freeze optional ordinary REAL request-local envelope reuse at backend preparation.
@@ -1849,6 +1859,12 @@ private:
 #endif
       deviceMemoryMetrics(sparse_envelope_->descriptors.deviceOrdinal()).uploaded(bytes);
     }
+    // The VALUE matrix bank is not consumed until extraction, so it can hold
+    // the independent affine projection while the orbital output is produced.
+    if (ecp_projected_backflow_active_)
+      ecp_value_projection_->projectAllConfigurations(blas_, stream, orbitals_, a_.data(),
+          parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
+          matrices_.data());
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
     if (periodic_value_pairs_)
       checkRuntime(launchPeriodicOrbitalValuesPairGeometry(stream, orbitals_, *model_->periodicCell(),
@@ -1869,7 +1885,7 @@ private:
           value_tape_.empty() ? nullptr : retained_backflow_.data(),
           value_tape_.empty() ? nullptr : retained_envelope_.data(), nullptr,
           sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}), "model periodic orbital VGL");
-    else if (usesTiledValueOrbitals())
+    else if (usesTiledValueOrbitals() && !ecp_projected_backflow_active_)
       checkRuntime(launchOpenOrbitalValuesTiled(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
@@ -1882,7 +1898,8 @@ private:
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
         active_.data(), orbitalStorage().data(), open_status_.data(),
         value_tape_.empty() ? nullptr : retained_backflow_.data(),
-          value_tape_.empty() ? nullptr : retained_envelope_.data()), "model open orbital VGL");
+          value_tape_.empty() ? nullptr : retained_envelope_.data(),
+        ecp_projected_backflow_active_ ? matrices_.data() : nullptr), "model open orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
     // This existing physical admission is the only capture publication boundary.
     // The request wrapper revokes it if any later determinant/result stage fails.
@@ -2476,6 +2493,31 @@ public:
       std::size_t logical_begin, const std::size_t* reference_indices,
       const std::size_t* changed_electrons, std::size_t count)
   {
+    ecp_projected_backflow_active_ = false;
+    const char* selection = std::getenv("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW");
+    if (selection && std::string_view(selection) != "0" && std::string_view(selection) != "1")
+      throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW must be 0 or 1");
+    if (selection && std::string_view(selection) == "1" && owner && generation && references &&
+        reference_indices && changed_electrons && count && count <= batch_capacity_)
+    {
+      const auto& environment = plan_.environment();
+      if (mode_ != SpatialJetMode::VALUE_ONLY || !value_tape_.empty() || mixed_dense_ ||
+          retained_targets_ || kinetic_trunk_only_ || environment.boundary != BoundaryCondition::OPEN ||
+          environment.amplitude_scalar_domain != ScalarDomain::REAL ||
+          environment.parameter_scalar_domain != ScalarDomain::REAL ||
+          environment.compute_scalar_domain != ScalarDomain::REAL)
+        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN FP64 VALUE");
+      if (!ecp_value_projection_)
+      {
+        auto capacity = orbitals_;
+        capacity.features.configuration_count = capacity.orbitals.configuration_count = batch_capacity_;
+        ecp_value_projection_ = std::make_unique<PreparedDeviceOrbitalProjection>(capacity);
+        std::clog << "PsiFormer ECP VALUE projection: grouped_configurations=1 capacity="
+                  << batch_capacity_ << " pointer_bytes=" << ecp_value_projection_->deviceBytes()
+                  << " numerical_storage=reused_matrix_bank\n";
+      }
+      ecp_projected_backflow_active_ = true;
+    }
     if (!sparse_envelope_)
       return;
     auto& anchor = *sparse_envelope_;
@@ -2529,6 +2571,7 @@ public:
   /// Last-tile completion, dense calls, exceptions and rebind all revoke reuse.
   void endSparseEnvelopeTile(bool completed, bool last) noexcept
   {
+    ecp_projected_backflow_active_ = false;
     if (!sparse_envelope_)
       return;
     sparse_envelope_->tile = {};
@@ -2757,6 +2800,7 @@ public:
     add(checkedDeviceBytes<OpenSpatialStatus>(cusp_state_status_.capacity()));
     add(checkedDeviceBytes<InferenceStatusWord>(sticky_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
+    if (ecp_value_projection_) add(ecp_value_projection_->deviceBytes());
     if (parallel_traces_) add(parallel_traces_->deviceWorkspaceBytes());
     if (periodic_value_tiling_)
     {
@@ -3256,6 +3300,8 @@ private:
     std::size_t generation = 0, requests_r1 = 0, requests_multiple = 0, potential_rows = 0;
     bool ready = false;
   };
+  std::unique_ptr<PreparedDeviceOrbitalProjection> ecp_value_projection_;
+  bool ecp_projected_backflow_active_ = false;
   std::unique_ptr<SparseEnvelopeAnchor> sparse_envelope_;
   /// Optional cold-owned tape; all stages overwrite their live prefix before consumption.
   struct PeriodicValueTilingScratch

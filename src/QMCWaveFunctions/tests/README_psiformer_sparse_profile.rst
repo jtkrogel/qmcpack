@@ -180,3 +180,56 @@ two configurations, D16/D64 and3/44 targets against both previous GPU routes
 bitwise and the native CPU tolerance. It also checks zero-weight derivative
 scans, singular/unavailable factors, nonfinite inputs, arithmetic overflow,
 configuration-wide clearing, failed refresh/recovery and zero hidden allocations.
+
+Dedicated ECP VALUE batch capacity
+----------------------------------
+
+With ``PSIFORMER_GPU_ECP_VALUE_TILE16=1``, the optional strict-positive-decimal
+``PSIFORMER_GPU_ECP_VALUE_TILE_CAPACITY`` selects the dedicated virtual VALUE
+capacity. Unset retains16. It does not change ordinary sampler/FULL capacity,
+ECP quadrature, logical virtual-point counts, or existing domain/reuse admission.
+The outer Hamiltonian virtual-point tile remains independently bounded at256;
+requested capacities above its effective request size do not imply that occupancy.
+Malformed, zero or overflowing enabled capacity selections fail explicitly.
+Compare the completed maximum occupancy and physical memory, not only the option.
+
+Grouped ECP orbital projection
+------------------------------
+
+``PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW=1`` admits ordinary, lazy,
+single-crowd real OPEN FP64 virtual VALUE requests to a grouped BLAS orbital
+projection. Unset/0 preserves the previous route; malformed selections and
+unsupported explicit backend configurations fail. This is independent of the
+periodic envelope-anchor policy. Retained derivatives, mixed precision and
+periodic/complex requests are outside this selector's supported domain.
+
+Independent configurations, jet planes and determinants share one pointer-batched
+BLAS call per occupied spin. Pointer arrays are refreshed from the current model
+on every request; no host numerical pointer bank is uploaded. Projection output
+reuses the existing VALUE matrix bank before determinant extraction. At N44,
+D64 and capacity264 the three device pointer banks occupy811008 bytes. Their
+capacity is included in device workspace accounting. Logical tails, current
+parameter addresses and request/error completion retain their own boundaries.
+
+The projection validation compares grouped and previous projections against CPU
+results, including padded layouts and empty-spin cases. Different FP64 reduction
+association can change roundoff; stochastic optimization trajectories need not
+remain identical over aggressive updates. Compare fixed-input evaluations and
+controlled nonzero updates as well as complete-unit work and timings.
+
+Small-matrix VALUE LU storage
+-----------------------------
+
+``PSIFORMER_GPU_SMALL_MATRIX_LU_SHARED=1`` selects a block-local shared-memory
+LU working matrix for dimensions32 through63. Unset/0 and other dimensions retain
+the global working matrix. The existing global LU owner still receives the full
+or partially factored matrix before status publication, including early failure
+paths. The N44 shared matrix occupies15488 bytes per block; this changes transient
+on-chip storage, not the persistent global allocation count. Invalid selections
+fail. Pivot order, per-cell arithmetic and permutation semantics are preserved.
+
+This selector is independent of ``PSIFORMER_GPU_VALUE_LU_PARALLEL_SCALE=1``;
+their interaction should be measured with complete units rather than inferred
+from isolated kernel timings. The small-LU validator checks scalar GPU and CPU
+results, inverse on/off, scaled/singular/nonfinite matrices, failure recovery and
+allocation ownership. Explicit selectors remain off by default.

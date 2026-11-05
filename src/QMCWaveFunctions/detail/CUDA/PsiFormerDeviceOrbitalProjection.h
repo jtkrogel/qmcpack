@@ -106,6 +106,50 @@ public:
     }
   }
 
+  /// All independent configurations/planes share one batched call per spin.
+  void projectAllConfigurations(AcceleratorBlasHandle& handle, Stream stream, const OpenOrbitalJetLayout& layout,
+      const double* features, const double* up, const double* down, double* output) const
+  {
+    const auto spin_count = (layout.spin_up_count != 0) +
+        (layout.spin_up_count != layout.features.electron_count);
+    const auto matrices = entryCount(layout) / spin_count;
+    if (matrices > std::size_t(std::numeric_limits<int>::max()))
+      throw std::length_error("Grouped orbital projection exceeds batched BLAS count");
+    validateOrbitalProjectionStream(handle, stream);
+    if (!layout.features.configuration_count ||
+        layout.features.configuration_count > capacity_.features.configuration_count ||
+        layout.features.plane_count > capacity_.features.plane_count ||
+        layout.features.electron_count != capacity_.features.electron_count ||
+        layout.determinant_count != capacity_.determinant_count ||
+        layout.spin_up_count != capacity_.spin_up_count || layout.feature_width != capacity_.feature_width ||
+        layout.feature_row_stride != capacity_.feature_row_stride ||
+        layout.orbital_row_stride != capacity_.orbital_row_stride ||
+        layout.orbital_determinant_stride != capacity_.orbital_determinant_stride ||
+        layout.backflow_feature_stride != capacity_.backflow_feature_stride ||
+        layout.backflow_determinant_stride != capacity_.backflow_determinant_stride ||
+        spatialJetSpanElements(layout.features) > spatialJetSpanElements(capacity_.features) ||
+        spatialJetSpanElements(layout.orbitals) > spatialJetSpanElements(capacity_.orbitals) ||
+        !features || !output || output == features || output == up || output == down ||
+        (layout.spin_up_count && !up) ||
+        (layout.spin_up_count != layout.features.electron_count && !down))
+      throw std::invalid_argument("Orbital projection exceeds its prepared pointer/layout capacity");
+    checkRuntime(launchOrbitalProjectionPointers(stream, layout, features, up, down, output,
+        weights_.data(), source_.data(), output_.data()), "orbital projection current pointers");
+    std::size_t bank_spin = 0;
+    for (std::size_t spin = 0; spin < 2; ++spin)
+    {
+      const auto rows = spin ? layout.features.electron_count - layout.spin_up_count : layout.spin_up_count;
+      if (!rows)
+        continue;
+      const DenseForwardLayout dense{rows, layout.feature_width, layout.features.electron_count,
+          layout.feature_row_stride, layout.backflow_feature_stride, layout.orbital_row_stride};
+      const auto offset = bank_spin * matrices;
+      projectOrbitalDeterminantsBatched(handle, dense, matrices,
+          weights_.data() + offset, source_.data() + offset, output_.data() + offset);
+      ++bank_spin;
+    }
+  }
+
   /// Count actual DEVICE capacities; no HOST numeric pointer bank exists.
   std::size_t deviceBytes() const noexcept
   {
