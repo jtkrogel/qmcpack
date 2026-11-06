@@ -97,10 +97,10 @@ inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& p
   const auto n = plan.modelShape().electrons();
   if (batched_projection)
   {
-    if (!allow_pair_check || n < 64 || e.periodic_profile || !e.fixed_nuclei ||
+    if (!allow_pair_check || e.periodic_profile || !e.fixed_nuclei ||
         e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
         !std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
-      throw std::invalid_argument("Batched paired heads require ordinary fixed legacy-torus FP64 Ne>=64");
+      throw std::invalid_argument("Batched paired heads require ordinary fixed legacy-torus FP64");
     const auto spins = (plan.modelShape().spin_up_electrons != 0) +
         (plan.modelShape().spin_up_electrons != n);
     cost.projection_pointer_bytes = spatial_detail::checkedProduct(std::size_t(2),
@@ -503,7 +503,7 @@ private:
       const auto* down = parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT, part);
       auto* output = projections_.data() + component * cost_.matrices;
       if (projection_banks_[component])
-        projection_banks_[component]->project(t.blas_, t.queue_.getNative(), t.orbitals_, t.a_.data(), up, down, output);
+        projection_banks_[component]->projectAllConfigurations(t.blas_, t.queue_.getNative(), t.orbitals_, t.a_.data(), up, down, output);
       else
         projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), up, down, output);
     }
@@ -777,8 +777,13 @@ private:
         cost.pair_event_bytes != sizeof(std::uint64_t)))
       throw std::invalid_argument("Retained score pair check requires one complete SCORE event owner");
     if (cost.projection_pointer_bytes)
+    {
       for (auto& bank : projection_banks_)
         bank = std::make_unique<PreparedDeviceOrbitalProjection>(trunk_->orbitals_);
+      std::clog << "PsiFormer paired VALUE projection: grouped_determinants=1 grouped_configurations=1"
+                << " capacity=" << capacity << " pointer_device_bytes=" << cost.projection_pointer_bytes
+                << " pointer_host_bytes=0\n";
+    }
     if (cost.periodic_geometry.device_bytes)
       trunk_->prepareTiledPeriodicValueGeometry(cost.periodic_geometry);
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +

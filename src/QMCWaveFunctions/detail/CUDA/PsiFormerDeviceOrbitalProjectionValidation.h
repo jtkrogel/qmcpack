@@ -137,27 +137,93 @@ inline void validateBatchedHeadFullOwner(bool inverse_columns = false)
 }
 
 /// Exercise actual Ne64 paired owners, exact costs, successor refresh and nodes.
-inline void validateBatchedHeadOwner()
+inline void validateBatchedHeadOwner(std::size_t ne = 64, std::size_t determinants = 16)
 {
-  const auto descriptors = makeTargetCostPlan(64, true, true);
-  const auto initialized = initializePsiFormerParameters(descriptors.modelShape(), 1729,
+  const auto descriptors = makeTargetCostPlan(ne, true, true);
+  auto shape = descriptors.modelShape();
+  if (ne == 44) { shape.spin_up_electrons = 26; shape.spin_down_electrons = 18; }
+  auto initialized = initializePsiFormerParameters(shape, 1729,
       PSIFORMER_COMPLEX_PERIODIC_V1, descriptors.environment());
+  if (determinants != shape.determinants)
+  {
+    // Expand the canonical D16 fixture using native tensor roles/layouts.
+    // New real/imaginary channels get distinct small perturbations; the trunk
+    // and finite envelope coefficients retain their original conditioning.
+    const PsiFormerExecutionPlan original(shape, initialized.layouts, initialized.environment);
+    const auto old_channels = shape.determinants * ne, channels = determinants * ne;
+    std::vector<ParameterLayoutInput> layouts;
+    std::vector<double> values;
+    for (const auto& tensor : original.parameterTensors())
+    {
+      auto dimensions = tensor.shape;
+      const bool backflow = tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT ||
+          tensor.role == ParameterRole::BACKFLOW_DOWN_WEIGHT;
+      const bool envelope = tensor.role == ParameterRole::ENVELOPE_PI_UP ||
+          tensor.role == ParameterRole::ENVELOPE_PI_DOWN || tensor.role == ParameterRole::ENVELOPE_ZETA_UP ||
+          tensor.role == ParameterRole::ENVELOPE_ZETA_DOWN;
+      if (backflow) dimensions[1] = channels;
+      if (envelope) dimensions[0] = channels;
+      std::size_t count = 1;
+      for (auto dimension : dimensions)
+        count = spatial_detail::checkedProduct(count, dimension, "Paired head fixture extent overflow");
+      const auto begin = values.size();
+      for (std::size_t i = 0; i < count; ++i)
+      {
+        const auto source = backflow ? (i / channels) * old_channels + (i % channels) % old_channels :
+            envelope ? ((i / shape.nuclei) % old_channels) * shape.nuclei + i % shape.nuclei : i;
+        double value = initialized.values[tensor.begin + source];
+        if (backflow && i % channels >= old_channels)
+        {
+          const double component = tensor.head_component == HeadTensorComponent::IMAG ? .37 : .13;
+          const double spin = tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT ? .11 : .29;
+          value += 1e-5 * std::sin(.017 * double(i / channels + 1) * double(i % channels + 1) + component + spin);
+        }
+        values.push_back(value);
+      }
+      layouts.push_back({tensor.module, tensor.name, dimensions, begin, values.size()});
+    }
+    initialized.model_shape.determinants = determinants;
+    initialized.layouts = std::move(layouts);
+    initialized.values = std::move(values);
+  }
   const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, initialized.environment);
-  std::vector<double> nuclei(3 * plan.modelShape().nuclei), positions(3 * 64 * 3);
+  std::vector<double> nuclei(3 * plan.modelShape().nuclei), positions(3 * ne * 3);
   for (std::size_t i = 0; i < nuclei.size(); ++i) nuclei[i] = .23 + .071 * i;
   const double irrational[3]{.6180339887498948, .4142135623730951, .7320508075688772};
   for (std::size_t b = 0; b < 3; ++b)
-    for (std::size_t e = 0; e < 64; ++e)
+    for (std::size_t e = 0; e < ne; ++e)
       for (std::size_t d = 0; d < 3; ++d)
       {
         const double fraction = (e + 1) * irrational[d] + .13 * (d + 1) + .017 * b;
-        positions[b * 192 + 3 * e + d] = 8 * (fraction - std::floor(fraction));
+        positions[b * 3 * ne + 3 * e + d] = 8 * (fraction - std::floor(fraction));
       }
   compute::Queue<PlatformKind::CUDA> queue;
   AcceleratorBlasHandle blas(queue);
   auto image = PreparedDeviceModel::preparePairedComplexValue(plan, initialized.values, nuclei);
   const auto old_cost = estimateComplexValueCost(plan, 3);
   const auto cost = estimateComplexValueCost(plan, 3, true, false, true);
+  // Grouping remains restricted to ordinary physical VALUE roles and the
+  // admitted fixed legacy torus. Geometry-policy rejection is independent of Ne.
+  bool rejected_role = false;
+  try { (void)estimateComplexValueCost(plan, 3, false, false, true); }
+  catch (const std::invalid_argument&) { rejected_role = true; }
+  if (!rejected_role)
+    throw std::runtime_error("Grouped paired projection admitted a retained VALUE role");
+  for (int policy = 0; policy < 2; ++policy)
+  {
+    auto environment = initialized.environment;
+    if (policy == 0) environment.fixed_nuclei = false;
+    else environment.periodic_axes[2] = false;
+    bool rejected_policy = false;
+    try
+    {
+      const PsiFormerExecutionPlan invalid(plan.modelShape(), initialized.layouts, environment);
+      (void)estimateComplexValueCost(invalid, 3, true, false, true);
+    }
+    catch (const std::invalid_argument&) { rejected_policy = true; }
+    if (!rejected_policy)
+      throw std::runtime_error("Grouped paired projection admitted an unsupported geometry policy");
+  }
   if (cost.device_bytes - old_cost.device_bytes != cost.projection_pointer_bytes ||
       cost.host_bytes != old_cost.host_bytes || !cost.projection_pointer_bytes)
     throw std::runtime_error("Batched head per-domain preflight is inconsistent");
@@ -181,7 +247,7 @@ inline void validateBatchedHeadOwner()
     throw std::runtime_error("Batched head actual owner differs from preflight");
   std::size_t comparisons = 0;
   const auto compare = [&](std::size_t live) {
-    const std::vector<double> input(positions.begin(), positions.begin() + live * 192);
+    const std::vector<double> input(positions.begin(), positions.begin() + live * 3 * ne);
     ordinary->evaluate(input);batched->evaluate(input);
     std::vector<ComplexValueResult> a(live), b(live);
     ordinary->download(ordinary->resultView(), a);batched->download(batched->resultView(), b);
@@ -216,7 +282,7 @@ inline void validateBatchedHeadOwner()
       std::fill(parameters.begin() + tensor.begin, parameters.begin() + tensor.end, 0);
   auto node = successor->makeUpdatedImage(parameters, 2);
   ordinary->rebindModel(node);batched->rebindModel(node);compare(1);
-  std::cout << "PASS batched paired Ne64 owner comparisons=" << comparisons
+  std::cout << "PASS batched paired owner Ne=" << ne << " D=" << determinants << " comparisons=" << comparisons
             << " cost_minus_one_noalloc=1 liveB=3,1,2 rebind=1 node=1 device_pointer_bytes="
             << cost.projection_pointer_bytes << " host_pointer_bytes=0\n";
 }
@@ -228,11 +294,20 @@ inline void validateOrbitalDeterminantBatches()
   AcceleratorBlasHandle blas(queue);
   std::size_t comparisons = 0;
   double max_cpu = 0, max_old = 0;
+  struct Case { SpatialJetMode mode; std::size_t ne, determinants, spin_up; };
+  std::vector<Case> cases;
   for (const auto mode : {SpatialJetMode::VALUE_ONLY, SpatialJetMode::FULL_VGL})
     for (const auto spin_up : {std::size_t(0), std::size_t(3), std::size_t(7)})
+      cases.push_back({mode, 7, 3, spin_up});
+  for (const std::size_t determinants : {16, 64})
+    cases.push_back({SpatialJetMode::VALUE_ONLY, 44, determinants, 26});
+  for (const auto& test : cases)
     {
-      // Ragged spins, non-power-of-two D/B, padded source/weights/output, full/target tails.
-      auto capacity = makeOpenOrbitalJetLayout(3, 3, 7, 2, 5, spin_up, mode, 8, 9, 65, 10, 31);
+      const auto mode = test.mode;
+      const auto spin_up = test.spin_up, ne = test.ne, determinants = test.determinants;
+      // Ragged spins, N44 D16/D64, padded source/weights/output, full/target tails.
+      auto capacity = makeOpenOrbitalJetLayout(3, determinants, ne, 2, 5, spin_up, mode,
+          8, ne + 2, ne * (ne + 2) + 2, ne + 3, determinants * (ne + 3) + 1);
       std::vector<double> features(spatialJetSpanElements(capacity.features));
       std::vector<double> up(openOrbitalBackflowSpan(capacity)), down(up.size());
       const auto output_size = spatialJetSpanElements(capacity.orbitals);
@@ -243,11 +318,11 @@ inline void validateOrbitalDeterminantBatches()
         down[i] = .29 * std::sin(.19 * (i + 3));
       }
       DeviceBuffer<double> x(features.size()), wu(up.size()), wd(down.size());
-      DeviceBuffer<double> old_output(output_size), new_output(output_size);
+      DeviceBuffer<double> old_output(output_size), new_output(output_size), determinant_output(output_size);
       x.upload(features.data(), features.size());wu.upload(up.data(), up.size());wd.upload(down.data(), down.size());
       PreparedDeviceOrbitalProjection bank(capacity);
-      const auto bytes = orbitalProjectionPointerBytes(3, capacity.features.plane_count, 3,
-          (spin_up != 0) + (spin_up != 7));
+      const auto bytes = orbitalProjectionPointerBytes(3, capacity.features.plane_count, determinants,
+          (spin_up != 0) + (spin_up != ne));
       if (bank.deviceBytes() != bytes)
         throw std::runtime_error("Batched orbital pointer cost differs from actual capacity");
       auto bad = capacity;
@@ -268,8 +343,9 @@ inline void validateOrbitalDeterminantBatches()
           layout.features = withSpatialTargetRange(layout.features, 4, 3);
           layout.orbitals = withSpatialTargetRange(layout.orbitals, 4, 3);
         }
-        std::vector<double> cpu(output_size, -.125), old(cpu), observed(cpu);
+        std::vector<double> cpu(output_size, -.125), old(cpu), observed(cpu), determinant_observed(cpu);
         old_output.upload(old.data(), old.size());new_output.upload(observed.data(), observed.size());
+        determinant_output.upload(determinant_observed.data(), determinant_observed.size());
         forEachOpenOrbitalProjection(layout, [&](const OpenOrbitalProjectionSlice& slice) {
           const auto& dense = slice.dense;
           const auto& weights = slice.spin_up ? up : down;
@@ -286,7 +362,7 @@ inline void validateOrbitalDeterminantBatches()
         auto& metrics = deviceMemoryMetrics(x.deviceOrdinal());
         const auto before = metrics.snapshot();
         projectOpenOrbitalJets(blas, layout, x.data(), wu.data(), wd.data(), old_output.data());
-        bank.project(blas, queue.getNative(), layout, x.data(), wu.data(), wd.data(), new_output.data());
+        bank.project(blas, queue.getNative(), layout, x.data(), wu.data(), wd.data(), determinant_output.data());
         bank.projectAllConfigurations(blas, queue.getNative(), layout, x.data(), wu.data(), wd.data(), new_output.data());
         queue.sync();
         const auto after = metrics.snapshot();
@@ -294,12 +370,15 @@ inline void validateOrbitalDeterminantBatches()
             before.upload_calls != after.upload_calls)
           throw std::runtime_error("Warm determinant batching allocated or uploaded pointer storage");
         old_output.download(old.data(), old.size());new_output.download(observed.data(), observed.size());
+        determinant_output.download(determinant_observed.data(), determinant_observed.size());
         for (std::size_t i = 0; i < observed.size(); ++i)
         {
           const auto ce = std::abs(observed[i] - cpu[i]), oe = std::abs(observed[i] - old[i]);
+          const auto de = std::abs(determinant_observed[i] - cpu[i]);
           max_cpu = std::max(max_cpu, ce);max_old = std::max(max_old, oe);
           if (!std::isfinite(observed[i]) || ce > 2e-12 * (1 + std::abs(cpu[i])) ||
-              oe > 2e-12 * (1 + std::abs(old[i])))
+              oe > 2e-12 * (1 + std::abs(old[i])) || !std::isfinite(determinant_observed[i]) ||
+              de > 2e-12 * (1 + std::abs(cpu[i])))
             throw std::runtime_error("Determinant batching changed logical projection or padding");
           ++comparisons;
         }
@@ -309,6 +388,9 @@ inline void validateOrbitalDeterminantBatches()
             << " max_cpu=" << max_cpu << " max_old_gpu=" << max_old
             << " warm_allocations=0 warm_uploads=0 B_tail=1 target_tail=1 empty_spins=1\n";
   validateBatchedHeadOwner();
+  validateBatchedHeadOwner(8, 16);
+  validateBatchedHeadOwner(44, 16);
+  validateBatchedHeadOwner(44, 64);
   validateBatchedHeadFullOwner();
 }
 } // namespace qmcplusplus::psiformer::device
