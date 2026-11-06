@@ -1883,7 +1883,8 @@ private:
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
           active_.data(), orbitalStorage().data(), open_status_.data(),
           value_tape_.empty() ? nullptr : retained_backflow_.data(),
-          value_tape_.empty() ? nullptr : retained_envelope_.data(), nullptr,
+          value_tape_.empty() ? nullptr : retained_envelope_.data(),
+          ecp_projected_backflow_active_ ? matrices_.data() : nullptr,
           sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}), "model periodic orbital VGL");
     else if (usesTiledValueOrbitals() && !ecp_projected_backflow_active_)
       checkRuntime(launchOpenOrbitalValuesTiled(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
@@ -2501,12 +2502,17 @@ public:
         reference_indices && changed_electrons && count && count <= batch_capacity_)
     {
       const auto& environment = plan_.environment();
+      const bool periodic = environment.boundary == BoundaryCondition::PERIODIC &&
+          environment.fixed_nuclei && !environment.periodic_profile && model_->periodicCell() &&
+          environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+          environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
       if (mode_ != SpatialJetMode::VALUE_ONLY || !value_tape_.empty() || mixed_dense_ ||
-          retained_targets_ || kinetic_trunk_only_ || environment.boundary != BoundaryCondition::OPEN ||
+          retained_targets_ || kinetic_trunk_only_ || periodic_value_pairs_ ||
+          (environment.boundary != BoundaryCondition::OPEN && !periodic) ||
           environment.amplitude_scalar_domain != ScalarDomain::REAL ||
           environment.parameter_scalar_domain != ScalarDomain::REAL ||
           environment.compute_scalar_domain != ScalarDomain::REAL)
-        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN FP64 VALUE");
+        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN or fixed legacy-torus FP64 VALUE without pair geometry");
       if (!ecp_value_projection_)
       {
         auto capacity = orbitals_;

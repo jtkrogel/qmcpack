@@ -197,11 +197,15 @@ Grouped ECP orbital projection
 ------------------------------
 
 ``PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW=1`` admits ordinary, lazy,
-single-crowd real OPEN FP64 virtual VALUE requests to a grouped BLAS orbital
+single-crowd real OPEN or fixed legacy Gamma FP64 virtual VALUE requests to a grouped BLAS orbital
 projection. Unset/0 preserves the previous route; malformed selections and
 unsupported explicit backend configurations fail. This is independent of the
-periodic envelope-anchor policy. Retained derivatives, mixed precision and
-periodic/complex requests are outside this selector's supported domain.
+periodic envelope-anchor policy. Gamma retains its periodic features and envelopes;
+ordinary fixed ``PERIODIC_TORUS_V1`` with all axes periodic and no optional periodic
+profile is admitted. Alternate periodic pair geometry, retained derivatives, mixed
+precision and complex requests are outside this selector's supported domain.
+The periodic orbital consumer computes canonical envelopes when projection is
+active, retaining the existing optional-anchor admission and physical diagnostics.
 
 Independent configurations, jet planes and determinants share one pointer-batched
 BLAS call per occupied spin. Pointer arrays are refreshed from the current model

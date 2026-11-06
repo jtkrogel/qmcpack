@@ -174,6 +174,135 @@ struct RealEnvelopeValidationAccess
     runPairGeometry(queue);
   }
 
+  /// Compare the ordinary molecular/Gamma owner at the shared projection boundary.
+  static void runProjection(compute::Queue<PlatformKind::CUDA>& queue)
+  {
+    const char* key = "PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW";
+    const std::optional<std::string> previous = std::getenv(key)
+        ? std::optional<std::string>(std::getenv(key)) : std::nullopt;
+    struct Restore
+    {
+      const char* key;
+      const std::optional<std::string>& previous;
+      ~Restore() { if (previous) setenv(key, previous->c_str(), 1); else unsetenv(key); }
+    } restore{key, previous};
+    std::size_t comparisons = 0;
+    double maximum = 0.;
+    for (const bool periodic : {false, true})
+      for (const std::size_t determinants : {16, 64})
+      {
+        ExecutionEnvironment environment;
+        if (periodic)
+        {
+          environment.boundary = BoundaryCondition::PERIODIC;
+          environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+          environment.lattice_vectors = {{{80., .3, .1}, {0., 80., .2}, {.1, 0., 80.}}};
+          environment.periodic_axes = {true, true, true};
+        }
+        const ModelShape shape{26, 18, 44, determinants, 64, 4, 1};
+        auto parameters = mixed_periodic_validation::parameters(environment, shape);
+        const auto plan = PsiFormerExecutionPlan::fromParameters(parameters, shape, environment);
+        constexpr std::size_t ne = 44;
+        std::vector<double> nuclei(3 * ne), positions(3 * ne * 3);
+        for (std::size_t e = 0; e < ne; ++e)
+          for (std::size_t d = 0; d < 3; ++d)
+          {
+            const auto grid = d == 0 ? e % 4 : d == 1 ? (e / 4) % 4 : e / 16;
+            nuclei[3 * e + d] = 1. + 6. * grid;
+            for (std::size_t b = 0; b < 3; ++b)
+              positions[b * 3 * ne + 3 * e + d] = nuclei[3 * e + d] + .06 + .02 * d + .001 * b;
+          }
+        auto image = std::make_shared<PreparedDeviceModel>(plan, parameters.flat_values(), nuclei, 0);
+        AcceleratorBlasHandle blas(queue);
+        PreparedDeviceInference scalar(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
+        PreparedDeviceInference candidate(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
+        setenv(key, "1", 1);
+        PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE,
+            DeviceExecutionPreparation{}, true);
+        if (!backend.sparseValueHintsRequested())
+          throw std::runtime_error("REAL ECP backend did not admit Gamma projection hints");
+        setenv(key, "0", 1);
+        const auto compare = [&](std::size_t live, bool translate) {
+          std::vector<double> input(positions.begin(), positions.begin() + live * 3 * ne);
+          if (translate)
+            for (std::size_t d = 0; d < 3; ++d)
+              input[d] += environment.lattice_vectors[0][d];
+          scalar.evaluate(input);
+          const std::size_t refs[]{0, 1, 0}, moved[]{ne, ne, 4};
+          setenv(key, "1", 1);
+          candidate.beginSparseEnvelopeTile(&candidate, 1, 2, 0, refs, moved, live);
+          if (!candidate.ecp_projected_backflow_active_)
+            throw std::runtime_error("REAL ECP projection did not activate");
+          try { candidate.evaluate(input); candidate.endSparseEnvelopeTile(true, true); }
+          catch (...) { candidate.endSparseEnvelopeTile(false, true); throw; }
+          if (candidate.ecp_projected_backflow_active_)
+            throw std::runtime_error("REAL ECP projection escaped tile lifetime");
+          const auto count = spatialJetSpanElements(candidate.orbitals_.orbitals);
+          std::vector<double> a(count), b(count);
+          scalar.orbitalStorage().download(a.data(), count);
+          candidate.orbitalStorage().download(b.data(), count);
+          for (std::size_t i = 0; i < count; ++i)
+          {
+            const auto error = std::abs(a[i] - b[i]);
+            maximum = std::max(maximum, error);
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || error > 2e-12 * (1 + std::abs(a[i])))
+              throw std::runtime_error("REAL ECP projected orbitals differ from scalar contraction");
+            ++comparisons;
+          }
+          const auto download = [](PreparedDeviceInference& graph) {
+            mixed_periodic_validation::Output result;
+            const auto& layout = graph.resultLayout();
+            result.phases.resize(layout.configuration_count);
+            result.jets.resize(spatialJetSpanElements(layout));
+            result.ratios.resize(layout.configuration_count * layout.laplacian_lanes);
+            graph.downloadResults(result.phases, result.jets, result.ratios);
+            return result;
+          };
+          const auto first = download(scalar), second = download(candidate);
+          for (std::size_t i = 0; i < first.phases.size(); ++i)
+            if (first.phases[i] != second.phases[i] ||
+                !std::isfinite(second.jets[i]) || std::abs(first.jets[i] - second.jets[i]) > 2e-10)
+              throw std::runtime_error("REAL ECP projection changed sign or amplitude");
+          setenv(key, "0", 1);
+        };
+        compare(3, false); // Cold pointer preparation precedes warm-allocation proof.
+        const auto before = deviceMemoryMetrics(candidate.positions_.deviceOrdinal()).snapshot();
+        for (const std::size_t live : {1, 2, 3}) compare(live, periodic);
+        const auto after = deviceMemoryMetrics(candidate.positions_.deviceOrdinal()).snapshot();
+        if (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls)
+          throw std::runtime_error("Warm REAL ECP projection allocated scratch");
+        auto changed = parameters.flat_values();
+        for (const auto& tensor : plan.parameterTensors())
+          if (tensor.role == ParameterRole::BACKFLOW_UP_WEIGHT || tensor.role == ParameterRole::BACKFLOW_DOWN_WEIGHT)
+            changed[tensor.begin] += .0001;
+        auto successor = image->makeUpdatedImage(changed, 1);
+        scalar.rebindModel(successor);
+        candidate.rebindModel(successor);
+        compare(2, false);
+        const std::size_t refs[]{0}, moved[]{ne};
+        setenv(key, "1", 1);
+        candidate.beginSparseEnvelopeTile(nullptr, 1, 1, 0, refs, moved, 1);
+        if (candidate.ecp_projected_backflow_active_)
+          throw std::runtime_error("REAL ECP projection admitted absent request owner");
+        candidate.endSparseEnvelopeTile(false, true);
+        // Physical failures revoke the result even when projection was selected.
+        candidate.beginSparseEnvelopeTile(&candidate, 2, 1, 0, refs, moved, 1);
+        auto broken = std::vector<double>(positions.begin(), positions.begin() + 3 * ne);
+        broken.back() = std::numeric_limits<double>::quiet_NaN();
+        bool failed = false;
+        try { candidate.evaluate(broken); }
+        catch (const std::runtime_error&) { failed = true; }
+        candidate.endSparseEnvelopeTile(false, true);
+        if (!failed || candidate.result_valid_ || candidate.ecp_projected_backflow_active_)
+          throw std::runtime_error("REAL ECP projection exposed failed physical outputs");
+        setenv(key, "0", 1);
+        compare(1, false); // Recovery must not inherit an invalid projection/request.
+      }
+    std::cout << "PASS real_ecp_projection N44 spin26_18 D16_D64 molecule_Gamma liveB3_1_2"
+              << " translated_images rebind request_lifetime physical_failure recovery warm0 comparisons=" << comparisons
+              << " max_orbital_error=" << maximum << "\n";
+  }
+
   /// Exercise the production selector/owners independently of the orbital component.
   static void runPairGeometry(compute::Queue<PlatformKind::CUDA>& queue)
   {

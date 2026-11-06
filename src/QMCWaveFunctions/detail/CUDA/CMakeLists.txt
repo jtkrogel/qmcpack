@@ -161,7 +161,10 @@ if(QMC_CUDA2HIP)
 else()
   set_target_properties(psiformer_device_periodic_validation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
-target_link_libraries(psiformer_device_periodic_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
+target_link_libraries(psiformer_device_periodic_validation PRIVATE psiformer_device qmcutil IO::HDF5 platform_LA)
+if(QMC_OMP)
+  target_link_libraries(psiformer_device_periodic_validation PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # Focused mixed affine primal/derivative oracle, independent of unrelated fixture parsers.
 add_executable(psiformer_device_mixed_affine_validation EXCLUDE_FROM_ALL
