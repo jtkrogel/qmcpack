@@ -175,6 +175,11 @@ struct RetainedCrowdSamples
   // ParticleSet copies share SimulationCell; retain the numeric observation cell.
   std::vector<std::array<double, 12>> replay_cell_twist;
   std::vector<int> replay_boundary;
+#ifdef QMC_COMPLEX
+  std::vector<wftrain::DerivativeValue> paired_local_energies;
+  std::optional<std::uint64_t> paired_energy_grid;
+  std::vector<PsiFormerComplexWF::ImmediateFullReplayContext> paired_replay_context;
+#endif
   psiformer::memory::HostCapacity trace_scalar_capacity;
   psiformer::memory::HostCapacity trace_particle_capacity;
 };
@@ -425,7 +430,8 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealGpuScoreBatchUnder
 
 /// The early factory copies fresh replay state but performs no derivatives or accepted-grid RNG.
 std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBatch(
-    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk)
+    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk,
+    const WFTrainDriverInput::ComplexGpuTraining* paired_gpu = nullptr)
 {
   const auto& electrons = crowd.get_walker_elecs();
   const auto& twfs = crowd.get_walker_twfs();
@@ -433,6 +439,22 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBa
   RefVectorWithLeader<TrialWaveFunction> wavefunctions(twfs[0], twfs);
   ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, particles);
   ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, wavefunctions);
+#ifdef QMC_COMPLEX
+  if (paired_gpu)
+  {
+    const auto& orbitals = twfs[0].get().getOrbitals();
+    const auto* paired = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+    if (!paired)
+      throw std::invalid_argument("Paired collected score requires its sole complex component");
+    const auto scope = PsiFormerComplexWF::GpuDerivativeScope::SCORE_ECP_ONLY;
+    chunk = std::min(chunk, paired->parameterSchema().parameterCount());
+    const auto required = paired->gpuDerivativeRequirements(
+        crowd.size(), crowd.size(), paired_gpu->kinetic_targets, chunk, scope);
+    return paired->makeBudgetedGpuDerivativeOperator(wavefunctions, particles, batch, offset,
+        crowd.size(), paired_gpu->kinetic_targets, chunk, required.device_bytes, required.host_bytes,
+        paired_gpu->maximum_matrix_work, scope);
+  }
+#endif
   return makeRealGpuScoreBatchUnderLocks(crowd, batch, offset, chunk);
 }
 
@@ -494,6 +516,12 @@ RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool ov
                                          walkers[sample].get().Properties(WalkerProperties::SIGN)});
       result.replay_cell_twist.push_back(immediateReplayCell(electrons[sample]));
       result.replay_boundary.push_back(electrons[sample].get().getLattice().getSuperCellEnum());
+#ifdef QMC_COMPLEX
+      const auto& orbitals = wavefunctions[sample].get().getOrbitals();
+      const auto* paired = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+      if (paired)
+        result.paired_replay_context.push_back(paired->immediateFullReplayContext());
+#endif
     }
     if (overlap)
       result.teachers.push_back(wavefunctions[sample].get().makeClone(*result.particles.back()));
@@ -569,6 +597,23 @@ private:
   wftrain::OrbitalLossNormalization normalization_;
 };
 
+#ifdef QMC_COMPLEX
+/// Adapt the saved physical G/L layout to the component's existing exact replay proof.
+bool canReusePairedCollectedFull(const PsiFormerComplexWF& component, const ParticleSet& live,
+    const ParticleSet& saved, const PsiFormerComplexWF::ImmediateFullReplayContext& context,
+    double log, double phase)
+{
+  if (saved.G.size() != saved.R.size() || saved.L.size() != saved.R.size())
+    return false;
+  std::vector<WaveFunctionComponent::ValueType> gradient;
+  gradient.reserve(3 * saved.R.size());
+  for (const auto& row : saved.G)
+    for (int d = 0; d < 3; ++d) gradient.push_back(row[d]);
+  std::vector<WaveFunctionComponent::ValueType> laplacian(saved.L.begin(), saved.L.end());
+  return component.canReuseImmediateFullSpatialReplay(live, saved, gradient, laplacian, context, log, phase);
+}
+#endif
+
 /** Replay a retained snapshot on resident clones and reconstruct coherent VGL.
  * Iterating snapshots in collection order leaves the live chains at their final
  * positions. No MC proposals or parameter publications occur during replay.
@@ -614,7 +659,7 @@ bool replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
   {
     const auto& twf = wavefunctions[sample].get();
     const auto& orbitals = twf.getOrbitals();
-    const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerWF*>(orbitals.front().get()) : nullptr;
+    const auto* component = orbitals.size() == 1 ? dynamic_cast<const ImmediateReplayComponent*>(orbitals.front().get()) : nullptr;
     const auto& captured = samples.replay_log_phase[sample];
     reuse_full = component && wftrain::isFiniteTrainingReal(captured[0]) && wftrain::isFiniteTrainingReal(captured[1]) &&
         wftrain::isFiniteTrainingReal(twf.getLogPsi()) && wftrain::isFiniteTrainingReal(twf.getPhase()) &&
@@ -626,8 +671,15 @@ bool replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
         wftrain::isFiniteTrainingReal(samples.local_energies[sample]) &&
         wftrain::isFiniteTrainingReal(walkers[sample].get().Properties(WalkerProperties::LOCALENERGY)) &&
         walkers[sample].get().Properties(WalkerProperties::LOCALENERGY) == samples.local_energies[sample] &&
+#ifdef QMC_COMPLEX
+        samples.paired_replay_context.size() == crowd.size() &&
+        samples.paired_replay_context[sample].version == *reuse_version &&
+        canReusePairedCollectedFull(*component, electrons[sample], *samples.particles[sample],
+                                   samples.paired_replay_context[sample], captured[0], captured[1]);
+#else
         component->canReuseFullSpatialReplay(electrons[sample], *samples.particles[sample],
                                              *reuse_version, captured[0], captured[1]);
+#endif
   }
   if (!reuse_full)
     TrialWaveFunction::mw_evaluateLog(wavefunction_batch, particle_batch);
@@ -959,6 +1011,98 @@ class ReplayOnlyECPSink final : public wftrain::ParameterReductionSink
 };
 
 #ifdef QMC_COMPLEX
+struct PairedCollectedEnergy
+{
+  std::size_t version;
+  std::uint64_t grid;
+  std::vector<wftrain::DerivativeValue> energies;
+  psiformer::memory::HostCapacity trace_capacity;
+};
+
+/// Assemble the paired local energy from native V and complete nonlocal scalar capture.
+std::vector<wftrain::DerivativeValue> completePairedLocalEnergies(
+    Crowd& crowd, wftrain::DerivativeArrayView<const wftrain::DerivativeValue> nonlocal)
+{
+  const auto& twfs = crowd.get_walker_twfs();
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& hamiltonians = crowd.get_walker_hamiltonians();
+  if (nonlocal.size() != static_cast<std::size_t>(crowd.size()))
+    throw std::logic_error("Paired nonlocal energy population differs from observation");
+  std::vector<wftrain::DerivativeValue> complete;
+  complete.reserve(crowd.size());
+  for (std::size_t sample = 0; sample < static_cast<std::size_t>(crowd.size()); ++sample)
+  {
+    const auto& orbitals = twfs[sample].get().getOrbitals();
+    const auto* paired = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+    if (!paired)
+      throw std::logic_error("Paired local energy requires its sole complex component");
+    auto& hamiltonian = hamiltonians[sample].get();
+    double reported_nonlocal = 0;
+    for (int term = 0; term < hamiltonian.size(); ++term)
+      if (const auto* nl = dynamic_cast<const NonLocalECPotential*>(hamiltonian.getComponent(term)))
+        reported_nonlocal += nl->getValue();
+    const auto tolerance = 512 * std::numeric_limits<double>::epsilon() *
+        (1 + std::abs(reported_nonlocal) + std::abs(nonlocal[sample].real()));
+    if (!wftrain::isFiniteTrainingReal(reported_nonlocal) ||
+        std::abs(reported_nonlocal - nonlocal[sample].real()) > tolerance)
+      throw std::logic_error("Scalar complex nonlocal energy differs from the native accepted real potential");
+    const auto observation = paired->observeCoulombEnergy(electrons[sample], hamiltonian.getLocalPotential());
+    // Native V contains Re(Vnl); restore only Im(Vnl) and the complete complex kinetic value.
+    const auto value = observation.local_energy + wftrain::DerivativeValue{0, nonlocal[sample].imag()};
+    if (!wftrain::isFiniteTrainingReal(value.real()) || !wftrain::isFiniteTrainingReal(value.imag()))
+      throw std::overflow_error("Scalar complete complex nonlocal energy is nonfinite");
+    complete.push_back(value);
+  }
+  return complete;
+}
+
+/// One native Hamiltonian traversal at the original observation, under P/WF/H locks.
+std::vector<QMCHamiltonian::FullPrecRealType> observePairedCollectedEnergy(
+    Crowd& crowd, std::size_t version, std::optional<PairedCollectedEnergy>& captured)
+{
+  const auto& twfs = crowd.get_walker_twfs();
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& hamiltonians = crowd.get_walker_hamiltonians();
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(twfs[0], twfs);
+  RefVectorWithLeader<ParticleSet> particles(electrons[0], electrons);
+  RefVectorWithLeader<QMCHamiltonian> hams(hamiltonians[0], hamiltonians);
+  auto componentAt = [&](std::size_t sample) -> const PsiFormerComplexWF& {
+    const auto& orbitals = twfs[sample].get().getOrbitals();
+    const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+    if (!component || component->immediateFullReplayContext().version != version || !component->gpuInferenceEnabled())
+      throw std::logic_error("Paired collection energy lost its accepted component/version");
+    return *component;
+  };
+  const auto& schema = componentAt(0).parameterSchema();
+  wftrain::NonLocalEnergyAccumulator energy(schema, version, 0, 0, crowd.size(),
+      electrons[0].get().getTotalNum(), wftrain::NonLocalEnergyAccumulator::requiredBytes(crowd.size()));
+  std::vector<wftrain::DerivativeValue> ones(crowd.size(), {1, 0});
+  const wftrain::VJPCoefficientChannel channel{wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+      wftrain::DerivativeProduct::LOCAL_ENERGY_VJP,
+      {schema.providerId(), schema.fingerprint(), version, 0, 0, {ones.data(), ones.size()}},
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)};
+  psiformer::memory::HostCapacity capture_scratch;
+  if (psiformer::memory::enabled())
+    capture_scratch.snapshotAt(__FILE__, __LINE__, "PairedCollectedEnergy::capture_scratch",
+        wftrain::NonLocalEnergyAccumulator::requiredBytes(crowd.size()) + ones.capacity() * sizeof(ones[0]),
+        reinterpret_cast<std::uintptr_t>(&crowd), 0, version);
+  ReplayOnlyECPSink sink;
+  auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hams, wavefunctions, particles, energy, {&channel, 1}, sink);
+  if (energy.gridFingerprint() != result.grid_fingerprint)
+    throw std::logic_error("Paired collection energy lost its accepted grid identity");
+  PairedCollectedEnergy observed{version, result.grid_fingerprint,
+      completePairedLocalEnergies(crowd, energy.energies())};
+  if (psiformer::memory::enabled())
+    observed.trace_capacity.snapshotAt(__FILE__, __LINE__, "PairedCollectedEnergy::complete_energy",
+        observed.energies.capacity() * sizeof(observed.energies[0]) + sizeof(observed.grid),
+        reinterpret_cast<std::uintptr_t>(&crowd), 0, version);
+  captured = std::move(observed);
+  return std::move(result.local_energies);
+}
+#endif
+
+#ifdef QMC_COMPLEX
 /// Conservative pre-cutoff bound from the actual ionic species and built PP grids.
 std::size_t pairedECPPointCapacity(const QMCHamiltonian& ham, const ParticleSet& electrons, std::size_t samples)
 {
@@ -1086,6 +1230,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       const auto native_cap = fixed_grid ? hamiltonians[0].get().nativeCaptureRequirements(samples).total_host_bytes : 0;
       const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, *consumer, {&channel, 1}, sink, native_cap);
+      if (work_counters)
+        work_counters->addHamiltonianEvaluations(result.local_energies.size(), result.local_energies.size());
       auto replay = consumer->releaseJVPReplay();
       if (replay->gridFingerprint() != result.grid_fingerprint)
         throw std::logic_error("Paired ECP accepted-grid identity changed before binding");
@@ -1171,33 +1317,15 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       auto& consumer = inline_consumer ? *inline_consumer : static_cast<wftrain::NonLocalECPDerivativeConsumer&>(*energy);
       const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, consumer, {&channel, 1}, sink);
+      if (work_counters)
+        work_counters->addHamiltonianEvaluations(result.local_energies.size(), result.local_energies.size());
       if (energy && energy->gridFingerprint() != result.grid_fingerprint)
         throw std::logic_error("Scalar nonlocal energy accepted-grid identity changed");
       const auto captured_energies = inline_consumer ? leader.capturedNonLocalEnergies(*inline_consumer) : energy->energies();
+      batch.local_energies = completePairedLocalEnergies(crowd, captured_energies);
       double maximum_imaginary_nonlocal = 0;
-      batch.local_energies.reserve(walkers.size());
-      for (std::size_t sample = 0; sample < walkers.size(); ++sample)
-      {
-        auto& hamiltonian = hamiltonians[sample].get();
-        const auto captured = captured_energies[sample];
-        double reported_nonlocal = 0;
-        for (int term = 0; term < hamiltonian.size(); ++term)
-          if (const auto* nonlocal = dynamic_cast<const NonLocalECPotential*>(hamiltonian.getComponent(term)))
-            reported_nonlocal += nonlocal->getValue();
-        const auto tolerance = 512 * std::numeric_limits<double>::epsilon() *
-            (1 + std::abs(reported_nonlocal) + std::abs(captured.real()));
-        if (!wftrain::isFiniteTrainingReal(reported_nonlocal) ||
-            std::abs(reported_nonlocal - captured.real()) > tolerance)
-          throw std::logic_error("Scalar complex nonlocal energy differs from the native accepted real potential");
-        // Native V already contains Re(Vnl). Restore only Im(Vnl), together with the actual complex kinetic value.
-        const auto observed = componentAt(sample).observeCoulombEnergy(
-            electrons[sample], hamiltonian.getLocalPotential());
-        const auto complete = observed.local_energy + wftrain::DerivativeValue{0, captured.imag()};
-        if (!wftrain::isFiniteTrainingReal(complete.real()) || !wftrain::isFiniteTrainingReal(complete.imag()))
-          throw std::overflow_error("Scalar complete complex nonlocal energy is nonfinite");
-        batch.local_energies.push_back(complete);
-        maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(captured.imag()));
-      }
+      for (const auto value : captured_energies)
+        maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(value.imag()));
       if (response) batch.additive_local_energy_vjp.emplace(response->release());
       app_log() << std::setprecision(17);
       if (capture_inline_ecp_vjp) app_log() << "WFTrain paired inline full-response ECP:";
@@ -3924,6 +4052,13 @@ void WFTrainBatched::run()
       prospective = checkedMemoryAdd(prospective, successor_bytes);
       prospective = checkedMemoryAdd(prospective, complex_fixed_grid_host_bytes);
       prospective = checkedMemoryAdd(prospective, complex_kfac_allowance);
+      // A score observation retains its paired energy and exact replay context
+      // while the eventual immutable score batch owns a separate energy vector.
+      if (complex_gpu_provider_ && wftrain::usesEnergyScoreEstimator(training_input_, true))
+        prospective = checkedMemoryAdd(prospective, checkedMemoryAdd(sizeof(std::uint64_t),
+            checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeValue) +
+                sizeof(PsiFormerComplexWF::ImmediateFullReplayContext) +
+                sizeof(std::array<double, 12>) + sizeof(std::array<double, 2>) + sizeof(int))));
       if (inline_ecp)
       {
         prospective = checkedMemoryAdd(prospective, inline_capture_bytes);
@@ -4277,6 +4412,20 @@ void WFTrainBatched::run()
       supportsCollectedScoreGeometry(*device_provider, population_.get_golden_electrons()) &&
       population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
       crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
+#elif defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  const bool sampled_score_reuse =
+      training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY && score_training &&
+      (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM || score_kfac_training) &&
+      complex_training && complex_gpu_provider_ && complex_training_component_ &&
+      !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
+      !vmcdriver_input_.get_use_drift() &&
+      vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
+      qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
+      complex_training_component_->gpuInferenceEnabled() &&
+      complex_training_component_->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+      population_.get_golden_twf().getOrbitals().size() == 1 &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+      crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
 #else
   constexpr bool sampled_score_reuse = false;
 #endif
@@ -4446,6 +4595,23 @@ void WFTrainBatched::run()
 
   wftrain::TrainingIterationState training_state{
       0, initial_version, selected_provider_->parameterSchema().fingerprint()};
+#ifdef QMC_COMPLEX
+  std::optional<PairedCollectedEnergy> collected_paired_energy;
+  if (sampled_score_reuse)
+    sampling_state.physical_energy_observe = [&](Crowd& crowd) {
+      if (&crowd != crowds_[0].get() || collected_paired_energy)
+        throw std::logic_error("Paired collection requires one unconsumed observation/crowd");
+      try
+      {
+        return observePairedCollectedEnergy(crowd, training_state.parameter_version, collected_paired_energy);
+      }
+      catch (...)
+      {
+        collected_paired_energy.reset();
+        throw;
+      }
+    };
+#endif
   const bool determinant_overlap =
       training_input_.getObjective() ==
       WFTrainDriverInput::Objective::DETERMINANT_OVERLAP;
@@ -4844,7 +5010,34 @@ void WFTrainBatched::run()
                   *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training,
                   (resident_adam_budget || resident_sr_budget.first || kfac_single_replay || sampled_score_reuse)
                       ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
-              const auto& snapshot = retained_samples.back();
+              auto& snapshot = retained_samples.back();
+#ifdef QMC_COMPLEX
+              if (sampled_score_reuse)
+              {
+                if (!collected_paired_energy || collected_paired_energy->version != training_state.parameter_version ||
+                    collected_paired_energy->energies.size() != snapshot.particles.size())
+                  throw std::logic_error("Paired collection retention requires its exact observed version/population");
+                snapshot.paired_local_energies = std::move(collected_paired_energy->energies);
+                snapshot.paired_energy_grid = collected_paired_energy->grid;
+                collected_paired_energy.reset();
+                if (psiformer::memory::enabled())
+                  snapshot.trace_scalar_capacity.snapshotAt(__FILE__, __LINE__, "RetainedCrowdSamples::scalar_vectors",
+                      snapshot.local_energies.capacity() * sizeof(double) +
+                      snapshot.replay_log_phase.capacity() * sizeof(snapshot.replay_log_phase[0]) +
+                      snapshot.replay_cell_twist.capacity() * sizeof(snapshot.replay_cell_twist[0]) +
+                      snapshot.replay_boundary.capacity() * sizeof(snapshot.replay_boundary[0]) +
+                      sizeof(*snapshot.paired_energy_grid) +
+                      snapshot.paired_local_energies.capacity() * sizeof(snapshot.paired_local_energies[0]) +
+                      snapshot.paired_replay_context.capacity() * sizeof(snapshot.paired_replay_context[0]),
+                      reinterpret_cast<std::uintptr_t>(crowds_[crowd_index].get()), crowd_index);
+              }
+              if (snapshot.paired_energy_grid)
+                retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes, sizeof(*snapshot.paired_energy_grid));
+              retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
+                  checkedMemoryAdd(checkedMemoryMultiply(snapshot.paired_local_energies.capacity(),
+                      sizeof(snapshot.paired_local_energies[0])), checkedMemoryMultiply(
+                      snapshot.paired_replay_context.capacity(), sizeof(snapshot.paired_replay_context[0]))));
+#endif
               if (work_counters)
                 work_counters->addRetainedConfigurations(snapshot.particles.size());
               if (snapshot.replay_version)
@@ -5151,9 +5344,9 @@ void WFTrainBatched::run()
             Crowd& crowd = *crowds_[samples.crowd_index];
             // KFAC reuses only FULL wavefunction state; ECP capture below still
             // evaluates its complete Hamiltonian and draws its accepted grid.
-            const bool resident_single_snapshot = (sampled_score_reuse || kfac_single_replay ||
+            const bool resident_single_snapshot = (sampled_score_reuse || (!complex_training && (kfac_single_replay ||
                 ((resident_adam_budget || resident_sr_budget.first) &&
-                 (!has_nonlocal_ecp || resident_device_authority_))) && !complex_training &&
+                 (!has_nonlocal_ecp || resident_device_authority_))))) &&
                 retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
             const bool fresh_full = replayCrowdSamples(crowd, samples, resident_single_snapshot
@@ -5172,19 +5365,36 @@ void WFTrainBatched::run()
               wftrain::PreparedEnergyGradientBatch batch;
               batch.weights.assign(samples.local_energies.size(), 1.0);
               batch.local_energy_term_mask = 0;
+#ifdef QMC_COMPLEX
+              if (!samples.paired_energy_grid || samples.paired_local_energies.size() != samples.local_energies.size())
+                throw std::logic_error("Paired score reuse requires complete accepted-grid energy");
+              for (const auto energy : samples.paired_local_energies)
+              {
+                if (!wftrain::isFiniteTrainingReal(energy.real()) || !wftrain::isFiniteTrainingReal(energy.imag()))
+                  throw std::logic_error("Paired collection energy reuse requires finite complete energies");
+                batch.local_energies.push_back(energy);
+              }
+#else
               for (const double energy : samples.local_energies)
               {
                 if (!wftrain::isFiniteTrainingReal(energy))
                   throw std::logic_error("Collection energy reuse requires finite accepted energies");
                 batch.local_energies.emplace_back(energy, 0.0);
               }
+#endif
               batch.derivative_operator = prepareImmediateGpuScoreBatch(
-                  crowd, batch_ordinal++, sample_offset, training_input_.getParameterChunkSize());
+                  crowd, batch_ordinal++, sample_offset, training_input_.getParameterChunkSize(),
+                  complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr);
               if (batch.derivative_operator->parameterVersion() != *samples.replay_version)
                 throw std::logic_error("Collection energy reuse observed a different parameter version");
               app_log() << "WFTrain collection energy reuse: version=" << *samples.replay_version
                         << " samples=" << samples.local_energies.size()
                         << " full_evaluations=0 hamiltonian_evaluations=0"
+#ifdef QMC_COMPLEX
+                        << " scalar_domain=complex paired_energy_grid=" << *samples.paired_energy_grid
+#else
+                        << " scalar_domain=real"
+#endif
                         << " score_kfac=" << score_kfac_training
                         << " score_ecp_full_handoff=" << score_ecp_full_handoff << std::endl;
               sample_offset += crowd.size();
@@ -7100,21 +7310,31 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
   // but does not consume spatial products or an energy at the publication boundary.
   // The next production observation rebuilds FULL before evaluating its Hamiltonian.
   // Keep other move, estimator, debug and parameter-authority paths unchanged.
-#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+#if !defined(MIXED_PRECISION)
+#ifdef QMC_COMPLEX
+  constexpr bool paired_refresh = true;
+  // GPU publication authority is the registered adapter, not the numerical component.
+  const auto* refresh_provider = complex_gpu_provider_ && selected_provider_ == complex_gpu_provider_.get()
+      ? complex_training_component_ : nullptr;
+  const bool refresh_provider_eligible = refresh_provider && refresh_provider->gpuInferenceEnabled() &&
+      refresh_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons());
+#else
+  constexpr bool paired_refresh = false;
   const auto* refresh_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+  const bool refresh_provider_eligible = refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
+      !refresh_provider->residentECPObservationEnabled() &&
+      supportsCollectedScoreGeometry(*refresh_provider, population_.get_golden_electrons());
+#endif
   const bool value_only_refresh =
       training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
       (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM ||
-       wftrain::usesKFACScoreEstimator(training_input_, false)) &&
-      wftrain::usesEnergyScoreEstimator(training_input_, false) &&
+       wftrain::usesKFACScoreEstimator(training_input_, paired_refresh)) &&
+      wftrain::usesEnergyScoreEstimator(training_input_, paired_refresh) &&
       !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
       !vmcdriver_input_.get_use_drift() &&
       vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
       qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
-      refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
-      !refresh_provider->residentECPObservationEnabled() &&
-      population_.get_golden_twf().getOrbitals().size() == 1 &&
-      supportsCollectedScoreGeometry(*refresh_provider, population_.get_golden_electrons());
+      refresh_provider_eligible && population_.get_golden_twf().getOrbitals().size() == 1;
 #else
   constexpr bool value_only_refresh = false;
 #endif

@@ -669,7 +669,11 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
     std::vector<QMCHamiltonian::FullPrecRealType> local_energies;
     {
       OptionalNativeTimerScope hamiltonian_timer(timers.hamiltonian_evaluation_api);
-      local_energies = ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
+      local_energies = sft.physical_energy_observe
+          ? sft.physical_energy_observe(crowd)
+          : ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
+      if (local_energies.size() != static_cast<std::size_t>(crowd.size()))
+        throw std::logic_error("Physical energy observer returned an inconsistent population");
     }
     if (timers.work_counters)
     {

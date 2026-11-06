@@ -58,6 +58,9 @@ public:
     bool evaluate_energy = true;
     /// A dedicated scalar observer may consume physical energies without scalar estimators.
     bool accumulate_estimators = true;
+    /// Optional physical observer; called under the ordinary P/WF/H resource locks.
+    /// Returns native real reporting energies and owns any additional paired observation.
+    std::function<std::vector<FullPrecRealType>(Crowd&)> physical_energy_observe;
     const bool serializing_crowd_walkers;
     // Explicit driver-owned scalar observer; native HOST particle/FULL state is dirty.
     bool resident_device_observation = false;

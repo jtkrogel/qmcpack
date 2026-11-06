@@ -3,6 +3,7 @@
 // See LICENSE file in top directory for details.
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_approx.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "QMCDrivers/tests/QMCDriverNewTestWrapper.h"
 #include "QMCDrivers/Crowd.h"
@@ -13,6 +14,8 @@
 #include "EstimatorInputDelegates.h"
 #include "SetupPools.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
+#include "QMCDrivers/WFTrain/TrainingWorkCounters.h"
+#include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCDrivers/WFTrain/OrbitalInferenceMoments.h"
 #include "QMCDrivers/WFTrain/ComplexOrbitalInferenceMoments.h"
 #include "Message/CommOperators.h"
@@ -90,7 +93,7 @@ public:
 
   void exerciseEnergy(const VMCDriverInput& vmc,
                       const std::shared_ptr<std::size_t>& physical,
-                      const std::shared_ptr<std::size_t>& auxiliary)
+                      const std::shared_ptr<std::size_t>& auxiliary, bool custom_observer = false)
   {
     ContextForSteps context(rngs_[0]);
     RefVector<ContextForSteps> contexts{context};
@@ -104,6 +107,18 @@ public:
     VMCBatchedSampling::Timers timers{timers_.resource_timer, timers_.movepbyp_timer, timers_.buffer_timer,
         timers_.hamiltonian_timer, timers_.collectables_timer, timers_.estimators_timer,
         [](Crowd&, std::string_view) {}};
+    wftrain::TrainingWorkCounters work;
+    timers.work_counters = &work;
+    std::size_t observation_calls = 0;
+    CHECK_FALSE(state.physical_energy_observe);
+    if (custom_observer)
+      state.physical_energy_observe = [&](Crowd& crowd) {
+        ++observation_calls;
+        const auto& h = crowd.get_walker_hamiltonians();
+        const auto& w = crowd.get_walker_twfs();
+        const auto& p = crowd.get_walker_elecs();
+        return QMCHamiltonian::mw_evaluate({h[0], h}, {w[0], w}, {p[0], p});
+      };
     const auto previous_timer_level = getGlobalTimerManager().get_timer_threshold_string();
     getGlobalTimerManager().set_timer_threshold(timer_level_fine);
     VMCBatchedSampling::runWarmupStep(0, state, timers, rngs_, crowds_);
@@ -112,12 +127,21 @@ public:
     CHECK(*auxiliary == 0);
     CHECK_FALSE(wftrain::isFiniteTrainingReal(
         crowds_[0]->get_walkers()[0].get().Properties(WalkerProperties::LOCALENERGY)));
+    CHECK(observation_calls == 0);
+    CHECK(work.snapshotAndReset().hamiltonian_walker_evaluations == 0);
     state.accumulate_estimators = false;
     VMCBatchedSampling::runVMCStep(0, state, timers, rngs_, crowds_);
     CHECK(crowds_[0]->get_walker_twfs()[0].get().hasValidGradients());
     CHECK(crowds_[0]->get_walker_twfs()[0].get().hasValidLaplacians());
-    CHECK(*physical > 0);
-    CHECK(*auxiliary > 0);
+    CHECK(*physical == crowds_[0]->size());
+    CHECK(*auxiliary == crowds_[0]->size());
+    CHECK(observation_calls == (custom_observer ? 1 : 0));
+    const auto observed_work = work.snapshotAndReset();
+    CHECK(observed_work.hamiltonian_walker_evaluations == crowds_[0]->size());
+    CHECK(observed_work.ecp_bearing_hamiltonian_walker_evaluations == 0);
+    for (std::size_t sample = 0; sample < crowds_[0]->size(); ++sample)
+      CHECK(crowds_[0]->get_walkers()[sample].get().Properties(WalkerProperties::LOCALENERGY) ==
+            crowds_[0]->get_walker_hamiltonians()[sample].get().getLocalEnergy());
     if (qmcdriver_input_.get_sub_steps() >= 2)
     {
 #ifdef ENABLE_TIMERS
@@ -162,7 +186,7 @@ TEST_CASE("Objective-only sampling never evaluates physical or auxiliary Hamilto
   driver.exercise(vmc);
   CHECK(*physical == 0);
   CHECK(*auxiliary == 0);
-  driver.exerciseEnergy(vmc, physical, auxiliary);
+  driver.exerciseEnergy(vmc, physical, auxiliary, GENERATE(false, true));
   CHECK(*physical > 0);
   CHECK(*auxiliary > 0);
 }
@@ -230,7 +254,7 @@ TEST_CASE("PsiFormer no-drift collective warmup keeps value-only state until pro
       MCPopulation(comm->size(), comm->rank(), electrons, trial_wavefunction, hamiltonian),
       generators.getRngRefs(), comm);
   driver.process(nullptr);
-  driver.exerciseEnergy(vmc, physical, auxiliary);
+  driver.exerciseEnergy(vmc, physical, auxiliary, GENERATE(false, true));
   CHECK(*physical > 0);
   CHECK(*auxiliary > 0);
 }
