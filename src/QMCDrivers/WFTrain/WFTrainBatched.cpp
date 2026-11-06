@@ -172,6 +172,9 @@ struct RetainedCrowdSamples
   /// Optional current-version/value evidence only for the admitted resident single snapshot.
   std::optional<std::size_t> replay_version;
   std::vector<std::array<double, 2>> replay_log_phase;
+  // ParticleSet copies share SimulationCell; retain the numeric observation cell.
+  std::vector<std::array<double, 12>> replay_cell_twist;
+  std::vector<int> replay_boundary;
   psiformer::memory::HostCapacity trace_scalar_capacity;
   psiformer::memory::HostCapacity trace_particle_capacity;
 };
@@ -241,6 +244,13 @@ std::array<double, 12> immediateReplayCell(const ParticleSet& particles)
     result[9 + axis] = particles.getTwist()[axis];
   }
   return result;
+}
+
+/// Geometry qualification shared by same-observation score reuse and VALUE publication.
+bool supportsCollectedScoreGeometry(const PsiFormerWF& component, const ParticleSet& particles)
+{
+  return particles.getLattice().getSuperCellEnum() == SUPERCELL_OPEN ||
+      component.matchesLegacyTorusPseudopotentialTarget(particles);
 }
 
 /// The component-specific proof is read-only; no temporary image handles escape this call.
@@ -468,22 +478,32 @@ RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool ov
   if (exact_energy_capacity)
     result.local_energies.reserve(crowd.size());
   if (replay_version)
+  {
     result.replay_log_phase.reserve(crowd.size());
+    result.replay_cell_twist.reserve(crowd.size());
+    result.replay_boundary.reserve(crowd.size());
+  }
   for (std::size_t sample = 0; sample < crowd.size(); ++sample)
   {
     result.particles.push_back(std::make_unique<ParticleSet>(electrons[sample]));
     result.particles.back()->update();
     result.local_energies.push_back(walkers[sample].get().Properties(WalkerProperties::LOCALENERGY));
     if (replay_version)
+    {
       result.replay_log_phase.push_back({walkers[sample].get().Properties(WalkerProperties::LOGPSI),
                                          walkers[sample].get().Properties(WalkerProperties::SIGN)});
+      result.replay_cell_twist.push_back(immediateReplayCell(electrons[sample]));
+      result.replay_boundary.push_back(electrons[sample].get().getLattice().getSuperCellEnum());
+    }
     if (overlap)
       result.teachers.push_back(wavefunctions[sample].get().makeClone(*result.particles.back()));
   }
   if (psiformer::memory::enabled())
     result.trace_scalar_capacity.snapshotAt(__FILE__, __LINE__, "RetainedCrowdSamples::scalar_vectors",
         result.local_energies.capacity() * sizeof(double) +
-        result.replay_log_phase.capacity() * sizeof(result.replay_log_phase[0]),
+        result.replay_log_phase.capacity() * sizeof(result.replay_log_phase[0]) +
+        result.replay_cell_twist.capacity() * sizeof(result.replay_cell_twist[0]) +
+        result.replay_boundary.capacity() * sizeof(result.replay_boundary[0]),
         reinterpret_cast<std::uintptr_t>(&crowd), index);
   if (psiformer::memory::enabled())
   {
@@ -567,12 +587,15 @@ bool replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
   // Only the admitted resident single snapshot can still be the live chain.
   bool reuse_full = reuse_version && samples.replay_version == reuse_version &&
       samples.particles.size() == crowd.size() && samples.local_energies.size() == crowd.size() &&
-      samples.replay_log_phase.size() == crowd.size();
+      samples.replay_log_phase.size() == crowd.size() &&
+      samples.replay_cell_twist.size() == crowd.size() && samples.replay_boundary.size() == crowd.size();
   for (std::size_t sample = 0; reuse_full && sample < crowd.size(); ++sample)
   {
     const auto& live = electrons[sample].get();
     const auto& saved = *samples.particles[sample];
-    reuse_full = live.R.size() == saved.R.size() && live.spins.size() == live.R.size() &&
+    reuse_full = samples.replay_boundary[sample] == live.getLattice().getSuperCellEnum() &&
+        samples.replay_cell_twist[sample] == immediateReplayCell(live) &&
+        live.R.size() == saved.R.size() && live.spins.size() == live.R.size() &&
         live.spins.size() == saved.spins.size();
     for (std::size_t electron = 0; reuse_full && electron < live.R.size(); ++electron)
     {
@@ -4251,7 +4274,7 @@ void WFTrainBatched::run()
       device_provider && device_provider->usesAcceleratorParameterProducts() &&
       !device_provider->residentECPObservationEnabled() &&
       population_.get_golden_twf().getOrbitals().size() == 1 &&
-      population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
+      supportsCollectedScoreGeometry(*device_provider, population_.get_golden_electrons()) &&
       population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
       crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
 #else
@@ -4828,6 +4851,10 @@ void WFTrainBatched::run()
                 retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
                     checkedMemoryAdd(sizeof(*snapshot.replay_version), checkedMemoryMultiply(
                         snapshot.replay_log_phase.capacity(), sizeof(snapshot.replay_log_phase[0]))));
+              retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
+                  checkedMemoryAdd(checkedMemoryMultiply(snapshot.replay_cell_twist.capacity(),
+                      sizeof(snapshot.replay_cell_twist[0])), checkedMemoryMultiply(
+                      snapshot.replay_boundary.capacity(), sizeof(snapshot.replay_boundary[0]))));
               retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
                   checkedMemoryMultiply(snapshot.local_energies.capacity(), sizeof(double)));
               for (const auto& particles : snapshot.particles)
@@ -7087,7 +7114,7 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
       refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
       !refresh_provider->residentECPObservationEnabled() &&
       population_.get_golden_twf().getOrbitals().size() == 1 &&
-      population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN;
+      supportsCollectedScoreGeometry(*refresh_provider, population_.get_golden_electrons());
 #else
   constexpr bool value_only_refresh = false;
 #endif
