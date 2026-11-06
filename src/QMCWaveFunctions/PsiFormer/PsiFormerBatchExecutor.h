@@ -729,6 +729,33 @@ public:
         exact_size(pending_parameter_version_, value_size);
   }
 
+  /** Prove the exact live dense VALUE result in grow-only, unplanned storage.
+   * Planned owners retain the stricter bound-capacity proof above.
+   */
+  bool ownsUnplannedDenseValueResult(const DirectBatchValueResultView& result,
+                                     std::size_t expected_size) const noexcept
+  {
+    if (bound_capacity_plan_ || electron_count_ == 0 ||
+        electron_count_ > std::numeric_limits<std::size_t>::max() / 3 ||
+        expected_size > std::numeric_limits<std::size_t>::max() / (3 * electron_count_))
+      return false;
+    const auto position_count = expected_size * 3 * electron_count_;
+    const auto covers = [expected_size](const auto& values) noexcept {
+      return values.size() >= expected_size;
+    };
+    return active_mode_ == DirectBatchMode::VALUE_ONLY &&
+        active_value_input_ == DirectBatchValueInput::DENSE_CONFIGURATIONS &&
+        active_reference_count_ == 0 && active_replacement_count_ == 0 &&
+        active_size_ == expected_size && result.size == expected_size &&
+        result.owner == this && successful_generation_ != 0 && result.generation == successful_generation_ &&
+        result.sign == sign_.data() && result.logabs == logabs_.data() && result.value == value_.data() &&
+        result.parameter_version == parameter_version_.data() &&
+        electron_positions_.size() >= position_count && position_ready_.size() >= position_count &&
+        covers(sign_) && covers(logabs_) && covers(value_) && covers(parameter_version_) &&
+        covers(pending_sign_) && covers(pending_logabs_) && covers(pending_value_) &&
+        covers(pending_parameter_version_);
+  }
+
   /** Prove that a spatial view is the exact result owned by this live request.
    * This is intentionally allocation-free and nonthrowing so callers can reject
    * malformed or stale evaluator views before publishing any result.

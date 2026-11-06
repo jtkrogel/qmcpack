@@ -1506,6 +1506,56 @@ TEST_CASE("PsiFormer planned spatial result ownership rejects repacked views",
       other_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
 }
 
+TEST_CASE("PsiFormer unplanned dense VALUE ownership rejects stale and foreign views",
+          "[wavefunction][psiformer][batch][unplanned_value_ownership]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor spatial(model, value, plan);
+  pf::DirectBatchExecutor executor(value, spatial);
+  const auto base = model.cfg.configuration(0);
+  auto workspace = executor.makeWorkspace();
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult({}, 0));
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 3);
+  loadBatch(*workspace, base, 3);
+  const auto first = executor.evaluateValues(*workspace);
+  CHECK(workspace->ownsUnplannedDenseValueResult(first, 3));
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(first, 2));
+  auto bad = first;
+  ++bad.generation;
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(bad, 3));
+  bad = first;
+  bad.owner = nullptr;
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(bad, 3));
+  bad = first;
+  bad.parameter_version = nullptr;
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(bad, 3));
+  auto foreign = executor.makeWorkspace();
+  foreign->resize(pf::DirectBatchMode::VALUE_ONLY, 3);
+  loadBatch(*foreign, base, 3);
+  const auto other = executor.evaluateValues(*foreign);
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(other, 3));
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 1);
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(first, 3));
+  loadBatch(*workspace, base, 1);
+  const auto tail = executor.evaluateValues(*workspace);
+  CHECK(workspace->ownsUnplannedDenseValueResult(tail, 1));
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(first, 3));
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 1);
+  loadBatch(*workspace, base, 1);
+  const auto full = executor.evaluateFull(*workspace);
+  CHECK_FALSE(workspace->ownsUnplannedDenseValueResult(full, 1));
+  auto bounded = executor.makeWorkspace();
+  bounded->prepare({{3, 0, 0, 0, 0}, {3, 0, 0}});
+  bounded->resize(pf::DirectBatchMode::VALUE_ONLY, 3);
+  loadBatch(*bounded, base, 3);
+  const auto bound_result = executor.evaluateValues(*bounded);
+  CHECK_FALSE(bounded->ownsUnplannedDenseValueResult(bound_result, 3));
+  CHECK(bounded->ownsValueResult(bound_result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 3));
+}
+
 TEST_CASE("PsiFormer planned value result ownership validates exact live views",
           "[wavefunction][psiformer][batch][memory]")
 {

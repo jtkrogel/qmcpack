@@ -400,6 +400,11 @@ public:
         PsiFormerWF::AcceptedStateRequirement::VALUE_ONLY);
   }
 
+  static std::uint64_t fullSpatialAcceptedStateRequirement() noexcept
+  {
+    return static_cast<std::uint64_t>(PsiFormerWF::AcceptedStateRequirement::FULL_SPATIAL);
+  }
+
   static bool cloneStateMatches(const PsiFormerWF& component,
                                 const PsiFormerCloneStateSnapshot& snapshot)
   {
@@ -2166,7 +2171,7 @@ TEST_CASE("PsiFormer Ne100 real Gamma cooperative VALUE LU captures one native E
 }
 
 TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
-          "[wavefunction][psiformer][multiwalker][ecp][gpu]")
+          "[wavefunction][psiformer][multiwalker][ecp][gpu][proposal_value_device]")
 {
   for (const bool periodic : {false, true})
   for (const char* frozen_lazy : {"0", "1"})
@@ -2378,6 +2383,105 @@ TEST_CASE("PsiFormer ECP VALUE16 freezes policy and isolates value capacity",
       CHECK(sameVectorBits(references[walker].R, extra_coordinates[walker - 1]));
       CHECK(sameVectorBits(references[walker].G, extra_gradients[walker - 1]));
       CHECK(sameVectorBits(references[walker].L, extra_laplacians[walker - 1]));
+    }
+
+    // Ordinary no-plan proposals share the device VALUE batch for both geometries.
+    // Uneven selections include an unchanged lane and a tail below tile capacity.
+    using Moves = MCMultiParticleMoves<CoordsType::POS>;
+    const std::vector<ParticleSet::IndexType> selected_indices{0, 0, 1, 2, 3, 1, 3};
+    const std::vector<std::size_t> selected_offsets{0, 0, 1, 5, 7};
+    std::vector<ParticleSet::PosType> proposed_positions;
+    std::vector<PsiFormerWF::LogValue> expected_proposal_logs, initial_logs;
+    for (std::size_t walker = 0; walker < 4; ++walker)
+    {
+      ParticleSet moved(references[walker]);
+      for (std::size_t row = selected_offsets[walker]; row < selected_offsets[walker + 1]; ++row)
+      {
+        auto position = references[walker].R[selected_indices[row]];
+        position += ParticleSet::PosType{0.002 * (row + 1), -.003, .001};
+        proposed_positions.push_back(position);
+        moved.R[selected_indices[row]] = position;
+      }
+      moved.update();
+      PsiFormerWF cpu("ordinary_value_proposal_reference", files.parameters.string(),
+                      files.configuration.string(), moved, *physical_source);
+      cpu.validateSystem(moved, *physical_source, "all_electron");
+      moved.G = Value(0);
+      moved.L = Value(0);
+      expected_proposal_logs.push_back(cpu.evaluateLog(moved, moved.G, moved.L));
+      initial_logs.push_back(static_cast<const PsiFormerWF&>(components[walker]).get_log_value());
+    }
+    const Moves selected_moves(selected_offsets, selected_indices, proposed_positions);
+    std::vector<ParticleSet::ParticleGradient> proposed_gradients(4);
+    std::vector<ParticleSet::ParticleLaplacian> proposed_laplacians(4);
+    RefVector<ParticleSet::ParticleGradient> proposal_g;
+    RefVector<ParticleSet::ParticleLaplacian> proposal_l;
+    for (std::size_t walker = 0; walker < 4; ++walker)
+    {
+      proposed_gradients[walker].resize(references[walker].getTotalNum());
+      proposed_laplacians[walker].resize(references[walker].getTotalNum());
+      proposed_gradients[walker] = Value(.023);
+      proposed_laplacians[walker] = Value(-.071);
+      proposal_g.push_back(proposed_gradients[walker]);
+      proposal_l.push_back(proposed_laplacians[walker]);
+    }
+    const auto proposal_g_before = proposed_gradients;
+    const auto proposal_l_before = proposed_laplacians;
+    std::vector<PsiFormerWF::LogValue> log_ratios(4);
+    const auto propose = [&] {
+      wavefunction->mw_evaluateMultiParticleMove(components, references, selected_moves,
+          log_ratios, proposal_g, proposal_l, WaveFunctionEvaluationRequest::VALUE_ONLY);
+      for (std::size_t walker = 0; walker < 4; ++walker)
+      {
+        const auto expected = expected_proposal_logs[walker] - initial_logs[walker];
+        checkValue(std::real(log_ratios[walker]), std::real(expected));
+        checkValue(std::imag(log_ratios[walker]), std::imag(expected));
+        CHECK(sameVectorBits(proposed_gradients[walker], proposal_g_before[walker]));
+        CHECK(sameVectorBits(proposed_laplacians[walker], proposal_l_before[walker]));
+      }
+    };
+    // Two coincident same-spin rows are an exact node; failure publishes no proposal.
+    const Moves node_moves({0, 0, 1, 1, 1}, {1}, {references[1].R[0]});
+    CHECK_THROWS(wavefunction->mw_evaluateMultiParticleMove(components, references, node_moves,
+        log_ratios, proposal_g, proposal_l, WaveFunctionEvaluationRequest::VALUE_ONLY));
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(*wavefunction, accepted_before));
+    for (std::size_t walker = 1; walker < 4; ++walker)
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+          static_cast<const PsiFormerWF&>(components[walker]), extra_states[walker - 1]));
+    propose();
+    CHECK_THROWS(wavefunction->mw_accept_rejectMultiParticleMove(
+        components, references, selected_moves, {false}));
+    wavefunction->mw_accept_rejectMultiParticleMove(
+        components, references, selected_moves, {false, false, false, false});
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(*wavefunction, accepted_before));
+    for (std::size_t walker = 1; walker < 4; ++walker)
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+          static_cast<const PsiFormerWF&>(components[walker]), extra_states[walker - 1]));
+
+    ResourceCollection selected_particle_resource("ordinary_value_selected_particles");
+    particles->createResource(selected_particle_resource);
+    ResourceCollectionTeamLock<ParticleSet> selected_particle_lock(selected_particle_resource, references);
+    propose();
+    std::vector<bool> position_valid;
+    ParticleSet::mw_makeMoveSelectedParticles(references, selected_moves, position_valid);
+    REQUIRE(std::all_of(position_valid.begin(), position_valid.end(), [](bool valid) { return valid; }));
+    const std::vector<bool> accept{true, false, true, false};
+    wavefunction->mw_accept_rejectMultiParticleMove(components, references, selected_moves, accept);
+    ParticleSet::mw_accept_rejectMoveSelectedParticles(references, accept);
+    for (std::size_t walker = 0; walker < 4; ++walker)
+    {
+      auto& p = references[walker];
+      auto& component = static_cast<PsiFormerWF&>(components[walker]);
+      const auto expected = accept[walker] ? expected_proposal_logs[walker] : initial_logs[walker];
+      checkValue(std::real(component.get_log_value()), std::real(expected));
+      checkValue(std::imag(component.get_log_value()), std::imag(expected));
+      p.G = Value(0);
+      p.L = Value(0);
+      const auto rebuilt = component.evaluateLog(p, p.G, p.L);
+      checkValue(std::real(rebuilt), std::real(expected));
+      checkValue(std::imag(rebuilt), std::imag(expected));
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneState(component).accepted_state_requirement ==
+            testing::TestPsiFormerVirtualBatch::fullSpatialAcceptedStateRequirement());
     }
   }
 }

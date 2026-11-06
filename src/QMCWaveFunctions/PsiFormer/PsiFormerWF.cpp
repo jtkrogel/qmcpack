@@ -17439,7 +17439,16 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
   auto& batch = *resource.batch_workspace;
   const bool cpu_target_scalar_value =
       transaction.state().cpu_target_vgl.targets != 0;
-  const bool clone_local_value = cpu_target_scalar_value || !batch_execution_plan_;
+  // A device numerical owner already supports dense VALUE tiles for this family.
+  // Batch-plan absence is a storage policy, not a reason to run device proposals on HOST.
+  const bool device_value = bool(transaction.state().numerical_tile_backend);
+  const bool ordinary_device_value = device_value &&
+      transaction.state().precision == psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      !transaction.state().execution_plan.environment().periodic_profile &&
+      !transaction.state().twist_phase.active();
+  const bool clone_local_value = cpu_target_scalar_value || (!batch_execution_plan_ && !ordinary_device_value);
+  std::size_t device_value_tiles = 0;
+  std::size_t cpu_value_configurations = 0;
   pf::DirectBatchValueResultView batch_result;
   const DirectBackendMode value_mode = transaction.state().direct_value_mode;
   if (!resource.walker_indices.empty() && value_mode != DirectBackendMode::ORACLE)
@@ -17472,6 +17481,7 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
               result.parameter_version[0] != parameter_version)
             throw std::logic_error(
                 "PsiFormer CPU-target clone VALUE result provenance is stale");
+          device_value_tiles += clone_batch.executionStatistics().tiles_executed;
           direct_signs[walker] = result.sign[0];
           direct_logabs[walker] = result.logabs[0];
           continue;
@@ -17488,6 +17498,7 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
             workspace.setPosition(electron, dimension, position[dimension]);
         }
         const auto direct = transaction.state().direct_value_executor.evaluate(workspace);
+        ++cpu_value_configurations;
         if (direct.parameter_version != parameter_version)
           throw std::logic_error(
               "PsiFormer CPU-target selected VALUE observed inconsistent parameters");
@@ -17504,9 +17515,15 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
         packBatchConfiguration(batch, slot, p_list[walker], moves.slice(walker));
       }
       batch_result = transaction.state().direct_batch_executor.evaluateValues(batch);
-      if (!batch.ownsValueResult(
-              batch_result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS,
-              resource.walker_indices.size()))
+      if (device_value)
+        device_value_tiles += batch.executionStatistics().tiles_executed;
+      else
+        cpu_value_configurations += resource.walker_indices.size();
+      const bool owns_result = batch_execution_plan_
+          ? batch.ownsValueResult(batch_result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS,
+                                 resource.walker_indices.size())
+          : batch.ownsUnplannedDenseValueResult(batch_result, resource.walker_indices.size());
+      if (!owns_result)
         throw std::logic_error(
             "PsiFormer value-only selected result is not the exact workspace-owned view");
     }
@@ -17537,6 +17554,7 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
       value_request.spatial_derivatives = pf::SpatialDerivativeRequest::NONE;
       value_request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
       oracle_results.push_back(transaction.model().evaluate(positions, value_request));
+      ++cpu_value_configurations;
     }
   }
 
@@ -17589,6 +17607,27 @@ void PsiFormerWF::mw_evaluateMultiParticleValueOnly(
       throw std::runtime_error(
           "PsiFormer value-only selected proposal produced a non-finite log ratio");
   }
+
+  // Completed request-local numerical counts, independent of concurrent crowd submissions.
+  // Report before the no-throw publication so a logging failure cannot publish a partial proposal.
+  static const bool trace_value_dispatch = [] {
+    const char* setting = std::getenv("PSIFORMER_WORK_COUNTER_TRACE");
+    return setting && *setting && std::string_view(setting) != "0";
+  }();
+  if (trace_value_dispatch)
+    psiformer::writeCapabilityReceipt(app_log(), "proposal_value_dispatch", {
+      {"model_identity", std::to_string(transaction.state().persistent_model_identity)},
+      {"parameter_version", std::to_string(parameter_version)},
+      {"requested_product", "VALUE_ONLY"},
+      {"requested_backend", psiformer::psiFormerAcceleratorBackendName(transaction.state().accelerator_resolution.backend)},
+      {"effective_backend", device_value_tiles ? psiformer::psiFormerAcceleratorBackendName(
+          transaction.state().accelerator_resolution.backend) : cpu_value_configurations ? "cpu" : "cache"},
+      {"value_populations", resource.walker_indices.empty() ? "0" : "1"},
+      {"value_configurations", std::to_string(resource.walker_indices.size())},
+      {"cpu_numerical_value_configurations", std::to_string(cpu_value_configurations)},
+      {"device_value_tiles", std::to_string(device_value_tiles)},
+      {"cache_only_configurations", std::to_string(walker_count - resource.walker_indices.size())},
+      {"spatial_products", "none"}});
 
   for (std::size_t walker = 0; walker < walker_count; ++walker)
   {
