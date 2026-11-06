@@ -237,12 +237,15 @@ allocation ownership. Explicit selectors remain off by default.
 Score-KFAC collection and publication reuse
 -------------------------------------------
 
-Real OPEN FP64 score-KFAC shares the existing score-Adam collection-energy and
-VALUE-only publication refresh policies. Admission requires one neural component,
+Real OPEN and fixed legacy Gamma FP64 score-KFAC share the score-Adam
+collection-energy and VALUE-only publication refresh policies. Gamma requires
+zero twist, matching fixed lattice metadata and the legacy torus feature policy.
+Admission requires one neural component,
 one crowd, one block/step, all-electron moves without drift, ordinary accelerator
 parameter products, no resident device-authority mode and disabled debug checks.
 Collection-energy reuse additionally requires a physical nonlocal ECP and the
-same-version, same-coordinate FULL replay proof; failure falls back to the
+same-version, same-coordinate FULL replay proof, including retained numeric
+cell/twist evidence; failure falls back to the
 previous preparation path. Legacy full-response KFAC and other domains retain
 their existing behavior.
 
