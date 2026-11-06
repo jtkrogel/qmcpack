@@ -548,7 +548,7 @@ inline bool configuredPeriodicValueGeometryTiled()
   throw std::invalid_argument("PSIFORMER_GPU_PERIODIC_VALUE_GEOMETRY_TILED must be 0 or 1");
 }
 
-/// Freeze optional ordinary REAL pair geometry at backend preparation.
+/// Freeze optional ordinary FP64 VALUE pair geometry at backend preparation.
 inline bool configuredPeriodicValuePairGeometry()
 {
   const char* value = std::getenv("PSIFORMER_GPU_PERIODIC_VALUE_PAIR_GEOMETRY");
@@ -1874,7 +1874,8 @@ private:
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
           active_.data(), orbitalStorage().data(), open_status_.data(), periodic_value_pairs_->radii.data(),
           periodic_value_pairs_->valid.data(), periodic_value_pairs_->radii.capacity(),
-          sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{}),
+          sparse_envelope_ ? sparse_envelope_->tile : SparseEnvelopeAnchorView{},
+          ecp_projected_backflow_active_ ? matrices_.data() : nullptr),
           "model periodic VALUE pair geometry");
     else if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicOrbitalJets(stream, orbitals_, *cell, a_.data(), positions_.data(), model_->nuclei(),
@@ -2419,17 +2420,33 @@ public:
         environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
   }
 
+  /// Geometry reuse is independent of the unchanged-row envelope policy.
+  bool admitsPeriodicValuePairs() const noexcept
+  {
+    const auto& environment = plan_.environment();
+    return (ne_ == 44 || ne_ >= 64) && mode_ == SpatialJetMode::VALUE_ONLY && value_tape_.empty() &&
+        !retained_targets_ && !kinetic_trunk_only_ && !mixed_dense_ && !mixed_open_features_excluded_ &&
+        !canonical_scalar_value_ && environment.fixed_nuclei && model_->periodicCell() &&
+        environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
+        environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+        environment.head_representation == HeadRepresentation::REAL &&
+        environment.amplitude_scalar_domain == ScalarDomain::REAL &&
+        environment.parameter_scalar_domain == ScalarDomain::REAL &&
+        environment.compute_scalar_domain == ScalarDomain::REAL &&
+        environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
+  }
+
   /// Charge capacity, although each producer/consumer touches only its live prefix.
   std::size_t periodicValuePairDeviceBytes() const
   {
-    return admitsSparseEnvelopeAnchor() && plan_.modelShape().nuclei != 0
+    return admitsPeriodicValuePairs() && plan_.modelShape().nuclei != 0
         ? estimatePeriodicValuePairCost(batch_capacity_, ne_, plan_.modelShape().nuclei).device_bytes : 0;
   }
 
   /// Publish optional storage only after the caller admits every simultaneous graph.
   void preparePeriodicValuePairs()
   {
-    if (periodic_value_pairs_ || !admitsSparseEnvelopeAnchor() || plan_.modelShape().nuclei == 0)
+    if (periodic_value_pairs_ || !admitsPeriodicValuePairs() || plan_.modelShape().nuclei == 0)
       return;
     const auto cost = estimatePeriodicValuePairCost(batch_capacity_, ne_, plan_.modelShape().nuclei);
     auto candidate = std::make_unique<PeriodicValuePairScratch>();
@@ -2507,12 +2524,12 @@ public:
           environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
           environment.periodic_axes[0] && environment.periodic_axes[1] && environment.periodic_axes[2];
       if (mode_ != SpatialJetMode::VALUE_ONLY || !value_tape_.empty() || mixed_dense_ ||
-          retained_targets_ || kinetic_trunk_only_ || periodic_value_pairs_ ||
+          retained_targets_ || kinetic_trunk_only_ ||
           (environment.boundary != BoundaryCondition::OPEN && !periodic) ||
           environment.amplitude_scalar_domain != ScalarDomain::REAL ||
           environment.parameter_scalar_domain != ScalarDomain::REAL ||
           environment.compute_scalar_domain != ScalarDomain::REAL)
-        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN or fixed legacy-torus FP64 VALUE without pair geometry");
+        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN or fixed legacy-torus FP64 VALUE");
       if (!ecp_value_projection_)
       {
         auto capacity = orbitals_;

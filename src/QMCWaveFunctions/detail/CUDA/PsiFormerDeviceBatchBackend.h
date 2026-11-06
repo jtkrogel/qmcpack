@@ -145,7 +145,8 @@ public:
             image_->plan().modelShape().nuclei != 0 &&
             !preparation_.select_vgl_targets && !preparation_.select_kinetic_targets &&
             !preparation_.metropolis_workspace_budget_bytes && !preparation_.metropolis_drift_budget_bytes &&
-            preparation_.active_inference_crowds == 1 && image_->plan().modelShape().electrons() >= 64 &&
+            preparation_.active_inference_crowds == 1 &&
+            (image_->plan().modelShape().electrons() == 44 || image_->plan().modelShape().electrons() >= 64) &&
             image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
             supportsLazyRealInferenceEnvironment(image_->plan().environment())),
         sparse_envelope_requested_(configuredRealVirtualEnvelopeReuse()),
@@ -694,8 +695,8 @@ public:
       return ordinary->pair_preparation_effective;
     }
     ordinary->pair_preparation_checked = true;
-    if (!first || !first->admitsSparseEnvelopeAnchor() ||
-        (value16 && (!second || !second->admitsSparseEnvelopeAnchor())) ||
+    if (!first || !first->admitsPeriodicValuePairs() ||
+        (value16 && (!second || !second->admitsPeriodicValuePairs())) ||
         !configuredDeviceMemoryAdmission().limit_bytes)
     {
       std::clog << "PsiFormer REAL VALUE pair geometry: effective=0 reason=unbounded_or_ineligible_baseline\n";

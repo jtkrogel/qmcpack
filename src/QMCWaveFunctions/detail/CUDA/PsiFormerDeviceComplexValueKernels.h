@@ -30,10 +30,16 @@ struct ComplexValueResult
 static_assert(sizeof(ComplexValueResult) == 48);
 static_assert(std::is_standard_layout_v<ComplexValueResult>);
 
+/// Instantiate the shared complete-Pair producer under the paired envelope's math policy.
+Error launchComplexValuePairs(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    double* radii, std::uint8_t* valid, std::size_t capacity);
+
 /// Reuse the real periodic envelope formula without constructing a legacy real head.
 Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
     const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
-    const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status);
+    const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status,
+    PeriodicValuePairView pair_bank = {});
 
 /// Reconstruct the exact accepted base using the first point and three by-value moved-row coordinates.
 Error launchComplexValueEnvelopeAnchor(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,

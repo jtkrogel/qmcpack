@@ -3,6 +3,7 @@
 // See LICENSE file in top directory. Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 #include "PsiFormerDeviceComplexValueKernels.h"
+#include "PsiFormerDevicePeriodicValuePairProducer.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 #include <cmath>
 #include <limits>
@@ -46,7 +47,8 @@ __device__ void fail(std::uint64_t* status, std::size_t index)
 /// Compute only real E using the unchanged shared radial/envelope arithmetic.
 __global__ void envelopes(OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
     const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
-    const double* zeta_up, const double* zeta_down, double* output, std::uint64_t* status)
+    const double* zeta_up, const double* zeta_down, double* output, std::uint64_t* status,
+    PeriodicValuePairView pair_bank)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto n = layout.features.electron_count, per = layout.determinant_count * n * n;
@@ -55,7 +57,8 @@ __global__ void envelopes(OpenOrbitalJetLayout layout, periodic_geometry::Cell c
   const auto local = index % per;
   if (open_orbital::buildElement(layout, nullptr, positions, nuclei, nullptr, nullptr,
       pi_up, pi_down, zeta_up, zeta_down, index / per, 0, local / (n * n),
-      (local / n) % n, local % n, output, nullptr, nullptr, &cell, nullptr, true) != OpenSpatialStatus::REGULAR)
+      (local / n) % n, local % n, output, nullptr, nullptr, &cell, nullptr, true,
+      nullptr, nullptr, nullptr, pair_bank) != OpenSpatialStatus::REGULAR)
     fail(status, index);
 }
 
@@ -703,17 +706,40 @@ Error launched()
 }
 } // namespace
 
+/// Preserve this translation unit's existing strict paired-envelope arithmetic.
+Error launchComplexValuePairs(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    double* radii, std::uint8_t* valid, std::size_t capacity)
+{
+  const auto cost = validatePeriodicValuePairStorage(layout, cell, positions, nuclei, radii, valid, capacity);
+  periodic_value_pairs::preparePairs<periodic_value_pairs::ComplexEnvelopeMath>
+      <<<blocks(cost.pair_elements), 128, 0, stream>>>(
+          layout, cell, positions, nuclei, radii, valid, cost.pair_elements);
+  return launched();
+}
+
 /// Launch the exact shared periodic real envelope value primitive.
 Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, periodic_geometry::Cell cell,
     const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
-    const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status)
+    const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status,
+    PeriodicValuePairView pair_bank)
 {
   if ((layout.features.mode != SpatialJetMode::VALUE_ONLY && layout.features.mode != SpatialJetMode::FULL_VGL) ||
       !positions || !nuclei || !pi_up || !pi_down ||
       !zeta_up || !zeta_down || !envelope || !status)
     throw std::invalid_argument("Complex VALUE envelope input is invalid");
+  if (pair_bank.radii || pair_bank.valid || pair_bank.pair_count)
+  {
+    periodic_geometry::validateCell(cell);
+    validateOpenOrbitalJetLayout(layout);
+    const auto cost = estimatePeriodicValuePairCost(layout.features.configuration_count,
+        layout.features.electron_count, layout.nucleus_count);
+    if (layout.features.mode != SpatialJetMode::VALUE_ONLY || !pair_bank.radii || !pair_bank.valid ||
+        pair_bank.pair_count < cost.pair_elements)
+      throw std::invalid_argument("Complex envelope pair bank has invalid extent or mode");
+  }
   envelopes<<<blocks(layout.features.configuration_count * layout.orbitals.element_count), 128, 0, stream>>>(
-      layout, cell, positions, nuclei, pi_up, pi_down, zeta_up, zeta_down, envelope, status);
+      layout, cell, positions, nuclei, pi_up, pi_down, zeta_up, zeta_down, envelope, status, pair_bank);
   return launched();
 }
 

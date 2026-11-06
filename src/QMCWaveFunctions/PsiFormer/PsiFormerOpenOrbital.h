@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
@@ -30,6 +31,14 @@
 
 namespace qmcplusplus::psiformer
 {
+
+/// Same-stream, live-prefix view of complete electron-ion Pair radius/validity.
+struct PeriodicValuePairView
+{
+  const double* radii = nullptr;
+  const std::uint8_t* valid = nullptr;
+  std::size_t pair_count = 0;
+};
 
 /** Pointer-free layout for feature jets and [B,plane,D,N,N] orbital jets.
  *
@@ -248,7 +257,8 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     const double* projected_backflow = nullptr, bool envelope_only = false,
     const double* precontracted_value = nullptr,
     const double* cached_envelope_value = nullptr,
-    double* captured_envelope_value = nullptr) noexcept
+    double* captured_envelope_value = nullptr,
+    PeriodicValuePairView pair_bank = {}) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -259,6 +269,10 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
   if ((cached_envelope_value || captured_envelope_value) &&
       layout.features.mode != SpatialJetMode::VALUE_ONLY)
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  if ((pair_bank.radii || pair_bank.valid || pair_bank.pair_count) &&
+      (!pair_bank.radii || !pair_bank.valid || !periodic_cell ||
+       layout.features.mode != SpatialJetMode::VALUE_ONLY))
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
   if (active_electron >= layout.features.electron_count)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
@@ -308,9 +322,20 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     double radius = ::sqrt(radius_squared);
     if (periodic_cell)
     {
-      if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair, true))
-        return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
-      radius = periodic_pair.radius;
+      if (pair_bank.radii)
+      {
+        const auto index = (configuration * layout.features.electron_count + row_electron) *
+            layout.nucleus_count + nucleus;
+        if (index >= pair_bank.pair_count || !pair_bank.valid[index])
+          return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+        radius = pair_bank.radii[index];
+      }
+      else
+      {
+        if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair, true))
+          return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+        radius = periodic_pair.radius;
+      }
     }
     if (!(radius > 0.0) && layout.features.mode != SpatialJetMode::VALUE_ONLY)
       return OpenSpatialStatus::COALESCENCE;

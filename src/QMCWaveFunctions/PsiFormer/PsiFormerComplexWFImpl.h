@@ -276,7 +276,8 @@ struct PsiFormerComplexWF::Impl
                            configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse(),
                            configuredHeadDeterminantBatch(), configuredFullInverseColumns(), configuredTargetFactorReuse(),
                            psiformer::device::configuredPeriodicValueGeometryTiled(),
-                           psiformer::device::configuredComplexTargetColdCooperativeLu(), mixed_inference);
+                           psiformer::device::configuredComplexTargetColdCooperativeLu(), mixed_inference, {},
+                           psiformer::device::configuredPeriodicValuePairGeometry());
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
@@ -287,7 +288,8 @@ struct PsiFormerComplexWF::Impl
         std::size_t virtual_capacity = 0, std::size_t trace_targets = 0, bool virtual_envelope_reuse = false,
         bool head_determinant_batch = false, bool full_inverse_columns = false, bool target_factor_reuse = false,
         bool periodic_value_tiling = false, bool target_cold_cooperative_lu = false, bool mixed_inference = false,
-        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters = {})
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters = {},
+        bool periodic_value_pairs = false)
     {
       using namespace psiformer::device;
       // Freeze one effective choice for every simultaneous ordinary VALUE owner.
@@ -295,6 +297,7 @@ struct PsiFormerComplexWF::Impl
           shared_mixed_parameters->modelImage().get() != shared_image.get()))
         throw std::invalid_argument("Shared paired affine cache requires its exact inference image");
       const bool tiled_requested = periodic_value_tiling;
+      const bool pairs_requested = periodic_value_pairs;
       const auto& environment = plan.environment();
       periodic_value_tiling = periodic_value_tiling && !mixed_inference &&
           plan.modelShape().electrons() >= 64 && environment.fixed_nuclei &&
@@ -302,14 +305,22 @@ struct PsiFormerComplexWF::Impl
           environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
           std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(),
               [](bool axis) { return axis; });
+      periodic_value_pairs = periodic_value_pairs && !mixed_inference && !virtual_envelope_reuse &&
+          (plan.modelShape().electrons() == 44 || plan.modelShape().electrons() >= 64) &&
+          plan.modelShape().nuclei && environment.fixed_nuclei && !environment.periodic_profile &&
+          environment.geometry_feature_policy == psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&
+          std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(),
+              [](bool axis) { return axis; });
+      if (pairs_requested && !periodic_value_pairs)
+        std::clog << "PsiFormer COMPLEX VALUE pair geometry: effective=0 reason=ineligible_profile\n";
       if (tiled_requested && !periodic_value_tiling)
         std::clog << "Periodic VALUE geometry tiling: effective=0 reason=ineligible_profile\n";
       const auto canonical_geometry = [&] {
-        app_log() << "  Periodic VALUE geometry tiling: effective=0 reason=optional_admission"
+        app_log() << "  Optional VALUE geometry: effective=0 reason=optional_admission"
                   << "; unchanged_baseline_owners=yes" << std::endl;
         return prepareFrozen(plan, parameters, nuclei, version, limit, preparation, capacity, shared_image,
             virtual_capacity, trace_targets, virtual_envelope_reuse, head_determinant_batch,
-            full_inverse_columns, target_factor_reuse, false, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters);
+            full_inverse_columns, target_factor_reuse, false, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters, false);
       };
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
@@ -341,7 +352,7 @@ struct PsiFormerComplexWF::Impl
       if (capacity > 1 && !configuredDeviceMemoryAdmission().limit_bytes)
         throw std::invalid_argument("Dense complex GPU tiles require native aggregate device admission");
       const auto value = estimateComplexValueCost(plan, capacity, true, false, head_determinant_batch,
-          periodic_value_tiling);
+          periodic_value_tiling, periodic_value_pairs);
       const auto spatial = preparation.max_targets
           ? estimateComplexSpatialTargetCost(plan, preparation.max_targets, capacity, trace_targets,
                 head_determinant_batch, target_factor_reuse, preparation.reuse_cusp_state, target_cold_cooperative_lu)
@@ -365,7 +376,7 @@ struct PsiFormerComplexWF::Impl
       }
       if (bytes > limit)
       {
-        if (periodic_value_tiling)
+        if (periodic_value_tiling || periodic_value_pairs)
           return canonical_geometry();
         throw std::length_error("Complex GPU VALUE+spatial lane exceeds its explicit device byte cap");
       }
@@ -386,7 +397,7 @@ struct PsiFormerComplexWF::Impl
         if (plan.environment().periodic_profile || !configuredDeviceMemoryAdmission().limit_bytes)
           throw std::invalid_argument("Complex virtual tiles require legacy periodic FP64 and aggregate device admission");
         const auto extra = estimateComplexValueCost(plan, virtual_capacity, true, virtual_envelope_reuse,
-            head_determinant_batch, periodic_value_tiling);
+            head_determinant_batch, periodic_value_tiling, periodic_value_pairs);
         const auto add = [](std::size_t a, std::size_t b) {
           return psiformer::spatial_detail::checkedAdd(a, b, "Complex virtual tile bytes overflow");
         };
@@ -399,7 +410,7 @@ struct PsiFormerComplexWF::Impl
                 sizeof(ComplexValueResult) + sizeof(std::array<std::size_t, 3>)))));
         if (add(bytes, host) > limit)
         {
-          if (periodic_value_tiling)
+          if (periodic_value_tiling || periodic_value_pairs)
             return canonical_geometry();
           throw std::length_error("Complex virtual tile exceeds conservative combined DEVICE/HOST numeric bound");
         }
@@ -417,7 +428,7 @@ struct PsiFormerComplexWF::Impl
                   << "; image_and_vendor_bytes_excluded=yes" << std::endl;
       try
       {
-        if (periodic_value_tiling)
+        if (periodic_value_tiling || periodic_value_pairs)
         {
           int ordinal;
 #ifdef QMC_CUDA2HIP
@@ -432,19 +443,20 @@ struct PsiFormerComplexWF::Impl
         return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
             preparation, work, bytes, host, capacity, shared_image, virtual_capacity, trace_targets,
             virtual_envelope_reuse, head_determinant_batch, full_inverse_columns, target_factor_reuse,
-            periodic_value_tiling, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters));
+            periodic_value_tiling, target_cold_cooperative_lu, mixed_inference, shared_mixed_parameters,
+            periodic_value_pairs));
       }
       catch (const std::length_error&)
       {
-        if (!periodic_value_tiling) throw;
+        if (!periodic_value_tiling && !periodic_value_pairs) throw;
       }
       catch (const std::bad_alloc&)
       {
-        if (!periodic_value_tiling) throw;
+        if (!periodic_value_tiling && !periodic_value_pairs) throw;
       }
       catch (const std::runtime_error& error)
       {
-        if (!periodic_value_tiling || !recoverOptionalEnvelopeAllocation(error)) throw;
+        if ((!periodic_value_tiling && !periodic_value_pairs) || !recoverOptionalEnvelopeAllocation(error)) throw;
       }
       // A failed constructor has retired every unpublished owner before retry.
       return canonical_geometry();
@@ -459,19 +471,20 @@ struct PsiFormerComplexWF::Impl
         std::size_t virtual_capacity, std::size_t trace_targets, bool virtual_envelope_reuse,
         bool head_determinant_batch, bool full_inverse_columns, bool target_factor_reuse,
         bool periodic_value_tiling, bool target_cold_cooperative_lu, bool mixed_inference,
-        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters)
+        std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters> shared_mixed_parameters,
+        bool periodic_value_pairs)
         : capacity(capacity), electrons(plan.modelShape().electrons()), virtual_capacity(virtual_capacity),
           trace_targets(trace_targets), virtual_envelope_reuse(virtual_envelope_reuse),
           head_determinant_batch(head_determinant_batch), full_inverse_columns(full_inverse_columns),
           mixed_inference(mixed_inference), target_factor_reuse(target_factor_reuse),
           target_cold_cooperative_lu(target_cold_cooperative_lu),
-          periodic_value_tiling(periodic_value_tiling), blas(queue),
+          periodic_value_tiling(periodic_value_tiling), periodic_value_pairs(periodic_value_pairs), blas(queue),
           image(shared_image ? std::move(shared_image) :
               (plan.environment().periodic_profile
                   ? psiformer::device::PreparedDeviceModel::preparePairedTwoCellProfile(plan, parameters, nuclei, version)
                   : psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version))),
           value(mixed_inference ? nullptr : psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas,
-              value_cost.device_bytes, false, head_determinant_batch, periodic_value_tiling)),
+              value_cost.device_bytes, false, head_determinant_batch, periodic_value_tiling, periodic_value_pairs)),
           full(mixed_inference ? nullptr : preparation.max_targets
               ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation, capacity,
                     trace_targets, head_determinant_batch, target_factor_reuse, target_cold_cooperative_lu)
@@ -491,7 +504,7 @@ struct PsiFormerComplexWF::Impl
       if (virtual_capacity)
       {
         const auto extra = psiformer::device::estimateComplexValueCost(plan, virtual_capacity, true,
-            virtual_envelope_reuse, head_determinant_batch, periodic_value_tiling);
+            virtual_envelope_reuse, head_determinant_batch, periodic_value_tiling, periodic_value_pairs);
         int ordinal;
 #ifdef QMC_CUDA2HIP
         psiformer::device::checkRuntime(hipGetDevice(&ordinal), "complex virtual tile device");
@@ -503,7 +516,7 @@ struct PsiFormerComplexWF::Impl
         { auto probe = psiformer::device::deviceMemoryMetrics(ordinal).reserveAllocation(extra.device_bytes); }
         virtual_value = psiformer::device::PreparedDeviceComplexValue::prepare(
             image, virtual_capacity, queue, blas, extra.device_bytes, virtual_envelope_reuse,
-            head_determinant_batch, periodic_value_tiling);
+            head_determinant_batch, periodic_value_tiling, periodic_value_pairs);
       }
       const auto actual_host = (mixed ? mixed->cost().host_bytes : value_cost.host_bytes + spatial_cost.host_bytes) +
               sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
@@ -522,6 +535,7 @@ struct PsiFormerComplexWF::Impl
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
                 << ", tile_capacity=" << capacity
                 << ", concurrent_trace_targets=" << trace_targets
+                << ", periodic_value_pairs=" << periodic_value_pairs
                 << ", virtual_envelope_reuse=" << virtual_envelope_reuse
                 << ", head_determinant_batch=" << head_determinant_batch
                 << ", full_inverse_columns=" << full_inverse_columns
@@ -675,6 +689,7 @@ struct PsiFormerComplexWF::Impl
     const bool target_factor_reuse;
     const bool target_cold_cooperative_lu;
     const bool periodic_value_tiling;
+    const bool periodic_value_pairs;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
@@ -5314,7 +5329,7 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
       source_lane->preparation, source_lane->capacity, image, source_lane->virtual_capacity, source_lane->trace_targets,
       source_lane->virtual_envelope_reuse, source_lane->head_determinant_batch, source_lane->full_inverse_columns,
       source_lane->target_factor_reuse, source_lane->periodic_value_tiling,
-      source_lane->target_cold_cooperative_lu, source_lane->mixed_inference));
+      source_lane->target_cold_cooperative_lu, source_lane->mixed_inference, {}, source_lane->periodic_value_pairs));
   pf::PsiFormer model(std::move(parameters), std::move(*configuration), original->model.ndet,
                       original->model.dim, original->model.heads, original->model.blocks);
   auto state = std::make_shared<Impl::Model>(getName(),
@@ -5563,7 +5578,7 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
           primary.target_factor_reuse, primary.periodic_value_tiling,
           primary.target_cold_cooperative_lu, primary.mixed_inference,
           primary.mixed ? primary.mixed->parameterCache() :
-              std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters>{});
+              std::shared_ptr<const psiformer::device::PreparedDeviceMixedDenseParameters>{}, primary.periodic_value_pairs);
       app_log() << "  Complex GPU independent crowd owner: maximum_active=" << impl_->state->gpu_crowds
                 << ", extra_device_bytes=" << resource.gpu->device_bytes
                 << ", extra_host_numeric_bytes=" << resource.gpu->host_bytes

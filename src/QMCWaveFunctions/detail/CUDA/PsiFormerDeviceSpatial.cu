@@ -1919,13 +1919,26 @@ Error launchOpenOrbitalValuesTiled(Stream stream, const OpenOrbitalJetLayout& la
   return peekSpatialLaunchError();
 }
 
+Error launchPeriodicValuePairs(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    double* radii, std::uint8_t* valid, std::size_t capacity)
+{
+  const auto cost = validatePeriodicValuePairStorage(layout, cell, positions, nuclei, radii, valid, capacity);
+  const auto blocks = checkedSpatialBlockCount(cost.pair_elements, "Periodic VALUE pair producer grid overflow");
+  periodic_value_pairs::preparePairs<periodic_value_pairs::RealOrbitalMath>
+      <<<blocks, spatial_block_size, 0, stream>>>(
+          layout, cell, positions, nuclei, radii, valid, cost.pair_elements);
+  return peekSpatialLaunchError();
+}
+
 Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* features,
     const double* positions, const double* nuclei, const double* backflow_up,
     const double* backflow_down, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
     double* output, OpenSpatialStatus* status, double* pair_radii,
-    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor)
+    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor,
+    const double* projected_backflow)
 {
   periodic_geometry::validateCell(cell);
   validateOpenOrbitalJetLayout(layout);
@@ -1946,21 +1959,22 @@ Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJe
       anchor.envelope == output || anchor.positions == positions ||
       anchor.envelope == positions || anchor.positions == output)
     anchor = {};
-  const auto pair_blocks = checkedSpatialBlockCount(cost.pair_elements,
-      "Periodic VALUE pair producer grid exceeds device x dimension");
+  if (projected_backflow == output && projected_backflow)
+    throw std::invalid_argument("Periodic VALUE pair projection aliases output");
+  // Anchor composition with grouped projection is qualified separately.
+  if (projected_backflow) anchor = {};
   const auto count = openOrbitalElementCount(layout);
   const auto orbital_blocks = checkedSpatialBlockCount(count,
       "Periodic VALUE pair consumer grid exceeds device x dimension");
   periodic_value_pairs::Inputs input{features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons};
   // The layout is the live prefix, not the capacity used for owner admission.
-  periodic_value_pairs::preparePairs<<<pair_blocks, spatial_block_size, 0, stream>>>(
-      layout, cell, input, pair_radii, pair_valid, cost.pair_elements);
-  const auto producer_error = peekSpatialLaunchError();
+  const auto producer_error = launchPeriodicValuePairs(stream, layout, cell, positions, nuclei,
+      pair_radii, pair_valid, pair_capacity);
   if (producer_error != success)
     return producer_error;
-  periodic_value_pairs::consumePairs<true><<<orbital_blocks, spatial_block_size, 0, stream>>>(
-      layout, cell, input, pair_radii, pair_valid, output, status, anchor, count);
+  periodic_value_pairs::consumePairs<<<orbital_blocks, spatial_block_size, 0, stream>>>(
+      layout, cell, input, pair_radii, pair_valid, output, status, anchor, count, projected_backflow);
   return peekSpatialLaunchError();
 }
 

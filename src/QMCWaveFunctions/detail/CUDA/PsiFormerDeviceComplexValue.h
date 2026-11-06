@@ -36,6 +36,7 @@ struct ComplexValueCost
   std::size_t envelope_anchor_bytes = 0, envelope_host_bytes = 0;
   std::size_t projection_pointer_bytes = 0;
   PeriodicValueTilingCost periodic_geometry;
+  PeriodicValuePairCost envelope_pairs;
 };
 
 namespace complex_detail
@@ -90,11 +91,22 @@ inline bool configuredComplexValuePairCheck()
 /// Count an ordinary VALUE owner, including its admitted optional pair records.
 inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
                                                bool allow_pair_check = true, bool virtual_envelope_reuse = false,
-                                               bool batched_projection = false, bool tiled_geometry = false)
+                                               bool batched_projection = false, bool tiled_geometry = false, bool pair_geometry = false)
 {
   auto cost = complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
   const auto& e = plan.environment();
   const auto n = plan.modelShape().electrons();
+  if (pair_geometry)
+  {
+    if (!allow_pair_check || (n != 44 && n < 64) || e.periodic_profile || !e.fixed_nuclei ||
+        !plan.modelShape().nuclei ||
+        e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Pair radius bank requires ordinary untaped fixed-torus FP64 VALUE");
+    cost.envelope_pairs = estimatePeriodicValuePairCost(batch, n, plan.modelShape().nuclei);
+    cost.device_bytes = spatial_detail::checkedAdd(cost.device_bytes, cost.envelope_pairs.device_bytes,
+        "Paired envelope pair bytes overflow");
+  }
   if (batched_projection)
   {
     if (!allow_pair_check || e.periodic_profile || !e.fixed_nuclei ||
@@ -122,6 +134,8 @@ inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& p
   }
   if (virtual_envelope_reuse)
   {
+    if (pair_geometry)
+      throw std::invalid_argument("Pair geometry with virtual envelope reuse requires separate qualification");
     if (!allow_pair_check || n < 64 || e.periodic_profile || !e.fixed_nuclei ||
         e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
         !std::all_of(e.periodic_axes.begin(), e.periodic_axes.end(), [](bool axis) { return axis; }))
@@ -201,20 +215,25 @@ public:
   static std::unique_ptr<PreparedDeviceComplexValue> prepare(std::shared_ptr<const PreparedDeviceModel> image,
       std::size_t capacity, compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
       std::size_t budget, bool virtual_envelope_reuse = false, bool batched_projection = false,
-      bool tiled_geometry = false)
+      bool tiled_geometry = false, bool pair_geometry = false)
   {
     if (!image)
       throw std::invalid_argument("Complex VALUE requires a named paired image");
     image->validateCurrentDevice();
     auto cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse,
-        batched_projection, tiled_geometry);
-    if (tiled_geometry && cost.device_bytes > budget)
+        batched_projection, tiled_geometry, pair_geometry);
+    if ((tiled_geometry || pair_geometry) && cost.device_bytes > budget)
     {
       cost = estimateComplexValueCost(image->plan(), capacity, true, virtual_envelope_reuse, batched_projection);
-      std::clog << "PsiFormer periodic VALUE geometry tiling: effective=0 reason=standalone_budget\n";
+      std::clog << "PsiFormer optional VALUE geometry: effective=0 reason=standalone_budget\n";
     }
     if (cost.device_bytes > budget)
       throw std::length_error("Numerical complex VALUE exceeds its standalone owner budget");
+    if (cost.envelope_pairs.device_bytes)
+      std::clog << "PsiFormer COMPLEX VALUE pair geometry: effective=1 Ne="
+                << image->plan().modelShape().electrons() << " capacity=" << capacity
+                << " added_DEVICE_bytes=" << cost.envelope_pairs.device_bytes
+                << " producer=complete_Pair request_local=1\n";
     if (cost.periodic_geometry.device_bytes)
       std::clog << "PsiFormer periodic VALUE geometry tiling: effective=1 Ne="
                 << image->plan().modelShape().electrons() << " capacity=" << capacity
@@ -276,6 +295,7 @@ private:
   friend class PreparedDeviceCanonicalComplexHead;
   friend class PreparedDeviceMixedComplexValue;
   friend struct PeriodicValueTilingValidationAccess;
+  friend struct SharedPairGeometryValidationAccess;
   /// The private mixed composition supplies a separately admitted pivot bank.
   void evaluateCoordinates(const std::vector<double>& positions, double* minimum_scaled_pivots)
   {
@@ -508,6 +528,10 @@ private:
         projectOpenOrbitalJets(t.blas_, t.orbitals_, t.a_.data(), up, down, output);
     }
     resetStatus();
+    if (cost_.envelope_pairs.pair_elements)
+      checkRuntime(launchComplexValuePairs(t.queue_.getNative(), t.orbitals_, *t.model_->periodicCell(),
+          t.positions_.data(), t.model_->nuclei(), pair_radii_.data(), pair_valid_.data(),
+          cost_.envelope_pairs.pair_elements), "paired VALUE pair geometry");
     if (virtual_envelope)
       checkRuntime(launchComplexValueVirtualEnvelopes(t.queue_.getNative(), t.orbitals_, *t.model_->periodicCell(),
           t.positions_.data(), t.model_->nuclei(), parameter(ParameterRole::ENVELOPE_PI_UP),
@@ -517,7 +541,8 @@ private:
     else
       checkRuntime(launchComplexValueEnvelopes(t.queue_.getNative(), t.orbitals_, *t.model_->periodicCell(),
           t.positions_.data(), t.model_->nuclei(), parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
-          parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN), envelope_.data(), status_.data()),
+          parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN), envelope_.data(), status_.data(),
+          {pair_radii_.data(), pair_valid_.data(), cost_.envelope_pairs.pair_elements}),
           "paired VALUE envelopes");
     if (t.mixed_dense_)
     {
@@ -763,6 +788,8 @@ private:
         solve_((retain_score || canonical_inverse) && retain_inverse ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0, "ComplexValue::solve_", __FILE__, __LINE__),
         permutation_(solve_.capacity(), "ComplexValue::permutation_", __FILE__, __LINE__),
         pair_events_(cost.pair_event_bytes / sizeof(std::uint64_t), "ComplexValue::pair_events_", __FILE__, __LINE__),
+        pair_radii_(cost.envelope_pairs.pair_elements, "ComplexValue::pair_radius_", __FILE__, __LINE__),
+        pair_valid_(cost.envelope_pairs.pair_elements, "ComplexValue::pair_valid_", __FILE__, __LINE__),
         envelope_base_(cost.envelope_anchor_bytes ? 3 * trunk_->ne_ : 0),
         envelope_rows_host_(cost.envelope_anchor_bytes ? capacity : 0),
         envelope_anchor_(cost.envelope_anchor_bytes / sizeof(double), "ComplexValue::request_envelope_", __FILE__, __LINE__),
@@ -790,7 +817,9 @@ private:
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +
         channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8 +
         (inverse_.capacity() + solve_.capacity()) * sizeof(cuDoubleComplex) + permutation_.capacity() * sizeof(std::size_t) +
-        pair_events_.capacity() * sizeof(std::uint64_t) + envelope_anchor_.capacity() * sizeof(double) +
+        pair_events_.capacity() * sizeof(std::uint64_t) +
+        pair_radii_.capacity() * sizeof(double) + pair_valid_.capacity() * sizeof(std::uint8_t) +
+        envelope_anchor_.capacity() * sizeof(double) +
         envelope_rows_.capacity() * sizeof(std::size_t) + envelope_anchor_status_.capacity() * sizeof(std::uint64_t) +
         (projection_banks_[0] ? projection_banks_[0]->deviceBytes() + projection_banks_[1]->deviceBytes() : 0);
     if ((cost.pair_event_bytes && ((retain_score && !score_pair_check_) || pair_events_.capacity() != capacity)) ||
@@ -858,6 +887,8 @@ private:
   DeviceBuffer<cuDoubleComplex> inverse_, solve_;
   DeviceBuffer<std::size_t> permutation_;
   DeviceBuffer<std::uint64_t> pair_events_;
+  DeviceBuffer<double> pair_radii_;
+  DeviceBuffer<std::uint8_t> pair_valid_;
   // HOST staging outlives device buffers, including cold destruction after a failed async metadata transfer.
   std::vector<double> envelope_base_;
   std::vector<std::size_t> envelope_rows_host_;

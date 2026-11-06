@@ -42,6 +42,22 @@ inline PeriodicValuePairCost estimatePeriodicValuePairCost(
   return cost;
 }
 
+/// Shared host admission for either established consumer math policy.
+inline PeriodicValuePairCost validatePeriodicValuePairStorage(const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const double* radii, const std::uint8_t* valid, std::size_t capacity)
+{
+  periodic_geometry::validateCell(cell);
+  validateOpenOrbitalJetLayout(layout);
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || !positions || !nuclei || !radii || !valid)
+    throw std::invalid_argument("Periodic VALUE pair producer requires owned VALUE storage");
+  const auto cost = estimatePeriodicValuePairCost(layout.features.configuration_count,
+      layout.features.electron_count, layout.nucleus_count);
+  if (cost.pair_elements > capacity)
+    throw std::invalid_argument("Periodic VALUE pair producer exceeds capacity");
+  return cost;
+}
+
 /// Capacity-owned VALUE geometry tape; feature/cusp stages reuse one flag bank.
 struct PeriodicValueTilingCost
 {
@@ -290,6 +306,11 @@ struct SparseEnvelopeAnchorView
   bool ready = false;
 };
 
+/// Produce the current owned coordinate generation without publishing physical errors.
+Error launchPeriodicValuePairs(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    double* radii, std::uint8_t* valid, std::size_t capacity);
+
 /// Fill only the live prefix, then consume its canonical Pair bank in nucleus order.
 Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJetLayout& layout,
     const periodic_geometry::Cell& cell, const double* features,
@@ -297,7 +318,8 @@ Error launchPeriodicOrbitalValuesPairGeometry(Stream stream, const OpenOrbitalJe
     const double* backflow_down, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
     double* output, OpenSpatialStatus* status, double* pair_radii,
-    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor = {});
+    std::uint8_t* pair_valid, std::size_t pair_capacity, SparseEnvelopeAnchorView anchor = {},
+    const double* projected_backflow = nullptr);
 
 /// Build real Gamma-periodic orbital jets and optional retained product factors.
 Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,

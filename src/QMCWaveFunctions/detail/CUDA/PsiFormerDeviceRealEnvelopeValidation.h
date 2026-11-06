@@ -175,7 +175,7 @@ struct RealEnvelopeValidationAccess
   }
 
   /// Compare the ordinary molecular/Gamma owner at the shared projection boundary.
-  static void runProjection(compute::Queue<PlatformKind::CUDA>& queue)
+  static void runProjection(compute::Queue<PlatformKind::CUDA>& queue, bool pair_geometry = false)
   {
     const char* key = "PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW";
     const std::optional<std::string> previous = std::getenv(key)
@@ -216,6 +216,14 @@ struct RealEnvelopeValidationAccess
         AcceleratorBlasHandle blas(queue);
         PreparedDeviceInference scalar(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
         PreparedDeviceInference candidate(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
+        std::unique_ptr<PreparedDeviceInference> grouped_reference;
+        if (periodic && pair_geometry)
+        {
+          candidate.preparePeriodicValuePairs();
+          if (!candidate.hasPeriodicValuePairs())
+            throw std::runtime_error("N44 periodic pair owner did not prepare");
+          grouped_reference = std::make_unique<PreparedDeviceInference>(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
+        }
         setenv(key, "1", 1);
         PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE,
             DeviceExecutionPreparation{}, true);
@@ -237,6 +245,18 @@ struct RealEnvelopeValidationAccess
           catch (...) { candidate.endSparseEnvelopeTile(false, true); throw; }
           if (candidate.ecp_projected_backflow_active_)
             throw std::runtime_error("REAL ECP projection escaped tile lifetime");
+          if (grouped_reference)
+          {
+            grouped_reference->beginSparseEnvelopeTile(grouped_reference.get(), 1, 2, 0, refs, moved, live);
+            try { grouped_reference->evaluate(input); grouped_reference->endSparseEnvelopeTile(true, true); }
+            catch (...) { grouped_reference->endSparseEnvelopeTile(false, true); throw; }
+            const auto count = spatialJetSpanElements(candidate.orbitals_.orbitals);
+            std::vector<double> baseline(count), banked(count);
+            grouped_reference->orbitalStorage().download(baseline.data(), count);
+            candidate.orbitalStorage().download(banked.data(), count);
+            if (std::memcmp(baseline.data(), banked.data(), count * sizeof(double)))
+              throw std::runtime_error("Grouped REAL Pair bank changed canonical orbital bits");
+          }
           const auto count = spatialJetSpanElements(candidate.orbitals_.orbitals);
           std::vector<double> a(count), b(count);
           scalar.orbitalStorage().download(a.data(), count);
@@ -278,6 +298,7 @@ struct RealEnvelopeValidationAccess
         auto successor = image->makeUpdatedImage(changed, 1);
         scalar.rebindModel(successor);
         candidate.rebindModel(successor);
+        if (grouped_reference) grouped_reference->rebindModel(successor);
         compare(2, false);
         const std::size_t refs[]{0}, moved[]{ne};
         setenv(key, "1", 1);
@@ -299,12 +320,13 @@ struct RealEnvelopeValidationAccess
         compare(1, false); // Recovery must not inherit an invalid projection/request.
       }
     std::cout << "PASS real_ecp_projection N44 spin26_18 D16_D64 molecule_Gamma liveB3_1_2"
+              << " pair_geometry=" << pair_geometry
               << " translated_images rebind request_lifetime physical_failure recovery warm0 comparisons=" << comparisons
               << " max_orbital_error=" << maximum << "\n";
   }
 
   /// Exercise the production selector/owners independently of the orbital component.
-  static void runPairGeometry(compute::Queue<PlatformKind::CUDA>& queue)
+  static void runPairGeometry(compute::Queue<PlatformKind::CUDA>& queue, std::size_t electrons = 64)
   {
     const char* key = "PSIFORMER_GPU_PERIODIC_VALUE_PAIR_GEOMETRY";
     const std::optional<std::string> previous = std::getenv(key)
@@ -337,7 +359,8 @@ struct RealEnvelopeValidationAccess
     environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
     environment.lattice_vectors = {{{80., .3, .1}, {0., 80., .2}, {.1, 0., 80.}}};
     environment.periodic_axes = {true, true, true};
-    const ModelShape shape{32, 32, 64, 1, 64, 4, 1};
+    const ModelShape shape{electrons == 44 ? 26u : 32u, electrons == 44 ? 18u : 32u,
+                           electrons, 1, 64, 4, 1};
     auto parameters = mixed_periodic_validation::parameters(environment, shape);
     const auto plan = PsiFormerExecutionPlan::fromParameters(parameters, shape, environment);
     const auto ne = shape.electrons();
@@ -436,7 +459,7 @@ struct RealEnvelopeValidationAccess
     auto fitting_second = backend.prepare(16);
     if (!backend.preparePeriodicValuePairs(*fitting_first, fitting_second.get()))
       throw std::runtime_error("Periodic VALUE pair admitted owners did not prepare");
-    std::cout << "PASS real_periodic_pair_geometry Ne64 exact_bits B4_B2_B1_B4 rebind warm0 retained_reject combined_B4_B16_minus1 cold_flag\n";
+    std::cout << "PASS real_periodic_pair_geometry Ne=" << ne << " exact_bits B4_B2_B1_B4 rebind warm0 retained_reject combined_B4_B16_minus1 cold_flag\n";
   }
 };
 } // namespace qmcplusplus::psiformer::device
