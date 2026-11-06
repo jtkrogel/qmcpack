@@ -233,3 +233,24 @@ their interaction should be measured with complete units rather than inferred
 from isolated kernel timings. The small-LU validator checks scalar GPU and CPU
 results, inverse on/off, scaled/singular/nonfinite matrices, failure recovery and
 allocation ownership. Explicit selectors remain off by default.
+
+Score-KFAC collection and publication reuse
+-------------------------------------------
+
+Real OPEN FP64 score-KFAC shares the existing score-Adam collection-energy and
+VALUE-only publication refresh policies. Admission requires one neural component,
+one crowd, one block/step, all-electron moves without drift, ordinary accelerator
+parameter products, no resident device-authority mode and disabled debug checks.
+Collection-energy reuse additionally requires a physical nonlocal ECP and the
+same-version, same-coordinate FULL replay proof; failure falls back to the
+previous preparation path. Legacy full-response KFAC and other domains retain
+their existing behavior.
+
+The score operator owns current-version evidence before affine statistics are
+constructed. KFAC factors, inverse cadence, curvature and objective policies do
+not change. After publication only the current VALUE is refreshed; the next
+physical observation rebuilds current spatial products before its Hamiltonian.
+This removes unused energy evaluations and their quadrature draws, so randomized
+trajectories need not match the previous random stream. Fixed-grid one-update
+checks compare physical scalars, parameters and KFAC state, while normal-grid
+runs verify finite updates, cache versions and one energy population per update.

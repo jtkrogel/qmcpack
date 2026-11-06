@@ -4243,13 +4243,14 @@ void WFTrainBatched::run()
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
   const bool sampled_score_reuse =
       training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY && score_training &&
-      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM || score_kfac_training) &&
       !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
       !vmcdriver_input_.get_use_drift() &&
       vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
       qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
       device_provider && device_provider->usesAcceleratorParameterProducts() &&
       !device_provider->residentECPObservationEnabled() &&
+      population_.get_golden_twf().getOrbitals().size() == 1 &&
       population_.get_golden_electrons().getLattice().SuperCellEnum == SUPERCELL_OPEN &&
       population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
       crowds_.size() == 1 && num_blocks == 1 && steps_per_block_ == 1;
@@ -5157,6 +5158,7 @@ void WFTrainBatched::run()
               app_log() << "WFTrain collection energy reuse: version=" << *samples.replay_version
                         << " samples=" << samples.local_energies.size()
                         << " full_evaluations=0 hamiltonian_evaluations=0"
+                        << " score_kfac=" << score_kfac_training
                         << " score_ecp_full_handoff=" << score_ecp_full_handoff << std::endl;
               sample_offset += crowd.size();
               batches.push_back(std::move(batch));
@@ -7075,7 +7077,8 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
   const auto* refresh_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
   const bool value_only_refresh =
       training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
-      training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM &&
+      (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM ||
+       wftrain::usesKFACScoreEstimator(training_input_, false)) &&
       wftrain::usesEnergyScoreEstimator(training_input_, false) &&
       !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
       !vmcdriver_input_.get_use_drift() &&
