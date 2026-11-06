@@ -26,22 +26,27 @@ inline void validatePeriodicValueGeometry(compute::Queue<PlatformKind::CUDA>& qu
                                                {{true, true, true}});
   std::size_t cases = 0;
   double max_host_error = 0.;
-  for (const std::size_t ne : {63, 64, 100, 200})
-    for (const std::size_t batch : {1, 4})
+  struct Fixture { std::size_t ne, nuclei, spin_up; };
+  const Fixture fixtures[] = {{44, 4, 26}, {44, 44, 26}, {44, 4, 0}, {44, 4, 44},
+                              {63, 63, 31}, {64, 64, 32}, {100, 100, 50}, {200, 200, 100}};
+  for (const auto fixture : fixtures)
+    for (const std::size_t batch : {1, 3})
     {
+      const auto ne = fixture.ne;
+      const auto ni = fixture.nuclei;
       const auto mode = SpatialJetMode::VALUE_ONLY;
-      const auto feature = makePeriodicFeatureJetLayout(batch, ne, ne, ne / 2, mode,
-          5, 5 * ne + 11, 7, ne * (7 * ne + 1) + 13, ne * (7 * ne + 1) + 31);
-      const auto cusp = makeOpenCuspJetLayout(batch, ne, ne / 2, mode,
+      const auto feature = makePeriodicFeatureJetLayout(batch, ne, ni, fixture.spin_up, mode,
+          5, 5 * ne + 11, 7, ne * (7 * ni + 1) + 13, ne * (7 * ni + 1) + 31);
+      const auto cusp = makeOpenCuspJetLayout(batch, ne, fixture.spin_up, mode,
           5, 5 * ne + 11, 3, 19);
       std::vector<double> base(batch * feature.position_configuration_stride, 17.);
-      std::vector<double> nuclei(ne * 7, 23.);
+      std::vector<double> nuclei(ni * 7, 23.);
       for (std::size_t b = 0; b < batch; ++b)
         for (std::size_t e = 0; e < ne; ++e)
           for (std::size_t d = 0; d < 3; ++d)
             base[b * feature.position_configuration_stride + 5 * e + d] =
                 .13 + .037 * e + .17 * d + .03 * b;
-      for (std::size_t n = 0; n < ne; ++n)
+      for (std::size_t n = 0; n < ni; ++n)
         for (std::size_t d = 0; d < 3; ++d)
           nuclei[7 * n + d] = .09 + .051 * n + .23 * d;
       DeviceBuffer<double> positions(base.size()), ions(nuclei.size());

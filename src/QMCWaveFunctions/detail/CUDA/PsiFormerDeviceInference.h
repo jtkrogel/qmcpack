@@ -2280,8 +2280,11 @@ public:
                        environment.amplitude_scalar_domain == ScalarDomain::REAL) ||
         (environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX &&
          environment.amplitude_scalar_domain == ScalarDomain::COMPLEX);
+    // Extend only ordinary FP64 N44 VALUE ownership; larger-size policy is unchanged.
+    const bool admitted_size = ne_ >= 64 || (ne_ == 44 && value_tape_.empty() &&
+        !retained_score_periodic_geometry_ && !mixed_dense_ && !mixed_open_features_excluded_);
     return !canonical_scalar_value_ && ((periodic_value_geometry_requested_ && value_tape_.empty()) || retained_score_periodic_geometry_) &&
-        ne_ >= 64 && mode_ == SpatialJetMode::VALUE_ONLY && !retained_targets_ && !kinetic_trunk_only_ &&
+        admitted_size && mode_ == SpatialJetMode::VALUE_ONLY && !retained_targets_ && !kinetic_trunk_only_ &&
         environment.fixed_nuclei &&
         environment.boundary == BoundaryCondition::PERIODIC && !environment.periodic_profile &&
         environment.geometry_feature_policy == GeometryFeaturePolicy::PERIODIC_TORUS_V1 &&

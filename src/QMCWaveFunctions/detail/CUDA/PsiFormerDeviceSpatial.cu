@@ -1462,7 +1462,7 @@ Error launchPeriodicFeatureValuesCooperative(Stream stream, const OpenFeatureJet
   validateOpenFeatureJetLayout(layout, true);
   if (!positions || !nuclei || !active_electrons || !output || !status)
     throw std::invalid_argument("PsiFormer cooperative periodic feature storage is null");
-  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64)
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || (layout.output.electron_count != 44 && layout.output.electron_count < 64))
     return launchPeriodicFeatureJets(stream, layout, cell, positions, nuclei, active_electrons, output, status);
   if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::length_error("PsiFormer cooperative periodic feature grid exceeds portable device x dimension");
@@ -1680,7 +1680,7 @@ Error launchPeriodicCuspValuesCooperative(Stream stream, const OpenCuspJetLayout
   validateOpenCuspJetLayout(layout);
   if (!positions || !active_electrons || !output || !status)
     throw std::invalid_argument("PsiFormer cooperative periodic cusp device storage is null");
-  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || layout.output.electron_count < 64)
+  if (layout.output.mode != SpatialJetMode::VALUE_ONLY || (layout.output.electron_count != 44 && layout.output.electron_count < 64))
     return launchPeriodicCuspJets(stream, layout, cell, positions, active_electrons,
         same_spin_alpha, opposite_spin_alpha, output, status);
   if (layout.output.configuration_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
