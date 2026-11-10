@@ -118,6 +118,34 @@ private:
 
 } // namespace
 
+TEST_CASE("PsiFormer cold numerical VALUE storage does not require sparse hints",
+          "[wavefunction][psiformer][batch][cold-value-context]")
+{
+  using namespace qmcplusplus::testing::psiformer;
+  auto files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters.string(), files.configuration.string());
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, 2, model.ndet, model.dim, model.heads, model.blocks});
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor spatial(model, value, plan);
+  auto tiles = std::make_shared<SyntheticTileBackend>(model.ne, false);
+  pf::DirectBatchExecutor batch(value, spatial, tiles);
+  auto workspace = batch.makeWorkspace();
+  workspace->prepareTileCapacity(2);
+  workspace->prepareSparseValueContext();
+  CHECK(tiles->preparations == 0);
+  CHECK_THROWS_AS(workspace->numericalSamplingWorkspace(), std::logic_error);
+  workspace->prepareNumericalValueContext();
+  CHECK_NOTHROW(workspace->numericalSamplingWorkspace());
+  CHECK(tiles->preparations == 1);
+  CHECK(tiles->calls == 0);
+  workspace->prepareNumericalValueContext();
+  CHECK(tiles->preparations == 1);
+  CHECK_THROWS_AS(workspace->prepareNumericalValueContext(3), std::invalid_argument);
+  CHECK(tiles->preparations == 1);
+  CHECK(tiles->calls == 0);
+}
+
 /// Opt-in protocol must preserve original order, noexcept moves and atomic failure.
 TEST_CASE("PsiFormer sparse VALUE hints have scoped move-safe request cookies",
           "[wavefunction][psiformer][batch][sparse-value-hints]")

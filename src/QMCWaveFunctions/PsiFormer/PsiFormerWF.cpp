@@ -5379,13 +5379,13 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
     {
       // VALUE16 owns virtual points independently. Its ordinary owner therefore
       // needs only the existing physical walker occupancy, not sixteen FULLs.
-      batch_workspace->prepareSparseValueContext(dedicated_value16
+      batch_workspace->prepareNumericalValueContext(dedicated_value16
           ? std::min(live_lanes, batch_workspace->tileCapacity()) : batch_workspace->tileCapacity());
       if (dedicated_value16 && !ecp_value_workspace)
       {
         auto candidate = model_state->direct_batch_executor.makeWorkspace();
         candidate->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, ecpValueTileCapacity());
-        candidate->prepareSparseValueContext();
+        candidate->prepareNumericalValueContext();
         ecp_value_workspace = std::move(candidate);
       }
       backend->prepareSparseValueReuse(batch_workspace->numericalSamplingWorkspace(),
