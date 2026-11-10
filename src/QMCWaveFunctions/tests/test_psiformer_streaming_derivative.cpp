@@ -2954,7 +2954,7 @@ TEST_CASE("CPU score-only PsiFormer omits kinetic storage with identical score p
        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)}};
   SelectedParameterSink forbidden(selected);
   CHECK_THROWS_AS(score->applyVJPs({energy_channel.data(), energy_channel.size()},
-      wftrain::DerivativeAdjoint::TRANSPOSE, forbidden), std::invalid_argument);
+      wftrain::DerivativeAdjoint::TRANSPOSE, forbidden), std::runtime_error);
   auto other_score = component.makeCpuScoreStreamingDerivativeOperator(components, particles, 1, 1, 73);
   CHECK(other_score->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
   std::cout << "CPU_SCORE_ONLY_STORAGE_PASS old_workspace=" << old_storage.evaluator_workspace_bytes
