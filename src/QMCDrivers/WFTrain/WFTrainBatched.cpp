@@ -433,7 +433,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealScoreBatchUnderLoc
 /// The early factory copies fresh replay state but performs no derivatives or accepted-grid RNG.
 std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBatch(
     Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk,
-    const WFTrainDriverInput::ComplexGpuTraining* paired_gpu = nullptr)
+    const WFTrainDriverInput::ComplexGpuTraining* paired_gpu = nullptr, bool cpu_profile = false)
 {
   const auto& electrons = crowd.get_walker_elecs();
   const auto& twfs = crowd.get_walker_twfs();
@@ -457,7 +457,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBa
         paired_gpu->maximum_matrix_work, scope);
   }
 #endif
-  return makeRealScoreBatchUnderLocks(crowd, batch, offset, chunk);
+  return makeRealScoreBatchUnderLocks(crowd, batch, offset, chunk, cpu_profile);
 }
 
 /// One scalar private evaluator reused by every retained conventional replay view.
@@ -1179,11 +1179,19 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, twf_batch);
     ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(crowd.getSharedResource().ham_res, hamiltonian_batch);
     ParticleSet::mw_update(electron_batch);
-    const bool reuse_full = full_handoff && gpu_training && score_only && has_nonlocal_ecp &&
+    const bool reuse_full = full_handoff && score_only && has_nonlocal_ecp &&
         !capture_ecp_jvp_replay && !capture_inline_ecp_vjp &&
         consumeImmediateFullReplay(crowd, *full_handoff);
     if (!reuse_full)
+    {
       TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+      if (work_counters && !gpu_training)
+      {
+        // Count the existing CPU preparation FULL as well as the earlier replay.
+        work_counters->addRequestedProducts(true, true, true);
+        work_counters->addComputedProducts(true, true, true);
+      }
+    }
     if (full_handoff)
       app_log() << "Paired immediate ECP FULL handoff: full_elided=" << reuse_full
                 << " full_evaluations=" << !reuse_full << " batch=" << batch_ordinal << " offset=" << sample_offset
@@ -1425,7 +1433,7 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   {
     const auto& components = twfs[0].get().getOrbitals();
     const auto* real = components.size() == 1 ? dynamic_cast<const PsiFormerWF*>(components[0].get()) : nullptr;
-    reuse_immediate_full = real && real->usesAcceleratorParameterProducts() &&
+    reuse_immediate_full = real && (real->usesAcceleratorParameterProducts() || cpu_score_only_products) &&
         real->isPseudopotentialSystem() && consumeImmediateFullReplay(crowd, *full_handoff);
   }
 #endif
@@ -4364,6 +4372,36 @@ void WFTrainBatched::run()
     if (!cpu_score_only_products)
       throw UniformCommunicateError("CPU score-only products require a sole real FP64 CPU PsiFormer ECP score-Adam/KFAC provider");
   }
+  const char* cpu_handoff_optin = std::getenv("PSIFORMER_CPU_ECP_FULL_HANDOFF");
+  if (cpu_handoff_optin && std::string(cpu_handoff_optin) != "0" && std::string(cpu_handoff_optin) != "1")
+    throw UniformCommunicateError("PSIFORMER_CPU_ECP_FULL_HANDOFF must be 0 or 1");
+  const bool cpu_handoff_requested = cpu_handoff_optin && std::string(cpu_handoff_optin) == "1";
+#if !defined(MIXED_PRECISION)
+#ifdef QMC_COMPLEX
+  const bool cpu_handoff_provider = complex_training_component_ && !complex_gpu_provider_ &&
+      !complex_training_component_->gpuInferenceEnabled() &&
+      complex_training_component_->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons());
+#else
+  const bool cpu_handoff_provider = cpu_score_only_products && device_provider &&
+      !device_provider->usesAcceleratorParameterProducts() && device_provider->isPseudopotentialSystem() &&
+      supportsCollectedScoreGeometry(*device_provider, population_.get_golden_electrons());
+#endif
+  const bool cpu_full_handoff = cpu_handoff_requested && cpu_handoff_provider && score_training &&
+      (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM || score_kfac_training) &&
+      !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
+      !vmcdriver_input_.get_use_drift() &&
+      vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
+      qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
+      population_.get_golden_twf().getOrbitals().size() == 1 &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP();
+#else
+  constexpr bool cpu_full_handoff = false;
+#endif
+  if (cpu_handoff_requested && !cpu_full_handoff)
+    throw UniformCommunicateError("CPU ECP FULL handoff requires a sole FP64 CPU PsiFormer ECP no-drift all-electron score provider");
+  if (cpu_full_handoff && myComm->rank() == 0)
+    app_log() << "WFTrain CPU ECP FULL handoff eligible; each replay needs fresh coordinate/version/G/L proof"
+              << std::endl;
   if (native_mixed_training && (crowds_.size() != 1 ||
       !population_.get_golden_hamiltonian().hasPhysicalNLPP() || !score_training ||
       (training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM &&
@@ -5444,7 +5482,7 @@ void WFTrainBatched::run()
             }
             std::optional<ImmediateFullReplayReceipt> full_handoff;
             std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score;
-            if ((kfac_ecp_full_handoff || score_ecp_full_handoff) && (fresh_full || sampled_score_reuse) &&
+            if ((kfac_ecp_full_handoff || score_ecp_full_handoff || cpu_full_handoff) && (fresh_full || sampled_score_reuse) &&
                 score_training && has_nonlocal_ecp && !capture_ecp_jvp_replay)
             {
               if (complex_training)
@@ -5463,7 +5501,8 @@ void WFTrainBatched::run()
               else
               {
                 prepared_score = prepareImmediateGpuScoreBatch(crowd, batch_ordinal, sample_offset,
-                                                               training_input_.getParameterChunkSize());
+                                                               training_input_.getParameterChunkSize(), nullptr,
+                                                               cpu_full_handoff);
                 const auto named = scoreOnlyECPCaptureNamedBytes(*prepared_score, crowd.size());
                 if (named < scalar_ecp_budget)
                   full_handoff = captureImmediateFullReplay(crowd, samples, training_state.parameter_version,
