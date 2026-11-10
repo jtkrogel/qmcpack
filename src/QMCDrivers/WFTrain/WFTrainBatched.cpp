@@ -4403,6 +4403,10 @@ void WFTrainBatched::run()
   if (cpu_full_handoff && myComm->rank() == 0)
     app_log() << "WFTrain CPU ECP FULL handoff eligible; each replay needs fresh coordinate/version/G/L proof"
               << std::endl;
+  // With one collection per crowd, its live chain is still the saved sample.
+  // Reuse only if replayCrowdSamples proves the exact FULL state after mw_update;
+  // the native accepted-grid Hamiltonian below remains unchanged.
+  const bool cpu_single_collected_snapshot = cpu_full_handoff && num_blocks == 1 && steps_per_block_ == 1;
   if (native_mixed_training && (crowds_.size() != 1 ||
       !population_.get_golden_hamiltonian().hasPhysicalNLPP() || !score_training ||
       (training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM &&
@@ -5081,7 +5085,8 @@ void WFTrainBatched::run()
             {
               retained_samples.push_back(retainCrowdSamples(
                   *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training,
-                  (resident_adam_budget || resident_sr_budget.first || kfac_single_replay || sampled_score_reuse)
+                  (resident_adam_budget || resident_sr_budget.first || kfac_single_replay || sampled_score_reuse ||
+                   cpu_single_collected_snapshot)
                       ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
               auto& snapshot = retained_samples.back();
 #ifdef QMC_COMPLEX
@@ -5422,7 +5427,8 @@ void WFTrainBatched::run()
                  (!has_nonlocal_ecp || resident_device_authority_))))) &&
                 retained_samples.size() == 1 && crowds_.size() == 1 &&
                 num_blocks == 1 && steps_per_block_ == 1;
-            const bool fresh_full = replayCrowdSamples(crowd, samples, resident_single_snapshot
+            const bool reuse_collected_full = cpu_single_collected_snapshot || resident_single_snapshot;
+            const bool fresh_full = replayCrowdSamples(crowd, samples, reuse_collected_full
                 ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
             if (fresh_full && work_counters)
             {
@@ -5490,7 +5496,8 @@ void WFTrainBatched::run()
             }
             std::optional<ImmediateFullReplayReceipt> full_handoff;
             std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score;
-            if ((kfac_ecp_full_handoff || score_ecp_full_handoff || cpu_full_handoff) && (fresh_full || sampled_score_reuse) &&
+            if ((kfac_ecp_full_handoff || score_ecp_full_handoff || cpu_full_handoff) &&
+                (fresh_full || sampled_score_reuse || cpu_single_collected_snapshot) &&
                 score_training && has_nonlocal_ecp && !capture_ecp_jvp_replay)
             {
               if (complex_training)
