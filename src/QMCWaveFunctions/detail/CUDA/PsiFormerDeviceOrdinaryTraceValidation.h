@@ -13,14 +13,21 @@ namespace qmcplusplus::psiformer::device
 inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::CUDA>& queue)
 {
   const char* key = "PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES";
-  const char* old = std::getenv(key);
-  const std::optional<std::string> previous = old ? std::optional<std::string>(old) : std::nullopt;
   struct Restore
   {
     const char* key;
-    const std::optional<std::string>& previous;
+    std::optional<std::string> previous;
+    explicit Restore(const char* name) : key(name)
+    {
+      if (const char* old = std::getenv(key)) previous = old;
+    }
     ~Restore() { if (previous) setenv(key, previous->c_str(), 1); else unsetenv(key); }
-  } restore{key, previous};
+  } restore(key), cooperative("PSIFORMER_GPU_COOPERATIVE_SPATIAL_TRACES"),
+      targets("PSIFORMER_GPU_SMALL_MATRIX_SPATIAL_TARGETS");
+  // Use the qualified production reference, rather than an accidentally serial
+  // one-thread-per-configuration oracle at the larger endpoint sizes.
+  setenv(cooperative.key, "1", 1);
+  setenv(targets.key, "1", 1);
   unsetenv(key);
   if (configuredRealFullParallelTraces()) throw std::runtime_error("Parallel ordinary traces changed default");
   setenv(key, "invalid", 1);
@@ -28,6 +35,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
   try { (void)configuredRealFullParallelTraces(); }
   catch (const std::invalid_argument&) { invalid_rejected = true; }
   if (!invalid_rejected) throw std::runtime_error("Invalid ordinary trace selector accepted");
+  setenv(key, "0", 1);
 
   AcceleratorBlasHandle blas(queue);
   for (const auto shape_pair : {std::pair<std::size_t, std::size_t>{22, 16}, {22, 64}, {22, 160},
@@ -124,7 +132,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
     compare(1);
     std::cout << "ORDINARY_PARALLEL_TRACES_PASS N=" << n << " D=" << determinants
               << " max_abs_error=" << maximum_error << " added_device_bytes=" << extra
-              << " tail_rebind_failure_recovery=yes warm_allocations=0\n";
+              << " tail_rebind_failure_recovery=yes warm_allocations=0" << std::endl;
   }
 }
 } // namespace qmcplusplus::psiformer::device
