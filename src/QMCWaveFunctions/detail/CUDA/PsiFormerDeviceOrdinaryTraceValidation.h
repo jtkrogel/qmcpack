@@ -65,6 +65,17 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
           positions[b * 3 * n + 3 * e + d] = nuclei[3 * e + d] + .06 + .02 * d + .01 * b;
       }
     auto image = std::make_shared<PreparedDeviceModel>(plan, parameters.flat_values(), nuclei, 0);
+    if (boundary == BoundaryCondition::PERIODIC && n == 22 && determinants == 16)
+    {
+      auto complex_environment = environment;
+      complex_environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+      complex_environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+      auto complex_parameters = mixed_periodic_validation::parameters(complex_environment, shape);
+      const auto complex_plan = PsiFormerExecutionPlan::fromParameters(complex_parameters, shape, complex_environment);
+      unsetenv(key);
+      if (planOrdinaryRealFullTraces(complex_plan, 2).total_device_bytes)
+        throw std::runtime_error("Automatic ordinary REAL trace planner admitted paired-complex outputs");
+    }
     setenv(key, "0", 1);
     PreparedDeviceInference reference(image, 2, queue, blas, SpatialJetMode::FULL_VGL);
     setenv(key, "1", 1);
@@ -160,6 +171,33 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
     compare(1);
     if (boundary == BoundaryCondition::OPEN)
     {
+      unsetenv(key);
+      {
+        PreparedDeviceInference score_owner(image, 1, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+        PreparedDeviceInference spatial_owner(image, 1, queue, blas, SpatialJetMode::FULL_VGL, false, true);
+        TargetVglPreparation target{1, 1024 * 1024 * 1024, 1000000000000ULL, 0, false};
+        PreparedDeviceInference target_owner(image, 1, queue, blas, SpatialJetMode::FULL_VGL,
+            false, false, configuredInferenceStatusPolicy(), target);
+        if (score_owner.usesOrdinaryParallelTraces() || spatial_owner.usesOrdinaryParallelTraces() ||
+            target_owner.usesOrdinaryParallelTraces())
+          throw std::runtime_error("Automatic ordinary traces entered an excluded retained/target owner");
+      }
+      auto mixed_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(successor, queue);
+      auto mixed_adapter = std::make_shared<PreparedDeviceMixedValueDense>(mixed_cache,
+          default_candidate.mixedDenseRowCapacity(), queue, blas);
+      const auto before_mixed = default_candidate.deviceWorkspaceBytes();
+      default_candidate.setMixedDense(mixed_adapter);
+      if (default_candidate.usesOrdinaryParallelTraces() ||
+          before_mixed - default_candidate.deviceWorkspaceBytes() != extra)
+        throw std::runtime_error("Automatic mixed attachment retained optional real trace scratch");
+      default_candidate.setMixedDense({});
+      bool explicit_attachment_rejected = false;
+      try { candidate.setMixedDense(mixed_adapter); }
+      catch (const std::invalid_argument&) { explicit_attachment_rejected = true; }
+      if (!explicit_attachment_rejected || !candidate.usesOrdinaryParallelTraces())
+        throw std::runtime_error("Explicit trace/mixed attachment diagnostic changed");
+      compare(1); // Detaching mixed must retain valid legacy FP64 execution.
+      std::cout << "ORDINARY_PARALLEL_TRACE_EXCLUSIONS_PASS retained_target_mixed=yes\n";
       // Reserve logical capacity, not physical memory, so the baseline fits
       // exactly and only the default's extra trace scratch is denied.
       const auto policy = configuredDeviceMemoryAdmission();
