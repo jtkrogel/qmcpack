@@ -39,6 +39,7 @@
 #include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCPUComponentTrace.h"
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceResources.h"
 #endif
@@ -342,6 +343,9 @@ bool QMCMain::execute()
     }
     saveXml();
   }
+  // All QMC sections have returned and their worker regions have quiesced.
+  // Snapshot optional per-worker CPU timings outside measured QMC units.
+  pf::cpu_component_trace::flushAllThreads();
   return true;
 }
 
