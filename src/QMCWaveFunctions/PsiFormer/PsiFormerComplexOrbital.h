@@ -424,7 +424,9 @@ private:
    * The unpublished result buffer supplies disjoint real/imaginary scratch planes;
    * all affine planes are scattered before composition writes final results.
    * std::complex arrays explicitly permit access as an interleaved scalar array.
-   * No packing, additional numeric capacity or allocation is needed. Nonfinite
+   * No packing or additional task-owned numeric allocation is needed. Vendor BLAS
+   * workspace is outside this owner accounting and is covered by process/node
+   * memory observations. Nonfinite
    * BLAS intermediates fall back to the original extended-precision projection.
    */
   bool projectBlas(const double* input, const ComplexOrbitalFeatureJetView* split,

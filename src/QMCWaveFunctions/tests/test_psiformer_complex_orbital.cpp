@@ -481,7 +481,7 @@ void blasProjection()
       for (std::size_t i = 0; i < psif::spatialJetSpanElements(scalar.layout()); ++i)
         check(near(blas.data()[i], scalar.data()[i], 2e-12), "BLAS split projection matches extended-precision oracle within FP64 tolerance");
       check(blas.storageBytes() == storage && blas.storageFingerprint() == fingerprint,
-            "BLAS projection introduces no retained or per-call allocation");
+            "BLAS projection keeps prepared storage and allocation identities unchanged");
       check(blas.storageBytes() == scalar.storageBytes(), "BLAS projection keeps prepared memory unchanged");
       // A finite-input FP64 intermediate overflow must use the wider oracle,
       // which can cancel opposite contributions before its finite narrowing.
