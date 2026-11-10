@@ -16,6 +16,7 @@
 #include "QMCDrivers/WalkerLogManager.h"
 #include "QMCDrivers/WFTrain/DeterminantOverlapObjective.h"
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
@@ -4530,6 +4531,13 @@ void WFTrainBatched::run()
         initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
       throw UniformCommunicateError(
           "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
+    if (myComm->rank() == 0 && !selected_provider_->usesAcceleratorParameterProducts() &&
+        std::getenv("PSIFORMER_WORK_COUNTER_TRACE"))
+      app_log() << "WFTrain CPU initial parameter identity: version=" << initial_parameters.version
+                << " schema=" << initial_parameters.schema_fingerprint
+                << " values_fingerprint=" << wftrain::TrainingCheckpoint::valuesFingerprint(initial_parameters.values)
+                << " parameters=" << initial_parameters.values.size()
+                << "; snapshot precedes timed iterations; fingerprint is FNV, not SHA256" << std::endl;
     return initial_parameters.version;
   }(); // Release the cold P vector before warm iterations.
   std::unique_ptr<wftrain::FirstOrderOptimizer> first_order_optimizer;
