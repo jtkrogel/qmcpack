@@ -3346,6 +3346,51 @@ TEST_CASE("PsiFormer retained ENERGY replay requires exact current FULL cache ev
 }
 
 #if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("CPU VALUE publication after parameter update reconstructs current FULL",
+          "[wavefunction][psiformer][cpu_value_publication]")
+{
+  const bool periodic = GENERATE(false, true);
+  Lattice lattice;
+  if (periodic)
+  {
+    lattice.R = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+    lattice.BoxBConds = {true, true, true};
+    lattice.reset();
+  }
+  SimulationCell cell(lattice);
+  auto live = makeLiHElectrons(cell, "lih_pp");
+  WaveFunctionComponentBuilder::PSetMap sources;
+  auto ions = makeLiHIons(cell, "lih_pp");
+  sources.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, live, sources);
+  auto component = buildInternalPsiFormer(builder, "pf_value_publication", 23, "pseudopotential", "0 257",
+      periodic ? "periodic_torus_v1" : "open_euclidean_v1");
+  live.G = ValueType(0); live.L = ValueType(0);
+  component->evaluateLog(live, live.G, live.L);
+  auto active = registerSelectedParameters(*component);
+  active[0] += 2e-4;
+  component->resetParametersExclusive(active);
+  ParticleSet reference(live);
+  auto reference_component = component->makeClone(reference);
+  reference.G = ValueType(0); reference.L = ValueType(0);
+  const auto expected = reference_component->evaluateLog(reference, reference.G, reference.L);
+  live.G = WaveFunctionComponent::GradType{7, 7, 7}; live.L = ValueType(7);
+  const auto value = component->evaluateLog(live, live.G, live.L, WaveFunctionEvaluationRequest::VALUE_ONLY);
+  CHECK(std::abs(value - expected) < 1e-10);
+  for (int e = 0; e < live.getTotalNum(); ++e)
+  {
+    CHECK(live.L[e] == ValueType(7));
+    for (int d = 0; d < 3; ++d) CHECK(live.G[e][d] == ValueType(7));
+  }
+  live.G = ValueType(0); live.L = ValueType(0);
+  CHECK(std::abs(component->evaluateLog(live, live.G, live.L) - expected) < 1e-10);
+  for (int e = 0; e < live.getTotalNum(); ++e)
+  {
+    CHECK(std::abs(live.L[e] - reference.L[e]) < 1e-9);
+    for (int d = 0; d < 3; ++d) CHECK(std::abs(live.G[e][d] - reference.G[e][d]) < 1e-9);
+  }
+}
+
 TEST_CASE("PsiFormer immediate replay proves fresh derivatives and fixed context",
           "[wavefunction][psiformer][immediate_full_replay]")
 {

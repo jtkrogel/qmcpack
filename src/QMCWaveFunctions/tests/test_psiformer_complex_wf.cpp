@@ -1183,6 +1183,39 @@ TEST_CASE("Complex shared CPU collective proposals retain atomic complete produc
   CHECK(family.numericStorage().shared_cpu_fingerprint == before.shared_cpu_fingerprint);
 }
 
+TEST_CASE("Complex CPU VALUE publication reconstructs FULL after parameter update",
+          "[wavefunction][psiformer][complex_wf][cpu_value_publication]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto live = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF component("publication", parameters(), live, source, clone_cap,
+      {.17, -.11, .07}, 0, {}, "pseudopotential");
+  evaluate(component, live);
+  auto candidate = component.snapshotParameters();
+  candidate.values[1] += .01;
+  component.publishParameters(candidate, candidate.version);
+  ParticleSet reference(live);
+  auto reference_base = component.makeClone(reference);
+  auto& reference_component = dynamic_cast<PsiFormerComplexWF&>(*reference_base);
+  const auto expected = evaluate(reference_component, reference);
+  const C sentinel{7, 3};
+  live.G = WaveFunctionComponent::GradType{sentinel, sentinel, sentinel};
+  live.L = sentinel;
+  close(component.evaluateLog(live, live.G, live.L, WaveFunctionEvaluationRequest::VALUE_ONLY), expected, 2e-12);
+  for (int e = 0; e < live.getTotalNum(); ++e)
+  {
+    CHECK(live.L[e] == sentinel);
+    for (int d = 0; d < 3; ++d) CHECK(live.G[e][d] == sentinel);
+  }
+  close(evaluate(component, live), expected, 2e-12);
+  for (int e = 0; e < live.getTotalNum(); ++e)
+  {
+    close(live.L[e], reference.L[e], 2e-11);
+    for (int d = 0; d < 3; ++d) close(live.G[e][d], reference.G[e][d], 2e-11);
+  }
+}
+
 TEST_CASE("Complex CPU VALUE warmup retains amplitudes and reconstructs FULL products",
           "[wavefunction][psiformer][complex_wf][complex_value_warmup]")
 {
