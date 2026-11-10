@@ -496,13 +496,16 @@ private:
     if (w.owner_ != this || w.mode_ != mode)
       throw std::invalid_argument("PsiFormer complex spatial workspace owner or mode mismatch");
     if (mode == DirectSpatialMode::TARGET_VGL) w.setTargetRange(active, targets);
+    cpu_component_trace::Scope timing(cpu_component_trace::Stage::spatial_real_trunk_inclusive);
     const auto t = mode == DirectSpatialMode::FULL_VGL ? trunk_.evaluateTrunkFull(*w.trunk_) :
         mode == DirectSpatialMode::TARGET_VGL ? trunk_.evaluateTrunkTarget(*w.trunk_, active, targets) :
                                               trunk_.evaluateTrunkActive(*w.trunk_, active);
+    timing.next(cpu_component_trace::Stage::spatial_envelope);
     const double* p = parameters_.flat_values().data();
     fillRealOrbitalEnvelopeJets(*t.geometry, w.orbitals_, descriptor_.spin_up,
         metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data(),
         metadata_.trunkLayout()->periodicProfile());
+    timing.next(cpu_component_trace::Stage::spatial_head);
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0,
         fourier_[0].size ? p + fourier_[0].begin : nullptr, fourier_[0].size};
@@ -514,9 +517,11 @@ private:
     w.head_.evaluate(features, w.envelopes_.data(), w.envelopes_.size(), t.packed_positions,
                      3 * descriptor_.electrons, heads, active);
     const auto* h = w.head_.data();
+    timing.next(cpu_component_trace::Stage::spatial_determinant);
     const auto det = w.determinant_.evaluateSpatial(h, h + w.orbitals_.element_count,
         w.features_.gradient_lanes, h + (1 + w.features_.gradient_lanes) * w.orbitals_.element_count,
         w.features_.laplacian_lanes, w.gradient_.data(), w.lap_log_.data(), w.lap_ratio_.data());
+    timing.next(cpu_component_trace::Stage::spatial_cusp_finalize);
     auto amplitude = det.amplitude;
     amplitude.log_abs += t.cusp;
     for (std::size_t lane = 0; lane < w.features_.gradient_lanes; ++lane)

@@ -229,7 +229,9 @@ private:
     workspace.invalidate();
     if (workspace.owner_ != this)
       throw std::invalid_argument("PsiFormer complex value workspace belongs to a different executor");
+    cpu_component_trace::Scope timing(cpu_component_trace::Stage::value_real_trunk_inclusive);
     const auto trunk = trunk_.evaluateTrunk(*workspace.trunk_);
+    timing.next(cpu_component_trace::Stage::value_envelope);
     const double* parameters = parameters_.flat_values().data();
     const auto& distances = trunk.geometry->electronNucleusPairs().distances();
     const std::size_t nuclei = trunk_.trunkLayout()->nucleusCount();
@@ -246,6 +248,7 @@ private:
               parameters + zeta_[spin].begin + channel * nuclei, nuclei, trunk_.trunkLayout()->periodicProfile());
         }
     }
+    timing.next(cpu_component_trace::Stage::value_head);
     qmcplusplus::psiformer::ComplexOrbitalHeadParameters heads;
     heads.up = {parameters + real_[0].begin, parameters + imaginary_[0].begin,
                 nullptr, nullptr, real_[0].size, 0, fourier_[0].size ? parameters + fourier_[0].begin : nullptr, fourier_[0].size};
@@ -269,7 +272,9 @@ public:
   DirectComplexValueResult evaluate(DirectComplexValueWorkspace& workspace) const
   {
     const auto trunk = evaluateOrbitalHead(workspace);
+    cpu_component_trace::Scope timing(cpu_component_trace::Stage::value_determinant);
     const auto determinant = workspace.determinant_.evaluate(workspace.head_.data(), nullptr, false);
+    timing.next(cpu_component_trace::Stage::value_cusp_finalize);
     auto amplitude = determinant.amplitude;
     // Preserve the exact same-spin physical node contract, including lattice images.
     const auto& pairs = trunk.geometry->electronPairs();

@@ -34,6 +34,7 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_VALUE_EXECUTOR_H
 #define QMCPLUSPLUS_PSIFORMER_VALUE_EXECUTOR_H
 
+#include "PsiFormerCPUComponentTrace.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
 #include "PsiFormerPeriodicFeatures.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
@@ -612,9 +613,13 @@ public:
       throw std::invalid_argument("PsiFormer real trunk workspace belongs to a different executor layout");
     validateTrunkWorkspace(workspace);
     const double* parameter_values = parameters_.flat_values().data();
+    cpu_component_trace::Scope timing(cpu_component_trace::Stage::real_value_geometry);
     refreshGeometry(workspace);
+    timing.next(cpu_component_trace::Stage::real_value_neural_trunk);
     buildTrunk(parameter_values, workspace);
+    timing.next(cpu_component_trace::Stage::real_value_cusp);
     const double cusp = cuspValue(parameter_values, workspace);
+    timing.stop();
     if (!is_finite_parameter_value(cusp))
       throw std::runtime_error("PsiFormer real trunk produced a non-finite cusp");
     for (double feature : workspace.features_a_)
