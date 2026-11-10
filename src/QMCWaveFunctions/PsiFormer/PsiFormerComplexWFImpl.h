@@ -193,10 +193,12 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Capture the optional determinant grouping once for this prepared family.
-    static bool configuredHeadDeterminantBatch()
+    static bool configuredHeadDeterminantBatch(bool mixed_inference = false)
     {
       const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_HEAD_DETERMINANT_BATCH");
-      if (!value || std::string_view(value) == "0")
+      if (!value)
+        return !mixed_inference;
+      if (std::string_view(value) == "0")
         return false;
       if (std::string_view(value) == "1")
         return true;
@@ -272,12 +274,26 @@ struct PsiFormerComplexWF::Impl
         std::size_t limit, std::size_t capacity, bool mixed_inference = false)
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
-      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
-                           configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse(),
-                           configuredHeadDeterminantBatch(), configuredFullInverseColumns(), configuredTargetFactorReuse(),
-                           psiformer::device::configuredPeriodicValueGeometryTiled(),
-                           psiformer::device::configuredComplexTargetColdCooperativeLu(), mixed_inference, {},
-                           psiformer::device::configuredPeriodicValuePairGeometry());
+      const bool head_batch = configuredHeadDeterminantBatch(mixed_inference);
+      const auto prepare_selected = [&](bool selected_head_batch) {
+        return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity, {},
+                             configuredVirtualCapacity(), configuredTraceTargets(), configuredVirtualEnvelopeReuse(),
+                             selected_head_batch, configuredFullInverseColumns(), configuredTargetFactorReuse(),
+                             psiformer::device::configuredPeriodicValueGeometryTiled(),
+                             psiformer::device::configuredComplexTargetColdCooperativeLu(), mixed_inference, {},
+                             psiformer::device::configuredPeriodicValuePairGeometry());
+      };
+      try { return prepare_selected(head_batch); }
+      catch (const std::length_error&)
+      {
+        if (!head_batch || std::getenv("PSIFORMER_GPU_COMPLEX_HEAD_DETERMINANT_BATCH")) throw;
+      }
+      catch (const std::bad_alloc&)
+      {
+        if (!head_batch || std::getenv("PSIFORMER_GPU_COMPLEX_HEAD_DETERMINANT_BATCH")) throw;
+      }
+      app_log() << "  Complex head projection: determinant_batch=0 reason=default_memory_admission\n";
+      return prepare_selected(false);
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.

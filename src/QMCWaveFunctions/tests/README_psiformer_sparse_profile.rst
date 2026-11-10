@@ -196,10 +196,17 @@ Compare the completed maximum occupancy and physical memory, not only the option
 Grouped ECP orbital projection
 ------------------------------
 
-``PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW=1`` admits ordinary, lazy,
+The default ``PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW`` preference is ON.
+Explicit ``0`` retains the previous projection; explicit ``1`` requests the
+supported grouped route. Automatic selection falls back to the previous route
+for unsupported requests, while unsupported explicit requests retain their
+existing diagnostic. This selector changes orbital projection execution, not
+the wavefunction ansatz or the ECP quadrature.
+
+The grouped route admits ordinary, lazy,
 single-crowd real OPEN or fixed legacy Gamma FP64 virtual VALUE requests to a grouped BLAS orbital
-projection. Unset/0 preserves the previous route; malformed selections and
-unsupported explicit backend configurations fail. This is independent of the
+projection. Malformed selections and unsupported explicit backend configurations
+fail. This is independent of the
 periodic envelope-anchor policy. Gamma retains its periodic features and envelopes;
 ordinary fixed ``PERIODIC_TORUS_V1`` with all axes periodic and no optional periodic
 profile is admitted. Alternate periodic pair geometry, retained derivatives, mixed
@@ -261,3 +268,40 @@ This removes unused energy evaluations and their quadrature draws, so randomized
 trajectories need not match the previous random stream. Fixed-grid one-update
 checks compare physical scalars, parameters and KFAC state, while normal-grid
 runs verify finite updates, cache versions and one energy population per update.
+
+
+Ordinary real FULL trace defaults
+----------------------------------
+
+``PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES`` defaults ON for supported ordinary,
+unretained real FP64 OPEN or legacy-torus FULL_VGL requests. The prepared
+determinant/target-parallel trace evaluator preserves canonical statistics and
+accounts for at most 8 MiB of added device scratch per numerical owner. Explicit
+``0`` retains the previous trace evaluator. If the metadata cannot fit this
+bounded workspace, automatic selection retains the previous route; explicit
+``1`` retains the strict workspace error. Actual route selection is reported at
+cold preparation. No electron-count threshold chooses the preference.
+
+Known mixed owners omit this real-only scratch before preparation. A direct
+mixed adapter attachment to an automatically selected real graph releases its
+optional trace scratch and retains the established mixed route. An explicitly
+selected incompatible ordinary trace/mixed combination remains an error.
+Retained/target/trunk graphs keep their separately qualified algorithms.
+
+Complex orbital projection defaults
+-----------------------------------
+
+``PSIFORMER_GPU_COMPLEX_HEAD_DETERMINANT_BATCH`` defaults ON for the supported
+FP64 complex prepared family and can be explicitly disabled with ``0``. The
+existing mixed family keeps batching OFF automatically; explicit incompatible
+mixed tuning retains its error. Grouped projection batches determinants and
+configurations in the VALUE consumer; FULL batches determinants per
+configuration/derivative plane. Numerical tile capacity remains 1 by default
+(``PSIFORMER_GPU_COMPLEX_TILE_CAPACITY``), independent of the separate virtual
+VALUE capacity. None of these defaults increases tile capacity based on N or D.
+
+The real ECP tile option retains its existing unset capacity16 when enabled;
+264/528 used in individual profiling fixtures are not global defaults. Existing
+shape, geometry, scalar-domain, memory, and mathematical eligibility guards are
+retained. These preferences do not promote the separate tiny-matrix determinant
+selector or alter small-matrix shared-LU dispatch.

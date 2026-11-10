@@ -29,7 +29,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
   setenv(cooperative.key, "1", 1);
   setenv(targets.key, "1", 1);
   unsetenv(key);
-  if (configuredRealFullParallelTraces()) throw std::runtime_error("Parallel ordinary traces changed default");
+  if (!configuredRealFullParallelTraces()) throw std::runtime_error("Parallel ordinary traces must default ON");
   setenv(key, "invalid", 1);
   bool invalid_rejected = false;
   try { (void)configuredRealFullParallelTraces(); }
@@ -38,15 +38,19 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
   setenv(key, "0", 1);
 
   AcceleratorBlasHandle blas(queue);
+  for (const auto boundary : {BoundaryCondition::PERIODIC, BoundaryCondition::OPEN})
   for (const auto shape_pair : {std::pair<std::size_t, std::size_t>{22, 16}, {22, 64}, {22, 160},
                                {44, 16}, {66, 16}, {88, 16}})
   {
     const auto n = shape_pair.first, determinants = shape_pair.second;
+    if (boundary == BoundaryCondition::OPEN && (n != 22 || determinants != 16)) continue;
     ExecutionEnvironment environment;
-    environment.boundary = BoundaryCondition::PERIODIC;
-    environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    environment.boundary = boundary;
+    environment.geometry_feature_policy = boundary == BoundaryCondition::OPEN
+        ? GeometryFeaturePolicy::OPEN_EUCLIDEAN_V1 : GeometryFeaturePolicy::PERIODIC_TORUS_V1;
     environment.lattice_vectors = {{{80., .3, .1}, {0., 80., .2}, {.1, 0., 80.}}};
-    environment.periodic_axes = {true, true, true};
+    environment.periodic_axes = boundary == BoundaryCondition::PERIODIC
+        ? std::array<bool, 3>{true, true, true} : std::array<bool, 3>{false, false, false};
     const auto up = 13 * n / 22;
     const ModelShape shape{up, n - up, n, determinants, 16, 4, 1};
     auto parameters = mixed_periodic_validation::parameters(environment, shape);
@@ -67,6 +71,28 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
     const auto extra = planOrdinaryRealFullTraces(plan, 2).total_device_bytes;
     PreparedDeviceInference candidate(image, 2, queue, blas, SpatialJetMode::FULL_VGL);
     PreparedDeviceInference value(image, 2, queue, blas, SpatialJetMode::VALUE_ONLY);
+    unsetenv(key);
+    PreparedDeviceInference default_candidate(image, 2, queue, blas, SpatialJetMode::FULL_VGL);
+    PreparedDeviceInference mixed_owner(image, 2, queue, blas, SpatialJetMode::FULL_VGL,
+        false, false, configuredInferenceStatusPolicy(), {}, OrdinaryTracePreparation::EXCLUDE_FOR_MIXED);
+    if (!default_candidate.usesOrdinaryParallelTraces() || mixed_owner.usesOrdinaryParallelTraces() ||
+        default_candidate.deviceWorkspaceBytes() != candidate.deviceWorkspaceBytes())
+      throw std::runtime_error("Default or mixed-owner trace admission differs");
+    if (planOrdinaryRealFullTraces(plan, 100000).total_device_bytes)
+      throw std::runtime_error("Automatic trace preference did not fall back for oversized metadata");
+    setenv(key, "1", 1);
+    bool budget_rejected = false;
+    try { (void)planOrdinaryRealFullTraces(plan, 100000); }
+    catch (const std::length_error&) { budget_rejected = true; }
+    if (!budget_rejected) throw std::runtime_error("Explicit trace budget violation was not rejected");
+    bool mixed_rejected = false;
+    try
+    {
+      PreparedDeviceInference explicit_mixed(image, 2, queue, blas, SpatialJetMode::FULL_VGL,
+          false, false, configuredInferenceStatusPolicy(), {}, OrdinaryTracePreparation::EXCLUDE_FOR_MIXED);
+    }
+    catch (const std::invalid_argument&) { mixed_rejected = true; }
+    if (!mixed_rejected) throw std::runtime_error("Explicit incompatible trace/mixed selection accepted");
     if (reference.usesOrdinaryParallelTraces() || !candidate.usesOrdinaryParallelTraces() ||
         value.usesOrdinaryParallelTraces() || candidate.ordinaryParallelTraceBytes() != extra ||
         candidate.deviceWorkspaceBytes() - reference.deviceWorkspaceBytes() != extra ||
@@ -78,6 +104,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
       const std::vector<double> coordinates(positions.begin(), positions.begin() + live * 3 * n);
       reference.evaluate(coordinates);
       candidate.evaluate(coordinates);
+      default_candidate.evaluate(coordinates);
       const auto read = [](PreparedDeviceInference& graph) {
         mixed_periodic_validation::Output out;
         const auto& layout = graph.resultLayout();
@@ -87,7 +114,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
         graph.downloadResults(out.phases, out.jets, out.ratios);
         return out;
       };
-      const auto a = read(reference), b = read(candidate);
+      const auto a = read(reference), b = read(candidate), automatic = read(default_candidate);
       const auto check = [&](const std::vector<double>& x, const std::vector<double>& y) {
         if (x.size() != y.size()) throw std::runtime_error("Ordinary parallel trace result shape differs");
         for (std::size_t i = 0; i < x.size(); ++i)
@@ -100,6 +127,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
         }
       };
       check(a.phases, b.phases); check(a.jets, b.jets); check(a.ratios, b.ratios);
+      check(b.phases, automatic.phases); check(b.jets, automatic.jets); check(b.ratios, automatic.ratios);
     };
     compare(2);
     int ordinal = -1;
@@ -114,11 +142,11 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
     if (after.allocation_calls != warm.allocation_calls || after.live_bytes != warm.live_bytes)
       throw std::runtime_error("Ordinary parallel traces allocated during warm evaluation/tails");
     auto successor = image->makeUpdatedImage(parameters.flat_values(), 1);
-    reference.rebindModel(successor); candidate.rebindModel(successor);
+    reference.rebindModel(successor); candidate.rebindModel(successor); default_candidate.rebindModel(successor);
     compare(2);
     auto bad = positions;
     bad[0] = std::numeric_limits<double>::infinity();
-    for (auto* graph : {&reference, &candidate})
+    for (auto* graph : {&reference, &candidate, &default_candidate})
     {
       bool rejected = false;
       try { graph->evaluate(bad); }
@@ -130,9 +158,45 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
       if (!rejected) throw std::runtime_error("Failed ordinary VGL published stale results");
     }
     compare(1);
-    std::cout << "ORDINARY_PARALLEL_TRACES_PASS N=" << n << " D=" << determinants
+    if (boundary == BoundaryCondition::OPEN)
+    {
+      // Reserve logical capacity, not physical memory, so the baseline fits
+      // exactly and only the default's extra trace scratch is denied.
+      const auto policy = configuredDeviceMemoryAdmission();
+      auto& metrics = deviceMemoryMetrics(ordinal);
+      const auto live = metrics.snapshot().live_bytes;
+      const auto baseline_bytes = reference.deviceWorkspaceBytes();
+      if (policy.limit_bytes && *policy.limit_bytes > policy.external_reserve_bytes &&
+          *policy.limit_bytes - policy.external_reserve_bytes > live + baseline_bytes)
+      {
+        const auto hold_bytes = *policy.limit_bytes - policy.external_reserve_bytes - live - baseline_bytes;
+        auto hold = metrics.reserveAllocation(hold_bytes);
+        const auto before_fallback = metrics.snapshot().live_bytes;
+        unsetenv(key);
+        {
+          PreparedDeviceInference fallback(image, 2, queue, blas, SpatialJetMode::FULL_VGL);
+          if (fallback.usesOrdinaryParallelTraces() || fallback.deviceWorkspaceBytes() != baseline_bytes)
+            throw std::runtime_error("Automatic aggregate trace admission did not retain baseline");
+        }
+        if (metrics.snapshot().live_bytes != before_fallback)
+          throw std::runtime_error("Automatic trace fallback leaked device ownership");
+        setenv(key, "1", 1);
+        bool explicit_budget_rejected = false;
+        try { PreparedDeviceInference denied(image, 2, queue, blas, SpatialJetMode::FULL_VGL); }
+        catch (const std::length_error&) { explicit_budget_rejected = true; }
+        if (!explicit_budget_rejected || metrics.snapshot().live_bytes != before_fallback)
+          throw std::runtime_error("Explicit aggregate trace failure changed ownership or was not rejected");
+        std::cout << "ORDINARY_PARALLEL_TRACE_AGGREGATE_FALLBACK_PASS baseline_bytes="
+                  << baseline_bytes << " logical_reservation_bytes=" << hold_bytes << std::endl;
+      }
+      else
+        std::cout << "ORDINARY_PARALLEL_TRACE_AGGREGATE_FALLBACK_NOT_RUN reason=no_finite_admission_margin\n";
+      unsetenv(key);
+    }
+    std::cout << "ORDINARY_PARALLEL_TRACES_PASS boundary="
+              << (boundary == BoundaryCondition::OPEN ? "OPEN" : "PERIODIC") << " N=" << n << " D=" << determinants
               << " max_abs_error=" << maximum_error << " added_device_bytes=" << extra
-              << " tail_rebind_failure_recovery=yes warm_allocations=0" << std::endl;
+              << " tail_rebind_failure_recovery=yes default_equivalence=yes budget_fallback=yes mixed_exclusion=yes warm_allocations=0" << std::endl;
   }
 }
 } // namespace qmcplusplus::psiformer::device

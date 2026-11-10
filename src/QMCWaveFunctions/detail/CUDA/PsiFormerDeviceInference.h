@@ -112,12 +112,15 @@ struct TargetVglCost
   std::size_t tile_count = 0;
 };
 
-/// Cold opt-in for the bounded determinant/target-parallel ordinary REAL leaf.
+/// Known mixed owners exclude ordinary FP64-only trace preparation before allocating.
+enum class OrdinaryTracePreparation { DEFAULT_POLICY, EXCLUDE_FOR_MIXED };
+
+/// Prefer bounded determinant/target-parallel ordinary REAL traces; explicit 0 retains legacy.
 inline bool configuredRealFullParallelTraces()
 {
   const char* value = std::getenv("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES");
-  if (!value || std::string_view(value) == "0") return false;
-  if (std::string_view(value) == "1") return true;
+  if (!value || std::string_view(value) == "1") return true;
+  if (std::string_view(value) == "0") return false;
   throw std::invalid_argument("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES must be 0 or 1");
 }
 
@@ -135,8 +138,18 @@ inline SpatialTraceWorkspacePlan planOrdinaryRealFullTraces(const PsiFormerExecu
         e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)))
     return {};
   const auto& s = plan.modelShape();
-  return planSpatialTraceWorkspace({batch, s.determinants, s.electrons(),
-      spatial_detail::checkedProduct(3, s.electrons(), "Ordinary parallel trace lanes overflow"), s.electrons()});
+  try
+  {
+    return planSpatialTraceWorkspace({batch, s.determinants, s.electrons(),
+        spatial_detail::checkedProduct(3, s.electrons(), "Ordinary parallel trace lanes overflow"), s.electrons()});
+  }
+  catch (const std::length_error&)
+  {
+    // An automatic preference must not reject a shape supported by the legacy
+    // evaluator. Explicit ON preserves the experimental route's strict budget.
+    if (std::getenv("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES")) throw;
+    return {};
+  }
 }
 
 /// Only ordinary legacy periodic REAL FULL can discard raw features before its head.
@@ -238,7 +251,7 @@ inline TargetVglCost estimateTargetVglCost(const PsiFormerExecutionPlan& plan, s
  * Optional phase overlap changes capacity only, never the arithmetic/work proxy.
  */
 inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
-                                               bool phase_bank = false)
+                                               bool phase_bank = false, bool ordinary_parallel_traces = true)
 {
   const auto& shape = plan.modelShape();
   const auto n = shape.electrons();
@@ -262,8 +275,9 @@ inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& p
     const auto orbital = mul(mul(batch, planes), mul(shape.determinants, mul(n, n)));
     cost.device_workspace_bytes -= checkedDeviceBytes<double>(std::min(raw, orbital));
   }
-  cost.device_workspace_bytes = add(cost.device_workspace_bytes,
-      planOrdinaryRealFullTraces(plan, batch).total_device_bytes);
+  if (ordinary_parallel_traces)
+    cost.device_workspace_bytes = add(cost.device_workspace_bytes,
+        planOrdinaryRealFullTraces(plan, batch).total_device_bytes);
   return cost;
 }
 
@@ -592,8 +606,8 @@ inline bool configuredPeriodicValuePairGeometry()
 inline bool configuredEcpValueProjectedBackflow()
 {
   const char* value = std::getenv("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW");
-  if (!value || std::string_view(value) == "0") return false;
-  if (std::string_view(value) == "1") return true;
+  if (!value || std::string_view(value) == "1") return true;
+  if (std::string_view(value) == "0") return false;
   throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW must be 0 or 1");
 }
 
@@ -1103,9 +1117,11 @@ public:
                           bool retain_score_tape = false,
                           bool retain_spatial_tape = false,
                           InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy(),
-                          TargetVglPreparation target_preparation = {})
+                          TargetVglPreparation target_preparation = {},
+                          OrdinaryTracePreparation ordinary_traces = OrdinaryTracePreparation::DEFAULT_POLICY)
       : PreparedDeviceInference(std::move(model), batch_size, queue, blas, mode,
-          retain_score_tape, retain_spatial_tape, status_policy, target_preparation, false)
+          retain_score_tape, retain_spatial_tape, status_policy, target_preparation,
+          false, false, false, false, ordinary_traces == OrdinaryTracePreparation::DEFAULT_POLICY)
   {}
 
 private:
@@ -1137,10 +1153,13 @@ private:
                           SpatialJetMode mode, bool retain_score_tape, bool retain_spatial_tape,
                           InferenceStatusPolicy status_policy,
                           TargetVglPreparation target_preparation, bool retained_targets, bool real_trunk_only = false,
-                          bool kinetic_trunk_only = false, bool retained_score_periodic_geometry = false)
+                          bool kinetic_trunk_only = false, bool retained_score_periodic_geometry = false,
+                          bool allow_ordinary_parallel_traces = true)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets), real_trunk_only_(real_trunk_only),
+        ordinary_parallel_traces_explicit_(std::getenv("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES") &&
+            configuredRealFullParallelTraces()),
         forward_phase_bank_requested_(configuredForwardPhaseBank()),
         cooperative_value_lu_requested_(configuredCooperativeValueLu()),
         small_matrix_cooperative_lu_requested_(configuredSmallMatrixCooperativeLu()),
@@ -1261,10 +1280,18 @@ private:
     if (target_preparation_.max_targets)
       setTargetRange(0, target_preparation_.max_targets);
 
-    const auto ordinary_trace_plan = mode_ == SpatialJetMode::FULL_VGL &&
+    if (!allow_ordinary_parallel_traces && ordinary_parallel_traces_explicit_ &&
+        mode_ == SpatialJetMode::FULL_VGL && !target_preparation_.max_targets)
+      throw std::invalid_argument("Ordinary parallel traces require FP64 affine execution");
+    const auto ordinary_trace_plan = allow_ordinary_parallel_traces && mode_ == SpatialJetMode::FULL_VGL &&
         !retain_score_tape && !retain_spatial_tape && !real_trunk_only && !kinetic_trunk_only &&
         !retained_targets_ && !target_preparation_.max_targets
         ? planOrdinaryRealFullTraces(plan_, batch_capacity_) : SpatialTraceWorkspacePlan{};
+    if (mode_ == SpatialJetMode::FULL_VGL && !retain_score_tape && !retain_spatial_tape &&
+        !real_trunk_only && !kinetic_trunk_only && !retained_targets_ && !target_preparation_.max_targets &&
+        !ordinary_trace_plan.total_device_bytes && configuredRealFullParallelTraces())
+      std::clog << "PsiFormer REAL FULL traces: selected=legacy reason="
+                << (allow_ordinary_parallel_traces ? "unsupported_or_workspace_budget" : "mixed_owner") << '\n';
 
     // The embedding is the last raw-feature consumer. The head first writes
     // orbitals after the complete trunk has been admitted on this same stream.
@@ -1383,8 +1410,24 @@ private:
     }
     if (ordinary_trace_plan.total_device_bytes)
     {
-      parallel_traces_ = std::make_unique<PreparedDeviceSpatialTraces>(ordinary_trace_plan.capacity,
-          queue_.getNative(), 8 * 1024 * 1024, true);
+      try
+      {
+        parallel_traces_ = std::make_unique<PreparedDeviceSpatialTraces>(ordinary_trace_plan.capacity,
+            queue_.getNative(), 8 * 1024 * 1024, true);
+      }
+      catch (const std::length_error&)
+      {
+        if (ordinary_parallel_traces_explicit_) throw;
+        std::clog << "PsiFormer REAL FULL traces: selected=legacy reason=aggregate_memory_admission\n";
+      }
+      catch (const std::bad_alloc&)
+      {
+        if (ordinary_parallel_traces_explicit_) throw;
+        std::clog << "PsiFormer REAL FULL traces: selected=legacy reason=scratch_allocation\n";
+      }
+    }
+    if (ordinary_trace_plan.total_device_bytes && parallel_traces_)
+    {
       ordinary_parallel_trace_bytes_ = parallel_traces_->deviceWorkspaceBytes();
       if (ordinary_parallel_trace_bytes_ != ordinary_trace_plan.total_device_bytes)
         throw std::logic_error("Ordinary parallel trace storage differs from preflight");
@@ -1449,7 +1492,8 @@ private:
                 << " Ne=" << ne_ << " static_shared_payload_bytes=4100; no extra global owner\n";
     if (forward_phase_bank_)
     {
-      const auto cost = estimateOrdinaryFullVglCost(plan_, batch_capacity_, true);
+      const auto cost = estimateOrdinaryFullVglCost(plan_, batch_capacity_, true,
+          ordinary_parallel_trace_bytes_ != 0);
       if (deviceWorkspaceBytes() != cost.device_workspace_bytes || hostWorkspaceBytes() != cost.host_workspace_bytes)
         throw std::logic_error("Forward phase bank prepared bytes differ from pre-allocation cost");
     }
@@ -2157,7 +2201,7 @@ public:
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
   {
-    if (adapter && ordinary_parallel_trace_bytes_)
+    if (adapter && ordinary_parallel_trace_bytes_ && ordinary_parallel_traces_explicit_)
       throw std::invalid_argument("Ordinary parallel traces require FP64 affine execution");
     if (mixed_retained_attachment_)
       throw std::invalid_argument("A retained mixed arithmetic binding cannot be replaced by ordinary attachment");
@@ -2173,6 +2217,15 @@ public:
       throw std::invalid_argument("Mixed affine adapter has a stale or foreign parameter image");
     if (adapter && adapter->maximumRows() < mixedDenseRowCapacity())
       throw std::invalid_argument("Mixed affine adapter cannot hold every requested spatial plane");
+    if (adapter && ordinary_parallel_trace_bytes_)
+    {
+      // Standalone callers may attach mixed affines after preparing the graph.
+      // Its implicit REAL-only preference must yield to that established route.
+      queue_.sync(); // A mode transition may follow work using this scratch.
+      parallel_traces_.reset();
+      ordinary_parallel_trace_bytes_ = 0;
+      std::clog << "PsiFormer REAL FULL traces: selected=legacy reason=mixed_affine_attachment\n";
+    }
     mixed_dense_ = std::move(adapter);
     if (mixed_dense_)
     {
@@ -2575,7 +2628,8 @@ public:
     const char* selection = std::getenv("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW");
     if (selection && std::string_view(selection) != "0" && std::string_view(selection) != "1")
       throw std::invalid_argument("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW must be 0 or 1");
-    if (selection && std::string_view(selection) == "1" && owner && generation && references &&
+    if (configuredEcpValueProjectedBackflow() && (selection || !ecp_projection_default_disabled_) &&
+        owner && generation && references &&
         reference_indices && changed_electrons && count && count <= batch_capacity_)
     {
       const auto& environment = plan_.environment();
@@ -2589,12 +2643,33 @@ public:
           environment.amplitude_scalar_domain != ScalarDomain::REAL ||
           environment.parameter_scalar_domain != ScalarDomain::REAL ||
           environment.compute_scalar_domain != ScalarDomain::REAL)
-        throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN or fixed legacy-torus FP64 VALUE");
+      {
+        if (selection)
+          throw std::invalid_argument("ECP projected backflow requires ordinary real OPEN or fixed legacy-torus FP64 VALUE");
+        return; // Automatic preference; this request retains the existing evaluator.
+      }
       if (!ecp_value_projection_)
       {
         auto capacity = orbitals_;
         capacity.features.configuration_count = capacity.orbitals.configuration_count = batch_capacity_;
-        ecp_value_projection_ = std::make_unique<PreparedDeviceOrbitalProjection>(capacity);
+        try
+        {
+          ecp_value_projection_ = std::make_unique<PreparedDeviceOrbitalProjection>(capacity);
+        }
+        catch (const std::length_error&)
+        {
+          if (selection) throw;
+          ecp_projection_default_disabled_ = true;
+          std::clog << "PsiFormer ECP VALUE projection: effective=0 reason=aggregate_memory_admission\n";
+          return;
+        }
+        catch (const std::bad_alloc&)
+        {
+          if (selection) throw;
+          ecp_projection_default_disabled_ = true;
+          std::clog << "PsiFormer ECP VALUE projection: effective=0 reason=pointer_bank_allocation\n";
+          return;
+        }
         std::clog << "PsiFormer ECP VALUE projection: grouped_configurations=1 capacity="
                   << batch_capacity_ << " pointer_bytes=" << ecp_value_projection_->deviceBytes()
                   << " numerical_storage=reused_matrix_bank\n";
@@ -3318,6 +3393,7 @@ private:
   const RealCanonicalHeadView* canonical_head_ = nullptr;
   const bool retained_targets_;
   const bool real_trunk_only_;
+  const bool ordinary_parallel_traces_explicit_;
   const bool forward_phase_bank_requested_;
   bool forward_phase_bank_ = false;
   std::size_t phase_bank_saved_bytes_ = 0;
@@ -3386,6 +3462,7 @@ private:
   };
   std::unique_ptr<PreparedDeviceOrbitalProjection> ecp_value_projection_;
   bool ecp_projected_backflow_active_ = false;
+  bool ecp_projection_default_disabled_ = false;
   std::unique_ptr<SparseEnvelopeAnchor> sparse_envelope_;
   /// Optional cold-owned tape; all stages overwrite their live prefix before consumption.
   struct PeriodicValueTilingScratch
@@ -3747,7 +3824,8 @@ public:
                                     SpatialJetMode mode = SpatialJetMode::VALUE_ONLY,
                                     bool allow_fp64_retry = true, TargetVglPreparation preparation = {})
       : reference_(model, capacity, queue, blas, mode, false, false,
-            configuredInferenceStatusPolicy(), checkedTargetPreparation(model, capacity, mode, allow_fp64_retry, preparation)),
+            configuredInferenceStatusPolicy(), checkedTargetPreparation(model, capacity, mode, allow_fp64_retry, preparation),
+            OrdinaryTracePreparation::EXCLUDE_FOR_MIXED),
         allow_retry_(allow_fp64_retry)
   {
     // Exclude the reference before conversion can fail and select FP64-only recovery.
@@ -3760,7 +3838,7 @@ public:
           reference_.mixedDenseRowCapacity(),
           queue, blas);
       approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode,
-          false, false, configuredInferenceStatusPolicy(), preparation);
+          false, false, configuredInferenceStatusPolicy(), preparation, OrdinaryTracePreparation::EXCLUDE_FOR_MIXED);
       approximate_->excludeCooperativeValueLuForMixedRequest();
       approximate_->excludeCooperativeOpenFeaturesForMixedRequest();
       approximate_->setMixedDense(adapter_);

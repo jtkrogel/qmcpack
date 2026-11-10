@@ -157,6 +157,8 @@ public:
             image_->plan().environment().boundary == BoundaryCondition::PERIODIC &&
             supportsLazyRealInferenceEnvironment(image_->plan().environment())),
         ecp_projection_requested_(configuredEcpValueProjectedBackflow()),
+        ecp_projection_explicit_(std::getenv("PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW") &&
+            ecp_projection_requested_),
         ecp_projection_eligible_(precision == PsiFormerPrecisionPolicy::FP64_REFERENCE && !outer_twist &&
             lazy_spatial && preparation_.active_inference_crowds == 1 &&
             supportsLazyRealInferenceEnvironment(image_->plan().environment())),
@@ -179,7 +181,11 @@ public:
     else if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
     if (ecp_projection_requested_ && !ecp_projection_eligible_)
-      throw std::invalid_argument("ECP VALUE projection hints require single-crowd lazy real OPEN or fixed legacy Gamma FP64");
+    {
+      if (ecp_projection_explicit_)
+        throw std::invalid_argument("ECP VALUE projection hints require single-crowd lazy real OPEN or fixed legacy Gamma FP64");
+      std::clog << "PsiFormer ECP VALUE projection: effective=0 reason=unsupported_default_request\n";
+    }
     if (sparse_envelope_requested_ && !sparse_envelope_eligible_)
       std::clog << "PsiFormer REAL virtual envelope preparation: effective=0 reason=profile_or_automatic_target_selection\n";
     if (pair_geometry_requested_ && !pair_geometry_eligible_)
@@ -1346,6 +1352,7 @@ private:
   const bool sparse_envelope_requested_;
   const bool sparse_envelope_eligible_;
   const bool ecp_projection_requested_;
+  const bool ecp_projection_explicit_;
   const bool ecp_projection_eligible_;
   mutable PsiFormerInferenceConcurrency inference_concurrency_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
