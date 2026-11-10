@@ -2912,4 +2912,54 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
 }
 #endif
 
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+TEST_CASE("CPU score-only PsiFormer omits kinetic storage with identical score products",
+          "[wavefunction][psiformer][training][cpu_score_only]")
+{
+  using namespace testing::psiformer;
+  GeneratedFiles files = generateFiles("lih"); // N4, bounded correctness fixture.
+  const SimulationCell cell;
+  ParticleSet electrons = makeElectrons(cell);
+  const std::vector<std::size_t> selected{0, 1, 127, 2047};
+  PsiFormerWF component("pf_cpu_score", files.parameters.string(), files.configuration.string(), true, selected);
+  auto active = registerSelectedParameters(component);
+  electrons.G = QMCTraits::GradType{};
+  electrons.L = QMCTraits::ValueType{};
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  RefVectorWithLeader<ParticleSet> particles(electrons);
+  particles.push_back(electrons);
+  auto complete = component.makeStreamingDerivativeOperator(components, particles, 0, 0, 257);
+  auto score = component.makeCpuScoreStreamingDerivativeOperator(components, particles, 0, 0, 257);
+  const auto old_storage = complete->storageDiagnostics();
+  const auto storage = score->storageDiagnostics();
+  CHECK(storage.evaluator_workspace_bytes < old_storage.evaluator_workspace_bytes);
+  CHECK(storage.parameter_scratch_bytes < old_storage.parameter_scratch_bytes);
+  CHECK(storage.shared_workspace_identity != old_storage.shared_workspace_identity);
+  CHECK(score->capabilities().local_energy_term_mask == 0);
+  CHECK((score->capabilities().product_mask & wftrain::derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP)) == 0);
+  const std::vector<DerivativeValue> coefficients{{0.7, 0.0}};
+  const std::vector<VJPCoefficientChannel> old_channel{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*complete, coefficients), 0}};
+  const std::vector<VJPCoefficientChannel> new_channel{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*score, coefficients), 0}};
+  SelectedParameterSink old_sink(selected), new_sink(selected);
+  complete->applyVJPs({old_channel.data(), old_channel.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, old_sink);
+  score->applyVJPs({new_channel.data(), new_channel.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, new_sink);
+  for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
+    checkClose(new_sink.results()[0][parameter], old_sink.results()[0][parameter]);
+  const std::vector<VJPCoefficientChannel> energy_channel{
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*score, coefficients),
+       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)}};
+  SelectedParameterSink forbidden(selected);
+  CHECK_THROWS_AS(score->applyVJPs({energy_channel.data(), energy_channel.size()},
+      wftrain::DerivativeAdjoint::TRANSPOSE, forbidden), std::invalid_argument);
+  auto other_score = component.makeCpuScoreStreamingDerivativeOperator(components, particles, 1, 1, 73);
+  CHECK(other_score->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
+  std::cout << "CPU_SCORE_ONLY_STORAGE_PASS old_workspace=" << old_storage.evaluator_workspace_bytes
+            << " new_workspace=" << storage.evaluator_workspace_bytes << " score_products_equal=yes\n";
+}
+#endif
+
 } // namespace qmcplusplus

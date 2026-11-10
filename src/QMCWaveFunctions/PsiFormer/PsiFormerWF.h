@@ -506,6 +506,14 @@ public:
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const override;
 
+  /// Prepare CPU score products without allocating a kinetic-response tape.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeCpuScoreStreamingDerivativeOperator(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size) const;
+
   /// Prepare only GPU score products; kinetic/local-energy requests remain unavailable.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeGpuScoreStreamingDerivativeOperator(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

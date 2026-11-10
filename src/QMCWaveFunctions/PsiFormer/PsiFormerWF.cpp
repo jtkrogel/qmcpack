@@ -2372,11 +2372,11 @@ struct PsiFormerDerivativeScratch
   PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters,
                              std::size_t score_capacity = 1, bool score_only = false)
       : score(state.numerical_tile_backend ? nullptr : state.direct_score_executor.makeWorkspace()),
-        kinetic(state.numerical_tile_backend ? nullptr : state.cpu_target_kinetic.targets
+        kinetic((state.numerical_tile_backend || score_only) ? nullptr : state.cpu_target_kinetic.targets
             ? state.direct_kinetic_executor.makeTargetWorkspace(state.cpu_target_kinetic.targets, state.cpu_target_kinetic.owner_budget)
             : state.direct_kinetic_executor.makeWorkspace())
   {
-    if (state.cpu_target_kinetic.targets && (!kinetic || kinetic->vectorStorageBytes() != state.cpu_target_kinetic.owner_bytes))
+    if (!score_only && state.cpu_target_kinetic.targets && (!kinetic || kinetic->vectorStorageBytes() != state.cpu_target_kinetic.owner_bytes))
       throw std::logic_error("PsiFormer CPU target kinetic owner differs from admitted numeric bytes");
     checkedBatchMemoryMultiply(parameters, sizeof(wftrain::DerivativeValue),
                                "PsiFormer shared derivative channels");
@@ -2702,7 +2702,7 @@ public:
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = deviceScoreCapacity();
     result.fixed_parameter_scratch_vectors   =
-        (hasDeviceProducts() ? 8 + 2 * deviceScoreContractionCapacity() : 3) + MAXIMUM_VJP_CHANNELS;
+        (hasDeviceProducts() ? 8 + 2 * deviceScoreContractionCapacity() : (score_only_ ? 1 : 3)) + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
     return result;
   }
@@ -4076,14 +4076,14 @@ private:
               "PsiFormer device product parameter vectors"), sizeof(double), "PsiFormer device parameter bytes")
         : score_workspace_->scoreStorageBytes();
     const std::size_t kinetic_parameter_bytes =
-        hasDeviceProducts() ? 0 : kinetic_workspace_->parameterStorageBytes();
+        (hasDeviceProducts() || score_only_) ? 0 : kinetic_workspace_->parameterStorageBytes();
     const std::size_t expected_kinetic_parameter_bytes =
         checkedBatchMemoryMultiply(
             checkedBatchMemoryMultiply(
                 std::size_t{2}, schema_->parameterCount(),
                 "PsiFormer streaming kinetic parameter vectors"),
             sizeof(double), "PsiFormer streaming kinetic parameter bytes");
-    if (!hasDeviceProducts() && kinetic_parameter_bytes != expected_kinetic_parameter_bytes)
+    if (!hasDeviceProducts() && !score_only_ && kinetic_parameter_bytes != expected_kinetic_parameter_bytes)
       throw std::length_error(
           "PsiFormer streaming kinetic parameter storage is not exact");
     std::size_t channel_bytes     = 0;
@@ -4163,7 +4163,7 @@ private:
     else
 #endif
       workspace_bytes = checkedBatchMemoryAdd(score_workspace_->vectorStorageBytes(),
-          kinetic_workspace_->vectorStorageBytes(), "PsiFormer streaming evaluator workspaces");
+          kinetic_workspace_ ? kinetic_workspace_->vectorStorageBytes() : 0, "PsiFormer streaming evaluator workspaces");
     workspace_bytes = checkedBatchMemoryAdd(workspace_bytes, observation_final_bytes,
         "ECP observation DEVICE final products");
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
@@ -7901,6 +7901,25 @@ PsiFormerWF::makeStreamingDerivativeOperator(
 {
   return makeStreamingDerivativeOperatorImpl(wfc_list, p_list, batch_ordinal, sample_offset,
       maximum_parameter_chunk_size, false);
+}
+
+/// CPU score-only requests keep their own immutable scratch profile.
+std::unique_ptr<wftrain::StreamingDerivativeOperator>
+PsiFormerWF::makeCpuScoreStreamingDerivativeOperator(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::size_t batch_ordinal,
+    std::size_t sample_offset,
+    std::size_t maximum_parameter_chunk_size) const
+{
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+  if (usesAcceleratorParameterProducts())
+    throw std::invalid_argument("PsiFormer CPU score-only factory requires CPU parameter products");
+  return makeStreamingDerivativeOperatorImpl(wfc_list, p_list, batch_ordinal, sample_offset,
+      maximum_parameter_chunk_size, true);
+#else
+  throw std::invalid_argument("PsiFormer CPU score-only factory requires a real FP64 build");
+#endif
 }
 
 /// Select a fixed GPU score-only lane without changing the generic factory.
