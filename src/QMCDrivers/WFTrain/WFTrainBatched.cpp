@@ -7338,20 +7338,34 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
   // The next production observation rebuilds FULL before evaluating its Hamiltonian.
   // Keep other move, estimator, debug and parameter-authority paths unchanged.
 #if !defined(MIXED_PRECISION)
+  const char* cpu_refresh_optin = std::getenv("PSIFORMER_CPU_SCORE_VALUE_REFRESH");
+  if (cpu_refresh_optin && std::string(cpu_refresh_optin) != "0" && std::string(cpu_refresh_optin) != "1")
+    throw UniformCommunicateError("PSIFORMER_CPU_SCORE_VALUE_REFRESH must be 0 or 1");
+  const bool cpu_refresh_requested = cpu_refresh_optin && std::string(cpu_refresh_optin) == "1";
 #ifdef QMC_COMPLEX
   constexpr bool paired_refresh = true;
   // GPU publication authority is the registered adapter, not the numerical component.
   const auto* refresh_provider = complex_gpu_provider_ && selected_provider_ == complex_gpu_provider_.get()
       ? complex_training_component_ : nullptr;
-  const bool refresh_provider_eligible = refresh_provider && refresh_provider->gpuInferenceEnabled() &&
+  const auto* cpu_refresh_provider = dynamic_cast<const PsiFormerComplexWF*>(selected_provider_);
+  const bool cpu_refresh_eligible = cpu_refresh_requested && cpu_refresh_provider &&
+      !cpu_refresh_provider->gpuInferenceEnabled() &&
+      cpu_refresh_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons()) &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP();
+  const bool gpu_refresh_eligible = refresh_provider && refresh_provider->gpuInferenceEnabled() &&
       refresh_provider->matchesLegacyTorusPseudopotentialTarget(population_.get_golden_electrons());
 #else
   constexpr bool paired_refresh = false;
   const auto* refresh_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
-  const bool refresh_provider_eligible = refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
+  const bool cpu_refresh_eligible = cpu_refresh_requested && refresh_provider &&
+      !refresh_provider->usesAcceleratorParameterProducts() && refresh_provider->isPseudopotentialSystem() &&
+      population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+      supportsCollectedScoreGeometry(*refresh_provider, population_.get_golden_electrons());
+  const bool gpu_refresh_eligible = refresh_provider && refresh_provider->usesAcceleratorParameterProducts() &&
       !refresh_provider->residentECPObservationEnabled() &&
       supportsCollectedScoreGeometry(*refresh_provider, population_.get_golden_electrons());
 #endif
+  const bool refresh_provider_eligible = gpu_refresh_eligible || cpu_refresh_eligible;
   const bool value_only_refresh =
       training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
       (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM ||
@@ -7362,6 +7376,12 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version, i
       vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::ALL_ELECTRON &&
       qmcdriver_input_.get_debug_checks() == DriverDebugChecks::ALL_OFF &&
       refresh_provider_eligible && population_.get_golden_twf().getOrbitals().size() == 1;
+  if (cpu_refresh_requested && (!cpu_refresh_eligible || !value_only_refresh))
+    throw UniformCommunicateError(
+        "CPU score VALUE refresh requires a sole FP64 CPU PsiFormer ECP no-drift all-electron score-Adam/KFAC provider");
+  if (cpu_refresh_eligible && myComm->rank() == 0)
+    app_log() << "WFTrain CPU score publication: VALUE_ONLY, no Hamiltonian; next production observation rebuilds FULL"
+              << std::endl;
 #else
   constexpr bool value_only_refresh = false;
 #endif
