@@ -421,15 +421,17 @@ void edgeCases()
 void blasProjection()
 {
   for (bool blocked : {false, true})
+    for (std::size_t spin_up : {0u, 2u, 3u})
     for (auto mode : {psif::SpatialJetMode::VALUE_ONLY, psif::SpatialJetMode::ACTIVE,
                       psif::SpatialJetMode::FULL_VGL})
     {
       psif::ComplexOrbitalHeadDescriptor d;
-      d.electrons = 3; d.spin_up = 2; d.determinants = 3; d.feature_width = 5;
+      d.electrons = 3; d.spin_up = spin_up; d.determinants = 3; d.feature_width = 5;
       d.structure = blocked ? psif::ComplexOrbitalStructure::SPIN_BLOCKED : psif::ComplexOrbitalStructure::FULL;
       const auto feature_layout = psif::makeSpatialJetLayout(2, 15, 3, mode, 17);
-      const auto envelope_layout = psif::makeSpatialJetLayout(2, 3 * (blocked ? 5 : 9), 3, mode,
-                                                           3 * (blocked ? 5 : 9) + 2);
+      const std::size_t matrix_elements = blocked ? spin_up * spin_up + (3 - spin_up) * (3 - spin_up) : 9;
+      const auto envelope_layout = psif::makeSpatialJetLayout(2, 3 * matrix_elements, 3, mode,
+                                                           3 * matrix_elements + 2);
       std::vector<double> features(psif::spatialJetSpanElements(feature_layout));
       std::vector<double> envelopes(psif::spatialJetSpanElements(envelope_layout));
       std::vector<double> positions(18, .17);
@@ -439,7 +441,8 @@ void blasProjection()
       psif::ComplexOrbitalHeadParameters parameters;
       for (std::size_t spin = 0; spin < 2; ++spin)
       {
-        const std::size_t cols = blocked ? (spin ? 1 : 2) : 3, count = 3 * cols;
+        const std::size_t rows = spin ? 3 - spin_up : spin_up;
+        const std::size_t cols = blocked ? rows : 3, count = rows ? 3 * cols : 0;
         wr[spin].resize(5 * count); wi[spin].resize(5 * count);
         br[spin].resize(count); bi[spin].resize(count);
         for (std::size_t i = 0; i < 5 * count; ++i)
