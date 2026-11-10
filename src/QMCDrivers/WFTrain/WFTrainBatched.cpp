@@ -408,8 +408,8 @@ std::size_t scoreOnlyECPCaptureNamedBytes(const wftrain::StreamingDerivativeOper
 }
 
 /// Prepare exactly the ordinary score-only owner; the caller holds both crowd resource guards.
-std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealGpuScoreBatchUnderLocks(
-    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk)
+std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealScoreBatchUnderLocks(
+    Crowd& crowd, std::size_t batch, std::size_t offset, std::size_t chunk, bool cpu_profile = false)
 {
   const auto& twfs = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -425,7 +425,9 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> makeRealGpuScoreBatchUnder
       throw std::invalid_argument("GPU score-only ECP requires one real component per walker");
     components.push_back(*wavefunction.get().getOrbitals()[0]);
   }
-  return real->makeGpuScoreStreamingDerivativeOperator(components, particles, batch, offset, chunk);
+  return cpu_profile
+      ? real->makeCpuScoreStreamingDerivativeOperator(components, particles, batch, offset, chunk)
+      : real->makeGpuScoreStreamingDerivativeOperator(components, particles, batch, offset, chunk);
 }
 
 /// The early factory copies fresh replay state but performs no derivatives or accepted-grid RNG.
@@ -455,7 +457,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> prepareImmediateGpuScoreBa
         paired_gpu->maximum_matrix_work, scope);
   }
 #endif
-  return makeRealGpuScoreBatchUnderLocks(crowd, batch, offset, chunk);
+  return makeRealScoreBatchUnderLocks(crowd, batch, offset, chunk);
 }
 
 /// One scalar private evaluator reused by every retained conventional replay view.
@@ -1154,7 +1156,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     bool capture_inline_ecp_vjp = false,
     ImmediateFullReplayReceipt* full_handoff = nullptr,
     std::unique_ptr<wftrain::StreamingDerivativeOperator> prepared_score = nullptr,
-    wftrain::TrainingWorkCounters* work_counters = nullptr)
+    wftrain::TrainingWorkCounters* work_counters = nullptr,
+    bool cpu_score_only_products = false)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -1449,8 +1452,9 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   // coordinates, gradients, and parameter version.
 #ifndef QMC_COMPLEX
   const auto* real = dynamic_cast<const PsiFormerWF*>(twfs[0].get().getOrbitals()[0].get());
-  if (score_only && real && real->usesAcceleratorParameterProducts())
+  if (score_only && real && (real->usesAcceleratorParameterProducts() || cpu_score_only_products))
   {
+    const bool cpu_score_owner = !real->usesAcceleratorParameterProducts();
     if (capture_ecp_jvp_replay || !real->isPseudopotentialSystem())
       throw std::invalid_argument("GPU score-only ECP requires physical PP batches without derivative replay");
     if (!provider_id.empty() && provider_id != real->parameterSchema().providerId())
@@ -1458,7 +1462,7 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     // Score covariance needs physical EL, but no local-energy parameter response.
     // Select its immutable profile before any complete kinetic owner is prepared.
     batch.derivative_operator = prepared_score ? std::move(prepared_score) :
-        makeRealGpuScoreBatchUnderLocks(crowd, batch_ordinal, sample_offset, maximum_parameter_chunk_size);
+        makeRealScoreBatchUnderLocks(crowd, batch_ordinal, sample_offset, maximum_parameter_chunk_size, cpu_score_owner);
     // This mask describes derivative coverage, not the complete physical EL below.
     batch.local_energy_term_mask = 0;
     const auto samples = walkers.size();
@@ -1515,7 +1519,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
         throw std::length_error("GPU ECP physical observation plus score owners exceed retained numeric budget");
     }
     // Physical EL includes ECP; this owner intentionally advertises no ECP dEL.
-    app_log() << "WFTrain GPU score-only accepted-grid ECP: grid=" << result.grid_fingerprint
+    app_log() << "WFTrain " << (cpu_score_owner ? "CPU" : "GPU")
+              << " score-only accepted-grid ECP: grid=" << result.grid_fingerprint
               << " version=" << version << " samples=" << samples
               << " parameter_response_mask=0 retained_grid_bytes=0; named budget excludes native tile/vendor storage"
               << std::endl;
@@ -4337,6 +4342,24 @@ void WFTrainBatched::run()
       wftrain::TrainingCapability::VALUE_EVALUATION};
   const bool score_training = wftrain::usesEnergyScoreEstimator(training_input_, complex_training);
   const bool score_kfac_training = wftrain::usesKFACScoreEstimator(training_input_, complex_training);
+  const char* cpu_score_optin = std::getenv("PSIFORMER_CPU_SCORE_ONLY_PRODUCTS");
+  if (cpu_score_optin && std::string(cpu_score_optin) != "0" && std::string(cpu_score_optin) != "1")
+    throw UniformCommunicateError("PSIFORMER_CPU_SCORE_ONLY_PRODUCTS must be 0 or 1");
+  bool cpu_score_only_products = false;
+  if (cpu_score_optin && std::string(cpu_score_optin) == "1")
+  {
+#if !defined(QMC_COMPLEX) && !defined(MIXED_PRECISION)
+    cpu_score_only_products = score_training &&
+        (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM || score_kfac_training) &&
+        device_provider && !device_provider->usesAcceleratorParameterProducts() &&
+        !resident_device_authority_ && !jastrow_binding_ && !conventional_binding_ &&
+        population_.get_golden_twf().getOrbitals().size() == 1 &&
+        device_provider->isPseudopotentialSystem() &&
+        population_.get_golden_hamiltonian().hasPhysicalNLPP();
+#endif
+    if (!cpu_score_only_products)
+      throw UniformCommunicateError("CPU score-only products require a sole real FP64 CPU PsiFormer ECP score-Adam/KFAC provider");
+  }
   if (native_mixed_training && (crowds_.size() != 1 ||
       !population_.get_golden_hamiltonian().hasPhysicalNLPP() || !score_training ||
       (training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM &&
@@ -5403,7 +5426,7 @@ void WFTrainBatched::run()
             }
             std::size_t scalar_ecp_budget = 0;
             if (!complex_training && score_training && has_nonlocal_ecp &&
-                selected_provider_->usesAcceleratorParameterProducts())
+                (selected_provider_->usesAcceleratorParameterProducts() || cpu_score_only_products))
             {
               auto live = checkedMemoryAdd(retained_configuration_bytes,
                   kfac_optimizer ? kfac_optimizer->retainedNumericBytes() : 0);
@@ -5458,7 +5481,7 @@ void WFTrainBatched::run()
                 nullptr,
 #endif
                 scalar_ecp_budget, usesInlinePairedECPResponse(training_input_),
-                full_handoff ? &*full_handoff : nullptr, std::move(prepared_score), work_counters));
+                full_handoff ? &*full_handoff : nullptr, std::move(prepared_score), work_counters, cpu_score_only_products));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
