@@ -609,7 +609,10 @@ public:
     const auto future_full = ordinary->hooks.spatial_ ? 0 :
         (ordinary->hooks.target_preparation_.max_targets
           ? estimatePreparedTargetVglCost(plan, ordinary->capacity, ordinary->hooks.target_preparation_).device_workspace_bytes
-          : estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes);
+          : spatial_detail::checkedAdd(
+              estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes,
+              planOrdinaryRealFullTraces(plan, ordinary->capacity).total_device_bytes,
+              "Sparse VALUE future parallel FULL bytes overflow"));
     const auto extra = spatial_detail::checkedAdd(first->sparseEnvelopeDeviceBytes(),
         second ? second->sparseEnvelopeDeviceBytes() : 0, "Sparse VALUE two-owner bytes overflow");
     int ordinal = -1;
@@ -706,7 +709,10 @@ public:
     const auto future_full = ordinary->hooks.spatial_ ? 0 :
         (ordinary->hooks.target_preparation_.max_targets
           ? estimatePreparedTargetVglCost(plan, ordinary->capacity, ordinary->hooks.target_preparation_).device_workspace_bytes
-          : estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes);
+          : spatial_detail::checkedAdd(
+              estimateTargetVglCost(plan, ordinary->capacity, plan.modelShape().electrons()).device_workspace_bytes,
+              planOrdinaryRealFullTraces(plan, ordinary->capacity).total_device_bytes,
+              "VALUE pair future parallel FULL bytes overflow"));
     const auto extra = spatial_detail::checkedAdd(first->periodicValuePairDeviceBytes(),
         second ? second->periodicValuePairDeviceBytes() : 0, "VALUE pair combined bytes overflow");
     int ordinal = -1;

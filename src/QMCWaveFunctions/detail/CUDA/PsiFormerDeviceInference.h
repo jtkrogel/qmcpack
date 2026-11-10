@@ -112,6 +112,33 @@ struct TargetVglCost
   std::size_t tile_count = 0;
 };
 
+/// Cold opt-in for the bounded determinant/target-parallel ordinary REAL leaf.
+inline bool configuredRealFullParallelTraces()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES");
+  if (!value || std::string_view(value) == "0") return false;
+  if (std::string_view(value) == "1") return true;
+  throw std::invalid_argument("PSIFORMER_GPU_REAL_FULL_PARALLEL_TRACES must be 0 or 1");
+}
+
+/// Preflight extra scratch independently of any numerical allocation or N gate.
+inline SpatialTraceWorkspacePlan planOrdinaryRealFullTraces(const PsiFormerExecutionPlan& plan,
+                                                           std::size_t batch)
+{
+  if (!configuredRealFullParallelTraces()) return {};
+  const auto& e = plan.environment();
+  if (!e.fixed_nuclei || e.head_representation != HeadRepresentation::REAL ||
+      e.amplitude_scalar_domain != ScalarDomain::REAL || e.parameter_scalar_domain != ScalarDomain::REAL ||
+      e.compute_scalar_domain != ScalarDomain::REAL ||
+      (e.boundary != BoundaryCondition::OPEN &&
+       (e.boundary != BoundaryCondition::PERIODIC ||
+        e.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)))
+    return {};
+  const auto& s = plan.modelShape();
+  return planSpatialTraceWorkspace({batch, s.determinants, s.electrons(),
+      spatial_detail::checkedProduct(3, s.electrons(), "Ordinary parallel trace lanes overflow"), s.electrons()});
+}
+
 /// Only ordinary legacy periodic REAL FULL can discard raw features before its head.
 inline bool supportsForwardPhaseBank(const PsiFormerExecutionPlan& plan)
 {
@@ -235,6 +262,8 @@ inline TargetVglCost estimateOrdinaryFullVglCost(const PsiFormerExecutionPlan& p
     const auto orbital = mul(mul(batch, planes), mul(shape.determinants, mul(n, n)));
     cost.device_workspace_bytes -= checkedDeviceBytes<double>(std::min(raw, orbital));
   }
+  cost.device_workspace_bytes = add(cost.device_workspace_bytes,
+      planOrdinaryRealFullTraces(plan, batch).total_device_bytes);
   return cost;
 }
 
@@ -1232,6 +1261,11 @@ private:
     if (target_preparation_.max_targets)
       setTargetRange(0, target_preparation_.max_targets);
 
+    const auto ordinary_trace_plan = mode_ == SpatialJetMode::FULL_VGL &&
+        !retain_score_tape && !retain_spatial_tape && !real_trunk_only && !kinetic_trunk_only &&
+        !retained_targets_ && !target_preparation_.max_targets
+        ? planOrdinaryRealFullTraces(plan_, batch_capacity_) : SpatialTraceWorkspacePlan{};
+
     // The embedding is the last raw-feature consumer. The head first writes
     // orbitals after the complete trunk has been admitted on this same stream.
     // Reverse/target/paired graphs keep their independently live storage.
@@ -1346,6 +1380,23 @@ private:
       if (!retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
           hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
         throw std::logic_error("Target VGL prepared storage disagrees with pre-allocation accounting");
+    }
+    if (ordinary_trace_plan.total_device_bytes)
+    {
+      parallel_traces_ = std::make_unique<PreparedDeviceSpatialTraces>(ordinary_trace_plan.capacity,
+          queue_.getNative(), 8 * 1024 * 1024, true);
+      ordinary_parallel_trace_bytes_ = parallel_traces_->deviceWorkspaceBytes();
+      if (ordinary_parallel_trace_bytes_ != ordinary_trace_plan.total_device_bytes)
+        throw std::logic_error("Ordinary parallel trace storage differs from preflight");
+      const auto complete_cost = estimateOrdinaryFullVglCost(plan_, batch_capacity_, forward_phase_bank_);
+      if (deviceWorkspaceBytes() != complete_cost.device_workspace_bytes ||
+          hostWorkspaceBytes() != complete_cost.host_workspace_bytes)
+        throw std::logic_error("Ordinary parallel FULL storage differs from complete preflight");
+      std::clog << "PsiFormer REAL FULL traces: selected=determinant_target_parallel Ne=" << ne_
+                << " D=" << shape_.determinants << " capacity=" << batch_capacity_
+                << " product_slots=" << ordinary_trace_plan.product_slots
+                << " added_device_bytes=" << ordinary_parallel_trace_bytes_
+                << " added_host_bytes=0 canonical_statistics=1; prepared_once=yes\n";
     }
     if (retain_score_tape || retain_spatial_tape)
     {
@@ -1925,7 +1976,7 @@ private:
           target_preparation_.max_targets && mode_ == SpatialJetMode::FULL_VGL &&
           !retained_targets_ && value_tape_.empty() && !kinetic_trunk_only_ && !mixed_dense_ &&
           !mixed_value_lu_excluded_ && plan_.environment().amplitude_scalar_domain == ScalarDomain::REAL;
-      if ((parallel_traces_ && !retained_targets_) || request_local_factor_reuse)
+      if ((parallel_traces_ && target_preparation_.max_targets && !retained_targets_) || request_local_factor_reuse)
       {
         // Only later tiles of this request may reuse successful bitwise-equal bases.
         // Every public/direct tile call and every new coordinate attempt starts fresh.
@@ -2106,6 +2157,8 @@ public:
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
   {
+    if (adapter && ordinary_parallel_trace_bytes_)
+      throw std::invalid_argument("Ordinary parallel traces require FP64 affine execution");
     if (mixed_retained_attachment_)
       throw std::invalid_argument("A retained mixed arithmetic binding cannot be replaced by ordinary attachment");
     if (adapter && (retained_targets_ || kinetic_trunk_only_ ||
@@ -2181,6 +2234,10 @@ public:
 
   /// Actual cold-selected overlap; views never add another allocation charge.
   bool usesForwardPhaseBank() const noexcept { return forward_phase_bank_; }
+
+  bool usesOrdinaryParallelTraces() const noexcept { return ordinary_parallel_trace_bytes_ != 0; }
+
+  std::size_t ordinaryParallelTraceBytes() const noexcept { return ordinary_parallel_trace_bytes_; }
 
   std::size_t forwardPhaseBankSavedBytes() const noexcept { return phase_bank_saved_bytes_; }
 
@@ -3264,6 +3321,7 @@ private:
   const bool forward_phase_bank_requested_;
   bool forward_phase_bank_ = false;
   std::size_t phase_bank_saved_bytes_ = 0;
+  std::size_t ordinary_parallel_trace_bytes_ = 0;
   const bool cooperative_value_lu_requested_;
   const bool small_matrix_cooperative_lu_requested_;
   bool mixed_value_lu_excluded_ = false;
