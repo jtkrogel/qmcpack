@@ -2949,6 +2949,20 @@ TEST_CASE("CPU score-only PsiFormer omits kinetic storage with identical score p
   score->applyVJPs({new_channel.data(), new_channel.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, new_sink);
   for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
     checkClose(new_sink.results()[0][parameter], old_sink.results()[0][parameter]);
+  std::vector<DerivativeValue> direction(score->parameterSchema().parameterCount());
+  for (std::size_t i = 0; i < selected.size(); ++i)
+    direction[selected[i]] = DerivativeValue{0.01 * (i + 1), 0.0};
+  const wftrain::StructuredParameterVectorConstView tangent(
+      score->parameterSchema(), score->parameterVersion(), {direction.data(), direction.size()});
+  RecordingSampleSink old_jvp, new_jvp;
+  complete->applyScoreJVP(tangent, old_jvp);
+  score->applyScoreJVP(tangent, new_jvp);
+  REQUIRE(old_jvp.results().size() == 1);
+  REQUIRE(new_jvp.results().size() == 1);
+  checkClose(new_jvp.results()[0], old_jvp.results()[0]);
+  RecordingSampleSink forbidden_jvp;
+  CHECK_THROWS_AS(score->applyLocalEnergyJVP(tangent,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC), forbidden_jvp), std::runtime_error);
   const std::vector<VJPCoefficientChannel> energy_channel{
       {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*score, coefficients),
        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)}};

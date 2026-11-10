@@ -1585,6 +1585,10 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, *ecp_consumer,
           {&ecp_channel, 1}, ecp_sink);
+  // Count this existing CPU/generic preparation traversal just as the scalar
+  // score-only capture path does; this adds no Hamiltonian evaluation.
+  if (work_counters)
+    work_counters->addHamiltonianEvaluations(ecp_result.local_energies.size(), ecp_result.local_energies.size());
   batch.local_energies.reserve(ecp_result.local_energies.size());
   for (const auto energy : ecp_result.local_energies)
     batch.local_energies.emplace_back(energy, 0.0);
