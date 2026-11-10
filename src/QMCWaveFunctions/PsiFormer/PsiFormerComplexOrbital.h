@@ -12,10 +12,24 @@
 #include "PsiFormerComplexDeterminant.h"
 #include "PsiFormerSpatialLayout.h"
 #include "PsiFormerFourierHead.h"
+#include "PsiFormerDenseKernels.h"
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace qmcplusplus::psiformer
 {
+/// Experimental CPU-only projection policy; scalar extended-precision oracle stays available.
+inline bool cpuComplexHeadBlasEnabled()
+{
+  static const bool enabled = [] {
+    const char* text = std::getenv("PSIFORMER_CPU_COMPLEX_HEAD_BLAS");
+    if (text && std::strcmp(text, "0") && std::strcmp(text, "1"))
+      throw std::invalid_argument("PSIFORMER_CPU_COMPLEX_HEAD_BLAS must be 0 or 1");
+    return text && !std::strcmp(text, "1");
+  }();
+  return enabled;
+}
 /// Matrix structure is independent of the real trunk and the orbital phase policy.
 enum class ComplexOrbitalStructure { FULL, SPIN_BLOCKED };
 
@@ -96,10 +110,10 @@ class ComplexOrbitalHeadWorkspace
 public:
   /// Copy descriptor and layouts, validate all extents, then reserve hot-call scratch.
   ComplexOrbitalHeadWorkspace(ComplexOrbitalHeadDescriptor descriptor,
-      SpatialJetLayout feature_layout, SpatialJetLayout envelope_layout)
+      SpatialJetLayout feature_layout, SpatialJetLayout envelope_layout, bool blas_projection = false)
       : descriptor_(std::move(descriptor)), features_(feature_layout), envelopes_(envelope_layout),
         output_(makeOutputLayout()), target_capacity_(output_.laplacian_lanes), projected_(spatialJetSpanElements(output_)),
-        result_(projected_.size())
+        result_(projected_.size()), blas_projection_(blas_projection)
   {}
 
   /// Workspaces own mutable staged jets exclusively.
@@ -184,6 +198,8 @@ private:
     validateParameters(parameters.up, 0);
     validateParameters(parameters.down, 1);
     for (std::size_t configuration = 0; configuration < output_.configuration_count; ++configuration)
+    {
+      const bool projected = blas_projection_ && projectBlas(features, split, parameters, configuration);
       for (std::size_t d = 0; d < descriptor_.determinants; ++d)
         for (std::size_t row = 0; row < descriptor_.electrons; ++row)
         {
@@ -192,10 +208,12 @@ private:
           for (std::size_t orbital = 0; orbital < columns(spin); ++orbital)
           {
             const std::size_t element = matrixElement(d, row, orbital);
-            project(features, split, p, configuration, d, row, orbital, element);
+            if (!projected)
+              project(features, split, p, configuration, d, row, orbital, element);
             compose(envelopes, positions, configuration, d, row, orbital, element, active_electron);
           }
         }
+    }
     if (descriptor_.fourier_modes)
     {
       transformFourierHeadJets(*descriptor_.fourier_modes, output_, descriptor_.determinants,
@@ -402,6 +420,51 @@ private:
     }
   }
 
+  /** Project the two real heads with native FP64 BLAS, retaining canonical output.
+   * The unpublished result buffer supplies disjoint real/imaginary scratch planes;
+   * all affine planes are scattered before composition writes final results.
+   * std::complex arrays explicitly permit access as an interleaved scalar array.
+   * No packing, additional numeric capacity or allocation is needed. Nonfinite
+   * BLAS intermediates fall back to the original extended-precision projection.
+   */
+  bool projectBlas(const double* input, const ComplexOrbitalFeatureJetView* split,
+      const ComplexOrbitalHeadParameters& parameters, std::size_t configuration)
+  {
+    double* scratch = reinterpret_cast<double*>(result_.data() + configuration * output_.configuration_stride);
+    for (std::size_t plane = 0; plane < output_.plane_count; ++plane)
+      for (std::size_t spin = 0; spin < 2; ++spin)
+      {
+        const std::size_t nrows = rows(spin), cols = columns(spin);
+        if (!nrows) continue;
+        const std::size_t count = spinProjectionCount(spin), first_row = spin ? descriptor_.spin_up : 0;
+        const std::size_t size = multiply(nrows, count);
+        const auto& p = spin ? parameters.down : parameters.up;
+        const double* source;
+        if (!split)
+          source = input + features_.uncheckedPlaneOffset(configuration, plane, first_row * descriptor_.feature_width);
+        else if (plane == 0)
+          source = split->values + configuration * features_.element_count + first_row * descriptor_.feature_width;
+        else if (plane <= features_.gradient_lanes)
+          source = split->gradients + (configuration * features_.gradient_lanes + plane - 1) *
+              features_.element_count + first_row * descriptor_.feature_width;
+        else
+          source = split->laplacians + (configuration * features_.laplacian_lanes +
+              plane - 1 - features_.gradient_lanes) * features_.element_count + first_row * descriptor_.feature_width;
+        dense::productBlasReal(source, p.real_weights, plane == 0 ? p.real_bias : nullptr,
+                              nrows, descriptor_.feature_width, count, scratch);
+        dense::productBlasReal(source, p.imaginary_weights, plane == 0 ? p.imaginary_bias : nullptr,
+                              nrows, descriptor_.feature_width, count, scratch + size);
+        for (std::size_t i = 0; i < 2 * size; ++i)
+          if (!determinant::isFiniteReal(scratch[i])) return false;
+        for (std::size_t row = 0; row < nrows; ++row)
+          for (std::size_t index = 0; index < count; ++index)
+            projected_[output_.uncheckedPlaneOffset(configuration, plane,
+                matrixElement(index / cols, first_row + row, index % cols))] =
+                C{scratch[row * count + index], scratch[size + row * count + index]};
+      }
+    return true;
+  }
+
   /// Read one prepared spatial plane from packed or compact split real storage.
   double featureValue(const double* packed, const ComplexOrbitalFeatureJetView* split,
       std::size_t configuration, std::size_t plane, std::size_t element) const
@@ -481,6 +544,7 @@ private:
   SpatialJetLayout features_, envelopes_, output_;
   const std::size_t target_capacity_;
   std::vector<C> projected_, result_;
+  const bool blas_projection_;
   bool valid_ = false;
 };
 } // namespace qmcplusplus::psiformer

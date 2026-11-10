@@ -173,7 +173,7 @@ private:
                 "score orbital overflow"), descriptor.electrons,
             qmcplusplus::psiformer::SpatialJetMode::VALUE_ONLY)),
         envelopes_(orbitals_.element_count), feature_seed_(features_.element_count),
-        head_(descriptor, features_, orbitals_), determinant_(descriptor.determinants, descriptor.electrons),
+        head_(descriptor, features_, orbitals_, qmcplusplus::psiformer::cpuComplexHeadBlasEnabled()), determinant_(descriptor.determinants, descriptor.electrons),
         matrix_adjoint_(orbitals_.element_count), score_(parameters)
   {}
 

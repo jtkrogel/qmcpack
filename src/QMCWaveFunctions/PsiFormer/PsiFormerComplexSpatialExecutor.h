@@ -194,7 +194,7 @@ private:
             checkedStorageProduct(descriptor.electrons, descriptor.electrons, "complex matrix extent overflow"),
             "complex orbital extent overflow"), descriptor.electrons, mode, targets)),
         envelopes_(qmcplusplus::psiformer::spatialJetSpanElements(orbitals_)),
-        head_(descriptor, features_, orbitals_), determinant_(descriptor.determinants, descriptor.electrons,
+        head_(descriptor, features_, orbitals_, qmcplusplus::psiformer::cpuComplexHeadBlasEnabled()), determinant_(descriptor.determinants, descriptor.electrons,
             0, features_.gradient_lanes, features_.laplacian_lanes),
         gradient_(features_.gradient_lanes), lap_log_(features_.laplacian_lanes), lap_ratio_(lap_log_.size())
   {}

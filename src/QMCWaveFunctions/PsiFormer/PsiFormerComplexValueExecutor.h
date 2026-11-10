@@ -147,7 +147,7 @@ private:
                 checkedStorageProduct(descriptor.electrons, descriptor.electrons, "complex matrix extent overflow"),
                 "complex orbital extent overflow"), descriptor.electrons,
             qmcplusplus::psiformer::SpatialJetMode::VALUE_ONLY)),
-        envelopes_(orbitals_.element_count), head_(descriptor, features_, orbitals_),
+        envelopes_(orbitals_.element_count), head_(descriptor, features_, orbitals_, qmcplusplus::psiformer::cpuComplexHeadBlasEnabled()),
         determinant_(descriptor.determinants, descriptor.electrons)
   {}
 

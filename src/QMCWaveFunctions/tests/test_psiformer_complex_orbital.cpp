@@ -417,6 +417,95 @@ void edgeCases()
          "nonfinite momentum rejected before evaluation");
 }
 
+/// Compare BLAS weight traversal against the original extended-precision oracle.
+void blasProjection()
+{
+  for (bool blocked : {false, true})
+    for (auto mode : {psif::SpatialJetMode::VALUE_ONLY, psif::SpatialJetMode::ACTIVE,
+                      psif::SpatialJetMode::FULL_VGL})
+    {
+      psif::ComplexOrbitalHeadDescriptor d;
+      d.electrons = 3; d.spin_up = 2; d.determinants = 3; d.feature_width = 5;
+      d.structure = blocked ? psif::ComplexOrbitalStructure::SPIN_BLOCKED : psif::ComplexOrbitalStructure::FULL;
+      const auto feature_layout = psif::makeSpatialJetLayout(2, 15, 3, mode, 17);
+      const auto envelope_layout = psif::makeSpatialJetLayout(2, 3 * (blocked ? 5 : 9), 3, mode,
+                                                           3 * (blocked ? 5 : 9) + 2);
+      std::vector<double> features(psif::spatialJetSpanElements(feature_layout));
+      std::vector<double> envelopes(psif::spatialJetSpanElements(envelope_layout));
+      std::vector<double> positions(18, .17);
+      for (std::size_t i = 0; i < features.size(); ++i) features[i] = std::sin(.17 * i);
+      for (std::size_t i = 0; i < envelopes.size(); ++i) envelopes[i] = std::cos(.13 * i);
+      std::array<std::vector<double>, 2> wr, wi, br, bi;
+      psif::ComplexOrbitalHeadParameters parameters;
+      for (std::size_t spin = 0; spin < 2; ++spin)
+      {
+        const std::size_t cols = blocked ? (spin ? 1 : 2) : 3, count = 3 * cols;
+        wr[spin].resize(5 * count); wi[spin].resize(5 * count);
+        br[spin].resize(count); bi[spin].resize(count);
+        for (std::size_t i = 0; i < 5 * count; ++i)
+        { wr[spin][i] = std::cos(.31 * i); wi[spin][i] = std::sin(.23 * i); }
+        for (std::size_t i = 0; i < count; ++i)
+        { br[spin][i] = .01 * i; bi[spin][i] = -.02 * i; }
+        auto& p = spin ? parameters.down : parameters.up;
+        p.real_weights = wr[spin].data(); p.imaginary_weights = wi[spin].data();
+        p.real_bias = br[spin].data(); p.imaginary_bias = bi[spin].data();
+        p.weight_count = wr[spin].size(); p.bias_count = count;
+      }
+      psif::ComplexOrbitalHeadWorkspace scalar(d, feature_layout, envelope_layout);
+      psif::ComplexOrbitalHeadWorkspace blas(d, feature_layout, envelope_layout, true);
+      const auto storage = blas.storageBytes(), fingerprint = blas.storageFingerprint();
+      scalar.evaluate(features.data(), features.size(), envelopes.data(), envelopes.size(),
+                      positions.data(), positions.size(), parameters, 2);
+      blas.evaluate(features.data(), features.size(), envelopes.data(), envelopes.size(),
+                          positions.data(), positions.size(), parameters, 2);
+      for (std::size_t i = 0; i < psif::spatialJetSpanElements(scalar.layout()); ++i)
+        check(near(blas.data()[i], scalar.data()[i], 2e-12), "BLAS packed projection matches extended-precision oracle within FP64 tolerance");
+      // Also exercise the compact split buffers used by native CPU spatial executors.
+      const auto count = feature_layout.configuration_count * feature_layout.element_count;
+      std::vector<double> values(count), gradients(count * feature_layout.gradient_lanes),
+                          laplacians(count * feature_layout.laplacian_lanes);
+      for (std::size_t c = 0; c < 2; ++c)
+        for (std::size_t plane = 0; plane < feature_layout.plane_count; ++plane)
+          for (std::size_t e = 0; e < feature_layout.element_count; ++e)
+          {
+            auto* out = plane == 0 ? values.data() + c * feature_layout.element_count :
+                plane <= feature_layout.gradient_lanes ? gradients.data() +
+                    (c * feature_layout.gradient_lanes + plane - 1) * feature_layout.element_count :
+                laplacians.data() + (c * feature_layout.laplacian_lanes +
+                    plane - 1 - feature_layout.gradient_lanes) * feature_layout.element_count;
+            out[e] = features[feature_layout.uncheckedPlaneOffset(c, plane, e)];
+          }
+      psif::ComplexOrbitalFeatureJetView split{values.data(), gradients.data(), laplacians.data(),
+                                             values.size(), gradients.size(), laplacians.size()};
+      blas.evaluate(split, envelopes.data(), envelopes.size(), positions.data(), positions.size(), parameters, 2);
+      for (std::size_t i = 0; i < psif::spatialJetSpanElements(scalar.layout()); ++i)
+        check(near(blas.data()[i], scalar.data()[i], 2e-12), "BLAS split projection matches extended-precision oracle within FP64 tolerance");
+      check(blas.storageBytes() == storage && blas.storageFingerprint() == fingerprint,
+            "BLAS projection introduces no retained or per-call allocation");
+      check(blas.storageBytes() == scalar.storageBytes(), "BLAS projection keeps prepared memory unchanged");
+      // A finite-input FP64 intermediate overflow must use the wider oracle,
+      // which can cancel opposite contributions before its finite narrowing.
+      std::fill(features.begin(), features.end(), 0.0);
+      for (std::size_t c = 0; c < 2; ++c)
+        for (std::size_t row = 0; row < 3; ++row)
+        {
+          features[feature_layout.uncheckedValueOffset(c, row * 5)] = 2.0;
+          features[feature_layout.uncheckedValueOffset(c, row * 5 + 1)] = -2.0;
+        }
+      for (std::size_t spin = 0; spin < 2; ++spin)
+      {
+        std::fill(wr[spin].begin(), wr[spin].end(), std::numeric_limits<double>::max());
+        std::fill(wi[spin].begin(), wi[spin].end(), 0.0);
+      }
+      scalar.evaluate(features.data(), features.size(), envelopes.data(), envelopes.size(),
+                      positions.data(), positions.size(), parameters, 2);
+      blas.evaluate(features.data(), features.size(), envelopes.data(), envelopes.size(),
+                    positions.data(), positions.size(), parameters, 2);
+      for (std::size_t i = 0; i < psif::spatialJetSpanElements(scalar.layout()); ++i)
+        check(blas.data()[i] == scalar.data()[i], "nonfinite BLAS intermediate falls back to wider oracle");
+    }
+}
+
 /// Exercise bounded CPU math only; no public XML or GPU capability is asserted.
 int main()
 {
@@ -425,6 +514,7 @@ int main()
   spatialFixture(true, psif::SpatialJetMode::FULL_VGL, 2, 1);
   spatialFixture(true, psif::SpatialJetMode::ACTIVE);
   spatialFixture(false, psif::SpatialJetMode::VALUE_ONLY);
+  blasProjection();
   parameterDirections();
   edgeCases();
   std::cout << checks << " checks, " << failures << " failures\n";
