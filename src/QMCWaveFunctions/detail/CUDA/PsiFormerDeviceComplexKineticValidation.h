@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_KINETIC_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_KINETIC_VALIDATION_H
+#include <initializer_list>
 #include "PsiFormerDeviceComplexKineticKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexOrbital.h"
@@ -21,7 +22,7 @@ inline void validateComplexKineticConcurrentTraces()
     throw std::invalid_argument("Concurrent kinetic trace oracle requires cooperative spatial traces=1");
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
   std::size_t comparisons = 0;
-  for (const auto descriptor : {std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
+  for (const auto descriptor : std::initializer_list<std::array<std::size_t, 3>>{std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
   {
     const auto n = descriptor[0], d = descriptor[1], k = descriptor[2], m = d * n * n;
     auto layout = makeOpenOrbitalJetLayout(1, d, n, 1, 3, n / 2, SpatialJetMode::FULL_VGL);
@@ -130,7 +131,7 @@ inline void validateComplexKineticChannelRoots()
   const auto clear = std::numeric_limits<std::uint64_t>::max();
   std::size_t comparisons = 0;
   // Cheap matrix-only cases, not a large-N neural architecture cross-product.
-  for (const auto descriptor : {std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
+  for (const auto descriptor : std::initializer_list<std::array<std::size_t, 3>>{std::array<std::size_t, 3>{64, 2, 3}, {100, 16, 1}})
   {
     const auto n = descriptor[0], d = descriptor[1], k = descriptor[2], nn = n * n, m = d * nn;
     auto layout = makeOpenOrbitalJetLayout(1, d, n, 1, 3, n / 2, SpatialJetMode::FULL_VGL);
@@ -242,7 +243,7 @@ inline void validateComplexKineticChannelRoots()
       if (!rejected)
         throw std::runtime_error("Channel roots invalid scratch/alias admission launched");
     }
-    for (const auto unsupported_shape : {std::array<std::size_t, 2>{63, d}, {301, d}, {n, 1}, {n, 17}})
+    for (const auto unsupported_shape : std::initializer_list<std::array<std::size_t, 2>>{std::array<std::size_t, 2>{63, d}, {301, d}, {n, 1}, {n, 17}})
     {
       const auto unsupported = makeOpenOrbitalJetLayout(1, unsupported_shape[1], unsupported_shape[0], 1, 3,
           unsupported_shape[0] / 2, SpatialJetMode::FULL_VGL);

@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_WEIGHTED_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SCORE_WEIGHTED_VALIDATION_H
+#include <initializer_list>
 #include "PsiFormerDeviceComplexScore.h"
 #include "PsiFormerDeviceComplexProducts.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
@@ -19,7 +20,7 @@ inline void validateComplexScoreWeightedInverses(bool grid = false)
   compute::Queue<PlatformKind::CUDA> queue;
   std::size_t comparisons = 0;
   const auto clear = std::numeric_limits<std::uint64_t>::max();
-  for (const auto dimensions : {std::array<std::size_t, 2>{63, 1}, {64, 1}, {65, 3},
+  for (const auto dimensions : std::initializer_list<std::array<std::size_t, 2>>{std::array<std::size_t, 2>{63, 1}, {64, 1}, {65, 3},
                                 {100, 16}, {200, 16}, {300, 16}, {64, 17}})
   {
     const auto n = dimensions[0], d = dimensions[1], count = d * n * n;
@@ -228,7 +229,7 @@ inline void measureComplexScoreWeightedInverses()
   Event begin, end;
   checkRuntime(create(&begin), "weighted inverse timing begin");
   checkRuntime(create(&end), "weighted inverse timing end");
-  for (const auto dimensions : {std::array<std::size_t, 2>{64, 1}, {100, 16}, {200, 16}})
+  for (const auto dimensions : std::initializer_list<std::array<std::size_t, 2>>{std::array<std::size_t, 2>{64, 1}, {100, 16}, {200, 16}})
   {
     const auto n = dimensions[0], d = dimensions[1], count = d * n * n;
     std::vector<cuDoubleComplex> input(count, make_cuDoubleComplex(0.375, -0.125));

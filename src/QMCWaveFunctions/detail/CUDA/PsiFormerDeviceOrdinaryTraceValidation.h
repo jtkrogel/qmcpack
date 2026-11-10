@@ -5,6 +5,7 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_ORDINARY_TRACE_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_ORDINARY_TRACE_VALIDATION_H
 
+#include <initializer_list>
 #include "PsiFormerDeviceMixedPeriodicGeometryValidation.h"
 
 namespace qmcplusplus::psiformer::device
@@ -39,7 +40,7 @@ inline void validateOrdinaryRealFullParallelTraces(compute::Queue<PlatformKind::
 
   AcceleratorBlasHandle blas(queue);
   for (const auto boundary : {BoundaryCondition::PERIODIC, BoundaryCondition::OPEN})
-  for (const auto shape_pair : {std::pair<std::size_t, std::size_t>{22, 16}, {22, 64}, {22, 160},
+  for (const auto shape_pair : std::initializer_list<std::pair<std::size_t, std::size_t>>{std::pair<std::size_t, std::size_t>{22, 16}, {22, 64}, {22, 160},
                                {44, 16}, {66, 16}, {88, 16}})
   {
     const auto n = shape_pair.first, determinants = shape_pair.second;

@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_KINETIC_HEAD_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_KINETIC_HEAD_VALIDATION_H
+#include <initializer_list>
 #include "PsiFormerDeviceComplexProducts.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include <cstring>
@@ -19,7 +20,7 @@ inline void validateComplexKineticHeadParallel()
   compute::Queue<PlatformKind::CUDA> queue;
   const auto cell = periodic_geometry::makeCell({{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}}, {true, true, true});
   std::size_t comparisons = 0;
-  for (const auto dimensions : {std::array<std::size_t, 2>{63, 2}, {64, 2}, {100, 2}, {64, 17}})
+  for (const auto dimensions : std::initializer_list<std::array<std::size_t, 2>>{std::array<std::size_t, 2>{63, 2}, {64, 2}, {100, 2}, {64, 17}})
     for (std::size_t k : {std::size_t(1), std::size_t(3)})
     {
       const auto n = dimensions[0], d = dimensions[1];
@@ -452,7 +453,7 @@ inline void measureComplexKineticHeadParallel()
   checkRuntime(create(&begin), "kinetic head timing begin");
   checkRuntime(create(&end), "kinetic head timing end");
   const auto cell = periodic_geometry::makeCell({{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}}, {true, true, true});
-  for (const auto dimensions : {std::array<std::size_t, 4>{64, 2, 8, 2}, {100, 16, 256, 20}})
+  for (const auto dimensions : std::initializer_list<std::array<std::size_t, 4>>{std::array<std::size_t, 4>{64, 2, 8, 2}, {100, 16, 256, 20}})
   {
     const auto n = dimensions[0], d = dimensions[1], width = dimensions[2], ni = dimensions[3];
     auto layout = makeOpenOrbitalJetLayout(1, d, n, ni, width, n / 2, SpatialJetMode::FULL_VGL);

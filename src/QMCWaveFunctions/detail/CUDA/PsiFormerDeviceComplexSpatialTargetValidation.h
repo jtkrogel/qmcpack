@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_TARGET_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_COMPLEX_SPATIAL_TARGET_VALIDATION_H
+#include <initializer_list>
 #include "PsiFormerDeviceComplexSpatial.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
@@ -229,7 +230,7 @@ inline void validateBatchedHeadTargetOwner(bool factor_reuse = false, bool cold_
         throw std::runtime_error("Cold LU strict option admission changed");
     }
     const auto before = metrics.snapshot();
-    for (const auto invalid : {std::pair<std::size_t, bool>{n, true}, {k, false}})
+    for (const auto invalid : std::initializer_list<std::pair<std::size_t, bool>>{std::pair<std::size_t, bool>{n, true}, {k, false}})
     {
       bool rejected = false;
       try { (void)estimateComplexSpatialTargetCost(plan, invalid.first, capacity, trace_targets,
@@ -391,7 +392,7 @@ void validateComplexSpatialTargetCosts()
   const auto before = deviceMemoryMetrics(0).snapshot();
   const auto work_budget = std::numeric_limits<std::size_t>::max();
   struct InvalidProfile { std::size_t electrons; bool periodic, paired; };
-  for (const auto invalid : {InvalidProfile{32, true, true}, {302, true, true},
+  for (const auto invalid : std::initializer_list<InvalidProfile>{InvalidProfile{32, true, true}, {302, true, true},
                             {100, false, true}, {100, true, false}})
   {
     bool rejected = false;
