@@ -131,6 +131,10 @@ public:
 
   std::unique_ptr<SPOSet> makeClone() const override { return std::make_unique<SplineC2C>(*this); }
 
+  std::size_t orbitalTargetTableBytes() const override;
+  std::string orbitalTargetFingerprint() const override;
+  std::unique_ptr<SPOSet> makeOrbitalTargetClone() const override;
+
   bool isRotationSupported() const override { return true; }
 
   ///store copy of spline coefficients for obrital rotation

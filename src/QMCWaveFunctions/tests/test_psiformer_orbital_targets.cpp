@@ -20,6 +20,11 @@
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/tests/ConstantSPOSet.h"
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/BsplineFactory/SplineC2C.h"
+#include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
+#include "spline2/MultiBspline.hpp"
+#endif
 #include "SimulationCell.h"
 #include "Utilities/RuntimeOptions.h"
 
@@ -57,6 +62,110 @@ std::unique_ptr<ConstantSPOSet<QMCTraits::ValueType>> makeSource(
 } // namespace
 
 #ifdef QMC_COMPLEX
+namespace
+{
+class OrbitalTargetSpline : public SplineC2C<double>
+{
+public:
+  OrbitalTargetSpline(const char* name, const Lattice& lattice,
+                     std::unique_ptr<MultiBsplineBase<double>> bank, const SPOSet::PosType& stored_k)
+      : SplineC2C<double>(name, 1, lattice, std::move(bank))
+  {
+    resizeStorage(1);
+    kPoints[0] = stored_k;
+    resize_kpoints();
+    finalizeConstruction();
+  }
+};
+}
+
+TEST_CASE("Complex spline orbital targets freeze coefficients and remove the actual Bloch twist",
+          "[wavefunction][psiformer][pretraining][complex_bspline_target]")
+{
+  Lattice lattice;
+  lattice.R = {6, 0, 0, .4, 7, 0, -.2, .3, 8};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet electrons(cell);
+  electrons.create({1, 1});
+  electrons.getSpeciesSet().addSpecies("u");
+  electrons.getSpeciesSet().addSpecies("d");
+  electrons.resetGroups();
+  electrons.R[0] = {.2, .3, .4};
+  electrons.R[1] = {1.1, -.2, .6};
+  const ParticleSet::PosType reduced{1.0 / 3, 1.0 / 6, 0};
+  electrons.setTwist(reduced);
+  electrons.update();
+  const auto cartesian = lattice.k_cart(reduced);
+  std::vector<std::unique_ptr<SPOSet>> sources;
+  std::vector<std::unique_ptr<DiracDeterminantBase>> determinants;
+  std::array<double*, 2> original_coefficients;
+  std::size_t table_bytes = 0;
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    Ugrid grids[3]{};
+    BCtype_d bc[3]{};
+    for (int d = 0; d < 3; ++d)
+    {
+      grids[d].start = 0; grids[d].end = 1; grids[d].num = 4;
+      bc[d].lCode = bc[d].rCode = PERIODIC;
+    }
+    auto bank = std::make_unique<MultiBspline<double>>(grids, bc, 2);
+    const auto& table = bank->getBlock(0);
+    std::fill_n(table.coefs, table.coefs_size, 0.0);
+    for (int x = 0; x < table.x_grid.num + 3; ++x)
+      for (int y = 0; y < table.y_grid.num + 3; ++y)
+        for (int z = 0; z < table.z_grid.num + 3; ++z)
+        {
+          const auto index = x * table.x_stride + y * table.y_stride + z * table.z_stride;
+          table.coefs[index] = 2 + spin;
+          table.coefs[index + 1] = .5 + spin;
+        }
+    original_coefficients[spin] = table.coefs;
+    table_bytes += bank->sizeInByte();
+    sources.push_back(std::make_unique<OrbitalTargetSpline>("occupied", lattice, std::move(bank), -cartesian));
+    determinants.push_back(std::make_unique<DiracDeterminant<>>(*sources.back(), spin, spin + 1));
+  }
+  SlaterDet teacher(electrons, std::move(sources), std::move(determinants));
+  constexpr std::size_t channels = 2;
+  const auto cap = table_bytes + (channels * 2 * 2 + 2) * sizeof(std::complex<double>);
+  CHECK_THROWS_AS(ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, electrons, {reduced[0], reduced[1], reduced[2]}, channels, cap - 1), std::length_error);
+  auto target = ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, electrons, {reduced[0], reduced[1], reduced[2]}, channels, cap);
+  CHECK(target.retainedScalarBytes() == cap);
+  const auto first = target.evaluate(electrons);
+  REQUIRE(first.size() == 8);
+  for (std::size_t channel = 0; channel < channels; ++channel)
+  {
+    CHECK(first[channel * 4].real() == Approx(2));
+    CHECK(first[channel * 4].imag() == Approx(.5));
+    CHECK(first[channel * 4 + 3].real() == Approx(3));
+    CHECK(first[channel * 4 + 3].imag() == Approx(1.5));
+    CHECK(first[channel * 4 + 1] == std::complex<double>{});
+    CHECK(first[channel * 4 + 2] == std::complex<double>{});
+  }
+  const auto fingerprint = target.descriptor().fingerprint();
+  // A later edit of the source coefficient bank must not change the frozen target.
+  original_coefficients[0][0] += 10;
+  CHECK(target.evaluate(electrons) == first);
+  auto changed = ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, electrons, {reduced[0], reduced[1], reduced[2]}, channels, cap);
+  CHECK(changed.descriptor().fingerprint() != fingerprint);
+  electrons.R[0] += lattice.a(0);
+  electrons.update();
+  const auto translated = target.evaluate(electrons);
+  for (std::size_t i = 0; i < translated.size(); ++i)
+  {
+    CHECK(translated[i].real() == Approx(first[i].real()).margin(1e-12));
+    CHECK(translated[i].imag() == Approx(first[i].imag()).margin(1e-12));
+  }
+  electrons.setTwist({0, 0, 0});
+  CHECK_THROWS_AS(ComplexOrbitalTargetEvaluator::fromSingleReference(
+      teacher, electrons, {}, channels, cap), std::invalid_argument);
+}
+
 TEST_CASE("Periodic Gaussian targets freeze coefficients and occupied gauge",
           "[wavefunction][psiformer][pretraining][periodic_lcao_target]")
 {

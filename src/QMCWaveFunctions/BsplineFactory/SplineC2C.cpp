@@ -16,6 +16,12 @@
 #include "ApplyPhaseC2C.hpp"
 #include "CPU/BLAS.hpp"
 #include "CPU/SIMD/inner_product.hpp"
+#include "spline2/MultiBspline.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <sstream>
+#include <type_traits>
 
 namespace qmcplusplus
 {
@@ -44,6 +50,79 @@ SplineC2C<ST>::SplineC2C(const std::string& my_name,
 
 template<typename ST>
 SplineC2C<ST>::SplineC2C(const SplineC2C& in) = default;
+
+template<typename ST>
+std::size_t SplineC2C<ST>::orbitalTargetTableBytes() const
+{
+  if (!std::is_same_v<ST, double> || offload_mapper_ || SplineInst->getNumBlocks() != 1 ||
+      kPoints.size() != static_cast<std::size_t>(getOrbitalSetSize()) ||
+      SplineInst->num_splines() < 2 * kPoints.size())
+    throw std::invalid_argument("Frozen complex spline target requires CPU FP64, complete undistributed occupied orbitals");
+  return SplineInst->sizeInByte();
+}
+
+template<typename ST>
+std::string SplineC2C<ST>::orbitalTargetFingerprint() const
+{
+  orbitalTargetTableBytes();
+  const auto& table = SplineInst->getBlock(0);
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  const auto mix = [&](double value) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000))
+      throw std::invalid_argument("Frozen spline target metadata/coefficients are nonfinite");
+    for (unsigned byte = 0; byte < sizeof(bits); ++byte)
+      hash = (hash ^ ((bits >> (8 * byte)) & 255)) * UINT64_C(1099511628211);
+  };
+  mix(getOrbitalSetSize());
+  for (int d = 0; d < 3; ++d)
+    for (int e = 0; e < 3; ++e) mix(prim_lattice_.R(d, e));
+  for (const auto& k : kPoints)
+    for (int d = 0; d < 3; ++d) mix(k[d]);
+  for (const auto& grid : {table.x_grid, table.y_grid, table.z_grid})
+  { mix(grid.start); mix(grid.end); mix(grid.num); }
+  for (const auto& bc : {table.xBC, table.yBC, table.zBC})
+  { mix(bc.lCode); mix(bc.rCode); mix(bc.lVal); mix(bc.rVal); }
+  // Hash realized used lanes, including restored caches, never uninitialized SIMD padding.
+  for (int x = 0; x < table.x_grid.num + 3; ++x)
+    for (int y = 0; y < table.y_grid.num + 3; ++y)
+      for (int z = 0; z < table.z_grid.num + 3; ++z)
+        for (std::size_t lane = 0; lane < 2 * kPoints.size(); ++lane)
+          mix(table.coefs[x * table.x_stride + y * table.y_stride + z * table.z_stride + lane]);
+  std::ostringstream identity;
+  identity << "complex-fp64-spline-realized-table-v1:" << std::hex << hash;
+  return identity.str();
+}
+
+template<typename ST>
+std::unique_ptr<SPOSet> SplineC2C<ST>::makeOrbitalTargetClone() const
+{
+  orbitalTargetTableBytes();
+  const auto& table = SplineInst->getBlock(0);
+  const Ugrid grid[]{table.x_grid, table.y_grid, table.z_grid};
+  const BCType bc[]{table.xBC, table.yBC, table.zBC};
+  auto bank = std::make_unique<MultiBspline<ST>>(grid, bc, SplineInst->num_splines());
+  const auto& copy = bank->getBlock(0);
+  if (copy.coefs_size != table.coefs_size)
+    throw std::logic_error("Frozen spline clone changed coefficient storage shape");
+  std::fill_n(copy.coefs, copy.coefs_size, ST{});
+  for (int x = 0; x < table.x_grid.num + 3; ++x)
+    for (int y = 0; y < table.y_grid.num + 3; ++y)
+      for (int z = 0; z < table.z_grid.num + 3; ++z)
+        for (std::size_t lane = 0; lane < 2 * kPoints.size(); ++lane)
+          copy.coefs[x * copy.x_stride + y * copy.y_stride + z * copy.z_stride + lane] =
+              table.coefs[x * table.x_stride + y * table.y_stride + z * table.z_stride + lane];
+  auto frozen = std::make_unique<SplineC2C<ST>>(getName(), getOrbitalSetSize(), prim_lattice_, std::move(bank));
+  frozen->resizeStorage(kPoints.size());
+  frozen->HalfG = HalfG;
+  frozen->MakeTwoCopies = MakeTwoCopies;
+  frozen->BandIndexMap = BandIndexMap;
+  frozen->kPoints = kPoints;
+  frozen->resize_kpoints();
+  frozen->finalizeConstruction();
+  return frozen;
+}
 
 template<typename ST>
 void SplineC2C<ST>::acquireResource(ResourceCollection& collection, const RefVectorWithLeader<SPOSet>& spo_list) const

@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
+#include "QMCWaveFunctions/BsplineFactory/BsplineSet.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,8 +50,10 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
   std::array<double, 9> lattice;
   ParticleSet::PosType reduced_vector;
   const bool localized = dynamic_cast<const LCAOrbitalSet*>(&source.getDet(0).getPhi()) != nullptr;
+  const bool spline = dynamic_cast<const BsplineSet*>(&source.getDet(0).getPhi()) != nullptr;
   std::string identity = localized ? "complex-lcao-fixed-gauge-periodic-part-v1;" :
-                                    "complex-free-orbital-fixed-gauge-periodic-part-v1;";
+      spline ? "complex-bspline-fixed-gauge-periodic-part-v1;" :
+               "complex-free-orbital-fixed-gauge-periodic-part-v1;";
   auto append = [&](double value) {
     std::uint64_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -74,7 +77,7 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
   std::array<std::unique_ptr<SPOSet>, 2> orbitals;
   std::array<const SPOSet*, 2> sources;
   std::array<const ParticleSet*, 2> source_ions{};
-  std::size_t detached_coefficient_elements = 0;
+  std::size_t detached_source_bytes = 0;
   std::size_t numeric_elements = channels * n * n;
   int first = 0;
   for (int spin = 0; spin < 2; ++spin)
@@ -82,9 +85,10 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
     const auto& determinant = source.getDet(spin);
     const auto* free = dynamic_cast<const FreeOrbital*>(&determinant.getPhi());
     const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(&determinant.getPhi());
+    const auto* bspline = dynamic_cast<const BsplineSet*>(&determinant.getPhi());
     const auto count = electrons.groupsize(spin);
     if (determinant.getFirstIndex() != first || determinant.getLastIndex() != first + count ||
-        determinant.getPhi().getOrbitalSetSize() < count || (localized ? !lcao : !free))
+        determinant.getPhi().getOrbitalSetSize() < count || (localized ? !lcao : spline ? !bspline : !free))
       throw std::invalid_argument("Complex orbital target requires matching occupied periodic spin blocks");
     if (localized)
     {
@@ -128,9 +132,38 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
         append(std::real(lcao->C->data()[coefficient]));
         append(std::imag(lcao->C->data()[coefficient]));
       }
-      if (lcao->C->size() > std::numeric_limits<std::size_t>::max() - detached_coefficient_elements)
+      if (lcao->C->size() > (std::numeric_limits<std::size_t>::max() - detached_source_bytes) /
+                              sizeof(std::complex<double>))
         throw std::length_error("Complex Gaussian target coefficient extent overflow");
-      detached_coefficient_elements += lcao->C->size();
+      detached_source_bytes += lcao->C->size() * sizeof(std::complex<double>);
+    }
+    else if (spline)
+    {
+      const auto bytes = bspline->orbitalTargetTableBytes();
+      if (bytes > std::numeric_limits<std::size_t>::max() - detached_source_bytes)
+        throw std::length_error("Complex B-spline target coefficient extent overflow");
+      detached_source_bytes += bytes;
+      const auto& primitive = bspline->primitiveLattice();
+      for (int d = 0; d < 3; ++d)
+        for (int e = 0; e < 3; ++e)
+          if (std::abs(primitive.R(d, e) - lattice[3 * d + e]) >
+              1e-10 * std::max(1.0, std::abs(lattice[3 * d + e])))
+            throw std::invalid_argument("Complex B-spline target currently requires the primitive simulation cell");
+      const auto& momenta = bspline->storedKPoints();
+      if (momenta.size() < static_cast<std::size_t>(count))
+        throw std::invalid_argument("Complex B-spline target lacks occupied Bloch momenta");
+      for (int column = 0; column < count; ++column)
+        for (int d = 0; d < 3; ++d)
+        {
+          double reciprocal = 0;
+          for (int e = 0; e < 3; ++e)
+            reciprocal += (-momenta[column][e] - cartesian[e]) * lattice[3 * d + e] /
+                (2 * std::acos(-1.0));
+          if (!isFiniteDouble(reciprocal) || std::abs(reciprocal - std::round(reciprocal)) > 1e-10)
+            throw std::invalid_argument("Complex B-spline target Bloch twist does not match the student");
+        }
+      // Fingerprint the realized table, not a filename or a capped whole-file image.
+      identity += bspline->orbitalTargetFingerprint() + ";";
     }
     else
     {
@@ -158,12 +191,13 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
     first += count;
   }
   // Admit target plus per-spin scratch before cloning or allocating either numeric buffer.
-  if (detached_coefficient_elements > std::numeric_limits<std::size_t>::max() - numeric_elements ||
-      numeric_elements + detached_coefficient_elements > maximum_numeric_bytes / sizeof(std::complex<double>))
+  if (numeric_elements > maximum_numeric_bytes / sizeof(std::complex<double>) ||
+      detached_source_bytes > maximum_numeric_bytes - numeric_elements * sizeof(std::complex<double>))
     throw std::length_error("Complex orbital target numeric cap exceeded before allocation");
   for (int spin = 0; spin < 2; ++spin)
   {
-    orbitals[spin] = sources[spin]->makeClone();
+    orbitals[spin] = spline ? static_cast<const BsplineSet*>(sources[spin])->makeOrbitalTargetClone() :
+                              sources[spin]->makeClone();
     if (localized)
     {
       auto& frozen = static_cast<LCAOrbitalSet&>(*orbitals[spin]);
@@ -172,7 +206,7 @@ ComplexOrbitalTargetEvaluator ComplexOrbitalTargetEvaluator::fromSingleReference
   }
   return {OrbitalTargetDescriptor::makeSingleReference(identity, electrons.groupsize(0),
       electrons.groupsize(1), channels), std::move(orbitals), lattice, reduced, cartesian, source_ions,
-      detached_coefficient_elements * sizeof(std::complex<double>)};
+      detached_source_bytes};
 }
 
 /// Allocate only the frozen target and per-spin value scratch; SPO clone storage is separate.

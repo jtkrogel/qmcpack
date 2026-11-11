@@ -22,6 +22,7 @@
 #define QMCPLUSPLUS_BSPLINESET_H
 
 #include "QMCWaveFunctions/SPOSet.h"
+#include <stdexcept>
 
 namespace qmcplusplus
 {
@@ -71,6 +72,16 @@ public:
 
   /// Null means provenance is unsupported, not that ordinary evaluation failed.
   const std::shared_ptr<const BsplineSourceIdentity>& sourceIdentity() const noexcept { return source_identity_; }
+
+  /// Metadata for a frozen occupied-orbital teacher; stored k has the historical opposite sign.
+  const Lattice& primitiveLattice() const noexcept { return prim_lattice_; }
+  const auto& storedKPoints() const noexcept { return kPoints; }
+  virtual std::size_t orbitalTargetTableBytes() const
+  { throw std::invalid_argument("This B-spline representation has no frozen orbital target"); }
+  virtual std::string orbitalTargetFingerprint() const
+  { throw std::invalid_argument("This B-spline representation has no frozen orbital target"); }
+  virtual std::unique_ptr<SPOSet> makeOrbitalTargetClone() const
+  { throw std::invalid_argument("This B-spline representation has no frozen orbital target"); }
 
   auto& getHalfG() const { return HalfG; }
 

@@ -3060,7 +3060,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         const bool supported_paired_move = supportsNativeEnergyMove(vmcdriver_input_, *complex) &&
             (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::PBYP || !vmcdriver_input_.get_use_drift());
         // Supervised raw-orbital VJPs use the explicit GPU publication wrapper, not ENERGY adjoints.
-        const bool gpu_orbital_mse = complex->gpuInferenceEnabled() && myComm->size() == 1 &&
+        const bool gpu_orbital_mse = complex->gpuInferenceEnabled() &&
             training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE &&
             training_input_.getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE &&
             optimizer == O::ADAM && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF &&
@@ -3157,7 +3157,8 @@ void WFTrainBatched::process(xmlNodePtr node)
               training_input_.getMaximumUpdateNorm() == 0));
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() ||
-             (myComm->size() != 1 && !legacy_paired_mpi2_kfac && !legacy_paired_score_ecp && !legacy_paired_inline_ecp) ||
+             (myComm->size() != 1 && !legacy_paired_mpi2_kfac && !legacy_paired_score_ecp && !legacy_paired_inline_ecp &&
+              !gpu_orbital_mse) ||
              !supported_paired_move ||
              !supported_optimizer))
           throw UniformCommunicateError(
@@ -7219,12 +7220,14 @@ void WFTrainBatched::initializeOrbitalPretraining()
   if (training_input_.samplesOrbitalStudent())
   {
     const auto* real_student = jastrow_binding_ ? &jastrow_binding_->neural() : dynamic_cast<PsiFormerWF*>(selected_provider_);
-    bool supported_student = real_student && !real_student->usesAcceleratorParameterProducts();
+    // Sampling selects coordinates only. The real provider already supplies the
+    // same orbital-MSE product on its numerical device lane as for teacher sampling.
+    bool supported_student = real_student != nullptr;
 #ifdef QMC_COMPLEX
     supported_student = supported_student || complex != nullptr;
 #endif
     if (!supported_student)
-      throw UniformCommunicateError("Student-measure orbital_mse requires a supported real CPU or paired provider");
+      throw UniformCommunicateError("Student-measure orbital_mse requires a supported real or paired provider");
     app_log() << "WFTrain orbital_mse sampling=student target=frozen energy_evaluation=off" << std::endl;
   }
 
