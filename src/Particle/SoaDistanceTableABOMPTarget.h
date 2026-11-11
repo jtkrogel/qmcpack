@@ -66,6 +66,11 @@ private:
     {
       auto& dt                         = dt_list.getCastedElement<SoaDistanceTableABOMPTarget>(iw);
       count_targets += dt.num_targets_ = coords_list[iw].size();
+      // Rows borrow their backing pool. Detach before either pool or row-vector
+      // growth: Vector's copy constructor would turn a borrowed row into an
+      // owning copy (and could read a pool already invalidated by resize).
+      dt.distances_.clear();
+      dt.displacements_.clear();
       dt.r_dr_memorypool_.free();
     }
 
@@ -341,6 +346,8 @@ private:
     num_targets_ = num_targets;
 
     // initialize memory containers and views
+    distances_.clear();
+    displacements_.clear();
     const size_t num_padded  = getAlignedSize<T>(num_sources_);
     const size_t stride_size = getPerTargetPctlStrideSize();
     r_dr_memorypool_.resize(stride_size * num_targets_);
