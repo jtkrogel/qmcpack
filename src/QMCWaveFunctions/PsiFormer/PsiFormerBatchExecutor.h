@@ -253,13 +253,20 @@ public:
   void prepareSparseValueContext(std::size_t capacity = 0)
   {
     if (tile_backend_ && sparse_request_)
-    {
-      if (!capacity)
-        capacity = tileCapacity();
-      if (capacity > tileCapacity())
-        throw std::invalid_argument("Sparse VALUE cold capacity exceeds existing tile selection");
-      prepareScratch(DirectBatchMode::VALUE_ONLY, capacity);
-    }
+      prepareNumericalValueContext(capacity);
+  }
+
+  /// Pair geometry also needs a cold VALUE owner when sparse hints are disabled.
+  /// Prepare storage only; no coordinates, sampler decisions or evaluation occur.
+  void prepareNumericalValueContext(std::size_t capacity = 0)
+  {
+    if (!tile_backend_)
+      return;
+    if (!capacity)
+      capacity = tileCapacity();
+    if (capacity > tileCapacity())
+      throw std::invalid_argument("Numerical VALUE cold capacity exceeds existing tile selection");
+    prepareScratch(DirectBatchMode::VALUE_ONLY, capacity);
   }
 
   /** Select a nonzero execution tile capacity and prepare the current request.

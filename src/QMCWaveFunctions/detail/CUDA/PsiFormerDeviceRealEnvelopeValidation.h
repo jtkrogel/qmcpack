@@ -27,6 +27,13 @@ struct RealEnvelopeValidationAccess
       const std::optional<std::string>& previous;
       ~Restore() { if (previous) setenv(key, previous->c_str(), 1); else unsetenv(key); }
     } restore{key, previous};
+    const char* projection_key = "PSIFORMER_GPU_ECP_VALUE_PROJECTED_BACKFLOW";
+    const std::optional<std::string> previous_projection = std::getenv(projection_key)
+        ? std::optional<std::string>(std::getenv(projection_key)) : std::nullopt;
+    Restore projection_restore{projection_key, previous_projection};
+    // This independent bitwise envelope-reuse oracle intentionally keeps its
+    // previous scalar projection; grouped projection has its own validation.
+    setenv(projection_key, "0", 1);
     unsetenv(key);
     if (configuredRealVirtualEnvelopeReuse())
       throw std::runtime_error("REAL envelope default is not OFF");
@@ -186,6 +193,15 @@ struct RealEnvelopeValidationAccess
       const std::optional<std::string>& previous;
       ~Restore() { if (previous) setenv(key, previous->c_str(), 1); else unsetenv(key); }
     } restore{key, previous};
+    unsetenv(key);
+    if (!configuredEcpValueProjectedBackflow())
+      throw std::runtime_error("ECP grouped projection must default ON");
+    setenv(key, "invalid", 1);
+    bool invalid_rejected = false;
+    try { (void)configuredEcpValueProjectedBackflow(); }
+    catch (const std::invalid_argument&) { invalid_rejected = true; }
+    if (!invalid_rejected) throw std::runtime_error("Malformed ECP projection selector accepted");
+    setenv(key, "0", 1);
     std::size_t comparisons = 0;
     double maximum = 0.;
     for (const bool periodic : {false, true})
@@ -224,20 +240,34 @@ struct RealEnvelopeValidationAccess
             throw std::runtime_error("N44 periodic pair owner did not prepare");
           grouped_reference = std::make_unique<PreparedDeviceInference>(image, 3, queue, blas, SpatialJetMode::VALUE_ONLY);
         }
+        unsetenv(key);
+        PreparedDeviceBatchBackend incompatible_default(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE,
+            DeviceExecutionPreparation{}, false);
+        if (!incompatible_default.ecp_projection_requested_ || incompatible_default.ecp_projection_eligible_)
+          throw std::runtime_error("Unsupported automatic ECP projection did not retain baseline");
         setenv(key, "1", 1);
+        bool incompatible_rejected = false;
+        try
+        {
+          PreparedDeviceBatchBackend incompatible_explicit(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE,
+              DeviceExecutionPreparation{}, false);
+        }
+        catch (const std::invalid_argument&) { incompatible_rejected = true; }
+        if (!incompatible_rejected) throw std::runtime_error("Explicit unsupported ECP projection accepted");
+        unsetenv(key);
         PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE,
             DeviceExecutionPreparation{}, true);
         if (!backend.sparseValueHintsRequested())
           throw std::runtime_error("REAL ECP backend did not admit Gamma projection hints");
         setenv(key, "0", 1);
-        const auto compare = [&](std::size_t live, bool translate) {
+        const auto compare = [&](std::size_t live, bool translate, bool automatic = false) {
           std::vector<double> input(positions.begin(), positions.begin() + live * 3 * ne);
           if (translate)
             for (std::size_t d = 0; d < 3; ++d)
               input[d] += environment.lattice_vectors[0][d];
           scalar.evaluate(input);
           const std::size_t refs[]{0, 1, 0}, moved[]{ne, ne, 4};
-          setenv(key, "1", 1);
+          if (automatic) unsetenv(key); else setenv(key, "1", 1);
           candidate.beginSparseEnvelopeTile(&candidate, 1, 2, 0, refs, moved, live);
           if (!candidate.ecp_projected_backflow_active_)
             throw std::runtime_error("REAL ECP projection did not activate");
@@ -287,7 +317,7 @@ struct RealEnvelopeValidationAccess
         };
         compare(3, false); // Cold pointer preparation precedes warm-allocation proof.
         const auto before = deviceMemoryMetrics(candidate.positions_.deviceOrdinal()).snapshot();
-        for (const std::size_t live : {1, 2, 3}) compare(live, periodic);
+        for (const std::size_t live : {1, 2, 3}) compare(live, periodic, true);
         const auto after = deviceMemoryMetrics(candidate.positions_.deviceOrdinal()).snapshot();
         if (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls)
           throw std::runtime_error("Warm REAL ECP projection allocated scratch");
@@ -321,6 +351,7 @@ struct RealEnvelopeValidationAccess
       }
     std::cout << "PASS real_ecp_projection N44 spin26_18 D16_D64 molecule_Gamma liveB3_1_2"
               << " pair_geometry=" << pair_geometry
+              << " automatic_projection=yes unsupported_default_fallback=yes explicit_unsupported_reject=yes"
               << " translated_images rebind request_lifetime physical_failure recovery warm0 comparisons=" << comparisons
               << " max_orbital_error=" << maximum << "\n";
   }

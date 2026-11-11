@@ -469,7 +469,8 @@ private:
     std::unique_ptr<PreparedDeviceInference> spatial;
     if (!lazy_spatial_ || spatial_)
       spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
-          SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_);
+          SpatialJetMode::FULL_VGL, false, false, status_policy, target_preparation_, mixed_parameters_
+              ? OrdinaryTracePreparation::EXCLUDE_FOR_MIXED : OrdinaryTracePreparation::DEFAULT_POLICY);
     std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense;
     if (mixed_parameters_)
     {
