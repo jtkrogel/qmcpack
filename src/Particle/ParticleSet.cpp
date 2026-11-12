@@ -395,8 +395,19 @@ void ParticleSet::mw_update(const RefVectorWithLeader<ParticleSet>& p_list, bool
   }
 
   if (!skipSK && p_leader.structure_factor_)
-    for (int iw = 0; iw < p_list.size(); iw++)
-      p_list[iw].structure_factor_->updateAllPart(p_list[iw]);
+  {
+    // A complete crowd with acquired resources can use the same batched SK
+    // path as move finalization. Calling updateAllPart for each walker here
+    // otherwise executes the host reciprocal sum even for offload positions.
+    if (p_leader.mw_structure_factor_data_handle_)
+    {
+      auto sk_list = extractSKRefList(p_list);
+      StructFact::mw_updateAllPart(sk_list, p_list, p_leader.mw_structure_factor_data_handle_);
+    }
+    else
+      for (int iw = 0; iw < p_list.size(); iw++)
+        p_list[iw].structure_factor_->updateAllPart(p_list[iw]);
+  }
 }
 
 void ParticleSet::makeMove(Index_t iat, const SingleParticlePos& displ, bool maybe_accept)

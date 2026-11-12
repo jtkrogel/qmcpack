@@ -19,6 +19,7 @@
 #include "Configuration.h"
 #include "OhmmsSoA/VectorSoaContainer.h"
 #include "OMPTarget/OffloadAlignedAllocators.hpp"
+#include <cstddef>
 
 namespace qmcplusplus
 {
@@ -57,6 +58,9 @@ public:
 
   int getNumK() const { return numk; }
 
+  /// Invalidate coordinate-dependent consumers even when a rebuilt list has the same size.
+  std::size_t getRevision() const { return revision_; }
+
   /** update k-vectors
    * @param sc supercell
    * @param kc cutoff radius in the K
@@ -70,6 +74,7 @@ public:
                     bool useSphere        = true);
 
 private:
+  std::size_t revision_ = 0;
   ///number of k-points
   int numk;
 

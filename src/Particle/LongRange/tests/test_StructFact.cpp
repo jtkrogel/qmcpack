@@ -69,4 +69,68 @@ TEST_CASE("StructFact", "[lrhandler]")
   }
 }
 
+TEST_CASE("StructFact coordinate reuse invalidates on positions species and reciprocal list", "[lrhandler][ewald]")
+{
+  Lattice lattice;
+  lattice.BoxBConds = true;
+  lattice.R.diagonal(5.0);
+  lattice.LR_dim_cutoff = 6.0;
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  ParticleSet particles(cell);
+  particles.getSpeciesSet().addSpecies("u");
+  particles.getSpeciesSet().addSpecies("d");
+  particles.create({2, 1});
+  particles.R[0] = {0.1, 0.2, 0.3};
+  particles.R[1] = {0.7, 0.5, 0.4};
+  particles.R[2] = {1.2, 0.8, 1.7};
+  KContainer k_list;
+  k_list.updateKLists(lattice, 4.0, 3);
+  StructFact sk(particles.getLRBox(), k_list);
+  const auto check = [&]() {
+    sk.updateAllPart(particles);
+    for (int group = 0; group < particles.groups(); ++group)
+      for (int k = 0; k < k_list.getNumK(); ++k)
+      {
+        double real = 0, imag = 0;
+        for (int i = 0; i < particles.getTotalNum(); ++i)
+          if (particles.getGroupID(i) == group)
+          {
+            const double phase = dot(k_list.getKptsCart()[k], particles.R[i]);
+            real += std::cos(phase);
+            imag += std::sin(phase);
+          }
+        CHECK(sk.rhok_r[group][k] == Approx(real).margin(1e-11));
+        CHECK(sk.rhok_i[group][k] == Approx(imag).margin(1e-11));
+      }
+  };
+  check();
+  check(); // identical-coordinate reuse
+  particles.R[1][0] += 0.25;
+  check();
+  std::swap(particles.GroupID[0], particles.GroupID[2]);
+  check();
+  const int original_nk = k_list.getNumK();
+  Lattice expanded(lattice);
+  expanded.R *= 1.2;
+  expanded.reset();
+  k_list.updateKLists(expanded, 4.0 / 1.2, 3);
+  REQUIRE(k_list.getNumK() == original_nk);
+  check(); // same-size list with different Cartesian vectors
+  KContainer replacement;
+  replacement.updateKLists(lattice, 4.0, 3);
+  k_list = replacement;
+  check(); // assignment from another list must not alias its generation
+  sk.turnOnStorePerParticle(particles);
+  particles.R[0][1] -= 0.1;
+  check();
+  for (int i = 0; i < particles.getTotalNum(); ++i)
+    for (int k = 0; k < k_list.getNumK(); ++k)
+    {
+      const double phase = dot(k_list.getKptsCart()[k], particles.R[i]);
+      CHECK(sk.eikr_r[i][k] == Approx(std::cos(phase)).margin(1e-11));
+      CHECK(sk.eikr_i[i][k] == Approx(std::sin(phase)).margin(1e-11));
+    }
+}
+
 } // namespace qmcplusplus

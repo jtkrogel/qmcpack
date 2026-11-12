@@ -14,6 +14,7 @@
 
 
 #include "KContainer.h"
+#include <atomic>
 #include <map>
 #include <cstdint>
 #include "Message/Communicate.h"
@@ -38,6 +39,10 @@ void KContainerT<REAL>::updateKLists(const Lattice& lattice,
                                      const Position& twist,
                                      bool useSphere)
 {
+  // Unique across containers so copy-assignment cannot alias two different
+  // reciprocal lists with coincidentally equal per-instance generation counts.
+  static std::atomic<std::size_t> next_revision{0};
+  revision_ = ++next_revision;
   kcutoff = kc;
   if (kcutoff <= 0.0)
   {

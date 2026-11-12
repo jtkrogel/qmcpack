@@ -359,6 +359,61 @@ TEST_CASE("ParticleSet batched all-particle move updates and restores structure 
   }
 }
 
+TEST_CASE("ParticleSet crowd update preserves scalar structure factors and skipSK", "[particle][ewald]")
+{
+  Lattice lattice;
+  lattice.BoxBConds = true;
+  lattice.R = ParticleSet::Tensor_t(6.0, 0.2, 0.0, 0.0, 5.0, 0.3, 0.1, 0.0, 7.0);
+  lattice.LR_dim_cutoff = 6.0;
+  lattice.reset();
+  const SimulationCell cell(lattice);
+  for (const auto kind : {DynamicCoordinateKind::DC_POS, DynamicCoordinateKind::DC_POS_OFFLOAD})
+    for (bool per_particle : {false, true})
+    {
+      ParticleSet p0(cell, kind);
+      p0.setName("e");
+      p0.getSpeciesSet().addSpecies("u");
+      p0.getSpeciesSet().addSpecies("d");
+      p0.create({13, 12});
+      for (int i = 0; i < 25; ++i)
+        p0.R[i] = {0.07 * i, 0.03 * i + 0.2, 0.11 * i + 0.1};
+      p0.createSK();
+      p0.update();
+      if (per_particle)
+        p0.turnOnPerParticleSK();
+      ParticleSet p1(p0);
+      RefVectorWithLeader<ParticleSet> p_list(p0, {p0, p1});
+      ResourceCollection resources("crowd_update_sk_resources");
+      p0.createResource(resources);
+      ResourceCollectionTeamLock<ParticleSet> lock(resources, p_list);
+      const auto original = p0.getSK().rhok_r;
+      p0.R[0][0] += 0.17;
+      p1.R[24][1] -= 0.23;
+      ParticleSet::mw_update(p_list, true);
+      for (std::size_t i = 0; i < original.size(); ++i)
+        CHECK(p0.getSK().rhok_r.data()[i] == original.data()[i]);
+      for (int repeat = 0; repeat < 2; ++repeat)
+      {
+        ParticleSet::mw_update(p_list);
+        for (const ParticleSet& p : p_list)
+          for (int group = 0; group < p.groups(); ++group)
+            for (int k = 0; k < p.getSK().getKLists().getNumK(); ++k)
+            {
+              double real = 0, imag = 0;
+              for (int i = 0; i < p.getTotalNum(); ++i)
+                if (p.getGroupID(i) == group)
+                {
+                  const double phase = dot(p.getSK().getKLists().getKptsCart()[k], p.R[i]);
+                  real += std::cos(phase);
+                  imag += std::sin(phase);
+                }
+              CHECK(p.getSK().rhok_r[group][k] == Approx(real).margin(1e-11));
+              CHECK(p.getSK().rhok_i[group][k] == Approx(imag).margin(1e-11));
+            }
+      }
+    }
+}
+
 TEST_CASE("ParticleSet all-particle moves filter boundary-invalid particles independently", "[particle]")
 {
   const SimulationCell cell = makeOpenCell();

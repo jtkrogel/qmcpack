@@ -21,6 +21,7 @@
 #include <NewTimer.h>
 #include <OMPTarget/OffloadAlignedAllocators.hpp>
 #include <type_traits/template_types.hpp>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -91,6 +92,8 @@ public:
 private:
   /// Compute all rhok elements from the start
   void computeRhok(const ParticleSet& P);
+  bool hasCurrentRhok(const ParticleSet& P) const;
+  void rememberRhokCoordinates(const ParticleSet& P);
   /** resize the internal data
    * @param nkpts
    * @param num_species number of species
@@ -105,8 +108,19 @@ private:
    * storing data per particle specie is more cost-effective
    */
   bool StorePerParticle;
+  // Exact coordinate snapshots avoid recomputing unchanged charge densities
+  // during parameter-only refresh and retained-configuration replay.
+  bool rhok_valid_ = false;
+  std::size_t rhok_k_revision_ = 0;
+  std::vector<PosType> rhok_positions_;
+  std::vector<int> rhok_groups_;
   /// timer for updateAllPart
   NewTimer& update_all_timer_;
+  NewTimer& host_compute_timer_;
+  NewTimer& device_update_timer_;
+  NewTimer& host_scatter_timer_;
+  NewTimer& buffer_resize_timer_;
+  NewTimer& cache_hit_timer_;
 };
 
 ///multi walker shared memory buffer

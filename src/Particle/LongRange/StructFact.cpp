@@ -30,7 +30,12 @@ StructFact::StructFact(const ParticleLayout& lattice, const KContainer& k_lists)
     : SuperCellEnum(SUPERCELL_BULK),
       k_lists_(k_lists),
       StorePerParticle(false),
-      update_all_timer_(createGlobalTimer("StructFact::update_all_part", timer_level_fine))
+      update_all_timer_(createGlobalTimer("StructFact::update_all_part", timer_level_fine)),
+      host_compute_timer_(createGlobalTimer("StructFact::host_compute", timer_level_fine)),
+      device_update_timer_(createGlobalTimer("StructFact::device_update_and_copy", timer_level_fine)),
+      host_scatter_timer_(createGlobalTimer("StructFact::host_scatter", timer_level_fine)),
+      buffer_resize_timer_(createGlobalTimer("StructFact::buffer_resize", timer_level_fine)),
+      cache_hit_timer_(createGlobalTimer("StructFact::unchanged_coordinates", timer_level_fine))
 {
   if (LRCoulombSingleton::isQuasi2D())
   {
@@ -57,7 +62,14 @@ void StructFact::resize(int nkpts, int num_species, int num_ptcls)
 void StructFact::updateAllPart(const ParticleSet& P)
 {
   ScopedTimer local(update_all_timer_);
+  if (hasCurrentRhok(P))
+  {
+    ScopedTimer cache_hit(cache_hit_timer_);
+    return;
+  }
+  ScopedTimer host_compute(host_compute_timer_);
   computeRhok(P);
+  rememberRhokCoordinates(P);
 }
 
 void StructFact::mw_updateAllPart(const RefVectorWithLeader<StructFact>& sk_list,
@@ -67,9 +79,24 @@ void StructFact::mw_updateAllPart(const RefVectorWithLeader<StructFact>& sk_list
   auto& sk_leader = sk_list.getLeader();
   auto& p_leader  = p_list.getLeader();
   ScopedTimer local(sk_leader.update_all_timer_);
+  bool all_current = true;
+  for (int iw = 0; iw < sk_list.size(); ++iw)
+    all_current = all_current && sk_list[iw].hasCurrentRhok(p_list[iw]);
+  if (all_current)
+  {
+    ScopedTimer cache_hit(sk_leader.cache_hit_timer_);
+    return;
+  }
   if (p_leader.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS_OFFLOAD || sk_leader.StorePerParticle)
+  {
+    ScopedTimer host_compute(sk_leader.host_compute_timer_);
     for (int iw = 0; iw < sk_list.size(); iw++)
-      sk_list[iw].computeRhok(p_list[iw]);
+      if (!sk_list[iw].hasCurrentRhok(p_list[iw]))
+      {
+        sk_list[iw].computeRhok(p_list[iw]);
+        sk_list[iw].rememberRhokCoordinates(p_list[iw]);
+      }
+  }
   else
   {
     const size_t nw          = p_list.size();
@@ -83,17 +110,24 @@ void StructFact::mw_updateAllPart(const RefVectorWithLeader<StructFact>& sk_list
     const size_t np_padded   = p_leader.getCoordinates().getAllParticlePos().capacity();
 
     constexpr size_t cplx_stride = 2;
-    mw_mem.nw_rhok.resize(nw * num_species * cplx_stride, nk_padded);
+    {
+      ScopedTimer buffer_resize(sk_leader.buffer_resize_timer_);
+      mw_mem.nw_rhok.resize(nw * num_species * cplx_stride, nk_padded);
+    }
 
     // make the compute over nk by blocks
     constexpr size_t kblock_size = 512;
-    const size_t num_kblocks     = (nk + kblock_size) / kblock_size;
+    const size_t num_kblocks     = (nk + kblock_size - 1) / kblock_size;
 
     auto* mw_rsoa_ptr   = mw_rsoa_dev_ptrs.data();
     auto* kpts_cart_ptr = kpts_cart.data();
     auto* mw_rhok_ptr   = mw_mem.nw_rhok.data();
     auto* group_offsets = p_leader.get_group_offsets().data();
 
+    {
+    // This host interval includes the existing synchronous map-from operation.
+    // Device kernel and transfer durations require a vendor trace.
+    ScopedTimer device_update(sk_leader.device_update_timer_);
     PRAGMA_OFFLOAD("omp target teams distribute collapse(2) map(always, from : mw_rhok_ptr[:mw_mem.nw_rhok.size()])")
     for (int iw = 0; iw < nw; iw++)
       for (int ib = 0; ib < num_kblocks; ib++)
@@ -122,16 +156,50 @@ void StructFact::mw_updateAllPart(const RefVectorWithLeader<StructFact>& sk_list
             mw_rhok_ptr[(iw * num_species + is) * cplx_stride * nk_padded + nk_padded + offset + ik] = rhok_i;
           }
       }
+    }
 
+    ScopedTimer host_scatter(sk_leader.host_scatter_timer_);
     for (int iw = 0; iw < nw; iw++)
       for (int is = 0; is < num_species; is++)
       {
         std::copy_n(mw_mem.nw_rhok[(iw * num_species + is) * cplx_stride], nk, sk_list[iw].rhok_r[is]);
         std::copy_n(mw_mem.nw_rhok[(iw * num_species + is) * cplx_stride + 1], nk, sk_list[iw].rhok_i[is]);
       }
+    for (int iw = 0; iw < nw; ++iw)
+      sk_list[iw].rememberRhokCoordinates(p_list[iw]);
   }
 }
 
+bool StructFact::hasCurrentRhok(const ParticleSet& P) const
+{
+  if (StorePerParticle || !rhok_valid_ || rhok_k_revision_ != k_lists_.getRevision() ||
+      rhok_positions_.size() != P.R.size() || rhok_groups_.size() != P.R.size() ||
+      rhok_r.rows() != P.groups() || rhok_i.rows() != P.groups() ||
+      rhok_r.cols() != k_lists_.getNumK() || rhok_i.cols() != k_lists_.getNumK())
+    return false;
+  for (std::size_t i = 0; i < P.R.size(); ++i)
+  {
+    if (rhok_groups_[i] != P.getGroupID(i))
+      return false;
+    for (int d = 0; d < DIM; ++d)
+      if (rhok_positions_[i][d] != P.R[i][d])
+        return false;
+  }
+  return true;
+}
+
+void StructFact::rememberRhokCoordinates(const ParticleSet& P)
+{
+  rhok_valid_ = false;
+  if (StorePerParticle)
+    return;
+  rhok_positions_.assign(P.R.begin(), P.R.end());
+  rhok_groups_.resize(P.R.size());
+  for (std::size_t i = 0; i < P.R.size(); ++i)
+    rhok_groups_[i] = P.getGroupID(i);
+  rhok_k_revision_ = k_lists_.getRevision();
+  rhok_valid_ = true;
+}
 
 /** evaluate rok per species, eikr  per particle
  */
@@ -209,6 +277,7 @@ void StructFact::turnOnStorePerParticle(const ParticleSet& P)
   if (!StorePerParticle)
   {
     StorePerParticle = true;
+    rhok_valid_ = false;
     computeRhok(P);
   }
 }
