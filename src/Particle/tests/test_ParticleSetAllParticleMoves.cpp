@@ -366,7 +366,7 @@ TEST_CASE("ParticleSet crowd update preserves scalar structure factors and skipS
   lattice.R = ParticleSet::Tensor_t(6.0, 0.2, 0.0, 0.0, 5.0, 0.3, 0.1, 0.0, 7.0);
   lattice.LR_dim_cutoff = 6.0;
   lattice.reset();
-  const SimulationCell cell(lattice);
+  SimulationCell cell(lattice);
   for (const auto kind : {DynamicCoordinateKind::DC_POS, DynamicCoordinateKind::DC_POS_OFFLOAD})
     for (bool per_particle : {false, true})
     {
@@ -378,7 +378,6 @@ TEST_CASE("ParticleSet crowd update preserves scalar structure factors and skipS
       for (int i = 0; i < 25; ++i)
         p0.R[i] = {0.07 * i, 0.03 * i + 0.2, 0.11 * i + 0.1};
       p0.createSK();
-      p0.update();
       if (per_particle)
         p0.turnOnPerParticleSK();
       ParticleSet p1(p0);
@@ -387,13 +386,22 @@ TEST_CASE("ParticleSet crowd update preserves scalar structure factors and skipS
       p0.createResource(resources);
       ResourceCollectionTeamLock<ParticleSet> lock(resources, p_list);
       const auto original = p0.getSK().rhok_r;
+      REQUIRE((per_particle || original.size() == 0));
       p0.R[0][0] += 0.17;
       p1.R[24][1] -= 0.23;
       ParticleSet::mw_update(p_list, true);
+      REQUIRE(p0.getSK().rhok_r.size() == original.size());
       for (std::size_t i = 0; i < original.size(); ++i)
         CHECK(p0.getSK().rhok_r.data()[i] == original.data()[i]);
-      for (int repeat = 0; repeat < 2; ++repeat)
+      for (int repeat = 0; repeat < 3; ++repeat)
       {
+        if (repeat == 2)
+        {
+          const int previous_nk = cell.getKLists().getNumK();
+          cell.getLattice().LR_dim_cutoff += 1.0;
+          cell.resetLRBox();
+          REQUIRE(cell.getKLists().getNumK() != previous_nk);
+        }
         ParticleSet::mw_update(p_list);
         for (const ParticleSet& p : p_list)
           for (int group = 0; group < p.groups(); ++group)

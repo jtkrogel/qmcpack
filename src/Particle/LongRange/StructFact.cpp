@@ -112,6 +112,11 @@ void StructFact::mw_updateAllPart(const RefVectorWithLeader<StructFact>& sk_list
     constexpr size_t cplx_stride = 2;
     {
       ScopedTimer buffer_resize(sk_leader.buffer_resize_timer_);
+      // Unlike computeRhok, the target loop does not initialize the per-walker
+      // outputs. mw_update may be their first update after createSK, and the
+      // reciprocal list can also have changed size since the previous call.
+      for (int iw = 0; iw < nw; ++iw)
+        sk_list[iw].resize(nk, num_species, p_list[iw].getTotalNum());
       mw_mem.nw_rhok.resize(nw * num_species * cplx_stride, nk_padded);
     }
 
