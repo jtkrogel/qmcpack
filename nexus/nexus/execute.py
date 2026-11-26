@@ -14,11 +14,12 @@
 #                                                                    #
 #====================================================================#
 
-
 from __future__ import annotations
 
-from subprocess import Popen, PIPE
+from subprocess import PIPE, Popen
+
 from .utilities import to_str
+
 
 def execute(
     command : str,

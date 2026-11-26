@@ -107,11 +107,16 @@
 from __future__ import annotations
 
 import os
-from .fileio import TextFile
-from .simulation import Simulation,SimulationInput,SimulationAnalyzer,NullSimulationAnalyzer
-from .developer import DevBase, obj, FileFormatError, NexusError
-
 from pathlib import Path
+
+from .developer import DevBase, FileFormatError, NexusError, obj
+from .fileio import TextFile
+from .simulation import (
+    NullSimulationAnalyzer,
+    Simulation,
+    SimulationAnalyzer,
+    SimulationInput,
+)
 
 type AnalyzerArg = str | Path | Simulation | None
 

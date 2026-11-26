@@ -12,9 +12,8 @@ if(QMC_COMPLEX)
   list(APPEND diamondC_2x1x1-Gaussian_pp_cplx_MSD_LONG_SCALARS "nonlocalecp" "2.123309301169 0.027315413153")
   list(APPEND diamondC_2x1x1-Gaussian_pp_cplx_MSD_LONG_SCALARS "ionion" "-25.55132719 0.000002")
   qmc_run_and_check(
-    long-diamondC_2x1x1-Gaussian_pp_cplx_MSD
+    long-diamondC_2x1x1_pp-msd_lcao_jas_cplx-vmc
     "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_2x1x1-Gaussian_pp_cplx_MSD"
-    vmc_long
     vmc_long.in.xml
     1
     16
@@ -35,9 +34,8 @@ if(QMC_COMPLEX)
   list(APPEND diamondC_2x1x1-Gaussian_pp_cplx_MSD_SHORT_SCALARS "nonlocalecp" "2.123309301169 0.064408195985")
   list(APPEND diamondC_2x1x1-Gaussian_pp_cplx_MSD_SHORT_SCALARS "ionion" "-25.55132719 0.000002")
   qmc_run_and_check(
-    short-diamondC_2x1x1-Gaussian_pp_cplx_MSD
+    short-diamondC_2x1x1_pp-msd_lcao_jas_cplx-vmc
     "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_2x1x1-Gaussian_pp_cplx_MSD"
-    vmc_short
     vmc_short.in.xml
     1
     16

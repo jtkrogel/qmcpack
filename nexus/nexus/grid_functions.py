@@ -81,14 +81,14 @@ Module contents
 """
 from __future__ import annotations
 
-
 import os
 from copy import deepcopy
-from .developer import DevBase, obj, error
-from .fileio import StandardFile,XsfFile
-from . import numpy_extensions as npe
 
 import numpy as np
+
+from . import numpy_extensions as npe
+from .developer import DevBase, error, obj
+from .fileio import StandardFile, XsfFile
 
 type ShapeT        = (
     np.ndarray

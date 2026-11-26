@@ -32,9 +32,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import os
-from .developer import obj
-from .simulation import Simulation,SimulationInput,SimulationAnalyzer
 
+from .developer import obj
+from .simulation import Simulation, SimulationAnalyzer, SimulationInput
 
 # PLEASE READ THIS
 #

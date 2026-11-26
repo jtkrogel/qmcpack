@@ -110,7 +110,7 @@ documentation.
 newer versions are faster; see :ref:`buildperformance` for performance suggestions. Versions of compilers over two years old are
 unsupported and untested by the developers although they may still work.
 
--  C/C++ compilers such as GNU, Clang, Intel, and IBM XL. C++ compilers
+-  C/C++ compilers such as GNU, Clang, and Intel. C++ compilers
    are required to support the C++ 17 standard. Use of recent (“current
    year version”) compilers is strongly encouraged.
 
@@ -203,11 +203,8 @@ Intel compiler
 The Intel compiler version must be 19 or newer due to use of C++17 and bugs and limitations in earlier versions.
 
 If a newer GCC is needed, the ``-cxxlib`` option can be used to point to a different
-GCC installation. (Alternately, the ``-gcc-name`` or ``-gxx-name`` options can be used.) Be sure to
-pass this flag to the C compiler in addition to the C++ compiler. This
-is necessary because CMake extracts some library paths from the C
-compiler, and those paths usually also contain to the C++ library. The
-symptom of this problem is C++ 17 standard library functions not found
+GCC installation. (Alternately, the ``-gcc-name`` or ``-gxx-name`` options can be used.) Pass this flag to the C++ compiler. This
+is necessary if the C++ 17 standard library functions are not found
 at link time.
 
 .. _cmake:
@@ -218,7 +215,7 @@ Building with CMake
 The build system for QMCPACK is based on CMake. It will autoconfigure
 based on the detected compilers and libraries. The most recent version
 of CMake has the best detection for the greatest variety of systems. The
-minimum required version of CMake is 3.21.0. Most
+minimum required version of CMake is 3.28.0. Most
 computer installations have a sufficiently recent CMake, though it might
 not be the default.
 
@@ -230,8 +227,8 @@ executable can be run directly from that location.
 
 Previously, QMCPACK made extensive use of toolchains, but the build
 system has since been updated to eliminate the use of toolchain files
-for most cases. The build system is verified to work with GNU, Intel,
-and IBM XLC compilers. Specific compile options can be specified either
+for most cases. The build system is verified to work with GNU, Clang,
+and Intel compilers. Specific compile options can be specified either
 through specific environment or CMake variables. When the libraries are
 installed in standard locations (e.g., /usr, /usr/local), there is no
 need to set environment or CMake variables for the packages.
@@ -251,17 +248,17 @@ Move to the build directory, run CMake, and make
 ::
 
   cd build
-  cmake -DCMAKE_C_COMPILER=mpiicc -DCMAKE_CXX_COMPILER=mpiicpc ..
+  cmake -DCMAKE_CXX_COMPILER=mpiicpc ..
   make -j 8
 
 You can increase the "8" to the number of cores on your system for
-faster builds. Substitute mpicc and mpicxx or other wrapped compiler names to suit
+faster builds. Substitute mpicxx or other wrapped compiler names to suit
 your system. For example, with OpenMPI use
 
 ::
 
   cd build
-  cmake -DCMAKE_C_COMPILER=mpicc -DCMAKE_CXX_COMPILER=mpicxx ..
+  cmake -DCMAKE_CXX_COMPILER=mpicxx ..
   make -j 8
 
 If you are feeling particularly lucky, you can skip the compiler specification:
@@ -291,7 +288,6 @@ which in turn set environment variables. The list of supported environment varia
 ::
 
   CXX                  C++ compiler
-  CC                   C Compiler
   VendorPerfLibs_ROOT  Path for vendor optimized libraries
   HDF5_ROOT            Path for HDF5
   BOOST_ROOT           Path for Boost
@@ -339,17 +335,12 @@ the path to the source directory.
     CMAKE_BUILD_TYPE     A variable which controls the type of build
                          (defaults to Release). Possible values are:
                          None (Do not set debug/optimize flags, use
-                         CMAKE_C_FLAGS or CMAKE_CXX_FLAGS)
+                         CMAKE_CXX_FLAGS)
                          Debug (create a debug build)
                          Release (create a release/optimized build)
                          RelWithDebInfo (create a release/optimized build with debug info)
                          MinSizeRel (create an executable optimized for size)
-    CMAKE_C_COMPILER     Set the C compiler
     CMAKE_CXX_COMPILER   Set the C++ compiler
-    CMAKE_C_FLAGS        Set the C flags.  Note: to prevent default
-                         debug/release flags from being used, set the CMAKE_BUILD_TYPE=None
-                         Also supported: CMAKE_C_FLAGS_DEBUG,
-                         CMAKE_C_FLAGS_RELEASE, and CMAKE_C_FLAGS_RELWITHDEBINFO
     CMAKE_CXX_FLAGS      Set the C++ flags.  Note: to prevent default
                          debug/release flags from being used, set the CMAKE_BUILD_TYPE=None
                          Also supported: CMAKE_CXX_FLAGS_DEBUG,
@@ -406,13 +397,6 @@ the path to the source directory.
     VendorPerfLibs_ROOT  Search path for the root directory of vendor performance libraries.
     BLA_VENDOR           For selecting specified or any BLAS/LAPACK libraries when VPL_ID is "Generic".
                          See full list at https://cmake.org/cmake/help/latest/module/FindLAPACK.html
-
-- Scalar and vector math functions
-
-  ::
-
-    QMC_MATH_VENDOR     Select a vendor optimized library for scalar and vector math functions.
-                        Providers are GENERIC INTEL_VML IBM_MASS AMD_LIBM
 
 - libxml2 related
 
@@ -546,7 +530,6 @@ Example configure and build
   ::
 
     export CXX=icpc
-    export CC=icc
     export VendorPerfLibs_ROOT=/usr/local/intel/mkl/10.0.3.020
     export HDF5_ROOT=/usr/local
     export BOOST_ROOT=/usr/local/boost
@@ -578,13 +561,12 @@ config directory. For example, on Cray systems these scripts might
 load the appropriate modules to set the appropriate programming
 environment, specific library versions, etc.
 
-An example script build.sh is given below. It is much more complex
+An example helper script is given below. It is much more complex
 than usually needed for comprehensiveness:
 
 ::
 
   export CXX=mpic++
-  export CC=mpicc
   export HDF5_ROOT=/opt/hdf5
   export BOOST_ROOT=/opt/boost
 
@@ -619,7 +601,7 @@ To use Intel MKL with, e.g. an MPICH wrapped gcc:
 ::
 
   cmake \
-    -DCMAKE_C_COMPILER=mpicc -DCMAKE_CXX_COMPILER=mpicxx \
+    -DCMAKE_CXX_COMPILER=mpicxx \
     -DVendorPerfLibs_ROOT=YOUR_INTEL_MKL_ROOT_DIRECTORY \
     ..
 
@@ -700,7 +682,7 @@ convenience we use a generic BLAS. A vendor-optimized BLAS is usually faster.
   # For qmca and other python-based analysis tools tools:
   sudo apt-get install python3-numpy python3-scipy python3-h5py python3-matplotlib
   cd build
-  cmake -DCMAKE_C_COMPILER=mpicc -DCMAKE_CXX_COMPILER=mpiCC ..
+  cmake -DCMAKE_CXX_COMPILER=mpiCC ..
   make -j 8 # Adjust to available core count
   ls -l bin/qmcpack
 
@@ -742,7 +724,7 @@ To build QMCPACK:
   module load mpi/openmpi-x86_64
   which mpirun # Sanity check; should print something like /usr/lib64/openmpi/bin/mpirun
   cd build
-  cmake -DCMAKE_C_COMPILER=mpicc -DCMAKE_CXX_COMPILER=mpiCC ..
+  cmake -DCMAKE_CXX_COMPILER=mpiCC ..
   make -j 8 # Adjust to available core count
   ls -l bin/qmcpack
 
@@ -804,7 +786,7 @@ QMCPACK build:
 ::
 
   cd build
-  cmake -DCMAKE_C_COMPILER=mpicc -DCMAKE_CXX_COMPILER=mpiCXX \
+  cmake -DCMAKE_CXX_COMPILER=mpiCXX \
         -DPython3_EXECUTABLE=/opt/local/bin/python ..
   make -j 8 # Adjust for available core count
   ls -l bin/qmcpack
@@ -850,15 +832,13 @@ package. This was successfully tested under OS X 10.15.7 "Catalina" on October 2
     brew install fftw
     brew install boost
     brew install hdf5
-    export OMPI_CC=gcc-10
     export OMPI_CXX=g++-10
 
 3.  Configure and build QMCPACK:
 
   ::
 
-    cmake -DCMAKE_C_COMPILER=/usr/local/bin/mpicc \
-          -DCMAKE_CXX_COMPILER=/usr/local/bin/mpicxx ..
+    cmake -DCMAKE_CXX_COMPILER=/usr/local/bin/mpicxx ..
     make -j 6 # Adjust for available core count
     ls -l bin/qmcpack
 
@@ -978,7 +958,7 @@ Then using the following command:
 
   mkdir build_armclang
   cd build_armclang
-  cmake -DCMAKE_C_COMPILER=armclang -DCMAKE_CXX_COMPILER=armclang++ -DQMC_MPI=0 \
+  cmake -DCMAKE_CXX_COMPILER=armclang++ -DQMC_MPI=0 \
       -DLAPACK_LIBRARIES="-L$ARMPL_DIR/lib -larmpl_mp" \
       -DFFTW_INCLUDE_DIR="$ARMPL_DIR/include" \
       -DFFTW_LIBRARIES="$ARMPL_DIR/lib/libarmpl_mp.a" \
@@ -989,7 +969,7 @@ Note that armclang is recognized as an 'unknown' compiler by CMake v3.13* and be
 
 ::
 
-  -DCMAKE_C_COMPILER_ID=Clang -DCMAKE_CXX_COMPILER_ID=Clang \
+  -DCMAKE_CXX_COMPILER_ID=Clang \
   -DCMAKE_CXX_COMPILER_VERSION=5.0 -DCMAKE_CXX_STANDARD_COMPUTED_DEFAULT=98 \
 
 Installing on Windows
@@ -1860,7 +1840,7 @@ Some tips to help troubleshoot installations of QMCPACK:
 
   ::
 
-      cmake -DCMAKE_C_COMPILER=/full/path/to/mpicc -DCMAKE_CXX_COMPILER=/full/path/to/mpicxx ..
+      cmake -DCMAKE_CXX_COMPILER=/full/path/to/mpicxx ..
 
 - To monitor the compiler and linker settings, use a verbose build, ``make
   VERBOSE=1``. If an individual source file fails to compile you

@@ -25,6 +25,7 @@
 #include "OhmmsData/AttributeSet.h"
 #include "OhmmsData/ParameterSet.h"
 #include "QMCWaveFunctions/SPOSet.h"
+#include "QMCWaveFunctions/Fermion/DiracDeterminantBase.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/OrbitalSetTraits.h"
 #include "Numerics/DeterminantOperators.h"
@@ -40,7 +41,7 @@ WaveFunctionTester::WaveFunctionTester(const ProjectData& project_data,
                                        TrialWaveFunction& psi,
                                        QMCHamiltonian& h,
                                        ParticleSetPool& ptclPool,
-                                       Communicate* comm)
+                                       Communicate& comm)
     : QMCDriver(project_data, w, psi, h, comm, "WaveFunctionTester"),
       PtclPool(ptclPool),
       checkRatio("no"),

@@ -20,13 +20,14 @@
 
 from __future__ import annotations
 
-import numpy as np
 import keyword
 from inspect import getmembers
+from pathlib import Path
+
+import numpy as np
+
 from .developer import DevBase, obj
 from .utilities import path_string, valid_variable_name
-
-from pathlib import Path
 
 
 class HDFglobals(DevBase):

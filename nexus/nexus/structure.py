@@ -117,24 +117,26 @@ Module contents
 """
 
 from __future__ import annotations
-import os
-from pathlib import Path
-from types import MappingProxyType
-from typing import TypeAlias
-import numpy as np
-from copy import deepcopy
-from random import randint
+
 import itertools
-from numpy import cos, cross, dot, pi, sin, sqrt
-from numpy.linalg import inv, det, norm
+import os
+from copy import deepcopy
+from pathlib import Path
+from random import randint
+from types import MappingProxyType
+
+import numpy as np
 import numpy.typing as npt
-from .unit_converter import convert
-from .numerics import nearest_neighbors, convex_hull, voronoi_neighbors
-from .periodic_table import Elements
-from .fileio import XsfFile, PoscarFile
-from .developer import DevBase, obj, FileFormatError, NotAnElementError
-from .utilities import path_string
+from numpy import cos, cross, dot, pi, sin, sqrt
+from numpy.linalg import det, inv, norm
+
 from . import numpy_extensions as npe
+from .developer import DevBase, FileFormatError, NotAnElementError, obj
+from .fileio import PoscarFile, XsfFile
+from .numerics import convex_hull, nearest_neighbors, voronoi_neighbors
+from .periodic_table import Elements
+from .unit_converter import convert
+from .utilities import path_string
 
 type ShiftT        = (
     np.ndarray
@@ -210,18 +212,16 @@ type ConsistentRet = bool | tuple[bool | int | str, bool | int | str | Elements]
 type SpeciesRet    = set | tuple[bool | set[str], Elements | set[str]]
 type NeighborsRet  = obj | list | tuple[obj | list, list]
 
-
-
-IdType: TypeAlias = "Structure | npt.NDArray[np.bool_] | int | str | Elements | list[str | Elements | int | float]"
+type IdType = "Structure | npt.NDArray[np.bool_] | int | str | Elements | list[str | Elements | int | float]"
 """Alias for identifiers that can be used to locate specific atoms in a Structure."""
 
-PosType: TypeAlias = list[int] | npt.NDArray[np.floating]
+type PosType = list[int] | npt.NDArray[np.floating]
 """Alias for types that can be used as positions in a ``locate`` call."""
 
-RType: TypeAlias = int | float | list[int | float]
+type RType = int | float | list[int | float]
 """Alias for types that can be accepted as a radius or list of radii."""
 
-ElementOrList: TypeAlias = str | int | Elements | list[str | Elements | int]
+type ElementOrList = str | int | Elements | list[str | Elements | int]
 """Alias for types that can be coerced into an element, or a list of those types."""
 
 

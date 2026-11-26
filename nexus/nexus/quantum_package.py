@@ -21,13 +21,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from .developer import obj, NexusError
+
+from .developer import NexusError, obj
 from .execute import execute
-from .nexus_base import nexus_config
-from .simulation import Simulation
-from .quantum_package_input import QuantumPackageInput, generate_quantum_package_input, read_qp_value
-from .quantum_package_analyzer import QuantumPackageAnalyzer
 from .gamess import Gamess
+from .nexus_base import nexus_config
+from .quantum_package_analyzer import QuantumPackageAnalyzer
+from .quantum_package_input import (
+    QuantumPackageInput,
+    generate_quantum_package_input,
+    read_qp_value,
+)
+from .simulation import Simulation
 
 
 class QuantumPackage(Simulation):

@@ -23,8 +23,10 @@
 from __future__ import annotations
 
 import numpy as np
-from .developer import DevBase, obj
+
 from . import numpy_extensions as npe
+from .developer import DevBase, obj
+
 
 class QEXML(DevBase):
     def __init__(self) -> None:

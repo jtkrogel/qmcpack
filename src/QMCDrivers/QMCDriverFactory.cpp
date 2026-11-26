@@ -50,6 +50,39 @@
 
 namespace qmcplusplus
 {
+namespace
+{
+// These checks are temporarily centralized here; input-only move/method
+// validity belongs in src/QMCDrivers/QMCDriverInput.cpp and VMC option validity
+// in src/QMCDrivers/VMC/VMCDriverInput.cpp once those classes are modernized.
+// Factory validation runs in stages because the selected method, both parsed
+// input objects, and particle-system state are resolved at different points
+// before driver construction. Spinor compatibility depends on runtime state.
+void validateBatchedMoveMode(QMCRunType run_type, const std::string& update_mode)
+{
+  const bool batched_run = run_type == QMCRunType::VMC_BATCH || run_type == QMCRunType::DMC_BATCH ||
+      run_type == QMCRunType::LINEAR_OPTIMIZE_BATCH;
+  if (!batched_run)
+    return; // Preserve legacy VMC/DMC aliases and move behavior.
+  if (update_mode != "pbyp" && update_mode != "allp")
+    throw UniformCommunicateError("Unknown move mode. Valid modes are: pbyp, allp.");
+  if (update_mode == "allp" && run_type != QMCRunType::VMC_BATCH)
+    throw UniformCommunicateError("All-particle moves are supported only by batched VMC.");
+}
+
+void validateBatchedVMCOptions(const QMCDriverInput& qmc_input, const VMCDriverInput& vmc_input, bool is_spinor)
+{
+  if (qmc_input.get_update_mode() != "allp")
+    return;
+  if (vmc_input.get_use_drift())
+    throw UniformCommunicateError("VMCBatched all-particle moves do not support drift.");
+  if (qmc_input.areWalkersSerialized())
+    throw UniformCommunicateError("VMCBatched all-particle moves do not support serialized crowd walkers.");
+  if (is_spinor)
+    throw UniformCommunicateError("VMCBatched all-particle moves support position coordinates only.");
+}
+} // namespace
+
 QMCDriverFactory::QMCDriverFactory(const ProjectData& project_data) : project_data_(project_data) {}
 
 /** Read the xml defining the driver for this QMC section
@@ -78,9 +111,9 @@ QMCDriverFactory::DriverAssemblyState QMCDriverFactory::readSection(xmlNodePtr c
   aAttrib.add(das.traces_tag, "trace");
   aAttrib.add(das.walkerlogs_tag, "walkerlog");
   aAttrib.put(cur);
-  das.append_run                 = (append_tag == "yes");
-  das.enable_profiling           = (profiling_tag == "yes");
-  das.what_to_do[UPDATE_MODE]    = (update_mode == "pbyp");
+  das.append_run       = (append_tag == "yes");
+  das.enable_profiling = (profiling_tag == "yes");
+  das.what_to_do[UPDATE_MODE] = (update_mode == "pbyp");
   infoSummary.flush();
   infoLog.flush();
 
@@ -127,6 +160,7 @@ QMCDriverFactory::DriverAssemblyState QMCDriverFactory::readSection(xmlNodePtr c
     else
       throw std::runtime_error("qmc method cannot be empty!");
   }
+  validateBatchedMoveMode(das.new_run_type, update_mode);
   return das;
 }
 
@@ -137,7 +171,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
                                                                       ParticleSetPool& particle_pool,
                                                                       WaveFunctionPool& wavefunction_pool,
                                                                       HamiltonianPool& hamiltonian_pool,
-                                                                      Communicate* comm) const
+                                                                      Communicate& comm) const
 {
   std::unique_ptr<QMCDriverInterface> new_driver;
 
@@ -211,9 +245,6 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     }
     else if (das.new_run_type == QMCRunType::VMC_BATCH)
     {
-      if (!das.what_to_do[UPDATE_MODE])
-        throw UniformCommunicateError("Batched driver only supports particle-by-particle moves.");
-
       app_summary() << "\n========================================"
                        "\n  Reading VMC driver XML input section"
                        "\n========================================"
@@ -225,6 +256,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       {
         qmcdriver_input.readXML(cur);
         vmcdriver_input.readXML(cur);
+        validateBatchedVMCOptions(qmcdriver_input, vmcdriver_input, qmc_system.isSpinor());
       }
       catch (const std::exception& e)
       {
@@ -238,10 +270,10 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
           std::make_unique<VMCBatched>(project_data_, std::move(qmcdriver_input),
                                        makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input()),
                                        std::move(vmcdriver_input), qmc_system,
-                                       MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
+                                       MCPopulation(comm.size(), comm.rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm);
 
-      new_driver->setUpdateMode(1);
+      new_driver->setUpdateMode(das.what_to_do[UPDATE_MODE]);
     }
     else if (das.new_run_type == QMCRunType::DMC)
     {
@@ -267,11 +299,19 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
         throw UniformCommunicateError(e.what());
       }
 
+      if (dmcdriver_input.get_l2_diffusion())
+      {
+        if (qmc_system.isSpinor())
+          throw UniformCommunicateError("L2 diffusion is not supported for spinor particle sets.");
+        if (!primaryH.has_L2())
+          throw UniformCommunicateError("L2 diffusion was requested, but the Hamiltonian has no L2 potential.");
+      }
+
       new_driver =
           std::make_unique<DMCBatched>(project_data_, std::move(qmcdriver_input),
                                        makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input()),
                                        std::move(dmcdriver_input), qmc_system,
-                                       MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
+                                       MCPopulation(comm.size(), comm.rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), comm);
     }
     else if (das.new_run_type == QMCRunType::RMC)
@@ -322,7 +362,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 
       auto opt = std::make_unique<QMCFixedSampleLinearOptimizeBatched>(project_data_, std::move(qmcdriver_input),
                                                                        std::move(vmcdriver_input), qmc_system,
-                                                                       MCPopulation(comm->size(), comm->rank(),
+                                                                       MCPopulation(comm.size(), comm.rank(),
                                                                                     qmc_system, primaryPsi, primaryH),
                                                                        RandomNumberControl::getChildrenRefs(),
                                                                        qmc_system.getSampleStack(), comm);

@@ -9,9 +9,8 @@ list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_LONG_SCALARS "localecp" "-7.13621881 
 list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_LONG_SCALARS "nonlocalecp" "0.82585828 0.015849296")
 list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_LONG_SCALARS "ionion" "-12.77566743 0.000001")
 qmc_run_and_check(
-  long-diamondC_1x1x1-Gaussian_pp_MSD
+  long-diamondC_1x1x1_pp-msd_lcao_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_1x1x1-Gaussian_pp_MSD"
-  vmc_long
   vmc_long.in.xml
   1
   16
@@ -31,9 +30,8 @@ list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_SHORT_SCALARS "localecp" "-7.13621881
 list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_SHORT_SCALARS "nonlocalecp" "0.82585828 0.05008377536")
 list(APPEND diamondC_1x1x1-Gaussian_pp_MSD_SHORT_SCALARS "ionion" "-12.77566743 0.000001")
 qmc_run_and_check(
-  short-diamondC_1x1x1-Gaussian_pp_MSD
+  short-diamondC_1x1x1_pp-msd_lcao_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_1x1x1-Gaussian_pp_MSD"
-  vmc_short
   vmc_short.in.xml
   1
   16
@@ -102,9 +100,8 @@ else()
 endif()
 
 qmc_run_and_check(
-  deterministic-diamondC_1x1x1-Gaussian_pp_MSD
+  deterministic-diamondC_1x1x1_pp-msd_lcao_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_1x1x1-Gaussian_pp_MSD"
-  det_vmc_dmc
   det_vmc_dmc.in.xml
   1
   1
@@ -165,9 +162,8 @@ endif()
 list(APPEND det_diamondC_1x1x1-Gaussian_pp_MSD_BATCHED_DMC_SCALARS "ionion" "-12.77566746 0.000001")
 
 qmc_run_and_check(
-  deterministic-diamondC_1x1x1-Gaussian_pp_MSD-batched
+  deterministic-diamondC_1x1x1_pp-msd_lcao_jas-vmcbatch
   "${qmcpack_SOURCE_DIR}/tests/solids/diamondC_1x1x1-Gaussian_pp_MSD"
-  det_vmc_dmc_batched
   det_vmc_dmc_batched.in.xml
   1
   1

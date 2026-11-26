@@ -17,6 +17,7 @@
 #include <sstream>
 #include "Utilities/RandomGenerator.h"
 #include "Message/Communicate.h"
+#include "Message/UniformCommunicateError.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/QMCDriverFactory.h"
 #include "QMCDrivers/QMCDriverInterface.h"
@@ -39,7 +40,7 @@ namespace testing
 class QMCDriverPools
 {
 public:
-  QMCDriverPools(const RuntimeOptions& runtime_options, Communicate* comm)
+  QMCDriverPools(const RuntimeOptions& runtime_options, Communicate& comm)
       : particle(MinimalParticlePool::make_diamondC_1x1x1(comm)),
         wavefunction(MinimalWaveFunctionPool::make_diamondC_1x1x1(runtime_options, comm, particle)),
         hamiltonian(MinimalHamiltonianPool::make_hamWithEE(comm, particle, wavefunction))
@@ -50,7 +51,7 @@ public:
 };
 
 auto createDriver(const RuntimeOptions& runtime_options,
-                  Communicate* comm,
+                  Communicate& comm,
                   QMCDriverFactory& driver_factory,
                   xmlNodePtr node,
                   QMCDriverFactory::DriverAssemblyState& das)
@@ -67,11 +68,10 @@ auto createDriver(const RuntimeOptions& runtime_options,
 TEST_CASE("QMCDriverFactory create VMC Driver", "[qmcapp]")
 {
   using namespace testing;
-  Communicate* comm;
-  comm = OHMMS::Controller;
+  Communicate& comm(*OHMMS::Controller);
 
   using DV = ProjectData::DriverVersion;
-  ProjectData test_project("testing", DV::LEGACY);
+  ProjectData test_project(DV::LEGACY);
   QMCDriverFactory driver_factory(test_project);
 
   Libxml2Document doc;
@@ -90,13 +90,12 @@ TEST_CASE("QMCDriverFactory create VMC Driver", "[qmcapp]")
 
 TEST_CASE("QMCDriverFactory create VMCBatched driver", "[qmcapp]")
 {
-  Communicate* comm;
-  comm = OHMMS::Controller;
+  Communicate& comm(*OHMMS::Controller);
   using namespace testing;
 
   SECTION("driver version behavior")
   {
-    ProjectData test_project("test", ProjectData::DriverVersion::BATCH);
+    ProjectData test_project;
     QMCDriverFactory driver_factory(test_project);
 
     Libxml2Document doc;
@@ -132,14 +131,92 @@ TEST_CASE("QMCDriverFactory create VMCBatched driver", "[qmcapp]")
   }
 }
 
+TEST_CASE("QMCDriverFactory all-particle method support", "[qmcapp]")
+{
+  ProjectData project;
+  QMCDriverFactory factory(project);
+  Libxml2Document doc;
+
+  SECTION("batched DMC rejects all-particle moves")
+  {
+    REQUIRE(doc.parseFromString("<qmc method=\"dmc\" move=\"allp\"/>"));
+    REQUIRE_THROWS(factory.readSection(doc.getRoot()));
+  }
+  SECTION("batched optimization rejects all-particle moves")
+  {
+    REQUIRE(doc.parseFromString("<qmc method=\"linear\" move=\"allp\"/>"));
+    REQUIRE_THROWS(factory.readSection(doc.getRoot()));
+  }
+  SECTION("legacy DMC retains all-particle support")
+  {
+    ProjectData legacy_project(ProjectData::DriverVersion::LEGACY);
+    QMCDriverFactory legacy_factory(legacy_project);
+    REQUIRE(doc.parseFromString("<qmc method=\"dmc\" move=\"allp\"/>"));
+    REQUIRE_NOTHROW(legacy_factory.readSection(doc.getRoot()));
+  }
+}
+
+TEST_CASE("QMCDriverFactory validates batched VMC all-particle options before construction", "[qmcapp]")
+{
+  using namespace testing;
+  Communicate& comm(*OHMMS::Controller);
+  ProjectData project;
+  QMCDriverFactory factory(project);
+
+  QMCDriverPools pools(project.getRuntimeOptions(), comm);
+  MCWalkerConfiguration* qmc_system = pools.particle.getWalkerSet("e");
+  const auto create_from_xml = [&](const char* xml, bool spinor = false) {
+    qmc_system->setSpinor(spinor);
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(xml));
+    xmlNodePtr node = doc.getRoot();
+    auto das        = factory.readSection(node);
+    return factory.createQMCDriver(node, das, std::nullopt, *qmc_system, pools.particle, pools.wavefunction,
+                                   pools.hamiltonian, comm);
+  };
+  const auto require_error = [&](const char* xml, const char* expected_message, bool spinor = false) {
+    try
+    {
+      create_from_xml(xml, spinor);
+      FAIL("Expected factory validation to throw");
+    }
+    catch (const UniformCommunicateError& error)
+    {
+      CHECK(std::string(error.what()) == expected_message);
+    }
+  };
+
+  SECTION("supported all-particle mode constructs batched VMC")
+  {
+    auto driver = create_from_xml("<qmc method=\"vmc_batch\" move=\"allp\"><parameter name=\"usedrift\">no</parameter></qmc>");
+    REQUIRE(driver != nullptr);
+    CHECK(driver->getEngineName() == "VMCBatched");
+  }
+  SECTION("drift is rejected")
+  {
+    require_error("<qmc method=\"vmc_batch\" move=\"allp\"><parameter name=\"usedrift\">yes</parameter></qmc>",
+                  "VMCBatched all-particle moves do not support drift.");
+  }
+  SECTION("serialized walkers are rejected through the parsed public input")
+  {
+    require_error("<qmc method=\"vmc_batch\" move=\"allp\"><parameter name=\"usedrift\">no</parameter><parameter "
+                  "name=\"crowd_serialize_walkers\">yes</parameter></qmc>",
+                  "VMCBatched all-particle moves do not support serialized crowd walkers.");
+  }
+  SECTION("spinor particle systems are rejected")
+  {
+    require_error("<qmc method=\"vmc_batch\" move=\"allp\"><parameter name=\"usedrift\">no</parameter></qmc>",
+                  "VMCBatched all-particle moves support position coordinates only.", true);
+  }
+}
+
 TEST_CASE("QMCDriverFactory create DMC driver", "[qmcapp]")
 {
   using namespace testing;
-  Communicate* comm;
-  comm = OHMMS::Controller;
+  Communicate& comm(*OHMMS::Controller);
 
   using DV = ProjectData::DriverVersion;
-  ProjectData test_project("testing", DV::LEGACY);
+  ProjectData test_project(DV::LEGACY);
   QMCDriverFactory driver_factory(test_project);
 
   Libxml2Document doc;
@@ -159,12 +236,11 @@ TEST_CASE("QMCDriverFactory create DMC driver", "[qmcapp]")
 TEST_CASE("QMCDriverFactory create DMCBatched driver", "[qmcapp]")
 {
   using namespace testing;
-  Communicate* comm;
-  comm = OHMMS::Controller;
+  Communicate& comm(*OHMMS::Controller);
 
   SECTION("driver version behavior")
   {
-    ProjectData test_project("test", ProjectData::DriverVersion::BATCH);
+    ProjectData test_project;
     QMCDriverFactory driver_factory(test_project);
 
     Libxml2Document doc;

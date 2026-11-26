@@ -39,7 +39,7 @@ VMCBatched::VMCBatched(const ProjectData& project_data,
                        MCPopulation&& pop,
                        const RefVector<RandomBase<FullPrecRealType>>& rng_refs,
                        SampleStack& samples,
-                       Communicate* comm)
+                       Communicate& comm)
     : QMCDriverNew(project_data,
                    std::move(qmcdriver_input),
                    std::move(estimator_manager),
@@ -81,6 +81,79 @@ void VMCBatched::advanceWalkers(const StateForThread& sft,
   if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD)
     checkLogAndGL(crowd, "checkGL_after_load", sft.serializing_crowd_walkers);
 
+  if (sft.qmcdrv_input.get_update_mode() == "allp")
+  {
+    // All-particle moves are batched POS moves: the dispatcher has no serialized fallback.
+    if constexpr (CT == CoordsType::POS)
+    {
+      ScopedTimer allp_local_timer(timers.moveallp_timer);
+      const int num_walkers   = crowd.size();
+      auto& walker_leader     = walker_elecs.getLeader();
+      const int num_particles = walker_leader.getTotalNum();
+
+      std::vector<bool> are_valid(num_walkers * num_particles);
+      std::vector<bool> is_accepted(num_walkers);
+      const std::vector<bool> evaluate_all(num_walkers, true);
+      std::vector<RealType> old_logpsi(num_walkers);
+      MCCoords<CT> walker_deltas(num_walkers * num_particles);
+
+      for (int sub_step = 0; sub_step < sft.qmcdrv_input.get_sub_steps(); ++sub_step)
+      {
+        // The all-particle dispatcher consumes particle-major displacements: ip * nw + iw.
+        makeGaussRandomWithEngine(walker_deltas, step_context.get_random_gen());
+        for (int ig = 0; ig < walker_leader.groups(); ++ig)
+        {
+          TauParams<RealType, CT> taus(sft.qmcdrv_input.get_tau(), 1.0 / walker_leader.get_mass_by_group()[ig],
+                                       sft.qmcdrv_input.get_spin_mass());
+          for (int iat = walker_leader.first(ig); iat < walker_leader.last(ig); ++iat)
+            for (int iw = 0; iw < num_walkers; ++iw)
+              walker_deltas.positions[iat * num_walkers + iw] *= taus.sqrttau;
+        }
+
+        // Save the log amplitude for this substep before evaluating the proposed configuration.
+        for (int iw = 0; iw < num_walkers; ++iw)
+          old_logpsi[iw] = walker_twfs[iw].getLogPsi();
+
+        ps_dispatcher.flex_makeMoveAllParticles(walker_elecs, walker_deltas, are_valid);
+        // Evaluate proposals for every walker, then resolve only rejected wavefunction transactions.
+        twf_dispatcher.flex_evaluateLogAllParticles(walker_twfs, walker_elecs, evaluate_all);
+
+        for (int iw = 0; iw < num_walkers; ++iw)
+        {
+          bool walker_valid = true;
+          for (int iat = 0; iat < num_particles; ++iat)
+            // This is a rare occurence limited to particles that fell outside of a cell vector
+            // specified as an open boundary.
+            if (!are_valid[iat * num_walkers + iw])
+            {
+              is_accepted[iw] = false;
+              walker_valid    = false;
+              break;
+            }
+
+          if (walker_valid)
+          {
+            const RealType probability = std::exp(2.0 * (walker_twfs[iw].getLogPsi() - old_logpsi[iw]));
+            is_accepted[iw]            = step_context.get_random_gen()() < probability;
+          }
+          // All particles in a walker share the all-particle transaction decision.
+          if (is_accepted[iw])
+            crowd.addAccept(num_particles);
+          else
+            crowd.addReject(num_particles);
+        }
+
+        ps_dispatcher.flex_accept_rejectMoveAllParticles(walker_elecs, is_accepted);
+        twf_dispatcher.flex_accept_rejectMoveAllParticles(walker_twfs, walker_elecs, is_accepted);
+      }
+    }
+    else
+    {
+      // Reject unsupported coordinates if input/factory validation is bypassed.
+      throw std::runtime_error("VMCBatched only supports CoordsType::POS for allp moves!");
+    }
+  }
+  else
   {
     ScopedTimer pbyp_local_timer(timers.movepbyp_timer);
     const int num_walkers   = crowd.size();
@@ -271,24 +344,16 @@ void VMCBatched::process(xmlNodePtr node)
   ScopedTimer local_timer(timers_.startup_timer);
   print_mem("VMCBatched before initialization", app_log());
 
-  try
-  {
-    QMCDriverNew::AdjustedWalkerCounts awc =
-        adjustGlobalWalkerCount(*myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
-                                qmcdriver_input_.get_walkers_per_rank(), 1.0,
-                                determineNumCrowds(qmcdriver_input_.get_num_crowds(), rngs_.size()));
+  QMCDriverNew::AdjustedWalkerCounts awc =
+      adjustGlobalWalkerCount(myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
+                              qmcdriver_input_.get_walkers_per_rank(), 1.0,
+                              determineNumCrowds(qmcdriver_input_.get_num_crowds(), rngs_.size()));
 
-    steps_per_block_ =
-        determineStepsPerBlock(awc.global_walkers, qmcdriver_input_.get_requested_samples(),
-                               qmcdriver_input_.get_requested_steps(), qmcdriver_input_.get_max_blocks());
+  steps_per_block_ = determineStepsPerBlock(awc.global_walkers, qmcdriver_input_.get_requested_samples(),
+                                            qmcdriver_input_.get_requested_steps(), qmcdriver_input_.get_max_blocks());
 
-    initPopulationAndCrowds(awc);
-    createStepContexts(crowds_.size());
-  }
-  catch (const UniformCommunicateError& ue)
-  {
-    myComm->barrier_and_abort(ue.what());
-  }
+  initPopulationAndCrowds(awc);
+  createStepContexts(crowds_.size());
 
   if (qmcdriver_input_.get_measure_imbalance())
     measureImbalance("Startup");
@@ -297,9 +362,7 @@ void VMCBatched::process(xmlNodePtr node)
 size_t VMCBatched::compute_samples_per_rank(const size_t num_blocks,
                                             const size_t samples_per_block,
                                             const size_t local_walkers)
-{
-  return num_blocks * samples_per_block * local_walkers;
-}
+{ return num_blocks * samples_per_block * local_walkers; }
 
 
 /** Runs the actual VMC section
@@ -318,7 +381,7 @@ void VMCBatched::run()
 {
   IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   //start the main estimator
-  estimator_manager_->startDriverRun();
+  estimator_manager_->startDriverRun(get_root_name());
 
   //initialize WalkerLogManager and collectors
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
@@ -331,8 +394,7 @@ void VMCBatched::run()
                            serializing_crowd_walkers_);
 
   LoopTimer<> vmc_loop;
-  RunTimeControl<> runtimeControl(run_time_manager, project_data_.getMaxCPUSeconds(), project_data_.getTitle(),
-                                  myComm->rank() == 0);
+  LoopRunTimeControl<> runtimeControl(run_time_manager, project_data_, "VMCBatched driver", "block", myComm);
 
   { // walker initialization
     ScopedTimer local_timer(timers_.init_walkers_timer);
@@ -379,11 +441,14 @@ void VMCBatched::run()
   }
 
   // this barrier fences all previous load imbalance. Avoid block 0 timing pollution.
-  myComm->barrier();
+  myComm.barrier();
 
   int global_step = 0;
   for (int block = 0; block < num_blocks; ++block)
   {
+    if (runtimeControl.checkStop(vmc_loop, block))
+      break;
+
     {
       ScopeGuard<LoopTimer<>> vmc_local_timer(vmc_loop);
       vmc_state.recalculate_properties_period =
@@ -422,28 +487,14 @@ void VMCBatched::run()
       recordBlock(block);
     }
 
-    bool stop_requested = false;
-    // Rank 0 decides whether the time limit was reached
-    if (!myComm->rank())
-      stop_requested = runtimeControl.checkStop(vmc_loop);
-    myComm->bcast(stop_requested);
-    // Progress messages before possibly stopping
-    if (!myComm->rank())
-      app_log() << runtimeControl.generateProgressMessage("VMCBatched", block, num_blocks);
-    if (stop_requested)
-    {
-      if (!myComm->rank())
-        app_log() << runtimeControl.generateStopMessage("VMCBatched", block);
-      run_time_manager.markStop();
-      break;
-    }
+    app_log() << runtimeControl.generateProgressMessage(vmc_loop, block, num_blocks);
   }
   // This is confusing logic from VMC.cpp want this functionality write documentation of this
   // and clean it up
   // bool wrotesamples = qmcdriver_input_.get_dump_config();
   // if (qmcdriver_input_.get_dump_config())
   // {
-  //wrotesamples = W.dumpEnsemble(wClones, wOut, myComm->size(), nBlocks);
+  //wrotesamples = W.dumpEnsemble(wClones, wOut, myComm.size(), nBlocks);
   //if (wrotesamples)
   //  app_log() << "  samples are written to the config.h5" << std::endl;
   // }

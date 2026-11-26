@@ -10,10 +10,20 @@ if(NOT QMC_COMPLEX)
   list(APPEND C4_SD_AE_QP_SHORT "ionion" "56.960598986000 0.001000000000")
 
   qmc_run_and_check(
-    short-C4_sd-ae-qp-vmc
+    short-C4_ae-sd_lcao_qp_jas-vmc
     "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
-    qmc_short-SD-C4_AE_Mol_QP
     qmc_short-SD-C4_AE_Mol_QP.in.xml
+    1
+    16
+    TRUE
+    0
+    C4_SD_AE_QP_SHORT # VMC
+  )
+
+  qmc_run_and_check(
+    short-C4_ae-sd_lcao_qp_jas-vmcbatch
+    "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
+    qmc_short-SD-C4_AE_Mol_QP-batch.in.xml
     1
     16
     TRUE
@@ -23,10 +33,20 @@ if(NOT QMC_COMPLEX)
 
   # Test case where number of orbitals is greater than the number of electrons
   qmc_run_and_check(
-    short-C4_sd-ae-large-qp-vmc
+    short-C4_large_ae-sd_lcao_qp_jas-vmc
     "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
-    qmc_short-SD-C4_AE_Mol_large_QP
     qmc_short-SD-C4_AE_Mol_large_QP.in.xml
+    1
+    16
+    TRUE
+    0
+    C4_SD_AE_QP_SHORT # VMC
+  )
+
+  qmc_run_and_check(
+    short-C4_large_ae-sd_lcao_qp_jas-vmcbatch
+    "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
+    qmc_short-SD-C4_AE_Mol_large_QP-batch.in.xml
     1
     16
     TRUE
@@ -42,10 +62,20 @@ if(NOT QMC_COMPLEX)
   list(APPEND C4_SD_AE_QP_LONG "ionion" "56.960598986000 0.001000000000")
 
   qmc_run_and_check(
-    long-C4_sd-ae-qp-vmc
+    long-C4_ae-sd_lcao_qp_jas-vmc
     "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
-    qmc_long-SD-C4_AE_Mol_QP
     qmc_long-SD-C4_AE_Mol_QP.in.xml
+    1
+    16
+    TRUE
+    0
+    C4_SD_AE_QP_LONG # VMC
+  )
+
+  qmc_run_and_check(
+    long-C4_ae-sd_lcao_qp_jas-vmcbatch
+    "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
+    qmc_long-SD-C4_AE_Mol_QP-batch.in.xml
     1
     16
     TRUE
@@ -68,10 +98,20 @@ if(NOT QMC_COMPLEX)
   list(APPEND C4_MD_AE_EXCITED_QP_SHORT "ionion" "56.960598986000 0.001000000000")
 
   qmc_run_and_check(
-    short-C4_md-ae-excited-qp-vmc
+    short-C4_excited_ae-msd_lcao_qp_jas-vmc
     "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
-    qmc_short-MD-C4_AE_Mol_Excited_QP
     qmc_short-MD-C4_AE_Mol_Excited_QP.in.xml
+    1
+    16
+    TRUE
+    0
+    C4_MD_AE_EXCITED_QP_SHORT # VMC
+  )
+
+  qmc_run_and_check(
+    short-C4_excited_ae-msd_lcao_qp_jas-vmcbatch
+    "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
+    qmc_short-MD-C4_AE_Mol_Excited_QP-batch.in.xml
     1
     16
     TRUE
@@ -87,10 +127,20 @@ if(NOT QMC_COMPLEX)
   list(APPEND C4_MD_AE_GROUND_QP_SHORT "ionion" "56.960598986000 0.001000000000")
 
   qmc_run_and_check(
-    short-C4_md-ae-ground-qp-vmc
+    short-C4_ground_ae-msd_lcao_qp_jas-vmc
     "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
-    qmc_short-MD-C4_AE_Mol_Ground_QP
     qmc_short-MD-C4_AE_Mol_Ground_QP.in.xml
+    1
+    16
+    TRUE
+    0
+    C4_MD_AE_GROUND_QP_SHORT # VMC
+  )
+
+  qmc_run_and_check(
+    short-C4_ground_ae-msd_lcao_qp_jas-vmcbatch
+    "${qmcpack_SOURCE_DIR}/tests/molecules/C4_ae"
+    qmc_short-MD-C4_AE_Mol_Ground_QP-batch.in.xml
     1
     16
     TRUE

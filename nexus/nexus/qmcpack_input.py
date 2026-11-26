@@ -135,25 +135,36 @@
 
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-from copy import deepcopy
 import inspect
 import keyword
+import os
+import sys
+from copy import deepcopy
+from pathlib import Path
+
 import numpy as np
-from .numpy_extensions import reshape_inplace
-from .xmlreader import XMLreader, XMLelement
-from .developer import DevBase, dotdict, obj, nxs_print, warn, FileFormatError, NexusError, sorted_generic
-from .periodic_table import Elements
-from .structure import Structure, Jellium, get_kpath
-from .physical_system import PhysicalSystem
-from .pseudoset import pp_elem_label, PseudoSet
-from .simulation import SimulationInput, SimulationInputTemplate
-from .pwscf_input import array_to_string as pwscf_array_string
-from .utilities import path_string
-from .unit_converter import convert
+
 from . import numpy_extensions as npe
+from .developer import (
+    DevBase,
+    FileFormatError,
+    NexusError,
+    dotdict,
+    nxs_print,
+    obj,
+    sorted_generic,
+    warn,
+)
+from .numpy_extensions import reshape_inplace
+from .periodic_table import Elements
+from .physical_system import PhysicalSystem
+from .pseudoset import PseudoSet, pp_elem_label
+from .pwscf_input import array_to_string as pwscf_array_string
+from .simulation import SimulationInput, SimulationInputTemplate
+from .structure import Jellium, Structure, get_kpath
+from .unit_converter import convert
+from .utilities import path_string
+from .xmlreader import XMLelement, XMLreader
 
 type ArgsT       = int | float | str | group | tuple[str, str]
 type KwargsT     = bool | int | float | str | Path | list[str]
@@ -1120,7 +1131,7 @@ class QIxml(Names):
                     #end for
                 #end if
             #end for
-            if self.text is not None:
+            if self.text is not None and self.text in self:
                 c = c.rstrip('\n')
                 c+=param.write(self[self.text],mode='elem',pad=ip,tag=None,normal_elem=True)
             #end if
@@ -2347,6 +2358,11 @@ class group(QIxml):
 
 
 
+class coefs_mem(QIxml):
+    attributes = ('shared_ranks','distributed_ranks')
+#end class coefs_mem
+
+
 class sposet(QIxml):
     attributes = ('basisset','type','name','group','size',
                   'index_min','index_max','energy_min','energy_max',
@@ -2354,7 +2370,7 @@ class sposet(QIxml):
                   'gs_sposet','basis_sposet','same_k','frequency','mass',
                   'source','version','precision','tilematrix',
                   'meshfactor')
-    elements   = ('occupation','coefficient','coefficients')
+    elements   = ('occupation','coefficient','coefficients','coefs_mem')
     text       = None
     identifier = 'name'
 #end class sposet
@@ -3053,15 +3069,12 @@ class linear(QIxml):
                   'max_its','cgsteps','eigcg','stabilizermethod',
                   'rnwarmupsteps','walkersperthread','minke','gradtol','alpha',
                   'tries','min_walkers','samplesperthread',
-                  'shift_i','shift_s','max_relative_change','max_param_change',
-                  'chase_lowest','chase_closest','block_lm','nblocks','nolds',
-                  'nkept','max_seconds','spin_mass',
+                  'shift_i','shift_s','max_seconds','spin_mass',
                   'sr_tau','sr_tolerance','sr_regularization','line_search',
                   )
     costs      = ('energy','unreweightedvariance','reweightedvariance','variance','difference')
     write_types = obj(gpu=yesno,usedrift=yesno,nonlocalpp=yesno,usebuffer=yesno,
-                      use_nonlocalpp_deriv=yesno,chase_lowest=yesno,
-                      chase_closest=yesno,block_lm=yesno,line_search=yesno)
+                      use_nonlocalpp_deriv=yesno,line_search=yesno)
 #end class linear
 
 class cslinear(QIxml):
@@ -3178,13 +3191,11 @@ class linear_batch(QIxml):
                   'max_its','cgsteps','eigcg','stabilizermethod',
                   'rnwarmupsteps','walkersperthread','minke','gradtol','alpha',
                   'tries','min_walkers','samplesperthread',
-                  'shift_i','shift_s','max_relative_change','max_param_change',
-                  'chase_lowest','chase_closest','block_lm','nblocks','nolds',
-                  'nkept',
+                  'shift_i','shift_s',
                   'crowds','opt_num_crowds'
                   )
     costs      = ('energy','unreweightedvariance','reweightedvariance','variance','difference')
-    write_types = obj(usedrift=yesno,nonlocalpp=yesno,usebuffer=yesno,use_nonlocalpp_deriv=yesno,chase_lowest=yesno,chase_closest=yesno,block_lm=yesno)
+    write_types = obj(usedrift=yesno,nonlocalpp=yesno,usebuffer=yesno,use_nonlocalpp_deriv=yesno)
 #end class linear_batch
 
 class wftest(QIxml):
@@ -3267,7 +3278,7 @@ classes = [   #standard classes
     atomicbasisset,basisgroup,init,var,traces,scalar_traces,particle_traces,array_traces,
     reference_points,nearestneighbors,neighbor_trace,dm1b,
     coefficient,radfunc,spindensity,structurefactor,magnetizationdensity,
-    sposet,bspline_builder,composite_builder,heg_builder,include,
+    sposet,coefs_mem,bspline_builder,composite_builder,heg_builder,include,
     multideterminant,detlist,ci,mcwalkerset,csf,det,
     optimize,cg_optimizer,flex_optimizer,optimize_qmc,wftest,kspace_jastrow,
     header,local,force,forwardwalking,observable,record,rmc,pressure,dmccorrection,
@@ -5627,7 +5638,7 @@ class QmcpackInput(SimulationInput,Names):
             If ``'linear'``, use one of the versions of the linear method.
             If ``'cslinear'``, use the correlated sampling linear method.
 
-        minmethod : {'quartic' , 'rescale' , 'linemin', 'adaptive', 'oneshift', 'sr_cg'}, default='quartic'
+        minmethod : {'quartic' , 'rescale' , 'linemin', 'oneshift', 'sr_cg'}, default='quartic'
 
         minwalkers : float, default=0.3
             Minimum threshold to accept a parameter update based on the
@@ -5723,18 +5734,6 @@ class QmcpackInput(SimulationInput,Names):
         shift_i : float
             Set the ``shift_i`` parameter. See QMCPACK manual.
         shift_s : float
-            Set the ``shift_s`` parameter. See QMCPACK manual.
-
-        Case ``qmc='opt'`` ``method='linear'`` ``minmethod='adaptive'``
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-        max_relative_change : float, default=10.0
-            Sets ``max_relative_change`` parameter. See QMCPACK manual.
-        max_param_change : float, default=0.3
-            Sets ``max_param_change`` parameter. See QMCPACK manual.
-        shift_i : float, default=0.01
-            Set the ``shift_i`` parameter. See QMCPACK manual.
-        shift_s : float, default=1.0
             Set the ``shift_s`` parameter. See QMCPACK manual.
 
         Case ``qmc='opt'`` ``method='linear'`` ``minmethod='sr_cg'``
@@ -6293,19 +6292,21 @@ def generate_particlesets(
 
 #mth
 def generate_sposets(
-    type           : str | None = None,
+    type           : str | None    = None,
     *,
-    occupation     : str | None = None,
-    spin_polarized : bool       = False,
-    nup                         = None,  #th
-    ndown                       = None,  #th
-    spo_up         : str        = 'spo_u',
-    spo_down       : str        = 'spo_d',
-    system                      = None,  #th
-    sposets                     = None,  #th
-    spindatasets   : bool       = False,
-    spinor                      = None,  #th
-    rotate         : bool       = False,
+    occupation     : str | None    = None,
+    spin_polarized : bool          = False,
+    nup                            = None,  #th
+    ndown                          = None,  #th
+    spo_up         : str           = 'spo_u',
+    spo_down       : str           = 'spo_d',
+    system                         = None,  #th
+    sposets                        = None,  #th
+    spindatasets   : bool          = False,
+    spinor                         = None,  #th
+    rotate         : bool          = False,
+    shared_ranks      = None,
+    distributed_ranks = None,
     ) -> collection:
     ndn = ndown
     if type is None:
@@ -6368,6 +6369,17 @@ def generate_sposets(
             )
         raise ValueError(msg)
     #end if
+    if distributed_ranks is not None or shared_ranks is not None:
+        if type in {"bspline", "einspline"}:
+            cm = coefs_mem()
+            if distributed_ranks is not None:
+                cm.distributed_ranks = distributed_ranks
+            if shared_ranks is not None:
+                cm.shared_ranks = shared_ranks
+            for spo in sposets:
+                spo.coefs_mem = cm
+        #end if
+    #end if
     if rotate:
         rotated_sposets = []
         for spo in sposets:
@@ -6396,28 +6408,30 @@ def generate_sposet_builder(type: str, *args, **kwargs) -> bspline_builder:
 
 #mth
 def generate_bspline_builder(
-    type           : str        = 'bspline',
+    type           : str           = 'bspline',
     *,
-    meshfactor     : float      = 1.0,
-    precision      : str        = 'float',
-    twistnum       : int | None = None,
-    twist                       = None,  #th
-    sort                        = None,  #th
-    version        : str        = '0.10',
-    truncate       : bool       = False,
-    buffer                      = None,  #th
-    spin_polarized : bool       = False,
-    hybridrep                   = None,  #th
-    href           : str        = 'MISSING.h5',
-    rotate         : bool       = False,
-    ions           : str        = 'ion0',
-    spo_up         : str        = 'spo_u',
-    spo_down       : str        = 'spo_d',
-    sposets                     = None,  #th
-    system                      = None,  #th
-    orbitals_cpu                = None,  #th
-    gpusharing                  = None,  #th
-    spinor                      = None,  #th
+    meshfactor        : float      = 1.0,
+    precision      : str           = 'float',
+    shared_ranks      = None,
+    distributed_ranks = None,
+    twistnum       : int | None    = None,
+    twist                          = None,  #th
+    sort                           = None,  #th
+    version        : str           = '0.10',
+    truncate          : bool       = False,
+    buffer                         = None,  #th
+    spin_polarized    : bool       = False,
+    hybridrep                      = None,  #th
+    href           : str           = 'MISSING.h5',
+    rotate         : bool          = False,
+    ions           : str           = 'ion0',
+    spo_up         : str           = 'spo_u',
+    spo_down       : str           = 'spo_d',
+    sposets                        = None,  #th
+    system                         = None,  #th
+    orbitals_cpu                   = None,  #th
+    gpusharing                     = None,  #th
+    spinor                         = None,  #th
     ) -> bspline_builder:
     tilematrix = np.identity(3,dtype=int)
     if system is not None:
@@ -6434,14 +6448,16 @@ def generate_bspline_builder(
         source     = ions,
         )
     sposets    = generate_sposets(
-        type           = type,
-        occupation     = 'slater_ground',
-        spin_polarized = spin_polarized,
-        system         = system,
-        sposets        = sposets,
-        spindatasets   = True,
-        spinor         = spinor,
-        rotate         = rotate,
+        type              = type,
+        occupation        = 'slater_ground',
+        spin_polarized    = spin_polarized,
+        system            = system,
+        sposets           = sposets,
+        spindatasets      = True,
+        spinor            = spinor,
+        rotate            = rotate,
+        shared_ranks      = shared_ranks,
+        distributed_ranks = distributed_ranks,
         )
     if not rotate:
         bsb.sposets = sposets
@@ -6763,6 +6779,8 @@ def generate_determinantset_old(
     *,
     meshfactor     : float            = 1.0,
     precision      : str              = 'float',
+    shared_ranks      = None,
+    distributed_ranks = None,
     twistnum                          = None,  #th
     twist                             = None,  #th
     spin_polarized : bool             = False,
@@ -6981,7 +6999,17 @@ def generate_determinantset_old(
                 msg = f'{exc1} excitation is not yet available for band type'
                 raise NotImplementedError(msg)
             #end if
-
+            if distributed_ranks is not None or shared_ranks is not None:
+                if type in {"bspline", "einspline"}:
+                    cm = coefs_mem()
+                    if distributed_ranks is not None:
+                        cm.distributed_ranks = distributed_ranks
+                    if shared_ranks is not None:
+                        cm.shared_ranks = shared_ranks
+                    for spo in dset.sposets:
+                        spo.coefs_mem = cm
+                #end if
+            #end if
             return dset
 
         #end if
@@ -8625,15 +8653,6 @@ linear_oneshift_legacy_defaults = obj(
     #shift_s    = 1.00,
     **shared_opt_legacy_defaults
     )
-linear_adaptive_legacy_defaults = obj(
-    minwalkers          = 0.3,
-    max_relative_change = 10.0,
-    max_param_change    = 0.3,
-    shift_i             = 0.01,
-    shift_s             = 1.00,
-    **shared_opt_legacy_defaults
-    )
-
 opt_method_legacy_defaults = obj({
     ('linear'  ,'quartic' ) : linear_quartic_legacy_defaults,
     ('linear'  ,'rescale' ) : linear_quartic_legacy_defaults,
@@ -8641,14 +8660,12 @@ opt_method_legacy_defaults = obj({
     ('cslinear','quartic' ) : linear_quartic_legacy_defaults,
     ('cslinear','rescale' ) : linear_quartic_legacy_defaults,
     ('cslinear','linemin' ) : linear_quartic_legacy_defaults,
-    ('linear'  ,'adaptive') : linear_adaptive_legacy_defaults,
     ('linear'  ,'oneshift') : linear_oneshift_legacy_defaults,
     ('linear'  ,'oneshiftonly') : linear_oneshift_legacy_defaults,
     })
 del shared_opt_legacy_defaults
 del linear_quartic_legacy_defaults
 del linear_oneshift_legacy_defaults
-del linear_adaptive_legacy_defaults
 
 allowed_opt_method_legacy_inputs = set(linear.attributes+linear.parameters
                                        +cslinear.attributes+cslinear.parameters)
@@ -8781,14 +8798,6 @@ linear_oneshift_batched_defaults = obj(
     #shift_s    = 1.00,
     **shared_opt_batched_defaults
     )
-linear_adaptive_batched_defaults = obj(
-    minwalkers          = 0.3,
-    max_relative_change = 10.0,
-    max_param_change    = 0.3,
-    shift_i             = 0.01,
-    shift_s             = 1.00,
-    **shared_opt_batched_defaults
-    )
 linear_sr_cg_batched_defaults = obj(
     sr_tau            = None,  # projector: 1-tau*H  (0.01/0.1 if line_search=no/yes)
     sr_tolerance      = 0.001, # conjugate gradient convergence tolerance
@@ -8804,7 +8813,6 @@ opt_method_batched_defaults = obj({
     ('cslinear','quartic' ) : linear_quartic_batched_defaults,
     ('cslinear','rescale' ) : linear_quartic_batched_defaults,
     ('cslinear','linemin' ) : linear_quartic_batched_defaults,
-    ('linear'  ,'adaptive') : linear_adaptive_batched_defaults,
     ('linear'  ,'oneshift') : linear_oneshift_batched_defaults,
     ('linear'  ,'oneshiftonly') : linear_oneshift_batched_defaults,
     ('linear'  ,'sr_cg')    : linear_sr_cg_batched_defaults,
@@ -8812,7 +8820,6 @@ opt_method_batched_defaults = obj({
 del shared_opt_batched_defaults
 del linear_quartic_batched_defaults
 del linear_oneshift_batched_defaults
-del linear_adaptive_batched_defaults
 del linear_sr_cg_batched_defaults
 
 allowed_opt_method_batched_inputs = set(linear.attributes+linear.parameters
@@ -9624,88 +9631,90 @@ def read_jastrows(filepath) -> list | None:
 
 
 gen_basic_input_defaults = obj(
-    id               = 'qmc',
-    series           = 0,
-    purpose          = '',
-    maxcpusecs       = None,
-    max_seconds      = None,
-    seed             = None,
-    bconds           = None,
-    truncate         = False,
-    buffer           = None,
-    lr_dim_cutoff    = 15,
-    lr_tol           = None,
-    lr_handler       = None,
-    remove_cell      = False,
-    randomsrc        = True,
-    meshfactor       = 1.0,
-    orbspline        = None,
-    precision        = 'float',
-    twistnum         = None,
-    twist            = None,
-    gcta             = None,
-    spin_polarized   = None,
-    partition        = None,
-    partition_mf     = None,
-    hybridrep        = None,
-    hybrid_rcut      = None,
-    hybrid_lmax      = None,
-    orbitals_h5      = 'MISSING.h5',
-    rotated_orbitals = False,
-    run_path         = None,
-    check_paths      = True,
-    excitation       = None,
-    system           = 'missing',
-    pseudos          = None,
-    nrule            = None,
-    pseudo_algorithm = None,
-    spinor           = None,
-    dla              = None,
-    delay_rank       = None,
-    det_batch        = None,
-    jastrows         = 'generateJ12',
-    opt_params       = None,
-    interactions     = 'all',
-    corrections      = 'default',
-    observables      = None,
-    estimators       = None,
-    estimator_period = None,
-    traces           = None,
-    calculations     = None,
-    det_format       = 'new',
-    J1               = False,
-    J2               = False,
-    J3               = False,
-    J1_size          = None,
-    J1_rcut          = None,
-    J1_dr            = 0.5,
-    J1_opt           = None,
-    J2_size          = None,
-    J2_rcut          = None,
-    J2_dr            = 0.5,
-    J2_init          = 'zero',
-    J2_opt           = None,
-    J3_isize         = 3,
-    J3_esize         = 3,
-    J3_rcut          = 5.0,
-    J3_opt           = None,
-    J1_rcut_open     = 5.0,
-    J2_rcut_open     = 10.0,
-    J1k              = False,
-    J1k_kcut         = 5.0,
-    J1k_symm         = 'crystal',
-    J1k_opt          = None,
-    J2k              = False,
-    J2k_kcut         = 5.0,
-    J2k_symm         = 'crystal',
-    J2k_opt          = None,
-    driver           = 'batched', # legacy,batched
+    id                = 'qmc',
+    series            = 0,
+    purpose           = '',
+    maxcpusecs        = None,
+    max_seconds       = None,
+    seed              = None,
+    bconds            = None,
+    truncate          = False,
+    buffer            = None,
+    lr_dim_cutoff     = 15,
+    lr_tol            = None,
+    lr_handler        = None,
+    remove_cell       = False,
+    randomsrc         = True,
+    meshfactor        = 1.0,
+    orbspline         = None,
+    precision         = 'float',
+    shared_ranks      = None,
+    distributed_ranks = None,
+    twistnum          = None,
+    twist             = None,
+    gcta              = None,
+    spin_polarized    = None,
+    partition         = None,
+    partition_mf      = None,
+    hybridrep         = None,
+    hybrid_rcut       = None,
+    hybrid_lmax       = None,
+    orbitals_h5       = 'MISSING.h5',
+    rotated_orbitals  = False,
+    run_path          = None,
+    check_paths       = True,
+    excitation        = None,
+    system            = 'missing',
+    pseudos           = None,
+    nrule             = None,
+    pseudo_algorithm  = None,
+    spinor            = None,
+    dla               = None,
+    delay_rank        = None,
+    det_batch         = None,
+    jastrows          = 'generateJ12',
+    opt_params        = None,
+    interactions      = 'all',
+    corrections       = 'default',
+    observables       = None,
+    estimators        = None,
+    estimator_period  = None,
+    traces            = None,
+    calculations      = None,
+    det_format        = 'new',
+    J1                = False,
+    J2                = False,
+    J3                = False,
+    J1_size           = None,
+    J1_rcut           = None,
+    J1_dr             = 0.5,
+    J1_opt            = None,
+    J2_size           = None,
+    J2_rcut           = None,
+    J2_dr             = 0.5,
+    J2_init           = 'zero',
+    J2_opt            = None,
+    J3_isize          = 3,
+    J3_esize          = 3,
+    J3_rcut           = 5.0,
+    J3_opt            = None,
+    J1_rcut_open      = 5.0,
+    J2_rcut_open      = 10.0,
+    J1k               = False,
+    J1k_kcut          = 5.0,
+    J1k_symm          = 'crystal',
+    J1k_opt           = None,
+    J2k               = False,
+    J2k_kcut          = 5.0,
+    J2k_symm          = 'crystal',
+    J2k_opt           = None,
+    driver            = 'batched', # legacy,batched
     # batched driver inputs
-    orbitals_cpu     = None,     # place/evaluate orbitals on cpu if on gpu
-    matrix_inv_cpu   = None,     # evaluate matrix inverse on cpu if on gpu
+    orbitals_cpu      = None,     # place/evaluate orbitals on cpu if on gpu
+    matrix_inv_cpu    = None,     # evaluate matrix inverse on cpu if on gpu
     # legacy cuda inputs
-    gpusharing       = None,
-    qmc              = None,     # opt,vmc,vmc_test,dmc,dmc_test
+    gpusharing        = None,
+    qmc               = None,     # opt,vmc,vmc_test,dmc,dmc_test
     )
 #mth
 def generate_basic_input(**kwargs) -> QmcpackInput | None:
@@ -9888,21 +9897,23 @@ def generate_basic_input(**kwargs) -> QmcpackInput | None:
                 #end if
             #end if
             ssb = generate_sposet_builder(
-                type           = kw.orbspline,
-                twist          = kw.twist,
-                twistnum       = kw.twistnum,
-                meshfactor     = kw.meshfactor,
-                precision      = kw.precision,
-                truncate       = kw.truncate,
-                buffer         = kw.buffer,
-                hybridrep      = kw.hybridrep,
-                href           = kw.orbitals_h5,
-                rotate         = kw.rotated_orbitals,
-                spin_polarized = kw.spin_polarized,
-                system         = kw.system,
-                orbitals_cpu   = kw.orbitals_cpu,
-                gpusharing     = kw.gpusharing,
-                spinor         = kw.spinor,
+                type              = kw.orbspline,
+                twist             = kw.twist,
+                twistnum          = kw.twistnum,
+                meshfactor        = kw.meshfactor,
+                precision         = kw.precision,
+                shared_ranks      = kw.shared_ranks,
+                distributed_ranks = kw.distributed_ranks,
+                truncate          = kw.truncate,
+                buffer            = kw.buffer,
+                hybridrep         = kw.hybridrep,
+                href              = kw.orbitals_h5,
+                rotate            = kw.rotated_orbitals,
+                spin_polarized    = kw.spin_polarized,
+                system            = kw.system,
+                orbitals_cpu      = kw.orbitals_cpu,
+                gpusharing        = kw.gpusharing,
+                spinor            = kw.spinor,
                 )
         #end if
         if kw.partition is None:
@@ -9930,18 +9941,20 @@ def generate_basic_input(**kwargs) -> QmcpackInput | None:
             kw.orbspline = 'einspline'
         #end if
         dset = generate_determinantset_old(
-            type           = kw.orbspline,
-            twistnum       = kw.twistnum,
-            meshfactor     = kw.meshfactor,
-            precision      = kw.precision,
-            hybridrep      = kw.hybridrep,
-            href           = kw.orbitals_h5,
-            spin_polarized = kw.spin_polarized,
-            excitation     = kw.excitation,
-            delay_rank     = kw.delay_rank,
-            gpusharing     = kw.gpusharing,
-            system         = kw.system,
-            spinor         = kw.spinor,
+            type              = kw.orbspline,
+            twistnum          = kw.twistnum,
+            meshfactor        = kw.meshfactor,
+            precision         = kw.precision,
+            shared_ranks      = kw.shared_ranks,
+            distributed_ranks = kw.distributed_ranks,
+            hybridrep         = kw.hybridrep,
+            href              = kw.orbitals_h5,
+            spin_polarized    = kw.spin_polarized,
+            excitation        = kw.excitation,
+            delay_rank        = kw.delay_rank,
+            gpusharing        = kw.gpusharing,
+            system            = kw.system,
+            spinor            = kw.spinor,
             )
     else:
         msg = (
@@ -10092,7 +10105,7 @@ def generate_basic_input(**kwargs) -> QmcpackInput | None:
     hmltn = generate_hamiltonian(
         system       = kw.system,
         pseudos      = kw.pseudos,
-        nrule         = kw.nrule,
+        nrule        = kw.nrule,
         algorithm    = kw.pseudo_algorithm,
         dla          = kw.dla,
         interactions = kw.interactions,
@@ -10517,8 +10530,8 @@ if __name__=='__main__':
 
 
     if test_ret_system:
-        from .structure import generate_structure
         from .physical_system import PhysicalSystem
+        from .structure import generate_structure
 
         system = PhysicalSystem(
             structure = generate_structure('diamond','fcc','Ge',(2,2,2),scale=5.639,units='A'),
@@ -10537,8 +10550,8 @@ if __name__=='__main__':
 
 
     if test_gen_input:
-        from .structure import generate_structure
         from .physical_system import PhysicalSystem
+        from .structure import generate_structure
 
         system = PhysicalSystem(
             structure = generate_structure('diamond','fcc','Ge',(2,2,2),scale=5.639,units='A'),

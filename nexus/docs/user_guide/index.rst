@@ -11,8 +11,10 @@ User Guide
     overview
     installation
     examples
+    pseudo-handling
     nexus-behavior
     user-scripts
+    sim-tools
     nexus-jobs
     qmcpack-input-mod
     qmcpack-input-gen

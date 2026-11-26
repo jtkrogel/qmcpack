@@ -56,6 +56,9 @@
 /* Require OpenMP unified shared memory */
 #cmakedefine QMC_OFFLOAD_USM @QMC_OFFLOAD_USM@
 
+/* Enable collective communication library for GPU */
+#cmakedefine QMC_CCL @QMC_CCL@
+
 /* Define to 1 if you have MPI library */
 #cmakedefine HAVE_MPI @HAVE_MPI@
 
@@ -99,8 +102,6 @@
 
 #endif /* HAVE_EINSPLINE_EXT */
 
-/* Find ESSL library */
-#cmakedefine HAVE_ESSL @HAVE_ESSL@
 
 /* Using translation of CUDA to HIP for GPU execution */
 #cmakedefine QMC_CUDA2HIP @QMC_CUDA2HIP@

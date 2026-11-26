@@ -18,9 +18,8 @@ list(APPEND HEG14GSNI_SCALARS "totenergy" " 0.627711  0.000001") # total energy
 list(APPEND HEG14GSNI_SCALARS "variance" " 0.000000  0.000001") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-ni
+  short-heg_14_gamma-sd_noj-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_NI
   heg-short-NI.xml
   1
   16
@@ -35,9 +34,8 @@ list(APPEND HEG14GSNI_DMC_SCALARS "totenergy" " 0.627711  0.000001") # total ene
 list(APPEND HEG14GSNI_DMC_SCALARS "variance" " 0.000000  0.000001") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-ni_dmc
+  short-heg_14_gamma-sd_noj-dmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_NI_dmc
   heg-short-NI-dmc.xml
   1
   16
@@ -53,9 +51,8 @@ list(APPEND HEG14GSHF_SCALARS "totenergy" "-0.812484  0.000271") # total energy
 list(APPEND HEG14GSHF_SCALARS "variance" " 0.193169  0.018612") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-hf
+  short-heg_14_gamma-sd_hf_noj-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_HF
   heg-short-HF.xml
   1
   16
@@ -71,9 +68,8 @@ list(APPEND HEG14GSSJ_SCALARS "totenergy" "-1.073323  0.000271") # total energy
 list(APPEND HEG14GSSJ_SCALARS "variance" " 0.024574  0.000181") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-sj
+  short-heg_14_gamma-sd_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJ
   heg-short-SJ.xml
   1
   16
@@ -90,9 +86,8 @@ list(APPEND HEG14GSSJ_NEW_SCALARS "variance" " 0.024564  0.000342") # energy var
 
 # legacy driver
 qmc_run_and_check(
-  short-heg_14_gamma-sj_new
+  short-heg_14_gamma-sd_new_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJ_new
   heg-short-SJ-new.xml
   1
   16
@@ -103,9 +98,8 @@ qmc_run_and_check(
 
 # batch driver
 qmc_run_and_check(
-  short-heg_14_gamma-sj_batch
+  short-heg_14_gamma-sd_jas-vmcbatch
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma/batch"
-  short_heg_SJ_batch
   short-heg-SJ-batch.xml
   1
   16
@@ -118,9 +112,8 @@ list(APPEND HEG14GSSJ_DMC_SCALARS "totenergy" "-1.110199  0.000322") # total ene
 list(APPEND HEG14GSSJ_DMC_SCALARS "variance" " 0.022894  0.000060") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-sj-dmc_batch
+  short-heg_14_gamma-sd_jas-dmcbatch
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma/batch"
-  short_heg_SJ_dmc_batch
   short-heg-SJ-dmc-batch.xml
   1
   16
@@ -132,9 +125,8 @@ qmc_run_and_check(
 
 # batch driver energy density
 qmc_run_and_check(
-  short-heg_14_gamma-sj_eden_batch
+  short-heg_14_gamma-sd_jas-vmcbatch_eden
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma/batch"
-  short_heg_SJ_eden_batch
   short-heg-SJ-eden-batch.xml
   4
   4
@@ -145,9 +137,8 @@ qmc_run_and_check(
 
 # batch driver energy density
 qmc_run_and_check(
-  short-heg_14_gamma-sj_dmc_eden_batch
+  short-heg_14_gamma-sd_jas-dmcbatch_eden
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma/batch"
-  short_heg_SJ_dmc_eden_batch
   short-heg-SJ-dmc-eden-batch.xml
   4
   4
@@ -184,12 +175,12 @@ function(add_heg_eden_stats_check test_name output_prefix series reference_filen
 endfunction()
 
 add_heg_eden_stats_check(
-  short-heg_14_gamma-sj_eden_batch
+  short-heg_14_gamma-sd_jas-vmcbatch_eden
   short_heg_SJ_eden_batch
   0
   qmc-ref/short_heg_SJ_eden_batch.s000.stat_ref_energydensity.dat)
 add_heg_eden_stats_check(
-  short-heg_14_gamma-sj_dmc_eden_batch
+  short-heg_14_gamma-sd_jas-dmcbatch_eden
   short_heg_SJ_dmc_eden_batch
   1
   qmc-ref/short_heg_SJ_dmc_eden_batch.s001.stat_ref_energydensity.dat)
@@ -206,9 +197,8 @@ else()
 endif()
 
 qmc_run_and_check(
-  deterministic-heg_14_gamma-sj-batch
+  deterministic-heg_14_gamma-sd_jas-vmcbatch
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma/batch"
-  deter_heg_SJ_batch
   deter-heg-SJ-batch.xml
   1
   1
@@ -224,9 +214,8 @@ list(APPEND HEG14GSSJ_DMC_SCALARS "totenergy" "-1.110199  0.000322") # total ene
 list(APPEND HEG14GSSJ_DMC_SCALARS "variance" " 0.022894  0.000060") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-sj_dmc
+  short-heg_14_gamma-sd_jas-dmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJ_dmc
   heg-short-SJ-dmc.xml
   1
   16
@@ -246,9 +235,8 @@ list(APPEND HEG14GLNI_SCALARS "totenergy" " 0.627711  0.000001") # total energy
 list(APPEND HEG14GLNI_SCALARS "variance" " 0.000000  0.000001") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-ni
+  long-heg_14_gamma-sd_noj-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_NI
   heg-long-NI.xml
   1
   16
@@ -264,9 +252,8 @@ list(APPEND HEG14GLNI_DMC_SCALARS "totenergy" " 0.627711  0.000001") # total ene
 list(APPEND HEG14GLNI_DMC_SCALARS "variance" " 0.000000  0.000001") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-ni_dmc
+  long-heg_14_gamma-sd_noj-dmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_NI_dmc
   heg-long-NI-dmc.xml
   1
   16
@@ -282,9 +269,8 @@ list(APPEND HEG14GLHF_SCALARS "totenergy" "-0.812484  0.000090") # total energy
 list(APPEND HEG14GLHF_SCALARS "variance" " 0.193169  0.006142") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-hf
+  long-heg_14_gamma-sd_hf_noj-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_HF
   heg-long-HF.xml
   1
   16
@@ -300,9 +286,8 @@ list(APPEND HEG14GLSJ_SCALARS "totenergy" "-1.073323  0.000090") # total energy
 list(APPEND HEG14GLSJ_SCALARS "variance" " 0.024574  0.000060") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-sj
+  long-heg_14_gamma-sd_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJ
   heg-long-SJ.xml
   1
   16
@@ -318,9 +303,8 @@ list(APPEND HEG14GLSJ_NEW_SCALARS "totenergy" "-1.073286  0.000090") # total ene
 list(APPEND HEG14GLSJ_NEW_SCALARS "variance" " 0.024564  0.000113") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-sj_new
+  long-heg_14_gamma-sd_new_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJ_new
   heg-long-SJ-new.xml
   1
   16
@@ -336,9 +320,8 @@ list(APPEND HEG14GLSJ_DMC_SCALARS "totenergy" "-1.110199  0.000106") # total ene
 list(APPEND HEG14GLSJ_DMC_SCALARS "variance" " 0.022894  0.000020") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-sj_dmc
+  long-heg_14_gamma-sd_jas-dmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJ_dmc
   heg-long-SJ-dmc.xml
   1
   16
@@ -355,9 +338,8 @@ list(APPEND HEG14GSSJB_SCALARS "totenergy" "-1.084963  0.0006") # total energy
 list(APPEND HEG14GSSJB_SCALARS "variance" " 0.022667  0.000764") # energy variance
 
 qmc_run_and_check(
-  short-heg_14_gamma-sjb
+  short-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJB
   heg-short-SJB.xml
   16
   1
@@ -367,9 +349,8 @@ qmc_run_and_check(
 )
 
 qmc_run_and_check(
-  short-heg_14_gamma-sjb
+  short-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJB
   heg-short-SJB.xml
   4
   4
@@ -379,9 +360,8 @@ qmc_run_and_check(
 )
 
 qmc_run_and_check(
-  short-heg_14_gamma-sjb
+  short-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_short_SJB
   heg-short-SJB.xml
   1
   16
@@ -397,9 +377,8 @@ list(APPEND HEG14GLSJB_SCALARS "totenergy" "-1.084963  0.000083") # total energy
 list(APPEND HEG14GLSJB_SCALARS "variance" " 0.022667  0.000252") # energy variance
 
 qmc_run_and_check(
-  long-heg_14_gamma-sjb
+  long-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJB
   heg-long-SJB.xml
   16
   1
@@ -409,9 +388,8 @@ qmc_run_and_check(
 )
 
 qmc_run_and_check(
-  long-heg_14_gamma-sjb
+  long-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJB
   heg-long-SJB.xml
   4
   4
@@ -421,9 +399,8 @@ qmc_run_and_check(
 )
 
 qmc_run_and_check(
-  long-heg_14_gamma-sjb
+  long-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  heg_long_SJB
   heg-long-SJB.xml
   1
   16
@@ -443,9 +420,8 @@ else()
 endif()
 
 qmc_run_and_check(
-  deterministic-heg_14_gamma-sjb
+  deterministic-heg_14_gamma-sd_bf_jas-vmc
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  det_heg_SJB
   det_heg-SJB.xml
   1
   1
@@ -455,9 +431,8 @@ qmc_run_and_check(
 )
 
 qmc_run_and_check(
-  deterministic-heg_14_gamma-sjb-batched
+  deterministic-heg_14_gamma-sd_bf_jas-vmcbatch
   "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-  det_heg_SJB_batched
   det_heg-SJB_batched.xml
   1
   1
@@ -465,25 +440,17 @@ qmc_run_and_check(
 
 if(NOT QMC_MIXED_PRECISION)
   simple_run_and_check(
-    deterministic-heg_14_gamma-sjb-opt
-    "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-    det_heg-SJB_opt.xml
-    1
-    1
-    check_opt.py
-    -s
-    1
-    -p
-    det_heg_SJB
-    -r
-    ./qmc-ref/ref_det_heg_SJB.s001.opt.xml)
+    BASE_NAME deterministic-heg_14_gamma-sd_bf_jas-opt
+    BASE_DIR "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
+    INPUT_FILE det_heg-SJB_opt.xml
+    CHECK_SCRIPT check_opt.py
+    CHECK_ARGS -s 1 -p det_heg_SJB -r ./qmc-ref/ref_det_heg_SJB.s001.opt.xml)
 
   list(APPEND DET_HEG14GSSJB_OPT_SCALARS "totenergy" "-0.93078813 0.000001")
 
   qmc_run_and_check(
-    deterministic-heg_14_gamma-sjb-opt_vmc
+    deterministic-heg_14_gamma-sd_bf_jas-opt_vmc
     "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-    det_heg_SJB
     det_heg-SJB_opt.xml
     1
     1
@@ -493,10 +460,9 @@ if(NOT QMC_MIXED_PRECISION)
   )
 
   qmc_run_and_check(
-    deterministic-heg_14_gamma-sjb-opt-batched
+    deterministic-heg_14_gamma-sd_bf_jas-optbatch
     "${qmcpack_SOURCE_DIR}/tests/heg/heg_14_gamma"
-    det_heg_SJB_opt_batched
-    det_heg-SJB_opt_batched.xml
+    det_heg-SJB_optbatch.xml
     1
     1
     TRUE)

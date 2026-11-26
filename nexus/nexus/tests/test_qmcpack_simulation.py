@@ -1,21 +1,31 @@
-import pytest
+import shutil
 from copy import deepcopy
-from . import NexusTestOrder
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+import pytest
+from numpy import array
+
+from ..developer import obj
+from ..machines import job
+from ..nexus_base import nexus_config
+from ..physical_system import generate_physical_system
+from ..qmcpack import Qmcpack, generate_qmcpack
+from ..qmcpack_analyzer import QmcpackAnalyzer
+from ..qmcpack_input import QmcpackInput, TracedQmcpackInput, dmc, mcwalkerset
+from ..rmg import generate_rmg
+from ..testing import clear_all_sims, failed, text_eq, value_eq
+from . import TEST_DIR, NexusTestOrder, create_pseudo_files, isolate_nexus_core
+from .test_qmcpack_converter_simulations import (
+    get_convert4qmc_sim,
+    get_pw2qmcpack_sim,
+    get_pyscf_to_afqmc_sim,
+)
+from .test_vasp_simulation import setup_vasp_sim as get_vasp_sim
+
 pytestmark = pytest.mark.order(NexusTestOrder.QMCPACK_SIMULATION)
 
-
-from pathlib import Path
-
-from . import isolate_nexus_core, create_pseudo_files, TEST_DIR
-
-from ..testing import clear_all_sims
-from ..testing import failed
-from ..testing import value_eq,text_eq
-
-
-
 def get_system(tiling=(1,1,1),kgrid=(1,1,1)):
-    from ..physical_system import generate_physical_system
 
     system = generate_physical_system(
         units  = 'A',
@@ -37,9 +47,6 @@ def get_system(tiling=(1,1,1),kgrid=(1,1,1)):
 
 
 def get_qmcpack_sim(type='rsqmc',**kwargs):
-    from ..machines import job
-    from ..qmcpack import Qmcpack,generate_qmcpack
-
     if type=='rsqmc':
         tiling = kwargs.pop('tiling',(1,1,1))
         kgrid = kwargs.pop('kgrid',(1,1,1))
@@ -67,9 +74,6 @@ def get_qmcpack_sim(type='rsqmc',**kwargs):
 
 
 def test_minimal_init():
-    from ..machines import job
-    from ..qmcpack import Qmcpack,generate_qmcpack
-
     sim = generate_qmcpack(
         job    = job(machine='ws1',cores=1),
         system = get_system(),
@@ -91,8 +95,6 @@ def test_minimal_init():
 
 
 def test_check_result():
-    from ..qmcpack_input import dmc
-
     sim = get_qmcpack_sim()
 
     assert(not sim.check_result('unknown',None))
@@ -130,11 +132,6 @@ def test_check_result():
 
 @isolate_nexus_core
 def test_get_result(tmp_path):
-    from ..developer import obj
-    from ..nexus_base import nexus_config
-    from ..qmcpack_analyzer import QmcpackAnalyzer
-    from ..qmcpack_input import dmc,mcwalkerset
-
     nexus_config.runs    = ''
     nexus_config.results = ''
     nexus_config.local_directory  = str(tmp_path)
@@ -238,9 +235,6 @@ def test_get_result(tmp_path):
 
 @isolate_nexus_core
 def test_restart_twist_average(tmp_path):
-    from ..nexus_base import nexus_config
-    from ..qmcpack_input import TracedQmcpackInput,dmc,mcwalkerset
-
     nexus_config.runs    = ''
     nexus_config.results = ''
     nexus_config.local_directory  = str(tmp_path)
@@ -301,16 +295,6 @@ def test_restart_twist_average(tmp_path):
 
 @isolate_nexus_core
 def test_incorporate_result(tmp_path):
-    import shutil
-    from numpy import array
-    from ..developer import obj
-    from ..nexus_base import nexus_config
-    from ..qmcpack_input import dmc,mcwalkerset
-    from .test_vasp_simulation import setup_vasp_sim as get_vasp_sim
-    from .test_qmcpack_converter_simulations import get_pw2qmcpack_sim
-    from .test_qmcpack_converter_simulations import get_convert4qmc_sim
-    from .test_qmcpack_converter_simulations import get_pyscf_to_afqmc_sim
-
     nexus_config.runs    = ''
     nexus_config.results = ''
     nexus_config.local_directory  = str(tmp_path)
@@ -404,7 +388,6 @@ def test_incorporate_result(tmp_path):
     wfn_file2.write_text('fake')
     assert(wfn_file2.exists())
 
-    from ..qmcpack_input import QmcpackInput
     inp = QmcpackInput(wfn_file)
 
     dset = sim.input.get('determinantset')
@@ -546,11 +529,73 @@ def test_incorporate_result(tmp_path):
     clear_all_sims()
 #end def test_incorporate_result()
 
+@isolate_nexus_core
+def test_incorporate_rmg_result(tmp_path):
+    # incorporate rmg orbitals
+    h5py = pytest.importorskip("h5py")
+
+    nexus_config.runs    = ''
+    nexus_config.results = ''
+    nexus_config.local_directory  = str(tmp_path)
+    nexus_config.remote_directory = str(tmp_path)
+    nexus_config.file_locations = nexus_config.file_locations + [str(tmp_path)]
+
+    sim = get_qmcpack_sim(identifier='qmc_rmg_orbitals')
+
+    rmg_orb = generate_rmg(
+        identifier            = 'rmg_orbitals',
+        job                   = job(machine='ws1',cores=1),
+        calculation_mode      = 'NSCF',
+        write_qmcpack_restart = True,
+        )
+    assert(rmg_orb.check_result('orbitals',None))
+
+    result = rmg_orb.get_result('orbitals',None)
+
+    rmg_h5file = tmp_path / 'Waves' / 'wave.out.h5'
+    rmg_h5file.parent.mkdir()
+    with h5py.File(rmg_h5file,'w') as f:
+        f['electrons/number_of_kpoints'] = array([2])
+    #end with
+
+    spo = sim.input.get('bspline')
+    assert(spo.href=='MISSING.h5')
+
+    with pytest.raises(ValueError,match='does not match the k-points of the system'):
+        sim.incorporate_result('orbitals',result,rmg_orb)
+    #end with
+
+    with h5py.File(rmg_h5file,'w') as f:
+        f['electrons/number_of_kpoints'] = array([1])
+    #end with
+
+    sim.incorporate_result('orbitals',result,rmg_orb)
+
+    assert(spo.href=='Waves/wave.out.h5')
+    assert(spo.twistnum==0)
+
+    # tiled cell: RMG holds the folded k-points (or the twists with use_folded=False)
+    sim = get_qmcpack_sim(identifier='qmc_rmg_orbitals_tiled',tiling=(2,1,1),kgrid=(2,2,2))
+    nfolded = len(sim.system.structure.folded_structure.kpoints)
+    ntwists = len(sim.system.structure.kpoints)
+    assert(nfolded==2*ntwists)
+    for nk in (nfolded,ntwists):
+        with h5py.File(rmg_h5file,'w') as f:
+            f['electrons/number_of_kpoints'] = array([nk])
+        #end with
+        sim.incorporate_result('orbitals',result,rmg_orb)
+    #end for
+    with h5py.File(rmg_h5file,'w') as f:
+        f['electrons/number_of_kpoints'] = array([nfolded-1])
+    #end with
+    with pytest.raises(ValueError,match='does not match the k-points of the system'):
+        sim.incorporate_result('orbitals',result,rmg_orb)
+    #end with
+
+
 
 @isolate_nexus_core
 def test_check_sim_status(tmp_path):
-    from ..nexus_base import nexus_config
-
     nexus_config.runs = ''
     nexus_config.local_directory  = str(tmp_path)
     nexus_config.remote_directory = str(tmp_path)
@@ -588,3 +633,38 @@ def test_check_sim_status(tmp_path):
 
     clear_all_sims()
 #end def test_check_sim_status()
+
+
+@pytest.mark.parametrize('shared_ranks', [None, 0, 1, 4])
+@pytest.mark.parametrize('distributed_ranks', [None, -1, 1, 2])
+def test_coefs_mem_ranks(tmp_path, shared_ranks, distributed_ranks):
+    # Use separate spin SPOs to check that both receive the memory settings.
+    sim = get_qmcpack_sim(
+        shared_ranks=shared_ranks,
+        distributed_ranks=distributed_ranks,
+        spin_polarized=True,
+    )
+    root = ET.fromstring(sim.input.write_text())
+    sposets = root.findall('.//sposet_builder/sposet')
+    assert len(sposets) == 2
+    # Only explicitly provided options should appear as XML attributes.
+    expected = {
+        name: str(value) for name, value in (
+            ('shared_ranks', shared_ranks), ('distributed_ranks', distributed_ranks)
+        ) if value is not None
+    }
+    for spo in sposets:
+        # Omit coefs_mem when neither option is set; otherwise emit it once.
+        if not expected:
+            assert spo.find('coefs_mem') is None
+        else:
+            assert len(spo.findall('coefs_mem')) == 1
+            assert spo.find('coefs_mem').attrib == expected
+    # Reading and rewriting the XML must preserve the coefs_mem attributes.
+    path = tmp_path / 'coefs_mem.xml'
+    sim.input.write(path)
+    reread = QmcpackInput(path)
+    assert [node.attrib for node in ET.fromstring(reread.write_text()).findall('.//coefs_mem')] == [
+        node.attrib for node in root.findall('.//coefs_mem')
+    ]
+    clear_all_sims()

@@ -29,43 +29,46 @@ from pathlib import Path
 
 import os
 from copy import deepcopy
+
 import numpy as np
-from .simulation import Simulation, NullSimulationAnalyzer
+
+from . import numpy_extensions as npe
+from .developer import DevBase, FileFormatError, NexusError, obj
+from .hdfreader import read_hdf
+from .nexus_base import nexus_config
+from .pseudoset import PseudoSet
+from .pwscf import Pwscf
+from .pyscf_sim import Pyscf
+from .qmcpack_analyzer import QmcpackAnalyzer
+from .qmcpack_converters import Convert4qmc, Convertpw4qmc, Pw2qmcpack, PyscfToAfqmc
+from .rmg import Rmg
 from .qmcpack_input import (  # noqa: F401
     QmcpackInput,
     TracedQmcpackInput,
-    loop,
-    linear,
-    cslinear,
-    vmc,
-    dmc,
-    collection,
-    determinantset,
-    hamiltonian,
-    init,
-    pairpot,
     bspline_builder,
-    generate_qmcpack_input,
-    generate_jastrows,
+    check_excitation_type,
+    collection,
+    cslinear,
+    determinantset,
+    dmc,
     generate_jastrow,
     generate_jastrow1,
     generate_jastrow2,
     generate_jastrow3,
+    generate_jastrows,
     generate_opt,
     generate_opts,
-    check_excitation_type,
-    )
-from .qmcpack_analyzer import QmcpackAnalyzer
-from .qmcpack_converters import Pw2qmcpack, Convert4qmc, Convertpw4qmc, PyscfToAfqmc
-from .pyscf_sim import Pyscf
-from .developer import DevBase, obj, NexusError, FileFormatError
-from .nexus_base import nexus_config
-from .pseudoset import PseudoSet
-from .hdfreader import read_hdf
+    generate_qmcpack_input,
+    hamiltonian,
+    init,
+    linear,
+    loop,
+    pairpot,
+    vmc,
+)
+from .simulation import NullSimulationAnalyzer, Simulation
 from .unit_converter import convert
-from .pwscf import Pwscf
 from .xmlreader import XMLreader
-from . import numpy_extensions as npe
 
 #mth
 def get_path(o, path: str, value = None):
@@ -870,6 +873,31 @@ class Qmcpack(Simulation):
     #end def get_result
 
 
+    def check_rmg_kpoints(self,h5file,allowed_nkpoints):
+        """Check that an RMG orbital file holds every k-point of the (folded) system.
+
+        RMG reduces a ``kpoint_mesh`` by symmetry, so the twists that QMCPACK
+        unfolds are only all present when RMG ran on the system's explicit
+        k-point list (the default when ``kpoint_mesh`` is not given).
+        """
+        import h5py
+        with h5py.File(h5file,'r') as f:
+            nk_h5 = int(np.array(f['electrons/number_of_kpoints']).ravel()[0])
+        #end with
+        if nk_h5 not in allowed_nkpoints:
+            msg = (
+                'RMG orbital file does not match the k-points of the system.\n'
+                f'  file: {h5file}\n'
+                f'  k-points in file: {nk_h5}\n'
+                f'  k-points expected: {sorted(allowed_nkpoints)}\n'
+                'Run RMG on the k-points of the system (do not set kpoint_mesh) so that\n'
+                'every twist of the QMCPACK run is present in the orbital file.'
+                )
+            raise ValueError(msg)
+        #end if
+    #end def check_rmg_kpoints
+
+
     def incorporate_result(
         self,
         result_name : str,
@@ -912,7 +940,7 @@ class Qmcpack(Simulation):
             #end if
         elif result_name=='orbitals':
             gcta_possible = False
-            if isinstance(sim,Pw2qmcpack) or isinstance(sim,Convertpw4qmc):
+            if isinstance(sim,(Pw2qmcpack,Convertpw4qmc,Rmg)):
 
                 gcta_possible = True
                 h5file = result.h5file
@@ -975,6 +1003,15 @@ class Qmcpack(Simulation):
                         +h5file
                         )
                     raise FileNotFoundError(msg)
+                #end if
+
+                if isinstance(sim,Rmg):
+                    # RMG runs in the primitive (folded) cell unless use_folded=False
+                    allowed_nkpoints = {nkpoints}
+                    if structure.folded_structure is not None:
+                        allowed_nkpoints.add(len(structure.folded_structure.kpoints))
+                    #end if
+                    self.check_rmg_kpoints(h5file,allowed_nkpoints)
                 #end if
 
                 twistnums = list(range(len(structure.kpoints)))
@@ -1596,7 +1633,7 @@ class Qmcpack(Simulation):
                         else:
                             sdet =  wf.determinantset.get('downdet')
                         #end if
-                        from numpy import linalg,where,isclose
+                        from numpy import isclose, linalg, where
                         vb = int(sdet.size / abs(linalg.det(tilematrix))) -1  # Separate for each spin channel
                         cb = vb+1
                         # Convert band_1, band_2 to band indexes

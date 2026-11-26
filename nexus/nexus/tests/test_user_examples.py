@@ -8,13 +8,13 @@ from subprocess import PIPE, Popen
 import pytest
 
 from ..developer import obj
-from ..testing import object_diff, text_diff
-from ..pwscf_input import PwscfInput
-from ..qmcpack_converters import Pw2qmcpackInput
 from ..gamess_input import GamessInput
+from ..pwscf_input import PwscfInput
+from ..pyscf_input import PyscfInput
+from ..qmcpack_converters import Pw2qmcpackInput
 from ..qmcpack_input import QmcpackInput
 from ..rmg_input import RmgInput
-from ..pyscf_input import PyscfInput
+from ..testing import object_diff, text_diff
 from . import TEST_DIR, NexusTestOrder
 
 pytestmark = pytest.mark.order(NexusTestOrder.USER_EXAMPLES)
@@ -71,7 +71,7 @@ def run_example_script(script: Path, test_path: Path) -> tuple[bool, str]:
     old_cwd = Path.cwd()
     os.chdir(test_path)
 
-    script_command = f"PYTHONPATH={nexus_root} {sys.executable} {script} --generate_only --sleep=0.01"
+    script_command = f"PYTHONPATH={nexus_root} {sys.executable} {script} --generate_only --sleep=0.01 --disable-logging"
     process = Popen(script_command, shell=True, stdout=PIPE, stderr=PIPE, close_fds=True)
     out, err = process.communicate()
     returncode = process.returncode
@@ -544,6 +544,39 @@ def test_rmg_diamond(tmp_path):
             )
         assert(success), message
 #end def test_rmg_diamond
+
+
+def test_rmg_diamond_dmc_twistavg(tmp_path):
+    test_data = dict(
+        path = 'rmg/02_diamond_dmc_twistavg',
+        scripts = [
+            'diamond_rmg_dmc_twistavg.py',
+            ],
+        files = [
+            ('rmg',     'input', 'runs/diamond/scf/scf.in'),
+            ('rmg',     'input', 'runs/diamond/nscf_twist/nscf.in'),
+            ('qmcpack', 'input', 'runs/diamond/optJ12/opt.in.xml'),
+            ('qmcpack', 'input', 'runs/diamond/dmc_twist/dmc.g000.twistnum_0.in.xml'),
+            ],
+        )
+
+    test_path = copy_example_files(test_data["path"], tmp_path)
+    copy_pseudos("qmcpack", tmp_path)
+
+    for script in test_data["scripts"]:
+        script_path = example_root / test_data["path"] / script
+        success, message = run_example_script(script_path, test_path)
+        assert(success), message
+
+    for code, _filetype, filepath in test_data["files"]:
+        success, message = check_generated_files(
+            code,
+            tmp_path,
+            test_data["path"],
+            filepath,
+            )
+        assert(success), message
+#end def test_rmg_diamond_dmc_twistavg
 
 
 def test_pyscf_h2o_ae_hf(tmp_path):

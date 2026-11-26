@@ -538,8 +538,6 @@ class Settings(NexusCore):
 
     gamess_vars  = frozenset({'ericfmt', 'mcppath'})
 
-    pwscf_vars   = frozenset({'vdw_table'})
-
     qm_package_vars = frozenset({'qprc'})
 
     deprecated_vars = frozenset({
@@ -552,7 +550,6 @@ class Settings(NexusCore):
         | machine_vars
         | deprecated_vars
         | gamess_vars
-        | pwscf_vars
         | qm_package_vars
         )
 
@@ -674,7 +671,7 @@ class Settings(NexusCore):
 
         version_text +=  "\n"
         version_text +=  "  Recommended Nexus Dependencies:\n"
-        version_text += f"    {'Python':<{name_align}} >= 3.10.0\n"
+        version_text += f"    {'Python':<{name_align}} >= 3.12.0\n"
         for pkg_name, pkg_info in nxs_deps.items():
             version_text += f"    {pkg_name:<{name_align}} >= {pkg_info['min_ver']:<10} ({pkg_info['status']})\n"
 
@@ -697,11 +694,17 @@ class Settings(NexusCore):
 
         self.nxs_print('Applying user settings')
 
+        if "vdw_table" in kwargs:
+            warn(
+                "Setting 'vdw_table' is deprecated due to its removal in QE 6.5!",
+                warn_type="deprecate"
+            )
+            del kwargs["vdw_table"]
+
         # extract settings based on keyword groups
         kw        = Settings.kw_set(Settings.nexus_vars | Settings.deprecated_vars, kwargs)
         mach_kw   = Settings.kw_set(Settings.machine_vars   ,kwargs)
         gamess_kw = Settings.kw_set(Settings.gamess_vars    ,kwargs)
-        pwscf_kw  = Settings.kw_set(Settings.pwscf_vars     ,kwargs)
         qm_pkg_kw = Settings.kw_set(Settings.qm_package_vars,kwargs)
         if len(kwargs)>0:
             msg = (
@@ -716,7 +719,6 @@ class Settings(NexusCore):
         # copy input settings
         self.update(**deepcopy(mach_kw))
         self.update(**deepcopy(gamess_kw))
-        self.update(**deepcopy(pwscf_kw))
 
         # process machine settings
         self.process_machine_settings(mach_kw)
@@ -728,10 +730,6 @@ class Settings(NexusCore):
         # process gamess settings
         Gamess.restore_default_settings()
         Gamess.settings(**gamess_kw)
-
-        # process pwscf settings
-        Pwscf.restore_default_settings()
-        Pwscf.settings(**pwscf_kw)
 
         # process quantum package settings
         QuantumPackage.restore_default_settings()
@@ -748,6 +746,26 @@ class Settings(NexusCore):
             "--version",
             action="version",
             version="Nexus {}.{}.{}".format(*nexus_version)
+            )
+        parser.add_argument(
+            "--disable-logging",
+            "--disable_logging",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help=(
+                "Disable all Nexus logging functionality. "
+                f"(default: {nexus_config.disable_logging})"
+                ),
+            )
+        parser.add_argument(
+            "--logfile-num-backups",
+            "--logfile_num_backups",
+            type=int,
+            default=argparse.SUPPRESS,
+            help=(
+                "Number of logfiles from previous runs to keep. "
+                f"(default: {nexus_config.logfile_num_backups})"
+                ),
             )
         parser.add_argument(
             "--status-only",
@@ -913,10 +931,7 @@ class Settings(NexusCore):
             "--vdw-table",
             "--vdw_table",
             default=argparse.SUPPRESS,
-            help=(
-                "Path to the vdw_table file used with Quantum ESPRESSO "
-                "(required only if running QE with van der Waals functionals)."
-                )
+            help=argparse.SUPPRESS,
             )
         parser.add_argument(
             "--qprc",
@@ -1222,6 +1237,16 @@ class Settings(NexusCore):
         for cfg_var in NexusConfig.__slots__:
             if (cfg_val := kw.pop(cfg_var, None)) is not None:
                 setattr(nexus_config, cfg_var, cfg_val)
+
+        # Set up logger after all settings have been set, so we don't accidentally
+        # overwrite a user's logs.
+        nexus_config.main_log_handler.backupCount = nexus_config.logfile_num_backups
+        logfile = f"{nexus_config.logger_name}.log"
+        if (
+            Path(logfile).exists()
+            and os.path.getsize(logfile) > 0
+        ): # Rollover when the file exists and has something in it.
+            nexus_config.main_log_handler.doRollover()
     #end def process_config_settings
 #end class Settings
 

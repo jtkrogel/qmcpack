@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from .developer import DevBase, obj, nxs_print
-from .structure import Structure
+from pathlib import Path
+
+from .developer import DevBase, nxs_print, obj
+from .execute import execute
 from .physical_system import PhysicalSystem
 from .simulation import SimulationInput
-from .execute import execute
-
-from pathlib import Path
+from .structure import Structure
 
 type KwargsT = bool | int | str | PhysicalSystem | tuple[int, int, int] | None
 

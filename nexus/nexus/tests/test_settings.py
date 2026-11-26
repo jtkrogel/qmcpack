@@ -10,7 +10,7 @@ from ..developer import obj
 from ..gamess import Gamess
 from ..generic import NexusUserWarning
 from ..machines import Job, Workstation
-from ..nexus_base import nexus_config, ShowStatusMode, SimStage
+from ..nexus_base import ShowStatusMode, SimStage, nexus_config
 from ..project_manager import ProjectManager
 from ..pseudoset import PseudoSet
 from ..pwscf import Pwscf
@@ -32,7 +32,6 @@ def test_settings(tmp_path):
         # check that Gamess, Pwscf, and Quantum Package settings are at default values
         assert(Gamess.ericfmt is None)
         assert(Gamess.mcppath is None)
-        assert(Pwscf.vdw_table is None)
         assert(QuantumPackage.qprc is None)
     #end def aux_defaults
 
@@ -50,6 +49,11 @@ def test_settings(tmp_path):
             'progress_tty',
             'pseudo_dir',
             'quiet',
+            "debug",
+            "disable_logging",
+            "logger_name",
+            "logfile_num_backups",
+            "main_log_handler",
             'remote_directory',
             'results',
             'runs',
@@ -76,6 +80,11 @@ def test_settings(tmp_path):
             'progress_tty',
             'pseudo_dir',
             'quiet',
+            "debug",
+            "disable_logging",
+            "logger_name",
+            "logfile_num_backups",
+            "main_log_handler",
             'remote_directory',
             'results',
             'runs',

@@ -32,10 +32,12 @@
 from __future__ import annotations
 
 import os
+
 import numpy as np
+
 from . import numpy_extensions as npe
-from .developer import DevBase, obj, FileFormatError, sorted_generic
-from .simulation import Simulation,SimulationAnalyzer
+from .developer import DevBase, FileFormatError, obj, sorted_generic
+from .simulation import Simulation, SimulationAnalyzer
 from .vasp_input import Incar
 
 from pathlib import Path

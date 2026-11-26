@@ -22,8 +22,7 @@
 
 from __future__ import annotations
 
-from .developer import obj
-from .developer import DevBase
+from .developer import DevBase, obj
 
 
 class Unit(DevBase):

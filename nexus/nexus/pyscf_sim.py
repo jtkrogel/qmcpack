@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import os
 import textwrap
+
 from .developer import obj
-from .simulation import Simulation
-from .pyscf_input import PyscfInput, generate_pyscf_input
 from .pyscf_analyzer import PyscfAnalyzer
+from .pyscf_input import PyscfInput, generate_pyscf_input
+from .simulation import Simulation
 
 from pathlib import Path
 
